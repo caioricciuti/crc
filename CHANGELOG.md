@@ -2,7 +2,7 @@
 
 One entry per tag, written for people who use the editor.
 
-## Unreleased
+## v0.2.0-alpha.2, 2026-09-26
 
 - Merge conflicts: a Conflicts group in Source Control, `MERGING` and
   friends in the status bar, and each conflict resolved in the file (Accept
@@ -10,6 +10,11 @@ One entry per tag, written for people who use the editor.
   aligned columns. Mark Resolved saves and stages the file once no markers
   are left. Git > Next Conflict and Previous Conflict; `conflict_view` in
   the settings picks the view a file opens in.
+- Git status is re-read when the repository changes with Source Control
+  closed too, so the status bar branch and the gutter marks stay current
+  after a commit, merge or checkout in the terminal.
+- The disk image is now `crc.dmg` in every release, and the site's Download
+  button fetches it directly.
 
 ## v0.2.0-alpha.1, 2026-09-24
 

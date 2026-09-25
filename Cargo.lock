@@ -20,7 +20,7 @@ dependencies = [
 
 [[package]]
 name = "crc"
-version = "0.2.0-alpha.1"
+version = "0.2.0-alpha.2"
 dependencies = [
  "cc",
  "objc2",
