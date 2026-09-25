@@ -26,6 +26,7 @@ file in crc applies it; there is no settings window and nothing to restart.
 | `format_on_save` | `true`, `false` | `false` | Format the file with its [language server](/docs/features/language-servers/) when saving. |
 | `word_wrap` | `"auto"`, `"on"`, `"off"` | `"auto"` | `auto` wraps Markdown and text files only. <kbd>⌥</kbd><kbd>Z</kbd> flips it for one document. |
 | `ssh_auth_sock` | a path | unset | The SSH agent socket Git uses for fetch, pull and push. |
+| `conflict_view` | `"inline"`, `"side-by-side"` | `"inline"` | How a file with [merge conflicts](/docs/features/git/#merge-conflicts) opens. The strip above the file switches either way. |
 
 ## The template
 
@@ -64,6 +65,11 @@ word_wrap = "auto"
 # `echo $SSH_AUTH_SOCK` in a terminal and put the path here. A leading ~/
 # is your home folder.
 # ssh_auth_sock = "~/.ssh/agent.sock"
+
+# How a file with merge conflicts opens: "inline", with buttons on each
+# conflict in the text, or "side-by-side", as columns. The strip above
+# the file switches between them.
+conflict_view = "inline"
 ```
 
 ## Why `ssh_auth_sock` exists

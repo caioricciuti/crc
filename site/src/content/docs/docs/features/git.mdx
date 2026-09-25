@@ -1,6 +1,6 @@
 ---
 title: Git
-description: Status, diffs, file and hunk staging, commits, branches, fetch, pull and push, gutter marks and blame.
+description: Status, diffs, file and hunk staging, commits, branches, fetch, pull and push, merge conflicts, gutter marks and blame.
 ---
 
 import { Aside, Steps } from "@astrojs/starlight/components";
@@ -47,8 +47,8 @@ The **Git** menu has:
 |---|---|
 | **Switch Branch…** | Lists your local branches in the palette. Type a name that is not one and it offers to create it. |
 | **Fetch** | `git fetch` |
-| **Pull** | `git pull` |
-| **Push** | `git push` |
+| **Pull** | `git pull --ff-only`: it never merges or rebases for you. |
+| **Push** | `git push`, never forced. A branch with no upstream is pushed to `origin` and tracks it. |
 | **Refresh** | Re-reads the status. |
 
 <Aside type="tip" title="SSH remotes from the Dock">
@@ -56,6 +56,44 @@ The **Git** menu has:
   Git may not reach your SSH agent. Set `ssh_auth_sock` in
   [settings](/docs/getting-started/settings/#why-ssh_auth_sock-exists) to the
   path `echo $SSH_AUTH_SOCK` prints in a terminal.
+</Aside>
+
+## Merge conflicts
+
+When a merge, rebase, cherry-pick or stash pop stops on a conflict, however
+you ran it, crc finds the conflicted files. They get their own
+**Conflicts** group in Source Control, and the status line says
+`MERGING`, `REBASING`, `CHERRY-PICKING` or `REVERTING`. Click a
+conflicted file to open it at its first conflict.
+
+A strip above the file counts what is left and switches between two views:
+
+- **Inline**: the conflict stays in the text. The current side is washed in
+  green, the incoming side in blue, and the conflict's first line carries
+  **Accept Current**, **Accept Incoming**, **Accept Both** and, when the
+  markers include the common ancestor, **Accept Base**. You can also just
+  edit the text by hand.
+- **Side by side**: the current, base and incoming versions of the file in
+  columns, each conflict's sections next to each other and padded so the
+  text after them lines up again. Each column has its own Accept button, and
+  **Accept Both** is at the end of the row. Click any line to go back to it
+  in the file.
+
+Every accept is one undo step, and the file is left unsaved until you save
+it. **Previous** and **Next** walk the conflicts, wrapping around the file.
+Once no markers are left, **Mark Resolved** saves the file and stages it,
+which is how Git knows the conflict is over; it refuses while any markers
+remain, so they cannot end up in a commit. Finish the merge or rebase with
+Git as usual.
+
+Everything in the strip is also in the **Git** menu, and so in the
+palette: Next Conflict, Previous Conflict, Accept Current, Accept Incoming,
+Accept Both, Accept Base, Conflicts Side by Side and Mark Resolved.
+
+<Aside type="tip" title="See the base">
+  Git writes the common ancestor into the markers only with
+  `git config --global merge.conflictStyle zdiff3` (or `diff3`). With it,
+  side by side gets a middle column and Accept Base is offered.
 </Aside>
 
 ## In the editor

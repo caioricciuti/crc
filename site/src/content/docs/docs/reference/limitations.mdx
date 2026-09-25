@@ -42,6 +42,12 @@ import { Aside } from "@astrojs/starlight/components";
 - **Gutter marks compare with HEAD**, not the index, and stop at 2 MiB.
 - **Hunk staging covers tracked text changes**; other change types use
   whole-file actions.
+- **Pull is fast-forward only**, and crc has no merge or rebase command of
+  its own. Conflicts from one you ran are resolved in crc; finishing,
+  continuing or aborting it is Git's.
+- **Conflict markers are Git's default seven characters.** A custom
+  `conflict-marker-size` is not recognised, and files over 16 MiB are not
+  scanned for conflicts.
 
 ## Files
 
