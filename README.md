@@ -1,5 +1,10 @@
 # crc
 
+[![CI](https://github.com/caioricciuti/crc/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/caioricciuti/crc/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/caioricciuti/crc?include_prereleases&label=release)](https://github.com/caioricciuti/crc/releases/latest)
+[![License: GPL-3.0](https://img.shields.io/github/license/caioricciuti/crc)](LICENSE)
+[![Website](https://img.shields.io/badge/website-crceditor.com-2ea44f)](https://crceditor.com)
+
 A text editor for macOS, drawn on the GPU straight from Metal and CoreText,
 with a terminal, local Git and Claude Code built in.
 
