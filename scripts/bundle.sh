@@ -12,6 +12,8 @@
 #   scripts/bundle.sh --release    build, sign with the Developer ID in the
 #                                  keychain, notarize, staple, and write a
 #                                  signed, notarized DMG plus SHA256SUMS
+#   scripts/bundle.sh --dmg        ad-hoc signed app in target/crc.dmg, laid
+#                                  out as a release's is, to look at it
 #
 # --release needs two things only the release machine has, both entered by
 # a person and never by a script: a "Developer ID Application" identity in
@@ -146,13 +148,7 @@ if [ "$MODE" = "--release" ]; then
     # releases/latest/download/crc.dmg, which only works if the file is
     # called the same in every release. The version is the release's title.
     DMG="target/${APP_NAME}.dmg"
-    STAGE="target/dmg"
-    rm -rf "$STAGE" "$DMG"
-    mkdir -p "$STAGE"
-    cp -R "$APP" "$STAGE/"
-    ln -s /Applications "$STAGE/Applications"
-    hdiutil create -quiet -volname "$APP_NAME" -srcfolder "$STAGE" -ov -format ULFO "$DMG"
-    rm -rf "$STAGE"
+    scripts/make-dmg.sh "$APP" "$DMG"
     codesign --force --timestamp --sign "$IDENTITY" "$DMG"
     # shellcheck disable=SC2086
     xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" $NOTARY_KEYCHAIN --wait 2>&1 | sed 's/^/    /'
@@ -168,6 +164,12 @@ else
     echo "==> ad-hoc signing"
     codesign --force --deep --sign - "$APP"
     codesign --verify --verbose "$APP" 2>&1 | sed 's/^/    /'
+fi
+
+if [ "$MODE" = "--dmg" ]; then
+    echo "==> disk image (not notarized)"
+    scripts/make-dmg.sh "$APP" "target/${APP_NAME}.dmg"
+    echo "    target/${APP_NAME}.dmg"
 fi
 
 if [ "$MODE" = "--install" ]; then
