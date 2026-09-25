@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Question or idea
+    url: https://github.com/caioricciuti/crc/discussions
+    about: How to do something, or something crc should do. Discussions keeps Issues for bugs.
+  - name: Security problem
+    url: https://github.com/caioricciuti/crc/security/advisories/new
+    about: Reported privately, only the maintainer sees it.
+  - name: Documentation
+    url: https://crceditor.com/docs/
+    about: Installing, settings, every feature and the known limits.

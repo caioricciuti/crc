@@ -1,0 +1,45 @@
+name: Bug report
+description: Something in crc does not work as it should.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Help > Report a Problem in crc opens an issue with the version, macOS and the newest crash already filled in. A security problem goes to [Report a vulnerability](https://github.com/caioricciuti/crc/security/advisories/new) instead, not here.
+  - type: textarea
+    id: happened
+    attributes:
+      label: What happened
+      description: What you saw. A screenshot helps with anything on screen.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to make it happen
+      description: The smallest steps from opening crc, and the kind of file or project.
+      placeholder: |
+        1. Open a folder with a .rs file
+        2. ...
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+  - type: input
+    id: version
+    attributes:
+      label: crc version
+      description: crc > About crc, or `crc --version` in a terminal.
+      placeholder: crc 0.2.0-alpha.2 (4ed090c0)
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      placeholder: macOS 15.4, Apple M2
+  - type: textarea
+    id: crash
+    attributes:
+      label: Crash log
+      description: If crc quit, attach the newest file from ~/Library/Logs/crc (Help > Show Crash Logs opens the folder).
