@@ -459,6 +459,12 @@ struct State {
     blame_rx: Option<mpsc::Receiver<(u64, usize, String)>>,
     /// Git marks per open buffer, keyed by buffer id.
     gutter: HashMap<u64, GutterState>,
+    /// Merge conflicts found in open documents, keyed by buffer id.
+    conflict_scans: HashMap<u64, crate::platform::conflicts::Scan>,
+    /// Conflicts are shown as columns rather than in the text.
+    conflict_side: bool,
+    /// What the conflict controls' cursor rects were built for.
+    conflict_cursor_key: Option<(u64, usize, usize, usize, usize, bool)>,
     /// The code font as asked for, and its size in points. The atlas holds
     /// the resolved face; this is what a rebuild at a new size starts from.
     font: String,
@@ -1095,6 +1101,39 @@ define_class!(
                     self.terminal_press(event, x, y);
                     return;
                 }
+                Some(Hit::ConflictMode(side)) => {
+                    self.set_conflict_side(side);
+                    return;
+                }
+                Some(Hit::ConflictStep(forward)) => {
+                    self.step_conflict(forward, false);
+                    return;
+                }
+                Some(Hit::ConflictResolve) => {
+                    self.mark_conflict_resolved();
+                    return;
+                }
+                Some(Hit::ConflictTake(index, take)) => {
+                    self.take_conflict(index, take);
+                    return;
+                }
+                // The columns are a view of the file: a click goes back to
+                // the file, at the line clicked.
+                Some(Hit::Text) if side_by_side(&self.ivars().state.borrow()) => {
+                    let line = {
+                        let mut state = self.ivars().state.borrow_mut();
+                        let total = state.docs.active().rope.len_lines();
+                        let text = chrome.text;
+                        active_conflicts_mut(&mut state).and_then(|view| {
+                            crate::platform::conflicts::side_line_at(view, total, text, x, y)
+                        })
+                    };
+                    self.set_conflict_side(false);
+                    if let Some(line) = line {
+                        self.caret_to_line(line);
+                    }
+                    return;
+                }
                 Some(Hit::ReviewAccept) => {
                     self.claude_decide(true);
                     return;
@@ -1583,6 +1622,10 @@ define_class!(
                         | Hit::ResponseSegment(_)
                         | Hit::ReviewAccept
                         | Hit::ReviewReject
+                        | Hit::ConflictMode(_)
+                        | Hit::ConflictStep(_)
+                        | Hit::ConflictResolve
+                        | Hit::ConflictTake(..)
                         | Hit::ToolbarTerminal
                         | Hit::TerminalTab(_)
                         | Hit::TerminalClose(_)
@@ -1592,7 +1635,7 @@ define_class!(
                     add(rect, &NSCursor::pointingHandCursor());
                 }
             }
-            if state.native_preview.is_none() && !(state.git_open && state.git.showing_diff) && active_review(&state).is_none() {
+            if state.native_preview.is_none() && !(state.git_open && state.git.showing_diff) && active_review(&state).is_none() && !side_by_side(&state) {
                 let gutter = layout::gutter_width(state.docs.active(), &state.renderer.atlas);
                 add(chrome.text.inset_left(gutter), &NSCursor::IBeamCursor());
             }
@@ -2007,6 +2050,47 @@ define_class!(
         #[unsafe(method(gitPush:))]
         fn action_git_push(&self, _sender: Option<&AnyObject>) {
             self.git_remote(crate::project::git::Remote::Push);
+        }
+
+        #[unsafe(method(nextConflict:))]
+        fn action_next_conflict(&self, _sender: Option<&AnyObject>) {
+            self.step_conflict(true, false);
+        }
+
+        #[unsafe(method(previousConflict:))]
+        fn action_previous_conflict(&self, _sender: Option<&AnyObject>) {
+            self.step_conflict(false, false);
+        }
+
+        #[unsafe(method(acceptCurrent:))]
+        fn action_accept_current(&self, _sender: Option<&AnyObject>) {
+            self.take_conflict_at_caret(crate::project::conflict::Take::Current);
+        }
+
+        #[unsafe(method(acceptIncoming:))]
+        fn action_accept_incoming(&self, _sender: Option<&AnyObject>) {
+            self.take_conflict_at_caret(crate::project::conflict::Take::Incoming);
+        }
+
+        #[unsafe(method(acceptBoth:))]
+        fn action_accept_both(&self, _sender: Option<&AnyObject>) {
+            self.take_conflict_at_caret(crate::project::conflict::Take::Both);
+        }
+
+        #[unsafe(method(acceptBase:))]
+        fn action_accept_base(&self, _sender: Option<&AnyObject>) {
+            self.take_conflict_at_caret(crate::project::conflict::Take::Base);
+        }
+
+        #[unsafe(method(toggleConflictColumns:))]
+        fn action_toggle_conflict_columns(&self, _sender: Option<&AnyObject>) {
+            let side = self.ivars().state.borrow().conflict_side;
+            self.set_conflict_side(!side);
+        }
+
+        #[unsafe(method(markResolved:))]
+        fn action_mark_resolved(&self, _sender: Option<&AnyObject>) {
+            self.mark_conflict_resolved();
         }
 
         #[unsafe(method(foldBlock:))]
@@ -2693,6 +2777,19 @@ define_class!(
                 || action == sel!(focusPreviousPane:)
             {
                 pane_count(&state) > 1
+            } else if action == sel!(nextConflict:)
+                || action == sel!(previousConflict:)
+                || action == sel!(acceptCurrent:)
+                || action == sel!(acceptIncoming:)
+                || action == sel!(acceptBoth:)
+            {
+                active_conflicts(&state).is_some_and(|v| !v.conflicts.is_empty())
+            } else if action == sel!(acceptBase:) {
+                active_conflicts(&state).is_some_and(|v| v.has_base())
+            } else if action == sel!(toggleConflictColumns:) {
+                active_conflicts(&state).is_some_and(|v| !v.conflicts.is_empty())
+            } else if action == sel!(markResolved:) {
+                active_conflicts(&state).is_some_and(|v| v.can_resolve())
             } else if action == sel!(triggerCompletion:) {
                 !field_has_keys(&state)
             } else if action == sel!(goToDefinition:) || action == sel!(showHover:) {
@@ -2994,6 +3091,26 @@ impl EditorView {
         // sidebar and the Markdown blocks still go a whole line at a time.
         let over_sidebar = chrome.sidebar.is_some_and(|r| r.contains(x, y));
         let previewing = state.preview.is_some() && default_preview(state.docs.active()).is_some();
+        // The columns scroll by their own rows.
+        if !over_sidebar && chrome.text.contains(x, y) && side_by_side(&state) {
+            let per_row = if precise {
+                crate::platform::conflicts::SIDE_LINE as f64
+            } else {
+                1.0 / WHEEL_LINES_PER_NOTCH
+            };
+            state.scroll_carry.1 -= dy / per_row;
+            let rows = state.scroll_carry.1.trunc();
+            state.scroll_carry.1 -= rows;
+            let total = state.docs.active().rope.len_lines();
+            if let Some(view) = active_conflicts_mut(&mut state) {
+                view.scroll = view.scroll.saturating_add_signed(rows as isize);
+                crate::platform::conflicts::clamp_side_scroll(view, total, chrome.text);
+            }
+            drop(state);
+            self.request_redraw();
+            self.pump();
+            return;
+        }
         if precise && !over_sidebar && !previewing {
             state.scroll_carry.1 = 0.0;
             state
@@ -3314,6 +3431,23 @@ impl EditorView {
             chrome.text.height,
             chrome.sidebar.map(|r| r.width),
         );
+        // The conflict buttons move with the text, so their cursor rects
+        // are rebuilt when it scrolls or they change.
+        let conflict_key = active_conflicts(&state).map(|view| {
+            let buffer = state.docs.active();
+            (
+                buffer.id(),
+                buffer.scroll_line,
+                buffer.scroll_column,
+                view.scroll,
+                view.conflicts.len(),
+                state.conflict_side,
+            )
+        });
+        if state.conflict_cursor_key != conflict_key {
+            state.conflict_cursor_key = conflict_key;
+            state.cursor_rects_for = None;
+        }
         if state.cursor_rects_for != Some(key) {
             state.cursor_rects_for = Some(key);
             if let Some(window) = self.window() {
@@ -3423,6 +3557,13 @@ impl EditorView {
             active_review(&state).is_some() && !field_has_keys(&state)
         };
         if reviewing && let Some(handled) = self.handle_review_key(event) {
+            return handled;
+        }
+        let columns = {
+            let state = self.ivars().state.borrow();
+            side_by_side(&state) && !field_has_keys(&state)
+        };
+        if columns && let Some(handled) = self.handle_conflict_side_key(event) {
             return handled;
         }
         // Escape with no overlay open drops back to a single cursor, which
@@ -4031,6 +4172,7 @@ impl EditorView {
                 self.ivars().state.borrow_mut().git.poll();
             }
             Step::Dump(path) => {
+                sync_conflicts(&mut self.ivars().state.borrow_mut());
                 let state = self.ivars().state.borrow();
                 let titles: Vec<String> =
                     (0..state.docs.len()).map(|i| state.docs.title(i)).collect();
@@ -4187,9 +4329,18 @@ impl EditorView {
                 );
                 let report = format!(
                     // First: the report ends with the document's text.
-                    "message: {}\nbranch: {}\nblame: {}\nfind_results: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\n{report}",
+                    "message: {}\nbranch: {}\nconflicts: {}\ngit_conflicts: {}\nblame: {}\nfind_results: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\n{report}",
                     state.message.as_ref().map_or("", |(text, _)| text.as_str()),
                     state.git.branch_status(),
+                    active_conflicts(&state).map_or("none".to_string(), |v| format!(
+                        "{} side={} unmerged={} resolvable={} scroll={}",
+                        v.conflicts.len(),
+                        side_by_side(&state),
+                        v.unmerged,
+                        v.can_resolve(),
+                        v.scroll
+                    )),
+                    state.git.conflict_count(),
                     state
                         .blame
                         .as_ref()
@@ -5551,10 +5702,11 @@ impl EditorView {
     /// A click inside the source-control column. Returns whether it landed on
     /// something; the caller falls through to the file tree otherwise.
     fn git_click(&self, column: Viewport, x: f32, y: f32) -> bool {
-        use crate::platform::git_panel::{Entry, Sidebar};
+        use crate::platform::git_panel::{Entry, Group, Sidebar};
         let mut state = self.ivars().state.borrow_mut();
         let g = Sidebar::new(column);
         let mut handled = true;
+        let mut conflict_file = None;
         if g.refresh.contains(x, y) {
             state.git.refresh();
         } else if g.commit.contains(x, y) {
@@ -5570,7 +5722,21 @@ impl EditorView {
             }
         } else if let Some((entry, rect)) = state.git.entry_at(g, x, y) {
             match entry {
-                Entry::File { change, staged } => {
+                // A conflict is resolved in the file, not read as a diff.
+                Entry::File {
+                    change,
+                    group: Group::Conflicts,
+                } => {
+                    state.git_focus = false;
+                    state.git.showing_diff = false;
+                    conflict_file = state
+                        .git
+                        .snapshot
+                        .as_ref()
+                        .and_then(|s| s.changes.get(change).map(|c| s.root.join(&c.path)));
+                }
+                Entry::File { change, group } => {
+                    let staged = group == Group::Staged;
                     // The staging control is on the row, so a click near the
                     // trailing edge stages rather than selects.
                     if g.toggle(rect).contains(x, y) {
@@ -5587,6 +5753,11 @@ impl EditorView {
             handled = false;
         }
         drop(state);
+        if let Some(path) = conflict_file
+            && self.load_path(&path.to_string_lossy())
+        {
+            self.step_conflict(true, true);
+        }
         self.request_redraw();
         self.resume_display_link();
         self.pump();
@@ -8379,6 +8550,221 @@ impl EditorView {
         self.resume_display_link();
     }
 
+    /// Puts the caret at the start of `line`, with a few lines of context
+    /// above it on screen.
+    fn caret_to_line(&self, line: usize) {
+        let (rows, _) = self.grid();
+        {
+            let mut state = self.ivars().state.borrow_mut();
+            let buffer = state.docs.active_mut();
+            let line = line.min(buffer.rope.len_lines().saturating_sub(1));
+            let at = buffer.rope.line_to_byte(line);
+            buffer.place_cursor(at, Motion::Move);
+            buffer.scroll_to(line.saturating_sub(rows / 4), rows);
+        }
+        self.request_redraw();
+        self.pump();
+    }
+
+    /// Git > Next Conflict and Previous Conflict, and the strip's buttons:
+    /// the caret to the next conflict's opening marker, wrapping around the
+    /// file. `from_top` goes to the first.
+    fn step_conflict(&self, forward: bool, from_top: bool) {
+        let target = {
+            let mut state = self.ivars().state.borrow_mut();
+            sync_conflicts(&mut state);
+            let line = state.docs.active().cursor_position().0;
+            active_conflicts(&state).and_then(|view| {
+                let index = if from_top {
+                    (!view.conflicts.is_empty()).then_some(0)
+                } else {
+                    crate::project::conflict::step(&view.conflicts, line, forward)
+                }?;
+                Some((
+                    index,
+                    view.conflicts.len(),
+                    view.conflicts[index].start_line,
+                ))
+            })
+        };
+        let Some((index, count, line)) = target else {
+            self.ivars().state.borrow_mut().message =
+                Some(("no conflicts in this file".to_string(), Instant::now()));
+            self.request_redraw();
+            self.pump();
+            return;
+        };
+        self.caret_to_line(line);
+        let text = self.chrome().text;
+        {
+            let mut state = self.ivars().state.borrow_mut();
+            let total = state.docs.active().rope.len_lines();
+            if let Some(view) = active_conflicts_mut(&mut state) {
+                crate::platform::conflicts::show_in_side(view, total, index, text);
+            }
+            state.message = Some((format!("conflict {} of {count}", index + 1), Instant::now()));
+        }
+        self.request_redraw();
+        self.pump();
+    }
+
+    /// Resolves conflict `index` of the active document to `take`: one edit,
+    /// one undo step, the file left unsaved.
+    fn take_conflict(&self, index: usize, take: crate::project::conflict::Take) {
+        {
+            let mut state = self.ivars().state.borrow_mut();
+            sync_conflicts(&mut state);
+            let Some((conflict, count)) = active_conflicts(&state).and_then(|v| {
+                v.conflicts
+                    .get(index)
+                    .cloned()
+                    .map(|c| (c, v.conflicts.len()))
+            }) else {
+                return;
+            };
+            if !conflict.offers(take) {
+                return;
+            }
+            let buffer = state.docs.active_mut();
+            let text = conflict.resolution(&buffer.rope, take);
+            // Its own undo step, never merged into typing just before it.
+            let caret = buffer.cursor();
+            buffer.place_cursor(caret, Motion::Move);
+            if buffer.replace_ranges(&[(conflict.range.clone(), text)]) == 0 {
+                state.message = Some(("this document is read-only".to_string(), Instant::now()));
+                drop(state);
+                self.request_redraw();
+                self.pump();
+                return;
+            }
+            let buffer = state.docs.active_mut();
+            buffer.place_cursor(conflict.range.start, Motion::Move);
+            let left = count - 1;
+            state.message = Some((
+                match left {
+                    0 => "no conflicts left".to_string(),
+                    1 => format!("{}; 1 conflict left", take.label()),
+                    n => format!("{}; {n} conflicts left", take.label()),
+                },
+                Instant::now(),
+            ));
+        }
+        self.after_edit();
+    }
+
+    /// Accept Current and friends from the menu: the conflict the caret is
+    /// in, or else the next one.
+    fn take_conflict_at_caret(&self, take: crate::project::conflict::Take) {
+        let index = {
+            let mut state = self.ivars().state.borrow_mut();
+            sync_conflicts(&mut state);
+            let line = state.docs.active().cursor_position().0;
+            active_conflicts(&state).and_then(|view| {
+                crate::project::conflict::at_line(&view.conflicts, line)
+                    .or_else(|| crate::project::conflict::step(&view.conflicts, line, true))
+            })
+        };
+        if let Some(index) = index {
+            self.take_conflict(index, take);
+        }
+    }
+
+    /// Inline or side by side. The columns open on the conflict the caret
+    /// is in, or the next one.
+    fn set_conflict_side(&self, side: bool) {
+        let text = self.chrome().text;
+        {
+            let mut state = self.ivars().state.borrow_mut();
+            state.conflict_side = side;
+            let line = state.docs.active().cursor_position().0;
+            let total = state.docs.active().rope.len_lines();
+            if side && let Some(view) = active_conflicts_mut(&mut state) {
+                let index = crate::project::conflict::at_line(&view.conflicts, line)
+                    .or_else(|| crate::project::conflict::step(&view.conflicts, line, true));
+                if let Some(index) = index {
+                    crate::platform::conflicts::show_in_side(view, total, index, text);
+                }
+            }
+        }
+        if let Some(window) = self.window() {
+            window.invalidateCursorRectsForView(self);
+        }
+        self.request_redraw();
+        self.pump();
+    }
+
+    /// Git > Mark Resolved: saves the file if it has to, then `git add`,
+    /// which is what ends a conflict for Git. Refused while markers remain,
+    /// since that would commit them.
+    fn mark_conflict_resolved(&self) {
+        let (path, ready, left, dirty) = {
+            let mut state = self.ivars().state.borrow_mut();
+            sync_conflicts(&mut state);
+            let buffer = state.docs.active();
+            let (path, dirty) = (buffer.path.clone(), buffer.is_dirty());
+            match active_conflicts(&state) {
+                Some(view) => (path, view.can_resolve(), view.conflicts.len(), dirty),
+                None => (path, false, 0, dirty),
+            }
+        };
+        let Some(path) = path.filter(|_| ready) else {
+            self.ivars().state.borrow_mut().message = Some((
+                match left {
+                    0 => "Git does not list this file as in conflict".to_string(),
+                    1 => "1 conflict left; resolve it first".to_string(),
+                    n => format!("{n} conflicts left; resolve them first"),
+                },
+                Instant::now(),
+            ));
+            self.request_redraw();
+            self.pump();
+            return;
+        };
+        if dirty && !self.save(false) {
+            return;
+        }
+        self.ivars().state.borrow_mut().git.mark_resolved(path);
+        self.resume_display_link();
+        self.request_redraw();
+        self.pump();
+    }
+
+    /// Keys while the columns show. `None` to handle the key as usual.
+    fn handle_conflict_side_key(&self, event: &NSEvent) -> Option<bool> {
+        const ESCAPE: u16 = 53;
+        let flags = event.modifierFlags();
+        let command = flags.contains(NSEventModifierFlags::Command);
+        let control = flags.contains(NSEventModifierFlags::Control);
+        let text = self.chrome().text;
+        let page = (crate::platform::conflicts::side_rows_visible(text) as isize - 2).max(1);
+        let delta = match event.keyCode() {
+            ESCAPE => {
+                self.set_conflict_side(false);
+                return Some(true);
+            }
+            key::UP => -1,
+            key::DOWN => 1,
+            key::PAGE_UP => -page,
+            key::PAGE_DOWN => page,
+            key::HOME => isize::MIN / 2,
+            key::END => isize::MAX / 2,
+            _ if command || control => return None,
+            // The columns are not editable; typing would land unseen.
+            _ => return Some(true),
+        };
+        {
+            let mut state = self.ivars().state.borrow_mut();
+            let total = state.docs.active().rope.len_lines();
+            if let Some(view) = active_conflicts_mut(&mut state) {
+                view.scroll = view.scroll.saturating_add_signed(delta);
+                crate::platform::conflicts::clamp_side_scroll(view, total, text);
+            }
+        }
+        self.request_redraw();
+        self.pump();
+        Some(true)
+    }
+
     /// Answers the review in the active tab.
     fn claude_decide(&self, accept: bool) {
         let answered = {
@@ -9288,8 +9674,11 @@ impl EditorView {
                 }
                 crate::project::watch::Change::Git => {
                     // The panel's own operations change the repository too;
-                    // those it already re-read.
-                    if state.git_open && !state.git.busy() && !state.git.settled_recently() {
+                    // those it already re-read. Read with the panel closed
+                    // as well: a merge in the terminal that leaves
+                    // conflicts is found here, and so are the status bar's
+                    // branch and the gutter's HEAD.
+                    if !state.git.busy() && !state.git.settled_recently() {
                         state.git_changed_at = Some(Instant::now());
                     }
                 }
@@ -9310,7 +9699,7 @@ impl EditorView {
         {
             state.git_changed_at = None;
             state.gutter.clear();
-            if state.git_open && !state.git.busy() && !state.git.settled_recently() {
+            if !state.git.busy() && !state.git.settled_recently() {
                 state.git.refresh();
             }
         }
@@ -9876,6 +10265,7 @@ impl EditorView {
             format_on_save: self.ivars().state.borrow().format_on_save,
             word_wrap: self.ivars().state.borrow().word_wrap,
             ssh_auth_sock: None,
+            conflict_side_by_side: false,
         }
         .save();
         self.ivars().state.borrow_mut().message = Some((
@@ -9933,6 +10323,7 @@ impl EditorView {
             state.format_on_save = settings.format_on_save;
             state.word_wrap = settings.word_wrap;
             state.ssh_auth_sock = settings.ssh_auth_sock.clone();
+            state.conflict_side = settings.conflict_side_by_side;
         }
         self.apply_theme();
         self.ivars().state.borrow_mut().message =
@@ -10060,6 +10451,8 @@ impl EditorView {
         let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
             return None;
         };
+        sync_conflicts(&mut state);
+        let side = side_by_side(&state);
         let chrome = chrome_of(&state);
         let carets_on = !self.caret_blinks(&state) || caret_phase(state.caret_since.elapsed()).0;
         let State {
@@ -10112,6 +10505,8 @@ impl EditorView {
             recent_projects,
             unshaped_on_screen,
             completion_chips,
+            conflict_scans,
+            conflict_side,
             ..
         } = &mut *state;
         *unshaped_on_screen = false;
@@ -10205,6 +10600,27 @@ impl EditorView {
                 theme.tab_active,
             );
             git.draw_diff(&mut renderer.atlas, editor_rect, theme, glyphs);
+        } else if side
+            && let Some(view) = conflict_scans
+                .get_mut(&buffer.id())
+                .and_then(|s| s.view.as_mut())
+        {
+            glyphs.clear();
+            layout::push_rect(
+                glyphs,
+                &renderer.atlas,
+                [editor_rect.x, editor_rect.y],
+                [editor_rect.width, editor_rect.height],
+                theme.tab_active,
+            );
+            crate::platform::conflicts::draw_side(
+                view,
+                &buffer.rope,
+                &mut renderer.atlas,
+                editor_rect,
+                theme,
+                glyphs,
+            );
         } else if let Some(review) = reviewing {
             glyphs.clear();
             layout::push_rect(
@@ -10308,6 +10724,34 @@ impl EditorView {
                     editor_rect,
                     theme,
                     &marks.marks,
+                );
+            }
+            // Conflicts: washes under the text, which was drawn first into
+            // a cleared list, so they go in at the front; the buttons on
+            // each opening marker go on top.
+            if let Some(view) = conflict_scans
+                .get(&buffer.id())
+                .and_then(|s| s.view.as_ref())
+            {
+                let bands = crate::platform::conflicts::bands(
+                    view,
+                    buffer,
+                    &renderer.atlas,
+                    editor_rect,
+                    theme,
+                );
+                glyphs.splice(0..0, bands);
+                let hits = crate::platform::conflicts::inline_hits(
+                    view,
+                    buffer,
+                    &mut renderer.atlas,
+                    editor_rect,
+                );
+                crate::platform::conflicts::draw_inline_buttons(
+                    &hits,
+                    &mut renderer.atlas,
+                    theme,
+                    glyphs,
                 );
             }
 
@@ -10478,6 +10922,33 @@ impl EditorView {
                 && let Some(view) = responses.get(&buffer.id())
             {
                 layout::build_response_strip(view, &mut renderer.atlas, strip, theme, glyphs);
+            }
+            if let Some(strip) = response_rect
+                && !responses.contains_key(&buffer.id())
+                && claude
+                    .as_ref()
+                    .and_then(|c| c.reviews.get(&buffer.id()))
+                    .is_none()
+                && let Some(view) = conflict_scans
+                    .get(&buffer.id())
+                    .and_then(|s| s.view.as_ref())
+            {
+                let file = buffer
+                    .path
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                crate::platform::conflicts::draw_strip(
+                    view,
+                    *conflict_side,
+                    &file,
+                    buffer.is_dirty(),
+                    &mut renderer.atlas,
+                    strip,
+                    theme,
+                    glyphs,
+                );
             }
             if let Some(strip) = response_rect
                 && let Some(review) = claude.as_ref().and_then(|c| c.reviews.get(&buffer.id()))
@@ -11347,6 +11818,52 @@ fn lsp_server_for<'a>(state: &'a State, buffer: &Buffer) -> Option<&'a crate::ls
         .filter(|s| s.is_ready())
 }
 
+/// Brings the active document's merge conflicts up to date with its text
+/// and with Git's status. Cheap when nothing changed.
+fn sync_conflicts(state: &mut State) {
+    let State {
+        docs,
+        conflict_scans,
+        git,
+        ..
+    } = state;
+    let generation = git.generation();
+    crate::platform::conflicts::sync(conflict_scans, docs.active(), generation, |path| {
+        git.is_conflicted(path)
+    });
+    let open: Vec<u64> = docs.iter().map(|b| b.id()).collect();
+    crate::platform::conflicts::prune(conflict_scans, &open);
+}
+
+/// The active document's conflicts, when it has any or Git has it
+/// unmerged, and nothing else has the editor column.
+fn active_conflicts(state: &State) -> Option<&crate::platform::conflicts::View> {
+    if (state.git_open && state.git.showing_diff) || active_review(state).is_some() {
+        return None;
+    }
+    state
+        .conflict_scans
+        .get(&state.docs.active().id())?
+        .view
+        .as_ref()
+}
+
+fn active_conflicts_mut(state: &mut State) -> Option<&mut crate::platform::conflicts::View> {
+    if (state.git_open && state.git.showing_diff) || active_review(state).is_some() {
+        return None;
+    }
+    let id = state.docs.active().id();
+    state.conflict_scans.get_mut(&id)?.view.as_mut()
+}
+
+/// The columns are showing: side-by-side mode, on a document that has
+/// conflicts, with no Markdown preview over it.
+fn side_by_side(state: &State) -> bool {
+    state.conflict_side
+        && !(state.preview.is_some() && default_preview(state.docs.active()).is_some())
+        && active_conflicts(state).is_some_and(|v| !v.conflicts.is_empty())
+}
+
 /// The review in the active tab, when it is one.
 fn active_review(state: &State) -> Option<&crate::platform::claude::Review> {
     state
@@ -11799,7 +12316,52 @@ fn draw_other_pane(
 /// shapes and scripted clicks all read this; none of them measures anything
 /// on its own.
 fn frame_of(state: &mut State) -> Frame {
+    sync_conflicts(state);
     let chrome = chrome_of(state);
+    let side = side_by_side(state);
+    let conflict_hits = {
+        let text_rect = chrome.text;
+        let State {
+            docs,
+            renderer,
+            conflict_scans,
+            git_open,
+            git,
+            ..
+        } = &mut *state;
+        let diffing = *git_open && git.showing_diff;
+        let buffer = docs.active();
+        match conflict_scans
+            .get_mut(&buffer.id())
+            .and_then(|s| s.view.as_mut())
+        {
+            Some(view) if !diffing => {
+                let mut hits = match chrome.response {
+                    Some(strip) => {
+                        crate::platform::conflicts::strip_hits(view, &mut renderer.atlas, strip)
+                    }
+                    None => Vec::new(),
+                };
+                if side {
+                    hits.extend(crate::platform::conflicts::side_hits(
+                        view,
+                        buffer.rope.len_lines(),
+                        &mut renderer.atlas,
+                        text_rect,
+                    ));
+                } else {
+                    hits.extend(crate::platform::conflicts::inline_hits(
+                        view,
+                        buffer,
+                        &mut renderer.atlas,
+                        text_rect,
+                    ));
+                }
+                hits
+            }
+            _ => Vec::new(),
+        }
+    };
     let mut frame = Frame::default();
     let State {
         tree,
@@ -11924,6 +12486,18 @@ fn frame_of(state: &mut State) -> Frame {
         frame.push(Hit::ReviewAccept, accept);
         frame.push(Hit::ReviewReject, reject);
     }
+    // A review or response owns the strip; conflicts only draw there when
+    // neither does.
+    if claude
+        .as_ref()
+        .and_then(|c| c.reviews.get(&docs.active().id()))
+        .is_none()
+        && !responses.contains_key(&docs.active().id())
+    {
+        for (hit, rect) in conflict_hits {
+            frame.push(hit, rect);
+        }
+    }
     if let Some(find) = chrome.find {
         frame.push(Hit::Find, find);
     }
@@ -11967,8 +12541,9 @@ fn chrome_of(state: &State) -> Chrome {
             0
         }
     });
-    let response =
-        state.responses.contains_key(&state.docs.active().id()) || active_review(state).is_some();
+    let response = state.responses.contains_key(&state.docs.active().id())
+        || active_review(state).is_some()
+        || active_conflicts(state).is_some();
     Chrome::with_panes(
         state.viewport,
         sidebar,
@@ -12488,6 +13063,25 @@ fn install_menu(mtm: MainThreadMarker, app: &NSApplication) {
     git_menu.addItem(&item("Fetch", sel!(gitFetch:), "", false));
     git_menu.addItem(&item("Pull", sel!(gitPull:), "", false));
     git_menu.addItem(&item("Push", sel!(gitPush:), "", false));
+    git_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    git_menu.addItem(&item("Next Conflict", sel!(nextConflict:), "", false));
+    git_menu.addItem(&item(
+        "Previous Conflict",
+        sel!(previousConflict:),
+        "",
+        false,
+    ));
+    git_menu.addItem(&item("Accept Current", sel!(acceptCurrent:), "", false));
+    git_menu.addItem(&item("Accept Incoming", sel!(acceptIncoming:), "", false));
+    git_menu.addItem(&item("Accept Both", sel!(acceptBoth:), "", false));
+    git_menu.addItem(&item("Accept Base", sel!(acceptBase:), "", false));
+    git_menu.addItem(&item(
+        "Conflicts Side by Side",
+        sel!(toggleConflictColumns:),
+        "",
+        false,
+    ));
+    git_menu.addItem(&item("Mark Resolved", sel!(markResolved:), "", false));
     git_item.setSubmenu(Some(&git_menu));
     menubar.addItem(&git_item);
 
@@ -12784,6 +13378,9 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         blame_want: None,
         blame_rx: None,
         gutter: HashMap::new(),
+        conflict_scans: HashMap::new(),
+        conflict_side: crate::platform::settings::Settings::load().conflict_side_by_side,
+        conflict_cursor_key: None,
         font: font.to_owned(),
         font_size: size_pt,
         theme_choice: crate::platform::settings::Settings::load().theme,

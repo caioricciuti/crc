@@ -20,6 +20,8 @@ enum Operation {
     Switch(String),
     CreateBranch(String),
     Remote(git::Remote, Option<PathBuf>),
+    /// `git add` on a path whose conflict the user has resolved.
+    Resolve(Change),
 }
 struct Reply {
     snapshot: Snapshot,
@@ -54,6 +56,12 @@ pub struct Panel {
     announcement: Option<String>,
     /// Whether the operation in flight is one that announces.
     announces: bool,
+    /// A path to mark resolved once the worker is free: Mark Resolved saves
+    /// first, and the save starts a refresh of its own.
+    resolve_queued: Option<PathBuf>,
+    /// Counts the worker's answers, so a view derived from the snapshot
+    /// knows when to look again.
+    generation: u64,
 }
 
 /// Height of one file row in the change list.
@@ -61,13 +69,40 @@ pub const ROW: f32 = 26.0;
 /// Height of a `Staged Changes` / `Changes` section heading.
 pub const SECTION: f32 = 26.0;
 
+/// The headings of the change list, in order.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Group {
+    /// Unmerged paths, which are neither staged nor unstaged until the
+    /// conflict in them is resolved and added.
+    Conflicts,
+    Staged,
+    Changes,
+}
+
+impl Group {
+    pub fn title(self) -> &'static str {
+        match self {
+            Group::Conflicts => "Conflicts",
+            Group::Staged => "Staged",
+            Group::Changes => "Changes",
+        }
+    }
+    fn holds(self, change: &Change) -> bool {
+        match self {
+            Group::Conflicts => change.conflicted(),
+            Group::Staged => change.staged(),
+            Group::Changes => change.unstaged(),
+        }
+    }
+}
+
 /// One line of the change list. A file modified in the index *and* in the
 /// working tree is a real state, and it appears under both headings, so a row
-/// is a change together with the side it is listed under.
+/// is a change together with the group it is listed under.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Entry {
-    Section { staged: bool, count: usize },
-    File { change: usize, staged: bool },
+    Section { group: Group, count: usize },
+    File { change: usize, group: Group },
 }
 
 impl Entry {
@@ -174,6 +209,8 @@ impl Panel {
             finished_at: None,
             announcement: None,
             announces: false,
+            resolve_queued: None,
+            generation: 0,
         };
         panel.refresh();
         panel
@@ -183,6 +220,11 @@ impl Panel {
     pub fn settled_recently(&self) -> bool {
         self.finished_at
             .is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(1500))
+    }
+
+    /// How many times the worker has answered.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn busy(&self) -> bool {
@@ -211,7 +253,51 @@ impl Panel {
                 }
             }
         }
+        if let Some(what) = snapshot.in_progress {
+            out.push_str(" · ");
+            out.push_str(what.label());
+        }
         out
+    }
+    /// Whether `path`, absolute, is unmerged as of the last status.
+    pub fn is_conflicted(&self, path: &std::path::Path) -> bool {
+        self.conflicted_change(path).is_some()
+    }
+    fn conflicted_change(&self, path: &std::path::Path) -> Option<&Change> {
+        let snapshot = self.snapshot.as_ref()?;
+        let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let root = std::fs::canonicalize(&snapshot.root).unwrap_or_else(|_| snapshot.root.clone());
+        let relative = path.strip_prefix(&root).ok()?;
+        snapshot
+            .changes
+            .iter()
+            .find(|c| c.conflicted() && c.path == relative)
+    }
+    /// How many paths are unmerged.
+    pub fn conflict_count(&self) -> usize {
+        self.snapshot
+            .as_ref()
+            .map_or(0, |s| s.changes.iter().filter(|c| c.conflicted()).count())
+    }
+    /// `git add` on `path`, absolute, once its conflict is resolved: now,
+    /// or as soon as the operation in flight finishes.
+    pub fn mark_resolved(&mut self, path: PathBuf) {
+        if self.busy() {
+            self.resolve_queued = Some(path);
+            return;
+        }
+        match self.conflicted_change(&path).cloned() {
+            Some(change) => self.start(Operation::Resolve(change)),
+            None => {
+                self.announcement = Some(format!(
+                    "{} is not in conflict",
+                    path.file_name().map_or_else(
+                        || path.display().to_string(),
+                        |n| n.to_string_lossy().into_owned()
+                    )
+                ))
+            }
+        }
     }
     /// The repository's top level, once read.
     pub fn root(&self) -> Option<&std::path::Path> {
@@ -252,25 +338,25 @@ impl Panel {
             return Vec::new();
         };
         let mut entries = Vec::new();
-        for staged in [true, false] {
+        for group in [Group::Conflicts, Group::Staged, Group::Changes] {
             let files: Vec<usize> = snapshot
                 .changes
                 .iter()
                 .enumerate()
-                .filter(|(_, c)| if staged { c.staged() } else { c.unstaged() })
+                .filter(|(_, c)| group.holds(c))
                 .map(|(i, _)| i)
                 .collect();
             if files.is_empty() {
                 continue;
             }
             entries.push(Entry::Section {
-                staged,
+                group,
                 count: files.len(),
             });
             entries.extend(
                 files
                     .into_iter()
-                    .map(|change| Entry::File { change, staged }),
+                    .map(|change| Entry::File { change, group }),
             );
         }
         entries
@@ -449,7 +535,10 @@ impl Panel {
         };
         self.announces = matches!(
             operation,
-            Operation::Switch(_) | Operation::CreateBranch(_) | Operation::Remote(..)
+            Operation::Switch(_)
+                | Operation::CreateBranch(_)
+                | Operation::Remote(..)
+                | Operation::Resolve(_)
         );
         let directory = self.directory.clone();
         let previous = self.selected_change().map(|c| c.path.clone());
@@ -506,6 +595,13 @@ impl Panel {
                     Operation::Stage(change, stage) => {
                         git::stage(&initial.root, &change, stage).err()
                     }
+                    Operation::Resolve(change) => match git::stage(&initial.root, &change, true) {
+                        Ok(()) => {
+                            done = Some(format!("marked {} resolved", change.label()));
+                            None
+                        }
+                        Err(error) => Some(error),
+                    },
                     Operation::StageHunk(change, hunk) => {
                         git::stage_hunk(&initial.root, &change, &hunk).err()
                     }
@@ -549,6 +645,7 @@ impl Panel {
             Err(mpsc::TryRecvError::Disconnected) => Err("Git worker stopped".into()),
         };
         self.rx = None;
+        self.generation += 1;
         self.finished_at = Some(std::time::Instant::now());
         match reply {
             Ok(reply) => {
@@ -602,6 +699,9 @@ impl Panel {
             Err(error) => {
                 self.note = error;
             }
+        }
+        if let Some(path) = self.resolve_queued.take() {
+            self.mark_resolved(path);
         }
         true
     }
@@ -725,7 +825,7 @@ impl Panel {
         }
         for (entry, rect) in rows {
             match entry {
-                Entry::Section { staged, count } => {
+                Entry::Section { group, count } => {
                     layout::push_ui_text(
                         out,
                         atlas,
@@ -735,12 +835,16 @@ impl Panel {
                             width: (rect.width - 20.0).max(0.0),
                             height: rect.height - 4.0,
                         },
-                        &format!("{}  {count}", if staged { "Staged" } else { "Changes" }),
-                        theme.status_text,
+                        &format!("{}  {count}", group.title()),
+                        if group == Group::Conflicts {
+                            theme.diff_removed
+                        } else {
+                            theme.status_text
+                        },
                     );
                 }
-                Entry::File { change, staged } => {
-                    self.draw_file_row(atlas, g, rect, change, staged, theme, out);
+                Entry::File { change, group } => {
+                    self.draw_file_row(atlas, g, rect, change, group, theme, out);
                 }
             }
         }
@@ -754,13 +858,15 @@ impl Panel {
         g: Sidebar,
         rect: Viewport,
         change: usize,
-        staged: bool,
+        group: Group,
         theme: &Theme,
         out: &mut Vec<GlyphInstance>,
     ) {
         let Some(item) = self.snapshot.as_ref().and_then(|s| s.changes.get(change)) else {
             return;
         };
+        let staged = group == Group::Staged;
+        let conflicted = group == Group::Conflicts;
         if change == self.selected && self.showing_diff {
             layout::push_rounded_rect(
                 out,
@@ -777,8 +883,15 @@ impl Panel {
         // One status letter, coloured, instead of a whole second line reading
         // "M Unstaged" under every file.
         let code = if staged { item.index } else { item.worktree };
-        let code = if code == b' ' { b'M' } else { code };
+        let code = if conflicted {
+            b'!'
+        } else if code == b' ' {
+            b'M'
+        } else {
+            code
+        };
         let colour = match code {
+            b'!' => theme.diff_removed,
             b'A' | b'?' => theme.diff_added,
             b'D' => theme.diff_removed,
             b'R' => theme.accent,
@@ -811,7 +924,13 @@ impl Panel {
         let name_rect = Viewport {
             x: rect.x + 28.0,
             y: rect.y,
-            width: (toggle.x - rect.x - 34.0).max(0.0),
+            width: (if conflicted {
+                rect.x + rect.width - 8.0
+            } else {
+                toggle.x
+            } - rect.x
+                - 34.0)
+                .max(0.0),
             height: rect.height,
         };
         let name_width = layout::ui_text_width(atlas, &name);
@@ -828,6 +947,11 @@ impl Panel {
                 &parent,
                 theme.gutter_text,
             );
+        }
+        // A conflicted file is staged by Mark Resolved above its text, once
+        // no markers are left in it; a plus here would stage the markers.
+        if conflicted {
+            return;
         }
         // Stage/unstage sits on the row it acts on. The old pair lived at the
         // bottom of the panel, an empty column away from the list.
@@ -1108,6 +1232,7 @@ mod tests {
                 root: PathBuf::from("/tmp"),
                 branch: "main".into(),
                 changes,
+                in_progress: None,
             }),
             selected: 0,
             list_scroll: 0,
@@ -1121,6 +1246,8 @@ mod tests {
             finished_at: None,
             announcement: None,
             announces: false,
+            resolve_queued: None,
+            generation: 0,
         }
     }
 
@@ -1158,7 +1285,7 @@ mod tests {
         assert_eq!(
             entries[0],
             Entry::Section {
-                staged: true,
+                group: Group::Staged,
                 count: 2
             }
         );
@@ -1166,20 +1293,20 @@ mod tests {
             entries[1],
             Entry::File {
                 change: 0,
-                staged: true
+                group: Group::Staged
             }
         );
         assert_eq!(
             entries[2],
             Entry::File {
                 change: 1,
-                staged: true
+                group: Group::Staged
             }
         );
         assert_eq!(
             entries[3],
             Entry::Section {
-                staged: false,
+                group: Group::Changes,
                 count: 3
             }
         );
@@ -1191,6 +1318,45 @@ mod tests {
             })
             .collect();
         assert_eq!(unstaged, vec![1, 2, 3], "both.rs is listed on both sides");
+    }
+
+    /// An unmerged file is neither staged nor unstaged: it has a heading of
+    /// its own, first, and no staging control.
+    #[test]
+    fn conflicted_files_are_listed_first_and_only_once() {
+        let panel = panel(vec![
+            change("dirty.rs", b' ', b'M'),
+            change("both.rs", b'U', b'U'),
+            change("added.rs", b'A', b'A'),
+        ]);
+        let entries = panel.entries();
+        assert_eq!(
+            entries[..3],
+            [
+                Entry::Section {
+                    group: Group::Conflicts,
+                    count: 2
+                },
+                Entry::File {
+                    change: 1,
+                    group: Group::Conflicts
+                },
+                Entry::File {
+                    change: 2,
+                    group: Group::Conflicts
+                },
+            ]
+        );
+        assert_eq!(entries.len(), 5, "then Changes with dirty.rs alone");
+        assert_eq!(panel.conflict_count(), 2);
+        assert_eq!(panel.staged_count(), 0);
+    }
+
+    #[test]
+    fn branch_status_names_a_merge_in_progress() {
+        let mut p = panel(Vec::new());
+        p.snapshot.as_mut().unwrap().in_progress = Some(git::InProgress::Merge);
+        assert_eq!(p.branch_status(), "main · MERGING");
     }
 
     #[test]
@@ -1213,7 +1379,7 @@ mod tests {
             *entry,
             Entry::File {
                 change: 0,
-                staged: false
+                group: Group::Changes
             }
         );
         let toggle = g.toggle(*rect);

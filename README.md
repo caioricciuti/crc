@@ -60,9 +60,11 @@ open -a crc .               # open the current folder as a project
 ## Settings
 
 crc > Settings (`Cmd-,`) opens `~/.config/crc/config.toml`, created from a
-commented template the first time. Five keys: `font`, `font_size`, `theme`
-(`system`, `dark` or `light`), `caret_blink` and `update_check` (`true` or
-`false`). Saving the file applies it. `Cmd-=`, `Cmd--` and `Cmd-0` change
+commented template the first time: `font`, `font_size`, `theme`
+(`system`, `dark` or `light`), `caret_blink`, `update_check`,
+`format_on_save`, `word_wrap`, `ssh_auth_sock` and `conflict_view`
+(`inline` or `side-by-side`), each explained in the file. Saving the file
+applies it. `Cmd-=`, `Cmd--` and `Cmd-0` change
 the size and write it back.
 
 ## What works
@@ -89,7 +91,8 @@ the size and write it back.
   project, started when the first file of that language opens:
   rust-analyzer, gopls, pyright, typescript-language-server and clangd,
   found in the usual install locations without reading your shell profile.
-  No rename, formatting or code actions yet.
+  Find references (`Shift-F12`), rename (`F2`), format (`Shift-Option-F`,
+  or on save) and signature help. No code actions yet.
 - **Claude Code inside crc**: type `claude` in any crc terminal and it
   connects to the window by itself, or press `Cmd-Shift-C` for a Claude tab.
   Claude sees the file and selection you are on and the language server
@@ -105,7 +108,17 @@ the size and write it back.
 - **Local Git** (`Cmd-Option-G`): branch and status, changed files, staged
   and working-tree diffs, whole-file and hunk stage/unstage, commit. Git runs
   on workers and reads saved disk state; hooks and signing stay as Git has
-  them. No remote operations.
+  them. Branch switch and create from the palette, fetch, fast-forward pull
+  and push (never forced), and the caret line's blame in the status line.
+- **Merge conflicts**, however the merge, rebase, cherry-pick or stash pop
+  that left them was run: conflicted files get their own group in Source
+  Control and the status bar says `MERGING` or `REBASING`. In the file,
+  each conflict is washed in its side's colour with Accept Current,
+  Incoming, Both and (with `diff3` or `zdiff3` markers) Base on its first
+  line; or switch to side by side, where the current, base and incoming
+  versions sit in aligned columns with the same buttons. Every accept is
+  one undo step. Mark Resolved saves and stages the file once no markers
+  are left, and refuses while any are.
 - **Files you can trust**: atomic saves that keep mode, links and symlink
   targets; a file changed by another program reloads if the tab is clean,
   and Save asks Overwrite, Cancel or Reload if it is not; a deleted file
@@ -132,12 +145,15 @@ the size and write it back.
 
 - **Language coverage is the list above.** A grammar is vendored generated C
   pinned in `third_party/CHECKSUMS`; SQL and Svelte are not in the alpha.
-- **Git is local.** No branch switching, remotes, conflict UI, blame or
-  history. Hunk staging covers tracked text changes; other change types use
-  whole-file actions. Gutter marks compare with HEAD, not the index.
-- **Language servers are read-only helpers.** No rename, formatting, code
-  actions, signature help or references.
-- **No word wrap, no code folding, no minimap.**
+- **Git stops short of history.** No history browser, branch deletion or
+  merge and rebase commands of its own (abort and continue are the
+  terminal's). Pull is fast-forward only. Hunk staging covers tracked text
+  changes; other change types use whole-file actions. Gutter marks compare
+  with HEAD, not the index. Conflict markers must be Git's default seven
+  characters.
+- **Language servers have no code actions yet**, so no quick fixes or
+  organise imports.
+- **No minimap.** Folding is by indentation, not by syntax.
 - **Panes are a way of looking.** A file is open in one pane at a time, and
   a session restores every pane's files into one pane.
 - **Bounded by design.** Project search skips files over 2 MiB and shows the

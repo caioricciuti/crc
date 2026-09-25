@@ -4,6 +4,7 @@
 pub mod claude;
 pub mod clipboard;
 pub mod commands;
+pub mod conflicts;
 pub mod dispatch;
 pub mod git_panel;
 pub mod latency;

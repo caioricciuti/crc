@@ -2,6 +2,15 @@
 
 One entry per tag, written for people who use the editor.
 
+## Unreleased
+
+- Merge conflicts: a Conflicts group in Source Control, `MERGING` and
+  friends in the status bar, and each conflict resolved in the file (Accept
+  Current, Incoming, Both or Base on its first line) or side by side in
+  aligned columns. Mark Resolved saves and stages the file once no markers
+  are left. Git > Next Conflict and Previous Conflict; `conflict_view` in
+  the settings picks the view a file opens in.
+
 ## v0.2.0-alpha.1, 2026-09-24
 
 The first build meant for other people. Apple Silicon, macOS 14 or later,

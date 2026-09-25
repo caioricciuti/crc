@@ -495,6 +495,9 @@ pub struct Theme {
     pub diff_modified: [f32; 4],
     pub diff_added_band: [f32; 4],
     pub diff_removed_band: [f32; 4],
+    /// The incoming side of a merge conflict; the current side is drawn in
+    /// `diff_added`, the way Git's own tools pair them.
+    pub conflict_incoming: [f32; 4],
     pub tab_bar: [f32; 4],
     pub tab_active: [f32; 4],
     pub tab_text: [f32; 4],
@@ -580,6 +583,7 @@ impl Theme {
             diff_modified: [0.722, 0.525, 0.043, 1.0],
             diff_added_band: [0.184, 0.561, 0.306, 0.14],
             diff_removed_band: [0.784, 0.271, 0.231, 0.12],
+            conflict_incoming: [0.149, 0.400, 0.780, 1.0],
 
             text,
             gutter_text: [0.541, 0.592, 0.576, 1.0],
@@ -662,6 +666,7 @@ mod theme_tests {
                 theme.diff_added,
                 theme.diff_removed,
                 theme.diff_modified,
+                theme.conflict_incoming,
             ];
             for fg in foregrounds {
                 assert!(
@@ -699,6 +704,7 @@ impl Default for Theme {
             diff_modified: [0.886, 0.643, 0.227, 1.0],
             diff_added_band: [0.353, 0.702, 0.451, 0.13],
             diff_removed_band: [0.867, 0.396, 0.365, 0.13],
+            conflict_incoming: [0.537, 0.706, 0.918, 1.0],
             cursor: [0.651, 0.867, 0.761, 1.0],
 
             // Text
@@ -3274,6 +3280,15 @@ pub enum Hit {
     /// Accept and Reject above a change proposed by Claude.
     ReviewAccept,
     ReviewReject,
+    /// Above a document with merge conflicts: the inline or side-by-side
+    /// switch (`true` for side by side), Previous and Next (`true`), and
+    /// Mark Resolved.
+    ConflictMode(bool),
+    ConflictStep(bool),
+    ConflictResolve,
+    /// Resolves conflict `n` of the active document one way, from its
+    /// marker line or its header in the columns.
+    ConflictTake(usize, crate::project::conflict::Take),
     Find,
     Text,
     Status,
@@ -3307,6 +3322,20 @@ impl Hit {
             Hit::ResponseSegment(i) => format!("response.segment.{i}"),
             Hit::ReviewAccept => "review.accept".into(),
             Hit::ReviewReject => "review.reject".into(),
+            Hit::ConflictMode(side) => if *side {
+                "conflict.side"
+            } else {
+                "conflict.inline"
+            }
+            .into(),
+            Hit::ConflictStep(forward) => if *forward {
+                "conflict.next"
+            } else {
+                "conflict.previous"
+            }
+            .into(),
+            Hit::ConflictResolve => "conflict.resolve".into(),
+            Hit::ConflictTake(i, take) => format!("conflict.{}.{i}", take.name()),
             Hit::Find => "find".into(),
             Hit::Text => "text".into(),
             Hit::Status => "status".into(),
@@ -4835,7 +4864,7 @@ pub fn screen_rows(buffer: &Buffer, viewport: Viewport, line_height: f32) -> Vec
 
 /// Cuts a quad to the rows between `top` and `bottom`, texture included,
 /// so a line half scrolled out of the text does not draw over the chrome.
-fn clip_vertical(quad: &mut GlyphInstance, top: f32, bottom: f32) {
+pub fn clip_vertical(quad: &mut GlyphInstance, top: f32, bottom: f32) {
     let start = quad.pos[1];
     let end = start + quad.size[1];
     if start >= top && end <= bottom {

@@ -60,6 +60,8 @@ pub struct Settings {
     /// the Dock does not get the shell's `SSH_AUTH_SOCK`, and crc does not
     /// read the shell profile, so it is given here.
     pub ssh_auth_sock: Option<PathBuf>,
+    /// How a file with merge conflicts opens: in the text, or as columns.
+    pub conflict_side_by_side: bool,
 }
 
 /// `word_wrap`: every document, none, or prose (Markdown and text) only.
@@ -81,6 +83,7 @@ impl Default for Settings {
             format_on_save: false,
             word_wrap: WordWrap::Auto,
             ssh_auth_sock: None,
+            conflict_side_by_side: false,
         }
     }
 }
@@ -119,6 +122,11 @@ word_wrap = \"auto\"
 # `echo $SSH_AUTH_SOCK` in a terminal and put the path here. A leading ~/
 # is your home folder.
 # ssh_auth_sock = \"~/.ssh/agent.sock\"
+
+# How a file with merge conflicts opens: \"inline\", with buttons on each
+# conflict in the text, or \"side-by-side\", as columns. The strip above
+# the file switches between them.
+conflict_view = \"inline\"
 ";
 
 impl Settings {
@@ -195,6 +203,11 @@ impl Settings {
                         });
                     }
                 }
+                "conflict_view" => match unquote(value).unwrap_or(value) {
+                    "inline" => settings.conflict_side_by_side = false,
+                    "side-by-side" | "side" => settings.conflict_side_by_side = true,
+                    _ => {}
+                },
                 "format_on_save" => match value {
                     "true" => settings.format_on_save = true,
                     "false" => settings.format_on_save = false,
@@ -307,6 +320,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn conflict_view_defaults_to_inline() {
+        assert!(!Settings::parse("").conflict_side_by_side);
+        assert!(Settings::parse("conflict_view = \"side-by-side\"\n").conflict_side_by_side);
+        assert!(!Settings::parse(TEMPLATE).conflict_side_by_side);
+    }
+
+    #[test]
     fn caret_blink_defaults_on_and_takes_a_bare_boolean() {
         assert!(Settings::parse("").caret_blink);
         assert!(!Settings::parse("caret_blink = false\n").caret_blink);
@@ -355,6 +375,7 @@ mod tests {
             format_on_save: false,
             word_wrap: WordWrap::Auto,
             ssh_auth_sock: None,
+            conflict_side_by_side: false,
         }
         .merged_into(existing);
         assert_eq!(

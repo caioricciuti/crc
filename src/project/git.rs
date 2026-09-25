@@ -15,11 +15,20 @@ pub struct Change {
 }
 
 impl Change {
+    /// Unmerged: both sides changed the path and Git left the result to
+    /// the user. Such a path is neither staged nor unstaged; `git add`
+    /// after resolving it is what ends the conflict.
+    pub fn conflicted(&self) -> bool {
+        self.index == b'U'
+            || self.worktree == b'U'
+            || (self.index == b'A' && self.worktree == b'A')
+            || (self.index == b'D' && self.worktree == b'D')
+    }
     pub fn staged(&self) -> bool {
-        self.index != b' ' && self.index != b'?'
+        self.index != b' ' && self.index != b'?' && !self.conflicted()
     }
     pub fn unstaged(&self) -> bool {
-        self.worktree != b' ' || self.index == b'?'
+        (self.worktree != b' ' || self.index == b'?') && !self.conflicted()
     }
     pub fn label(&self) -> String {
         self.path.to_string_lossy().into_owned()
@@ -34,6 +43,45 @@ pub struct Snapshot {
     pub root: PathBuf,
     pub branch: String,
     pub changes: Vec<Change>,
+    /// A merge, rebase, cherry-pick or revert that stopped for the user.
+    pub in_progress: Option<InProgress>,
+}
+
+/// An operation Git left half done, read from the files it keeps in the
+/// Git directory while one is under way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InProgress {
+    Merge,
+    Rebase,
+    CherryPick,
+    Revert,
+}
+
+impl InProgress {
+    /// As the status bar shows it.
+    pub fn label(self) -> &'static str {
+        match self {
+            InProgress::Merge => "MERGING",
+            InProgress::Rebase => "REBASING",
+            InProgress::CherryPick => "CHERRY-PICKING",
+            InProgress::Revert => "REVERTING",
+        }
+    }
+
+    /// What the files in `git_dir` say is under way, if anything.
+    pub fn read(git_dir: &Path) -> Option<InProgress> {
+        if git_dir.join("rebase-merge").is_dir() || git_dir.join("rebase-apply").is_dir() {
+            Some(InProgress::Rebase)
+        } else if git_dir.join("MERGE_HEAD").is_file() {
+            Some(InProgress::Merge)
+        } else if git_dir.join("CHERRY_PICK_HEAD").is_file() {
+            Some(InProgress::CherryPick)
+        } else if git_dir.join("REVERT_HEAD").is_file() {
+            Some(InProgress::Revert)
+        } else {
+            None
+        }
+    }
 }
 
 /// What a line in a rendered diff is, which decides how it is drawn.
@@ -399,7 +447,20 @@ pub fn marks(diff: &Diff) -> Vec<Mark> {
 }
 
 pub fn snapshot(directory: &Path) -> Result<Snapshot, String> {
-    let root = toplevel(directory)?;
+    // One process for both: the top level, and the Git directory, which is
+    // not `<root>/.git` in a linked worktree.
+    let located = run(
+        directory,
+        &["rev-parse", "--show-toplevel", "--absolute-git-dir"],
+    )?;
+    let mut lines = located.split(|&b| b == b'\n').filter(|l| !l.is_empty());
+    let root = PathBuf::from(std::ffi::OsString::from_vec(
+        lines.next().ok_or("Git returned no top level")?.to_vec(),
+    ));
+    let in_progress = lines
+        .next()
+        .map(|dir| PathBuf::from(std::ffi::OsString::from_vec(dir.to_vec())))
+        .and_then(|dir| InProgress::read(&dir));
     let bytes = run(
         &root,
         &[
@@ -410,7 +471,9 @@ pub fn snapshot(directory: &Path) -> Result<Snapshot, String> {
             "--untracked-files=all",
         ],
     )?;
-    parse_status(root, &bytes)
+    let mut snapshot = parse_status(root, &bytes)?;
+    snapshot.in_progress = in_progress;
+    Ok(snapshot)
 }
 
 fn parse_status(root: PathBuf, bytes: &[u8]) -> Result<Snapshot, String> {
@@ -456,6 +519,7 @@ fn parse_status(root: PathBuf, bytes: &[u8]) -> Result<Snapshot, String> {
         root,
         branch,
         changes,
+        in_progress: None,
     })
 }
 
@@ -994,6 +1058,68 @@ mod tests {
             remote(&dir, Remote::Push, None).unwrap_err(),
             "this branch has no upstream and there is no origin remote"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_merge_conflict_is_listed_apart_and_ends_with_add() {
+        let dir = std::env::temp_dir().join(format!("crc-conflict-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "merge.conflictStyle=zdiff3",
+                ])
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        };
+        assert!(git(&["init", "-q", "-b", "main"]));
+        std::fs::write(dir.join("f.txt"), "a\nx = 0\nz\n").unwrap();
+        assert!(git(&["add", "f.txt"]));
+        assert!(git(&["commit", "-q", "-m", "base"]));
+        assert!(git(&["switch", "-q", "-c", "topic"]));
+        std::fs::write(dir.join("f.txt"), "a\nx = 2\nz\n").unwrap();
+        assert!(git(&["commit", "-q", "-am", "topic"]));
+        assert!(git(&["switch", "-q", "main"]));
+        std::fs::write(dir.join("f.txt"), "a\nx = 1\nz\n").unwrap();
+        assert!(git(&["commit", "-q", "-am", "main"]));
+        assert!(!git(&["merge", "-q", "topic"]), "the merge conflicts");
+
+        let s = snapshot(&dir).unwrap();
+        assert_eq!(s.in_progress, Some(InProgress::Merge));
+        assert_eq!(s.changes.len(), 1);
+        let change = &s.changes[0];
+        assert_eq!(change.status(), "UU");
+        assert!(change.conflicted() && !change.staged() && !change.unstaged());
+        let text = std::fs::read_to_string(dir.join("f.txt")).unwrap();
+        let rope = crate::text::rope::Rope::from_text(&text);
+        let found = crate::project::conflict::parse(&rope);
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].resolution(&rope, crate::project::conflict::Take::Base),
+            "x = 0\n"
+        );
+
+        std::fs::write(dir.join("f.txt"), "a\nx = 2\nz\n").unwrap();
+        stage(&s.root, change, true).unwrap();
+        let s = snapshot(&dir).unwrap();
+        assert!(s.changes[0].staged() && !s.changes[0].conflicted());
+        assert_eq!(s.in_progress, Some(InProgress::Merge), "until committed");
+        assert!(git(&["commit", "-q", "--no-edit"]));
+        assert_eq!(snapshot(&dir).unwrap().in_progress, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
