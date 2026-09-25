@@ -82,13 +82,14 @@ jobs:
 
       # gh is on the runner already, so no third-party action is needed to
       # publish. Draft: the DMG gets opened by a person before anyone else
-      # sees the release.
+      # sees the release. The title is the bare version, `0.2.0-alpha.1`
+      # for the tag `v0.2.0-alpha.1`.
       - name: Open a draft release with the DMG
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" \
-            --draft --generate-notes --title "crc $GITHUB_REF_NAME" \
+            --draft --generate-notes --title "${GITHUB_REF_NAME#v}" \
             target/crc-*.dmg target/SHA256SUMS
 
       - name: Remove the keychain
