@@ -9,7 +9,9 @@ import editorLight from "../assets/editor-light.png";
 import terminalDark from "../assets/terminal-dark.png";
 import homeDark from "../assets/home-dark.png";
 
-const release = "https://github.com/caioricciuti/crc/releases/latest";
+// The newest release's disk image, straight from GitHub: every release names
+// it crc.dmg, so this never changes.
+const release = "https://github.com/caioricciuti/crc/releases/latest/download/crc.dmg";
 
 const shots = [
   { label: "Editor", src: editorDark, alt: "crc editing a Rust file: syntax colours, indent guides, a Git mark in the gutter and the project sidebar." },
@@ -68,7 +70,7 @@ const keys = [
     <div class="container hero-copy">
       <a class="pill" href="/changelog/">
         <span class="pill-tag">New</span>
-        <span>v0.2.0-alpha.1 is out for Apple Silicon</span>
+        <span>The alpha is out for Apple Silicon</span>
         <svg class="arrow" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.6" d="M6 3l5 5-5 5"/></svg>
       </a>
       <h1 class="h1">

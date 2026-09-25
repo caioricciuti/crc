@@ -142,7 +142,10 @@ if [ "$MODE" = "--release" ]; then
     spctl -a -vv -t exec "$APP" 2>&1 | sed 's/^/    /'
 
     echo "==> disk image"
-    DMG="target/${APP_NAME}-${VERSION}.dmg"
+    # No version in the name: the site's Download button is GitHub's
+    # releases/latest/download/crc.dmg, which only works if the file is
+    # called the same in every release. The version is the release's title.
+    DMG="target/${APP_NAME}.dmg"
     STAGE="target/dmg"
     rm -rf "$STAGE" "$DMG"
     mkdir -p "$STAGE"
