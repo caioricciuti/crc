@@ -1,0 +1,63 @@
+---
+title: Language servers
+description: Diagnostics, definition, hover, references, rename, formatting and signature help from the servers you already have installed.
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+crc talks to five language servers. It does not install them: if one is on
+your Mac, crc finds it and starts it when the first file of that language
+opens. One server runs per language per project.
+
+## Supported servers
+
+| Language | Server | Binary crc looks for |
+|---|---|---|
+| Rust | rust-analyzer | `rust-analyzer` |
+| Go | gopls | `gopls` |
+| Python | pyright | `basedpyright-langserver`, then `pyright-langserver` |
+| TypeScript, TSX, JavaScript, JSX | typescript-language-server | `typescript-language-server` |
+| C, C++ | clangd | `clangd` |
+
+TypeScript, TSX and JavaScript files share one server process.
+
+## What you get
+
+<div class="crc-keys">
+  <div><span>Go to definition</span><span><kbd>F12</kbd> or <kbd>⌘</kbd>-click</span></div>
+  <div><span>Hover</span><span><kbd>F1</kbd></span></div>
+  <div><span>Rename symbol</span><span><kbd>F2</kbd></span></div>
+  <div><span>Format document</span><span><kbd>⇧</kbd><kbd>⌥</kbd><kbd>F</kbd></span></div>
+  <div><span>Completion</span><span><kbd>⌃</kbd><kbd>Space</kbd></span></div>
+</div>
+
+- **Diagnostics** are underlined in the text, with error and warning counts
+  in the status line.
+- **Find References** is in the Go menu.
+- **Signature help** shows the parameters of the call you are typing.
+- **Format on save**: set `format_on_save = true` in
+  [settings](/docs/getting-started/settings/).
+- **Completion** from the server is one of several sources; see
+  [Completion](/docs/features/completion/).
+
+## Where crc looks
+
+Apps opened from the Dock see only the system's default `PATH`, and crc does
+not run your shell to read your profile. So it looks, in order, in:
+
+1. Your Rust toolchains, `~/.rustup/toolchains/*/bin`, newest first.
+2. The app's own `PATH`.
+3. `~/.cargo/bin`, `~/go/bin`, `~/.bun/bin`, `~/Library/pnpm`,
+   `~/.local/bin` and `~/.npm-global/bin`.
+4. `$PNPM_HOME`, when set.
+5. `/opt/homebrew/bin`, `/usr/local/bin` and `/usr/local/go/bin`.
+
+<Aside type="tip" title="rust-analyzer">
+  The toolchains come first on purpose: the `rust-analyzer` on `PATH` is
+  usually a rustup proxy, and the real binary sits in the toolchain folder.
+  `rustup component add rust-analyzer` puts it there.
+</Aside>
+
+## Not yet
+
+Code actions are not supported.

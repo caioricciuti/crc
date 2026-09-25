@@ -1,0 +1,75 @@
+---
+title: crc documentation
+description: Everything crc does, how to install it, and every key it answers to.
+tableOfContents: false
+prev: false
+---
+
+import { Image } from "astro:assets";
+import { CardGrid, LinkCard, LinkButton, Card } from "@astrojs/starlight/components";
+import editorDark from "../../../assets/editor-dark.png";
+import editorLight from "../../../assets/editor-light.png";
+
+<div class="crc-intro">
+  <p>
+    crc is a text editor for macOS, drawn on the GPU straight from Metal and
+    CoreText, with a terminal, local Git and Claude Code built in. These pages
+    cover installing it, every feature, and every key it answers to.
+  </p>
+  <div class="crc-intro-actions">
+    <LinkButton href="/docs/getting-started/installation/" icon="right-arrow">Install crc</LinkButton>
+    <LinkButton href="/docs/reference/keyboard-shortcuts/" variant="secondary">Keyboard shortcuts</LinkButton>
+  </div>
+</div>
+
+<div class="crc-shot">
+  <Image src={editorDark} alt="crc editing a Rust file with the project sidebar open." class="only-dark" widths={[800, 1400]} sizes="46rem" />
+  <Image src={editorLight} alt="The same file in the light appearance." class="only-light" widths={[800, 1400]} sizes="46rem" />
+</div>
+
+## Start here
+
+<CardGrid>
+  <LinkCard title="Installation" description="Download the signed DMG or build from source in three commands." href="/docs/getting-started/installation/" />
+  <LinkCard title="A tour of the window" description="The home screen, sidebar, tabs, status line and panels." href="/docs/getting-started/tour/" />
+  <LinkCard title="Settings" description="One commented TOML file. Saving it applies it." href="/docs/getting-started/settings/" />
+  <LinkCard title="Keyboard shortcuts" description="Every binding, grouped by what you are doing." href="/docs/reference/keyboard-shortcuts/" />
+</CardGrid>
+
+## What is built in
+
+<CardGrid>
+  <Card title="Claude Code" icon="star">
+    Type `claude` in a crc terminal and it connects. It sees your file,
+    selection and diagnostics; its edits open as diffs.
+    [Read more](/docs/features/claude-code/)
+  </Card>
+  <Card title="Completion that learns" icon="pencil">
+    Ghost text, a row of alternatives, and a line saying why the first one is
+    offered. [Read more](/docs/features/completion/)
+  </Card>
+  <Card title="Terminal" icon="seti:shell">
+    Your login shell in the project folder, on an xterm-compatible emulator
+    written for crc. [Read more](/docs/features/terminal/)
+  </Card>
+  <Card title="Git" icon="github">
+    Stage files or single hunks, commit, switch branches, fetch, pull and push.
+    [Read more](/docs/features/git/)
+  </Card>
+  <Card title="Language servers" icon="puzzle">
+    Definition, hover, references, rename, formatting and signature help for
+    five languages. [Read more](/docs/features/language-servers/)
+  </Card>
+  <Card title="HTTP requests" icon="rocket">
+    Send requests from `.http` files and read the response in a tab.
+    [Read more](/docs/features/http-requests/)
+  </Card>
+</CardGrid>
+
+## What crc is not
+
+crc is an alpha for Apple Silicon Macs on macOS 14 or later. It is used daily
+by its author and is going to a small group of testers first. It has no
+extensions, no Intel, Linux or Windows builds, and a fixed set of languages.
+The full list is in [Known limits](/docs/reference/limitations/); why it is
+built this way is in [Why crc exists](/vision/).

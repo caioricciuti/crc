@@ -1,0 +1,76 @@
+---
+title: Files and saving
+description: Atomic saves, external changes, crash recovery, encodings, line endings and very large files.
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+An editor's first job is not to lose or damage your text. This page is how crc
+does that.
+
+## Saving
+
+<div class="crc-keys">
+  <div><span>Save</span><span><kbd>⌘</kbd><kbd>S</kbd></span></div>
+  <div><span>Save as</span><span><kbd>⌘</kbd><kbd>⇧</kbd><kbd>S</kbd></span></div>
+</div>
+
+Saves are **atomic**: crc writes a new file and swaps it in, so a crash or a
+full disk mid-save never leaves half a file. The file's **mode**, **links**
+and **symlink targets** are kept.
+
+**File › Revert to Saved** throws away your edits and goes back to what is on
+disk.
+
+## When another program changes a file
+
+crc watches the project folder.
+
+| The tab is… | What happens |
+|---|---|
+| Clean | It reloads with the new contents. |
+| Dirty | Nothing changes until you save. Then crc asks: **Overwrite**, **Cancel** or **Reload**. |
+| Deleted on disk | The tab is marked unsaved, so closing it asks first. |
+
+This is what makes [Claude Code](/docs/features/claude-code/), formatters and
+`git checkout` safe to run next to open tabs.
+
+## Closing and quitting
+
+Closing a tab or quitting crc with unsaved changes asks first.
+
+## Crash recovery
+
+If crc crashes, the text of every unsaved document is written to
+`~/Library/Application Support/crc/recovery/` before the process ends. The
+next time crc starts, it asks whether to restore them.
+
+<Aside type="tip" title="Plain files, on purpose">
+  Each crash gets its own folder holding, for each unsaved document, `<n>.txt`
+  with its text and `<n>.path` with where it came from. If crc cannot start at
+  all, your work is still there to open with anything.
+</Aside>
+
+Recovery covers crashes in crc's own code. It does not cover a power cut.
+
+## Encodings and line endings
+
+crc keeps what the file had:
+
+- UTF-8, with or without a byte-order mark
+- UTF-16 with a BOM
+- Windows-1252
+- LF, CRLF and every other line ending
+
+The encoding and line ending are shown in the status line.
+
+## Very large files
+
+| Size | Behaviour |
+|---|---|
+| Up to 512 MB | Opens normally. A 100 MiB file costs what a small one does. |
+| Over 512 MB | Opens **read-only**, and says why. |
+| Over 2 GB | Refused, and says why. |
+
+Lines too long to shape quickly are drawn without shaping, and the status
+line says so while one is on screen.

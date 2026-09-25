@@ -1,0 +1,445 @@
+/* The landing pages. Colours come from the editor's own Graphite theme
+   (render/layout.rs Theme::default) so the site and the app match. */
+
+:root {
+  color-scheme: dark;
+  --bg: #0a0c0c;
+  --bg-1: #0f1212;
+  --bg-2: #141718;
+  --editor: #191c1d;
+  --sidebar: #202425;
+  --raised: #292e2f;
+  --line: rgba(255, 255, 255, 0.07);
+  --line-2: rgba(255, 255, 255, 0.12);
+  --text: #eef2f0;
+  --text-2: #b7c0bc;
+  --muted: #8a9691;
+  --dim: #5f6b67;
+  --mint: #a6ddc2;
+  --mint-2: #3fb98a;
+  --mint-glow: rgba(166, 221, 194, 0.18);
+  --added: #98cf9f;
+  --removed: #e29c96;
+  --modified: #e2a43a;
+  --kw: #c792ea;
+  --fn: #82aaff;
+  --type: #7fd1c2;
+  --prop: #89ddff;
+  --str: #a5d68a;
+  --num: #f6a35b;
+  --const: #e9c46a;
+  --attr: #f0a3c9;
+  --comment: #6f7b77;
+  --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI", Roboto, sans-serif;
+  --display: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", "Segoe UI", Roboto, sans-serif;
+  --mono: "SF Mono", ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace;
+  --radius: 14px;
+  --container: 76rem;
+  --gutter: clamp(1rem, 4vw, 2rem);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+  scroll-padding-top: 5rem;
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 16px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  overflow-x: hidden;
+}
+
+img {
+  max-width: 100%;
+  height: auto;
+  display: block;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+code,
+kbd,
+pre {
+  font-family: var(--mono);
+}
+
+[hidden] {
+  display: none !important;
+}
+
+::selection {
+  background: rgba(166, 221, 194, 0.3);
+}
+
+:focus-visible {
+  outline: 2px solid var(--mint);
+  outline-offset: 3px;
+  border-radius: 6px;
+}
+
+/* The glows behind sections are wider than the page on a phone. */
+main {
+  overflow-x: clip;
+}
+
+.container {
+  width: 100%;
+  max-width: var(--container);
+  margin-inline: auto;
+  padding-inline: var(--gutter);
+}
+
+/* ---- Buttons ---------------------------------------------------------- */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.55rem;
+  height: 2.9rem;
+  padding: 0 1.3rem;
+  border-radius: 999px;
+  font-size: 0.95rem;
+  font-weight: 560;
+  letter-spacing: -0.005em;
+  white-space: nowrap;
+  transition: transform 0.15s ease, background 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+}
+.btn:active {
+  transform: translateY(1px);
+}
+.btn svg {
+  flex: none;
+}
+.btn-light {
+  background: var(--text);
+  color: #0b0d0d;
+}
+.btn-light:hover {
+  background: #fff;
+  box-shadow: 0 0 0 4px rgba(255, 255, 255, 0.08), 0 8px 30px rgba(166, 221, 194, 0.25);
+}
+.btn-ghost {
+  color: var(--text);
+  border: 1px solid var(--line-2);
+  background: rgba(255, 255, 255, 0.03);
+}
+.btn-ghost:hover {
+  background: rgba(255, 255, 255, 0.07);
+  border-color: rgba(255, 255, 255, 0.2);
+}
+.btn-small {
+  height: 2.1rem;
+  padding: 0 0.95rem;
+  font-size: 0.85rem;
+}
+.btn .arrow {
+  transition: transform 0.2s ease;
+}
+.btn:hover .arrow {
+  transform: translateX(3px);
+}
+
+/* ---- Nav -------------------------------------------------------------- */
+
+.nav {
+  position: fixed;
+  inset: 0 0 auto 0;
+  z-index: 50;
+  padding-top: env(safe-area-inset-top, 0px);
+  border-bottom: 1px solid transparent;
+  transition: background 0.25s ease, border-color 0.25s ease, backdrop-filter 0.25s ease;
+}
+.nav.scrolled,
+.nav.open {
+  background: rgba(10, 12, 12, 0.72);
+  backdrop-filter: saturate(160%) blur(18px);
+  -webkit-backdrop-filter: saturate(160%) blur(18px);
+  border-bottom-color: var(--line);
+}
+.nav-inner {
+  max-width: var(--container);
+  margin-inline: auto;
+  padding: 0 var(--gutter);
+  height: 4rem;
+  display: flex;
+  align-items: center;
+  gap: 2rem;
+}
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.6rem;
+  font-weight: 650;
+  font-size: 1.15rem;
+  letter-spacing: -0.02em;
+}
+.brand img {
+  border-radius: 7px;
+  box-shadow: 0 0 0 1px var(--line-2);
+}
+.nav-links {
+  display: flex;
+  gap: 0.25rem;
+  margin-right: auto;
+}
+.nav-links a {
+  padding: 0.4rem 0.75rem;
+  border-radius: 8px;
+  font-size: 0.9rem;
+  color: var(--text-2);
+  transition: color 0.15s ease, background 0.15s ease;
+}
+.nav-links a:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.05);
+}
+.nav-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-left: auto;
+}
+.icon-link {
+  display: grid;
+  place-items: center;
+  width: 2.1rem;
+  height: 2.1rem;
+  border-radius: 999px;
+  color: var(--text-2);
+  transition: color 0.15s ease, background 0.15s ease;
+}
+.icon-link:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.06);
+}
+.menu-toggle {
+  display: none;
+  width: 2.1rem;
+  height: 2.1rem;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  position: relative;
+}
+.menu-toggle span {
+  position: absolute;
+  left: 0.5rem;
+  right: 0.5rem;
+  height: 1.5px;
+  background: var(--text);
+  transition: transform 0.2s ease, top 0.2s ease;
+}
+.menu-toggle span:first-child {
+  top: 0.8rem;
+}
+.menu-toggle span:last-child {
+  top: 1.2rem;
+}
+.nav.open .menu-toggle span:first-child {
+  top: 1rem;
+  transform: rotate(45deg);
+}
+.nav.open .menu-toggle span:last-child {
+  top: 1rem;
+  transform: rotate(-45deg);
+}
+.mobile-menu {
+  display: flex;
+  flex-direction: column;
+  padding: 0.5rem var(--gutter) 1.25rem;
+}
+.mobile-menu a {
+  padding: 0.8rem 0;
+  border-bottom: 1px solid var(--line);
+  font-size: 1.05rem;
+  color: var(--text-2);
+}
+@media (max-width: 52rem) {
+  .nav-links {
+    display: none;
+  }
+  .menu-toggle {
+    display: block;
+  }
+}
+@media (min-width: 52.01rem) {
+  .mobile-menu {
+    display: none !important;
+  }
+}
+
+/* ---- Section scaffolding --------------------------------------------- */
+
+.section {
+  position: relative;
+  padding-block: clamp(5rem, 11vw, 9rem);
+}
+.eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--mint);
+}
+.eyebrow::before {
+  content: "";
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: 2px;
+  background: currentColor;
+  box-shadow: 0 0 12px currentColor;
+}
+.h2 {
+  font-family: var(--display);
+  font-size: clamp(2rem, 4.6vw, 3.4rem);
+  line-height: 1.05;
+  letter-spacing: -0.035em;
+  font-weight: 640;
+  margin: 1rem 0 0;
+  text-wrap: balance;
+}
+.h2 .soft {
+  color: var(--muted);
+}
+.lead {
+  font-size: clamp(1.02rem, 1.4vw, 1.18rem);
+  line-height: 1.6;
+  color: var(--text-2);
+  max-width: 38rem;
+  margin: 1.25rem 0 0;
+  text-wrap: pretty;
+}
+.section-head {
+  max-width: 48rem;
+}
+.section-head.center {
+  margin-inline: auto;
+  text-align: center;
+}
+.section-head.center .lead {
+  margin-inline: auto;
+}
+
+/* Reveal on scroll. Without JS, or with reduced motion, stays visible. */
+[data-reveal] {
+  opacity: 0;
+  transform: translateY(18px);
+  transition: opacity 0.8s cubic-bezier(0.2, 0.7, 0.2, 1), transform 0.8s cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+[data-reveal].in {
+  opacity: 1;
+  transform: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  [data-reveal] {
+    opacity: 1;
+    transform: none;
+    transition: none;
+  }
+}
+@media (scripting: none) {
+  [data-reveal] {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+kbd.key {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.6em;
+  height: 1.6em;
+  padding: 0 0.4em;
+  border-radius: 6px;
+  font-family: var(--sans);
+  font-size: 0.8em;
+  font-weight: 500;
+  color: var(--text);
+  background: linear-gradient(180deg, #2a2f30, #1e2223);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: 0 1px 0 rgba(0, 0, 0, 0.6), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+}
+
+/* ---- Footer ----------------------------------------------------------- */
+
+.footer {
+  border-top: 1px solid var(--line);
+  padding-block: 4rem calc(2rem + env(safe-area-inset-bottom, 0px));
+  background: linear-gradient(180deg, var(--bg), #070808);
+}
+.footer-grid {
+  display: grid;
+  grid-template-columns: 2fr repeat(3, 1fr);
+  gap: 2.5rem;
+}
+.footer-brand p {
+  color: var(--muted);
+  font-size: 0.92rem;
+  max-width: 18rem;
+  margin: 1rem 0 0;
+}
+.footer h3 {
+  font-size: 0.8rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--dim);
+  margin: 0 0 1rem;
+}
+.footer-grid > div:not(.footer-brand) {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+.footer-grid a:not(.brand) {
+  color: var(--text-2);
+  font-size: 0.92rem;
+  transition: color 0.15s ease;
+}
+.footer-grid a:not(.brand):hover {
+  color: var(--text);
+}
+.footer-base {
+  display: flex;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 1rem;
+  margin-top: 3.5rem;
+  padding-top: 1.5rem;
+  border-top: 1px solid var(--line);
+  color: var(--dim);
+  font-size: 0.85rem;
+}
+@media (max-width: 48rem) {
+  .footer-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+  .footer-brand {
+    grid-column: 1 / -1;
+  }
+}

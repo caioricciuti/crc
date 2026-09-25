@@ -1,0 +1,43 @@
+---
+title: Where crc keeps things
+description: Every file and folder crc reads or writes outside your projects.
+---
+
+import { FileTree, Aside } from "@astrojs/starlight/components";
+
+crc keeps very little, all of it local. It sends nothing anywhere except the
+daily update check, which you can turn off.
+
+<FileTree>
+- ~/
+  - .config/
+    - crc/
+      - config.toml your [settings](/docs/getting-started/settings/)
+  - .claude/
+    - ide/
+      - PORT.lock the [Claude Code](/docs/features/claude-code/) bridge's port and token, while crc runs
+  - Library/
+    - Application Support/
+      - crc/
+        - completion.db what you picked in completion, for ranking
+        - recovery/ unsaved text after a crash
+        - session what was open last time
+    - Caches/
+      - crc/
+        - index/ the project index for completion and symbols, rebuilt when deleted
+    - Logs/
+      - crc/ crash logs
+</FileTree>
+
+| Path | Safe to delete? |
+|---|---|
+| `~/.config/crc/config.toml` | Yes. It is recreated from the template when you open Settings. |
+| `~/Library/Caches/crc/` | Yes. It is a cache. |
+| `~/Library/Application Support/crc/completion.db` | Yes, or use **Go › Forget Completion History**. |
+| `~/Library/Application Support/crc/recovery/` | Once you have restored what you need from it. |
+| `~/Library/Logs/crc/` | Yes. **Help › Show Crash Logs** opens it. |
+
+<Aside>
+  `XDG_CONFIG_HOME` moves the settings file; `CLAUDE_CONFIG_DIR` moves the
+  lock file.
+</Aside>

@@ -1,0 +1,84 @@
+---
+title: Settings
+description: One commented TOML file. Saving it in crc applies it.
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+**crc › Settings…** (<kbd>⌘</kbd><kbd>,</kbd>) opens `~/.config/crc/config.toml`
+in a tab. The first time, it is created from a commented template. Saving the
+file in crc applies it; there is no settings window and nothing to restart.
+
+<Aside>
+  When `XDG_CONFIG_HOME` is set, the file is `$XDG_CONFIG_HOME/crc/config.toml`
+  instead.
+</Aside>
+
+## Every key
+
+| Key | Values | Default | What it does |
+|---|---|---|---|
+| `font` | any installed monospace face | `"SF Mono"` | The code font. |
+| `font_size` | `8` to `32` | `13` | Points. <kbd>⌘</kbd><kbd>=</kbd> and <kbd>⌘</kbd><kbd>-</kbd> change it and write it back; <kbd>⌘</kbd><kbd>0</kbd> resets. |
+| `theme` | `"system"`, `"dark"`, `"light"` | `"system"` | The appearance. `system` follows macOS. |
+| `caret_blink` | `true`, `false` | `true` | `false` keeps the caret solid. |
+| `update_check` | `true`, `false` | `true` | Once a day at launch, ask GitHub whether a newer release exists. Nothing is downloaded. |
+| `format_on_save` | `true`, `false` | `false` | Format the file with its [language server](/docs/features/language-servers/) when saving. |
+| `word_wrap` | `"auto"`, `"on"`, `"off"` | `"auto"` | `auto` wraps Markdown and text files only. <kbd>⌥</kbd><kbd>Z</kbd> flips it for one document. |
+| `ssh_auth_sock` | a path | unset | The SSH agent socket Git uses for fetch, pull and push. |
+
+## The template
+
+This is the file crc writes the first time:
+
+```toml title="~/.config/crc/config.toml"
+# crc settings. The app rewrites its own keys when you zoom or pick a
+# theme and leaves every other line alone, so edit freely. Saving this
+# file in crc applies it.
+
+# Any monospace face installed on this Mac.
+font = "SF Mono"
+
+# 8 to 32 points. Cmd-= and Cmd-- change it; Cmd-0 goes back to 13.
+font_size = 13
+
+# "system", "dark" or "light".
+theme = "system"
+
+# false keeps the caret solid.
+caret_blink = true
+
+# Once a day at launch, ask GitHub whether a newer release exists. Nothing
+# is downloaded; Help > Check for Updates works either way.
+update_check = true
+
+# Format the file with its language server when saving it.
+format_on_save = false
+
+# Wrap long lines: "auto" for Markdown and text files, "on" or "off".
+# View > Word Wrap (Option-Z) flips it for one document.
+word_wrap = "auto"
+
+# The SSH agent socket Git uses for fetch, pull and push, for when crc is
+# opened from the Dock and does not have your shell's SSH_AUTH_SOCK. Run
+# `echo $SSH_AUTH_SOCK` in a terminal and put the path here. A leading ~/
+# is your home folder.
+# ssh_auth_sock = "~/.ssh/agent.sock"
+```
+
+## Why `ssh_auth_sock` exists
+
+Apps opened from the Dock do not inherit your shell's environment, so Git run
+by crc may not find the SSH agent that `git push` uses in your terminal. Run
+this in a terminal and put the path it prints in the setting:
+
+```sh
+echo $SSH_AUTH_SOCK
+```
+
+## Environment variables
+
+| Variable | Effect |
+|---|---|
+| `CRC_NO_CLAUDE=1` | Turns off the [Claude Code](/docs/features/claude-code/) bridge. |
+| `XDG_CONFIG_HOME` | Moves the settings file, as above. |

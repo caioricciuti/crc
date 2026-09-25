@@ -1,0 +1,53 @@
+---
+title: Completion
+description: Ghost text, a row of alternatives, and a line saying why. Built from the language server, a project index, nearby words, paths and your own history.
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+Completion in crc works in every language, with or without a language server,
+and says why it offers what it offers.
+
+## How it looks
+
+- **The best guess** appears as ghost text at the caret.
+- **The alternatives** sit in a single row of chips under the line.
+- **One line of explanation** says why the picked one is offered: where it is
+  defined, how often it is used, and how often you picked it after the same
+  receiver.
+
+## Keys
+
+<div class="crc-keys">
+  <div><span>Ask for completion</span><span><kbd>⌃</kbd><kbd>Space</kbd></span></div>
+  <div><span>Take the suggestion</span><span><kbd>Tab</kbd></span></div>
+  <div><span>Pick another</span><span><kbd>↑</kbd> <kbd>↓</kbd>, then <kbd>↩</kbd></span></div>
+  <div><span>Take one directly</span><span><kbd>⌥</kbd><kbd>1</kbd>…<kbd>9</kbd></span></div>
+  <div><span>Close</span><span><kbd>Esc</kbd></span></div>
+</div>
+
+## Where suggestions come from
+
+| Source | What it knows |
+|---|---|
+| The [language server](/docs/features/language-servers/) | Types, members and imports, where a server is installed. |
+| The project index | What the whole project defines and uses, kept in SQLite in `~/Library/Caches/crc/index/`. |
+| Nearby words | Words close to the caret in the same file. |
+| Paths | Files in the project, respecting any `.gitignore`, for `./` imports and quoted paths. |
+| Your history | What you picked before, and after which receiver. |
+
+## Your history stays yours
+
+What you pick is recorded in
+`~/Library/Application Support/crc/completion.db`, on your Mac only.
+**Go › Forget Completion History** clears it.
+
+## `.gitignore`, previewed
+
+Typing a line in a `.gitignore` shows in the Explorer what it would ignore,
+before you save.
+
+<Aside type="tip">
+  The index is a cache. Deleting `~/Library/Caches/crc/index/` is safe; crc
+  rebuilds it.
+</Aside>

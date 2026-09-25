@@ -1,0 +1,138 @@
+---
+// Completion as crc draws it: ghost text at the caret, the alternatives as
+// one row of chips, and a line saying why the first one is offered.
+---
+
+<div class="pane" aria-hidden="true">
+  <div class="ln"><b>31</b><span><span class="k">pub fn</span> <span class="f">plantings_per_bed</span>(entries: &amp;[<span class="t">Entry</span>]) -&gt; <span class="t">BTreeMap</span>&lt;<span class="t">u8</span>, <span class="t">usize</span>&gt; {"{"}</span></div>
+  <div class="ln"><b>32</b><span>    <span class="k">let mut</span> beds = <span class="t">BTreeMap</span>::<span class="f">new</span>();</span></div>
+  <div class="ln cur-line"><b>33</b><span>    <span class="k">for</span> entry <span class="k">in</span> entries.it<span class="caret"></span><span class="ghost">er() {"{"}</span></span></div>
+  <div class="chips">
+    <span class="chip on">iter <kbd>Tab</kbd></span>
+    <span class="chip">into_iter <kbd>⌥2</kbd></span>
+    <span class="chip">is_empty <kbd>⌥3</kbd></span>
+    <span class="chip">iter_mut <kbd>⌥4</kbd></span>
+  </div>
+  <div class="why">
+    <span class="dot"></span>
+    <span><b>iter</b> · defined in core::slice · used 14× in this project · you picked it 9× after <i>entries.</i></span>
+  </div>
+  <div class="ln"><b>34</b><span>        *beds.<span class="f">entry</span>(entry.bed).<span class="f">or_insert</span>(<span class="n">0</span>) += <span class="n">1</span>;</span></div>
+  <div class="ln"><b>35</b><span>    {"}"}</span></div>
+  <div class="ln"><b>36</b><span>    beds</span></div>
+  <div class="ln"><b>37</b><span>{"}"}</span></div>
+</div>
+
+<style>
+  .pane {
+    border-radius: 12px;
+    background: var(--editor);
+    border: 1px solid var(--line-2);
+    box-shadow: 0 40px 100px -20px rgba(0, 0, 0, 0.8);
+    padding: 1rem 0;
+    font-family: var(--mono);
+    font-size: clamp(0.66rem, 1.05vw, 0.82rem);
+    line-height: 1.8;
+    overflow: hidden;
+    color: #dce2df;
+  }
+  .ln {
+    display: flex;
+    white-space: pre;
+  }
+  .ln b {
+    flex: none;
+    width: 3rem;
+    padding-right: 1rem;
+    text-align: right;
+    font-weight: 400;
+    color: #727f78;
+  }
+  .cur-line {
+    background: rgba(255, 255, 255, 0.042);
+  }
+  .cur-line b {
+    color: var(--mint);
+  }
+  .k { color: var(--kw); }
+  .f { color: var(--fn); }
+  .t { color: var(--type); }
+  .n { color: var(--num); }
+  .ghost {
+    color: #5c6864;
+  }
+  .caret {
+    display: inline-block;
+    width: 2px;
+    height: 1.2em;
+    vertical-align: -0.25em;
+    background: var(--mint);
+    animation: blink 1.1s steps(1) infinite;
+  }
+  .chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    padding: 0.35rem 1rem 0.2rem 4.4rem;
+  }
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45rem;
+    padding: 0.05rem 0.55rem;
+    border-radius: 6px;
+    background: #292e2f;
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    color: #b7c0bc;
+    font-size: 0.92em;
+  }
+  .chip.on {
+    background: rgba(166, 221, 194, 0.14);
+    border-color: rgba(166, 221, 194, 0.4);
+    color: var(--mint);
+  }
+  .chip kbd {
+    font-family: var(--sans);
+    font-size: 0.78em;
+    opacity: 0.6;
+  }
+  .why {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    padding: 0.2rem 1rem 0.5rem 4.4rem;
+    color: #919c97;
+    font-family: var(--sans);
+    font-size: 0.9em;
+    line-height: 1.5;
+  }
+  .why b {
+    color: var(--text);
+    font-weight: 600;
+  }
+  .why i {
+    font-style: normal;
+    font-family: var(--mono);
+    color: var(--prop);
+  }
+  .dot {
+    flex: none;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--mint);
+    transform: translateY(-1px);
+  }
+  @keyframes blink {
+    50% { opacity: 0; }
+  }
+  @media (max-width: 40rem) {
+    .chips,
+    .why {
+      padding-left: 3rem;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .caret { animation: none; }
+  }
+</style>

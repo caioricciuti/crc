@@ -1,0 +1,58 @@
+---
+// Starlight's header ends with the social icons. This puts the site's own
+// links and the download button in front of them.
+import Default from "@astrojs/starlight/components/SocialIcons.astro";
+
+const path = Astro.url.pathname;
+const links = [
+  { href: "/docs/", label: "Docs", active: path.startsWith("/docs/") },
+  { href: "/changelog/", label: "Changelog", active: path.startsWith("/changelog/") },
+];
+---
+
+<nav class="crc-links" aria-label="Site">
+  {links.map((l) => (
+    <a href={l.href} aria-current={l.active ? "page" : undefined}>{l.label}</a>
+  ))}
+  <a class="crc-download" href="https://github.com/caioricciuti/crc/releases/latest">Download</a>
+</nav>
+<Default />
+
+<style>
+  .crc-links {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    margin-inline-end: 0.5rem;
+  }
+  .crc-links a {
+    padding: 0.35rem 0.7rem;
+    border-radius: 8px;
+    font-size: 0.875rem;
+    color: var(--sl-color-gray-2);
+    text-decoration: none;
+    transition: color 0.15s ease, background 0.15s ease;
+  }
+  .crc-links a:hover,
+  .crc-links a[aria-current="page"] {
+    color: var(--sl-color-white);
+    background: var(--sl-color-gray-6);
+  }
+  .crc-links a.crc-download {
+    margin-inline-start: 0.4rem;
+    padding: 0.35rem 0.9rem;
+    border-radius: 999px;
+    background: var(--sl-color-white);
+    color: var(--sl-color-black);
+    font-weight: 600;
+  }
+  .crc-links a.crc-download:hover {
+    background: var(--sl-color-accent-high);
+    color: var(--sl-color-black);
+  }
+  @media (max-width: 50rem) {
+    .crc-links {
+      display: none;
+    }
+  }
+</style>

@@ -1,0 +1,55 @@
+---
+title: Syntax highlighting
+description: tree-sitter grammars compiled from vendored C, with indent guides, bracket pairs and Git marks in the gutter.
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+crc highlights with [tree-sitter](https://tree-sitter.github.io/), compiled
+from C source checked into the repository rather than taken as a crate. Every
+grammar is pinned by checksum in `third_party/CHECKSUMS`.
+
+## Languages
+
+| Language | Language server |
+|---|---|
+| Rust | rust-analyzer |
+| Python | pyright |
+| Go | gopls |
+| C and C++ | clangd |
+| JavaScript and JSX | typescript-language-server |
+| TypeScript and TSX | typescript-language-server |
+| HTML, and Svelte and Vue files | none |
+| CSS | none |
+| JSON | none |
+| TOML | none |
+| YAML | none |
+| Shell | none |
+
+Languages embedded in one another, such as CSS and JavaScript inside HTML,
+are parsed as themselves. That is also how `.svelte` and `.vue` files are
+highlighted: as HTML with script and style blocks.
+
+<Aside type="note">
+  SQL is not in the alpha. A new language means vendoring its
+  generated C and reviewing it, so the list grows deliberately.
+</Aside>
+
+## The palette
+
+The Graphite theme uses eight distinct hue families, in dark and light, so
+keywords, functions, types, properties, strings, numbers, constants and
+attributes are told apart by colour.
+
+## In the gutter
+
+- **Indent guides** show the structure of the block you are in.
+- **The bracket pair** around the caret is highlighted.
+- **Git marks** show lines added, changed or deleted compared with HEAD, as
+  you type.
+
+<Aside type="note" title="Limits">
+  Gutter marks compare with HEAD, not the index, and stop at 2 MiB. The
+  bracket matcher counts its own pair only and does not skip strings or
+  comments.
+</Aside>

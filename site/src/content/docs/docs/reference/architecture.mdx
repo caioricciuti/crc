@@ -1,0 +1,81 @@
+---
+title: Architecture
+description: The design decisions behind crc, and where each part lives in the source.
+---
+
+import { FileTree, CardGrid, Card } from "@astrojs/starlight/components";
+
+## Design decisions
+
+<CardGrid>
+  <Card title="macOS only, no wgpu" icon="laptop">
+    Going straight to Metal through `objc2` costs about 10 crates instead of
+    about 200, and one build script instead of about 40. The price is that a
+    Linux or Windows port means writing a second backend from scratch. That
+    was a deliberate trade, not an oversight.
+  </Card>
+  <Card title="CoreText, not a Rust font stack" icon="pencil">
+    It ships with the OS, handles hinting and complex-script shaping better
+    than anything we would write, and costs zero dependencies.
+  </Card>
+  <Card title="Our own rope" icon="seti:rust">
+    `src/text/rope.rs` is a persistent B-tree. Its API shape dictates undo,
+    multiple cursors, syntax-tree sync and eventual CRDT merging, so it is core
+    to the product. `Rope::clone` is O(1) and shares structure.
+  </Card>
+  <Card title="One draw call per frame" icon="rocket">
+    Every glyph is an instance of one quad. Drawing a screen of text is a
+    single `drawPrimitives` with no per-frame geometry work.
+  </Card>
+</CardGrid>
+
+## Supply chain
+
+The dependency tree is **14 crates, one vendored build script, zero proc
+macros**, and that build script has been read line by line.
+
+tree-sitter is compiled from C checked into `third_party/` with crc's own
+`build.rs`, rather than taken as a crate. The crate would have cost 29
+crates, 10 build scripts and a proc macro, because `serde_json` is one of its
+build dependencies.
+
+Every dependency is pinned exactly (`=x.y.z`), and CI fails if a new build
+script or any proc-macro crate enters the tree. The review of each one is in
+the [dependency review](/dependency-review/).
+
+## Where things live
+
+<FileTree>
+- src/
+  - text/
+    - rope.rs persistent B-tree rope
+    - buffer.rs cursor, selection, undo, files, edit tracking
+    - documents.rs open tabs
+  - syntax/ tree-sitter parsing and highlight queries
+  - complete/ completion ranking and history
+  - index/ the SQLite project index
+  - lsp/ language servers: registry, stdio transport, client
+  - ide/ the Claude Code bridge: lock file, WebSocket, MCP
+  - term/ the terminal emulator
+  - http/ `.http` request files, environments, curl runner
+  - markdown/ Markdown rendering
+  - project/
+    - tree.rs sidebar file tree
+    - finder.rs Cmd-P fuzzy matching
+    - git.rs Git commands, status parsing and bounded diffs
+    - watch.rs FSEvents watcher for the project root
+  - render/
+    - font.rs CoreText shaping and paged glyph rasterization
+    - layout.rs visible lines to glyph quads, hit testing
+    - metal.rs pipeline, instance buffer, one draw call
+    - shader.metal vertex and fragment
+  - platform/
+    - window.rs NSWindow, input, event loop
+    - git_panel.rs the Source Control panel and its workers
+    - latency.rs keystroke-to-present timing
+    - recovery.rs unsaved text through a crash
+    - session.rs what was open last time
+  - json.rs JSON reader and printer, shared by HTTP and LSP
+- examples/ benchmarks and headless render dumps
+- third_party/ vendored C for tree-sitter and its grammars
+</FileTree>

@@ -1,0 +1,40 @@
+---
+title: Tabs and split panes
+description: Switching, reordering and managing tabs, and splitting the editor into up to four panes.
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+## Tabs
+
+<div class="crc-keys">
+  <div><span>Switch to tab 1 to 9</span><span><kbd>⌘</kbd><kbd>1</kbd>…<kbd>9</kbd></span></div>
+  <div><span>Previous tab</span><span><kbd>⌘</kbd><kbd>[</kbd></span></div>
+  <div><span>Next tab</span><span><kbd>⌘</kbd><kbd>]</kbd></span></div>
+  <div><span>Close tab</span><span><kbd>⌘</kbd><kbd>W</kbd></span></div>
+  <div><span>New file</span><span><kbd>⌘</kbd><kbd>N</kbd></span></div>
+</div>
+
+- **Drag** a tab to reorder it. **Right-click** it to manage tabs.
+- **Scroll** over the tab strip to reveal tabs that do not fit.
+- **Double-click** the empty part of the tab strip for a new file.
+- A tab with unsaved changes says so, and closing it asks first.
+
+<kbd>⌘</kbd><kbd>N</kbd> puts a name field in the sidebar, so a new file
+starts with a name and a place in the project.
+
+## Split panes
+
+<div class="crc-keys">
+  <div><span>Split the editor to the right</span><span><kbd>⌘</kbd><kbd>{"\\"}</kbd></span></div>
+  <div><span>Focus the next pane</span><span><kbd>⌘</kbd><kbd>⌥</kbd><kbd>]</kbd></span></div>
+  <div><span>Focus the previous pane</span><span><kbd>⌘</kbd><kbd>⌥</kbd><kbd>[</kbd></span></div>
+  <div><span>Close the pane</span><span><kbd>⌘</kbd><kbd>⌥</kbd><kbd>W</kbd></span></div>
+</div>
+
+Up to four panes, each with its own tabs.
+
+<Aside title="Panes are a way of looking">
+  A file is open in one pane at a time. Restoring a session puts every pane's
+  files back into one pane.
+</Aside>

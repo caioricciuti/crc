@@ -1,0 +1,93 @@
+---
+title: Editing text
+description: Multiple cursors, find and replace, folding, word wrap, line moves and the motions your fingers already know.
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+Everything here works in every file type, whether or not crc has a grammar
+or a language server for it.
+
+## Multiple cursors
+
+<div class="crc-keys">
+  <div><span>Select the word, then the next match</span><span><kbd>⌘</kbd><kbd>D</kbd></span></div>
+  <div><span>Add a cursor anywhere</span><span><kbd>⌥</kbd>-click</span></div>
+  <div><span>Back to one cursor</span><span><kbd>Esc</kbd></span></div>
+</div>
+
+Every edit, motion and selection applies at every cursor at once.
+
+## Find and replace
+
+<div class="crc-keys">
+  <div><span>Find in the file</span><span><kbd>⌘</kbd><kbd>F</kbd></span></div>
+  <div><span>Next match</span><span><kbd>⌘</kbd><kbd>G</kbd></span></div>
+  <div><span>Previous match</span><span><kbd>⌘</kbd><kbd>⇧</kbd><kbd>G</kbd></span></div>
+  <div><span>Switch to the replace field</span><span><kbd>Tab</kbd></span></div>
+  <div><span>Cycle, or replace</span><span><kbd>↩</kbd></span></div>
+  <div><span>Go to line</span><span><kbd>⌘</kbd><kbd>L</kbd></span></div>
+</div>
+
+Find supports regular expressions. **Edit › Replace All** replaces every
+match. To search the whole project, see
+[Search and navigation](/docs/features/search-and-navigation/).
+
+## Lines and blocks
+
+<div class="crc-keys">
+  <div><span>Toggle comment</span><span><kbd>⌘</kbd><kbd>/</kbd></span></div>
+  <div><span>Duplicate line</span><span><kbd>⌘</kbd><kbd>⇧</kbd><kbd>D</kbd></span></div>
+  <div><span>Move line up</span><span><kbd>⌘</kbd><kbd>⇧</kbd><kbd>↑</kbd></span></div>
+  <div><span>Move line down</span><span><kbd>⌘</kbd><kbd>⇧</kbd><kbd>↓</kbd></span></div>
+  <div><span>Indent selection</span><span><kbd>Tab</kbd></span></div>
+  <div><span>Outdent selection</span><span><kbd>⇧</kbd><kbd>Tab</kbd></span></div>
+</div>
+
+New lines are auto-indented, and brackets and quotes close themselves.
+Indent guides show the structure, and the bracket pair around the caret is
+highlighted.
+
+## Folding
+
+<div class="crc-keys">
+  <div><span>Fold the block at the caret</span><span><kbd>⌘</kbd><kbd>⌥</kbd><kbd>←</kbd></span></div>
+  <div><span>Unfold it</span><span><kbd>⌘</kbd><kbd>⌥</kbd><kbd>→</kbd></span></div>
+</div>
+
+**View › Fold All** and **View › Unfold All** do the whole file.
+
+## Word wrap
+
+<kbd>⌥</kbd><kbd>Z</kbd> (**View › Word Wrap**) wraps long lines in the
+current document. By default Markdown and text files wrap and code does not;
+the `word_wrap` [setting](/docs/getting-started/settings/) changes that.
+
+## Motions
+
+| Keys | Does |
+|---|---|
+| Arrows, <kbd>Home</kbd> / <kbd>End</kbd>, <kbd>PgUp</kbd> / <kbd>PgDn</kbd> | Move |
+| <kbd>⇧</kbd> with any of those | Extend the selection |
+| <kbd>⌥</kbd> + arrows | Move by word |
+| <kbd>⌥</kbd><kbd>⌫</kbd> | Delete a word |
+| <kbd>⌃</kbd><kbd>A</kbd> <kbd>E</kbd> <kbd>K</kbd> <kbd>D</kbd> <kbd>B</kbd> <kbd>F</kbd> <kbd>P</kbd> <kbd>N</kbd> | The macOS Emacs bindings |
+| Click, drag, <kbd>⇧</kbd>-click | Position and select |
+| <kbd>⌘</kbd><kbd>A</kbd> | Select all |
+| <kbd>⌘</kbd><kbd>Z</kbd> / <kbd>⌘</kbd><kbd>⇧</kbd><kbd>Z</kbd> | Undo, redo |
+
+## Font size
+
+<kbd>⌘</kbd><kbd>=</kbd> and <kbd>⌘</kbd><kbd>-</kbd> zoom the code font and
+write the size back to your [settings](/docs/getting-started/settings/);
+<kbd>⌘</kbd><kbd>0</kbd> goes back to 13 points.
+
+## Unicode
+
+Full Unicode, with emoji and CJK. Dead keys and input methods go through
+macOS text input.
+
+<Aside type="caution" title="Text input is new">
+  Dead keys and IME need wider testing across keyboard layouts. If one
+  misbehaves, please [report it](/docs/reference/reporting-problems/).
+</Aside>

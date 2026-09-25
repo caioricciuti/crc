@@ -1,0 +1,47 @@
+---
+title: Terminal
+description: Terminal sessions under the editor, running your login shell in the project folder on an xterm-compatible emulator written for crc.
+---
+
+import { Image } from "astro:assets";
+import terminalDark from "../../../../assets/terminal-dark.png";
+
+<div class="crc-shot">
+  <Image src={terminalDark} alt="The terminal panel open under a Rust file, with a zsh prompt." widths={[800, 1400]} sizes="46rem" />
+</div>
+
+## Open it
+
+<div class="crc-keys">
+  <div><span>Toggle the terminal panel</span><span><kbd>⌃</kbd><kbd>`</kbd></span></div>
+  <div><span>Toggle the panel</span><span><kbd>⌘</kbd><kbd>J</kbd></span></div>
+  <div><span>Claude Code in a tab</span><span><kbd>⌘</kbd><kbd>⇧</kbd><kbd>C</kbd></span></div>
+</div>
+
+**View › New Terminal** starts another session, and the <kbd>+</kbd> in the
+panel does the same. Each session has its own tab.
+
+## Your shell, in your project
+
+Sessions run your **login shell** in the **project folder**, so your prompt,
+aliases and `PATH` are the ones you set up.
+
+## The emulator
+
+The emulator is xterm-compatible and written for crc. It supports:
+
+- 24-bit colour
+- scroll regions
+- the alternate screen, so full-screen programs work
+- bracketed paste
+
+## Open paths from output
+
+<kbd>⌘</kbd>-click a path in the output, such as `src/main.rs:42:7` from a
+compiler error, to open it at that line and column. Relative paths are tried
+against the session's folder first, then the project's.
+
+## Claude Code
+
+Run `claude` in any crc terminal and it connects to the window by itself.
+See [Claude Code](/docs/features/claude-code/).

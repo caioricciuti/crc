@@ -1,7 +1,7 @@
 // Mirrors the repository's Markdown into the site's content collection.
 //
-// The documents people read are ../README.md, ../CHANGELOG.md,
-// ../CONTRIBUTING.md and a few files in ../docs. They stay where they are,
+// The project documents (../CHANGELOG.md, ../CONTRIBUTING.md and a few
+// files in ../docs) stay where they are,
 // written as plain Markdown for GitHub; this script copies them into
 // src/content/docs with the frontmatter Starlight needs and links rewritten
 // to site paths. The copies are generated and gitignored. Runs under bun
@@ -18,14 +18,15 @@ const github = "https://github.com/caioricciuti/crc/blob/main/";
 // source path (from the repository root) -> site slug, description, and a
 // title where the file's own H1 is not the right page name
 const pages = [
-  ["README.md", "handbook", "What crc is, what works, what does not, and how to install it.", "Handbook"],
   ["CHANGELOG.md", "changelog", "One entry per release."],
   ["docs/vision.md", "vision", "The three bets behind the editor."],
   ["docs/dependency-review.md", "dependency-review", "Every crate and build script, read."],
   ["CONTRIBUTING.md", "contributing", "How to propose a change."],
 ];
 
-const slugFor = new Map(pages.map(([path, slug]) => [path, slug]));
+// The README is not mirrored: the hand-written guide under /docs/ replaces
+// it on the site, so links to it land there.
+const slugFor = new Map([...pages.map(([path, slug]) => [path, slug]), ["README.md", "docs"]]);
 
 function rewriteLinks(markdown, fromPath) {
   const fromDir = fromPath.includes("/") ? dirname(fromPath) : "";
@@ -42,6 +43,8 @@ function rewriteLinks(markdown, fromPath) {
         return acc;
       }, [])
       .join("/");
+    // The README's limits section has its own page on the site.
+    if (normal === "README.md" && anchor === "what-does-not") return "](/docs/reference/limitations/)";
     const slug = slugFor.get(normal);
     const suffix = anchor ? `#${anchor}` : "";
     if (slug) return `](/${slug}/${suffix})`;

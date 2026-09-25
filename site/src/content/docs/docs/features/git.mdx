@@ -1,0 +1,72 @@
+---
+title: Git
+description: Status, diffs, file and hunk staging, commits, branches, fetch, pull and push, gutter marks and blame.
+---
+
+import { Aside, Steps } from "@astrojs/starlight/components";
+
+crc drives the `git` you already have. Git runs on worker threads, so the
+editor never waits on it, and your hooks and commit signing stay exactly as
+Git has them configured.
+
+## Source Control
+
+<kbd>⌘</kbd><kbd>⌥</kbd><kbd>G</kbd> opens **Source Control** in the sidebar.
+It shows:
+
+- the current branch, how far it is ahead of or behind its upstream, and
+  whether a merge or rebase is in progress
+- **staged** and **working-tree** changes, file by file
+- the diff of the selected file
+
+## Stage and commit
+
+<Steps>
+
+1. Select a changed file to see its diff.
+2. Stage the **whole file**, or stage and unstage **single hunks** from the
+   diff.
+3. Write a message and press <kbd>⌘</kbd><kbd>↩</kbd> to commit what is
+   staged. **Git › Commit…** does the same from the menu.
+
+</Steps>
+
+Git reads the files as saved on disk, so save before staging an edit you want
+included.
+
+<Aside type="note">
+  Hunk staging covers tracked text changes. Other kinds of change use the
+  whole-file actions.
+</Aside>
+
+## Branches and remotes
+
+The **Git** menu has:
+
+| Command | Does |
+|---|---|
+| **Switch Branch…** | Lists your local branches in the palette. Type a name that is not one and it offers to create it. |
+| **Fetch** | `git fetch` |
+| **Pull** | `git pull` |
+| **Push** | `git push` |
+| **Refresh** | Re-reads the status. |
+
+<Aside type="tip" title="SSH remotes from the Dock">
+  An app opened from the Dock does not get your shell's `SSH_AUTH_SOCK`, so
+  Git may not reach your SSH agent. Set `ssh_auth_sock` in
+  [settings](/docs/getting-started/settings/#why-ssh_auth_sock-exists) to the
+  path `echo $SSH_AUTH_SOCK` prints in a terminal.
+</Aside>
+
+## In the editor
+
+- **Gutter marks** show lines added, changed or deleted compared with HEAD, as
+  you type.
+- **Blame**: the status line says who last changed the caret's line, when, and
+  the commit's summary. Unsaved edits count as not committed yet.
+- **The branch** is in the status line too.
+
+## Limits
+
+Gutter marks compare with HEAD, not the index, and stop at files over 2 MiB.
+The full list is in [Known limits](/docs/reference/limitations/).

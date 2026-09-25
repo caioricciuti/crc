@@ -1,0 +1,88 @@
+---
+title: Claude Code
+description: Claude Code connects to crc as its IDE. It sees your file, selection and diagnostics, and every edit it proposes opens as a diff you accept or reject.
+---
+
+import { Steps, Aside, Tabs, TabItem } from "@astrojs/starlight/components";
+
+crc is an IDE that [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
+connects to, the same way it connects to VS Code or JetBrains. You do not
+install an extension; the bridge is part of the editor.
+
+## Connect
+
+<Tabs>
+<TabItem label="From a crc terminal">
+
+<Steps>
+
+1. Open the [terminal panel](/docs/features/terminal/) with <kbd>⌃</kbd><kbd>`</kbd>.
+2. Run `claude`.
+
+   It finds the crc window it is running in and connects by itself.
+
+</Steps>
+
+</TabItem>
+<TabItem label="As a tab">
+
+Press <kbd>⌘</kbd><kbd>⇧</kbd><kbd>C</kbd> (**View › Claude Code**). crc opens a
+terminal tab running `claude`, already connected.
+
+</TabItem>
+</Tabs>
+
+You need Claude Code installed and signed in; crc does not bundle it.
+
+## What Claude sees
+
+Without copying anything into the prompt, Claude can ask crc for:
+
+| Tool | What crc answers |
+|---|---|
+| `getCurrentSelection`, `getLatestSelection` | The file and selection you are on. |
+| `getDiagnostics` | Errors and warnings from the [language servers](/docs/features/language-servers/). |
+| `getOpenEditors` | Your open tabs, which one is active and which have unsaved changes. |
+| `getWorkspaceFolders` | The project folder. |
+| `checkDocumentDirty`, `saveDocument` | Whether a file has unsaved edits, and saving it. |
+| `openFile` | Opening a file in a tab. |
+| `openDiff`, `closeAllDiffTabs` | Proposing an edit as a diff, and closing those diffs. |
+
+## Reviewing edits
+
+Every edit Claude proposes opens as a **diff tab**. Read it, then:
+
+<div class="crc-keys">
+  <div><span>Accept the change</span><span><kbd>⌘</kbd><kbd>↩</kbd></span></div>
+  <div><span>Reject it</span><span><kbd>Esc</kbd></span></div>
+</div>
+
+Claude waits for your answer, however long you take.
+
+Files that Claude writes to disk directly show up in their tabs at once, the
+same way any [file changed by another program](/docs/features/files/) does:
+a clean tab reloads, and a tab with unsaved edits asks before anything is
+overwritten.
+
+## Security
+
+<Aside type="caution" title="Local only">
+  The bridge listens on `127.0.0.1` only, never on the network. It is
+  protected by a random token, written to a lock file readable by you alone, in
+  `~/.claude/ide/` (or under `$CLAUDE_CONFIG_DIR` when that is set). A client
+  without the token is refused.
+</Aside>
+
+To turn the bridge off entirely, start crc with `CRC_NO_CLAUDE=1` in its
+environment:
+
+```sh
+CRC_NO_CLAUDE=1 open -a crc .
+```
+
+## Where this is going
+
+Claude Code connecting to crc is the first step of a larger idea: an agent as
+a protocol client, reading the same buffer state, syntax tree and index the
+editor's own UI uses. That is not built yet; [Why crc exists](/vision/) says
+more.

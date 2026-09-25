@@ -1,0 +1,151 @@
+---
+// The marketing pages. Starlight owns /docs; this layout is everything
+// else: one dark look, the same nav and footer on every page.
+import "../styles/landing.css";
+
+interface Props {
+  title: string;
+  description: string;
+}
+
+const { title, description } = Astro.props;
+const canonical = new URL(Astro.url.pathname, Astro.site);
+const release = "https://github.com/caioricciuti/crc/releases/latest";
+const repo = "https://github.com/caioricciuti/crc";
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <link rel="canonical" href={canonical} />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <meta name="theme-color" content="#0a0c0c" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:url" content={canonical} />
+    <meta name="twitter:card" content="summary_large_image" />
+  </head>
+  <body>
+    <header class="nav" data-nav>
+      <div class="nav-inner">
+        <a class="brand" href="/" aria-label="crc home">
+          <img src="/favicon.svg" alt="" width="26" height="26" />
+          <span>crc</span>
+        </a>
+        <nav class="nav-links" aria-label="Main">
+          <a href="/#features">Features</a>
+          <a href="/#claude">Claude Code</a>
+          <a href="/#speed">Performance</a>
+          <a href="/docs/">Docs</a>
+          <a href="/changelog/">Changelog</a>
+        </nav>
+        <div class="nav-actions">
+          <a class="icon-link" href={repo} aria-label="crc on GitHub">
+            <svg viewBox="0 0 16 16" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+          </a>
+          <a class="btn btn-small btn-light" href={release}>Download</a>
+          <button class="menu-toggle" type="button" aria-label="Menu" aria-expanded="false" data-menu-toggle>
+            <span></span><span></span>
+          </button>
+        </div>
+      </div>
+      <div class="mobile-menu" data-mobile-menu hidden>
+        <a href="/#features">Features</a>
+        <a href="/#claude">Claude Code</a>
+        <a href="/#speed">Performance</a>
+        <a href="/docs/">Docs</a>
+        <a href="/changelog/">Changelog</a>
+        <a href={repo}>GitHub</a>
+      </div>
+    </header>
+
+    <main>
+      <slot />
+    </main>
+
+    <footer class="footer">
+      <div class="container footer-grid">
+        <div class="footer-brand">
+          <a class="brand" href="/">
+            <img src="/favicon.svg" alt="" width="26" height="26" />
+            <span>crc</span>
+          </a>
+          <p>A text editor for macOS, drawn on the GPU. Free software under the GPL.</p>
+        </div>
+        <div>
+          <h3>Product</h3>
+          <a href={release}>Download</a>
+          <a href="/changelog/">Changelog</a>
+          <a href="/docs/reference/limitations/">Known limits</a>
+          <a href="/docs/reference/performance/">Performance</a>
+        </div>
+        <div>
+          <h3>Docs</h3>
+          <a href="/docs/">Overview</a>
+          <a href="/docs/getting-started/installation/">Installation</a>
+          <a href="/docs/features/claude-code/">Claude Code</a>
+          <a href="/docs/reference/keyboard-shortcuts/">Keyboard shortcuts</a>
+        </div>
+        <div>
+          <h3>Project</h3>
+          <a href="/vision/">Why crc exists</a>
+          <a href="/dependency-review/">Dependency review</a>
+          <a href="/contributing/">Contributing</a>
+          <a href={`${repo}/issues`}>Issues</a>
+        </div>
+      </div>
+      <div class="container footer-base">
+        <span>GPL-3.0-or-later</span>
+        <span>No telemetry. No accounts. No web view.</span>
+      </div>
+    </footer>
+
+    <script>
+      const nav = document.querySelector<HTMLElement>("[data-nav]");
+      const onScroll = () => nav?.classList.toggle("scrolled", window.scrollY > 8);
+      onScroll();
+      window.addEventListener("scroll", onScroll, { passive: true });
+
+      const toggle = document.querySelector<HTMLButtonElement>("[data-menu-toggle]");
+      const menu = document.querySelector<HTMLElement>("[data-mobile-menu]");
+      toggle?.addEventListener("click", () => {
+        if (!menu) return;
+        const open = menu.hidden;
+        menu.hidden = !open;
+        toggle.setAttribute("aria-expanded", String(open));
+        nav?.classList.toggle("open", open);
+      });
+      menu?.querySelectorAll("a").forEach((a) =>
+        a.addEventListener("click", () => {
+          menu.hidden = true;
+          toggle?.setAttribute("aria-expanded", "false");
+          nav?.classList.remove("open");
+        }),
+      );
+
+      // Sections fade in once as they reach the viewport.
+      const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      const items = document.querySelectorAll<HTMLElement>("[data-reveal]");
+      if (reduce || !("IntersectionObserver" in window)) {
+        items.forEach((el) => el.classList.add("in"));
+      } else {
+        const io = new IntersectionObserver(
+          (entries) => {
+            for (const entry of entries) {
+              if (!entry.isIntersecting) continue;
+              entry.target.classList.add("in");
+              io.unobserve(entry.target);
+            }
+          },
+          { rootMargin: "0px 0px -8% 0px" },
+        );
+        items.forEach((el) => io.observe(el));
+      }
+    </script>
+  </body>
+</html>

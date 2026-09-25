@@ -1,0 +1,1765 @@
+---
+import { Image } from "astro:assets";
+import Landing from "../layouts/Landing.astro";
+import ClaudeMock from "../components/landing/ClaudeMock.astro";
+import CompletionMock from "../components/landing/CompletionMock.astro";
+import GitMock from "../components/landing/GitMock.astro";
+import editorDark from "../assets/editor-dark.png";
+import editorLight from "../assets/editor-light.png";
+import terminalDark from "../assets/terminal-dark.png";
+import homeDark from "../assets/home-dark.png";
+
+const release = "https://github.com/caioricciuti/crc/releases/latest";
+
+const shots = [
+  { label: "Editor", src: editorDark, alt: "crc editing a Rust file: syntax colours, indent guides, a Git mark in the gutter and the project sidebar." },
+  { label: "Terminal", src: terminalDark, alt: "crc with a terminal panel open under the editor, running zsh in the project folder." },
+  { label: "Light", src: editorLight, alt: "The same Rust file in crc's light appearance." },
+  { label: "Home", src: homeDark, alt: "crc's home screen with Start actions, recent folders and a short list of keys." },
+];
+
+const languages = [
+  ["Rust", "#f6a35b"],
+  ["Python", "#82aaff"],
+  ["TypeScript", "#82aaff"],
+  ["TSX", "#89ddff"],
+  ["JavaScript", "#e9c46a"],
+  ["JSX", "#89ddff"],
+  ["Go", "#7fd1c2"],
+  ["C", "#b7c0bc"],
+  ["C++", "#c792ea"],
+  ["HTML", "#e29c96"],
+  ["CSS", "#c792ea"],
+  ["JSON", "#a5d68a"],
+  ["TOML", "#f0a3c9"],
+  ["YAML", "#e2a43a"],
+  ["Shell", "#98cf9f"],
+];
+
+const keys = [
+  [["⌘", "P"], "Open any file"],
+  [["⌘", "P", ">"], "Run any menu command"],
+  [["⌘", "⇧", "F"], "Find in project"],
+  [["⌘", "D"], "Next occurrence as a cursor"],
+  [["⌘", "⇧", "C"], "Claude Code tab"],
+  [["⌃", "`"], "Terminal panel"],
+  [["⌘", "⌥", "G"], "Source Control"],
+  [["⌘", "\\"], "Split right"],
+  [["F12"], "Go to definition"],
+  [["F2"], "Rename symbol"],
+  [["⌘", "E"], "Markdown preview"],
+  [["⌥", "Z"], "Word wrap"],
+];
+---
+
+<Landing
+  title="crc: the editor that keeps up with you"
+  description="A native macOS text editor drawn on the GPU with Metal and CoreText. Terminal, local Git and Claude Code built in. 0.8 ms keystroke to GPU."
+>
+  <!-- ================= HERO ================= -->
+  <section class="hero">
+    <div class="hero-bg" aria-hidden="true">
+      <div class="aurora a1"></div>
+      <div class="aurora a2"></div>
+      <div class="aurora a3"></div>
+      <div class="grid"></div>
+    </div>
+
+    <div class="container hero-copy">
+      <a class="pill" href="/changelog/">
+        <span class="pill-tag">New</span>
+        <span>v0.2.0-alpha.1 is out for Apple Silicon</span>
+        <svg class="arrow" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.6" d="M6 3l5 5-5 5"/></svg>
+      </a>
+      <h1 class="h1">
+        The editor that<br /><span class="grad">keeps up with you.</span>
+      </h1>
+      <p class="sub">
+        A native macOS editor drawn on the GPU straight from Metal and CoreText.
+        Terminal, Git and Claude Code built in. No Electron, no web view,
+        and <strong>0.8&nbsp;ms</strong> from keystroke to GPU in a 100&nbsp;MiB file.
+      </p>
+      <div class="cta">
+        <a class="btn btn-light btn-lg" href={release}>
+          <svg viewBox="0 0 814 1000" width="15" height="18" aria-hidden="true"><path fill="currentColor" d="M788 341c-6 4-107 61-107 187 0 146 128 198 132 199-1 3-20 70-67 138-42 60-86 120-152 120s-83-38-159-38c-74 0-101 40-161 40s-103-56-151-124C66 783 21 660 21 543c0-187 122-287 242-287 64 0 117 42 157 42 38 0 98-45 171-45 28 0 128 3 197 88zM554 167c30-35 51-84 51-133 0-7-1-14-2-19-49 2-107 33-142 73-27 31-53 80-53 130 0 7 1 15 2 17 3 1 8 1 13 1 44 0 99-30 131-69z"/></svg>
+          Download for macOS
+        </a>
+        <a class="btn btn-ghost btn-lg" href="/docs/">
+          Read the docs
+          <svg class="arrow" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.6" d="M3 8h10M9 4l4 4-4 4"/></svg>
+        </a>
+      </div>
+      <p class="meta">
+        <span>Apple Silicon</span><span>macOS 14+</span><span>Signed &amp; notarized</span><span>Free &amp; open source</span>
+      </p>
+    </div>
+
+    <div class="container stage-wrap">
+      <div class="switch" role="tablist" aria-label="Screenshots">
+        {shots.map((s, i) => (
+          <button type="button" role="tab" aria-selected={i === 0 ? "true" : "false"} data-shot={i}>{s.label}</button>
+        ))}
+        <span class="switch-glider" aria-hidden="true"></span>
+      </div>
+      <div class="stage">
+        <div class="stage-glow" aria-hidden="true"></div>
+        <div class="stage-frame">
+          {shots.map((s, i) => (
+            <Image
+              src={s.src}
+              alt={s.alt}
+              class:list={["shot", { on: i === 0 }]}
+              data-shot-img={i}
+              widths={[800, 1400, 2000]}
+              sizes="(max-width: 76rem) 100vw, 72rem"
+              loading={i === 0 ? "eager" : "lazy"}
+              fetchpriority={i === 0 ? "high" : "auto"}
+            />
+          ))}
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= STATS ================= -->
+  <section class="stats-band">
+    <div class="container stats" data-reveal>
+      <div><strong>0.8<small>ms</small></strong><span>keystroke to GPU, p99,<br />in a 100 MiB file</span></div>
+      <div><strong>14</strong><span>crates in the whole<br />dependency tree</span></div>
+      <div><strong>17<small>MB</small></strong><span>on disk, signed<br />and notarized</span></div>
+      <div><strong>0</strong><span>web views, JS runtimes<br />or telemetry</span></div>
+    </div>
+  </section>
+
+  <!-- ================= CLAUDE ================= -->
+  <section class="section" id="claude">
+    <div class="container split">
+      <div class="split-copy" data-reveal>
+        <span class="eyebrow">Claude Code, inside</span>
+        <h2 class="h2">An agent that edits<br /><span class="soft">where you can see it.</span></h2>
+        <p class="lead">
+          Type <code>claude</code> in any crc terminal and it connects to the window by itself,
+          or press <kbd class="key">⌘</kbd><kbd class="key">⇧</kbd><kbd class="key">C</kbd> for a Claude tab.
+          Every change it proposes opens as a diff you accept or reject.
+        </p>
+        <ul class="checks">
+          <li><b>Context without copy-paste.</b> Claude sees the file and selection you are on, and the language server diagnostics.</li>
+          <li><b>Diffs, not surprises.</b> Accept with <kbd class="key">⌘</kbd><kbd class="key">↩</kbd>, reject with <kbd class="key">Esc</kbd>.</li>
+          <li><b>Live files.</b> Anything Claude writes to disk shows up in its tab at once.</li>
+          <li><b>Local only.</b> The bridge listens on 127.0.0.1 behind a random token readable by you alone.</li>
+        </ul>
+        <a class="more" href="/docs/features/claude-code/">How the bridge works <span>→</span></a>
+      </div>
+      <div class="split-visual" data-reveal>
+        <div class="visual-bg v-claude" aria-hidden="true"></div>
+        <ClaudeMock />
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= COMPLETION ================= -->
+  <section class="section tight" id="features">
+    <div class="container split reverse">
+      <div class="split-copy" data-reveal>
+        <span class="eyebrow">Completion that learns</span>
+        <h2 class="h2">It tells you why<br /><span class="soft">it guessed that.</span></h2>
+        <p class="lead">
+          The best guess appears as ghost text at the caret; the alternatives sit
+          in one row of chips under the line. A single line explains the pick:
+          where it is defined, how often it is used, how often you chose it after
+          the same receiver.
+        </p>
+        <div class="sources">
+          <span>Language server</span>
+          <span>Project index (SQLite)</span>
+          <span>Nearby words</span>
+          <span>Paths &amp; imports</span>
+          <span>Your own history</span>
+        </div>
+        <p class="fine">History stays on your Mac. Go &gt; Forget Completion History clears it.</p>
+      </div>
+      <div class="split-visual" data-reveal>
+        <div class="visual-bg v-complete" aria-hidden="true"></div>
+        <CompletionMock />
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= TERMINAL + GIT ================= -->
+  <section class="section tight">
+    <div class="container">
+      <div class="section-head center" data-reveal>
+        <span class="eyebrow">Terminal and Git</span>
+        <h2 class="h2">Your shell and your repo,<br /><span class="soft">one keystroke away.</span></h2>
+        <p class="lead">
+          Terminal sessions run your login shell in the project folder on an
+          xterm-compatible emulator written for crc. Source Control stages whole
+          files or single hunks, commits, switches branches, fetches, pulls and pushes.
+        </p>
+      </div>
+      <div class="tg" data-reveal>
+        <div class="tg-shot">
+          <Image src={terminalDark} alt="The terminal panel under the editor, with a zsh prompt in the project folder." widths={[800, 1400]} sizes="(max-width: 60rem) 100vw, 48rem" />
+        </div>
+        <div class="tg-git">
+          <GitMock />
+        </div>
+      </div>
+      <div class="tg-facts" data-reveal>
+        <div><b>24-bit colour</b><span>scroll regions, alternate screen, bracketed paste</span></div>
+        <div><b>⌘-click a path</b><span><code>src/main.rs:42:7</code> in any output opens that line</span></div>
+        <div><b>Hunk staging</b><span>stage or unstage one change at a time</span></div>
+        <div><b>Blame in the status line</b><span>who changed the caret's line, and when</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= SPEED ================= -->
+  <section class="section speed" id="speed">
+    <div class="speed-bg" aria-hidden="true"></div>
+    <div class="container">
+      <div class="section-head" data-reveal>
+        <span class="eyebrow">Performance</span>
+        <h2 class="h2">A tenth of a frame.<br /><span class="soft">In a 100 MiB file.</span></h2>
+        <p class="lead">
+          At 120 Hz a frame lasts 8.333 ms. crc goes from keystroke to finished GPU work
+          in 0.803 ms at p99 with the caret halfway through 2.7 million lines. The
+          harness ships in the repository, so you can measure it yourself.
+        </p>
+      </div>
+
+      <div class="bench" data-reveal>
+        <div class="bench-row">
+          <div class="bench-label"><b>Editor viewport</b><span>p99, keystroke to GPU completion</span></div>
+          <div class="bench-track"><div class="bench-bar" style="--w: 9.64%"></div></div>
+          <div class="bench-val">0.803 ms</div>
+        </div>
+        <div class="bench-row">
+          <div class="bench-label"><b>With toolbar, sidebar, tabs, status</b><span>the whole window</span></div>
+          <div class="bench-track"><div class="bench-bar alt" style="--w: 12.1%"></div></div>
+          <div class="bench-val">1.009 ms</div>
+        </div>
+        <div class="bench-row budget">
+          <div class="bench-label"><b>One frame at 120 Hz</b><span>the budget</span></div>
+          <div class="bench-track"><div class="bench-bar ghost" style="--w: 100%"></div></div>
+          <div class="bench-val">8.333 ms</div>
+        </div>
+        <div class="bench-code">
+          <span class="dim">$</span> cargo run --release --offline --example frame_latency <span class="dim">-- --chrome</span>
+        </div>
+      </div>
+
+      <div class="why-fast" data-reveal>
+        <div>
+          <span class="n">01</span>
+          <h3>One draw call per frame</h3>
+          <p>Every glyph is an instance of one quad. A screen of text is a single <code>drawPrimitives</code>.</p>
+        </div>
+        <div>
+          <span class="n">02</span>
+          <h3>Only what you can see</h3>
+          <p>Layout touches the visible lines, so a 100 MiB file costs what a small one does.</p>
+        </div>
+        <div>
+          <span class="n">03</span>
+          <h3>A persistent rope</h3>
+          <p>Our own B-tree. Cloning is O(1), which makes undo snapshots and background parsing cheap.</p>
+        </div>
+        <div>
+          <span class="n">04</span>
+          <h3>Metal and CoreText</h3>
+          <p>The OS's own text shaping and GPU API, reached directly. No browser engine in between.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= BENTO ================= -->
+  <section class="section" id="more">
+    <div class="container">
+      <div class="section-head center" data-reveal>
+        <span class="eyebrow">Everything else</span>
+        <h2 class="h2">Everything an editor needs.<br /><span class="soft">Nothing it doesn't.</span></h2>
+      </div>
+
+      <div class="bento" data-reveal>
+        <article class="card c-wide">
+          <div class="card-art art-palette" aria-hidden="true">
+            <div class="pal">
+              <div class="pal-input"><span class="q">&gt;</span> sw<span class="caret"></span></div>
+              <div class="pal-row on"><span>Git: <b>Sw</b>itch Branch…</span></div>
+              <div class="pal-row"><span>View: <b>S</b>plit Editor Right</span><kbd>⌘\</kbd></div>
+              <div class="pal-row"><span>Go: Go to <b>S</b>ymbol in Project…</span><kbd>⌘T</kbd></div>
+              <div class="pal-row"><span>View: <b>W</b>ord Wrap</span><kbd>⌥Z</kbd></div>
+            </div>
+          </div>
+          <h3>Open Quickly, and every command</h3>
+          <p><kbd class="key">⌘</kbd><kbd class="key">P</kbd> fuzzy-finds any file. Type <code>&gt;</code> in the same box to run any menu command.</p>
+        </article>
+
+        <article class="card">
+          <div class="card-art art-split" aria-hidden="true">
+            <i></i><i></i><i></i><i></i>
+          </div>
+          <h3>Split panes</h3>
+          <p>Up to four, each with its own tabs. <kbd class="key">⌘</kbd><kbd class="key">\</kbd></p>
+        </article>
+
+        <article class="card">
+          <div class="card-art art-cursors" aria-hidden="true">
+            <div><span class="k">let</span> bed<span class="mc"></span> = 3;</div>
+            <div><span class="k">let</span> bed<span class="mc"></span> = 7;</div>
+            <div><span class="k">let</span> bed<span class="mc"></span> = 9;</div>
+          </div>
+          <h3>Multiple cursors</h3>
+          <p><kbd class="key">⌘</kbd><kbd class="key">D</kbd> for the next match, Option-click for anywhere.</p>
+        </article>
+
+        <article class="card c-tall">
+          <div class="card-art art-http" aria-hidden="true">
+            <div class="req">
+              <div><span class="c">### Create a bed</span></div>
+              <div><span class="k">POST</span> <span class="u">{"{{host}}"}/beds</span></div>
+              <div><span class="t">Content-Type:</span> application/json</div>
+              <div>&nbsp;</div>
+              <div>{"{"}<span class="s">"name"</span>: <span class="s">"north"</span>{"}"}</div>
+            </div>
+            <div class="res">
+              <div class="res-head"><span class="ok">201 Created</span><span>84 ms</span></div>
+              <div>{"{"}</div>
+              <div>&nbsp;&nbsp;<span class="p">"id"</span>: <span class="n">12</span>,</div>
+              <div>&nbsp;&nbsp;<span class="p">"name"</span>: <span class="s">"north"</span></div>
+              <div>{"}"}</div>
+            </div>
+          </div>
+          <h3>HTTP requests from <code>.http</code> files</h3>
+          <p>The JetBrains and VS Code REST Client format, with environments. <kbd class="key">⌘</kbd><kbd class="key">↩</kbd> sends the request under the caret; the response opens in a tab.</p>
+        </article>
+
+        <article class="card">
+          <div class="card-art art-lsp" aria-hidden="true">
+            <span>rust-analyzer</span><span>gopls</span><span>pyright</span><span>typescript-language-server</span><span>clangd</span>
+          </div>
+          <h3>Language servers</h3>
+          <p>Definition, hover, references, rename, format and signature help. Found where you installed them.</p>
+        </article>
+
+        <article class="card">
+          <div class="card-art art-dialog" aria-hidden="true">
+            <div class="dlg">
+              <b>garden.yaml changed on disk</b>
+              <span>You have unsaved edits.</span>
+              <div class="dlg-btns"><i>Reload</i><i>Cancel</i><i class="pri">Overwrite</i></div>
+            </div>
+          </div>
+          <h3>Files you can trust</h3>
+          <p>Atomic saves that keep mode and symlinks. Crash recovery for unsaved text. Every encoding and line ending preserved.</p>
+        </article>
+
+        <article class="card">
+          <div class="card-art art-md" aria-hidden="true">
+            <div class="md-src"><span class="c">## </span>Beds<br /><span class="c">- </span>north: <span class="c">**</span>tomato<span class="c">**</span></div>
+            <div class="md-out"><b>Beds</b><span>• north: <strong>tomato</strong></span></div>
+          </div>
+          <h3>Markdown, rendered</h3>
+          <p>Renders in place as you type, with a preview on <kbd class="key">⌘</kbd><kbd class="key">E</kbd>. Images, PDFs and media open in Quick Look.</p>
+        </article>
+
+        <article class="card c-full">
+          <div class="card-art art-fold" aria-hidden="true">
+            <div><span class="chev">›</span><span class="k">pub fn</span> <span class="f">read_log</span>(path: &amp;<span class="t">Path</span>) <span class="folded">{"{ … }"}</span></div>
+            <div><span class="chev open">›</span><span class="k">pub fn</span> <span class="f">plantings_per_bed</span>(entries: &amp;[<span class="t">Entry</span>]) {"{"}</div>
+            <div class="in">    <span class="k">let mut</span> beds = <span class="t">BTreeMap</span>::<span class="f">new</span>();  <span class="c">// long lines wrap on ⌥Z, and wrap by default in Markdown</span></div>
+          </div>
+          <h3>Folding, word wrap and the rest</h3>
+          <p>Fold a block or the whole file, wrap long lines, go to symbol, find and replace with regex, comment toggle, line move and duplicate, Emacs motions, full Unicode with emoji and CJK, session restore.</p>
+        </article>
+      </div>
+
+      <div class="langs" data-reveal>
+        <p>Highlighting via tree-sitter, compiled from vendored C</p>
+        <div class="marquee">
+          <div class="marquee-track">
+            {[...languages, ...languages].map(([name, color], i) => (
+              <span class:list={["lang", { dup: i >= languages.length }]} aria-hidden={i >= languages.length ? "true" : undefined}><i style={`background:${color}`}></i>{name}</span>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= KEYBOARD ================= -->
+  <section class="section tight keys-section">
+    <div class="container split">
+      <div class="split-copy" data-reveal>
+        <span class="eyebrow">Keyboard first</span>
+        <h2 class="h2">Your hands<br /><span class="soft">never leave the keys.</span></h2>
+        <p class="lead">
+          macOS conventions where they exist, the bindings every editor shares where
+          they don't, and the Emacs motions your fingers already know.
+        </p>
+        <a class="more" href="/docs/reference/keyboard-shortcuts/">All keyboard shortcuts <span>→</span></a>
+      </div>
+      <div class="keygrid" data-reveal>
+        {keys.map(([combo, label]) => (
+          <div class="keyrow">
+            <span class="combo">{(combo as string[]).map((k) => <kbd class="key">{k}</kbd>)}</span>
+            <span>{label}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= TRUST ================= -->
+  <section class="section trust" id="trust">
+    <div class="container">
+      <div class="section-head center" data-reveal>
+        <span class="eyebrow">Supply chain</span>
+        <h2 class="h2">Read, not trusted.</h2>
+        <p class="lead">
+          Cargo runs build scripts and proc macros with no allowlist and no minimum release age.
+          So crc keeps its tree small enough to read, and CI fails if that changes.
+        </p>
+      </div>
+      <div class="trust-grid" data-reveal>
+        <div class="trust-num"><strong>14</strong><span>crates, every one pinned to an exact version</span></div>
+        <div class="trust-num"><strong>1</strong><span>build script, read line by line</span></div>
+        <div class="trust-num"><strong>0</strong><span>proc macros anywhere in the tree</span></div>
+      </div>
+      <div class="compare" data-reveal>
+        <div class="compare-row head"><span>Adding tree-sitter</span><span>Crates</span><span>Build scripts</span><span>Proc macros</span></div>
+        <div class="compare-row"><span>As the crates.io crate</span><span>29</span><span>10</span><span>1</span></div>
+        <div class="compare-row us"><span>As vendored C, crc's own build.rs</span><span>0</span><span>1</span><span>0</span></div>
+      </div>
+      <p class="trust-foot" data-reveal>
+        Signed with a Developer ID and notarized. Grammars pinned by checksum. GitHub Actions pinned by commit.{" "}
+        <a href="/dependency-review/">Read the dependency review →</a>
+      </p>
+    </div>
+  </section>
+
+  <!-- ================= HONEST ================= -->
+  <section class="section tight">
+    <div class="container honest" data-reveal>
+      <div>
+        <span class="eyebrow warn">An honest alpha</span>
+        <h2 class="h2">What it doesn't do yet.</h2>
+        <p class="lead">Used every day by its author, now going to a small group of testers. Passing tests are not a stability guarantee.</p>
+        <a class="more" href="/docs/reference/limitations/">Every known limit <span>→</span></a>
+      </div>
+      <ul class="nots">
+        <li><b>macOS on Apple Silicon only.</b> No Intel build, no Linux or Windows plans.</li>
+        <li><b>A fixed set of grammars.</b> No SQL highlighting in the alpha.</li>
+        <li><b>No code actions</b> from language servers, and no minimap.</li>
+        <li><b>A file lives in one pane at a time.</b></li>
+        <li><b>Updates are announced, not installed.</b> Nothing downloads itself.</li>
+        <li><b>No extensions yet.</b> WASM with declared capabilities is the plan.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ================= FINAL CTA ================= -->
+  <section class="final">
+    <div class="final-bg" aria-hidden="true"></div>
+    <div class="container final-inner" data-reveal>
+      <img src="/favicon.svg" alt="" width="72" height="72" class="final-icon" />
+      <h2 class="h2">Try the alpha.</h2>
+      <p class="lead">Seventeen megabytes. Opens without a Gatekeeper warning. Drag it to Applications and open a folder.</p>
+      <div class="cta center">
+        <a class="btn btn-light btn-lg" href={release}>
+          <svg viewBox="0 0 814 1000" width="15" height="18" aria-hidden="true"><path fill="currentColor" d="M788 341c-6 4-107 61-107 187 0 146 128 198 132 199-1 3-20 70-67 138-42 60-86 120-152 120s-83-38-159-38c-74 0-101 40-161 40s-103-56-151-124C66 783 21 660 21 543c0-187 122-287 242-287 64 0 117 42 157 42 38 0 98-45 171-45 28 0 128 3 197 88zM554 167c30-35 51-84 51-133 0-7-1-14-2-19-49 2-107 33-142 73-27 31-53 80-53 130 0 7 1 15 2 17 3 1 8 1 13 1 44 0 99-30 131-69z"/></svg>
+          Download for macOS
+        </a>
+        <a class="btn btn-ghost btn-lg" href="/docs/getting-started/installation/">Build from source</a>
+      </div>
+      <pre class="final-code"><span class="dim">$</span> open -a crc .</pre>
+    </div>
+  </section>
+</Landing>
+
+<script>
+  const tabs = Array.from(document.querySelectorAll<HTMLButtonElement>("[data-shot]"));
+  const imgs = Array.from(document.querySelectorAll<HTMLElement>("[data-shot-img]"));
+  const glider = document.querySelector<HTMLElement>(".switch-glider");
+  let current = 0;
+  let timer: number | undefined;
+
+  function place(tab: HTMLElement) {
+    if (!glider) return;
+    glider.style.width = `${tab.offsetWidth}px`;
+    glider.style.transform = `translateX(${tab.offsetLeft}px)`;
+  }
+
+  function show(i: number) {
+    current = i;
+    tabs.forEach((t, n) => t.setAttribute("aria-selected", String(n === i)));
+    imgs.forEach((img, n) => img.classList.toggle("on", n === i));
+    place(tabs[i]);
+  }
+
+  const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  function auto() {
+    if (reduce) return;
+    window.clearInterval(timer);
+    timer = window.setInterval(() => show((current + 1) % tabs.length), 5000);
+  }
+
+  tabs.forEach((t, i) =>
+    t.addEventListener("click", () => {
+      show(i);
+      window.clearInterval(timer);
+    }),
+  );
+  window.addEventListener("resize", () => place(tabs[current]));
+  requestAnimationFrame(() => place(tabs[0]));
+  document.fonts?.ready.then(() => place(tabs[current]));
+
+  // Only rotate while the screenshot is on screen.
+  const stage = document.querySelector(".stage");
+  if (stage && "IntersectionObserver" in window) {
+    new IntersectionObserver(([e]) => (e.isIntersecting ? auto() : window.clearInterval(timer))).observe(stage);
+  }
+</script>
+
+<style>
+  /* ---------- hero ---------- */
+  .hero {
+    position: relative;
+    padding-top: calc(8.5rem + env(safe-area-inset-top, 0px));
+    overflow: hidden;
+    isolation: isolate;
+  }
+  .hero-bg {
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
+  }
+  .aurora {
+    position: absolute;
+    border-radius: 50%;
+    filter: blur(90px);
+    opacity: 0.55;
+  }
+  .a1 {
+    width: 60rem;
+    height: 34rem;
+    left: 50%;
+    top: 26rem;
+    transform: translateX(-50%);
+    background: radial-gradient(closest-side, rgba(63, 185, 138, 0.55), transparent);
+  }
+  .a2 {
+    width: 38rem;
+    height: 30rem;
+    left: 8%;
+    top: 34rem;
+    background: radial-gradient(closest-side, rgba(130, 170, 255, 0.35), transparent);
+  }
+  .a3 {
+    width: 36rem;
+    height: 30rem;
+    right: 6%;
+    top: 30rem;
+    background: radial-gradient(closest-side, rgba(199, 146, 234, 0.3), transparent);
+  }
+  .grid {
+    position: absolute;
+    inset: 0;
+    background-image:
+      linear-gradient(rgba(255, 255, 255, 0.035) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255, 255, 255, 0.035) 1px, transparent 1px);
+    background-size: 64px 64px;
+    mask-image: radial-gradient(ellipse 70% 50% at 50% 20%, #000 20%, transparent 75%);
+    -webkit-mask-image: radial-gradient(ellipse 70% 50% at 50% 20%, #000 20%, transparent 75%);
+  }
+  .hero-copy {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+  }
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.6rem;
+    padding: 0.3rem 0.8rem 0.3rem 0.35rem;
+    border-radius: 999px;
+    border: 1px solid var(--line-2);
+    background: rgba(255, 255, 255, 0.03);
+    font-size: 0.83rem;
+    color: var(--text-2);
+    transition: border-color 0.2s ease, background 0.2s ease;
+  }
+  .pill:hover {
+    border-color: rgba(166, 221, 194, 0.4);
+    background: rgba(166, 221, 194, 0.06);
+  }
+  .pill-tag {
+    padding: 0.1rem 0.5rem;
+    border-radius: 999px;
+    background: var(--mint);
+    color: #0f1d17;
+    font-weight: 650;
+    font-size: 0.72rem;
+  }
+  .h1 {
+    font-family: var(--display);
+    font-size: clamp(2.7rem, 8vw, 5.6rem);
+    line-height: 0.98;
+    letter-spacing: -0.045em;
+    font-weight: 660;
+    margin: 1.6rem 0 0;
+  }
+  .grad {
+    background: linear-gradient(95deg, #eef2f0 10%, var(--mint) 45%, #82aaff 75%, #c792ea 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  .sub {
+    max-width: 40rem;
+    margin: 1.6rem 0 0;
+    font-size: clamp(1.02rem, 1.7vw, 1.22rem);
+    line-height: 1.6;
+    color: var(--text-2);
+    text-wrap: pretty;
+  }
+  .sub strong {
+    color: var(--text);
+    font-weight: 600;
+  }
+  .cta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+    margin-top: 2.2rem;
+    justify-content: center;
+  }
+  .btn-lg {
+    height: 3.2rem;
+    padding: 0 1.5rem;
+    font-size: 1rem;
+  }
+  .meta {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 0.4rem 1.2rem;
+    margin: 1.6rem 0 0;
+    font-size: 0.82rem;
+    color: var(--muted);
+  }
+  .meta span {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45rem;
+  }
+  .meta span::before {
+    content: "";
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: var(--mint-2);
+  }
+
+  .stage-wrap {
+    margin-top: 4rem;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  .switch {
+    position: relative;
+    display: inline-flex;
+    padding: 4px;
+    border-radius: 999px;
+    border: 1px solid var(--line-2);
+    background: rgba(15, 18, 18, 0.7);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    margin-bottom: 1.5rem;
+  }
+  .switch button {
+    position: relative;
+    z-index: 1;
+    border: 0;
+    background: transparent;
+    color: var(--muted);
+    font: inherit;
+    font-size: 0.85rem;
+    padding: 0.4rem 1rem;
+    border-radius: 999px;
+    cursor: pointer;
+    transition: color 0.2s ease;
+  }
+  .switch button[aria-selected="true"] {
+    color: #0f1d17;
+    font-weight: 600;
+  }
+  .switch-glider {
+    position: absolute;
+    top: 4px;
+    bottom: 4px;
+    left: 0;
+    width: 0;
+    border-radius: 999px;
+    background: var(--mint);
+    transition: transform 0.35s cubic-bezier(0.3, 0.7, 0.2, 1), width 0.35s cubic-bezier(0.3, 0.7, 0.2, 1);
+  }
+  .stage {
+    position: relative;
+    width: 100%;
+    max-width: 72rem;
+    padding: clamp(0.75rem, 3vw, 2.5rem);
+    border-radius: 24px;
+    background:
+      radial-gradient(120% 90% at 0% 0%, rgba(63, 185, 138, 0.35), transparent 55%),
+      radial-gradient(90% 90% at 100% 0%, rgba(130, 170, 255, 0.3), transparent 55%),
+      radial-gradient(100% 80% at 50% 100%, rgba(199, 146, 234, 0.28), transparent 60%),
+      linear-gradient(180deg, #13201b, #0e1214);
+    border: 1px solid var(--line-2);
+    box-shadow: 0 60px 160px -40px rgba(63, 185, 138, 0.35);
+  }
+  .stage::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    pointer-events: none;
+    opacity: 0.35;
+    mix-blend-mode: overlay;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.6'/%3E%3C/svg%3E");
+  }
+  .stage-glow {
+    position: absolute;
+    inset: 10% 10% -6% 10%;
+    background: radial-gradient(closest-side, rgba(166, 221, 194, 0.25), transparent);
+    filter: blur(40px);
+    z-index: -1;
+  }
+  .stage-frame {
+    position: relative;
+    z-index: 1;
+    display: grid;
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 30px 80px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(0, 0, 0, 0.6), 0 0 0 1.5px rgba(255, 255, 255, 0.08);
+    background: var(--editor);
+  }
+  .stage-frame :global(.shot) {
+    grid-area: 1 / 1;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    object-position: top left;
+    aspect-ratio: 16 / 10;
+    opacity: 0;
+    transform: scale(1.01);
+    transition: opacity 0.6s ease, transform 0.8s ease;
+  }
+  .stage-frame :global(.shot.on) {
+    opacity: 1;
+    transform: none;
+  }
+
+  /* ---------- stats ---------- */
+  .stats-band {
+    padding-block: 4.5rem 1rem;
+  }
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    border-block: 1px solid var(--line);
+  }
+  .stats > div {
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+    padding: 2rem 1.5rem;
+    border-left: 1px solid var(--line);
+  }
+  .stats > div:first-child {
+    border-left: 0;
+  }
+  .stats strong {
+    font-family: var(--display);
+    font-size: clamp(2.4rem, 4.5vw, 3.4rem);
+    font-weight: 620;
+    line-height: 1;
+    letter-spacing: -0.04em;
+    font-variant-numeric: tabular-nums;
+  }
+  .stats small {
+    font-size: 0.45em;
+    margin-left: 0.15em;
+    color: var(--mint);
+    letter-spacing: 0;
+  }
+  .stats span {
+    color: var(--muted);
+    font-size: 0.9rem;
+    line-height: 1.45;
+  }
+  @media (max-width: 48rem) {
+    .stats {
+      grid-template-columns: 1fr 1fr;
+    }
+    .stats > div:nth-child(3) {
+      border-left: 0;
+    }
+    .stats > div:nth-child(n + 3) {
+      border-top: 1px solid var(--line);
+    }
+  }
+
+  /* ---------- split sections ---------- */
+  .section.tight {
+    padding-block: clamp(3.5rem, 8vw, 6rem);
+  }
+  .split {
+    display: grid;
+    grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+    gap: clamp(2.5rem, 6vw, 5rem);
+    align-items: center;
+  }
+  .split.reverse .split-copy {
+    order: 2;
+  }
+  .split-visual {
+    position: relative;
+  }
+  .visual-bg {
+    position: absolute;
+    inset: -12% -8%;
+    z-index: -1;
+    filter: blur(60px);
+    opacity: 0.6;
+    pointer-events: none;
+  }
+  .v-claude {
+    background: radial-gradient(40% 50% at 40% 40%, rgba(217, 119, 87, 0.35), transparent), radial-gradient(40% 50% at 70% 70%, rgba(63, 185, 138, 0.3), transparent);
+  }
+  .v-complete {
+    background: radial-gradient(40% 50% at 50% 50%, rgba(130, 170, 255, 0.35), transparent), radial-gradient(30% 40% at 30% 70%, rgba(166, 221, 194, 0.25), transparent);
+  }
+  .split-copy code,
+  .lead code {
+    font-size: 0.9em;
+    padding: 0.1em 0.4em;
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--mint);
+  }
+  .checks {
+    list-style: none;
+    padding: 0;
+    margin: 2rem 0 0;
+    display: grid;
+    gap: 1rem;
+  }
+  .checks li {
+    position: relative;
+    padding-left: 2rem;
+    color: var(--text-2);
+    font-size: 0.97rem;
+  }
+  .checks li::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 0.3rem;
+    width: 1.1rem;
+    height: 1.1rem;
+    border-radius: 50%;
+    background: rgba(166, 221, 194, 0.14) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4 8.5l2.5 2.5L12 5.5' fill='none' stroke='%23a6ddc2' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center / 0.8rem no-repeat;
+  }
+  .checks b {
+    color: var(--text);
+    font-weight: 600;
+  }
+  .more {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    margin-top: 2rem;
+    color: var(--mint);
+    font-weight: 550;
+    font-size: 0.95rem;
+  }
+  .more span {
+    transition: transform 0.2s ease;
+  }
+  .more:hover span {
+    transform: translateX(4px);
+  }
+  .sources {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-top: 2rem;
+  }
+  .sources span {
+    padding: 0.35rem 0.8rem;
+    border-radius: 999px;
+    border: 1px solid var(--line-2);
+    font-size: 0.83rem;
+    color: var(--text-2);
+    background: rgba(255, 255, 255, 0.02);
+  }
+  .fine {
+    color: var(--dim);
+    font-size: 0.85rem;
+    margin-top: 1.2rem;
+  }
+  @media (max-width: 60rem) {
+    .split {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .split.reverse .split-copy {
+      order: 0;
+    }
+  }
+
+  /* ---------- terminal + git ---------- */
+  .tg {
+    display: grid;
+    grid-template-columns: minmax(0, 1.7fr) minmax(0, 1fr);
+    gap: 1.25rem;
+    margin-top: 3.5rem;
+    align-items: center;
+  }
+  .tg-shot {
+    border-radius: 14px;
+    overflow: hidden;
+    border: 1px solid var(--line-2);
+    box-shadow: 0 40px 100px -20px rgba(0, 0, 0, 0.8);
+    background: var(--editor);
+  }
+  .tg-shot :global(img) {
+    width: 100%;
+    height: auto;
+  }
+  .tg-facts {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1.5rem;
+    margin-top: 2.5rem;
+  }
+  .tg-facts div {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    padding-top: 1rem;
+    border-top: 1px solid var(--line-2);
+  }
+  .tg-facts b {
+    font-weight: 600;
+    font-size: 0.95rem;
+  }
+  .tg-facts span {
+    color: var(--muted);
+    font-size: 0.88rem;
+    line-height: 1.5;
+  }
+  .tg-facts code {
+    color: var(--mint);
+    font-size: 0.85em;
+  }
+  @media (max-width: 60rem) {
+    .tg {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .tg-facts {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+  }
+
+  /* ---------- speed ---------- */
+  .speed {
+    background: linear-gradient(180deg, transparent, rgba(63, 185, 138, 0.04) 40%, transparent);
+    overflow: hidden;
+  }
+  .speed-bg {
+    position: absolute;
+    inset: 0;
+    background-image: radial-gradient(rgba(166, 221, 194, 0.12) 1px, transparent 1px);
+    background-size: 22px 22px;
+    mask-image: radial-gradient(ellipse 60% 60% at 80% 30%, #000, transparent 70%);
+    -webkit-mask-image: radial-gradient(ellipse 60% 60% at 80% 30%, #000, transparent 70%);
+    pointer-events: none;
+  }
+  .bench {
+    position: relative;
+    margin-top: 3.5rem;
+    padding: clamp(1.25rem, 3vw, 2.25rem);
+    border-radius: 18px;
+    border: 1px solid var(--line-2);
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.03), rgba(255, 255, 255, 0.01));
+    display: grid;
+    gap: 1.6rem;
+  }
+  .bench-row {
+    display: grid;
+    grid-template-columns: 16rem minmax(0, 1fr) 6rem;
+    align-items: center;
+    gap: 1.5rem;
+  }
+  .bench-label {
+    display: flex;
+    flex-direction: column;
+  }
+  .bench-label b {
+    font-weight: 580;
+    font-size: 0.95rem;
+  }
+  .bench-label span {
+    color: var(--muted);
+    font-size: 0.8rem;
+  }
+  .bench-track {
+    height: 14px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.04);
+    overflow: hidden;
+  }
+  .bench-bar {
+    height: 100%;
+    width: 0;
+    border-radius: 999px;
+    background: linear-gradient(90deg, var(--mint-2), var(--mint));
+    box-shadow: 0 0 24px rgba(166, 221, 194, 0.6);
+    transition: width 1.6s cubic-bezier(0.2, 0.8, 0.2, 1) 0.2s;
+  }
+  .bench-bar.alt {
+    background: linear-gradient(90deg, #5b8cff, var(--fn));
+    box-shadow: 0 0 24px rgba(130, 170, 255, 0.5);
+  }
+  .bench-bar.ghost {
+    background: repeating-linear-gradient(90deg, rgba(255, 255, 255, 0.12) 0 2px, transparent 2px 10px);
+    box-shadow: none;
+  }
+  .in .bench-bar {
+    width: var(--w);
+  }
+  @media (prefers-reduced-motion: reduce), (scripting: none) {
+    .bench-bar {
+      width: var(--w);
+      transition: none;
+    }
+  }
+  .bench-val {
+    font-family: var(--mono);
+    font-size: 0.95rem;
+    text-align: right;
+    color: var(--text);
+    font-variant-numeric: tabular-nums;
+  }
+  .budget .bench-val {
+    color: var(--muted);
+  }
+  .bench-code {
+    font-family: var(--mono);
+    font-size: 0.85rem;
+    padding: 0.9rem 1.1rem;
+    border-radius: 10px;
+    background: rgba(0, 0, 0, 0.35);
+    border: 1px solid var(--line);
+    color: var(--text-2);
+    overflow-x: auto;
+    white-space: nowrap;
+  }
+  .dim {
+    color: var(--dim);
+  }
+  @media (max-width: 48rem) {
+    .bench-row {
+      grid-template-columns: 1fr auto;
+      gap: 0.6rem 1rem;
+    }
+    .bench-track {
+      grid-column: 1 / -1;
+      grid-row: 2;
+    }
+  }
+  .why-fast {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1.25rem;
+    margin-top: 1.25rem;
+  }
+  .why-fast > div {
+    padding: 1.5rem;
+    border-radius: 16px;
+    border: 1px solid var(--line);
+    background: rgba(255, 255, 255, 0.015);
+  }
+  .why-fast .n {
+    font-family: var(--mono);
+    font-size: 0.75rem;
+    color: var(--mint);
+  }
+  .why-fast h3 {
+    margin: 0.8rem 0 0.5rem;
+    font-size: 1.02rem;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+  .why-fast p {
+    margin: 0;
+    color: var(--muted);
+    font-size: 0.9rem;
+    line-height: 1.55;
+  }
+  .why-fast code {
+    font-size: 0.85em;
+    color: var(--text-2);
+  }
+  @media (max-width: 60rem) {
+    .why-fast {
+      grid-template-columns: 1fr 1fr;
+    }
+  }
+  @media (max-width: 36rem) {
+    .why-fast {
+      grid-template-columns: 1fr;
+    }
+  }
+
+  /* ---------- bento ---------- */
+  .bento {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-auto-flow: dense;
+    gap: 1.25rem;
+    margin-top: 3.5rem;
+  }
+  .card {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    padding: 1.5rem;
+    border-radius: 20px;
+    border: 1px solid var(--line);
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0.01));
+    overflow: hidden;
+    transition: border-color 0.3s ease, transform 0.3s ease;
+  }
+  .card:hover {
+    border-color: rgba(166, 221, 194, 0.25);
+    transform: translateY(-2px);
+  }
+  .card::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: radial-gradient(60% 50% at 50% 0%, rgba(166, 221, 194, 0.08), transparent);
+    opacity: 0;
+    transition: opacity 0.3s ease;
+    pointer-events: none;
+  }
+  .card:hover::before {
+    opacity: 1;
+  }
+  .c-wide {
+    grid-column: span 2;
+  }
+  .c-tall {
+    grid-row: span 2;
+  }
+  .c-full {
+    grid-column: 1 / -1;
+  }
+  .card h3 {
+    margin: 1.4rem 0 0.4rem;
+    font-size: 1.08rem;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+  .card h3 code {
+    font-size: 0.9em;
+    color: var(--mint);
+  }
+  .card p {
+    margin: 0;
+    color: var(--muted);
+    font-size: 0.92rem;
+    line-height: 1.55;
+  }
+  .card p code {
+    color: var(--text-2);
+  }
+  .card-art {
+    min-height: 9rem;
+    border-radius: 12px;
+    background: var(--editor);
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    padding: 1rem;
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    line-height: 1.7;
+    color: #dce2df;
+    overflow: hidden;
+  }
+  .k { color: var(--kw); }
+  .f { color: var(--fn); }
+  .t { color: var(--type); }
+  .s { color: var(--str); }
+  .n { color: var(--num); }
+  .c { color: var(--comment); }
+  .p { color: var(--prop); }
+  .u { color: var(--const); }
+
+  .art-palette {
+    display: grid;
+    place-items: center;
+    background:
+      radial-gradient(60% 80% at 50% 0%, rgba(166, 221, 194, 0.12), transparent),
+      var(--editor);
+  }
+  .pal {
+    width: min(100%, 28rem);
+    border-radius: 10px;
+    background: #292e2f;
+    border: 1px solid #53635b;
+    box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5);
+    padding: 0.4rem;
+    font-family: var(--sans);
+    font-size: 0.82rem;
+  }
+  .pal-input {
+    padding: 0.4rem 0.6rem 0.55rem;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+    margin-bottom: 0.3rem;
+    font-family: var(--mono);
+  }
+  .pal-input .q {
+    color: var(--mint);
+  }
+  .caret {
+    display: inline-block;
+    width: 2px;
+    height: 1.05em;
+    vertical-align: -0.15em;
+    margin-left: 1px;
+    background: var(--mint);
+    animation: blink 1.1s steps(1) infinite;
+  }
+  .pal-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 0.3rem 0.6rem;
+    border-radius: 6px;
+    color: #b7c0bc;
+  }
+  .pal-row b {
+    color: var(--mint);
+    font-weight: 600;
+  }
+  .pal-row.on {
+    background: rgba(166, 221, 194, 0.12);
+    color: var(--text);
+  }
+  .pal-row kbd {
+    font-family: var(--sans);
+    color: #727f78;
+    font-size: 0.75rem;
+  }
+  .art-split {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+    padding: 6px;
+  }
+  .art-split i {
+    border-radius: 6px;
+    background:
+      linear-gradient(90deg, rgba(199, 146, 234, 0.6) 0 22%, transparent 22%) 10px 14px / 60% 3px no-repeat,
+      linear-gradient(90deg, rgba(130, 170, 255, 0.55) 0 40%, transparent 40%) 18px 24px / 70% 3px no-repeat,
+      linear-gradient(90deg, rgba(165, 214, 138, 0.5) 0 30%, transparent 30%) 18px 34px / 60% 3px no-repeat,
+      linear-gradient(90deg, rgba(220, 226, 223, 0.25) 0 50%, transparent 50%) 10px 44px / 70% 3px no-repeat,
+      #1e2223;
+    border: 1px solid rgba(255, 255, 255, 0.05);
+  }
+  .art-split i:first-child {
+    box-shadow: inset 0 2px 0 var(--mint);
+  }
+  .art-cursors {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    font-size: 0.92rem;
+    line-height: 2;
+    padding-left: 1.5rem;
+  }
+  .mc {
+    display: inline-block;
+    width: 2px;
+    height: 1.1em;
+    vertical-align: -0.2em;
+    background: var(--mint);
+    box-shadow: 0 0 8px var(--mint);
+    animation: blink 1.1s steps(1) infinite;
+  }
+  .art-cursors div {
+    position: relative;
+  }
+  .art-cursors div::before {
+    content: "";
+    position: absolute;
+    left: 2.5em;
+    width: 3ch;
+    top: 0.3em;
+    bottom: 0.3em;
+    border-radius: 3px;
+    background: rgba(166, 221, 194, 0.18);
+  }
+  .art-http {
+    display: flex;
+    flex-direction: column;
+    gap: 0.8rem;
+    flex: 1;
+  }
+  .c-tall .card-art {
+    flex: 1;
+  }
+  .req,
+  .res {
+    white-space: nowrap;
+  }
+  .res {
+    border-radius: 8px;
+    padding: 0.7rem 0.8rem;
+    background: rgba(0, 0, 0, 0.25);
+    border: 1px solid rgba(255, 255, 255, 0.05);
+  }
+  .res-head {
+    display: flex;
+    justify-content: space-between;
+    margin-bottom: 0.4rem;
+    font-family: var(--sans);
+    font-size: 0.75rem;
+    color: #727f78;
+  }
+  .ok {
+    color: var(--added);
+    font-weight: 600;
+  }
+  .art-lsp {
+    display: flex;
+    flex-wrap: wrap;
+    align-content: center;
+    gap: 0.45rem;
+  }
+  .art-lsp span {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45rem;
+    padding: 0.25rem 0.6rem;
+    border-radius: 6px;
+    background: #292e2f;
+    font-size: 0.74rem;
+  }
+  .art-lsp span::before {
+    content: "";
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--added);
+    box-shadow: 0 0 8px var(--added);
+  }
+  .art-dialog {
+    display: grid;
+    place-items: center;
+    background:
+      linear-gradient(rgba(0, 0, 0, 0.3), rgba(0, 0, 0, 0.3)),
+      repeating-linear-gradient(180deg, transparent 0 18px, rgba(255, 255, 255, 0.03) 18px 19px),
+      var(--editor);
+  }
+  .dlg {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    padding: 0.9rem 1rem;
+    border-radius: 10px;
+    background: #292e2f;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5);
+    font-family: var(--sans);
+    font-size: 0.8rem;
+  }
+  .dlg span {
+    color: #919c97;
+  }
+  .dlg-btns {
+    display: flex;
+    gap: 0.4rem;
+    margin-top: 0.6rem;
+  }
+  .dlg-btns i {
+    font-style: normal;
+    font-size: 0.72rem;
+    padding: 0.2rem 0.6rem;
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.07);
+  }
+  .dlg-btns i.pri {
+    background: var(--mint);
+    color: #102019;
+    font-weight: 600;
+  }
+  .art-md {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.8rem;
+    align-items: center;
+  }
+  .md-out {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    padding: 0.7rem;
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.04);
+    font-family: var(--sans);
+  }
+  .md-out b {
+    font-size: 1rem;
+  }
+  .md-out strong {
+    color: var(--mint);
+  }
+  .art-fold {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    white-space: nowrap;
+  }
+  .art-fold .in {
+    padding-left: 1.2rem;
+  }
+  .chev {
+    display: inline-block;
+    width: 1.2rem;
+    color: #727f78;
+  }
+  .chev.open {
+    transform: rotate(90deg);
+    width: 0.8rem;
+    margin-right: 0.4rem;
+  }
+  .folded {
+    padding: 0 0.3rem;
+    border-radius: 4px;
+    background: rgba(166, 221, 194, 0.14);
+    color: var(--mint);
+  }
+  @keyframes blink {
+    50% {
+      opacity: 0;
+    }
+  }
+  @media (max-width: 60rem) {
+    .bento {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .c-tall {
+      grid-row: auto;
+    }
+  }
+  @media (max-width: 40rem) {
+    .bento {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .c-wide {
+      grid-column: auto;
+    }
+  }
+
+  /* ---------- languages ---------- */
+  .langs {
+    margin-top: 4rem;
+    text-align: center;
+  }
+  .langs p {
+    color: var(--muted);
+    font-size: 0.9rem;
+    margin: 0 0 1.25rem;
+  }
+  .marquee {
+    overflow: hidden;
+    mask-image: linear-gradient(90deg, transparent, #000 12%, #000 88%, transparent);
+    -webkit-mask-image: linear-gradient(90deg, transparent, #000 12%, #000 88%, transparent);
+  }
+  .marquee-track {
+    display: flex;
+    gap: 0.75rem;
+    width: max-content;
+    animation: marquee 40s linear infinite;
+  }
+  .marquee:hover .marquee-track {
+    animation-play-state: paused;
+  }
+  .lang {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.55rem;
+    padding: 0.55rem 1.1rem;
+    border-radius: 999px;
+    border: 1px solid var(--line-2);
+    background: rgba(255, 255, 255, 0.02);
+    font-size: 0.92rem;
+    color: var(--text-2);
+    white-space: nowrap;
+  }
+  .lang i {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+  }
+  @keyframes marquee {
+    to {
+      transform: translateX(calc(-50% - 0.375rem));
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .marquee-track {
+      animation: none;
+      flex-wrap: wrap;
+      justify-content: center;
+      width: auto;
+    }
+    .lang.dup {
+      display: none;
+    }
+    .caret,
+    .mc {
+      animation: none;
+    }
+  }
+
+  /* ---------- keys ---------- */
+  .keygrid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.6rem;
+  }
+  .keyrow {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    padding: 0.8rem 1rem;
+    border-radius: 12px;
+    border: 1px solid var(--line);
+    background: rgba(255, 255, 255, 0.015);
+    font-size: 0.9rem;
+    color: var(--text-2);
+    transition: border-color 0.2s ease, background 0.2s ease;
+  }
+  .keyrow:hover {
+    border-color: rgba(166, 221, 194, 0.25);
+    background: rgba(166, 221, 194, 0.04);
+  }
+  .combo {
+    display: inline-flex;
+    gap: 0.25rem;
+    min-width: 5.6rem;
+  }
+  .combo :global(kbd.key) {
+    font-size: 0.85rem;
+  }
+  @media (max-width: 36rem) {
+    .keygrid {
+      grid-template-columns: 1fr;
+    }
+  }
+
+  /* ---------- trust ---------- */
+  .trust-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 1.25rem;
+    margin-top: 3.5rem;
+  }
+  .trust-num {
+    padding: 2rem;
+    border-radius: 20px;
+    border: 1px solid var(--line);
+    background: radial-gradient(80% 80% at 50% 0%, rgba(166, 221, 194, 0.07), transparent), rgba(255, 255, 255, 0.015);
+    text-align: center;
+  }
+  .trust-num strong {
+    display: block;
+    font-family: var(--display);
+    font-size: clamp(3.5rem, 8vw, 5.5rem);
+    line-height: 1;
+    font-weight: 620;
+    letter-spacing: -0.05em;
+    background: linear-gradient(180deg, #fff, var(--mint));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  .trust-num span {
+    display: block;
+    margin-top: 0.8rem;
+    color: var(--muted);
+    font-size: 0.92rem;
+  }
+  .compare {
+    margin-top: 1.25rem;
+    border-radius: 16px;
+    border: 1px solid var(--line);
+    overflow: hidden;
+    font-size: 0.92rem;
+  }
+  .compare-row {
+    display: grid;
+    grid-template-columns: 2fr 1fr 1fr 1fr;
+    gap: 1rem;
+    padding: 0.95rem 1.4rem;
+    border-top: 1px solid var(--line);
+    color: var(--text-2);
+  }
+  .compare-row span:not(:first-child) {
+    text-align: right;
+    font-family: var(--mono);
+  }
+  .compare-row.head {
+    border-top: 0;
+    background: rgba(255, 255, 255, 0.025);
+    color: var(--muted);
+    font-size: 0.8rem;
+  }
+  .compare-row.head span {
+    font-family: var(--sans) !important;
+  }
+  .compare-row.us {
+    color: var(--text);
+    background: rgba(166, 221, 194, 0.05);
+  }
+  .compare-row.us span:not(:first-child) {
+    color: var(--mint);
+  }
+  .trust-foot {
+    margin: 1.75rem auto 0;
+    text-align: center;
+    color: var(--muted);
+    font-size: 0.92rem;
+    max-width: 44rem;
+  }
+  .trust-foot a {
+    color: var(--mint);
+    white-space: nowrap;
+  }
+  @media (max-width: 48rem) {
+    .trust-grid {
+      grid-template-columns: 1fr;
+    }
+    .compare-row {
+      grid-template-columns: 1.6fr repeat(3, 1fr);
+      gap: 0.5rem;
+      padding: 0.8rem 1rem;
+      font-size: 0.82rem;
+    }
+  }
+
+  /* ---------- honest ---------- */
+  .honest {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr);
+    gap: clamp(2rem, 5vw, 4rem);
+    padding: clamp(1.75rem, 5vw, 3.5rem);
+    border-radius: 24px;
+    border: 1px solid var(--line);
+    background: linear-gradient(135deg, rgba(226, 164, 58, 0.06), transparent 50%), rgba(255, 255, 255, 0.015);
+  }
+  .honest .h2 {
+    font-size: clamp(2rem, 3.6vw, 2.9rem);
+  }
+  .eyebrow.warn {
+    color: var(--modified);
+  }
+  .nots {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 0.2rem;
+    align-content: center;
+  }
+  .nots li {
+    padding: 0.85rem 0 0.85rem 1.8rem;
+    border-bottom: 1px solid var(--line);
+    color: var(--muted);
+    font-size: 0.93rem;
+    position: relative;
+  }
+  .nots li:last-child {
+    border-bottom: 0;
+  }
+  .nots li::before {
+    content: "";
+    position: absolute;
+    left: 0.2rem;
+    top: 1.35rem;
+    width: 0.7rem;
+    height: 1.5px;
+    background: var(--modified);
+  }
+  .nots b {
+    color: var(--text);
+    font-weight: 580;
+  }
+  @media (max-width: 60rem) {
+    .honest {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+
+  /* ---------- final ---------- */
+  .final {
+    position: relative;
+    padding-block: clamp(6rem, 12vw, 10rem);
+    overflow: hidden;
+    isolation: isolate;
+    text-align: center;
+  }
+  .final-bg {
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    background:
+      radial-gradient(40% 50% at 50% 60%, rgba(63, 185, 138, 0.28), transparent 70%),
+      radial-gradient(30% 40% at 30% 40%, rgba(130, 170, 255, 0.14), transparent 70%),
+      radial-gradient(30% 40% at 70% 40%, rgba(199, 146, 234, 0.14), transparent 70%);
+  }
+  .final-inner {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  .final-icon {
+    border-radius: 18px;
+    box-shadow: 0 20px 60px rgba(166, 221, 194, 0.3), 0 0 0 1px var(--line-2);
+  }
+  .final .h2 {
+    margin-top: 2rem;
+    font-size: clamp(2.6rem, 6vw, 4.5rem);
+  }
+  .final .lead {
+    margin-inline: auto;
+  }
+  .final-code {
+    margin: 2rem 0 0;
+    padding: 0.7rem 1.2rem;
+    border-radius: 10px;
+    border: 1px solid var(--line);
+    background: rgba(0, 0, 0, 0.35);
+    color: var(--text-2);
+    font-size: 0.88rem;
+  }
+</style>

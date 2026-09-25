@@ -1,0 +1,104 @@
+---
+title: Keyboard shortcuts
+description: Every key crc answers to, grouped by what you are doing.
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+<Aside type="tip">
+  Forgot one? <kbd>⌘</kbd><kbd>P</kbd> then <kbd>&gt;</kbd> lists every menu
+  command with its key.
+</Aside>
+
+## Files
+
+| Keys | Action |
+|---|---|
+| <kbd>⌘</kbd><kbd>N</kbd> | New file, as a name field in the sidebar |
+| <kbd>⌘</kbd><kbd>O</kbd> | Open a file |
+| <kbd>⌘</kbd><kbd>⇧</kbd><kbd>O</kbd> | Open a folder |
+| <kbd>⌘</kbd><kbd>P</kbd> | Open Quickly: fuzzy file open |
+| <kbd>⌘</kbd><kbd>S</kbd> | Save |
+| <kbd>⌘</kbd><kbd>⇧</kbd><kbd>S</kbd> | Save as |
+| <kbd>⌘</kbd><kbd>W</kbd> | Close the tab |
+| <kbd>⌘</kbd><kbd>,</kbd> | Open the settings file |
+| <kbd>⌘</kbd><kbd>Q</kbd> | Quit |
+
+## Editing
+
+| Keys | Action |
+|---|---|
+| <kbd>⌘</kbd><kbd>Z</kbd> / <kbd>⌘</kbd><kbd>⇧</kbd><kbd>Z</kbd> | Undo, redo |
+| <kbd>⌘</kbd><kbd>C</kbd> / <kbd>⌘</kbd><kbd>X</kbd> / <kbd>⌘</kbd><kbd>V</kbd> | Copy, cut, paste |
+| <kbd>⌘</kbd><kbd>A</kbd> | Select all |
+| <kbd>⌘</kbd><kbd>/</kbd> | Toggle comment |
+| <kbd>⌘</kbd><kbd>⇧</kbd><kbd>D</kbd> | Duplicate line |
+| <kbd>⌘</kbd><kbd>⇧</kbd><kbd>↑</kbd> / <kbd>↓</kbd> | Move line up or down |
+| <kbd>Tab</kbd> / <kbd>⇧</kbd><kbd>Tab</kbd> | Indent, outdent the selection |
+| <kbd>⌘</kbd><kbd>D</kbd> | Select the word, then the next occurrence as another cursor |
+| <kbd>⌥</kbd>-click | Add a cursor |
+| <kbd>Esc</kbd> | Back to one cursor |
+| <kbd>⌥</kbd> + arrows, <kbd>⌥</kbd><kbd>⌫</kbd> | Word-wise motion and deletion |
+| <kbd>⌃</kbd><kbd>A</kbd> <kbd>E</kbd> <kbd>K</kbd> <kbd>D</kbd> <kbd>B</kbd> <kbd>F</kbd> <kbd>P</kbd> <kbd>N</kbd> | The macOS Emacs bindings |
+
+## Find
+
+| Keys | Action |
+|---|---|
+| <kbd>⌘</kbd><kbd>F</kbd> | Find in the file. <kbd>Tab</kbd> switches to replace; <kbd>↩</kbd> cycles or replaces |
+| <kbd>⌘</kbd><kbd>G</kbd> / <kbd>⌘</kbd><kbd>⇧</kbd><kbd>G</kbd> | Next, previous match |
+| <kbd>⌘</kbd><kbd>⇧</kbd><kbd>F</kbd> | Find in the project |
+| <kbd>⌘</kbd><kbd>L</kbd> | Go to line |
+| <kbd>⌘</kbd><kbd>R</kbd> | Go to symbol in the file |
+| <kbd>⌘</kbd><kbd>T</kbd> | Go to symbol in the project |
+| <kbd>&gt;</kbd> in <kbd>⌘</kbd><kbd>P</kbd> | Run a menu command |
+
+## Code
+
+| Keys | Action |
+|---|---|
+| <kbd>F12</kbd>, <kbd>⌘</kbd>-click | Go to definition |
+| <kbd>F1</kbd> | Hover information for the symbol at the caret |
+| <kbd>F2</kbd> | Rename symbol |
+| <kbd>⇧</kbd><kbd>⌥</kbd><kbd>F</kbd> | Format document |
+| <kbd>⌃</kbd><kbd>Space</kbd> | Completion |
+| <kbd>Tab</kbd> | Take the suggestion |
+| <kbd>↑</kbd> / <kbd>↓</kbd>, then <kbd>↩</kbd> | Pick another suggestion |
+| <kbd>⌥</kbd><kbd>1</kbd>…<kbd>9</kbd> | Take a suggestion directly |
+
+## View
+
+| Keys | Action |
+|---|---|
+| <kbd>⌘</kbd><kbd>B</kbd> | Toggle the sidebar |
+| <kbd>⌘</kbd><kbd>E</kbd> | Toggle the Markdown preview |
+| <kbd>⌘</kbd><kbd>⌥</kbd><kbd>←</kbd> / <kbd>→</kbd> | Fold, unfold the block |
+| <kbd>⌥</kbd><kbd>Z</kbd> | Word wrap for this document |
+| <kbd>⌘</kbd><kbd>=</kbd> / <kbd>⌘</kbd><kbd>-</kbd> / <kbd>⌘</kbd><kbd>0</kbd> | Zoom in, out, back to 13 pt |
+
+## Tabs and panes
+
+| Keys | Action |
+|---|---|
+| <kbd>⌘</kbd><kbd>1</kbd>…<kbd>9</kbd> | Switch to a tab |
+| <kbd>⌘</kbd><kbd>[</kbd> / <kbd>⌘</kbd><kbd>]</kbd> | Previous, next tab |
+| <kbd>⌘</kbd><kbd>{"\\"}</kbd> | Split the editor to the right |
+| <kbd>⌘</kbd><kbd>⌥</kbd><kbd>[</kbd> / <kbd>⌘</kbd><kbd>⌥</kbd><kbd>]</kbd> | Focus the previous, next pane |
+| <kbd>⌘</kbd><kbd>⌥</kbd><kbd>W</kbd> | Close the pane |
+
+With the mouse: drag a tab to reorder it, right-click it to manage tabs,
+scroll over the tab strip to reveal overflowed tabs, and double-click the
+empty strip for a new file.
+
+## Panels and tools
+
+| Keys | Action |
+|---|---|
+| <kbd>⌃</kbd><kbd>`</kbd> or <kbd>⌘</kbd><kbd>J</kbd> | Terminal panel |
+| <kbd>⌘</kbd><kbd>⇧</kbd><kbd>C</kbd> | Claude Code tab |
+| <kbd>⌘</kbd><kbd>↩</kbd> in a Claude diff | Accept the edit |
+| <kbd>Esc</kbd> in a Claude diff | Reject the edit |
+| <kbd>⌘</kbd><kbd>⌥</kbd><kbd>G</kbd> | Source Control |
+| <kbd>⌘</kbd><kbd>↩</kbd> in Source Control | Commit the staged changes |
+| <kbd>⌘</kbd><kbd>↩</kbd> in a `.http` file | Send the request under the caret |
+| <kbd>Esc</kbd> in a picker or panel | Dismiss |

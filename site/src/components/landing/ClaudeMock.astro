@@ -1,0 +1,186 @@
+---
+// A crc window with a Claude Code edit open as a diff tab, drawn in HTML
+// with the editor's own colours. Illustrative, not a screenshot.
+---
+
+<div class="win" aria-hidden="true">
+  <div class="bar">
+    <span class="lights"><i></i><i></i><i></i></span>
+    <span class="tab">main.rs</span>
+    <span class="tab active"><span class="spark">✳</span> Claude: main.rs</span>
+  </div>
+  <div class="diff">
+    <div class="ln"><b>14</b><span><span class="c">/// Reads the log, one entry per line.</span></span></div>
+    <div class="ln"><b>15</b><span><span class="k">pub fn</span> <span class="f">read_log</span>(path: &amp;<span class="t">Path</span>) -&gt; io::<span class="t">Result</span>&lt;<span class="t">Vec</span>&lt;<span class="t">Entry</span>&gt;&gt; {"{"}</span></div>
+    <div class="ln del"><b>16</b><span>    <span class="k">let</span> text = fs::<span class="f">read_to_string</span>(path)?;</span></div>
+    <div class="ln add"><b>16</b><span>    <span class="k">let</span> text = fs::<span class="f">read_to_string</span>(path)</span></div>
+    <div class="ln add"><b>17</b><span>        .<span class="f">map_err</span>(|e| <span class="f">annotate</span>(e, path))?;</span></div>
+    <div class="ln"><b>18</b><span>    <span class="k">let mut</span> entries = <span class="t">Vec</span>::<span class="f">new</span>();</span></div>
+    <div class="ln del"><b>19</b><span>    <span class="k">for</span> line <span class="k">in</span> text.<span class="f">lines</span>() {"{"}</span></div>
+    <div class="ln add"><b>19</b><span>    <span class="k">for</span> line <span class="k">in</span> text.<span class="f">lines</span>().<span class="f">filter</span>(|l| !l.<span class="f">starts_with</span>(<span class="s">'#'</span>)) {"{"}</span></div>
+    <div class="ln"><b>20</b><span>        <span class="k">let mut</span> parts = line.<span class="f">splitn</span>(<span class="n">4</span>, <span class="s">' '</span>);</span></div>
+  </div>
+  <div class="actions">
+    <span class="hint">Claude proposed 2 changes</span>
+    <span class="btns">
+      <span class="reject">Reject <kbd>Esc</kbd></span>
+      <span class="accept">Accept <kbd>⌘↩</kbd></span>
+    </span>
+  </div>
+  <div class="term">
+    <div><span class="p">~/garden-log</span> <span class="g">main</span> ❯ claude</div>
+    <div class="dim">⎿ Connected to crc · sees main.rs, selection 16:5–16:44, 1 diagnostic</div>
+    <div><span class="q">&gt;</span> skip comment lines and say which file failed<span class="cur"></span></div>
+  </div>
+</div>
+
+<style>
+  .win {
+    border-radius: 12px;
+    background: var(--editor);
+    border: 1px solid var(--line-2);
+    box-shadow: 0 40px 100px -20px rgba(0, 0, 0, 0.8), 0 0 0 1px rgba(0, 0, 0, 0.5);
+    overflow: hidden;
+    font-family: var(--mono);
+    font-size: clamp(0.66rem, 1.05vw, 0.8rem);
+    line-height: 1.75;
+  }
+  .bar {
+    display: flex;
+    align-items: stretch;
+    gap: 0;
+    height: 2.4rem;
+    background: var(--sidebar);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    font-family: var(--sans);
+    font-size: 0.78rem;
+    color: #919c97;
+  }
+  .lights {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0 0.9rem;
+  }
+  .lights i {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: #3a3f40;
+  }
+  .tab {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0 1rem;
+    border-right: 1px solid rgba(255, 255, 255, 0.04);
+  }
+  .tab.active {
+    background: var(--editor);
+    color: var(--text);
+    box-shadow: inset 0 -2px 0 var(--mint);
+  }
+  .spark {
+    color: #d97757;
+  }
+  .diff {
+    padding: 0.6rem 0;
+    overflow: hidden;
+  }
+  .ln {
+    display: flex;
+    white-space: pre;
+    padding-right: 1rem;
+    color: #dce2df;
+  }
+  .ln b {
+    flex: none;
+    width: 3rem;
+    padding-right: 1rem;
+    text-align: right;
+    font-weight: 400;
+    color: #727f78;
+  }
+  .ln.add {
+    background: rgba(90, 179, 115, 0.13);
+    box-shadow: inset 3px 0 0 var(--added);
+  }
+  .ln.del {
+    background: rgba(221, 101, 93, 0.13);
+    box-shadow: inset 3px 0 0 var(--removed);
+  }
+  .ln.del span {
+    opacity: 0.7;
+  }
+  .k { color: var(--kw); }
+  .f { color: var(--fn); }
+  .t { color: var(--type); }
+  .s { color: var(--str); }
+  .n { color: var(--num); }
+  .c { color: var(--comment); }
+  .actions {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 0.7rem 1rem;
+    border-top: 1px solid rgba(255, 255, 255, 0.05);
+    background: var(--sidebar);
+    font-family: var(--sans);
+    font-size: 0.78rem;
+  }
+  .hint {
+    color: #919c97;
+  }
+  .btns {
+    display: flex;
+    gap: 0.5rem;
+  }
+  .btns > span {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.3rem 0.7rem;
+    border-radius: 7px;
+    border: 1px solid var(--line-2);
+    color: var(--text-2);
+  }
+  .btns .accept {
+    background: var(--mint);
+    border-color: var(--mint);
+    color: #102019;
+    font-weight: 600;
+  }
+  .btns kbd {
+    font-family: var(--sans);
+    font-size: 0.7rem;
+    opacity: 0.7;
+  }
+  .term {
+    padding: 0.8rem 1rem 1rem;
+    background: #151819;
+    border-top: 1px solid rgba(255, 255, 255, 0.05);
+    color: #dce2df;
+    white-space: nowrap;
+    overflow: hidden;
+  }
+  .p { color: var(--fn); }
+  .g { color: var(--kw); }
+  .q { color: #d97757; }
+  .dim { color: #727f78; }
+  .cur {
+    display: inline-block;
+    width: 0.55em;
+    height: 1.1em;
+    margin-left: 2px;
+    vertical-align: -0.2em;
+    background: var(--mint);
+    animation: blink 1.1s steps(1) infinite;
+  }
+  @keyframes blink {
+    50% { opacity: 0; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .cur { animation: none; }
+  }
+</style>

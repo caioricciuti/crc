@@ -1,0 +1,44 @@
+---
+title: Reporting a problem
+description: How to report a bug with everything needed to fix it.
+next: false
+---
+
+import { Steps, Aside } from "@astrojs/starlight/components";
+
+## From inside crc
+
+<Steps>
+
+1. Choose **Help › Report a Problem…**.
+
+   crc opens a new GitHub issue in your browser with the version, your macOS
+   version and the last crash, if any, already filled in.
+
+2. Add what you did, what you expected, and what happened instead.
+
+3. Submit it from the browser.
+
+</Steps>
+
+<Aside>
+  crc sends nothing itself. The report is a pre-filled page in your browser;
+  nothing leaves your Mac until you submit it.
+</Aside>
+
+## By hand
+
+Open an issue on [GitHub](https://github.com/caioricciuti/crc/issues/new) with:
+
+- what you did, step by step
+- what you expected, and what happened
+- the version, from **crc › About crc** or `crc --version`
+- a screenshot, which helps more than a long description
+
+## Crash logs
+
+Crash logs are in `~/Library/Logs/crc`. **Help › Show Crash Logs** opens the
+folder.
+
+If crc crashed with unsaved work, see
+[Crash recovery](/docs/features/files/#crash-recovery).

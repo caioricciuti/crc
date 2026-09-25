@@ -1,0 +1,105 @@
+---
+title: Installation
+description: Download the signed DMG, or build crc from source with Rust.
+---
+
+import { Steps, Tabs, TabItem, Aside, LinkButton } from "@astrojs/starlight/components";
+
+## Requirements
+
+- An **Apple Silicon Mac** on **macOS 14** or later. There is no Intel build
+  in the alpha and no plan for Linux or Windows.
+- Nothing else. [Language servers](/docs/features/language-servers/) are
+  optional and found if they are installed.
+
+## Install the app
+
+<Tabs syncKey="install">
+<TabItem label="Download" icon="download">
+
+<Steps>
+
+1. Download the DMG from the latest release.
+
+   <LinkButton href="https://github.com/caioricciuti/crc/releases/latest" icon="external">Latest release</LinkButton>
+
+2. Open it and drag **crc** to **Applications**.
+
+   The app is signed with a Developer ID and notarized, so it opens without a
+   Gatekeeper warning.
+
+3. Optionally, check the download against `SHA256SUMS` from the same release:
+
+   ```sh
+   shasum -a 256 path/to/the.dmg
+   ```
+
+   The hash printed should match the line for that file in `SHA256SUMS`.
+
+</Steps>
+
+</TabItem>
+<TabItem label="Build from source" icon="seti:rust">
+
+You need Rust 1.98 or newer. The repository pins the exact toolchain in
+`rust-toolchain.toml`, so `rustup` fetches it for you.
+
+<Steps>
+
+1. Clone the repository:
+
+   ```sh
+   git clone https://github.com/caioricciuti/crc
+   cd crc
+   ```
+
+2. Build the bundle and install it:
+
+   ```sh
+   scripts/bundle.sh --install
+   ```
+
+   That puts an ad-hoc signed `crc.app` in `/Applications`.
+
+3. For a fully offline, auditable build, vendor the crates first:
+
+   ```sh
+   scripts/vendor.sh
+   ```
+
+</Steps>
+
+</TabItem>
+</Tabs>
+
+## Open files and folders
+
+From Finder, drop a file or folder on the Dock icon. From a terminal:
+
+```sh
+open -a crc path/to/file    # open a file
+open -a crc .               # open the current folder as a project
+```
+
+Inside crc, <kbd>⌘</kbd><kbd>O</kbd> opens a file and
+<kbd>⌘</kbd><kbd>⇧</kbd><kbd>O</kbd> opens a folder. Recent folders are on the
+[home screen](/docs/getting-started/tour/#the-home-screen).
+
+## Updates
+
+Once a day crc asks GitHub for the list of releases and says in the status
+line when a newer one exists. **Help › Check for Updates** opens its page.
+Nothing is downloaded or installed for you; download the new DMG and replace
+the app. Set `update_check = false` in [settings](/docs/getting-started/settings/)
+to turn the daily check off.
+
+## Uninstall
+
+Drag `crc.app` from Applications to the Trash. crc also keeps a few files of
+its own; [Where crc keeps things](/docs/reference/storage/) lists them if you
+want to remove those too.
+
+<Aside type="tip" title="Next">
+  Take the [tour of the window](/docs/getting-started/tour/), or jump straight
+  to the [keyboard shortcuts](/docs/reference/keyboard-shortcuts/).
+</Aside>

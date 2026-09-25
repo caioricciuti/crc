@@ -1,0 +1,68 @@
+---
+title: Performance
+description: The number, how it is measured, and how to reproduce it on your own Mac.
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+## The number
+
+Measured on 2026-09-24 for `v0.2.0-alpha.1`, with a **100 MiB file** and the
+caret halfway through **2.7 million lines**:
+
+| Scope | Keystroke to GPU completion, p99 | Budget |
+|---|---:|---:|
+| Editor viewport | **0.803 ms** | 8.333 ms |
+| Editor with native toolbar, sidebar, tabs and status | **1.009 ms** | 8.333 ms |
+
+The budget is one frame at 120 Hz. The whole window finishes its work in about
+an eighth of it.
+
+## Reproduce it
+
+The harness is in the repository. From a clone:
+
+```sh
+cargo run --release --offline --example frame_latency
+cargo run --release --offline --example frame_latency -- --chrome
+```
+
+Other benchmarks in `examples/`:
+
+| Example | Measures |
+|---|---|
+| `frame_latency` | Keystroke to GPU completion, editor only or with `--chrome` |
+| `long_line_latency` | The same, on very long lines |
+| `syntax_latency` | Reparsing and highlighting after an edit |
+| `rope_bench` | The text buffer's operations |
+
+<Aside type="caution" title="What it measures, and what it does not">
+  The harness measures buffer mutation, layout, draw encoding and GPU
+  completion. It excludes event delivery before the app and display scanout,
+  so it is **not** a camera-measured input-to-photon result. Results vary by
+  machine.
+</Aside>
+
+## Why it is fast
+
+- **One draw call per frame.** Every glyph is an instance of one quad, so
+  drawing a screen of text is a single `drawPrimitives` with no per-frame
+  geometry work.
+- **Only the visible lines** are laid out, so a 100 MiB file costs what a small
+  one does.
+- **A persistent rope.** The buffer is a B-tree whose clone is O(1), which
+  makes undo snapshots cheap and lets background work read a consistent
+  snapshot while you type.
+- **Metal and CoreText directly**, with no browser engine or cross-platform
+  graphics layer in between.
+
+More in [Architecture](/docs/reference/architecture/).
+
+## Seeing it live
+
+Start crc with `CRC_SHOW_LATENCY=1` and the status line shows the latency
+summary instead of the caret position:
+
+```sh
+CRC_SHOW_LATENCY=1 open -a crc .
+```

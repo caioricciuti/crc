@@ -1,0 +1,62 @@
+---
+title: Search and navigation
+description: Open Quickly, the command palette, project search, symbols and go to definition.
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+## Open Quickly
+
+<kbd>⌘</kbd><kbd>P</kbd> (or **Find a file…** in the toolbar) fuzzy-matches
+every file in the project. Type a few letters from anywhere in the path.
+
+## The command palette
+
+Type <kbd>&gt;</kbd> in the same box and it lists every menu command instead.
+If you remember roughly what a command is called but not its key, this is
+the fastest way to it.
+
+Two more prefixes in the same box:
+
+| Type | Lists |
+|---|---|
+| <kbd>@</kbd> | What the current file defines, in order, so it doubles as an outline. |
+| <kbd>#</kbd> | Definitions across the whole project, from the project index. |
+
+## Find in project
+
+<kbd>⌘</kbd><kbd>⇧</kbd><kbd>F</kbd> searches the whole project in the
+background, so typing never waits on it.
+
+With project search open, **Edit › Replace All** replaces every match across
+the project's files.
+
+<Aside type="note" title="Bounded by design">
+  Project search skips files over 2 MiB and shows the first 500 matches.
+</Aside>
+
+## Symbols
+
+<div class="crc-keys">
+  <div><span>Go to symbol in the file</span><span><kbd>⌘</kbd><kbd>R</kbd></span></div>
+  <div><span>Go to symbol in the project</span><span><kbd>⌘</kbd><kbd>T</kbd></span></div>
+  <div><span>Go to line</span><span><kbd>⌘</kbd><kbd>L</kbd></span></div>
+</div>
+
+## Code navigation
+
+These come from the [language server](/docs/features/language-servers/) for
+the file, when one is installed.
+
+<div class="crc-keys">
+  <div><span>Go to definition</span><span><kbd>F12</kbd> or <kbd>⌘</kbd>-click</span></div>
+  <div><span>Hover information</span><span><kbd>F1</kbd></span></div>
+  <div><span>Rename symbol</span><span><kbd>F2</kbd></span></div>
+</div>
+
+**Go › Find References** lists every use of the symbol at the caret.
+
+## From the terminal
+
+<kbd>⌘</kbd>-click a path such as `src/main.rs:42:7` in
+[terminal](/docs/features/terminal/) output to open it at that line and column.

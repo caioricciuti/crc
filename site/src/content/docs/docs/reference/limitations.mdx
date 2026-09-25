@@ -1,0 +1,58 @@
+---
+title: Known limits
+description: What crc does not do yet, and what it does not do on purpose.
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+<Aside type="caution" title="This is an alpha">
+  crc is used daily by its author and is now going to a small group of
+  testers. Passing tests are not a stability guarantee. Known problems are in
+  the [issue tracker](https://github.com/caioricciuti/crc/issues).
+</Aside>
+
+## Platform
+
+- **macOS on Apple Silicon only**, macOS 14 or later. There is no Intel build
+  in the alpha.
+- **No Linux or Windows, deliberately.** crc talks to Metal and CoreText
+  directly; a port would mean writing a second backend from scratch. See
+  [Architecture](/docs/reference/architecture/).
+
+## Languages
+
+- **Highlighting covers the [listed languages](/docs/features/syntax-highlighting/).**
+  Each grammar is vendored generated C pinned in `third_party/CHECKSUMS`. SQL is
+  not in the alpha.
+- **Five language servers**, and no code actions from them.
+
+## Editor
+
+- **No minimap.**
+- **Panes are a way of looking.** A file is open in one pane at a time, and a
+  restored session puts every pane's files into one pane.
+- **Bounded by design.** Project search skips files over 2 MiB and shows the
+  first 500 matches. The bracket matcher counts its own pair only and does not
+  skip strings or comments.
+- **Text input is new.** Dead keys and IME go through macOS text input and
+  need wider testing across layouts.
+
+## Git
+
+- **Gutter marks compare with HEAD**, not the index, and stop at 2 MiB.
+- **Hunk staging covers tracked text changes**; other change types use
+  whole-file actions.
+
+## Files
+
+- Files over **512 MB** open read-only; files over **2 GB** are refused. Both
+  say why.
+- Crash recovery covers crashes in crc's own code, not a power cut.
+
+## Updates and extensions
+
+- **Updates are announced, not installed.** Once a day crc asks GitHub whether
+  a newer release exists and says so in the status line. Nothing is
+  downloaded. `update_check = false` turns the check off.
+- **No extensions.** Extensions as WASM with declared capabilities is one of
+  [the project's bets](/vision/), and not built yet.

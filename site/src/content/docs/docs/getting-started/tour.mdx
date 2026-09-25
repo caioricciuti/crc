@@ -1,0 +1,67 @@
+---
+title: A tour of the window
+description: The home screen, the sidebar, tabs, the status line and the panels.
+---
+
+import { Image } from "astro:assets";
+import { Aside } from "@astrojs/starlight/components";
+import homeDark from "../../../../assets/home-dark.png";
+import editorDark from "../../../../assets/editor-dark.png";
+import editorLight from "../../../../assets/editor-light.png";
+import terminalDark from "../../../../assets/terminal-dark.png";
+
+crc is one window per project. The text is drawn by crc itself on the GPU;
+around it is native macOS chrome in the system font, in light and dark, with
+the right pointer for every control.
+
+## The home screen
+
+Open a folder with nothing else open and crc shows its home screen: **Start**
+actions (Open Folder, New File, Go to File), your **Recent** folders, and a
+short list of keys worth learning first. Start typing and it becomes an
+untitled document.
+
+<div class="crc-shot">
+  <Image src={homeDark} alt="crc's home screen: Start actions, recent folders and a list of keys." widths={[800, 1400]} sizes="46rem" />
+</div>
+
+## The editor
+
+<div class="crc-shot">
+  <Image src={editorDark} alt="A Rust file open in crc with the Explorer sidebar." class="only-dark" widths={[800, 1400]} sizes="46rem" />
+  <Image src={editorLight} alt="A Rust file open in crc, light appearance." class="only-light" widths={[800, 1400]} sizes="46rem" />
+</div>
+
+From the top of the window down:
+
+- **The toolbar** holds the sidebar toggle, the project menu, the Terminal
+  button and **Find a file…**, which is the same box as <kbd>⌘</kbd><kbd>P</kbd>.
+- **The sidebar** (<kbd>⌘</kbd><kbd>B</kbd>) has two tabs. **Explorer** is the
+  file tree, with buttons for a new file, a new folder, collapse and refresh.
+  **Source Control** is the [Git panel](/docs/features/git/).
+- **Tabs** sit above the editor with a breadcrumb of the file's path under
+  them. See [Tabs and split panes](/docs/features/tabs-and-panes/).
+- **The gutter** shows line numbers and marks lines that differ from Git's
+  HEAD: added, changed and deleted.
+- **The status line** at the bottom says whether the file is saved, the error
+  and warning counts from the language server, who last changed the caret's
+  line (from `git blame`), the branch, the caret position, the encoding and
+  the line ending.
+
+## The panel
+
+<kbd>⌃</kbd><kbd>`</kbd> or <kbd>⌘</kbd><kbd>J</kbd> opens the
+[terminal](/docs/features/terminal/) under the editor.
+
+<div class="crc-shot">
+  <Image src={terminalDark} alt="The terminal panel open under a Rust file." widths={[800, 1400]} sizes="46rem" />
+</div>
+
+## Right-click
+
+The Explorer's context menu creates files and folders, renames, moves to the
+Trash and reveals in Finder. Right-click a tab to manage tabs.
+
+<Aside title="Sessions">
+  crc remembers what was open last time and restores it when you come back.
+</Aside>

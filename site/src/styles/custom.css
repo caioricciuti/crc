@@ -1,180 +1,431 @@
-/* Graphite, the editor's own palette, on Starlight's tokens. The dark table
-   is the editor's default; the light one is its light appearance. */
+/* The docs, on Starlight's tokens, in the editor's Graphite palette. Dark
+   matches the landing page; light is the editor's light appearance. */
 
 :root {
-  --sl-color-accent-low: #1f3a30;
+  --sl-color-accent-low: #15302a;
   --sl-color-accent: #3fb98a;
   --sl-color-accent-high: #a6ddc2;
-  --sl-color-white: #e3e6e5;
-  --sl-color-gray-1: #c9cfcd;
-  --sl-color-gray-2: #a6afac;
-  --sl-color-gray-3: #7e8f87;
-  --sl-color-gray-4: #4b5754;
-  --sl-color-gray-5: #2b3132;
-  --sl-color-gray-6: #202425;
-  --sl-color-black: #171a1b;
-  --sl-font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI", sans-serif;
-  --sl-font-mono: "SF Mono", ui-monospace, Menlo, monospace;
+  --sl-color-white: #eef2f0;
+  --sl-color-gray-1: #d3dad7;
+  --sl-color-gray-2: #b0bab6;
+  --sl-color-gray-3: #85918c;
+  --sl-color-gray-4: #56625e;
+  --sl-color-gray-5: #2a3031;
+  --sl-color-gray-6: #1a1e1f;
+  --sl-color-black: #0c0e0e;
+  --sl-color-bg-nav: rgba(12, 14, 14, 0.78);
+  --sl-color-bg-sidebar: #0c0e0e;
+  --sl-color-hairline-light: rgba(255, 255, 255, 0.06);
+  --sl-color-hairline: rgba(255, 255, 255, 0.07);
+  --sl-color-hairline-shade: rgba(255, 255, 255, 0.1);
+  --sl-color-bg-inline-code: rgba(255, 255, 255, 0.06);
+  --sl-font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI", Roboto, sans-serif;
+  --sl-font-mono: "SF Mono", ui-monospace, "JetBrains Mono", Menlo, monospace;
+  --sl-content-width: 46rem;
+  --sl-text-h1: 2.6rem;
+  --sl-text-h2: 1.65rem;
+  --sl-text-h3: 1.25rem;
+  --sl-line-height: 1.7;
   --crc-frame: rgba(255, 255, 255, 0.08);
-  --crc-shadow: 0 30px 80px rgba(0, 0, 0, 0.55);
+  --crc-card: rgba(255, 255, 255, 0.025);
+  --crc-glow: rgba(166, 221, 194, 0.12);
+  --crc-key-top: #2a2f30;
+  --crc-key-bottom: #1e2223;
 }
 
 :root[data-theme="light"] {
-  --sl-color-accent-low: #d5efe4;
+  --sl-color-accent-low: #dcf2e8;
   --sl-color-accent: #1f8a63;
-  --sl-color-accent-high: #145a41;
-  --sl-color-white: #1e2323;
-  --sl-color-gray-1: #2e3534;
-  --sl-color-gray-2: #4b5754;
-  --sl-color-gray-3: #66726f;
-  --sl-color-gray-4: #a6afac;
-  --sl-color-gray-5: #d5d9d9;
-  --sl-color-gray-6: #eceeee;
-  --sl-color-gray-7: #f7f8f8;
+  --sl-color-accent-high: #11513a;
+  --sl-color-white: #111615;
+  --sl-color-gray-1: #26302e;
+  --sl-color-gray-2: #3f4a47;
+  --sl-color-gray-3: #62706c;
+  --sl-color-gray-4: #9aa6a2;
+  --sl-color-gray-5: #d7dddb;
+  --sl-color-gray-6: #eef1f0;
+  --sl-color-gray-7: #f7f9f8;
   --sl-color-black: #ffffff;
-  --crc-frame: rgba(0, 0, 0, 0.1);
-  --crc-shadow: 0 30px 80px rgba(20, 30, 28, 0.18);
+  --sl-color-bg-nav: rgba(255, 255, 255, 0.8);
+  --sl-color-bg-sidebar: #fbfcfc;
+  --sl-color-hairline-light: rgba(0, 0, 0, 0.05);
+  --sl-color-hairline: rgba(0, 0, 0, 0.08);
+  --sl-color-hairline-shade: rgba(0, 0, 0, 0.12);
+  --sl-color-bg-inline-code: rgba(0, 0, 0, 0.05);
+  --crc-frame: rgba(0, 0, 0, 0.09);
+  --crc-card: rgba(0, 0, 0, 0.018);
+  --crc-glow: rgba(31, 138, 99, 0.1);
+  --crc-key-top: #ffffff;
+  --crc-key-bottom: #f1f3f2;
 }
 
-/* ---- Landing page ------------------------------------------------------ */
+body {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
 
-/* The hero is words only; the picture comes right after, full width. */
-.hero {
-  padding-block: 2rem 0.5rem;
+::selection {
+  background: color-mix(in srgb, var(--sl-color-accent) 30%, transparent);
 }
-.hero > .sl-flex:first-child {
-  max-width: 44rem;
+
+/* ---- Header ------------------------------------------------------------ */
+
+.header {
+  backdrop-filter: saturate(160%) blur(16px);
+  -webkit-backdrop-filter: saturate(160%) blur(16px);
+  border-bottom-color: var(--sl-color-hairline) !important;
 }
-.hero h1 {
-  font-size: clamp(2.4rem, 5.5vw, 4rem);
-  line-height: 1.05;
+.site-title {
+  gap: 0.55rem;
+  font-weight: 650;
   letter-spacing: -0.02em;
-  font-weight: 700;
+  color: var(--sl-color-white);
 }
-.hero .tagline {
-  font-size: clamp(1rem, 1.6vw, 1.25rem);
-  line-height: 1.55;
-  color: var(--sl-color-gray-2);
-  max-width: 40rem;
-}
-/* Only the one-column version of the hero is used, so let it span. */
-.hero .sl-flex.copy {
-  max-width: none;
+.site-title img {
+  height: 1.6rem;
+  width: auto;
+  border-radius: 6px;
 }
 
-.showcase {
-  margin: 2.5rem auto 0;
-  max-width: 72rem;
-}
-.showcase img {
-  display: block;
-  width: 100%;
-  height: auto;
-  border-radius: 14px;
-  border: 1px solid var(--crc-frame);
-  box-shadow: var(--crc-shadow);
-}
-/* One screenshot per appearance. These outrank the frame rule above. */
-.showcase img.only-light { display: none; }
-:root[data-theme="light"] .showcase img.only-dark { display: none; }
-:root[data-theme="light"] .showcase img.only-light { display: block; }
+/* ---- Sidebar ----------------------------------------------------------- */
 
-.stats {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
-  gap: 1rem 2rem;
-  margin: 3.5rem auto 3rem;
-  max-width: 72rem;
-  padding: 1.5rem 0;
-  border-top: 1px solid var(--crc-frame);
-  border-bottom: 1px solid var(--crc-frame);
+.sidebar-pane {
+  border-inline-end-color: var(--sl-color-hairline) !important;
 }
-.stats div {
-  display: flex;
-  flex-direction: column;
-  gap: 0.25rem;
-}
-.stats strong {
-  font-size: 2.25rem;
-  line-height: 1;
-  font-weight: 700;
-  letter-spacing: -0.02em;
-  color: var(--sl-color-accent-high);
-  font-variant-numeric: tabular-nums;
-}
-:root[data-theme="light"] .stats strong {
-  color: var(--sl-color-accent-high);
-}
-.stats span {
+nav.sidebar .top-level > li > details > summary .group-label > span,
+.sidebar-content .group-label .large {
+  font-size: 0.72rem;
+  font-weight: 650;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
   color: var(--sl-color-gray-3);
-  font-size: 0.95rem;
-  line-height: 1.4;
+}
+.sidebar-content a {
+  border-radius: 7px;
+  font-size: 0.9rem;
+  padding: 0.3rem 0.6rem;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.sidebar-content a:hover {
+  background: var(--sl-color-gray-6);
+  color: var(--sl-color-white);
+}
+.sidebar-content a[aria-current="page"],
+.sidebar-content a[aria-current="page"]:hover {
+  background: var(--sl-color-accent-low);
+  color: var(--sl-color-accent-high);
+  font-weight: 600;
+}
+.sidebar-content .sl-badge {
+  font-size: 0.65rem;
 }
 
-.card-grid {
-  max-width: 72rem;
-  margin-inline: auto;
-}
-.card {
-  border-color: var(--crc-frame);
-  background: color-mix(in srgb, var(--sl-color-black) 70%, var(--sl-color-gray-6));
-}
-.card .title {
-  font-size: 1.1rem;
-}
-.card .icon {
-  color: var(--sl-color-accent);
-  border-color: var(--crc-frame);
-}
+/* ---- Content ----------------------------------------------------------- */
 
-.feature {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr);
-  gap: 3rem;
-  align-items: center;
-  max-width: 72rem;
-  margin: 4rem auto 0;
+.content-panel {
+  border-top-color: var(--sl-color-hairline) !important;
 }
-.feature h2 {
+h1#_top {
+  font-weight: 680;
+  letter-spacing: -0.035em;
+  line-height: 1.1;
+}
+.sl-markdown-content :is(h2, h3, h4) {
+  letter-spacing: -0.02em;
+  font-weight: 640;
+}
+.sl-markdown-content h2 {
+  margin-top: 2.75rem;
+  padding-top: 1.75rem;
+  border-top: 1px solid var(--sl-color-hairline);
+}
+.sl-markdown-content > h2:first-child,
+.sl-markdown-content > .sl-heading-wrapper.level-h2:first-child h2 {
+  border-top: 0;
+  padding-top: 0;
+}
+.sl-markdown-content .sl-heading-wrapper.level-h2 {
+  margin-top: 2.75rem;
+  padding-top: 1.75rem;
+  border-top: 1px solid var(--sl-color-hairline);
+}
+.sl-markdown-content .sl-heading-wrapper.level-h2 h2 {
   margin-top: 0;
-  font-size: 1.75rem;
-  letter-spacing: -0.01em;
+  padding-top: 0;
+  border-top: 0;
 }
-.feature-text p {
+.sl-markdown-content p,
+.sl-markdown-content li {
   color: var(--sl-color-gray-2);
-  line-height: 1.6;
 }
-.feature-shot img {
-  display: block;
+.sl-markdown-content strong {
+  color: var(--sl-color-white);
+  font-weight: 620;
+}
+.sl-markdown-content a:not(:where(.not-content *, .card, .sl-link-card, .sl-link-button)) {
+  color: var(--sl-color-accent-high);
+  text-decoration-color: color-mix(in srgb, var(--sl-color-accent) 45%, transparent);
+  text-underline-offset: 3px;
+  text-decoration-thickness: 1px;
+}
+.sl-markdown-content a:not(:where(.not-content *)):hover {
+  text-decoration-color: currentColor;
+}
+.sl-markdown-content :not(pre) > code {
+  border-radius: 5px;
+  padding: 0.12em 0.38em;
+  font-size: 0.86em;
+  border: 1px solid var(--sl-color-hairline);
+}
+
+/* Keycaps. Write <kbd>⌘</kbd><kbd>P</kbd> in any page. */
+.sl-markdown-content kbd,
+.crc-keys kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.65em;
+  height: 1.65em;
+  padding: 0 0.42em;
+  margin: 0 0.08em;
+  border-radius: 6px;
+  font-family: var(--sl-font);
+  font-size: 0.78em;
+  font-weight: 550;
+  line-height: 1;
+  color: var(--sl-color-white);
+  background: linear-gradient(180deg, var(--crc-key-top), var(--crc-key-bottom));
+  border: 1px solid var(--sl-color-hairline-shade);
+  box-shadow: 0 1px 0 var(--sl-color-hairline-shade);
+  vertical-align: 0.08em;
+  white-space: nowrap;
+}
+
+/* Tables: framed, rounded, scrollable when wide. */
+.sl-markdown-content table {
+  display: table;
   width: 100%;
-  height: auto;
-  border-radius: 12px;
+  border-collapse: separate;
+  border-spacing: 0;
   border: 1px solid var(--crc-frame);
-  box-shadow: var(--crc-shadow);
+  border-radius: 12px;
+  font-size: 0.9rem;
 }
-@media (max-width: 60rem) {
-  .feature {
-    grid-template-columns: 1fr;
-    gap: 1.5rem;
+.sl-markdown-content :is(th, td) {
+  border: 0;
+  border-bottom: 1px solid var(--sl-color-hairline);
+  padding: 0.65rem 1rem;
+}
+.sl-markdown-content tr:last-child td {
+  border-bottom: 0;
+}
+.sl-markdown-content th {
+  background: var(--crc-card);
+  color: var(--sl-color-gray-3);
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.sl-markdown-content td:first-child {
+  white-space: nowrap;
+}
+
+@media (max-width: 50rem) {
+  .sl-markdown-content table {
+    display: block;
+    overflow-x: auto;
   }
 }
 
-.alpha {
-  max-width: 44rem;
-  margin: 4rem auto 2rem;
+/* Cards and link cards. */
+.card,
+.sl-link-card {
+  border-color: var(--crc-frame) !important;
+  border-radius: 14px !important;
+  background: linear-gradient(180deg, var(--crc-card), transparent) !important;
+  box-shadow: none !important;
+  transition: border-color 0.2s ease, transform 0.2s ease, background 0.2s ease;
 }
-.alpha h2 {
-  margin-top: 0;
+.sl-link-card:hover {
+  border-color: color-mix(in srgb, var(--sl-color-accent) 45%, transparent) !important;
+  background: radial-gradient(80% 100% at 50% 0%, var(--crc-glow), transparent) !important;
+  transform: translateY(-1px);
 }
-.alpha p {
+.card .icon {
+  color: var(--sl-color-accent-high);
+  background: var(--sl-color-accent-low);
+  border: 0;
+  border-radius: 10px;
+  padding: 0.35rem;
+}
+.card .title {
+  font-weight: 620;
+  letter-spacing: -0.01em;
+}
+.card .body p {
   color: var(--sl-color-gray-2);
-  line-height: 1.6;
 }
 
-/* ---- Docs pages -------------------------------------------------------- */
+/* Asides: softer, rounded. */
+.starlight-aside {
+  border-radius: 12px;
+  border-inline-start-width: 3px;
+}
 
-/* Tables in the handbook are wide; keep them scrollable, not squeezed. */
-.sl-markdown-content table {
+.starlight-aside--tip {
+  --sl-color-asides-text-accent: var(--sl-color-accent-high);
+  --sl-color-asides-border: var(--sl-color-accent);
+  background-color: color-mix(in srgb, var(--sl-color-accent) 10%, transparent);
+}
+
+/* Steps: a mint rail. */
+.sl-steps > li::before {
+  background: var(--sl-color-accent-low) !important;
+  color: var(--sl-color-accent-high) !important;
+  border: 1px solid color-mix(in srgb, var(--sl-color-accent) 40%, transparent);
+  font-weight: 650;
+}
+.sl-steps > li::after {
+  background: linear-gradient(var(--sl-color-accent-low), var(--sl-color-hairline)) !important;
+}
+
+/* Tabs. */
+starlight-tabs [role="tablist"] {
+  border-bottom-color: var(--sl-color-hairline) !important;
+}
+starlight-tabs [role="tab"][aria-selected="true"] {
+  color: var(--sl-color-accent-high) !important;
+  border-color: var(--sl-color-accent) !important;
+}
+
+/* Right-hand table of contents. */
+starlight-toc a[aria-current="true"],
+starlight-toc a[aria-current="true"]:hover {
+  color: var(--sl-color-accent-high);
+}
+
+/* Prev/next. */
+.pagination-links a {
+  border-radius: 12px;
+  border-color: var(--crc-frame);
+  box-shadow: none;
+  transition: border-color 0.2s ease;
+}
+.pagination-links a:hover {
+  border-color: color-mix(in srgb, var(--sl-color-accent) 45%, transparent);
+}
+
+/* ---- Doc-page furniture used by the MDX pages -------------------------- */
+
+/* A screenshot in a window frame. */
+.crc-shot {
+  margin: 1.75rem 0;
+  border-radius: 12px;
+  overflow: hidden;
+  border: 1px solid var(--crc-frame);
+  box-shadow: 0 24px 60px -20px rgba(0, 0, 0, 0.55);
+}
+.crc-shot img {
   display: block;
-  overflow-x: auto;
+  width: 100%;
+  height: auto;
+}
+:root[data-theme="light"] .crc-shot {
+  box-shadow: 0 24px 60px -24px rgba(20, 30, 28, 0.25);
+}
+.crc-shot + p em {
+  font-size: 0.85rem;
+  color: var(--sl-color-gray-3);
+}
+
+/* One picture per appearance. */
+.only-light {
+  display: none !important;
+}
+:root[data-theme="light"] .only-dark {
+  display: none !important;
+}
+:root[data-theme="light"] .only-light {
+  display: block !important;
+}
+
+/* The docs home banner. */
+.crc-intro {
+  position: relative;
+  margin: 0 0 2rem;
+  padding: 2rem;
+  border-radius: 18px;
+  border: 1px solid var(--crc-frame);
+  background:
+    radial-gradient(70% 120% at 0% 0%, color-mix(in srgb, var(--sl-color-accent) 22%, transparent), transparent 60%),
+    radial-gradient(60% 120% at 100% 0%, rgba(130, 170, 255, 0.14), transparent 60%),
+    var(--crc-card);
+  overflow: hidden;
+}
+.crc-intro p {
+  margin: 0;
+  font-size: 1.1rem;
+  line-height: 1.6;
+  color: var(--sl-color-gray-1);
+}
+.crc-intro .crc-intro-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  margin-top: 1.4rem;
+}
+
+/* A compact grid of shortcut pills. */
+.crc-keys {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(15rem, 1fr));
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+.crc-keys > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.55rem 0.8rem;
+  border-radius: 10px;
+  border: 1px solid var(--crc-frame);
+  background: var(--crc-card);
+  font-size: 0.88rem;
+  color: var(--sl-color-gray-2);
+}
+.crc-keys > div > span:last-child {
+  display: inline-flex;
+  flex: none;
+}
+.crc-keys + * {
+  margin-top: 1.5rem;
+}
+
+/* Status chips: implemented, partial, planned. */
+.crc-status {
+  display: inline-block;
+  padding: 0.05rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 650;
+  letter-spacing: 0.03em;
+  vertical-align: 0.15em;
+}
+.crc-status.yes {
+  background: var(--sl-color-accent-low);
+  color: var(--sl-color-accent-high);
+}
+.crc-status.no {
+  background: color-mix(in srgb, #e2a43a 18%, transparent);
+  color: #c98a1f;
+}
+
+/* The highlighted entry in a FileTree: dark text on the mint fill. */
+starlight-file-tree .highlight {
+  color: #0c0e0e !important;
+}
+:root[data-theme="light"] starlight-file-tree .highlight {
+  color: #ffffff !important;
 }

@@ -1,0 +1,74 @@
+---
+title: HTTP requests
+description: Write requests in .http files, the format JetBrains and the VS Code REST Client read, and send them with one key.
+---
+
+import { Aside, FileTree } from "@astrojs/starlight/components";
+
+Open a `.http` or `.rest` file, put the caret in a request and press
+<kbd>⌘</kbd><kbd>↩</kbd> (**Run › Send Request**). The response opens in its
+own tab.
+
+The format is the one JetBrains' HTTP client and the VS Code REST Client
+read, so a request file works in three editors, and Postman or Insomnia
+exports convert to it.
+
+## A request file
+
+```http title="api.http"
+@host = https://api.example.com
+
+### List users
+GET {{host}}/users
+Authorization: Bearer {{token}}
+
+### Create one
+# @name create
+POST {{host}}/users
+Content-Type: application/json
+
+{"name": "Ada"}
+```
+
+## The format
+
+- **Blocks** are separated by lines starting with `###`. Text after the `###`
+  names the request.
+- Inside a block: comment lines (`#` or `//`), then the **request line**, then
+  **headers** until a blank line, then the **body**.
+- The body can come from a file instead: `< ./file.json`.
+- `# @name create` names a request explicitly.
+
+## Variables and environments
+
+`@name = value` lines outside a request define variables, used as
+`{{name}}`. Everything else comes from environment files beside the request
+file or in a parent folder:
+
+<FileTree>
+- api/
+  - http-client.env.json shared values, safe to commit
+  - http-client.private.env.json secrets, keep out of Git
+  - **users.http**
+</FileTree>
+
+Both files are keyed by environment name:
+
+```json title="http-client.env.json"
+{
+  "dev": { "host": "http://localhost:8080" },
+  "prod": { "host": "https://api.example.com" }
+}
+```
+
+`# @env prod` in the request file picks the environment; otherwise the first
+one in the file is used. A variable that is defined nowhere is reported by
+name, with where to define it.
+
+## How requests are sent
+
+<Aside title="No network code in the editor">
+  crc has no HTTP client of its own. Requests go through the system `curl`,
+  which ships with macOS, driven the way `git` is: one subprocess, a size
+  cap, a timeout, and curl's own error shown verbatim when it fails.
+</Aside>
