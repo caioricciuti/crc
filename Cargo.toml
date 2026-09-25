@@ -1,0 +1,181 @@
+[package]
+name = "crc"
+version = "0.2.0-alpha.1"
+edition = "2024"
+rust-version = "1.98"
+license = "GPL-3.0-or-later"
+description = "A GPU-rendered text editor for macOS, built directly on Metal and CoreText."
+repository = "https://github.com/caioricciuti/crc"
+keywords = ["editor", "metal", "coretext", "macos"]
+categories = ["text-editors"]
+
+# Every version is an exact pin (`=`). No caret ranges: a malicious patch
+# release cannot drift in on a rebuild. Sources are vendored under vendor/
+# and builds run offline, so a rebuild fetches nothing at all.
+#
+# The tree is the objc2 family, maintained by simlay + madsmtm, vetted
+# 2026-09-18 (see docs/dependency-review.md).
+#
+# `default-features = false` everywhere is deliberate. The objc2 crates gate
+# every Objective-C class behind its own feature, and the defaults turn on all
+# of them plus four sibling framework crates we never touch (cloud-kit,
+# core-data, core-image, core-video). Listing only what we use drops those
+# crates from the build entirely and cuts compile time by a large factor.
+#
+# Text shaping and rasterization come from CoreText, which ships with the OS,
+# so there is no third-party font stack here. The rope is ours: src/text/rope.rs.
+
+# The only build dependency, and the only thing that compiles C here. Pinned
+# to the newest release that was at least 7 days old when it was added, which
+# is the cargo-side equivalent of npm's min-release-age: 1.4.7 and 1.4.6 were
+# both inside that window at the time.
+[build-dependencies]
+cc = "=1.4.5"
+
+[dependencies]
+objc2 = { version = "=0.6.4", default-features = false, features = ["std"] }
+
+objc2-foundation = { version = "=0.3.2", default-features = false, features = [
+    "std",
+    "NSString",
+    "NSGeometry",
+    "NSObjCRuntime",
+    "NSRange",
+    "NSRegularExpression",
+    "NSTextCheckingResult",
+    "NSValue",
+    "NSArray",
+    "NSDictionary",
+    "NSAttributedString",
+    "NSNotification",
+    "NSThread",
+    "NSDate",
+    "NSError",
+    "NSData",
+    "NSURL",
+    "NSFileManager",   # move project-tree items to Trash
+    "NSUserDefaults",  # one registered default: key repeat over the accent menu
+] }
+
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = [
+    "std",
+    # Gate the methods that traffic in CGFloat/CGSize (backing scale, scroll
+    # deltas) and in CALayer (layer-hosting views). Neither adds a crate.
+    "objc2-core-foundation",
+    "objc2-quartz-core",
+    "NSApplication",
+    "NSResponder",
+    "NSWindow",
+    "NSView",
+    "NSAppearance",    # light or dark: the system setting, and the choice in config.toml
+    "NSEvent",
+    "NSScreen",
+    "NSMenu",
+    "NSMenuItem",
+    "NSGraphics",
+    "NSColor",
+    "NSPasteboard",
+    "NSAlert",         # unsaved-changes confirmation
+    "NSCursor",        # resize cursor over the sidebar divider
+    "NSButton",        # NSAlert::addButtonWithTitle returns one
+    "NSControl",       # NSButton -> NSControl -> NSView
+    "NSOpenPanel",     # Cmd-O; its class is gated on the whole
+    "NSSavePanel",     # NSOpenPanel -> NSSavePanel -> NSPanel -> NSWindow
+    "NSPanel",         # superclass chain, so all three are required
+    "NSTextInputClient",   # real text input: IME, dead keys, accents
+    "NSTextInputContext",  # discarding a half-typed composition on click
+    "NSGraphicsContext",   # gates the NSEvent constructors the self-test uses
+    "NSRunningApplication",
+    "NSTrackingArea",      # hover: the close button on the tab under the pointer
+] }
+
+objc2-quartz-core = { version = "=0.3.2", default-features = false, features = [
+    "std",
+    # Gates setContentsScale / setDrawableSize, which take CoreGraphics types.
+    "objc2-core-foundation",
+    # Gates CAMetalDrawable and CAMetalLayer::nextDrawable.
+    "objc2-metal",
+    "CABase",
+    "CALayer",
+    "CAMetalLayer",
+    "CAMediaTiming",
+    "CADisplayLink",       # frame pacing that follows ProMotion
+    "CAFrameRateRange",
+] }
+
+objc2-metal = { version = "=0.3.2", default-features = false, features = [
+    "std",
+    "MTLDefines",
+    "MTLTypes",
+    "MTLDevice",
+    "MTLDrawable",
+    "MTLPixelFormat",
+    "MTLResource",
+    "MTLBuffer",
+    "MTLTexture",
+    "MTLSampler",
+    "MTLLibrary",
+    "MTLPipeline",
+    "MTLRenderPipeline",
+    "MTLRenderPass",
+    "MTLRenderCommandEncoder",
+    "MTLCommandEncoder",
+    "MTLCommandBuffer",
+    "MTLCommandQueue",
+    "MTLVertexDescriptor",
+    "MTLDataType",
+] }
+
+objc2-core-text = { version = "=0.3.2", default-features = false, features = [
+    "std",
+    # Gates the glyph-mapping, metrics and rasterization methods, which all
+    # traffic in CoreGraphics types.
+    "objc2-core-graphics",
+    "CTDefines",
+    "CTFont",
+    "CTFontDescriptor",
+    "CTFontTraits",
+    "CTLine",
+    "CTRun",
+    "CTTypesetter",
+    "CTStringAttributes",
+] }
+
+objc2-core-graphics = { version = "=0.3.2", default-features = false, features = [
+    "std",
+    "CGBase",
+    "CGGeometry",
+    "CGAffineTransform",
+    "CGColorSpace",
+    "CGContext",
+    "CGBitmapContext",
+    "CGFont",
+    "CGDataProvider",  # a CGFont from bytes: the bundled icon font
+    "CGImage",
+    "CGColor",
+] }
+
+objc2-core-foundation = { version = "=0.3.2", default-features = false, features = [
+    "std",
+    "CFBase",
+    "CFString",
+    "CFArray",
+    "CFDictionary",
+    "CFNumber",
+    "CFAttributedString",
+    "CFData",          # wraps the icon font's bytes for CGDataProvider
+    "CFCGTypes",
+] }
+
+[profile.dev]
+# The editor is unusable at dev-profile speeds when scrolling a large file,
+# and latency has to be measurable during development, not only in release.
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"

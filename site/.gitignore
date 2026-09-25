@@ -1,0 +1,17 @@
+# Installed packages and build output.
+node_modules/
+dist/
+.astro/
+
+# Mirrored from ../README.md, ../CHANGELOG.md, ../CONTRIBUTING.md and
+# ../docs by scripts/sync-docs.mjs on every build. Edit the originals.
+src/content/docs/handbook.md
+src/content/docs/changelog.md
+src/content/docs/vision.md
+src/content/docs/dependency-review.md
+src/content/docs/contributing.md
+
+# The repository ignores PNGs at the root; the site ships these three.
+!src/assets/*.png
+
+/asdasd

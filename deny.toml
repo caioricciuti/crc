@@ -1,0 +1,33 @@
+# cargo-deny configuration. Run with `cargo deny check`.
+
+[advisories]
+# Fail on any known vulnerability in the tree.
+yanked = "deny"
+
+[licenses]
+# The project is GPL-3.0-or-later. Every dependency must be under a licence
+# that can be combined into a GPLv3 work. All of these are permissive and
+# GPLv3-compatible; note Apache-2.0 is compatible with GPLv3 specifically,
+# not with GPLv2.
+allow = [
+    # This crate's own licence. cargo-deny checks the root package too, so
+    # omitting it makes the project reject itself.
+    "GPL-3.0-or-later",
+    # Dependency licences. All permissive and GPLv3-compatible; note
+    # Apache-2.0 is compatible with GPLv3 specifically, not with GPLv2.
+    "MIT",
+    "Apache-2.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Two versions of the same crate usually means an unreviewed tree slipped in
+# behind a transitive dependency.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

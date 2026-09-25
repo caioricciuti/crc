@@ -1,0 +1,18 @@
+{
+  "name": "crc-site",
+  "private": true,
+  "description": "crceditor.com: the handbook and docs for crc, built with Starlight from the Markdown in ../docs.",
+  "type": "module",
+  "scripts": {
+    "sync": "bun run scripts/sync-docs.mjs",
+    "dev": "bun run sync && astro dev",
+    "build": "bun run sync && astro build",
+    "preview": "astro preview"
+  },
+  "dependencies": {
+    "@astrojs/starlight": "0.42.1",
+    "astro": "7.3.3"
+  },
+  "trustedDependencies": [],
+  "packageManager": "bun@1.4.2"
+}

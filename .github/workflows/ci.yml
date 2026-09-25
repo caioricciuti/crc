@@ -1,0 +1,134 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Nothing here writes to the repository, so the token cannot either.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Actions are pinned to a commit, with the release it corresponds to in a
+# comment. A tag like `v4` is a branch in all but name: whoever controls the
+# action can move it, and every workflow that trusts it runs the new code on
+# its next push. That is the drift the exact pins in Cargo.toml exist to stop,
+# and a workflow is code that runs with the repository checked out.
+#
+# Only GitHub's own actions are used. The one third-party action that was
+# here, a build cache, saved about a minute on a 14-crate tree.
+
+jobs:
+  # The supply-chain gate. This project's whole dependency posture is "14
+  # crates, one build script, zero proc macros", and that claim is worthless
+  # unless something checks it on every change.
+  #
+  # It runs first and the jobs that compile anything wait for it. Nothing in
+  # this job executes a dependency's code: vendoring downloads and verifies
+  # checksums against Cargo.lock, and the gate only reads what cargo reports.
+  # A pull request that adds a build script is stopped here, before
+  # `cargo test` in the next job would have run it.
+  supply-chain:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      # The version comes from rust-toolchain.toml.
+      - name: Toolchain
+        run: |
+          rustup toolchain install
+          cargo --version
+
+      - name: Vendored C matches its reviewed checksums
+        run: ./scripts/check-third-party.sh
+
+      # The gate lives in a script so it can be run locally, and so the
+      # allowlist is a reviewable file rather than YAML buried in a job.
+      - name: Vendor, then build scripts, proc macros, tree size
+        run: ./scripts/vendor.sh
+
+  test:
+    needs: supply-chain
+    # Metal and CoreText are macOS APIs. There is no other target.
+    runs-on: macos-15
+    env:
+      # Anything that reaches the network during a build is a bug we want
+      # loud. Every step below builds from vendor/ and nothing else.
+      CARGO_NET_OFFLINE: true
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Toolchain
+        run: |
+          rustup toolchain install
+          cargo --version
+
+      # The one step allowed to fetch. It can only fetch what Cargo.lock
+      # names, verified against the checksums recorded there.
+      - name: Vendor
+        env:
+          CARGO_NET_OFFLINE: false
+        run: |
+          mkdir -p .cargo
+          cargo vendor --locked --versioned-dirs > .cargo/config.toml
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked --offline -- -D warnings
+
+      - name: Test
+        run: cargo test --all-targets --locked --offline
+
+      # The renderer needs a GPU. GitHub's macOS runners have one, but not a
+      # display, which is exactly why the offscreen path exists: it exercises
+      # the real pipeline, shader and layout with no window.
+      - name: Render a frame headless
+        run: cargo run --release --locked --offline --example frame_dump -- /tmp/ci-frame.bmp
+
+      - name: Upload the rendered frame
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: rendered-frame
+          path: /tmp/ci-frame.bmp
+
+  # Its own job, because installing cargo-deny compiles a few hundred crates
+  # with their build scripts and proc macros. That is a tool's dependency
+  # tree, not ours, and it should not share a job with anything it could
+  # influence. It has a read-only token and produces nothing the other jobs use.
+  advisories:
+    needs: supply-chain
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Toolchain
+        run: |
+          rustup toolchain install
+          cargo --version
+
+      # Pinned exactly, for the same reason every dependency is: an
+      # unpinned `cargo install` pulls whatever is newest at run time.
+      - name: Cache cargo-deny
+        id: cache-deny
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ~/.cargo/bin/cargo-deny
+          key: cargo-deny-0.20.2-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install cargo-deny
+        if: steps.cache-deny.outputs.cache-hit != 'true'
+        run: cargo install cargo-deny --locked --version 0.20.2
+
+      - name: Advisories and licenses
+        run: cargo deny check

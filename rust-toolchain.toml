@@ -1,0 +1,10 @@
+# The compiler was the one unpinned input to a build where everything else
+# is pinned exactly. `stable` moves every six weeks, and with `-D warnings`
+# in CI a new lint breaks the build with no change to the code.
+#
+# rustup reads this file and installs the toolchain on first use. Bump it on
+# purpose, in its own commit, together with `rust-version` in Cargo.toml.
+[toolchain]
+channel = "1.98.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

@@ -1,0 +1,180 @@
+/* Graphite, the editor's own palette, on Starlight's tokens. The dark table
+   is the editor's default; the light one is its light appearance. */
+
+:root {
+  --sl-color-accent-low: #1f3a30;
+  --sl-color-accent: #3fb98a;
+  --sl-color-accent-high: #a6ddc2;
+  --sl-color-white: #e3e6e5;
+  --sl-color-gray-1: #c9cfcd;
+  --sl-color-gray-2: #a6afac;
+  --sl-color-gray-3: #7e8f87;
+  --sl-color-gray-4: #4b5754;
+  --sl-color-gray-5: #2b3132;
+  --sl-color-gray-6: #202425;
+  --sl-color-black: #171a1b;
+  --sl-font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI", sans-serif;
+  --sl-font-mono: "SF Mono", ui-monospace, Menlo, monospace;
+  --crc-frame: rgba(255, 255, 255, 0.08);
+  --crc-shadow: 0 30px 80px rgba(0, 0, 0, 0.55);
+}
+
+:root[data-theme="light"] {
+  --sl-color-accent-low: #d5efe4;
+  --sl-color-accent: #1f8a63;
+  --sl-color-accent-high: #145a41;
+  --sl-color-white: #1e2323;
+  --sl-color-gray-1: #2e3534;
+  --sl-color-gray-2: #4b5754;
+  --sl-color-gray-3: #66726f;
+  --sl-color-gray-4: #a6afac;
+  --sl-color-gray-5: #d5d9d9;
+  --sl-color-gray-6: #eceeee;
+  --sl-color-gray-7: #f7f8f8;
+  --sl-color-black: #ffffff;
+  --crc-frame: rgba(0, 0, 0, 0.1);
+  --crc-shadow: 0 30px 80px rgba(20, 30, 28, 0.18);
+}
+
+/* ---- Landing page ------------------------------------------------------ */
+
+/* The hero is words only; the picture comes right after, full width. */
+.hero {
+  padding-block: 2rem 0.5rem;
+}
+.hero > .sl-flex:first-child {
+  max-width: 44rem;
+}
+.hero h1 {
+  font-size: clamp(2.4rem, 5.5vw, 4rem);
+  line-height: 1.05;
+  letter-spacing: -0.02em;
+  font-weight: 700;
+}
+.hero .tagline {
+  font-size: clamp(1rem, 1.6vw, 1.25rem);
+  line-height: 1.55;
+  color: var(--sl-color-gray-2);
+  max-width: 40rem;
+}
+/* Only the one-column version of the hero is used, so let it span. */
+.hero .sl-flex.copy {
+  max-width: none;
+}
+
+.showcase {
+  margin: 2.5rem auto 0;
+  max-width: 72rem;
+}
+.showcase img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border-radius: 14px;
+  border: 1px solid var(--crc-frame);
+  box-shadow: var(--crc-shadow);
+}
+/* One screenshot per appearance. These outrank the frame rule above. */
+.showcase img.only-light { display: none; }
+:root[data-theme="light"] .showcase img.only-dark { display: none; }
+:root[data-theme="light"] .showcase img.only-light { display: block; }
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+  gap: 1rem 2rem;
+  margin: 3.5rem auto 3rem;
+  max-width: 72rem;
+  padding: 1.5rem 0;
+  border-top: 1px solid var(--crc-frame);
+  border-bottom: 1px solid var(--crc-frame);
+}
+.stats div {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+.stats strong {
+  font-size: 2.25rem;
+  line-height: 1;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--sl-color-accent-high);
+  font-variant-numeric: tabular-nums;
+}
+:root[data-theme="light"] .stats strong {
+  color: var(--sl-color-accent-high);
+}
+.stats span {
+  color: var(--sl-color-gray-3);
+  font-size: 0.95rem;
+  line-height: 1.4;
+}
+
+.card-grid {
+  max-width: 72rem;
+  margin-inline: auto;
+}
+.card {
+  border-color: var(--crc-frame);
+  background: color-mix(in srgb, var(--sl-color-black) 70%, var(--sl-color-gray-6));
+}
+.card .title {
+  font-size: 1.1rem;
+}
+.card .icon {
+  color: var(--sl-color-accent);
+  border-color: var(--crc-frame);
+}
+
+.feature {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr);
+  gap: 3rem;
+  align-items: center;
+  max-width: 72rem;
+  margin: 4rem auto 0;
+}
+.feature h2 {
+  margin-top: 0;
+  font-size: 1.75rem;
+  letter-spacing: -0.01em;
+}
+.feature-text p {
+  color: var(--sl-color-gray-2);
+  line-height: 1.6;
+}
+.feature-shot img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border-radius: 12px;
+  border: 1px solid var(--crc-frame);
+  box-shadow: var(--crc-shadow);
+}
+@media (max-width: 60rem) {
+  .feature {
+    grid-template-columns: 1fr;
+    gap: 1.5rem;
+  }
+}
+
+.alpha {
+  max-width: 44rem;
+  margin: 4rem auto 2rem;
+}
+.alpha h2 {
+  margin-top: 0;
+}
+.alpha p {
+  color: var(--sl-color-gray-2);
+  line-height: 1.6;
+}
+
+/* ---- Docs pages -------------------------------------------------------- */
+
+/* Tables in the handbook are wide; keep them scrollable, not squeezed. */
+.sl-markdown-content table {
+  display: block;
+  overflow-x: auto;
+}

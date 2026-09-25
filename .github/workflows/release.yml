@@ -1,0 +1,96 @@
+name: Release
+
+# A tag `v<version>` builds, signs, notarizes and packages the app, then
+# opens a draft release with the DMG and its checksum attached. Publishing
+# the draft is a person's click, after opening the DMG once.
+on:
+  push:
+    tags: ["v*"]
+
+# Creating the release and uploading its assets is the one write this
+# workflow makes. Everything else is read.
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: macos-15
+    # The secrets live on the `release` environment, not the repository, so
+    # a pull request or a branch build can never see them and a required
+    # reviewer can be put in front of every release.
+    environment: release
+    steps:
+      # Same pin as ci.yml. A tag is a branch in all but name.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: The tag must be the version in Cargo.toml
+        run: |
+          version=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = //; s/"//g')
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $version" >&2
+            exit 1
+          fi
+
+      - name: Third-party sources match their checksums
+        run: scripts/check-third-party.sh
+
+      - name: Tests
+        run: cargo test --release --locked
+
+      # A throwaway keychain that exists for this job only. The certificate
+      # arrives as a secret, is imported, and the file is removed at once;
+      # the keychain is deleted in the last step whatever happened before.
+      - name: Import the signing certificate
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/release.keychain-db"
+          keychain_password=$(openssl rand -hex 24)
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          printf '%s' "$APPLE_CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          rm -f "$RUNNER_TEMP/certificate.p12"
+          # Lets codesign use the key without a prompt there is nobody to answer.
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain"
+          security default-keychain -s "$keychain"
+          security find-identity -v -p codesigning "$keychain"
+
+      - name: Store the notary credentials in the same keychain
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          xcrun notarytool store-credentials crc-notary \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" \
+            --keychain "$RUNNER_TEMP/release.keychain-db"
+
+      - name: Build, sign, notarize and package
+        env:
+          CRC_NOTARY_KEYCHAIN: ${{ runner.temp }}/release.keychain-db
+        run: scripts/bundle.sh --release
+
+      # gh is on the runner already, so no third-party action is needed to
+      # publish. Draft: the DMG gets opened by a person before anyone else
+      # sees the release.
+      - name: Open a draft release with the DMG
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --draft --generate-notes --title "crc $GITHUB_REF_NAME" \
+            target/crc-*.dmg target/SHA256SUMS
+
+      - name: Remove the keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/release.keychain-db" || true

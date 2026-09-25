@@ -1,0 +1,15 @@
+/target
+**/*.rs.bk
+*.bmp
+*.png
+
+# Vendored dependency sources. Not committed: 16MB against 132KB of source,
+# and every dependency bump would produce an unreadable diff. The security
+# properties it provided are enforced in CI instead (see .github/workflows),
+# and `scripts/vendor.sh` recreates it locally for offline or audit work.
+/vendor
+/.cargo/config.toml
+
+# Editor and agent settings stay on each machine.
+/.claude/
+.DS_Store
