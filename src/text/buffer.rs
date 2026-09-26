@@ -11,7 +11,7 @@
 //! costs one pointer bump and a refcount. It is the payoff for having written
 //! the rope as a persistent tree.
 
-use std::io::{Read, Seek};
+use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::time::{Duration, Instant};
@@ -31,6 +31,15 @@ const COALESCE_WINDOW: Duration = Duration::from_millis(600);
 /// character.
 fn is_continuation(b: u8) -> bool {
     b & 0xC0 == 0x80
+}
+
+/// `text` with CRLF and lone CR as LF, the only line break the rope holds.
+fn normalize_newlines(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.contains('\r') {
+        text.replace("\r\n", "\n").replace('\r', "\n").into()
+    } else {
+        text.into()
+    }
 }
 
 /// Copies mode, owner, ACLs and extended attributes onto a replacement file.
@@ -85,13 +94,38 @@ fn matches_disk(
 
 /// What `stat` said about the file the last time the buffer read or wrote it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct DiskStamp {
+pub struct DiskStamp {
     len: u64,
     modified: Option<std::time::SystemTime>,
 }
 
 impl DiskStamp {
-    fn of(path: &std::path::Path) -> std::io::Result<Self> {
+    /// `len secs nanos`, or `len -` without a modification time: how a
+    /// recovery file keeps it.
+    pub fn encode(&self) -> String {
+        match self
+            .modified
+            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+        {
+            Some(d) => format!("{} {} {}", self.len, d.as_secs(), d.subsec_nanos()),
+            None => format!("{} -", self.len),
+        }
+    }
+
+    pub fn decode(text: &str) -> Option<Self> {
+        let mut parts = text.split_whitespace();
+        let len = parts.next()?.parse().ok()?;
+        let modified = match parts.next()? {
+            "-" => None,
+            secs => Some(
+                std::time::UNIX_EPOCH
+                    + std::time::Duration::new(secs.parse().ok()?, parts.next()?.parse().ok()?),
+            ),
+        };
+        Some(DiskStamp { len, modified })
+    }
+
+    pub fn of(path: &std::path::Path) -> std::io::Result<Self> {
         let meta = std::fs::metadata(path)?;
         Ok(DiskStamp {
             len: meta.len(),
@@ -352,7 +386,7 @@ impl Buffer {
     /// Replaces the whole text of a generated document with a new version,
     /// keeping the tab, its identity and the caret near where it was.
     pub fn regenerate(&mut self, text: &str) {
-        self.rope = Rope::from_text(text);
+        self.rope = Rope::from_text(&normalize_newlines(text));
         self.extra.clear();
         self.clamp_positions();
         // The whole rope was replaced: queued edits no longer describe the
@@ -437,6 +471,11 @@ impl Buffer {
             buffer.indent_style = crate::text::indent::for_file(path, &buffer.rope);
         }
         Ok(buffer)
+    }
+
+    /// What `stat` said the last time this buffer read or wrote its file.
+    pub fn disk_stamp(&self) -> Option<DiskStamp> {
+        self.stamp
     }
 
     /// Opened past [`READ_ONLY_BYTES`], so it cannot be edited.
@@ -539,7 +578,16 @@ impl Buffer {
     ///
     /// Dirty from the start, and the file at `path` is not read: what is on
     /// disk is the last save, and this is what came after it.
-    pub fn recovered(path: Option<std::path::PathBuf>, text: &str) -> Self {
+    ///
+    /// `stamp` is what the crashed instance knew of the file. When the file
+    /// has changed since, the disk text is not what the edits were made
+    /// against: the first save asks, as for any change on disk.
+    pub fn recovered(
+        path: Option<std::path::PathBuf>,
+        text: &str,
+        stamp: Option<DiskStamp>,
+    ) -> Self {
+        let path = path.map(|p| std::fs::canonicalize(&p).unwrap_or(p));
         let mut buffer = Buffer::from_text(text);
         if let Some((saved, format)) = path
             .as_deref()
@@ -548,6 +596,11 @@ impl Buffer {
         {
             buffer.saved = Some(Rope::from_text(&saved));
             buffer.format = format;
+        }
+        let now = path.as_deref().and_then(|p| DiskStamp::of(p).ok());
+        buffer.stamp = stamp.or(now);
+        if stamp.is_some() && stamp != now {
+            buffer.saved = None;
         }
         buffer.path = path;
         buffer.dirty = true;
@@ -612,7 +665,10 @@ impl Buffer {
                         "cannot verify the previous disk contents",
                     )
                 })?;
-                if !matches_disk(&target, expected, &self.format)? {
+                // Our own stamp still on the file means nobody wrote it since;
+                // only a changed stamp costs reading the whole file.
+                let unchanged = self.stamp.is_some() && DiskStamp::of(&target).ok() == self.stamp;
+                if !unchanged && !matches_disk(&target, expected, &self.format)? {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::AlreadyExists,
                         "file changed on disk since it was opened",
@@ -627,15 +683,64 @@ impl Buffer {
         }
 
         file_format::validate(&self.rope, &self.format)?;
-        if existing.as_ref().is_some_and(|m| m.nlink() > 1) {
+        let in_place = existing.as_ref().is_some_and(|m| m.nlink() > 1);
+        let atomic = if in_place {
+            None
+        } else {
+            Some(self.write_replacing(&target, existing.is_some()))
+        };
+        match atomic {
+            Some(Ok(())) => {}
+            // A writable file in a directory we may not create in: write
+            // the file itself, as for a hard link.
+            Some(Err(e)) if e.kind() == std::io::ErrorKind::PermissionDenied && existing.is_some() => {
+                self.write_in_place(&target)?;
+            }
+            Some(Err(e)) => return Err(e),
             // Rename would silently detach the other names from this file.
             // Writing the same inode preserves its links, ACLs and xattrs.
-            let mut file = std::fs::OpenOptions::new().write(true).open(&target)?;
-            file.seek(std::io::SeekFrom::Start(0))?;
-            file.set_len(0)?;
-            file_format::write(&mut file, &self.rope, &self.format)?;
-            file.sync_all()?;
-        } else {
+            None => self.write_in_place(&target)?,
+        }
+        self.stamp = DiskStamp::of(&target).ok();
+        self.conflict_noticed = false;
+        self.path = Some(std::fs::canonicalize(&target).unwrap_or(target));
+        self.saved = Some(self.rope.clone());
+        self.dirty = false;
+        Ok(())
+    }
+
+    /// Writes over the file's own bytes. Nothing is truncated before the new
+    /// text is all written, and a write that fails half-way puts the old
+    /// text back, when it is known.
+    fn write_in_place(&self, target: &std::path::Path) -> std::io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        let mut new = Vec::new();
+        file_format::write(&mut new, &self.rope, &self.format)?;
+        let mut old = None;
+        if let Some(saved) = &self.saved
+            && self.path.as_deref() == Some(target)
+        {
+            let mut bytes = Vec::new();
+            file_format::write(&mut bytes, saved, &self.format)?;
+            old = Some(bytes);
+        }
+        let file = std::fs::OpenOptions::new().write(true).open(target)?;
+        let result = file
+            .write_all_at(&new, 0)
+            .and_then(|()| file.set_len(new.len() as u64))
+            .and_then(|()| file.sync_all());
+        if let (Err(_), Some(old)) = (&result, old) {
+            let _ = file
+                .write_all_at(&old, 0)
+                .and_then(|()| file.set_len(old.len() as u64))
+                .and_then(|()| file.sync_all());
+        }
+        result
+    }
+
+    /// Writes a temporary file next to `target` and renames it over.
+    fn write_replacing(&self, target: &std::path::Path, existing: bool) -> std::io::Result<()> {
+        {
             let parent = target.parent().ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -670,29 +775,23 @@ impl Buffer {
             })?;
             let result: std::io::Result<()> = (|| {
                 file_format::write(&mut file, &self.rope, &self.format)?;
-                if existing.is_some() {
-                    copy_metadata(&target, &file)?;
+                if existing {
+                    copy_metadata(target, &file)?;
                     // COPYFILE_STAT also copies the old modification time.
                     file.set_times(
                         std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()),
                     )?;
                 }
                 file.sync_all()?;
-                std::fs::rename(&temp_path, &target)?;
+                std::fs::rename(&temp_path, target)?;
                 std::fs::File::open(parent)?.sync_all()?;
                 Ok(())
             })();
             if result.is_err() {
                 let _ = std::fs::remove_file(&temp_path);
             }
-            result?;
+            result
         }
-        self.stamp = DiskStamp::of(&target).ok();
-        self.conflict_noticed = false;
-        self.path = Some(std::fs::canonicalize(&target).unwrap_or(target));
-        self.saved = Some(self.rope.clone());
-        self.dirty = false;
-        Ok(())
     }
 
     fn from_rope(rope: Rope) -> Self {
@@ -942,13 +1041,7 @@ impl Buffer {
         if self.is_locked() {
             return;
         }
-        let normalized;
-        let text = if text.contains('\r') {
-            normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-            normalized.as_str()
-        } else {
-            text
-        };
+        let text = &*normalize_newlines(text);
         if !self.extra.is_empty() {
             self.checkpoint_keeping_cursors(EditKind::Insert);
             // Multi-cursor edits are not describable as a single tree-sitter
@@ -1464,6 +1557,16 @@ impl Buffer {
         if offsets.is_empty() {
             return 0;
         }
+        let text = &*normalize_newlines(text);
+        // The caret keeps its place in the text around the replacements.
+        let mut caret = self.cursor;
+        for &offset in offsets.iter().rev() {
+            if offset + needle.len() <= self.cursor {
+                caret = caret + text.len() - needle.len();
+            } else if offset < self.cursor {
+                caret = offset + text.len();
+            }
+        }
 
         self.checkpoint(EditKind::Insert);
         // Back to front, so earlier replacements do not shift later offsets.
@@ -1475,7 +1578,7 @@ impl Buffer {
             self.record_edit(offset, end, old_end_point, offset + text.len());
         }
 
-        self.cursor = self.cursor.min(self.rope.len_bytes());
+        self.cursor = caret.min(self.rope.len_bytes());
         self.anchor = self.cursor;
         self.clamp_positions();
         offsets.len()
@@ -1492,6 +1595,18 @@ impl Buffer {
         if replacements.is_empty() {
             return 0;
         }
+        // A formatter on a CRLF file answers in CRLF; the rope holds LF
+        // only and the file's own endings are restored on save.
+        let normalized: Vec<(std::ops::Range<usize>, String)>;
+        let replacements = if replacements.iter().any(|(_, t)| t.contains('\r')) {
+            normalized = replacements
+                .iter()
+                .map(|(r, t)| (r.clone(), normalize_newlines(t).into_owned()))
+                .collect();
+            &normalized[..]
+        } else {
+            replacements
+        };
         let mut previous_end = 0;
         for (range, _) in replacements {
             if range.start < previous_end
@@ -3701,6 +3816,26 @@ mod tests {
     }
 
     #[test]
+    fn formatter_crlf_does_not_reach_the_rope() {
+        // A CRLF file formatted by a server that answers in CRLF saved every
+        // formatted line as CR CR LF.
+        let mut b = Buffer::from_text("a\nb\n");
+        b.replace_ranges(&[(0..4, "x\r\ny\r\n".into())]);
+        assert_eq!(b.rope.to_string(), "x\ny\n");
+        b.replace_all("y", "1\r2");
+        assert_eq!(b.rope.to_string(), "x\n1\n2\n");
+    }
+
+    #[test]
+    fn replace_all_keeps_the_caret_in_its_text() {
+        let mut b = Buffer::from_text("aa x aa y");
+        b.place_cursor(8, Move); // before "y"
+        b.replace_all("aa", "b");
+        assert_eq!(b.rope.to_string(), "b x b y");
+        assert_eq!(b.cursor, 6, "still before y");
+    }
+
+    #[test]
     fn fold_all_folds_top_level_blocks() {
         let mut b = Buffer::from_text(BLOCKS);
         b.fold_all();
@@ -4176,6 +4311,67 @@ mod tests {
         );
         assert_eq!(std::fs::read(&legacy).unwrap(), b"Xcaf\xe9\r\n");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn in_place_save_shrinks_and_grows_the_same_inode() {
+        let dir = scratch_dir("in-place");
+        let path = dir.join("linked.txt");
+        std::fs::write(&path, "a long first version\n").expect("write");
+        std::fs::hard_link(&path, dir.join("other")).expect("link");
+        let mut b = Buffer::open(&path).expect("open");
+        b.select_range(0, b.rope.len_bytes());
+        b.insert("short\n");
+        b.save(None).expect("save");
+        assert_eq!(std::fs::read_to_string(dir.join("other")).unwrap(), "short\n");
+        b.insert("and now a much longer text than before\n");
+        b.save(None).expect("save");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("other")).unwrap(),
+            "short\nand now a much longer text than before\n"
+        );
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn a_writable_file_in_a_locked_folder_still_saves() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("locked");
+        let path = dir.join("notes.txt");
+        std::fs::write(&path, "old").expect("write");
+        let mut b = Buffer::open(&path).expect("open");
+        b.insert("new ");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+        let saved = b.save(None);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        saved.expect("save in place");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new old");
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn recovered_text_asks_before_replacing_a_file_changed_since() {
+        let dir = scratch_dir("recovered");
+        let path = dir.join("draft.txt");
+        std::fs::write(&path, "before the crash").expect("write");
+        let at_crash = DiskStamp::of(&path).unwrap();
+        assert_eq!(DiskStamp::decode(&at_crash.encode()), Some(at_crash));
+        let mut quiet = Buffer::recovered(Some(path.clone()), "restored", Some(at_crash));
+        assert_eq!(quiet.disk_state(), DiskState::Unchanged);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(&path, "written by another program").expect("write");
+        let mut b = Buffer::recovered(Some(path.clone()), "restored", Some(at_crash));
+        assert_ne!(b.disk_state(), DiskState::Unchanged, "the change is flagged");
+        let refused = b.save(None).unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "written by another program"
+        );
+        b.save_overwriting(None).expect("overwrite");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "restored");
+        let _ = quiet.save(None);
+        std::fs::remove_dir_all(dir).expect("cleanup");
     }
 
     #[test]

@@ -131,7 +131,7 @@ impl Session {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let _ = std::fs::write(&path, self.serialize());
+        let _ = crate::platform::write_atomically(&path, self.serialize().as_bytes());
     }
 
     fn serialize(&self) -> String {

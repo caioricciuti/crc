@@ -25,7 +25,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use crate::text::buffer::Buffer;
+use crate::text::buffer::{Buffer, DiskStamp};
 use crate::text::rope::Rope;
 
 /// One dirty document, as of the last frame.
@@ -33,6 +33,7 @@ struct Entry {
     id: u64,
     path: Option<PathBuf>,
     rope: Rope,
+    stamp: Option<DiskStamp>,
 }
 
 static TABLE: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
@@ -42,6 +43,18 @@ static TABLE: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
 pub struct Recovered {
     pub path: Option<PathBuf>,
     pub text: String,
+    /// What the crashed instance knew of the file on disk.
+    pub stamp: Option<DiskStamp>,
+}
+
+impl Recovered {
+    /// Whether the file was written by something else after the crash.
+    pub fn changed_on_disk(&self) -> bool {
+        match (&self.path, self.stamp) {
+            (Some(path), Some(stamp)) => DiskStamp::of(path).ok() != Some(stamp),
+            _ => false,
+        }
+    }
 }
 
 /// Where crash directories are written.
@@ -70,6 +83,7 @@ pub fn publish<'a>(buffers: impl Iterator<Item = &'a Buffer>) {
                 if entry.path != buffer.path {
                     entry.path = buffer.path.clone();
                 }
+                entry.stamp = buffer.disk_stamp();
                 table.swap(seen, at);
             }
             None => {
@@ -77,6 +91,7 @@ pub fn publish<'a>(buffers: impl Iterator<Item = &'a Buffer>) {
                     id: buffer.id(),
                     path: buffer.path.clone(),
                     rope: buffer.rope.clone(),
+                    stamp: buffer.disk_stamp(),
                 });
                 let last = table.len() - 1;
                 table.swap(seen, last);
@@ -132,11 +147,20 @@ pub fn install(dir: PathBuf) {
 fn dump(dir: &Path) -> std::io::Result<Option<PathBuf>> {
     // A poisoned lock means the panic happened inside `publish`. The table
     // is a list of whole entries either way, so it is still worth writing.
-    // A lock held by this very thread cannot be waited for, hence `try`.
-    let table = match TABLE.try_lock() {
-        Ok(table) => table,
-        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-        Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+    // A lock held by this very thread cannot be waited for, hence `try`;
+    // one held by another thread is released in a moment, hence the
+    // retries. Half a second is the price of the first case.
+    let mut tries = 0;
+    let table = loop {
+        match TABLE.try_lock() {
+            Ok(table) => break table,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) if tries < 50 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+        }
     };
     if table.is_empty() {
         return Ok(None);
@@ -159,19 +183,28 @@ fn dump(dir: &Path) -> std::io::Result<Option<PathBuf>> {
     Ok(Some(crash))
 }
 
+/// Writes `<n>.path`, then the text as `<n>.part`, and renames that to
+/// `<n>.txt` only once it is all on disk: a disk that fills half-way leaves
+/// no `.txt` to offer, where a truncated one would be restored and saved
+/// over the intact file.
 fn write_entry(crash: &Path, n: usize, entry: &Entry) -> std::io::Result<()> {
-    let mut text = std::fs::File::create(crash.join(format!("{n}.txt")))?;
-    for chunk in entry.rope.chunks_in(0..entry.rope.len_bytes()) {
-        text.write_all(chunk.as_bytes())?;
-    }
-    text.sync_all()?;
-
     use std::os::unix::ffi::OsStrExt;
     let path = entry
         .path
         .as_deref()
         .map_or(&b""[..], |p| p.as_os_str().as_bytes());
-    std::fs::write(crash.join(format!("{n}.path")), path)
+    std::fs::write(crash.join(format!("{n}.path")), path)?;
+    if let Some(stamp) = entry.stamp {
+        std::fs::write(crash.join(format!("{n}.stamp")), stamp.encode())?;
+    }
+
+    let part = crash.join(format!("{n}.part"));
+    let mut text = std::io::BufWriter::new(std::fs::File::create(&part)?);
+    for chunk in entry.rope.chunks_in(0..entry.rope.len_bytes()) {
+        text.write_all(chunk.as_bytes())?;
+    }
+    text.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+    std::fs::rename(part, crash.join(format!("{n}.txt")))
 }
 
 /// What earlier crashes left behind.
@@ -253,7 +286,10 @@ pub fn pending(dir: &Path) -> Pending {
                 .ok()
                 .filter(|p| !p.is_empty())
                 .map(|p| PathBuf::from(std::ffi::OsString::from_vec(p)));
-            documents.push(Recovered { path, text });
+            let stamp = std::fs::read_to_string(crash.join(format!("{n}.stamp")))
+                .ok()
+                .and_then(|s| DiskStamp::decode(&s));
+            documents.push(Recovered { path, text, stamp });
         }
         if readable {
             complete.push(crash.clone());
@@ -319,10 +355,12 @@ mod tests {
                 Recovered {
                     path: Some(PathBuf::from("/tmp/some dir/notes.md")),
                     text: "caf\u{e9} \u{65e5}\u{672c}\n".into(),
+                    stamp: None,
                 },
                 Recovered {
                     path: None,
-                    text: "scratch".into()
+                    text: "scratch".into(),
+                    stamp: None,
                 },
             ]
         );
@@ -357,7 +395,8 @@ mod tests {
             pending(&dir).documents,
             vec![Recovered {
                 path: None,
-                text: "aa".into()
+                text: "aa".into(),
+                stamp: None,
             }]
         );
 
@@ -411,6 +450,35 @@ mod tests {
         std::fs::remove_dir_all(dir).expect("cleanup");
     }
 
+    #[test]
+    fn a_half_written_entry_is_not_offered() {
+        let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("part");
+        let crash = dir.join("123-1");
+        std::fs::create_dir_all(&crash).expect("mkdir");
+        std::fs::write(crash.join("count"), "1").expect("count");
+        std::fs::write(crash.join("0.path"), "/tmp/x").expect("path");
+        std::fs::write(crash.join("0.part"), "trunc").expect("part");
+        let found = pending(&dir);
+        assert!(found.documents.is_empty(), "a truncated text is never restored");
+        found.clear();
+        assert!(crash.join("0.part").exists(), "and nothing is deleted");
+        std::fs::remove_dir_all(dir).expect("cleanup");
+
+        let crash = scratch("entry");
+        std::fs::create_dir_all(&crash).expect("mkdir");
+        let entry = Entry {
+            id: 0,
+            path: Some(PathBuf::from("/tmp/y")),
+            rope: crate::text::rope::Rope::from_text("whole"),
+            stamp: None,
+        };
+        write_entry(&crash, 0, &entry).expect("write");
+        assert_eq!(std::fs::read_to_string(crash.join("0.txt")).unwrap(), "whole");
+        assert!(!crash.join("0.part").exists());
+        std::fs::remove_dir_all(crash).expect("cleanup");
+    }
+
     /// The real path: a process that panics with the hook installed. This
     /// test runs itself as a child, which takes the panicking branch, and
     /// then looks at what the child left on disk.
@@ -446,6 +514,7 @@ mod tests {
             vec![Recovered {
                 path: Some(PathBuf::from("/tmp/victim.rs")),
                 text: "typed just before the crash".into(),
+                stamp: None,
             }]
         );
         std::fs::remove_dir_all(&dir).ok();

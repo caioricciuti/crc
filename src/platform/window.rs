@@ -5334,12 +5334,18 @@ impl EditorView {
 
         let mut state = self.ivars().state.borrow_mut();
         let mut result = state.docs.active_mut().save(chosen.as_deref());
+        // Save As onto the tab's own file is a plain save, conflicts and all.
+        let own_file = match (&chosen, &state.docs.active().path) {
+            (None, _) => true,
+            (Some(chosen), Some(current)) => same_file(chosen, current),
+            (Some(_), None) => false,
+        };
         if let Err(e) = &result
             && matches!(
                 e.kind(),
                 std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::NotFound
             )
-            && chosen.is_none()
+            && own_file
         {
             // Someone else changed or removed the file. The alert spins a
             // nested run loop, so the borrow goes first.
@@ -5348,7 +5354,7 @@ impl EditorView {
             match self.ask_about_conflict(missing) {
                 Conflict::Overwrite => {
                     state = self.ivars().state.borrow_mut();
-                    result = state.docs.active_mut().save_overwriting(None);
+                    result = state.docs.active_mut().save_overwriting(chosen.as_deref());
                 }
                 Conflict::Reload => {
                     state = self.ivars().state.borrow_mut();
@@ -8430,8 +8436,8 @@ impl EditorView {
     /// A rename's edits. Open documents are edited in place, one undo step
     /// each, and left unsaved; files that are not open are edited on disk
     /// through the same save path as everything else.
-    fn apply_rename(&self, files: Vec<(std::path::PathBuf, Vec<crate::lsp::TextEdit>)>) {
-        let outcome = self.apply_workspace_edit(&files);
+    fn apply_rename(&self, server: Language, files: Vec<crate::lsp::FileEdits>) {
+        let outcome = self.apply_workspace_edit(server, &files);
         self.ivars().state.borrow_mut().message = Some((
             if files.is_empty() {
                 "the server had nothing to rename".into()
@@ -8445,19 +8451,37 @@ impl EditorView {
     }
 
     /// Applies a server's edits by file: open documents in place, one undo
-    /// step each, left unsaved; other files on disk.
+    /// step each, left unsaved; other files on disk. An open document typed
+    /// into since the server computed its edits is left alone and counted
+    /// as failed: its positions would land on shifted text.
     fn apply_workspace_edit(
         &self,
-        files: &[(std::path::PathBuf, Vec<crate::lsp::TextEdit>)],
+        server: Language,
+        files: &[crate::lsp::FileEdits],
     ) -> EditOutcome {
         let (rows, cols) = self.grid();
         let mut outcome = EditOutcome::default();
         {
             let mut state = self.ivars().state.borrow_mut();
             let mut touched = Vec::new();
-            for (path, edits) in files {
+            for file in files {
+                let (path, edits) = (&file.path, &file.edits);
                 if edits.is_empty() {
                     continue;
+                }
+                let open = all_docs(&state)
+                    .flat_map(|d| d.iter())
+                    .find(|b| b.path.as_deref().is_some_and(|p| same_file(p, path)))
+                    .map(|b| (b.id(), b.path.clone()));
+                if let Some((id, own_path)) = open {
+                    let sent = own_path
+                        .as_deref()
+                        .and_then(|p| state.lsp.get(&server).and_then(|s| s.version_of(p)));
+                    let moved = file.version.is_some() && sent.is_some() && file.version != sent;
+                    if moved || state.lsp_dirty.contains_key(&id) {
+                        outcome.failed.push(path.clone());
+                        continue;
+                    }
                 }
                 let buffer = all_docs_mut(&mut state)
                     .into_iter()
@@ -8646,7 +8670,7 @@ impl EditorView {
     /// A code action's edits, then its command on the server. `save` when
     /// Organize Imports ran for a save, which goes on to save and format.
     fn run_steps(&self, server: Language, steps: crate::lsp::client::ActionSteps, save: bool) {
-        let outcome = self.apply_workspace_edit(&steps.edits);
+        let outcome = self.apply_workspace_edit(server, &steps.edits);
         let changed = outcome.open + outcome.written > 0;
         {
             let mut state = self.ivars().state.borrow_mut();
@@ -10295,7 +10319,7 @@ impl EditorView {
                     }
                 }
                 Event::ApplyEdit { id, edits } => {
-                    let outcome = self.apply_workspace_edit(&edits);
+                    let outcome = self.apply_workspace_edit(key, &edits);
                     let mut state = self.ivars().state.borrow_mut();
                     if let Some(server) = state.lsp.get_mut(&key) {
                         server.answer_apply_edit(&id, outcome.failed.is_empty());
@@ -10348,7 +10372,7 @@ impl EditorView {
                     self.ivars().state.borrow_mut().message = Some((first, Instant::now()));
                 }
                 Event::References(locations) => self.show_references(locations),
-                Event::Rename(files) => self.apply_rename(files),
+                Event::Rename(files) => self.apply_rename(key, files),
                 Event::Formatting { path, edits, save } => self.apply_format(&path, &edits, save),
                 Event::Signature { path, signature } => {
                     let mut state = self.ivars().state.borrow_mut();
@@ -11109,9 +11133,15 @@ impl EditorView {
                     let created = target
                         .parent()
                         .map_or(Ok(()), std::fs::create_dir_all)
-                        .and_then(|()| std::fs::write(&target, ""));
+                        // Never truncates: a file that appeared since the
+                        // check above is an error, not an empty file.
+                        .and_then(|()| std::fs::File::create_new(&target).map(drop));
                     match created {
                         Ok(()) => self.open_created_file(&target),
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                            self.ivars().state.borrow_mut().message =
+                                Some((format!("{name} already exists"), Instant::now()));
+                        }
                         Err(error) => {
                             self.ivars().state.borrow_mut().message =
                                 Some((format!("could not create: {error}"), Instant::now()));
@@ -11150,16 +11180,17 @@ impl EditorView {
     fn open_created_file(&self, path: &Path) {
         {
             let mut state = self.ivars().state.borrow_mut();
-            match Buffer::open(path) {
+            let message = match Buffer::open(path) {
                 // add, not push: the file may already be open.
-                Ok(buffer) => state.docs.add(buffer),
-                Err(e) => {
-                    state.message = Some((format!("created but not opened: {e}"), Instant::now()));
+                Ok(buffer) => {
+                    state.docs.add(buffer);
+                    format!("created {}", path.display())
                 }
-            }
+                Err(e) => format!("created but not opened: {e}"),
+            };
             state.preview = default_preview(state.docs.active());
             reveal_active_tab(&mut state);
-            state.message = Some((format!("created {}", path.display()), Instant::now()));
+            state.message = Some((message, Instant::now()));
         }
         self.refresh_project_after_disk_change();
         self.sync_title();
@@ -13874,9 +13905,14 @@ fn restore_summary(documents: &[recovery::Recovered]) -> String {
                     || path.display().to_string(),
                     |n| n.to_string_lossy().into_owned(),
                 );
-                match path.parent().and_then(|p| p.file_name()) {
+                let name = match path.parent().and_then(|p| p.file_name()) {
                     Some(folder) => format!("{name} (in {})", folder.to_string_lossy()),
                     None => name,
+                };
+                if d.changed_on_disk() {
+                    format!("{name}, changed on disk since")
+                } else {
+                    name
                 }
             }
             None => "Untitled".to_string(),
@@ -14649,7 +14685,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         if !found.documents.is_empty() {
             if ask_to_restore(mtm, &found.documents) {
                 for document in std::mem::take(&mut found.documents) {
-                    docs.restore(Buffer::recovered(document.path, &document.text));
+                    docs.restore(Buffer::recovered(document.path, &document.text, document.stamp));
                 }
                 // Back under the hook's protection before the files go.
                 recovery::publish(docs.iter());
@@ -14881,6 +14917,7 @@ mod tests {
         let one = [Recovered {
             path: Some("/work/garden-log/src/main.rs".into()),
             text: String::new(),
+            stamp: None,
         }];
         let text = super::restore_summary(&one);
         assert!(
@@ -14893,6 +14930,7 @@ mod tests {
             .map(|n| Recovered {
                 path: (n > 0).then(|| format!("/notes/{n}.md").into()),
                 text: String::new(),
+                stamp: None,
             })
             .collect();
         let text = super::restore_summary(&many);

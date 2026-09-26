@@ -12,7 +12,8 @@ use std::time::Instant;
 
 use super::transport::{Incoming, Transport, Wake};
 use super::{
-    CodeAction, Completion, Diagnostic, Location, Position, Severity, Signature, TextEdit,
+    CodeAction, Completion, Diagnostic, FileEdits, Location, Position, Severity, Signature,
+    TextEdit,
     offset_of, path_for, uri_for,
 };
 use crate::json::{Value, compact, number, object, string};
@@ -40,7 +41,9 @@ enum Pending {
         path: PathBuf,
     },
     References,
-    Rename,
+    Rename {
+        origin: Option<(PathBuf, u64)>,
+    },
     Formatting {
         path: PathBuf,
         save: bool,
@@ -52,8 +55,11 @@ enum Pending {
     CodeActions {
         path: PathBuf,
         invoked: bool,
+        version: Option<u64>,
     },
-    Resolve,
+    Resolve {
+        origin: Option<(PathBuf, u64)>,
+    },
     Command,
     Shutdown,
 }
@@ -63,7 +69,7 @@ enum Pending {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionSteps {
     pub title: String,
-    pub edits: Vec<(PathBuf, Vec<TextEdit>)>,
+    pub edits: Vec<FileEdits>,
     pub command: Option<String>,
 }
 
@@ -87,7 +93,7 @@ pub enum Event {
     },
     References(Vec<Location>),
     /// Edits per file: a rename's answer.
-    Rename(Vec<(PathBuf, Vec<TextEdit>)>),
+    Rename(Vec<FileEdits>),
     /// Edits for one file. `save` when the format was asked for by a save.
     Formatting {
         path: PathBuf,
@@ -110,7 +116,7 @@ pub enum Event {
     /// with [`Server::answer_apply_edit`] and `id`, compact JSON.
     ApplyEdit {
         id: String,
-        edits: Vec<(PathBuf, Vec<TextEdit>)>,
+        edits: Vec<FileEdits>,
     },
     /// A request the person made was refused, with the server's reason.
     Refused(String),
@@ -248,6 +254,27 @@ impl Server {
 
     pub fn knows(&self, path: &Path) -> bool {
         self.versions.contains_key(path)
+    }
+
+    /// The version of `path` the server was last sent, if it has it open.
+    pub fn version_of(&self, path: &Path) -> Option<u64> {
+        self.versions.get(path).copied()
+    }
+
+    fn origin(&self, path: &Path) -> Option<(PathBuf, u64)> {
+        Some((path.to_path_buf(), self.version_of(path)?))
+    }
+
+    /// Gives edits that came without a version the one they were computed
+    /// against: `origin`'s for the document asked about, the current one
+    /// for any other the server has open.
+    fn stamp(&self, files: &mut [FileEdits], origin: Option<&(PathBuf, u64)>) {
+        for file in files.iter_mut().filter(|f| f.version.is_none()) {
+            file.version = match origin {
+                Some((path, version)) if *path == file.path => Some(*version),
+                _ => self.version_of(&file.path),
+            };
+        }
     }
 
     fn request(&mut self, method: &str, params: Value, pending: Pending) -> u64 {
@@ -430,7 +457,8 @@ impl Server {
             ("position", Self::position(at)),
             ("newName", string(new_name)),
         ]);
-        self.request("textDocument/rename", params, Pending::Rename)
+        let origin = self.origin(path);
+        self.request("textDocument/rename", params, Pending::Rename { origin })
     }
 
     /// Whether the server said it formats documents.
@@ -507,6 +535,7 @@ impl Server {
             Pending::CodeActions {
                 path: path.to_path_buf(),
                 invoked,
+                version: self.versions.get(path).copied(),
             },
         )
     }
@@ -528,10 +557,13 @@ impl Server {
         let incomplete = value.get("edit").is_none()
             && (value.get("data").is_some() || value.get("command").is_none());
         if !bare && incomplete && resolves {
-            self.request("codeAction/resolve", value, Pending::Resolve);
+            let origin = action.origin.clone();
+            self.request("codeAction/resolve", value, Pending::Resolve { origin });
             return None;
         }
-        Some(steps_of(&action.title, &value))
+        let mut steps = steps_of(&action.title, &value);
+        self.stamp(&mut steps.edits, action.origin.as_ref());
+        Some(steps)
     }
 
     /// Runs a command, compact JSON with `command` and `arguments`, on the
@@ -716,10 +748,10 @@ impl Server {
                             events.push(Event::Failed(reason));
                         }
                         Pending::References
-                        | Pending::Rename
+                        | Pending::Rename { .. }
                         | Pending::Formatting { .. }
                         | Pending::CodeActions { invoked: true, .. }
-                        | Pending::Resolve
+                        | Pending::Resolve { .. }
                         | Pending::Command => {
                             events.push(Event::Refused(text));
                         }
@@ -789,7 +821,11 @@ impl Server {
                     .unwrap_or_default();
                 events.push(Event::References(locations));
             }
-            Pending::Rename => events.push(Event::Rename(parse_workspace_edit(&result))),
+            Pending::Rename { origin } => {
+                let mut files = parse_workspace_edit(&result);
+                self.stamp(&mut files, origin.as_ref());
+                events.push(Event::Rename(files));
+            }
             Pending::Formatting { path, save } => {
                 let edits = result
                     .as_array()
@@ -801,10 +837,20 @@ impl Server {
                 path,
                 signature: parse_signature(&result),
             }),
-            Pending::CodeActions { path, .. } => {
+            Pending::CodeActions { path, version, .. } => {
+                let origin = version.map(|v| (path.clone(), v));
                 let actions = result
                     .as_array()
-                    .map(|items| items.iter().filter_map(parse_code_action).collect())
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(parse_code_action)
+                            .map(|a| CodeAction {
+                                origin: origin.clone(),
+                                ..a
+                            })
+                            .collect()
+                    })
                     .unwrap_or_default();
                 events.push(Event::CodeActions {
                     path,
@@ -812,13 +858,15 @@ impl Server {
                     actions,
                 });
             }
-            Pending::Resolve => {
+            Pending::Resolve { origin } => {
                 let title = result
                     .get("title")
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_owned();
-                events.push(Event::Action(steps_of(&title, &result)));
+                let mut steps = steps_of(&title, &result);
+                self.stamp(&mut steps.edits, origin.as_ref());
+                events.push(Event::Action(steps));
             }
             Pending::Command => {}
             Pending::Shutdown => {
@@ -857,13 +905,17 @@ impl Server {
     ) {
         match method {
             // Answered once the window has tried the edits.
-            "workspace/applyEdit" => events.push(Event::ApplyEdit {
-                id: compact(id),
-                edits: params
+            "workspace/applyEdit" => {
+                let mut edits = params
                     .and_then(|p| p.get("edit"))
                     .map(parse_workspace_edit)
-                    .unwrap_or_default(),
-            }),
+                    .unwrap_or_default();
+                self.stamp(&mut edits, None);
+                events.push(Event::ApplyEdit {
+                    id: compact(id),
+                    edits,
+                });
+            }
             "workspace/configuration" => {
                 // Nothing configured: one null per item asked for.
                 let count = params
@@ -941,6 +993,7 @@ fn parse_code_action(value: &Value) -> Option<CodeAction> {
             .and_then(Value::as_str)
             .map(str::to_owned),
         raw: compact(value),
+        origin: None,
     })
 }
 
@@ -1073,7 +1126,7 @@ fn parse_text_edit(value: &Value) -> Option<TextEdit> {
 /// A WorkspaceEdit's text edits by file, from `documentChanges` when the
 /// server sent them, else `changes`. File creations, renames and deletions
 /// are not applied, and are left out.
-fn parse_workspace_edit(value: &Value) -> Vec<(PathBuf, Vec<TextEdit>)> {
+fn parse_workspace_edit(value: &Value) -> Vec<FileEdits> {
     let edits = |items: Option<&Value>| -> Vec<TextEdit> {
         items
             .and_then(Value::as_array)
@@ -1085,14 +1138,26 @@ fn parse_workspace_edit(value: &Value) -> Vec<(PathBuf, Vec<TextEdit>)> {
             .iter()
             .filter_map(|change| {
                 let uri = change.path("textDocument.uri")?.as_str()?;
-                Some((path_for(uri)?, edits(change.get("edits"))))
+                Some(FileEdits {
+                    path: path_for(uri)?,
+                    // The protocol's guard that the edits still apply; null
+                    // for a file the server does not have open.
+                    version: change.path("textDocument.version").and_then(Value::as_u64),
+                    edits: edits(change.get("edits")),
+                })
             })
             .collect();
     }
     match value.get("changes") {
         Some(Value::Object(files)) => files
             .iter()
-            .filter_map(|(uri, list)| Some((path_for(uri)?, edits(Some(list)))))
+            .filter_map(|(uri, list)| {
+                Some(FileEdits {
+                    path: path_for(uri)?,
+                    version: None,
+                    edits: edits(Some(list)),
+                })
+            })
             .collect(),
         _ => Vec::new(),
     }
@@ -1203,14 +1268,22 @@ mod tests {
         .unwrap();
         let parsed = parse_workspace_edit(&changes);
         assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].0, PathBuf::from("/p/a.rs"));
-        assert_eq!(parsed[0].1[0].text, "x");
+        assert_eq!(parsed[0].path, PathBuf::from("/p/a.rs"));
+        assert_eq!(parsed[0].version, None);
+        assert_eq!(parsed[0].edits[0].text, "x");
         let document = crate::json::parse(
             r#"{"documentChanges":[{"textDocument":{"uri":"file:///p/b.rs","version":3},"edits":[]},{"kind":"create","uri":"file:///p/c.rs"}]}"#,
         )
         .unwrap();
         let parsed = parse_workspace_edit(&document);
-        assert_eq!(parsed, vec![(PathBuf::from("/p/b.rs"), Vec::new())]);
+        assert_eq!(
+            parsed,
+            vec![FileEdits {
+                path: PathBuf::from("/p/b.rs"),
+                version: Some(3),
+                edits: Vec::new()
+            }]
+        );
     }
 
     #[test]
@@ -1265,7 +1338,11 @@ mod tests {
         pub struct Dir(pub std::path::PathBuf);
         impl Dir {
             pub fn new(prefix: &str) -> Dir {
-                let dir = std::env::temp_dir().join(format!("{prefix}-{}", std::process::id()));
+                // One per test: tests run in parallel in one process, and
+                // the fake server reads every file in its folder.
+                static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let dir = std::env::temp_dir().join(format!("{prefix}-{}-{n}", std::process::id()));
                 let _ = std::fs::remove_dir_all(&dir);
                 std::fs::create_dir_all(&dir).unwrap();
                 Dir(dir)
@@ -1390,6 +1467,19 @@ mod tests {
             })
         );
 
+        // A rename answered as `changes` carries the version it was asked
+        // at, so edits computed before later typing can be told apart.
+        let asked_at = server.version_of(&file);
+        server.rename(&file, at, "omega");
+        server.did_change(&file, "let a = alp; typed after\n");
+        let reply = server.wait_for(Duration::from_secs(5), |e| matches!(e, Event::Rename(_)));
+        let Some(Event::Rename(files)) = reply else {
+            panic!("no rename: {}", server.transport.stderr_tail());
+        };
+        assert!(files.iter().all(|f| f.version.is_some()));
+        assert_eq!(files.iter().find(|f| f.path == file).unwrap().version, asked_at);
+        assert_ne!(server.version_of(&file), asked_at);
+
         server.did_close(&file);
         assert!(!server.diagnostics.contains_key(&file));
         server.shutdown();
@@ -1467,7 +1557,7 @@ mod tests {
         };
         assert_eq!(steps.title, "Replace TODO with DONE");
         assert_eq!(steps.edits.len(), 1);
-        assert_eq!(steps.edits[0].1[0].text, "DONE");
+        assert_eq!(steps.edits[0].edits[0].text, "DONE");
         assert_eq!(steps.command, None);
 
         // A command: the server comes back asking for the edit.
@@ -1481,7 +1571,7 @@ mod tests {
         }) else {
             panic!("no applyEdit");
         };
-        assert_eq!(edits[0].1[0].text, "X = 1  # TODO");
+        assert_eq!(edits[0].edits[0].text, "X = 1  # TODO");
         server.answer_apply_edit(&id, true);
 
         // Narrowed to one kind, the edit comes with it.
@@ -1503,7 +1593,7 @@ mod tests {
         let steps = server.action_steps(&actions[0]).unwrap();
         let rope = crate::text::rope::Rope::from_text("import b\nimport a\nx = 1  # TODO\n");
         assert_eq!(
-            super::super::apply_edits(&rope, &steps.edits[0].1).as_deref(),
+            super::super::apply_edits(&rope, &steps.edits[0].edits).as_deref(),
             Some("import a\nimport b\nx = 1  # TODO\n")
         );
     }

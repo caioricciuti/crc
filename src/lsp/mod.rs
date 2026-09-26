@@ -125,6 +125,18 @@ pub struct CodeAction {
     /// The CodeAction or Command as sent, compact JSON, for running it:
     /// its edit, its command, or the whole of it for `codeAction/resolve`.
     pub raw: String,
+    /// The document asked about and its version then: what the action's
+    /// edits to it were computed against.
+    pub origin: Option<(std::path::PathBuf, u64)>,
+}
+
+/// A WorkspaceEdit's edits to one file, with the document version they were
+/// computed against when that is known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileEdits {
+    pub path: std::path::PathBuf,
+    pub version: Option<u64>,
+    pub edits: Vec<TextEdit>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

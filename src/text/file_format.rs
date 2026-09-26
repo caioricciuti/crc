@@ -176,7 +176,15 @@ fn encode_1252(ch: char) -> Option<u8> {
     CP1252.iter().position(|c| *c == ch).map(|i| i as u8 + 0x80)
 }
 
-pub fn write<W: Write>(mut out: W, rope: &Rope, format: &DiskFormat) -> io::Result<()> {
+pub fn write<W: Write>(out: W, rope: &Rope, format: &DiskFormat) -> io::Result<()> {
+    // Anything but UTF-8 with LF goes out a character at a time; a file
+    // handed straight in would take one system call for each.
+    let mut out = io::BufWriter::with_capacity(64 * 1024, out);
+    write_buffered(&mut out, rope, format)?;
+    out.flush()
+}
+
+fn write_buffered<W: Write>(mut out: W, rope: &Rope, format: &DiskFormat) -> io::Result<()> {
     if format.encoding == Encoding::Utf8
         && format.preferred == Ending::Lf
         && format.endings.iter().all(|ending| *ending == Ending::Lf)

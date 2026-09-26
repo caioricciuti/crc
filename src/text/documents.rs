@@ -89,11 +89,12 @@ impl Documents {
             .iter()
             .enumerate()
             .filter_map(|(index, buffer)| {
-                buffer
-                    .path
-                    .as_deref()
-                    .is_some_and(|open| open == path || open.starts_with(path))
-                    .then_some(index)
+                (!buffer.is_dirty()
+                    && buffer
+                        .path
+                        .as_deref()
+                        .is_some_and(|open| open == path || open.starts_with(path)))
+                .then_some(index)
             })
             .collect();
         indices.reverse();
@@ -537,6 +538,7 @@ mod tests {
         d.restore(Buffer::recovered(
             Some(canonical.clone()),
             "last save, and more",
+            None,
         ));
         assert_eq!(d.len(), 2, "no second tab for the same file");
         assert_eq!(d.active_index(), 0);
@@ -547,11 +549,11 @@ mod tests {
         );
 
         // Untitled work comes back as a tab of its own.
-        d.restore(Buffer::recovered(None, "never had a name"));
+        d.restore(Buffer::recovered(None, "never had a name", None));
         assert_eq!(d.len(), 3);
 
         // And a tab that has changes of its own is not overwritten.
-        d.restore(Buffer::recovered(Some(canonical), "an older crash"));
+        d.restore(Buffer::recovered(Some(canonical), "an older crash", None));
         assert_eq!(d.len(), 4);
         d.switch(0);
         assert_eq!(d.active().rope.to_string(), "last save, and more");

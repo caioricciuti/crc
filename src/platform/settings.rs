@@ -6,7 +6,7 @@
 //! one line it has to and leaves everything else in the file as it found it,
 //! comments included, so zooming in the app does not trample a hand edit.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The default code font, and the size the UI font stays at.
 pub const DEFAULT_FONT: &str = "SF Mono";
@@ -252,12 +252,26 @@ impl Settings {
         let Some(path) = Settings::path() else {
             return Err(std::io::Error::other("no home directory"));
         };
-        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        self.save_to(&path)
+    }
+
+    fn save_to(&self, path: &Path) -> std::io::Result<()> {
+        let existing = match std::fs::read(path) {
+            Ok(bytes) => String::from_utf8(bytes).map_err(|_| {
+                // Rewriting it from the template would drop every hand edit.
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "the settings file is not UTF-8, so it was left alone",
+                )
+            })?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e),
+        };
         let text = self.merged_into(&existing);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&path, text)
+        crate::platform::write_atomically(path, text.as_bytes())
     }
 
     /// `existing` with our keys replaced in place, or appended.
@@ -331,6 +345,23 @@ fn format_size(size: f32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_settings_file_that_is_not_utf8_is_left_alone() {
+        let dir = std::env::temp_dir().join(format!("caio-settings-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let original = b"# caf\xe9\nformat_on_save = true\n".to_vec();
+        std::fs::write(&path, &original).unwrap();
+        let err = Settings::parse("").save_to(&path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        std::fs::write(&path, "format_on_save = true\n").unwrap();
+        Settings::parse("").save_to(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("format_on_save = true\n"), "{text}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn organize_imports_on_save_defaults_off() {
