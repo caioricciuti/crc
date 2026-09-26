@@ -70,6 +70,8 @@ pub enum Action {
     Refresh,
     Confirm,
     Cancel,
+    /// Gives the editor column back; the list stays in the sidebar.
+    Close,
 }
 
 impl Action {
@@ -84,6 +86,7 @@ impl Action {
             Action::Refresh => "extensions.refresh".into(),
             Action::Confirm => "extensions.confirm".into(),
             Action::Cancel => "extensions.cancel".into(),
+            Action::Close => "extensions.close".into(),
         }
     }
 }
@@ -263,6 +266,7 @@ pub fn draw_details(
     text(out, atlas, x, y, 200.0, "Extensions", theme.text);
     let mut bx = right;
     for (label, action) in [
+        ("Close", Action::Close),
         ("Refresh", Action::Refresh),
         ("Install from Folder\u{2026}", Action::InstallFolder),
     ] {

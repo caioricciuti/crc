@@ -8990,6 +8990,13 @@ impl EditorView {
                 }
             }
             Action::Refresh => self.refresh_registry(),
+            Action::Close => {
+                let mut state = self.ivars().state.borrow_mut();
+                if let Some(page) = &mut state.extensions {
+                    page.details = false;
+                    page.confirm = None;
+                }
+            }
         }
         self.request_redraw();
         self.pump();
@@ -12048,6 +12055,10 @@ impl EditorView {
         }
         layout::build_toolbar(tree, &mut renderer.atlas, toolbar_rect, theme, glyphs);
 
+        // Under the Extensions details the tabs are still laid out, so
+        // their hit list stays true, but drawn into nothing.
+        let mut hidden = Vec::new();
+        let details = extensions.as_ref().is_some_and(|p| p.details);
         layout::build_tab_bar(
             docs,
             *tab_scroll,
@@ -12055,7 +12066,7 @@ impl EditorView {
             &mut renderer.atlas,
             tab_rect,
             theme,
-            glyphs,
+            if details { &mut hidden } else { glyphs },
             tab_hits,
         );
 
@@ -13023,10 +13034,11 @@ fn completion_language(buffer: &Buffer) -> String {
         })
 }
 
-/// Where the Extensions details draw: the editor column under the tabs,
-/// breadcrumbs included, since those name a document the details are not.
+/// Where the Extensions details draw: the focused pane's whole column, tabs
+/// and breadcrumbs included, since those name a document the details are
+/// not. Close, Escape or the strip gives the column back.
 fn details_rect(chrome: &Chrome) -> Viewport {
-    let top = chrome.breadcrumbs.y;
+    let top = chrome.tabs.y;
     Viewport {
         y: top,
         height: chrome.text.y + chrome.text.height - top,
@@ -13680,7 +13692,8 @@ fn frame_of(state: &mut State) -> Frame {
     for (index, pane) in &chrome.others {
         frame.push(Hit::Pane(*index), pane.whole());
     }
-    for hit in tab_hits.iter() {
+    let covered = extensions.as_ref().is_some_and(|p| p.details);
+    for hit in tab_hits.iter().filter(|_| !covered) {
         if hit.index == docs.active_index() {
             frame.push(
                 Hit::TabClose(hit.index),

@@ -1452,7 +1452,7 @@ dump $T/act-back.out
 click @activity.extensions
 wait 400
 dump $T/act-ext.out
-key 53
+click @extensions.close
 wait 100
 dump $T/act-ext-list.out
 click @activity.explorer
@@ -1468,7 +1468,7 @@ expect "$T/act-hidden.out" activity "source-control sidebar=off"
 expect "$T/act-back.out" activity "source-control sidebar=on"
 expect "$T/act-ext.out" activity "extensions sidebar=on"
 grep -q '^extensions: open ' "$T/act-ext.out" || { echo "FAIL act-ext: the details did not open"; fail=1; }
-grep -q '^extensions: list ' "$T/act-ext-list.out" || { echo "FAIL act-ext-list: Escape did not keep the list"; fail=1; }
+grep -q '^extensions: list ' "$T/act-ext-list.out" || { echo "FAIL act-ext-list: Close did not keep the list"; fail=1; }
 expect "$T/act-explorer.out" activity "explorer sidebar=on"
 expect "$T/act-explorer.out" extensions "closed"
 
@@ -1548,8 +1548,9 @@ quit
 SCRIPT
 HOME="$T/exthome" CRC_EXT_REGISTRY="file://$T/extreg/" CRC_EXT_REGISTRY_KEY="$T/extreg/pub.pem" CRC_EXT_FOLDER="$T/extfolder" CRC_SELFTEST="$T/ext.script" "$BIN" "$T/extproj/notes.txt" 2> "$T/ext.err"
 expect "$T/ext-open.out" extensions "open selected=crc.sort-lines installed= registry=ready:crc.sort-lines confirm=- busy=- note=-"
-# Refresh, Install from Folder, the row and Install: each a pointing hand.
-expect "$T/ext-open.out" pointer_targets 4
+# Close, Refresh, Install from Folder, Install and the row in the sidebar:
+# each a pointing hand.
+expect "$T/ext-open.out" pointer_targets 5
 expect "$T/ext-confirm.out" extensions "open selected=crc.sort-lines installed= registry=ready:crc.sort-lines confirm=crc.sort-lines busy=- note=-"
 expect "$T/ext-installed.out" extensions "open selected=crc.sort-lines installed=crc.sort-lines:0.1.0:on:signed registry=ready:crc.sort-lines confirm=- busy=- note=Installed Sort Lines 0.1.0"
 expect "$T/ext-installed.out" ext_commands "Sort Lines|Sort Lines Descending|Remove Duplicate Lines"
