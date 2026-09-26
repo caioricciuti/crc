@@ -254,7 +254,8 @@ unsafe extern "C" fn deliver(info: *mut c_void) {
     if shared.closed.load(Ordering::SeqCst) {
         return;
     }
-    let (tree, git) = std::mem::take(&mut *shared.pending.lock().unwrap_or_else(|e| e.into_inner()));
+    let (tree, git) =
+        std::mem::take(&mut *shared.pending.lock().unwrap_or_else(|e| e.into_inner()));
     if tree {
         (shared.on_change.0)(Change::Tree);
     }
@@ -322,8 +323,14 @@ mod tests {
             classify(root, &[], Path::new("/p/src/main.rs")),
             Some(Change::Tree)
         );
-        assert_eq!(classify(root, &[], Path::new("/p/.env")), Some(Change::Tree));
-        assert_eq!(classify(root, &[], Path::new("/p/.git/HEAD")), Some(Change::Git));
+        assert_eq!(
+            classify(root, &[], Path::new("/p/.env")),
+            Some(Change::Tree)
+        );
+        assert_eq!(
+            classify(root, &[], Path::new("/p/.git/HEAD")),
+            Some(Change::Git)
+        );
         assert_eq!(
             classify(root, &[], Path::new("/p/.git/index")),
             Some(Change::Git)
@@ -333,13 +340,19 @@ mod tests {
             Some(Change::Git)
         );
         assert_eq!(classify(root, &[], Path::new("/p/.git/index.lock")), None);
-        assert_eq!(classify(root, &[], Path::new("/p/.git/objects/ab/cd")), None);
+        assert_eq!(
+            classify(root, &[], Path::new("/p/.git/objects/ab/cd")),
+            None
+        );
         assert_eq!(
             classify(root, &[], Path::new("/p/node_modules/x/index.js")),
             None
         );
         assert_eq!(classify(root, &[], Path::new("/p/target/debug/app")), None);
-        assert_eq!(classify(root, &[], Path::new("/p/src/.crc-1-2-3.tmp")), None);
+        assert_eq!(
+            classify(root, &[], Path::new("/p/src/.crc-1-2-3.tmp")),
+            None
+        );
         assert_eq!(
             classify(root, &[], Path::new("/p")),
             None,
@@ -352,9 +365,18 @@ mod tests {
         // A subfolder of a repository, and a linked worktree.
         let root = Path::new("/repo/app");
         let dirs = [PathBuf::from("/repo/.git")];
-        assert_eq!(classify(root, &dirs, Path::new("/repo/.git/HEAD")), Some(Change::Git));
-        assert_eq!(classify(root, &dirs, Path::new("/repo/.git/objects/ab")), None);
-        assert_eq!(classify(root, &dirs, Path::new("/repo/app/x.rs")), Some(Change::Tree));
+        assert_eq!(
+            classify(root, &dirs, Path::new("/repo/.git/HEAD")),
+            Some(Change::Git)
+        );
+        assert_eq!(
+            classify(root, &dirs, Path::new("/repo/.git/objects/ab")),
+            None
+        );
+        assert_eq!(
+            classify(root, &dirs, Path::new("/repo/app/x.rs")),
+            Some(Change::Tree)
+        );
         assert_eq!(classify(root, &dirs, Path::new("/repo/other/y.rs")), None);
         let dirs = [
             PathBuf::from("/main/.git/worktrees/wt"),

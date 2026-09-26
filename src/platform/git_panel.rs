@@ -62,6 +62,10 @@ pub struct Panel {
     resolve_queued: std::collections::VecDeque<PathBuf>,
     /// A change clicked while Git was busy, shown once it is done.
     select_queued: Option<PathBuf>,
+    /// What was asked for while Git was busy (a stage, a commit, a
+    /// refresh the watcher wanted), run once it is done. The latest wins;
+    /// a refresh never replaces something the person asked for.
+    queued: Option<Operation>,
     /// Counts the worker's answers, so a view derived from the snapshot
     /// knows when to look again.
     generation: u64,
@@ -214,6 +218,7 @@ impl Panel {
             announces: false,
             resolve_queued: Default::default(),
             select_queued: None,
+            queued: None,
             generation: 0,
         };
         panel.refresh();
@@ -324,10 +329,10 @@ impl Panel {
         self.snapshot.as_ref()?.changes.get(self.selected)
     }
     pub fn can_stage(&self) -> bool {
-        !self.busy() && self.selected_change().is_some_and(Change::unstaged)
+        self.selected_change().is_some_and(Change::unstaged)
     }
     pub fn can_unstage(&self) -> bool {
-        !self.busy() && self.selected_change().is_some_and(Change::staged)
+        self.selected_change().is_some_and(Change::staged)
     }
     /// The change list as it is drawn: a heading per non-empty section, then
     /// its files. Built once per frame and reused for hit testing, so what is
@@ -392,10 +397,8 @@ impl Panel {
 
     /// Stage or unstage one change by index, rather than whatever happens to
     /// be selected. The buttons live on the row they act on now.
+    /// Asked for while Git is busy, these wait their turn (see `queued`).
     pub fn stage_index(&mut self, index: usize, staged: bool) {
-        if self.busy() {
-            return;
-        }
         let Some(change) = self
             .snapshot
             .as_ref()
@@ -422,11 +425,9 @@ impl Panel {
     }
 
     pub fn can_commit(&self) -> bool {
-        !self.busy()
-            && self
-                .snapshot
-                .as_ref()
-                .is_some_and(|s| s.changes.iter().any(Change::staged))
+        self.snapshot
+            .as_ref()
+            .is_some_and(|s| s.changes.iter().any(Change::staged))
             && !self.message.rope.to_string().trim().is_empty()
     }
     pub fn refresh(&mut self) {
@@ -451,9 +452,6 @@ impl Panel {
         }
     }
     pub fn stage_hunk(&mut self, index: usize) {
-        if self.busy() {
-            return;
-        }
         let Some(change) = self.selected_change().cloned() else {
             return;
         };
@@ -524,12 +522,20 @@ impl Panel {
             .then_some(index)
     }
     pub fn commit(&mut self) {
+        let message = self.message.rope.to_string();
+        // A second click while the first commit runs is the same commit.
+        if self.busy() && self.submitted.as_deref() == Some(message.as_str()) {
+            return;
+        }
         if self.can_commit() {
-            self.start(Operation::Commit(self.message.rope.to_string()));
+            self.start(Operation::Commit(message));
         }
     }
     fn start(&mut self, operation: Operation) {
         if self.busy() {
+            if !matches!(operation, Operation::Refresh) || self.queued.is_none() {
+                self.queued = Some(operation);
+            }
             return;
         }
         self.submitted = if let Operation::Commit(message) = &operation {
@@ -712,6 +718,8 @@ impl Panel {
         }
         if let Some(path) = self.resolve_queued.pop_front() {
             self.mark_resolved(path);
+        } else if let Some(operation) = self.queued.take() {
+            self.start(operation);
         } else if let Some(path) = self.select_queued.take() {
             self.start(Operation::Select(path));
         }
@@ -1275,6 +1283,7 @@ mod tests {
             announces: false,
             resolve_queued: Default::default(),
             select_queued: None,
+            queued: None,
             generation: 0,
         }
     }

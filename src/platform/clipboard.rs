@@ -20,3 +20,14 @@ pub fn read_text() -> Option<String> {
     let value = unsafe { pasteboard.stringForType(NSPasteboardTypeString) }?;
     Some(value.to_string())
 }
+
+/// Whether the clipboard offers plain text, without reading it: menu
+/// validation asks on every key equivalent, and the text may be megabytes.
+pub fn has_text() -> bool {
+    let pasteboard = NSPasteboard::generalPasteboard();
+    pasteboard.types().is_some_and(|types| {
+        types
+            .iter()
+            .any(|t| &*t == unsafe { NSPasteboardTypeString })
+    })
+}

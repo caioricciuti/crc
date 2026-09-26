@@ -354,7 +354,7 @@ grep -q 'Last%20crash%3A%20panic%3A%20selftest%3A%20forced%20panic' "$T/report.o
 # Help > Check for Updates, from the palette, against local listings: a newer
 # release is announced (a test instance does not open the browser), and an
 # empty listing means this is the latest.
-printf '[{"tag_name": "v999.0.0", "html_url": "https://example.invalid/999", "draft": false}]' > "$T/releases-new.json"
+printf '[{"tag_name": "v999.0.0", "html_url": "https://github.com/caioricciuti/crc/releases/tag/v999.0.0", "draft": false}]' > "$T/releases-new.json"
 printf '[]' > "$T/releases-none.json"
 cat > "$T/update.script" <<SCRIPT
 key 35 cmd p
@@ -366,7 +366,7 @@ dump $T/update.out
 quit
 SCRIPT
 CRC_UPDATE_URL="file://$T/releases-new.json" CRC_SELFTEST="$T/update.script" "$BIN" "$T/crashproj/notes.rs" 2> "$T/update.err"
-expect "$T/update.out" message "crc 999.0.0 is out; would open https://example.invalid/999"
+expect "$T/update.out" message "crc 999.0.0 is out; would open https://github.com/caioricciuti/crc/releases/tag/v999.0.0"
 CRC_UPDATE_URL="file://$T/releases-none.json" CRC_SELFTEST="$T/update.script" "$BIN" "$T/crashproj/notes.rs" 2> "$T/update-none.err"
 mv "$T/update.out" "$T/update-none.out"
 grep -q '^message: crc .* is the latest release$' "$T/update-none.out" \
@@ -1041,8 +1041,9 @@ expect "$T/commands-wheel.out" palette_scroll 3
 expect "$T/commands-wheel.out" palette_first "About crc"
 # Row 1 is selected above the rows in view; the list moves to show it.
 expect "$T/commands-keys.out" palette_scroll 1
-# Cmd-P closed Source Control; running the toggle by mistake would reopen it.
-expect "$T/commands-none-run.out" git_open false
+# Source Control stays open under the palette; running the toggle by
+# mistake on a query with no matches would close it.
+expect "$T/commands-none-run.out" git_open true
 expect "$T/commands-none-run.out" dirty false
 
 # ---- @ and # in Cmd-P go to a symbol ----------------------------------------

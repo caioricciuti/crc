@@ -13,8 +13,7 @@ use std::time::Instant;
 use super::transport::{Incoming, Transport, Wake};
 use super::{
     CodeAction, Completion, Diagnostic, FileEdits, Location, Position, Severity, Signature,
-    TextEdit,
-    offset_of, path_for, uri_for,
+    TextEdit, offset_of, path_for, uri_for,
 };
 use crate::json::{Value, compact, number, object, string};
 
@@ -1340,7 +1339,8 @@ mod tests {
             pub fn new(prefix: &str) -> Dir {
                 // One per test: tests run in parallel in one process, and
                 // the fake server reads every file in its folder.
-                static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                static NEXT: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
                 let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let dir = std::env::temp_dir().join(format!("{prefix}-{}-{n}", std::process::id()));
                 let _ = std::fs::remove_dir_all(&dir);
@@ -1477,7 +1477,10 @@ mod tests {
             panic!("no rename: {}", server.transport.stderr_tail());
         };
         assert!(files.iter().all(|f| f.version.is_some()));
-        assert_eq!(files.iter().find(|f| f.path == file).unwrap().version, asked_at);
+        assert_eq!(
+            files.iter().find(|f| f.path == file).unwrap().version,
+            asked_at
+        );
         assert_ne!(server.version_of(&file), asked_at);
 
         server.did_close(&file);

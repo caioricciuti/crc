@@ -460,7 +460,10 @@ mod tests {
         std::fs::write(crash.join("0.path"), "/tmp/x").expect("path");
         std::fs::write(crash.join("0.part"), "trunc").expect("part");
         let found = pending(&dir);
-        assert!(found.documents.is_empty(), "a truncated text is never restored");
+        assert!(
+            found.documents.is_empty(),
+            "a truncated text is never restored"
+        );
         found.clear();
         assert!(crash.join("0.part").exists(), "and nothing is deleted");
         std::fs::remove_dir_all(dir).expect("cleanup");
@@ -474,7 +477,10 @@ mod tests {
             stamp: None,
         };
         write_entry(&crash, 0, &entry).expect("write");
-        assert_eq!(std::fs::read_to_string(crash.join("0.txt")).unwrap(), "whole");
+        assert_eq!(
+            std::fs::read_to_string(crash.join("0.txt")).unwrap(),
+            "whole"
+        );
         assert!(!crash.join("0.part").exists());
         std::fs::remove_dir_all(crash).expect("cleanup");
     }

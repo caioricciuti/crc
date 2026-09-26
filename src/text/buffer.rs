@@ -713,7 +713,9 @@ impl Buffer {
             Some(Ok(())) => {}
             // A writable file in a directory we may not create in: write
             // the file itself, as for a hard link.
-            Some(Err(e)) if e.kind() == std::io::ErrorKind::PermissionDenied && existing.is_some() => {
+            Some(Err(e))
+                if e.kind() == std::io::ErrorKind::PermissionDenied && existing.is_some() =>
+            {
                 self.write_in_place(&target)?;
             }
             Some(Err(e)) => return Err(e),
@@ -4345,7 +4347,10 @@ mod tests {
         b.select_range(0, b.rope.len_bytes());
         b.insert("short\n");
         b.save(None).expect("save");
-        assert_eq!(std::fs::read_to_string(dir.join("other")).unwrap(), "short\n");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("other")).unwrap(),
+            "short\n"
+        );
         b.insert("and now a much longer text than before\n");
         b.save(None).expect("save");
         assert_eq!(
@@ -4383,7 +4388,11 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(10));
         std::fs::write(&path, "written by another program").expect("write");
         let mut b = Buffer::recovered(Some(path.clone()), "restored", Some(at_crash));
-        assert_ne!(b.disk_state(), DiskState::Unchanged, "the change is flagged");
+        assert_ne!(
+            b.disk_state(),
+            DiskState::Unchanged,
+            "the change is flagged"
+        );
         let refused = b.save(None).unwrap_err();
         assert_eq!(refused.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(

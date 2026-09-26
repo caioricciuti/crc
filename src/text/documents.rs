@@ -396,7 +396,11 @@ mod tests {
         assert_eq!(d.title(0), "Untitled");
         d.push(Buffer::new());
         d.active_mut().insert("y");
-        assert_eq!(d.active().rope.to_string(), "y", "a second untitled tab takes typing");
+        assert_eq!(
+            d.active().rope.to_string(),
+            "y",
+            "a second untitled tab takes typing"
+        );
 
         let mut d = scratch();
         d.push(Buffer::from_text("a file"));

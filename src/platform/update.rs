@@ -44,6 +44,11 @@ pub fn newer_release(json: &str, current: &str) -> Outcome {
         ) else {
             continue;
         };
+        // It is handed to `open`: a page of this repository only, never
+        // another scheme or site.
+        if !url.starts_with("https://github.com/caioricciuti/crc/") {
+            continue;
+        }
         let version = tag.trim_start_matches('v');
         if compare(version, current) != Ordering::Greater {
             continue;
@@ -220,20 +225,23 @@ mod tests {
     #[test]
     fn picks_the_newest_published_release_past_this_one() {
         let json = r#"[
-            {"tag_name": "v0.3.0", "html_url": "https://x/0.3.0", "draft": true},
-            {"tag_name": "v0.2.0-alpha.3", "html_url": "https://x/a3", "draft": false},
-            {"tag_name": "v0.2.0-alpha.2", "html_url": "https://x/a2", "draft": false},
-            {"tag_name": "v0.2.0-alpha.1", "html_url": "https://x/a1", "draft": false},
-            {"tag_name": "not-a-version", "html_url": "https://x/n"}
+            {"tag_name": "v0.3.0", "html_url": "https://github.com/caioricciuti/crc/releases/0.3.0", "draft": true},
+            {"tag_name": "v0.2.0-alpha.3", "html_url": "https://github.com/caioricciuti/crc/releases/a3", "draft": false},
+            {"tag_name": "v0.2.0-alpha.2", "html_url": "https://github.com/caioricciuti/crc/releases/a2", "draft": false},
+            {"tag_name": "v0.2.0-alpha.1", "html_url": "https://github.com/caioricciuti/crc/releases/a1", "draft": false},
+            {"tag_name": "not-a-version", "html_url": "https://github.com/caioricciuti/crc/releases/n"}
         ]"#;
         assert_eq!(
             newer_release(json, "0.2.0-alpha.1"),
             Ok(Some(Release {
                 version: "0.2.0-alpha.3".into(),
-                url: "https://x/a3".into()
+                url: "https://github.com/caioricciuti/crc/releases/a3".into()
             }))
         );
         assert_eq!(newer_release(json, "0.2.0-alpha.3"), Ok(None));
+        // A page anywhere else is not a release of this editor.
+        let elsewhere = r#"[{"tag_name": "v9.0.0", "html_url": "file:///etc/passwd"}]"#;
+        assert_eq!(newer_release(elsewhere, "0.2.0"), Ok(None));
         assert_eq!(newer_release("[]", "0.2.0"), Ok(None));
         assert!(newer_release("{\"message\": \"Not Found\"}", "0.2.0").is_err());
     }
@@ -245,7 +253,7 @@ mod tests {
         let file = dir.join("releases.json");
         std::fs::write(
             &file,
-            r#"[{"tag_name": "v999.0.0", "html_url": "https://x/999"}]"#,
+            r#"[{"tag_name": "v999.0.0", "html_url": "https://github.com/caioricciuti/crc/releases/999"}]"#,
         )
         .unwrap();
         let found = fetch(&format!("file://{}", file.display()));

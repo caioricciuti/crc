@@ -131,6 +131,50 @@ fn typed_text(characters: &str) -> String {
         .collect()
 }
 
+/// Text an input method committed to the document. A lone control
+/// character is a key (Return and Tab are handled by key code before they
+/// get here, keypad Enter is U+0003); in a longer run, line breaks and tabs
+/// are text: dictation's "new line", a text replacement's second line.
+fn inserted_text(characters: &str) -> String {
+    let mut chars = characters.chars();
+    if chars.next().is_none() || chars.next().is_none() {
+        return typed_text(characters);
+    }
+    characters
+        .chars()
+        .filter(|&c| {
+            matches!(c, '\n' | '\r' | '\t')
+                || (!c.is_control() && !('\u{f700}'..='\u{f8ff}').contains(&c))
+        })
+        .collect()
+}
+
+/// Whether `dir` is too big a folder to become the project for a file
+/// opened from it: home, anything above it, and the standard folders that
+/// hold everything. Scanning and watching those costs more than the
+/// sidebar is worth.
+fn too_broad_to_adopt(dir: &Path) -> bool {
+    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+        return dir.parent().is_none();
+    };
+    let home = std::fs::canonicalize(&home).unwrap_or(home);
+    home.starts_with(&dir)
+        || ["Desktop", "Documents", "Downloads", "Library"]
+            .iter()
+            .any(|name| dir == home.join(name))
+}
+
+/// Starts `command` and reaps it from a thread, so a short-lived helper
+/// (`open -R`, `open <url>`) does not stay a zombie until quit.
+fn spawn_reaped(command: &mut std::process::Command) -> std::io::Result<()> {
+    let mut child = command.spawn()?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
 /// A pasted string cut down to what a one-row field can hold: its first
 /// line, without control characters.
 fn single_line(text: &str) -> String {
@@ -680,6 +724,8 @@ struct State {
     /// letter, syllables waiting to become a word. Shown at the caret, and
     /// not part of the document until it is committed.
     marked: Option<String>,
+    /// Where the input method puts the caret inside `marked`, in chars.
+    marked_caret: usize,
     /// Input events still to be played, when `CRC_SELFTEST` named a script.
     selftest: std::collections::VecDeque<Step>,
     /// Confirms that a scripted click reached the native project menu action.
@@ -968,6 +1014,9 @@ pub struct Ivars {
     /// wake the CPU 120 times a second. Outside the state so it can be
     /// resumed while the state is borrowed.
     display_link: std::cell::OnceCell<Retained<CADisplayLink>>,
+    /// Trackpad scrolling left over from the last event, in lines, for the
+    /// views that scroll by whole lines (terminal, review, Git).
+    wheel_rest: Cell<f64>,
 }
 
 define_class!(
@@ -1852,6 +1901,7 @@ define_class!(
 
         #[unsafe(method(scrollWheel:))]
         fn scroll_wheel(&self, event: &NSEvent) {
+            let lines = self.wheel_lines(event);
             // The palette is modal: the wheel scrolls its list, and never
             // the document or terminal behind it.
             if self.ivars().state.borrow().palette.is_some() {
@@ -1862,19 +1912,12 @@ define_class!(
                 let point = self.convertPoint_fromView(event.locationInWindow(), None);
                 let panel = self.chrome().terminal;
                 if panel.is_some_and(|rect| rect.contains(point.x as f32, point.y as f32)) {
-                    let dy = event.scrollingDeltaY();
                     let mut state = self.ivars().state.borrow_mut();
                     let history = state.terminal.active_tab().map_or(0, |tab| {
                         tab.session.term.lock().unwrap_or_else(|e| e.into_inner()).scrollback_len()
                     });
-                    let back = state.terminal.back;
-                    state.terminal.back = if dy > 0.0 {
-                        (back + 3).min(history)
-                    } else if dy < 0.0 {
-                        back.saturating_sub(3)
-                    } else {
-                        back
-                    };
+                    let back = state.terminal.back as isize;
+                    state.terminal.back = (back - lines).clamp(0, history as isize) as usize;
                     drop(state);
                     self.request_redraw();
                     self.pump();
@@ -1889,9 +1932,8 @@ define_class!(
                 if text.contains(point.x as f32, point.y as f32)
                     && let Some(review) = state.claude.as_mut().and_then(|c| c.reviews.get_mut(&id))
                 {
-                    let dy = event.scrollingDeltaY();
-                    if dy.abs() >= 0.01 {
-                        review.scroll_by(if dy < 0.0 { 3 } else { -3 }, text);
+                    if lines != 0 {
+                        review.scroll_by(lines, text);
                         drop(state);
                         self.request_redraw();
                         self.pump();
@@ -1916,8 +1958,9 @@ define_class!(
                 if over_list || over_diff {
                     let mut state = self.ivars().state.borrow_mut();
                     let g = crate::platform::git_panel::Sidebar::new(chrome.sidebar.unwrap_or(chrome.text));
-                    let delta = if event.scrollingDeltaY() < 0.0 { 3 } else { -3 };
-                    state.git.scroll(delta, g.list.contains(x, y), g, chrome.text);
+                    if lines != 0 {
+                        state.git.scroll(lines, g.list.contains(x, y), g, chrome.text);
+                    }
                     drop(state);
                     self.request_redraw();
                     if let Some(window) = self.window() {
@@ -2423,11 +2466,14 @@ define_class!(
                 self.after_terminal_layout();
                 return;
             }
-            let (count, active) = {
+            let (count, active, panes) = {
                 let state = self.ivars().state.borrow();
-                (state.docs.len(), state.docs.active_index())
+                (state.docs.len(), state.docs.active_index(), pane_count(&state))
             };
-            if count > 1 {
+            // In a split the last tab of a pane closes that pane, which
+            // `close_tab` already does; only the last tab of the last pane
+            // closes the window.
+            if count > 1 || panes > 1 {
                 self.close_tab(active);
             } else if self.confirm_discard_all()
                 && let Some(window) = self.window() {
@@ -2517,10 +2563,9 @@ define_class!(
                     .and_then(|b| b.path.clone())
             };
             if let Some(path) = path {
-                let _ = std::process::Command::new("/usr/bin/open")
+                let _ = spawn_reaped(std::process::Command::new("/usr/bin/open")
                     .arg("-R")
-                    .arg(&path)
-                    .spawn();
+                    .arg(&path));
             }
         }
 
@@ -2540,10 +2585,9 @@ define_class!(
             };
             // `open -R` is the documented way to reveal a path in Finder and
             // avoids pulling in the NSWorkspace surface for one action.
-            let _ = std::process::Command::new("/usr/bin/open")
+            let _ = spawn_reaped(std::process::Command::new("/usr/bin/open")
                 .arg("-R")
-                .arg(&path)
-                .spawn();
+                .arg(&path));
         }
 
         /// Opens a new GitHub issue in the browser with the version, macOS
@@ -2559,7 +2603,7 @@ define_class!(
             let note = if self.ivars().testing {
                 format!("would open {url}")
             } else {
-                match std::process::Command::new("/usr/bin/open").arg(&url).spawn() {
+                match spawn_reaped(std::process::Command::new("/usr/bin/open").arg(&url)) {
                     Ok(_) => "a new issue is open in your browser; nothing is sent until you submit it".to_string(),
                     Err(e) => format!("could not open the browser: {e}"),
                 }
@@ -2584,17 +2628,16 @@ define_class!(
                 return;
             };
             let _ = std::fs::create_dir_all(&dir);
-            let _ = std::process::Command::new("/usr/bin/open").arg(&dir).spawn();
+            let _ = spawn_reaped(std::process::Command::new("/usr/bin/open").arg(&dir));
         }
 
         #[unsafe(method(revealProjectInFinder:))]
         fn action_reveal_project(&self, _sender: Option<&AnyObject>) {
             let root = self.ivars().state.borrow().tree.root().map(Path::to_path_buf);
             if let Some(root) = root {
-                let _ = std::process::Command::new("/usr/bin/open")
+                let _ = spawn_reaped(std::process::Command::new("/usr/bin/open")
                     .arg("-R")
-                    .arg(root)
-                    .spawn();
+                    .arg(root));
             }
         }
 
@@ -2964,7 +3007,7 @@ define_class!(
                 active.path.is_some()
                     && (active.is_dirty() || active.disk_state() != DiskState::Unchanged)
             } else if action == sel!(paste:) {
-                clipboard::read_text().is_some_and(|t| !t.is_empty())
+                clipboard::has_text()
             } else if action == sel!(moveContextTabLeft:) {
                 state.context_tab.is_some_and(|index| index > 0)
             } else if action == sel!(moveContextTabRight:) {
@@ -3044,9 +3087,29 @@ define_class!(
         fn do_command(&self, _selector: Sel) {}
 
         #[unsafe(method(setMarkedText:selectedRange:replacementRange:))]
-        fn set_marked_text(&self, string: &AnyObject, _selected: NSRange, _replacement: NSRange) {
+        fn set_marked_text(&self, string: &AnyObject, selected: NSRange, replacement: NSRange) {
             let text = text_of(string);
+            // Composing over committed text (reconversion, some Korean
+            // input methods): that text is selected, so committing the
+            // composition replaces it.
+            if replacement.location != NSNotFound as usize
+                && self.ivars().state.try_borrow_mut().is_ok()
+            {
+                self.edit_focused(|buffer, _| {
+                    buffer.select_input_range(replacement.location, replacement.length)
+                });
+            }
             if let Ok(mut state) = self.ivars().state.try_borrow_mut() {
+                // The input method's caret inside the composition, given in
+                // UTF-16 units.
+                let mut units = 0;
+                state.marked_caret = text
+                    .chars()
+                    .take_while(|c| {
+                        units += c.len_utf16();
+                        units <= selected.location
+                    })
+                    .count();
                 state.marked = (!text.is_empty()).then_some(text);
             }
             self.request_redraw();
@@ -3126,10 +3189,27 @@ define_class!(
         fn first_rect(&self, _range: NSRange, _actual: NSRangePointer) -> NSRect {
             let in_view = match self.ivars().state.try_borrow() {
                 Ok(state) => {
-                    let text = chrome_of(&state).text;
-                    let caret =
-                        layout::caret_rect(state.docs.active(), &state.renderer.atlas, text)
-                            .unwrap_or(Viewport { width: 0.0, height: 0.0, ..text });
+                    let chrome = chrome_of(&state);
+                    let text = chrome.text;
+                    // Where the keys go: an input method's candidates open
+                    // beside the field being typed in, not the document.
+                    let field = if !field_has_keys(&state) {
+                        None
+                    } else if state.goto.is_some() || state.rename.is_some() {
+                        Some(chrome.status)
+                    } else if state.palette.is_some() {
+                        let rect = layout::palette_rect(state.viewport, 1);
+                        Some(Viewport { height: layout::PALETTE_ROW, ..rect })
+                    } else if state.find.is_some() && state.sidebar_edit.is_none() && !state.git_focus {
+                        chrome.find
+                    } else {
+                        chrome.sidebar
+                    };
+                    let caret = match field {
+                        Some(rect) => Viewport { width: 0.0, ..rect },
+                        None => layout::caret_rect(state.docs.active(), &state.renderer.atlas, text)
+                            .unwrap_or(Viewport { width: 0.0, height: 0.0, ..text }),
+                    };
                     NSRect::new(
                         NSPoint::new(caret.x as f64, caret.y as f64),
                         NSSize::new(caret.width as f64, caret.height as f64),
@@ -3235,6 +3315,7 @@ impl EditorView {
             deferred_change: Cell::new((false, false)),
             deferred_size: Cell::new(None),
             display_link: std::cell::OnceCell::new(),
+            wheel_rest: Cell::new(0.0),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
 
@@ -3435,9 +3516,7 @@ impl EditorView {
             (Ok(Some(release)), true) => Some(if self.ivars().testing {
                 format!("crc {} is out; would open {}", release.version, release.url)
             } else {
-                let _ = std::process::Command::new("/usr/bin/open")
-                    .arg(&release.url)
-                    .spawn();
+                let _ = spawn_reaped(std::process::Command::new("/usr/bin/open").arg(&release.url));
                 format!(
                     "crc {} is out; its release page is open in your browser",
                     release.version
@@ -3503,6 +3582,33 @@ impl EditorView {
             state.cursor_rects_for = None;
         }
         self.ivars().needs_redraw.set(true);
+    }
+
+    /// Whole lines to scroll for a wheel event, forward (down the content)
+    /// positive. A trackpad's point deltas add up across events; a mouse
+    /// wheel's notch is three lines.
+    fn wheel_lines(&self, event: &NSEvent) -> isize {
+        let dy = event.scrollingDeltaY();
+        let rest = self.ivars().wheel_rest.get();
+        let total = if event.hasPreciseScrollingDeltas() {
+            let line = self
+                .ivars()
+                .state
+                .try_borrow()
+                .map_or(16.0, |s| s.renderer.atlas.metrics.line_height as f64);
+            rest - dy / line.max(1.0)
+        } else {
+            -dy * 3.0
+        };
+        let lines = total.trunc();
+        self.ivars()
+            .wheel_rest
+            .set(if event.hasPreciseScrollingDeltas() {
+                total - lines
+            } else {
+                0.0
+            });
+        lines as isize
     }
 
     /// Records that a human pressed a key or clicked at `at`.
@@ -3884,8 +3990,21 @@ impl EditorView {
         if self.ivars().state.borrow().sidebar_edit.is_some() {
             return self.handle_sidebar_edit_key(event);
         }
-        if self.ivars().state.borrow().git_open {
-            return self.handle_git_key(event);
+        // Source Control claims its own keys (Escape, Cmd-Return, the
+        // message field once clicked); everything else falls through to the
+        // document beside it.
+        let git_turn = {
+            let state = self.ivars().state.borrow();
+            // A field opened over it (the palette, find) keeps its keys.
+            state.git_open
+                && (state.git_focus
+                    || (state.rename.is_none()
+                        && state.goto.is_none()
+                        && state.palette.is_none()
+                        && state.find.is_none()))
+        };
+        if git_turn && self.handle_git_key(event) {
+            return true;
         }
         // The Extensions page has the column: Escape leaves its
         // confirmation, then the page; nothing types into the document
@@ -4156,10 +4275,19 @@ impl EditorView {
         if command {
             // Cmd-1..9 jumps straight to a tab. Not menu items, because nine
             // of them would bury the rest of the Window menu.
+            // The key's character, or the digit row's position where the
+            // layout puts other characters there (AZERTY's `&é"'(§è!ç`).
+            const DIGIT_ROW: [u16; 9] = [18, 19, 20, 21, 23, 22, 26, 28, 25];
             if let Some(digit) = event
                 .charactersIgnoringModifiers()
                 .and_then(|c| c.to_string().chars().next())
                 .and_then(|c| c.to_digit(10))
+                .or_else(|| {
+                    DIGIT_ROW
+                        .iter()
+                        .position(|&code| code == event.keyCode())
+                        .map(|i| i as u32 + 1)
+                })
                 .filter(|d| (1..=9).contains(d))
             {
                 let switched = {
@@ -4771,7 +4899,7 @@ impl EditorView {
                 buffer.select_input_range(replacement.location, replacement.length);
             }
             let text = match focus {
-                Focus::Document => typed_text(text),
+                Focus::Document => inserted_text(text),
                 Focus::Goto => text.chars().filter(char::is_ascii_digit).collect(),
                 Focus::FindQuery | Focus::Field => single_line(text),
             };
@@ -4858,6 +4986,7 @@ impl EditorView {
             if state.tree.root().is_none()
                 && let Some(dir) = std::path::Path::new(path).parent()
                 && dir.is_dir()
+                && !too_broad_to_adopt(dir)
             {
                 state.tree.set_root(dir);
                 state.git = crate::platform::git_panel::Panel::new(dir.to_path_buf());
@@ -4956,13 +5085,22 @@ impl EditorView {
                 .flat_map(|d| d.iter().filter_map(|b| b.path.clone()))
                 .collect(),
             // An index into `files`, which leaves out untitled documents, so
-            // count only the named ones in front of the active tab.
-            active: state
-                .docs
-                .iter()
-                .take(state.docs.active_index())
-                .filter(|b| b.path.is_some())
-                .count(),
+            // count only the named ones in front of the active tab. An
+            // untitled active tab is not in the list: the named one before
+            // it stands in, not the one after.
+            active: {
+                let before = state
+                    .docs
+                    .iter()
+                    .take(state.docs.active_index())
+                    .filter(|b| b.path.is_some())
+                    .count();
+                if state.docs.active().path.is_some() {
+                    before
+                } else {
+                    before.saturating_sub(1)
+                }
+            },
             sidebar: state.sidebar,
             recent: state.recent_projects.clone(),
         }
@@ -4978,7 +5116,12 @@ impl EditorView {
         if self.ivars().state.borrow().discard_confirmed {
             return true;
         }
-        let original = self.ivars().state.borrow().docs.active_index();
+        // Where the person was: the pane, and the document by identity,
+        // since the loop moves between panes and closes tabs.
+        let (original_pane, original_doc) = {
+            let state = self.ivars().state.borrow();
+            (state.focused_pane, state.docs.active().id())
+        };
         let session = self.capture_session();
         self.ivars().state.borrow_mut().quit_session = Some(session);
         loop {
@@ -5017,10 +5160,14 @@ impl EditorView {
 
             match self.ask_about_active() {
                 Discard::Cancel => {
+                    self.ivars().state.borrow_mut().quit_session = None;
+                    self.focus_pane(original_pane);
                     {
                         let mut state = self.ivars().state.borrow_mut();
-                        state.quit_session = None;
-                        state.docs.switch(original);
+                        let at = state.docs.iter().position(|b| b.id() == original_doc);
+                        if let Some(at) = at {
+                            state.docs.switch(at);
+                        }
                     }
                     self.sync_title();
                     self.reparse();
@@ -5778,7 +5925,10 @@ impl EditorView {
 
     /// Opens the go-to-line field.
     fn open_goto(&self) {
-        self.ivars().state.borrow_mut().goto = Some(Buffer::new());
+        let mut state = self.ivars().state.borrow_mut();
+        close_fields(&mut state);
+        state.goto = Some(Buffer::new());
+        drop(state);
         self.request_redraw();
         self.pump();
     }
@@ -6105,7 +6255,9 @@ impl EditorView {
     fn handle_git_key(&self, event: &NSEvent) -> bool {
         let flags = event.modifierFlags();
         if flags.contains(NSEventModifierFlags::Command) {
-            if event.keyCode() == key::RETURN {
+            // Commits from the message field; in a document, Cmd-Return is
+            // the document's (a .http file sends its request).
+            if event.keyCode() == key::RETURN && self.ivars().state.borrow().git_focus {
                 self.ivars().state.borrow_mut().git.commit();
                 self.resume_display_link();
                 return true;
@@ -6114,7 +6266,15 @@ impl EditorView {
         }
         if event.keyCode() == 53 {
             // Escape steps back out: first the diff, then the field, then the
-            // view itself.
+            // view itself. Extra cursors in the document go first.
+            {
+                let state = self.ivars().state.borrow();
+                if !state.git_focus
+                    && (state.docs.active().cursor_count() > 1 || state.signature.is_some())
+                {
+                    return false;
+                }
+            }
             let mut state = self.ivars().state.borrow_mut();
             if state.git_focus {
                 state.git_focus = false;
@@ -6176,7 +6336,7 @@ impl EditorView {
     /// Opens the palette with `prefix` typed: `@` for the document's
     /// symbols, `#` for the project's.
     fn open_palette_with(&self, prefix: &str) {
-        self.ivars().state.borrow_mut().git_open = false;
+        close_fields(&mut self.ivars().state.borrow_mut());
         // Before the field takes the keyboard: validation asks the editor
         // which commands apply, and a focused field changes the answer.
         let commands = commands::from_menu(MainThreadMarker::from(self), |item| {
@@ -6513,6 +6673,7 @@ impl EditorView {
             query.insert(&seed);
             query.select_all();
         }
+        close_fields(&mut self.ivars().state.borrow_mut());
         self.ivars().state.borrow_mut().find = Some(FindBar {
             query,
             replacement: Buffer::new(),
@@ -7261,26 +7422,24 @@ impl EditorView {
 
     /// Handles a click at `x` inside the tab bar.
     fn tab_click(&self, x: f32) {
-        let (hit, active) = {
-            let state = self.ivars().state.borrow();
-            let hit = state
-                .tab_hits
-                .iter()
-                .find(|h| x >= h.x0 && x < h.x1)
-                .copied();
-            (hit, state.docs.active_index())
-        };
+        let hit = self
+            .ivars()
+            .state
+            .borrow()
+            .tab_hits
+            .iter()
+            .find(|h| x >= h.x0 && x < h.x1)
+            .copied();
         // The empty part of the bar does nothing, and does not fall through
         // to the text behind it either.
         let Some(hit) = hit else {
             return;
         };
 
-        // Only the active tab draws its close cross, so only there is that
-        // corner a close button. On the others it used to be an invisible
-        // one: a click near the right edge of a tab closed it.
+        // The cross is drawn on the active tab and on the tab under the
+        // pointer, which a clicked tab always is: a click on it closes.
         let on_cross = x >= hit.close_x0 && x < hit.close_x1;
-        if on_cross && hit.index == active {
+        if on_cross {
             self.close_tab(hit.index);
         } else {
             let mut state = self.ivars().state.borrow_mut();
@@ -7327,6 +7486,14 @@ impl EditorView {
             let state = self.ivars().state.borrow();
             state.docs.iter().nth(index).is_some_and(|b| b.is_dirty())
         };
+        let id = self
+            .ivars()
+            .state
+            .borrow()
+            .docs
+            .iter()
+            .nth(index)
+            .map(Buffer::id);
         if dirty {
             // Show the prompt against the document being closed, which means
             // switching to it first so the alert names the right file. The
@@ -7340,6 +7507,11 @@ impl EditorView {
         }
         {
             let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
+                return;
+            };
+            // By identity: the alert's run loop may have opened a tab (a
+            // Claude proposal) and moved the one asked about.
+            let Some(index) = id.and_then(|id| state.docs.iter().position(|b| b.id() == id)) else {
                 return;
             };
             let closed = state.docs.close(index);
@@ -8372,6 +8544,7 @@ impl EditorView {
         let mut field = Buffer::new();
         field.insert(&name);
         field.select_all();
+        close_fields(&mut state);
         state.rename = Some(RenameField {
             field,
             path,
@@ -10019,13 +10192,21 @@ impl EditorView {
             }
             let focused = state.docs.iter().position(|b| b.id() == id);
             if focused.is_none() {
-                for pane in &mut state.panes {
-                    let found = pane.docs.iter().position(|b| b.id() == id);
-                    if let Some(index) = found {
-                        if pane.docs.len() > 1 {
-                            pane.docs.close(index);
+                let found =
+                    state.panes.iter().enumerate().find_map(|(p, pane)| {
+                        Some((p, pane.docs.iter().position(|b| b.id() == id)?))
+                    });
+                if let Some((p, index)) = found {
+                    if state.panes[p].docs.len() > 1 {
+                        state.panes[p].docs.close(index);
+                    } else {
+                        // The review was all the pane held: the pane goes,
+                        // as it would for its last tab closed by hand. A
+                        // review is never dirty, so nothing is asked.
+                        state.panes.remove(p);
+                        if p < state.focused_pane {
+                            state.focused_pane -= 1;
                         }
-                        break;
                     }
                 }
             }
@@ -10992,8 +11173,7 @@ impl EditorView {
         }
         let mut state = self.ivars().state.borrow_mut();
         state.sidebar = true;
-        state.palette = None;
-        state.goto = None;
+        close_fields(&mut state);
         let Some(root) = state.tree.root().map(Path::to_path_buf) else {
             return;
         };
@@ -11308,15 +11488,17 @@ impl EditorView {
             goto,
             git,
             git_open,
+            git_focus,
             sidebar_edit,
             rename,
             ..
         } = &mut *state;
+        // The commit message only once it has been clicked, as for typing.
         let (buffer, focus) = if let Some(edit) = sidebar_edit {
             (&mut edit.field, Focus::Field)
         } else if let Some(rename) = rename {
             (&mut rename.field, Focus::Field)
-        } else if *git_open {
+        } else if *git_open && *git_focus {
             (&mut git.message, Focus::Field)
         } else if let Some(field) = goto {
             (field, Focus::Goto)
@@ -11726,6 +11908,7 @@ impl EditorView {
             worst,
             message,
             marked,
+            marked_caret,
             responses,
             sidebar_edit,
             panes,
@@ -12019,7 +12202,14 @@ impl EditorView {
                 && goto.is_none()
                 && let Some(at) = layout::caret_rect(buffer, &renderer.atlas, editor_rect)
             {
-                layout::push_marked_text(glyphs, &mut renderer.atlas, at, text, theme);
+                layout::push_marked_text(
+                    glyphs,
+                    &mut renderer.atlas,
+                    at,
+                    text,
+                    *marked_caret,
+                    theme,
+                );
             }
 
             // What the language server thinks of the visible lines.
@@ -12329,9 +12519,12 @@ impl EditorView {
                     if found.is_empty() {
                         "No matches".to_string()
                     } else {
+                        // From the selection's start: a found match is
+                        // selected with the caret at its end.
+                        let from = buffer.selection().map_or(buffer.cursor(), |r| r.start);
                         let at = found
                             .iter()
-                            .position(|m| m.range.start >= buffer.cursor())
+                            .position(|m| m.range.start >= from)
                             .unwrap_or(0);
                         format!("{} of {}", at + 1, found.len())
                     }
@@ -12782,11 +12975,23 @@ impl EditorView {
                 theme.gutter_text,
             );
             let x = advance * (label.len() as f32 + 1.0);
+            // The field's own caret and selection: Left, Right and Shift
+            // move them.
+            let column = |at: usize| field.rope.byte_to_char(at) as f32 * advance;
+            if let Some(range) = field.selection() {
+                layout::push_rect(
+                    glyphs,
+                    &renderer.atlas,
+                    [x + column(range.start), y],
+                    [column(range.end) - column(range.start), status_height],
+                    theme.selection,
+                );
+            }
             layout::push_text(glyphs, &mut renderer.atlas, x, y, &text, theme.text);
             layout::push_rect(
                 glyphs,
                 &renderer.atlas,
-                [x + text.chars().count() as f32 * advance, y],
+                [x + column(field.cursor()), y],
                 [(advance * 0.15).max(1.0), status_height],
                 theme.cursor,
             );
@@ -13199,9 +13404,10 @@ fn open_diff_tab(state: &mut State, change: usize, staged: bool) {
     else {
         return;
     };
-    let name = path
-        .file_name()
-        .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+    let name = path.file_name().map_or_else(
+        || path.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
     let label = format!(
         "{name} ({})",
         if staged { "Staged" } else { "Working tree" }
@@ -13526,6 +13732,18 @@ impl crate::ide::mcp::Host for ClaudeHost<'_> {
 
 /// Whether typing goes to a field (palette, find, go to line, a sidebar
 /// name, the commit message) rather than to the document.
+/// Closes every one-line field that takes the keyboard ahead of the
+/// document, so the one about to open is the one that gets the keys: the
+/// order they are checked in is not the order they were opened in. The find
+/// bar stays; the others sit ahead of it.
+fn close_fields(state: &mut State) {
+    state.sidebar_edit = None;
+    state.rename = None;
+    state.palette = None;
+    state.goto = None;
+    state.git_focus = false;
+}
+
 fn field_has_keys(state: &State) -> bool {
     state.sidebar_edit.is_some()
         || state.rename.is_some()
@@ -13541,7 +13759,7 @@ fn focused_buffer(state: &State) -> &Buffer {
         &edit.field
     } else if let Some(rename) = &state.rename {
         &rename.field
-    } else if state.git_open {
+    } else if state.git_open && state.git_focus {
         &state.git.message
     } else if let Some(field) = &state.goto {
         field
@@ -14762,7 +14980,11 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         if !found.documents.is_empty() {
             if ask_to_restore(mtm, &found.documents) {
                 for document in std::mem::take(&mut found.documents) {
-                    docs.restore(Buffer::recovered(document.path, &document.text, document.stamp));
+                    docs.restore(Buffer::recovered(
+                        document.path,
+                        &document.text,
+                        document.stamp,
+                    ));
                 }
                 // Back under the hook's protection before the files go.
                 recovery::publish(docs.iter());
@@ -14802,6 +15024,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         drag_point: None,
         autoscroll_carry: 0.0,
         marked: None,
+        marked_caret: 0,
         selftest: std::collections::VecDeque::new(),
         project_menu_requested: false,
         last_selftest_click_ms: 0.0,
@@ -14986,7 +15209,10 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
 
 #[cfg(test)]
 mod tests {
-    use super::{caret_phase, single_line, spawn_project_index, spawn_project_refresh, typed_text};
+    use super::{
+        caret_phase, inserted_text, single_line, spawn_project_index, spawn_project_refresh,
+        typed_text,
+    };
     use std::time::Duration;
 
     #[test]
@@ -15061,6 +15287,26 @@ mod tests {
             "a\u{e9}\u{65e5}\u{1f600}"
         );
         assert_eq!(typed_text("\u{f6ff}\u{f900}"), "\u{f6ff}\u{f900}");
+    }
+
+    #[test]
+    fn home_and_its_big_folders_are_never_adopted() {
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        assert!(super::too_broad_to_adopt(&home));
+        assert!(super::too_broad_to_adopt(std::path::Path::new("/")));
+        assert!(super::too_broad_to_adopt(&home.join("Downloads")));
+        let project = std::env::temp_dir().join(format!("caio-adopt-{}", std::process::id()));
+        std::fs::create_dir_all(&project).unwrap();
+        assert!(!super::too_broad_to_adopt(&project));
+        std::fs::remove_dir_all(project).unwrap();
+    }
+
+    #[test]
+    fn dictated_line_breaks_are_text() {
+        assert_eq!(inserted_text("one\ntwo\tthree"), "one\ntwo\tthree");
+        assert_eq!(inserted_text("\r"), "", "a lone Return is a key");
+        assert_eq!(inserted_text("\u{3}"), "");
+        assert_eq!(inserted_text("a\u{1b}b"), "ab");
     }
 
     #[test]

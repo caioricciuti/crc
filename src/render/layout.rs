@@ -3667,9 +3667,7 @@ pub fn build_signature(
         5.5,
         theme.palette_background,
     );
-    let active = active.filter(|r| {
-        r.start <= r.end && shown.get(r.clone()).is_some()
-    });
+    let active = active.filter(|r| r.start <= r.end && shown.get(r.clone()).is_some());
     let parts: [(&str, [f32; 4]); 3] = match &active {
         Some(r) => [
             (&shown[..r.start], theme.status_text),
@@ -4824,10 +4822,12 @@ pub fn push_marked_text(
     atlas: &mut Atlas,
     at: Viewport,
     text: &str,
+    caret: usize,
     theme: &Theme,
 ) {
     let m = atlas.metrics;
     let cells: usize = text.chars().map(display_width).sum();
+    let caret_cells: usize = text.chars().take(caret).map(display_width).sum();
     let width = cells.max(1) as f32 * m.advance;
     // Its own background, since it is drawn over whatever follows the caret
     // rather than pushing it along.
@@ -4846,6 +4846,15 @@ pub fn push_marked_text(
         [at.x, m.snap(at.y + at.height - thickness * 2.0)],
         [width, thickness],
         theme.accent,
+    );
+    // The input method's own caret, where the next keystroke changes the
+    // composition.
+    push_rect(
+        out,
+        atlas,
+        [at.x + caret_cells as f32 * m.advance, at.y],
+        [(m.advance * 0.15).max(1.0), at.height],
+        theme.cursor,
     );
 }
 

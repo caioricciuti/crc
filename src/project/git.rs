@@ -204,10 +204,7 @@ impl Diff {
                     diff.push(DiffKind::Added, None, Some(new), body);
                 } else {
                     // A space, or nothing where an editor stripped it.
-                    remaining = (
-                        remaining.0.saturating_sub(1),
-                        remaining.1.saturating_sub(1),
-                    );
+                    remaining = (remaining.0.saturating_sub(1), remaining.1.saturating_sub(1));
                     old += 1;
                     new += 1;
                     diff.push(DiffKind::Context, Some(old), Some(new), body);
@@ -1033,8 +1030,18 @@ pub fn remote(root: &Path, what: Remote, ssh_auth_sock: Option<&Path>) -> Result
         });
         rx
     };
-    let out = tail(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
-    let err = tail(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let out = tail(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let err = tail(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
     let started = std::time::Instant::now();
     let status = loop {
         match child.try_wait().map_err(|e| e.to_string())? {
@@ -1270,11 +1277,18 @@ mod tests {
         );
         // The unmerged file reads as an ordinary diff against HEAD.
         let shown = Diff::parse(&diff(&s.root, change).unwrap());
-        assert!(shown.lines.iter().any(|l| l.kind == DiffKind::Added
-            && l.text.starts_with("<<<<<<<")));
-        assert!(shown.lines.iter().any(|l| l.kind == DiffKind::Context
-            && l.text == "x = 1"
-            && l.old == Some(2)));
+        assert!(
+            shown
+                .lines
+                .iter()
+                .any(|l| l.kind == DiffKind::Added && l.text.starts_with("<<<<<<<"))
+        );
+        assert!(
+            shown
+                .lines
+                .iter()
+                .any(|l| l.kind == DiffKind::Context && l.text == "x = 1" && l.old == Some(2))
+        );
 
         std::fs::write(dir.join("f.txt"), "a\nx = 2\nz\n").unwrap();
         stage(&s.root, change, true).unwrap();

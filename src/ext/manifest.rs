@@ -257,7 +257,10 @@ pub fn check_module(manifest: &Manifest, module: &super::wasm::Module) -> Result
         shape(&command.id, (2, 1))?;
     }
     for (module, name, arity) in module.import_arities() {
-        match super::run::HOST_FUNCTIONS.iter().find(|(n, _)| module == "crc" && *n == name) {
+        match super::run::HOST_FUNCTIONS
+            .iter()
+            .find(|(n, _)| module == "crc" && *n == name)
+        {
             None => {
                 return Err(format!(
                     "it imports {module}.{name}, which crc does not provide"

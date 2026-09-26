@@ -276,13 +276,15 @@ mod tests {
     }
 
     fn manifest_for(commands: &str) -> crate::ext::manifest::Manifest {
-        crate::ext::manifest::parse(&crate::json::parse(&format!(
-            r#"{{"id": "t.shapes", "name": "Shapes", "version": "0.1.0",
+        crate::ext::manifest::parse(
+            &crate::json::parse(&format!(
+                r#"{{"id": "t.shapes", "name": "Shapes", "version": "0.1.0",
             "description": "x", "authors": ["t"], "license": "MIT",
             "api": 1, "entry": "t.wasm", "capabilities": ["selection.read"],
             "commands": [{commands}]}}"#
-        ))
-        .unwrap())
+            ))
+            .unwrap(),
+        )
         .unwrap()
     }
 
