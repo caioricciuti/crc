@@ -20,6 +20,7 @@ const github = "https://github.com/caioricciuti/crc/blob/main/";
 const pages = [
   ["CHANGELOG.md", "changelog", "One entry per release."],
   ["docs/vision.md", "vision", "The three bets behind the editor."],
+  ["docs/extensions.md", "extensions", "How extensions will work: WebAssembly, declared capabilities, signing.", "Extensions: design"],
   ["docs/dependency-review.md", "dependency-review", "Every crate and build script, read."],
   ["CONTRIBUTING.md", "contributing", "How to propose a change."],
 ];

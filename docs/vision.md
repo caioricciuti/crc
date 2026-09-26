@@ -84,6 +84,7 @@ read, write and reach, and a host that enforces it. Installing an extension
 should never mean handing a stranger your home folder.
 
 *Not built yet.* crc has no extensions at all until this exists, on purpose.
+How they will work is in [the extensions design](extensions.md).
 
 ### 3. An agent is a protocol client, not a sidebar
 

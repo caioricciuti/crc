@@ -1,6 +1,6 @@
 // crceditor.com. The landing page is src/pages/index.astro; everything under
 // /docs/ is hand-written MDX in src/content/docs/docs. The project pages
-// (changelog, vision, dependency review, contributing) come from the
+// (changelog, vision, extensions, dependency review, contributing) come from the
 // repository's Markdown, mirrored into src/content/docs by
 // scripts/sync-docs.mjs before every build. Edit those files, not the copies.
 import { defineConfig } from "astro/config";
@@ -85,6 +85,7 @@ export default defineConfig({
           items: [
             { label: "Changelog", slug: "changelog" },
             { label: "Why crc exists", slug: "vision" },
+            { label: "Extensions design", slug: "extensions" },
             { label: "Dependency review", slug: "dependency-review" },
             { label: "Contributing", slug: "contributing" },
           ],
