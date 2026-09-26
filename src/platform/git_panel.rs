@@ -59,6 +59,8 @@ pub struct Panel {
     /// A path to mark resolved once the worker is free: Mark Resolved saves
     /// first, and the save starts a refresh of its own.
     resolve_queued: Option<PathBuf>,
+    /// A change clicked while Git was busy, shown once it is done.
+    select_queued: Option<PathBuf>,
     /// Counts the worker's answers, so a view derived from the snapshot
     /// knows when to look again.
     generation: u64,
@@ -210,6 +212,7 @@ impl Panel {
             announcement: None,
             announces: false,
             resolve_queued: None,
+            select_queued: None,
             generation: 0,
         };
         panel.refresh();
@@ -435,7 +438,12 @@ impl Panel {
     }
     pub fn select(&mut self, index: usize) {
         if let Some(change) = self.snapshot.as_ref().and_then(|s| s.changes.get(index)) {
-            self.start(Operation::Select(change.path.clone()));
+            let path = change.path.clone();
+            if self.busy() {
+                self.select_queued = Some(path);
+            } else {
+                self.start(Operation::Select(path));
+            }
         }
     }
     pub fn stage(&mut self, staged: bool) {
@@ -702,6 +710,8 @@ impl Panel {
         }
         if let Some(path) = self.resolve_queued.take() {
             self.mark_resolved(path);
+        } else if let Some(path) = self.select_queued.take() {
+            self.start(Operation::Select(path));
         }
         true
     }
@@ -1247,6 +1257,7 @@ mod tests {
             announcement: None,
             announces: false,
             resolve_queued: None,
+            select_queued: None,
             generation: 0,
         }
     }

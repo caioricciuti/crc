@@ -297,6 +297,12 @@ pub struct Buffer {
     pub display_ext: Option<&'static str>,
     /// Read-only file shown by the native Quick Look view.
     preview_file: bool,
+    /// The empty document behind the Home page. Home is a page, not a
+    /// document: nothing typed there may turn it into an "Untitled" one.
+    home_page: bool,
+    /// A tab that shows something else in the editor column (a Source
+    /// Control diff) and has no text of its own to edit.
+    view_only: bool,
     /// Whether there are unsaved changes.
     dirty: bool,
     /// Last contents read from or written to disk, shared with the rope.
@@ -486,7 +492,21 @@ impl Buffer {
     /// Whether edits are refused: a preview has no text to edit, and a
     /// read-only file is too big to.
     fn is_locked(&self) -> bool {
-        self.preview_file || self.read_only
+        self.preview_file || self.read_only || self.home_page || self.view_only
+    }
+
+    pub fn set_view_only(&mut self, view_only: bool) {
+        self.view_only = view_only;
+    }
+
+    /// A tab with no text of its own: no caret, encoding or save state.
+    pub fn is_view_only(&self) -> bool {
+        self.view_only
+    }
+
+    /// Marks this as the document behind the Home page, which refuses edits.
+    pub fn set_home_page(&mut self, home: bool) {
+        self.home_page = home;
     }
 
     /// Whether the file behind this buffer still matches the last read or
@@ -801,6 +821,8 @@ impl Buffer {
             anchor: 0,
             extra: Vec::new(),
             read_only: false,
+            home_page: false,
+            view_only: false,
             scroll_line: 0,
             scroll_fraction: 0.0,
             scroll_column: 0,

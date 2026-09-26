@@ -607,6 +607,19 @@ expect "$T/reordered.out" preview "true"
 expect "$T/new-tab.out" tabs "two.txt | one.md | Untitled"
 expect "$T/new-tab.out" active "2"
 
+# Home is a page: typing there makes no Untitled document.
+cat > "$T/home-typing.script" <<SCRIPT
+wait 300
+text abc
+key 36
+dump $T/home-typing.out
+quit
+SCRIPT
+mkdir -p "$T/homeproj"
+CRC_SELFTEST="$T/home-typing.script" "$BIN" "$T/homeproj" 2> "$T/home-typing.err"
+expect "$T/home-typing.out" tabs "Home"
+expect "$T/home-typing.out" dirty "false"
+
 # Find fields must own the ordinary editing shortcuts, including Command-
 # Backspace. Default find is case-insensitive and Return in Replace advances.
 printf 'foo FOO\n' > "$T/find-fields.txt"
@@ -863,12 +876,16 @@ expect "$T/git-unstage.out" git_staged 0
 # The row body opens the diff; the editor column is no longer blocked by a
 # modal, so the document stays open behind it.
 expect "$T/git-diff.out" git_diff true
+# The diff has a tab of its own, beside the document.
+expect "$T/git-diff.out" tabs "sample.txt | sample.txt (Staged)"
 expect "$T/git-message.out" git_focus true
 expect "$T/git-message.out" git_message 'Personal commit'
 expect "$T/git-message.out" dirty false
 expect "$T/git-commit.out" git_changes 0
 expect "$T/git-commit.out" git_message ''
 expect "$T/git-closed.out" git_open false
+expect "$T/git-closed.out" tabs "sample.txt"
+expect "$T/git-closed.out" git_diff false
 if [ "$(git -C "$T/gitproj" log -1 --format=%s)" != 'Personal commit' ]; then
     echo 'FAIL: native commit action did not create the expected commit'
     fail=1

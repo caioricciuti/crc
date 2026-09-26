@@ -488,6 +488,9 @@ const DIVIDER_GRAB: f32 = 5.0;
 struct State {
     git: crate::platform::git_panel::Panel,
     git_open: bool,
+    /// The tab a Source Control diff is shown in, by buffer id. The diff
+    /// is on screen exactly when that tab is the active one.
+    diff_tab: Option<u64>,
     /// Whether the commit message field has the keyboard. Source control is
     /// docked, not modal, so it only takes typing when it is asked to.
     git_focus: bool,
@@ -1395,10 +1398,7 @@ define_class!(
                 return;
             }
 
-            if chrome.text.contains(x, y)
-                && self.ivars().state.borrow().git_open
-                && self.ivars().state.borrow().git.showing_diff
-            {
+            if chrome.text.contains(x, y) && diffing(&self.ivars().state.borrow()) {
                 let mut state = self.ivars().state.borrow_mut();
                 if let Some(hunk) = state.git.hunk_action_at(chrome.text, x, y) {
                     state.git.stage_hunk(hunk);
@@ -1803,11 +1803,11 @@ define_class!(
             for target in &state.pointer_targets {
                 add(*target, &NSCursor::pointingHandCursor());
             }
-            if !ext_details(&state) && state.native_preview.is_none() && !(state.git_open && state.git.showing_diff) && active_review(&state).is_none() && !side_by_side(&state) {
+            if !ext_details(&state) && state.native_preview.is_none() && !diffing(&state) && active_review(&state).is_none() && !side_by_side(&state) {
                 let gutter = layout::gutter_width(state.docs.active(), &state.renderer.atlas);
                 add(chrome.text.inset_left(gutter), &NSCursor::IBeamCursor());
             }
-            if state.git_open && state.git.showing_diff {
+            if diffing(&state) {
                 for action in state.git.hunk_action_rects(chrome.text) {
                     add(action, &NSCursor::pointingHandCursor());
                 }
@@ -1899,15 +1899,23 @@ define_class!(
                     return;
                 }
             }
-            if self.ivars().state.borrow().git_open {
+            let (git_open, diff_shown) = {
+                let state = self.ivars().state.borrow();
+                (state.git_open, diffing(&state))
+            };
+            if git_open || diff_shown {
                 let point = self.convertPoint_fromView(event.locationInWindow(), None);
                 let (x, y) = (point.x as f32, point.y as f32);
                 let chrome = self.chrome();
                 // The change list and the diff scroll independently, each
-                // under the pointer, like the two columns they are.
-                if let Some(rect) = chrome.sidebar && (rect.contains(x, y) || chrome.text.contains(x, y)) {
+                // under the pointer, like the two columns they are. The
+                // list only while Source Control is open; the diff while its
+                // tab is showing.
+                let over_list = git_open && chrome.sidebar.is_some_and(|r| r.contains(x, y));
+                let over_diff = diff_shown && chrome.text.contains(x, y);
+                if over_list || over_diff {
                     let mut state = self.ivars().state.borrow_mut();
-                    let g = crate::platform::git_panel::Sidebar::new(rect);
+                    let g = crate::platform::git_panel::Sidebar::new(chrome.sidebar.unwrap_or(chrome.text));
                     let delta = if event.scrollingDeltaY() < 0.0 { 3 } else { -3 };
                     state.git.scroll(delta, g.list.contains(x, y), g, chrome.text);
                     drop(state);
@@ -4462,7 +4470,7 @@ impl EditorView {
                     "git_open: {}\ngit_focus: {}\ngit_diff: {}\ngit_pending: {}\ngit_changes: {}\ngit_staged: {}\ngit_hunks_staged: {}\ngit_hunks_working: {}\ngit_message: {}\nproject_menu_requested: {}\nlast_click_ms: {:.3}\nfinder_entries: {}\nsidebar_edit: {}\npalette_query: {}\npalette_first: {}\npalette_scroll: {}\npanes: {}\nfocused_pane: {}\nlsp: {}\ndiagnostics: {}\ncompletion: {}\nkey_handler_draws: {}\nwindow_title: {}\nshaping_pending: {}\ncaret_shaped: {}\nclaude: {}\nterminal: {}\n{}",
                     state.git_open,
                     state.git_focus,
-                    state.git.showing_diff,
+                    diffing(&state),
                     state.git.busy(),
                     state.git.snapshot.as_ref().map_or(0, |s| s.changes.len()),
                     state.git.snapshot.as_ref().map_or(0, |s| s
@@ -6016,8 +6024,6 @@ impl EditorView {
                 state.palette = None;
                 state.goto = None;
                 state.git.refresh();
-            } else {
-                state.git.showing_diff = false;
             }
         }
         // A sidebar that has been hidden cannot show either view.
@@ -6058,7 +6064,6 @@ impl EditorView {
                     group: Group::Conflicts,
                 } => {
                     state.git_focus = false;
-                    state.git.showing_diff = false;
                     conflict_file = state
                         .git
                         .snapshot
@@ -6073,8 +6078,8 @@ impl EditorView {
                         state.git.stage_index(change, !staged);
                     } else {
                         state.git_focus = false;
-                        state.git.showing_diff = true;
                         state.git.select(change);
+                        open_diff_tab(&mut state, change, staged);
                     }
                 }
                 Entry::Section { .. } => handled = false,
@@ -6113,8 +6118,15 @@ impl EditorView {
             let mut state = self.ivars().state.borrow_mut();
             if state.git_focus {
                 state.git_focus = false;
-            } else if state.git.showing_diff {
-                state.git.showing_diff = false;
+            } else if diffing(&state) {
+                let index = state.docs.active_index();
+                state.docs.close(index);
+                state.preview = default_preview(state.docs.active());
+                reveal_active_tab(&mut state);
+                drop(state);
+                self.sync_title();
+                self.request_redraw();
+                return true;
             } else {
                 drop(state);
                 self.set_sidebar_view(false);
@@ -8874,7 +8886,6 @@ impl EditorView {
             state.palette = None;
             state.completion = None;
             state.git_open = false;
-            state.git.showing_diff = false;
             state.sidebar = true;
         }
         self.refresh_registry();
@@ -11729,6 +11740,7 @@ impl EditorView {
             completion_chips,
             conflict_scans,
             conflict_side,
+            diff_tab,
             ..
         } = &mut *state;
         *unshaped_on_screen = false;
@@ -11808,10 +11820,11 @@ impl EditorView {
         // underneath, which stops being untouched, and the editor is back.
         let home = docs.is_home();
 
-        // A change picked in Source Control takes the editor column, the way
-        // a diff editor does. The document keeps its tab and comes back when
-        // one is clicked.
-        let diffing = *git_open && git.showing_diff;
+        // A change picked in Source Control has a tab of its own, and takes
+        // the editor column while that tab is active, the way a diff editor
+        // does. The list highlights the change only then.
+        let diffing = *diff_tab == Some(docs.active().id());
+        git.showing_diff = diffing;
         let reviewing = claude.as_ref().and_then(|c| c.reviews.get(&buffer.id()));
 
         if let Some(page) = extensions.as_mut().filter(|p| p.details) {
@@ -12665,6 +12678,9 @@ impl EditorView {
             .map(|(_, _, text)| format!("   ·   {text}"))
             .unwrap_or_default();
         let status = note.or(diag_note).unwrap_or_else(|| {
+            if buffer.is_view_only() {
+                return name.to_string();
+            }
             format!(
                 "{}   {}{}{}",
                 name,
@@ -12689,8 +12705,19 @@ impl EditorView {
             format!("{}  {:?}", latency.summary(), worst)
         } else {
             let branch = git.branch_status();
+            let position = if buffer.is_view_only() {
+                String::new()
+            } else {
+                format!(
+                    "Ln {}, Col {}     {}     {}",
+                    line + 1,
+                    column + 1,
+                    buffer.disk_format().label(),
+                    buffer.disk_format().line_ending_label()
+                )
+            };
             format!(
-                "{}{}{}Ln {}, Col {}     {}     {}",
+                "{}{}{}{}",
                 if claude.as_ref().is_some_and(|c| c.is_connected()) {
                     "✻ Claude     "
                 } else {
@@ -12702,10 +12729,7 @@ impl EditorView {
                     format!("{branch}     ")
                 },
                 diag_counts,
-                line + 1,
-                column + 1,
-                buffer.disk_format().label(),
-                buffer.disk_format().line_ending_label()
+                position
             )
         };
         let right_width = 320.0f32.min(status_rect.width * 0.55);
@@ -13134,7 +13158,7 @@ fn sync_conflicts(state: &mut State) {
 /// The active document's conflicts, when it has any or Git has it
 /// unmerged, and nothing else has the editor column.
 fn active_conflicts(state: &State) -> Option<&crate::platform::conflicts::View> {
-    if (state.git_open && state.git.showing_diff) || active_review(state).is_some() {
+    if diffing(state) || active_review(state).is_some() {
         return None;
     }
     state
@@ -13145,7 +13169,7 @@ fn active_conflicts(state: &State) -> Option<&crate::platform::conflicts::View> 
 }
 
 fn active_conflicts_mut(state: &mut State) -> Option<&mut crate::platform::conflicts::View> {
-    if (state.git_open && state.git.showing_diff) || active_review(state).is_some() {
+    if diffing(state) || active_review(state).is_some() {
         return None;
     }
     let id = state.docs.active().id();
@@ -13161,6 +13185,60 @@ fn side_by_side(state: &State) -> bool {
 }
 
 /// The review in the active tab, when it is one.
+/// Shows change `change` of Source Control in the diff tab: the one
+/// already open, renamed for this change, or a new one. A diff tab left in
+/// another pane moves to this one.
+fn open_diff_tab(state: &mut State, change: usize, staged: bool) {
+    let Some(path) = state
+        .git
+        .snapshot
+        .as_ref()
+        .and_then(|s| s.changes.get(change))
+        .map(|c| c.path.clone())
+    else {
+        return;
+    };
+    let name = path
+        .file_name()
+        .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+    let label = format!(
+        "{name} ({})",
+        if staged { "Staged" } else { "Working tree" }
+    );
+    let existing = state
+        .diff_tab
+        .and_then(|id| state.docs.iter().position(|b| b.id() == id));
+    match existing {
+        Some(index) => {
+            state.docs.switch(index);
+            state.docs.active_mut().label = Some(label);
+        }
+        None => {
+            if let Some(id) = state.diff_tab {
+                for pane in &mut state.panes {
+                    let index = pane.docs.iter().position(|b| b.id() == id);
+                    if let Some(index) = index {
+                        pane.docs.close(index);
+                    }
+                }
+            }
+            let mut tab = Buffer::generated(&label, "txt", "");
+            tab.set_view_only(true);
+            state.diff_tab = Some(tab.id());
+            state.docs.push(tab);
+        }
+    }
+    state.preview = None;
+    state.completion = None;
+    reveal_active_tab(state);
+}
+
+/// Whether the Source Control diff has the editor column: its tab is the
+/// active one.
+fn diffing(state: &State) -> bool {
+    state.diff_tab == Some(state.docs.active().id())
+}
+
 fn active_review(state: &State) -> Option<&crate::platform::claude::Review> {
     state
         .claude
@@ -13392,7 +13470,6 @@ impl crate::ide::mcp::Host for ClaudeHost<'_> {
                 bridge.reviews.insert(id, review);
             }
             // The review takes the editor column, so nothing may cover it.
-            state.git.showing_diff = false;
             state.preview = None;
             state.completion = None;
             state.message = Some((
@@ -13621,11 +13698,10 @@ fn frame_of(state: &mut State) -> Frame {
             docs,
             renderer,
             conflict_scans,
-            git_open,
-            git,
+            diff_tab,
             ..
         } = &mut *state;
-        let diffing = *git_open && git.showing_diff;
+        let diffing = *diff_tab == Some(docs.active().id());
         let buffer = docs.active();
         match conflict_scans
             .get_mut(&buffer.id())
@@ -14706,6 +14782,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         native_preview: None,
         git,
         git_open: false,
+        diff_tab: None,
         git_focus: false,
         hovered_tab: None,
         tree_drag: None,

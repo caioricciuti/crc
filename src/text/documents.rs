@@ -19,9 +19,20 @@ impl Documents {
     /// document leaves an empty untitled one rather than no document at all,
     /// so the rest of the editor never has to handle "nothing is open".
     pub fn new(initial: Buffer) -> Self {
-        Documents {
+        let mut docs = Documents {
             buffers: vec![initial],
             active: 0,
+        };
+        docs.settle_home();
+        docs
+    }
+
+    /// Keeps the Home page's document locked while it is the Home page, and
+    /// only then: wherever [`Documents::is_home`] can become true.
+    fn settle_home(&mut self) {
+        let home = self.is_home();
+        for buffer in &mut self.buffers {
+            buffer.set_home_page(home);
         }
     }
 
@@ -211,6 +222,7 @@ impl Documents {
             Some(index) if !self.buffers[index].is_dirty() => {
                 self.buffers[index] = buffer;
                 self.active = index;
+                self.settle_home();
             }
             _ => self.push(buffer),
         }
@@ -225,10 +237,11 @@ impl Documents {
         if self.is_home() {
             self.buffers[0] = buffer;
             self.active = 0;
-            return;
+        } else {
+            self.buffers.push(buffer);
+            self.active = self.buffers.len() - 1;
         }
-        self.buffers.push(buffer);
-        self.active = self.buffers.len() - 1;
+        self.settle_home();
     }
 
     /// Closes `index`, returning the buffer that was removed.
@@ -249,6 +262,7 @@ impl Documents {
         } else if index < self.active {
             self.active -= 1;
         }
+        self.settle_home();
         Some(removed)
     }
 
@@ -279,7 +293,12 @@ impl Documents {
 }
 
 fn is_untouched(buffer: &Buffer) -> bool {
-    buffer.path.is_none() && !buffer.is_dirty() && buffer.rope.len_bytes() == 0
+    // A generated tab (a diff, a response) is something open even when
+    // it has no text.
+    buffer.path.is_none()
+        && buffer.label.is_none()
+        && !buffer.is_dirty()
+        && buffer.rope.len_bytes() == 0
 }
 
 #[cfg(test)]
@@ -288,6 +307,13 @@ mod tests {
 
     fn scratch() -> Documents {
         Documents::new(Buffer::new())
+    }
+
+    /// One untitled document with unsaved text in it.
+    fn typed(text: &str) -> Documents {
+        let mut buffer = Buffer::new();
+        buffer.insert(text);
+        Documents::new(buffer)
     }
 
     #[test]
@@ -355,11 +381,22 @@ mod tests {
     }
 
     #[test]
-    fn home_ends_when_something_is_typed_or_opened_and_returns_when_all_is_closed() {
+    fn home_ignores_typing_ends_when_something_opens_and_returns_when_all_is_closed() {
+        // Home is a page: typing there changes nothing.
         let mut d = scratch();
         d.active_mut().insert("x");
+        assert!(d.is_home());
+        assert_eq!(d.active().rope.len_bytes(), 0);
+        assert!(!d.any_dirty());
+
+        // A document made on purpose is editable, and back at Home once
+        // everything else is closed and it is empty again.
+        let mut d = typed("x");
         assert!(!d.is_home());
         assert_eq!(d.title(0), "Untitled");
+        d.push(Buffer::new());
+        d.active_mut().insert("y");
+        assert_eq!(d.active().rope.to_string(), "y", "a second untitled tab takes typing");
 
         let mut d = scratch();
         d.push(Buffer::from_text("a file"));
@@ -380,8 +417,7 @@ mod tests {
 
     #[test]
     fn pushing_keeps_a_scratch_buffer_that_has_been_typed_in() {
-        let mut d = scratch();
-        d.active_mut().insert("unsaved work");
+        let mut d = typed("unsaved work");
         d.push(Buffer::from_text("second"));
         assert_eq!(d.len(), 2, "must not discard a dirty scratch buffer");
         assert_eq!(d.active_index(), 1);
@@ -389,8 +425,7 @@ mod tests {
 
     #[test]
     fn switching_and_cycling_wrap() {
-        let mut d = scratch();
-        d.active_mut().insert("a");
+        let mut d = typed("a");
         d.push(Buffer::from_text("b"));
         d.push(Buffer::from_text("c"));
         assert_eq!(d.len(), 3);
@@ -409,8 +444,7 @@ mod tests {
 
     #[test]
     fn closing_before_the_active_tab_keeps_the_same_document_showing() {
-        let mut d = scratch();
-        d.active_mut().insert("first");
+        let mut d = typed("first");
         d.push(Buffer::from_text("second"));
         d.push(Buffer::from_text("third"));
         d.switch(2);
@@ -426,8 +460,7 @@ mod tests {
 
     #[test]
     fn closing_the_active_tab_falls_back_in_range() {
-        let mut d = scratch();
-        d.active_mut().insert("first");
+        let mut d = typed("first");
         d.push(Buffer::from_text("second"));
         d.switch(1);
         d.close(1);
@@ -437,8 +470,7 @@ mod tests {
 
     #[test]
     fn closing_the_last_document_leaves_an_empty_one() {
-        let mut d = scratch();
-        d.active_mut().insert("only");
+        let mut d = typed("only");
         d.close(0);
         assert_eq!(d.len(), 1, "there is always a document");
         assert!(d.active().rope.is_empty());
@@ -516,8 +548,7 @@ mod tests {
 
     #[test]
     fn any_dirty_sees_background_tabs() {
-        let mut d = scratch();
-        d.active_mut().insert("dirty");
+        let mut d = typed("dirty");
         d.push(Buffer::from_text("clean"));
         assert!(!d.active().is_dirty());
         assert!(d.any_dirty(), "a dirty tab in the background still counts");
