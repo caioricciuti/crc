@@ -1,0 +1,16 @@
+{
+  "id": "crc.sort-lines",
+  "name": "Sort Lines",
+  "version": "0.1.0",
+  "description": "Sort the selected lines, or the whole document, and remove duplicates.",
+  "authors": ["crc"],
+  "license": "MIT OR Apache-2.0",
+  "api": 1,
+  "entry": "sort_lines.wasm",
+  "capabilities": ["selection.read", "selection.replace"],
+  "commands": [
+    { "id": "sort", "title": "Sort Lines" },
+    { "id": "sort_reverse", "title": "Sort Lines Descending" },
+    { "id": "unique", "title": "Remove Duplicate Lines" }
+  ]
+}

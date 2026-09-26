@@ -4,6 +4,7 @@
 //! layers can be tested and benchmarked without opening a window.
 
 pub mod complete;
+pub mod ext;
 pub mod http;
 pub mod ide;
 pub mod index;
