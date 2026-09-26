@@ -2,28 +2,27 @@
 
 One entry per tag, written for people who use the editor.
 
-## Unreleased
+## v0.2.0-alpha.3, 2026-09-26
 
+- Extensions. They are WebAssembly run by crc's own interpreter, and each
+  can do only what it declares: read and replace the selection or the
+  document, nothing else. The Extensions icon in the new strip (or
+  Cmd-Shift-X) lists what is installed and what the signed registry
+  offers; installing shows exactly what an extension may do and waits for
+  your yes. Their commands are in the Extensions menu and the palette.
+  Three official ones to start: Sort Lines, Change Case and Encode and
+  Decode. Install from Folder… installs your own, unsigned and marked so.
+- An icon strip at the window's left: Explorer, Source Control (with a
+  count of changed files) and Extensions. Clicking the panel that is
+  showing hides the sidebar; the strip stays. It replaces the Explorer and
+  Source Control switch at the top of the sidebar.
 - Code actions from the language server: a lightbulb in place of the line
   number where the caret rests on a line with fixes, and Go > Quick Fix
   (Cmd-.) to list them in the palette, preferred first. Go > Organize
-  Imports (Shift-Option-O), and `organize_imports_on_save` in the settings,
-  which runs before format-on-save.
-- A rename's edits now refresh the Git gutter marks of the open files they
-  change.
-- Extensions: Extensions > Extensions… (Cmd-Shift-X) lists what is
-  installed and what the signed registry offers, shows what each may do,
-  and installs only after you agree to it. Extensions are WebAssembly run by
-  crc's own interpreter and can read and replace the selection or the
-  document, nothing else; their commands are in the Extensions menu and the
-  palette. Install from Folder… installs unsigned ones, marked as such. The
-  registry goes live with its first signed release. Change Case and
-  Encode and Decode join Sort Lines as official extensions.
-- An icon strip at the window's left, like other editors' activity bar:
-  Explorer, Source Control (with a count of changed files) and Extensions.
-  Clicking the panel that is showing hides the sidebar; the strip stays.
-  It replaces the Explorer and Source Control switch at the top of the
-  sidebar.
+  Imports (Shift-Option-O), and `organize_imports_on_save` in the
+  settings, which runs before format-on-save.
+- A rename's edits now refresh the Git gutter marks of the open files
+  they change.
 
 ## v0.2.0-alpha.2, 2026-09-26
 
