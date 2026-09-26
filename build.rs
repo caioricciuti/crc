@@ -54,6 +54,25 @@ fn main() {
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/index");
+    // A commit on a branch moves the branch's ref, not HEAD, and leaves the
+    // index alone when everything was staged, so the revision went stale.
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    // Only paths that exist: Cargo reruns every build for a missing one.
+    let refs = git(&["symbolic-ref", "-q", "HEAD"])
+        .and_then(|branch| git(&["rev-parse", "--git-path", &branch]))
+        .into_iter()
+        .chain(git(&["rev-parse", "--git-path", "packed-refs"]));
+    for path in refs.filter(|p| std::path::Path::new(p).exists()) {
+        println!("cargo:rerun-if-changed={path}");
+    }
     cc::Build::new()
         .file("src/render/caret.c")
         .flag("-fblocks")
