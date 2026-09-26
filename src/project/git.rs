@@ -731,7 +731,12 @@ pub fn stage(root: &Path, change: &Change, staged: bool) -> Result<(), String> {
         cmd.args(["rm", "--cached", "--"]);
     }
     cmd.arg(&change.path);
-    if let Some(old) = &change.original {
+    // Unstaging a rename restores both names. Staging one needs the old
+    // name only while it is still on disk: after `git mv` it is in neither
+    // the tree nor the index, and `git add` refuses the whole command.
+    if let Some(old) = &change.original
+        && (!staged || root.join(old).exists())
+    {
         cmd.arg(old);
     }
     checked(cmd.output().map_err(|e| e.to_string())?).map(|_| ())
@@ -882,10 +887,44 @@ pub fn remote(root: &Path, what: Remote, ssh_auth_sock: Option<&Path>) -> Result
         cmd.env("SSH_AUTH_SOCK", sock);
     }
     let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+    // Both pipes are read while it runs: a fetch of many refs or a push
+    // whose server talks a lot fills a pipe's 64 KiB and would wait on us
+    // for ever. Only the end of stderr is kept; that is where Git says
+    // what happened.
+    // Handed back over a channel: a helper Git starts (a credential cache
+    // daemon) can keep a pipe open after Git itself has exited.
+    let tail = |pipe: Option<Box<dyn Read + Send>>| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            const KEEP: usize = 64 * 1024;
+            let mut kept = Vec::new();
+            let Some(mut pipe) = pipe else {
+                let _ = tx.send(kept);
+                return;
+            };
+            let mut chunk = [0u8; 8192];
+            while let Ok(n) = pipe.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                kept.extend_from_slice(&chunk[..n]);
+                if kept.len() > 2 * KEEP {
+                    kept.drain(..kept.len() - KEEP);
+                }
+            }
+            if kept.len() > KEEP {
+                kept.drain(..kept.len() - KEEP);
+            }
+            let _ = tx.send(kept);
+        });
+        rx
+    };
+    let out = tail(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let err = tail(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
     let started = std::time::Instant::now();
-    loop {
+    let status = loop {
         match child.try_wait().map_err(|e| e.to_string())? {
-            Some(_) => break,
+            Some(status) => break status,
             None if started.elapsed() > REMOTE_TIMEOUT => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -896,10 +935,13 @@ pub fn remote(root: &Path, what: Remote, ssh_auth_sock: Option<&Path>) -> Result
             }
             None => std::thread::sleep(std::time::Duration::from_millis(50)),
         }
-    }
-    let output = child.wait_with_output().map_err(|e| e.to_string())?;
-    let said = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    if output.status.success() {
+    };
+    drop(out);
+    let stderr = err
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap_or_default();
+    let said = String::from_utf8_lossy(&stderr).trim().to_owned();
+    if status.success() {
         Ok(said)
     } else {
         Err(if said.is_empty() {
@@ -1337,6 +1379,26 @@ mod tests {
         let preview = diff(&root, change).unwrap();
         assert!(preview.contains("truncated at 512 KiB"));
         assert!(preview.len() < 513 * 1024);
+
+        // A staged rename edited again stages its new edit.
+        run(&root, &["add", "-A"]).unwrap();
+        commit(&root, "Everything").unwrap();
+        run(&root, &["mv", "a file.txt", "moved.txt"]).unwrap();
+        std::fs::write(root.join("moved.txt"), "moved and edited\n").unwrap();
+        let s = snapshot(&root).unwrap();
+        let moved = s
+            .changes
+            .iter()
+            .find(|c| c.path == Path::new("moved.txt"))
+            .unwrap();
+        assert!(moved.original.is_some());
+        stage(&root, moved, true).unwrap();
+        assert!(
+            run(&root, &["diff", "--quiet", "--", "moved.txt"]).is_ok(),
+            "the edit is in the index"
+        );
+        let staged = run(&root, &["diff", "--cached", "--", "moved.txt"]).unwrap();
+        assert!(String::from_utf8_lossy(&staged).contains("+moved and edited"));
         std::fs::remove_dir_all(root).unwrap();
     }
 
