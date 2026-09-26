@@ -172,6 +172,22 @@ mod tests {
     /// crc.<name>), and functions (type index, locals, code without the
     /// final end), each exported as f<n> over the whole index space.
     fn module(types: &[(u8, u8)], imports: &[(u32, &str)], funcs: &[(u32, u8, &[u8])]) -> Vec<u8> {
+        let names: Vec<String> = (0..funcs.len())
+            .map(|i| format!("f{}", i + imports.len()))
+            .collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        named_module(types, imports, funcs, &names, false)
+    }
+
+    /// [`module`] with the functions exported as `names`, and the memory as
+    /// `memory` when asked.
+    fn named_module(
+        types: &[(u8, u8)],
+        imports: &[(u32, &str)],
+        funcs: &[(u32, u8, &[u8])],
+        names: &[&str],
+        export_memory: bool,
+    ) -> Vec<u8> {
         let mut out = b"\0asm\x01\0\0\0".to_vec();
         let mut body = Vec::new();
         leb(types.len() as u32, &mut body);
@@ -208,13 +224,15 @@ mod tests {
         section(4, &body, &mut out);
         section(5, &[1, 1, 1, 2], &mut out);
         let mut body = Vec::new();
-        leb(funcs.len() as u32, &mut body);
-        for i in 0..funcs.len() as u32 {
-            let name = format!("f{}", i + imports.len() as u32);
+        leb(funcs.len() as u32 + u32::from(export_memory), &mut body);
+        for (i, name) in names.iter().enumerate() {
             leb(name.len() as u32, &mut body);
             body.extend_from_slice(name.as_bytes());
             body.push(0);
-            leb(i + imports.len() as u32, &mut body);
+            leb(i as u32 + imports.len() as u32, &mut body);
+        }
+        if export_memory {
+            body.extend_from_slice(&[6, b'm', b'e', b'm', b'o', b'r', b'y', 2, 0]);
         }
         section(7, &body, &mut out);
         let mut body = vec![1, 0, 0x41, 0, 0x0b];
@@ -255,6 +273,73 @@ mod tests {
         let mut i = instance(bytes);
         let func = i.func(f).unwrap();
         i.call(func, args)
+    }
+
+    fn manifest_for(commands: &str) -> crate::ext::manifest::Manifest {
+        crate::ext::manifest::parse(&crate::json::parse(&format!(
+            r#"{{"id": "t.shapes", "name": "Shapes", "version": "0.1.0",
+            "description": "x", "authors": ["t"], "license": "MIT",
+            "api": 1, "entry": "t.wasm", "capabilities": ["selection.read"],
+            "commands": [{commands}]}}"#
+        ))
+        .unwrap())
+        .unwrap()
+    }
+
+    fn run_once(bytes: &[u8]) -> Result<crate::ext::run::Response, String> {
+        let manifest = manifest_for(r#"{"id": "go", "title": "Go"}"#);
+        let mut loaded = crate::ext::run::load(manifest, bytes)?;
+        loaded.run(&crate::ext::run::Request {
+            command: "go".into(),
+            text: "x".into(),
+            selection: true,
+            language: String::new(),
+        })
+    }
+
+    #[test]
+    fn wrong_import_and_export_shapes_are_refused_not_run() {
+        // The host indexed arguments and results by the shape
+        // crc expects, and the module declared another.
+        let zero: &[u8] = &[0x41, 0x00];
+        let nothing: &[u8] = &[];
+        let log_bare: &[u8] = &[0x10, 0x00, 0x41, 0x00];
+        // Types: 0 () -> (), 1 (i32) -> i32, 2 (i32 i32) -> (),
+        // 3 (i32 i32) -> i32, 4 (i32) -> ().
+        let types = &[(0, 0), (1, 1), (2, 0), (2, 1), (1, 0)];
+        let names = &["crc_alloc", "crc_free", "go"];
+        let good = named_module(
+            types,
+            &[],
+            &[(1, 0, zero), (2, 0, nothing), (3, 0, zero)],
+            names,
+            true,
+        );
+        assert!(run_once(&good).is_err_and(|e| e.contains("answered")));
+        let bad_alloc = named_module(
+            types,
+            &[],
+            &[(4, 0, nothing), (2, 0, nothing), (3, 0, zero)],
+            names,
+            true,
+        );
+        assert!(run_once(&bad_alloc).is_err_and(|e| e.contains("crc_alloc")));
+        let bad_command = named_module(
+            types,
+            &[],
+            &[(1, 0, zero), (2, 0, nothing), (2, 0, nothing)],
+            names,
+            true,
+        );
+        assert!(run_once(&bad_command).is_err_and(|e| e.contains("go")));
+        let bad_log = named_module(
+            types,
+            &[(0, "log")],
+            &[(1, 0, zero), (2, 0, nothing), (3, 0, log_bare)],
+            names,
+            true,
+        );
+        assert!(run_once(&bad_log).is_err_and(|e| e.contains("crc.log")));
     }
 
     #[test]

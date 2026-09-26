@@ -801,9 +801,6 @@ struct State {
     /// One refresh interval, learned from the display link. 120Hz until it
     /// tells us otherwise.
     frame_interval: Duration,
-    /// Paused whenever there is nothing to draw, so an idle editor does not
-    /// wake the CPU 120 times a second.
-    display_link: Option<Retained<CADisplayLink>>,
 }
 
 struct NativePreview {
@@ -959,6 +956,15 @@ pub struct Ivars {
     handling_key: Cell<bool>,
     /// Native self-test guard against drawing an unmeasured intermediate frame.
     draws_during_key_handler: Cell<u64>,
+    /// Watcher changes (tree, git) and a window size that arrived while the
+    /// state was borrowed, from a main-queue block run inside a modal loop.
+    /// The display link applies them on its next tick.
+    deferred_change: Cell<(bool, bool)>,
+    deferred_size: Cell<Option<NSSize>>,
+    /// Paused whenever there is nothing to draw, so an idle editor does not
+    /// wake the CPU 120 times a second. Outside the state so it can be
+    /// resumed while the state is borrowed.
+    display_link: std::cell::OnceCell<Retained<CADisplayLink>>,
 }
 
 define_class!(
@@ -1452,7 +1458,10 @@ define_class!(
                             let offset = if hit.caret_stops.is_empty() {
                                 let m = state.renderer.atlas.metrics;
                                 let row = ((y - hit.rect.y) / m.line_height).floor().max(0.0) as usize;
-                                let line = (hit.lines.start + row).min(hit.lines.end.saturating_sub(1));
+                                // The hit is from the last drawn frame; an edit since may
+                                // have removed lines.
+                                let last = state.docs.active().rope.len_lines().saturating_sub(1);
+                                let line = (hit.lines.start + row).min(hit.lines.end.saturating_sub(1)).min(last);
                                 let column = ((x - hit.rect.x - m.advance) / m.advance).round().max(0.0) as usize;
                                 let source = state.docs.active().rope.line(line);
                                 let content = source.trim_end_matches('\n').trim_end_matches('\r');
@@ -1940,6 +1949,16 @@ define_class!(
         /// when the buffer is idle.
         #[unsafe(method(onDisplayLink:))]
         fn on_display_link(&self, link: &CADisplayLink) {
+            if let Some(size) = self.ivars().deferred_size.take() {
+                self.resize(size);
+            }
+            let (tree, git) = self.ivars().deferred_change.replace((false, false));
+            if tree {
+                self.project_changed(crate::project::watch::Change::Tree);
+            }
+            if git {
+                self.project_changed(crate::project::watch::Change::Git);
+            }
             self.poll_tree_children();
             let git_changed = self.ivars().state.try_borrow_mut().is_ok_and(|mut state| {
                 let changed = state.git.poll();
@@ -3205,6 +3224,9 @@ impl EditorView {
             in_key_down: Cell::new(false),
             handling_key: Cell::new(false),
             draws_during_key_handler: Cell::new(0),
+            deferred_change: Cell::new((false, false)),
+            deferred_size: Cell::new(None),
+            display_link: std::cell::OnceCell::new(),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
 
@@ -3600,7 +3622,7 @@ impl EditorView {
         };
         if state.renderer.atlas.has_pending_shaping() {
             self.ivars().needs_redraw.set(true);
-            if let Some(link) = &state.display_link {
+            if let Some(link) = self.ivars().display_link.get() {
                 link.setPaused(false);
             }
         }
@@ -3700,15 +3722,7 @@ impl EditorView {
     /// display the view is currently on, which is only known once the view is
     /// in a window.
     fn resume_display_link(&self) {
-        let Ok(existing) = self
-            .ivars()
-            .state
-            .try_borrow()
-            .map(|state| state.display_link.clone())
-        else {
-            return;
-        };
-        if let Some(link) = existing {
+        if let Some(link) = self.ivars().display_link.get() {
             link.setPaused(false);
             return;
         }
@@ -3727,8 +3741,7 @@ impl EditorView {
             link.addToRunLoop_forMode(&NSRunLoop::currentRunLoop(), NSRunLoopCommonModes);
         }
         link.setPaused(false);
-        // Not busy: the borrow above succeeded and nothing since re-enters.
-        self.ivars().state.borrow_mut().display_link = Some(link);
+        let _ = self.ivars().display_link.set(link);
     }
 
     /// Applies a key event. Returns whether anything changed.
@@ -4679,7 +4692,7 @@ impl EditorView {
                         .map(|t| {
                             let label = &t.signature.label;
                             match &t.signature.active {
-                                Some(r) => format!("{} [{}]", label, &label[r.clone()]),
+                                Some(r) => format!("{} [{}]", label, label.get(r.clone()).unwrap_or_default()),
                                 None => label.clone(),
                             }
                         })
@@ -10828,7 +10841,17 @@ impl EditorView {
     /// the project.
     fn project_changed(&self, change: crate::project::watch::Change) {
         {
-            let mut state = self.ivars().state.borrow_mut();
+            // A main-queue block also runs inside modal alerts, panels and
+            // menu tracking, where the state may be borrowed.
+            let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
+                let (tree, git) = self.ivars().deferred_change.get();
+                self.ivars().deferred_change.set(match change {
+                    crate::project::watch::Change::Tree => (true, git),
+                    crate::project::watch::Change::Git => (tree, true),
+                });
+                self.resume_display_link();
+                return;
+            };
             match change {
                 crate::project::watch::Change::Tree => {
                     state.project_changed_at = Some(Instant::now());
@@ -11578,6 +11601,7 @@ impl EditorView {
     fn resize(&self, size: NSSize) {
         let scale = self.window().map_or(2.0, |w| w.backingScaleFactor());
         let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
+            self.ivars().deferred_size.set(Some(size));
             self.request_redraw();
             return;
         };
@@ -14774,7 +14798,6 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         pending_input: None,
         title_sync_pending: false,
         frame_interval: Duration::from_secs_f64(1.0 / 120.0),
-        display_link: None,
     };
 
     let content = NSRect::new(NSPoint::new(0.0, 0.0), frame.size);

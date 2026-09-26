@@ -3668,7 +3668,7 @@ pub fn build_signature(
         theme.palette_background,
     );
     let active = active.filter(|r| {
-        r.end <= shown.len() && shown.is_char_boundary(r.start) && shown.is_char_boundary(r.end)
+        r.start <= r.end && shown.get(r.clone()).is_some()
     });
     let parts: [(&str, [f32; 4]); 3] = match &active {
         Some(r) => [
@@ -4678,7 +4678,13 @@ pub fn offset_at_point(buffer: &Buffer, atlas: &Atlas, x: f32, y: f32) -> usize 
                 if row.last {
                     row_end
                 } else {
-                    row_end.saturating_sub(1).max(row.start)
+                    // The last char's start, not the byte before
+                    // `row_end`: a CJK row breaks mid-word, and the byte
+                    // before the break is inside a character.
+                    buffer
+                        .rope
+                        .char_to_byte(buffer.rope.byte_to_char(row_end).saturating_sub(1))
+                        .max(row.start)
                 },
             );
         }

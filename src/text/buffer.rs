@@ -785,7 +785,7 @@ impl Buffer {
 
     /// Moves the cursor, optionally dragging the selection with it.
     pub fn place_cursor(&mut self, byte: usize, motion: Motion) {
-        self.cursor = byte.min(self.rope.len_bytes());
+        self.cursor = self.char_floor(byte);
         self.goal_column = None;
         // A plain click is a plain movement: back to one cursor, and the end
         // of the current undo run.
@@ -1152,8 +1152,7 @@ impl Buffer {
 
     /// Adds a cursor, ignoring one that duplicates an existing position.
     pub fn add_cursor(&mut self, anchor: usize, head: usize) {
-        let len = self.rope.len_bytes();
-        let (anchor, head) = (anchor.min(len), head.min(len));
+        let (anchor, head) = (self.char_floor(anchor), self.char_floor(head));
         if (self.anchor, self.cursor) == (anchor, head) || self.extra.contains(&(anchor, head)) {
             return;
         }
@@ -1878,23 +1877,27 @@ impl Buffer {
         self.after_move(Motion::Move);
     }
 
+    /// `at` clamped into the buffer and back onto a char boundary.
+    fn char_floor(&self, at: usize) -> usize {
+        let mut at = at.min(self.rope.len_bytes());
+        while at > 0 && self.rope.byte_at(at).is_some_and(is_continuation) {
+            at -= 1;
+        }
+        at
+    }
+
     /// Clamps cursor and anchor into the buffer and onto char boundaries.
     fn clamp_positions(&mut self) {
-        let rope = &self.rope;
-        let clamp = |at: usize| {
-            let mut at = at.min(rope.len_bytes());
-            while at > 0 && rope.byte_at(at).is_some_and(is_continuation) {
-                at -= 1;
-            }
-            at
-        };
-        self.cursor = clamp(self.cursor);
-        self.anchor = clamp(self.anchor);
+        self.cursor = self.char_floor(self.cursor);
+        self.anchor = self.char_floor(self.anchor);
         // The extra cursors too: they are dereferenced by the renderer on
         // the very next frame, and an offset past the end asserts there.
-        for cursor in &mut self.extra {
-            *cursor = (clamp(cursor.0), clamp(cursor.1));
-        }
+        let extra: Vec<_> = self
+            .extra
+            .iter()
+            .map(|&(a, b)| (self.char_floor(a), self.char_floor(b)))
+            .collect();
+        self.extra = extra;
         self.goal_column = None;
     }
 
@@ -2143,6 +2146,25 @@ impl Buffer {
         }
         // Any movement ends an edit run for undo purposes.
         self.last_edit = None;
+        self.reveal_cursors();
+    }
+
+    /// Opens every fold that hides a cursor. Go to line, find, go to
+    /// definition and a click can all land inside a fold, and a caret on a
+    /// hidden line has no screen row to move from.
+    fn reveal_cursors(&mut self) {
+        if self.folds.is_empty() {
+            return;
+        }
+        let lines: Vec<usize> = std::iter::once(self.cursor)
+            .chain(self.extra.iter().map(|(_, head)| *head))
+            .map(|at| self.rope.byte_to_line(at))
+            .collect();
+        for line in lines {
+            if self.is_hidden(line) {
+                self.unfold(line);
+            }
+        }
     }
 
     pub fn move_left(&mut self, motion: Motion) {
@@ -2360,6 +2382,9 @@ impl Buffer {
     /// measured from the start of the row.
     fn move_row(&mut self, delta: isize, motion: Motion) {
         let line = self.rope.byte_to_line(self.cursor);
+        if self.is_hidden(line) {
+            self.unfold(line);
+        }
         let starts = self.row_starts(line);
         let row = wrap::row_of(&starts, self.cursor);
         let column = wrap::column_in_row(&self.rope, starts[row], self.cursor);
@@ -3637,6 +3662,42 @@ mod tests {
         assert!(!b.folds.is_empty());
         b.undo();
         assert!(b.folds.is_empty(), "undo opens folds");
+    }
+
+    #[test]
+    fn landing_inside_a_fold_opens_it() {
+        // Go to line, find and go to definition put the caret on a
+        // hidden line, and Up from there indexed an empty row list.
+        let mut b = Buffer::from_text(BLOCKS);
+        b.fold(0);
+        b.goto_line(2);
+        assert!(b.folds.is_empty(), "the fold opens");
+        b.move_up(Move);
+        assert_eq!(b.cursor_position().0, 1);
+        b.fold(0);
+        b.select_range(b.rope.line_to_byte(1), b.rope.line_to_byte(1) + 2);
+        assert!(b.folds.is_empty());
+        // A caret put on a hidden line behind the API's back still moves.
+        b.fold(0);
+        b.cursor = b.rope.line_to_byte(2);
+        b.anchor = b.cursor;
+        b.move_up(Move);
+        b.fold(0);
+        b.cursor = b.rope.line_to_byte(2);
+        b.move_down(Move);
+    }
+
+    #[test]
+    fn cursors_land_on_char_boundaries() {
+        // A click past a wrapped CJK row asked for the byte before the
+        // break, inside a character.
+        let mut b = Buffer::from_text("日本語");
+        b.place_cursor(4, Move);
+        assert_eq!(b.cursor, 3);
+        b.insert("x");
+        assert_eq!(b.rope.to_string(), "日x本語");
+        b.add_cursor(8, 8);
+        assert_eq!(b.extra, [(7, 7)]);
     }
 
     #[test]

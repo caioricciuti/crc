@@ -609,6 +609,24 @@ impl Module {
             .map(|(m, n, _)| (m.as_str(), n.as_str()))
     }
 
+    /// Parameter and result counts of the exported function `name`.
+    pub fn export_arity(&self, name: &str) -> Option<(usize, usize)> {
+        self.exports.iter().find_map(|(n, e)| match e {
+            Extern::Func(index) if n == name => self
+                .func_type(*index as usize)
+                .map(|t| (t.params, t.results)),
+            _ => None,
+        })
+    }
+
+    /// What the module imports, as `module.name` with the parameter and
+    /// result counts it expects.
+    pub fn import_arities(&self) -> impl Iterator<Item = (&str, &str, (usize, usize))> {
+        self.imports
+            .iter()
+            .map(|(m, n, t)| (m.as_str(), n.as_str(), (t.params, t.results)))
+    }
+
     /// The type of function `index` in the whole index space.
     fn func_type(&self, index: usize) -> Option<&FuncType> {
         match index.checked_sub(self.imports.len()) {

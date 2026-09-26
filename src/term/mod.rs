@@ -686,7 +686,7 @@ impl Term {
                 5 => self.replies.extend_from_slice(b"\x1b[0n"),
                 6 => {
                     let row = if self.modes.origin {
-                        self.row - self.top
+                        self.row.saturating_sub(self.top)
                     } else {
                         self.row
                     };
@@ -1071,6 +1071,11 @@ impl Term {
         self.col = saved.col.min(self.cols - 1);
         self.pen = saved.pen;
         self.modes.origin = saved.origin;
+        // The region may have changed since the save; origin mode keeps
+        // the cursor inside it.
+        if saved.origin {
+            self.row = self.row.clamp(self.top, self.bottom);
+        }
         self.line_drawing = saved.line_drawing;
         self.pending_wrap = false;
     }
@@ -1347,6 +1352,14 @@ mod tests {
         );
         assert!(t.take_replies().is_empty());
         assert!(t.modes.bracketed_paste);
+    }
+
+    #[test]
+    fn restored_cursor_stays_in_the_scroll_region() {
+        // A cursor saved above a region set later underflowed the
+        // origin-relative row in the position report.
+        let mut t = term("\x1b[?6h\x1b7\x1b[5;10r\x1b8\x1b[6n");
+        assert_eq!(String::from_utf8(t.take_replies()).unwrap(), "\x1b[1;1R");
     }
 
     #[test]

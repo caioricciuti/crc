@@ -11,7 +11,7 @@ use crate::json::{Value, object, string};
 
 /// The host functions crc provides, all in the import module `crc`. `log`
 /// needs no capability; later ones are linked only when granted.
-pub const HOST_FUNCTIONS: &[&str] = &["log"];
+pub const HOST_FUNCTIONS: &[(&str, (usize, usize))] = &[("log", (2, 0))];
 
 /// Memory an extension may grow to: 64 MB.
 const MAX_PAGES: usize = 1024;
@@ -62,7 +62,10 @@ pub fn load(manifest: Manifest, wasm: &[u8]) -> Result<Loaded, String> {
             ("crc", "log") => {
                 let sink = sink.clone();
                 Some(Box::new(move |memory: &mut [u8], args: &[u64]| {
-                    let (ptr, len) = (args[0] as u32 as usize, args[1] as u32 as usize);
+                    let [ptr, len] = args else {
+                        return Err(Trap("log takes a pointer and a length".into()));
+                    };
+                    let (ptr, len) = (*ptr as u32 as usize, *len as u32 as usize);
                     let bytes = memory
                         .get(ptr..ptr.saturating_add(len))
                         .ok_or_else(|| Trap("log outside memory".into()))?;
@@ -138,13 +141,19 @@ impl Loaded {
             other => format!("{name} failed: {other}"),
         };
         let len = input.len() as u64;
-        let ptr = self.instance.call(self.alloc, &[len]).map_err(trap)?[0] as usize;
+        let first = |values: Vec<u64>| {
+            values
+                .first()
+                .copied()
+                .ok_or_else(|| format!("{name} returned nothing"))
+        };
+        let ptr = first(self.instance.call(self.alloc, &[len]).map_err(trap)?)? as usize;
         self.instance
             .memory
             .get_mut(ptr..ptr + input.len())
             .ok_or_else(|| format!("{name} gave memory it does not have"))?
             .copy_from_slice(input.as_bytes());
-        let packed = self.instance.call(func, &[ptr as u64, len]).map_err(trap)?[0];
+        let packed = first(self.instance.call(func, &[ptr as u64, len]).map_err(trap)?)?;
         let (out, out_len) = ((packed >> 32) as usize, (packed & 0xffff_ffff) as usize);
         let bytes = self
             .instance

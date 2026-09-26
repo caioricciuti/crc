@@ -240,11 +240,35 @@ pub fn check_module(manifest: &Manifest, module: &super::wasm::Module) -> Result
             ));
         }
     }
-    for (module, name) in module.import_names() {
-        if module != "crc" || !super::run::HOST_FUNCTIONS.contains(&name) {
-            return Err(format!(
-                "it imports {module}.{name}, which crc does not provide"
-            ));
+    // The shapes crc calls them with; a module that declares another
+    // would be handed the wrong number of values.
+    let entry = &manifest.entry;
+    let shape = |name: &str, want: (usize, usize)| match module.export_arity(name) {
+        Some(got) if got == want => Ok(()),
+        Some(_) => Err(format!(
+            "{name} in {entry} takes {} and returns {}, not what crc calls it with",
+            want.0, want.1
+        )),
+        None => Err(format!("{name} in {entry} is not a function")),
+    };
+    shape("crc_alloc", (1, 1))?;
+    shape("crc_free", (2, 0))?;
+    for command in &manifest.commands {
+        shape(&command.id, (2, 1))?;
+    }
+    for (module, name, arity) in module.import_arities() {
+        match super::run::HOST_FUNCTIONS.iter().find(|(n, _)| module == "crc" && *n == name) {
+            None => {
+                return Err(format!(
+                    "it imports {module}.{name}, which crc does not provide"
+                ));
+            }
+            Some((_, want)) if *want != arity => {
+                return Err(format!(
+                    "it imports {module}.{name} with the wrong parameters"
+                ));
+            }
+            Some(_) => {}
         }
     }
     Ok(())

@@ -1133,7 +1133,9 @@ fn parse_signature(value: &Value) -> Option<Signature> {
                     }
                     label.len()
                 };
-                Some(byte(start)..byte(end))
+                // Reversed bounds would be sliced as-is by the drawing code.
+                let (start, end) = (byte(start), byte(end));
+                (start <= end).then_some(start..end)
             }
             _ => None,
         });
@@ -1164,7 +1166,8 @@ pub fn completion_range(
     caret: usize,
 ) -> std::ops::Range<usize> {
     if let Some((start, end, _)) = &item.edit {
-        return offset_of(rope, *start)..offset_of(rope, *end);
+        let (start, end) = (offset_of(rope, *start), offset_of(rope, *end));
+        return start.min(end)..start.max(end);
     }
     // No edit given: the word before the caret.
     let line = rope.byte_to_line(caret);
@@ -1231,6 +1234,12 @@ mod tests {
         .unwrap();
         let s = parse_signature(&with_labels).unwrap();
         assert_eq!(&s.label[s.active.unwrap()], "b");
+        // Reversed bounds were a range the drawing code sliced with.
+        let reversed = crate::json::parse(
+            r#"{"signatures":[{"label":"fn f(a, b)","parameters":[{"label":[6,2]}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(parse_signature(&reversed).unwrap().active, None);
         assert_eq!(parse_signature(&Value::Null), None);
     }
 
