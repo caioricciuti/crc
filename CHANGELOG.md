@@ -17,7 +17,13 @@ One entry per tag, written for people who use the editor.
   crc's own interpreter and can read and replace the selection or the
   document, nothing else; their commands are in the Extensions menu and the
   palette. Install from Folder… installs unsigned ones, marked as such. The
-  registry goes live with its first signed release.
+  registry goes live with its first signed release. Change Case and
+  Encode and Decode join Sort Lines as official extensions.
+- An icon strip at the window's left, like other editors' activity bar:
+  Explorer, Source Control (with a count of changed files) and Extensions.
+  Clicking the panel that is showing hides the sidebar; the strip stays.
+  It replaces the Explorer and Source Control switch at the top of the
+  sidebar.
 
 ## v0.2.0-alpha.2, 2026-09-26
 

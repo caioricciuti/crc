@@ -276,6 +276,9 @@ pub const EDITOR_MIN_WIDTH: f32 = 140.0;
 #[derive(Clone, Debug)]
 pub struct Chrome {
     pub toolbar: Viewport,
+    /// The icon strip at the far left: Explorer, Source Control,
+    /// Extensions. There whether or not the sidebar is.
+    pub activity: Viewport,
     pub sidebar: Option<Viewport>,
     /// Across the top of the editor column.
     pub tabs: Viewport,
@@ -362,6 +365,8 @@ impl Chrome {
             ..window
         };
         let (toolbar, body) = body.split_top(TOOLBAR_HEIGHT);
+        let activity = body.take_left(ACTIVITY_WIDTH.min(body.width));
+        let body = body.inset_left(activity.width);
 
         // A sidebar that would squeeze the editor to nothing is not shown.
         let sidebar = sidebar
@@ -426,6 +431,7 @@ impl Chrome {
 
         Chrome {
             toolbar,
+            activity,
             sidebar,
             tabs,
             breadcrumbs,
@@ -2910,6 +2916,95 @@ pub fn sidebar_rows(viewport: Viewport) -> usize {
 ///
 /// Source control lives in the sidebar rather than in a window-filling modal,
 /// so it needs somewhere to be switched to.
+/// Width of the icon strip at the window's left edge.
+pub const ACTIVITY_WIDTH: f32 = 44.0;
+
+/// The panels the icon strip switches between, top to bottom.
+pub const ACTIVITY_ICONS: [(char, &str); 3] = [
+    ('\u{eaf0}', "explorer"),       // cod-files
+    ('\u{ea68}', "source-control"), // cod-source_control
+    ('\u{eae6}', "extensions"),     // cod-extensions
+];
+
+/// Each icon's square in the strip.
+pub fn activity_items(strip: Viewport) -> [Viewport; 3] {
+    let size = ACTIVITY_WIDTH;
+    std::array::from_fn(|i| Viewport {
+        x: strip.x,
+        y: strip.y + 6.0 + i as f32 * size,
+        width: size,
+        height: size,
+    })
+}
+
+/// The icon strip. `active` is the panel the sidebar shows, when it shows;
+/// `badge` counts Source Control's changes.
+pub fn push_activity(
+    out: &mut Vec<GlyphInstance>,
+    atlas: &mut Atlas,
+    strip: Viewport,
+    theme: &Theme,
+    active: Option<usize>,
+    badge: usize,
+) {
+    push_rect(
+        out,
+        atlas,
+        [strip.x, strip.y],
+        [strip.width, strip.height],
+        theme.sidebar_background,
+    );
+    push_rect(
+        out,
+        atlas,
+        [strip.x + strip.width - 1.0, strip.y],
+        [1.0, strip.height],
+        theme.hairline,
+    );
+    for (i, rect) in activity_items(strip).into_iter().enumerate() {
+        if rect.y + rect.height > strip.y + strip.height {
+            break;
+        }
+        let on = active == Some(i);
+        if on {
+            push_rect(
+                out,
+                atlas,
+                [rect.x, rect.y + 8.0],
+                [2.0, rect.height - 16.0],
+                theme.accent,
+            );
+        }
+        let [r, g, b, a] = theme.sidebar_text;
+        push_icon_scaled(
+            out,
+            atlas,
+            rect,
+            ACTIVITY_ICONS[i].0,
+            if on { theme.text } else { [r, g, b, a * 0.55] },
+            1.45,
+        );
+        if i == 1 && badge > 0 {
+            let label = if badge > 99 {
+                "99+".to_owned()
+            } else {
+                badge.to_string()
+            };
+            let w = (ui_text_width(atlas, &label) + 8.0).max(16.0);
+            let pill = Viewport {
+                x: rect.x + rect.width - w - 3.0,
+                y: rect.y + rect.height - 18.0,
+                width: w,
+                height: 15.0,
+            };
+            push_rounded_rect(out, pill, 7.5, theme.accent);
+            push_ui_text_centered(out, atlas, pill, &label, theme.sidebar_background);
+        }
+    }
+}
+
+/// The top row of the sidebar, where the panel's title is written. Split in
+/// two halves, which the action row below lines up with.
 pub fn sidebar_switcher(viewport: Viewport) -> (Viewport, Viewport) {
     let track = Viewport {
         x: viewport.x + 10.0,
@@ -3063,41 +3158,19 @@ pub fn build_sidebar_with_edit(
         return 0;
     }
 
-    let (explorer, source) = sidebar_switcher(viewport);
-    push_rounded_rect(
-        out,
-        Viewport {
-            width: explorer.width + source.width,
-            ..explorer
-        },
-        6.0,
-        theme.tab_active,
-    );
-    let active = if scm { source } else { explorer };
-    push_rounded_rect(
-        out,
-        Viewport {
-            x: active.x + 2.0,
-            y: active.y + 2.0,
-            width: (active.width - 4.0).max(0.0),
-            height: active.height - 4.0,
-        },
-        5.0,
-        theme.tab_hover,
-    );
-    push_ui_text_centered(
+    // The panel's name; the icon strip switches panels.
+    let (title, source) = sidebar_switcher(viewport);
+    push_ui_text(
         out,
         atlas,
-        explorer,
-        "Explorer",
-        if scm { theme.status_text } else { theme.text },
-    );
-    push_ui_text_centered(
-        out,
-        atlas,
-        source,
-        "Source Control",
-        if scm { theme.text } else { theme.status_text },
+        Viewport {
+            x: title.x + 2.0,
+            y: title.y + 3.0,
+            width: title.width + source.width,
+            height: 20.0,
+        },
+        if scm { "SOURCE CONTROL" } else { "EXPLORER" },
+        theme.status_text,
     );
     if scm {
         // The panel draws the rest of the column.
@@ -3339,8 +3412,8 @@ pub enum Hit {
     TerminalNew,
     /// The terminal's screen.
     Terminal,
-    SidebarExplorer,
-    SidebarSourceControl,
+    /// An icon in the strip: 0 Explorer, 1 Source Control, 2 Extensions.
+    Activity(usize),
     /// New file, new folder, collapse all, refresh.
     SidebarAction(usize),
     SidebarRow(usize),
@@ -3385,8 +3458,7 @@ impl Hit {
             Hit::TerminalClose(i) => format!("terminal.close.{i}"),
             Hit::TerminalNew => "terminal.new".into(),
             Hit::Terminal => "terminal".into(),
-            Hit::SidebarExplorer => "sidebar.explorer".into(),
-            Hit::SidebarSourceControl => "sidebar.source-control".into(),
+            Hit::Activity(i) => format!("activity.{}", ACTIVITY_ICONS[*i].1),
             Hit::SidebarAction(i) => format!("sidebar.action.{i}"),
             Hit::SidebarRow(i) => format!("sidebar.row.{i}"),
             Hit::SidebarDivider => "sidebar.divider".into(),
@@ -5115,6 +5187,34 @@ pub fn push_icon_centered(
     });
 }
 
+/// An icon-font glyph centred in `rect` at `scale` times its usual size,
+/// for places where an icon stands alone and a text-sized one looks lost.
+pub fn push_icon_scaled(
+    out: &mut Vec<GlyphInstance>,
+    atlas: &mut Atlas,
+    rect: Viewport,
+    glyph: char,
+    color: [f32; 4],
+    scale: f32,
+) {
+    let Some(slot) = atlas.slot_for(glyph) else {
+        return;
+    };
+    let (cell_w, cell_h) = atlas.cell_size();
+    let (width, height) = (cell_w * slot.cells as f32 * scale, cell_h * scale);
+    out.push(GlyphInstance {
+        pos: [
+            atlas.metrics.snap(rect.x + (rect.width - width) * 0.5),
+            rect.y + (rect.height - height) * 0.5,
+        ],
+        size: [width, height],
+        uv: slot.uv,
+        flags: slot.flags(),
+        color,
+        ..Default::default()
+    });
+}
+
 /// A UI label aligned to the right edge of `rect`.
 ///
 /// For trailing hints like a keyboard shortcut, which were previously placed
@@ -6729,7 +6829,13 @@ mod tests {
                 + 2.0 * FIND_ROW_HEIGHT
                 + TEXT_TOP_PAD
         );
-        assert_eq!(chrome.text.x, 240.0);
+        assert_eq!(
+            chrome.text.x,
+            ACTIVITY_WIDTH + 240.0,
+            "after the strip and the sidebar"
+        );
+        assert_eq!(chrome.activity.x, 0.0);
+        assert_eq!(chrome.activity.width, ACTIVITY_WIDTH);
         assert_eq!(chrome.text.y + chrome.text.height, 760.0 - STATUS_HEIGHT);
     }
 

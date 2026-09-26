@@ -1068,8 +1068,13 @@ define_class!(
             // The Extensions page owns the editor column while it is open.
             let page_action = {
                 let state = self.ivars().state.borrow();
+                let in_list = chrome.sidebar.is_some_and(|r| r.contains(x, y));
                 match &state.extensions {
-                    Some(page) if state.palette.is_none() && chrome.text.contains(x, y) => {
+                    Some(page)
+                        if state.palette.is_none()
+                            && ((page.details && details_rect(&chrome).contains(x, y))
+                                || in_list) =>
+                    {
                         Some(page.hit(x, y))
                     }
                     _ => None,
@@ -1185,12 +1190,8 @@ define_class!(
                     self.ivars().state.borrow_mut().dragging_divider = true;
                     return;
                 }
-                Some(Hit::SidebarExplorer) => {
-                    self.set_sidebar_view(false);
-                    return;
-                }
-                Some(Hit::SidebarSourceControl) => {
-                    self.set_sidebar_view(true);
+                Some(Hit::Activity(index)) => {
+                    self.activate(index);
                     return;
                 }
                 Some(Hit::SidebarAction(slot)) => {
@@ -1284,8 +1285,13 @@ define_class!(
                     return;
                 }
                 Some(Hit::Tab(index)) => {
-                    self.ivars().state.borrow_mut().extensions = None;
-                    self.ivars().state.borrow_mut().tab_drag = Some(index);
+                    {
+                        let mut state = self.ivars().state.borrow_mut();
+                        if let Some(page) = &mut state.extensions {
+                            page.details = false;
+                        }
+                        state.tab_drag = Some(index);
+                    }
                     self.tab_click(x);
                     return;
                 }
@@ -1764,8 +1770,7 @@ define_class!(
                     Hit::ToolbarSidebar
                         | Hit::ToolbarProject
                         | Hit::ToolbarSearch
-                        | Hit::SidebarExplorer
-                        | Hit::SidebarSourceControl
+                        | Hit::Activity(_)
                         | Hit::SidebarAction(_)
                         | Hit::Tab(_)
                         | Hit::TabClose(_)
@@ -1789,7 +1794,7 @@ define_class!(
             for target in &state.pointer_targets {
                 add(*target, &NSCursor::pointingHandCursor());
             }
-            if state.extensions.is_none() && state.native_preview.is_none() && !(state.git_open && state.git.showing_diff) && active_review(&state).is_none() && !side_by_side(&state) {
+            if !ext_details(&state) && state.native_preview.is_none() && !(state.git_open && state.git.showing_diff) && active_review(&state).is_none() && !side_by_side(&state) {
                 let gutter = layout::gutter_width(state.docs.active(), &state.renderer.atlas);
                 add(chrome.text.inset_left(gutter), &NSCursor::IBeamCursor());
             }
@@ -1804,9 +1809,6 @@ define_class!(
                 if find.height > layout::FIND_ROW_HEIGHT * 2.0 { add(Viewport { y: find.y + layout::FIND_ROW_HEIGHT * 2.0, height: find.height - layout::FIND_ROW_HEIGHT * 2.0, ..find }, &NSCursor::pointingHandCursor()); }
             }
             if let Some(rect) = chrome.sidebar {
-                let (explorer, source) = layout::sidebar_switcher(rect);
-                add(explorer, &NSCursor::pointingHandCursor());
-                add(source, &NSCursor::pointingHandCursor());
                 if state.git_open {
                     // Only over the controls that are actually there: the
                     // empty column below the last change is not clickable.
@@ -3635,7 +3637,13 @@ impl EditorView {
         let pointer_targets: Vec<Viewport> = state
             .extensions
             .iter()
-            .flat_map(|page| page.hits.iter().map(|(r, _)| *r))
+            .flat_map(|page| {
+                page.hits
+                    .iter()
+                    .filter(|_| page.details)
+                    .chain(page.list_hits.iter())
+                    .map(|(r, _)| *r)
+            })
             .chain(state.bulb_rect)
             .collect();
         if state.pointer_targets != pointer_targets {
@@ -3861,7 +3869,7 @@ impl EditorView {
         // The Extensions page has the column: Escape leaves its
         // confirmation, then the page; nothing types into the document
         // underneath. The palette, opened over it, keeps its own keys.
-        if self.ivars().state.borrow().extensions.is_some()
+        if ext_details(&self.ivars().state.borrow())
             && self.ivars().state.borrow().palette.is_none()
             && !event
                 .modifierFlags()
@@ -3875,7 +3883,10 @@ impl EditorView {
                     page.is_some_and(|p| p.confirm.take().is_some())
                 };
                 if !confirming {
-                    self.ivars().state.borrow_mut().extensions = None;
+                    let mut state = self.ivars().state.borrow_mut();
+                    if let Some(page) = &mut state.extensions {
+                        page.details = false;
+                    }
                 }
                 self.request_redraw();
             }
@@ -4557,15 +4568,28 @@ impl EditorView {
                             .is_some_and(|(id, _)| id == state.docs.active().id()),
                     )
                 );
+                let activity = format!(
+                    "{} sidebar={}",
+                    if state.extensions.is_some() {
+                        "extensions"
+                    } else if state.git_open {
+                        "source-control"
+                    } else {
+                        "explorer"
+                    },
+                    if state.sidebar { "on" } else { "off" }
+                );
                 let report = format!(
                     // First: the report ends with the document's text.
-                    "message: {}\npointer_targets: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nconflicts: {}\ngit_conflicts: {}\nblame: {}\nfind_results: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\n{report}",
+                    "message: {}\nactivity: {}\npointer_targets: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nconflicts: {}\ngit_conflicts: {}\nblame: {}\nfind_results: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\n{report}",
                     state.message.as_ref().map_or("", |(text, _)| text.as_str()),
+                    activity,
                     state.pointer_targets.len(),
                     state.extensions.as_ref().map_or("closed".to_string(), |page| {
                         use crate::platform::extensions::Registry;
                         format!(
-                            "open selected={} installed={} registry={} confirm={} busy={} note={}",
+                            "{} selected={} installed={} registry={} confirm={} busy={} note={}",
+                            if page.details { "open" } else { "list" },
                             page.selected.as_deref().unwrap_or("-"),
                             page.installed
                                 .iter()
@@ -5964,6 +5988,7 @@ impl EditorView {
     fn set_sidebar_view(&self, scm: bool) {
         {
             let mut state = self.ivars().state.borrow_mut();
+            state.extensions = None;
             state.git_open = scm;
             // Typing belongs to the editor until the message field is asked
             // for. Focusing it here would swallow the next keystroke.
@@ -8764,6 +8789,42 @@ impl EditorView {
         }
     }
 
+    /// A click on the icon strip. The panel the sidebar already shows hides
+    /// the sidebar, and brings it back; any other panel is shown.
+    fn activate(&self, index: usize) {
+        let (showing, current) = {
+            let state = self.ivars().state.borrow();
+            let current = if state.extensions.is_some() {
+                2
+            } else if state.git_open {
+                1
+            } else {
+                0
+            };
+            (state.sidebar, current)
+        };
+        if index == current {
+            let mut state = self.ivars().state.borrow_mut();
+            state.sidebar = !showing;
+            drop(state);
+            self.request_redraw();
+            self.pump();
+            return;
+        }
+        match index {
+            0 => self.set_sidebar_view(false),
+            1 => self.set_sidebar_view(true),
+            _ => self.open_extensions(),
+        }
+        let mut state = self.ivars().state.borrow_mut();
+        if !state.sidebar {
+            state.sidebar = true;
+        }
+        drop(state);
+        self.request_redraw();
+        self.pump();
+    }
+
     /// crc > Extensions…: the page, with what is installed now and the
     /// registry being fetched.
     fn open_extensions(&self) {
@@ -8775,6 +8836,9 @@ impl EditorView {
             state.extensions = Some(page);
             state.palette = None;
             state.completion = None;
+            state.git_open = false;
+            state.git.showing_diff = false;
+            state.sidebar = true;
         }
         self.refresh_registry();
         self.request_redraw();
@@ -8822,6 +8886,7 @@ impl EditorView {
                 if let Some(page) = &mut state.extensions {
                     page.selected = Some(id);
                     page.confirm = None;
+                    page.details = true;
                 }
             }
             Action::Install(id) => {
@@ -11622,8 +11687,10 @@ impl EditorView {
 
         // The one layout. `chrome_of` needs the whole state, so it is asked
         // before the state is taken apart field by field below.
+        let ext_details_rect = details_rect(&chrome);
         let Chrome {
             toolbar: toolbar_rect,
+            activity: activity_rect,
             sidebar: sidebar_rect,
             tabs: tab_rect,
             breadcrumbs: breadcrumb_rect,
@@ -11685,12 +11752,12 @@ impl EditorView {
         let diffing = *git_open && git.showing_diff;
         let reviewing = claude.as_ref().and_then(|c| c.reviews.get(&buffer.id()));
 
-        if let Some(page) = extensions.as_mut() {
+        if let Some(page) = extensions.as_mut().filter(|p| p.details) {
             glyphs.clear();
-            crate::platform::extensions::draw(
+            crate::platform::extensions::draw_details(
                 page,
                 &mut renderer.atlas,
-                editor_rect,
+                ext_details_rect,
                 theme,
                 glyphs,
             );
@@ -11992,7 +12059,10 @@ impl EditorView {
             tab_hits,
         );
 
-        if diffing {
+        if extensions.as_ref().is_some_and(|p| p.details) {
+            // The Extensions details cover this row; a document's path here
+            // would label them as something they are not.
+        } else if diffing {
             // The breadcrumb row says which change is on screen, so the
             // editor column is never an unlabelled wall of diff.
             layout::push_rect(
@@ -12378,7 +12448,34 @@ impl EditorView {
             }
         }
 
-        if let Some(rect) = sidebar_rect {
+        layout::push_activity(
+            glyphs,
+            &mut renderer.atlas,
+            activity_rect,
+            theme,
+            sidebar_rect.map(|_| {
+                if extensions.is_some() {
+                    2
+                } else if *git_open {
+                    1
+                } else {
+                    0
+                }
+            }),
+            git.snapshot.as_ref().map_or(0, |s| s.changes.len()),
+        );
+        if let Some(rect) = sidebar_rect
+            && let Some(page) = extensions.as_mut()
+        {
+            layout::push_rect(
+                glyphs,
+                &renderer.atlas,
+                [rect.x, rect.y],
+                [rect.width, rect.height],
+                theme.sidebar_background,
+            );
+            crate::platform::extensions::draw_list(page, &mut renderer.atlas, rect, theme, glyphs);
+        } else if let Some(rect) = sidebar_rect {
             let edit_text = sidebar_edit.as_ref().map(|e| e.field.rope.to_string());
             let edit = sidebar_edit
                 .as_ref()
@@ -12924,6 +13021,22 @@ fn completion_language(buffer: &Buffer) -> String {
                 .and_then(Path::file_name)
                 .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
         })
+}
+
+/// Where the Extensions details draw: the editor column under the tabs,
+/// breadcrumbs included, since those name a document the details are not.
+fn details_rect(chrome: &Chrome) -> Viewport {
+    let top = chrome.breadcrumbs.y;
+    Viewport {
+        y: top,
+        height: chrome.text.y + chrome.text.height - top,
+        ..chrome.text
+    }
+}
+
+/// Whether the Extensions details have the editor column.
+fn ext_details(state: &State) -> bool {
+    state.extensions.as_ref().is_some_and(|p| p.details)
 }
 
 fn lsp_server_for<'a>(state: &'a State, buffer: &Buffer) -> Option<&'a crate::lsp::client::Server> {
@@ -13489,8 +13602,17 @@ fn frame_of(state: &mut State) -> Frame {
         git_open,
         tab_hits,
         sidebar_edit,
+        extensions,
         ..
     } = state;
+    for (index, item) in layout::activity_items(chrome.activity)
+        .into_iter()
+        .enumerate()
+    {
+        if item.y + item.height <= chrome.activity.y + chrome.activity.height {
+            frame.push(Hit::Activity(index), item);
+        }
+    }
     frame.push(Hit::ToolbarSidebar, layout::toolbar_sidebar(chrome.toolbar));
     frame.push(
         Hit::ToolbarProject,
@@ -13522,10 +13644,7 @@ fn frame_of(state: &mut State) -> Frame {
                 height: rect.height,
             },
         );
-        let (explorer, source) = layout::sidebar_switcher(rect);
-        frame.push(Hit::SidebarExplorer, explorer);
-        frame.push(Hit::SidebarSourceControl, source);
-        if !*git_open {
+        if !*git_open && extensions.is_none() {
             let (_, actions) = layout::sidebar_actions(rect);
             for (index, action) in actions.into_iter().enumerate() {
                 frame.push(Hit::SidebarAction(index), action);

@@ -213,8 +213,8 @@ expect "$T/scroll-drag.out" cursor "1:1"
 # down than whole-line arithmetic would say.
 cat > "$T/smooth.script" <<SCRIPT
 key 11 cmd b
-trackpad 600 400 -30
-click 600 205
+trackpad 644 400 -30
+click 644 205
 dump $T/smooth.out
 quit
 SCRIPT
@@ -391,29 +391,29 @@ fi
 printf 'abcdefghij\nklmnopqrst\nhello world foo\n\tTabbed line\nlast\n' > "$T/mouse.txt"
 cat > "$T/mouse.script" <<SCRIPT
 key 11 cmd b
-click 51.2 144
+click 95.2 144
 dump $T/click.out
-click 88 163 2
+click 132 163 2
 dump $T/double.out
-click 60 125 3
+click 104 125 3
 dump $T/triple.out
-click 300 62
+click 344 62
 dump $T/tabbar.out
-click 24 125
-down 24 125
-drag 48 144
+click 68 125
+down 68 125
+drag 92 144
 dump $T/drag.out
-up 48 144
-down 30 163 2
-drag 125 163
-up 125 163
+up 92 144
+down 74 163 2
+drag 169 163
+up 169 163
 dump $T/worddrag.out
-click 24 125
-down 300 62
-drag 60 163
-up 60 163
+click 68 125
+down 344 62
+drag 104 163
+up 104 163
 dump $T/strayDrag.out
-click 88 163 2
+click 132 163 2
 text X
 dump $T/replace.out
 key 6 cmd z
@@ -441,17 +441,17 @@ printf '\342\201\247שלום abc\342\201\251' >> "$T/long-unicode.txt"
 cat > "$T/long-unicode.script" <<SCRIPT
 key 11 cmd b
 wait 300
-click 32 125
+click 76 125
 key 123 shift
 dump $T/long-unicode.out
 text Q
 wait 300
-click 32 125
+click 76 125
 key 123 shift
 dump $T/long-unicode-edited.out
 key 6 cmd z
 wait 300
-click 32 125
+click 76 125
 key 123 shift
 dump $T/long-unicode-restored.out
 quit
@@ -532,7 +532,7 @@ dump $T/find.out
 key 53
 # Type, then open another file from the palette (#12): it used to replace
 # this buffer and everything typed into it, without a word.
-click 300 280
+click 344 280
 text unsaved
 key 35 cmd p
 text b.txt
@@ -578,7 +578,7 @@ printf 'two\n' > "$T/proj/two.txt"
 cat > "$T/tabs.script" <<SCRIPT
 key 11 cmd b
 dump $T/preview.out
-click 100 160
+click 144 160
 dump $T/source.out
 text X
 dump $T/live-edit.out
@@ -586,11 +586,11 @@ key 35 cmd p
 text two.txt
 key 36
 dump $T/two.out
-down 50 62
-drag 220 62
-up 220 62
+down 94 62
+drag 264 62
+up 264 62
 dump $T/reordered.out
-click 700 62 2
+click 744 62 2
 dump $T/new-tab.out
 quit
 SCRIPT
@@ -702,10 +702,10 @@ printf 'visible\n' > "$T/treeproj/visible.txt"
 cat > "$T/tree-expand.script" <<SCRIPT
 wait 250
 # Tree rows start below the 48pt toolbar and 70pt sidebar header, so row n
-# is centred at 118 + 26n + 13.
-click 70 131
+# is centred at 118 + 26n + 13; the sidebar starts after the 44pt strip.
+click 114 131
 wait 250
-click 80 157
+click 124 157
 dump $T/tree-expand.out
 key 35 cmd p
 text visible.txt
@@ -729,13 +729,13 @@ mkdir -p "$T/personal-project-with-a-long-folder-name" "$T/titlehome"
 printf 'personal sample\n' > "$T/personal-project-with-a-long-folder-name/seed.txt"
 cat > "$T/title-menu.script" <<SCRIPT
 wait 350
-resize 420 450
+resize 464 450
 dump $T/title-narrow.out
 click 145 24
 dump $T/title-menu.out
 touch $T/personal-project-with-a-long-folder-name/after.txt
 dump $T/title-stale.out
-click 217 99
+click 261 99
 wait 500
 dump $T/title-refreshed.out
 key 35 cmd p
@@ -745,7 +745,7 @@ dump $T/title-opened.out
 quit
 SCRIPT
 HOME="$T/titlehome" CRC_SELFTEST="$T/title-menu.script" "$BIN" "$T/personal-project-with-a-long-folder-name" 2> "$T/title-menu.err"
-if ! grep -q '^layout: window 420x450 sidebar Some(240' "$T/title-narrow.out"; then
+if ! grep -q '^layout: window 464x450 sidebar Some(240' "$T/title-narrow.out"; then
     echo 'FAIL: narrow native window lost its sidebar or did not resize'
     fail=1
 fi
@@ -764,9 +764,9 @@ printf 'personal sample\n' > "$T/moveproj/source.txt"
 ln -s missing-target "$T/moveproj/holder/source.txt"
 cat > "$T/move.script" <<SCRIPT
 wait 400
-down 60 157
-drag 60 131
-up 60 131
+down 104 157
+drag 104 131
+up 104 131
 wait 400
 quit
 SCRIPT
@@ -824,22 +824,22 @@ dump $T/git-status.out
 # Commit button at 182 and the list at 220. One untracked file means a
 # section heading at 220 and its row at 246, with the stage control inset
 # 30pt from the trailing edge of the column.
-click 220 259
+click 264 259
 wait 500
 dump $T/git-stage.out
-click 220 259
+click 264 259
 wait 500
 dump $T/git-unstage.out
-click 220 259
+click 264 259
 wait 500
 # Click the row body, not the control: it selects and opens the diff.
-click 60 259
+click 104 259
 wait 500
 dump $T/git-diff.out
-click 120 161
+click 164 161
 text Personal commit
 dump $T/git-message.out
-click 120 196
+click 164 196
 wait 700
 dump $T/git-commit.out
 # Escape steps back out: first the message field, then the diff, then the
@@ -891,7 +891,7 @@ cat > "$T/hunk-ui.script" <<SCRIPT
 wait 350
 key 5 cmd,opt g
 wait 500
-click 60 259
+click 104 259
 wait 500
 dump $T/hunk-before.out
 click 1050 145
@@ -1067,8 +1067,8 @@ expect "$T/symbols-open.out" cursor "1:1"
 
 # ---- word wrap ---------------------------------------------------------------
 # A .txt file wraps by default. The long second line is 264 columns; at this
-# window's 103 the first row holds two sentences and "the quick brown " (104
-# bytes, the space hanging), the second 103. Down moves by row, a click on the third screen
+# window's 98 (after the 44pt icon strip) the first row holds two sentences
+# and "the quick " (98 bytes), the second starts at "brown", column 99. Down moves by row, a click on the third screen
 # row lands in the second row of line 2, and View > Word Wrap turns it off.
 mkdir -p "$T/wrapproj"
 python3 -c "import sys; w='the quick brown fox jumps over the lazy dog '; open(sys.argv[1],'w').write('short line\n'+w*6+'\nlast line\n')" "$T/wrapproj/notes.txt"
@@ -1082,7 +1082,7 @@ key 125 -
 dump $T/wrap-next.out
 key 125 -
 dump $T/wrap-last.out
-click 298 163
+click 342 163
 dump $T/wrap-click.out
 key 35 cmd p
 wait 200
@@ -1093,11 +1093,11 @@ dump $T/wrap-off.out
 quit
 SCRIPT
 CRC_SELFTEST="$T/wrap.script" "$BIN" "$T/wrapproj/notes.txt" 2> "$T/wrap.err"
-expect "$T/wrap-open.out" wrap "103 row 0"
-expect "$T/wrap-down.out" cursor "2:105"
-expect "$T/wrap-next.out" cursor "2:208"
+expect "$T/wrap-open.out" wrap "98 row 0"
+expect "$T/wrap-down.out" cursor "2:99"
+expect "$T/wrap-next.out" cursor "2:197"
 expect "$T/wrap-last.out" cursor "3:1"
-expect "$T/wrap-click.out" cursor "2:109"
+expect "$T/wrap-click.out" cursor "2:103"
 expect "$T/wrap-off.out" wrap "off row 0"
 expect "$T/wrap-off.out" message "word wrap off"
 
@@ -1110,7 +1110,7 @@ mkdir -p "$T/foldproj"
 printf 'fn a() {\n    one;\n    two;\n}\n\ndef b():\n    x = 1\n\n    return x\nend\n' > "$T/foldproj/blocks.rs"
 cat > "$T/fold.script" <<SCRIPT
 wait 300
-click 268 125
+click 312 125
 dump $T/fold-click.out
 key 125 -
 dump $T/fold-down.out
@@ -1427,6 +1427,51 @@ HOME="$T/lsp4home" CRC_LSP_FAKE="$PWD/scripts/fake-lsp.py" CRC_SELFTEST="$T/lsp4
     || { echo "FAIL lsp4: main.py is: $(cat "$T/lsp4proj/main.py")"; fail=1; }
 expect "$T/lsp4-saved.out" dirty false
 
+# ---- activity bar --------------------------------------------------------------
+# The icon strip at the left: another panel's icon switches to it, the
+# active one hides the sidebar and brings it back, and Extensions puts its
+# list in the sidebar and its details in the editor column.
+mkdir -p "$T/actproj" "$T/acthome"
+git init -q -b main "$T/actproj"
+printf 'one\n' > "$T/actproj/a.txt"
+git -C "$T/actproj" add a.txt
+git -C "$T/actproj" -c user.name=Tester -c user.email=t@example.com -c commit.gpgsign=false commit -q -m first
+printf 'two\n' >> "$T/actproj/a.txt"
+cat > "$T/act.script" <<SCRIPT
+wait 500
+dump $T/act-start.out
+click @activity.source-control
+wait 300
+dump $T/act-scm.out
+click @activity.source-control
+wait 100
+dump $T/act-hidden.out
+click @activity.source-control
+wait 100
+dump $T/act-back.out
+click @activity.extensions
+wait 400
+dump $T/act-ext.out
+key 53
+wait 100
+dump $T/act-ext-list.out
+click @activity.explorer
+wait 100
+dump $T/act-explorer.out
+quit
+SCRIPT
+HOME="$T/acthome" CRC_SELFTEST="$T/act.script" "$BIN" "$T/actproj" 2> "$T/act.err"
+expect "$T/act-start.out" activity "explorer sidebar=on"
+expect "$T/act-scm.out" activity "source-control sidebar=on"
+expect "$T/act-scm.out" git_open true
+expect "$T/act-hidden.out" activity "source-control sidebar=off"
+expect "$T/act-back.out" activity "source-control sidebar=on"
+expect "$T/act-ext.out" activity "extensions sidebar=on"
+grep -q '^extensions: open ' "$T/act-ext.out" || { echo "FAIL act-ext: the details did not open"; fail=1; }
+grep -q '^extensions: list ' "$T/act-ext-list.out" || { echo "FAIL act-ext-list: Escape did not keep the list"; fail=1; }
+expect "$T/act-explorer.out" activity "explorer sidebar=on"
+expect "$T/act-explorer.out" extensions "closed"
+
 # ---- extensions ---------------------------------------------------------------
 # A registry on disk, signed with a throwaway key the test instance is told
 # to trust (only honoured under CRC_SELFTEST), serving the Sort Lines module
@@ -1509,7 +1554,8 @@ expect "$T/ext-confirm.out" extensions "open selected=crc.sort-lines installed= 
 expect "$T/ext-installed.out" extensions "open selected=crc.sort-lines installed=crc.sort-lines:0.1.0:on:signed registry=ready:crc.sort-lines confirm=- busy=- note=Installed Sort Lines 0.1.0"
 expect "$T/ext-installed.out" ext_commands "Sort Lines|Sort Lines Descending|Remove Duplicate Lines"
 expect "$T/ext-palette.out" palette_first "Sort Lines"
-expect "$T/ext-sorted.out" extensions "closed"
+# Escape gives the column back; the list stays in the sidebar.
+expect "$T/ext-sorted.out" extensions "list selected=crc.sort-lines installed=crc.sort-lines:0.1.0:on:signed registry=ready:crc.sort-lines confirm=- busy=- note=Installed Sort Lines 0.1.0"
 expect_line "$T/ext-sorted.out" 1 "apple"
 expect_line "$T/ext-sorted.out" 2 "apple"
 expect_line "$T/ext-sorted.out" 3 "fig"

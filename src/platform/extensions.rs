@@ -53,6 +53,11 @@ pub struct Page {
     /// Recent log lines per extension, from its calls.
     pub logs: HashMap<String, Vec<String>>,
     pub hits: Vec<(Viewport, Action)>,
+    /// The list's rows in the sidebar, as last drawn.
+    pub list_hits: Vec<(Viewport, Action)>,
+    /// Whether the details have the editor column. Escape and a tab give
+    /// the column back; the list stays in the sidebar.
+    pub details: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -95,6 +100,8 @@ impl Page {
             note: None,
             logs: HashMap::new(),
             hits: Vec::new(),
+            list_hits: Vec::new(),
+            details: true,
         }
     }
 
@@ -126,6 +133,8 @@ impl Page {
     pub fn hit(&self, x: f32, y: f32) -> Option<Action> {
         self.hits
             .iter()
+            .filter(|_| self.details)
+            .chain(self.list_hits.iter())
             .rev()
             .find(|(r, _)| r.contains(x, y))
             .map(|(_, a)| a.clone())
@@ -135,6 +144,8 @@ impl Page {
     pub fn named(&self, name: &str) -> Option<Viewport> {
         self.hits
             .iter()
+            .filter(|_| self.details)
+            .chain(self.list_hits.iter())
             .find(|(_, a)| a.name() == name)
             .map(|(r, _)| *r)
     }
@@ -147,7 +158,6 @@ pub fn newer(a: &str, b: &str) -> bool {
 }
 
 const PAD: f32 = 28.0;
-const ROW: f32 = 46.0;
 const BUTTON_H: f32 = 26.0;
 
 fn button(
@@ -222,7 +232,9 @@ fn text(
     );
 }
 
-pub fn draw(
+/// The editor column: the header with its two actions, then the selected
+/// extension's details, or the install confirmation.
+pub fn draw_details(
     page: &mut Page,
     atlas: &mut Atlas,
     rect: Viewport,
@@ -277,103 +289,12 @@ pub fn draw(
     layout::push_rect(out, atlas, [x, y], [right - x, 1.0], theme.hairline);
     y += 12.0;
 
-    // The list on the left, details on the right.
-    let list_w = ((right - x) * 0.42).clamp(220.0, 360.0);
-    let detail_x = x + list_w + 24.0;
-    let detail_w = right - detail_x;
+    // The details take the column; the list is in the sidebar.
+    // Prose keeps a readable measure rather than the width of a wide window.
+    let detail_x = x;
+    let detail_w = (right - x).min(680.0);
     let top = y;
-
-    let offered = page.offered();
-    let mut rows: Vec<(&'static str, String, String, String, char)> = Vec::new();
-    for i in &page.installed {
-        let mut state = i.manifest.version.clone();
-        if !i.enabled {
-            state.push_str(" \u{b7} off");
-        }
-        if !i.signed {
-            state.push_str(" \u{b7} unsigned");
-        }
-        rows.push((
-            "Installed",
-            i.manifest.id.clone(),
-            i.manifest.name.clone(),
-            state,
-            crate::project::icons::extension_icon(&i.manifest.icon),
-        ));
-    }
-    for e in &offered {
-        let state = if page.installed(&e.manifest.id).is_some() {
-            format!("update to {}", e.manifest.version)
-        } else {
-            e.manifest.version.clone()
-        };
-        rows.push((
-            "Available",
-            e.manifest.id.clone(),
-            e.manifest.name.clone(),
-            state,
-            crate::project::icons::extension_icon(&e.manifest.icon),
-        ));
-    }
-    let mut last_section = "";
-    for (section, id, name, state, icon) in &rows {
-        if *section != last_section {
-            if y + 22.0 > bottom {
-                break;
-            }
-            text(out, atlas, x, y, list_w, section, dim);
-            y += 24.0;
-            last_section = section;
-        }
-        if y + ROW > bottom {
-            break;
-        }
-        let row = Viewport {
-            x: x - 8.0,
-            y,
-            width: list_w + 16.0,
-            height: ROW - 4.0,
-        };
-        if page.selected.as_deref() == Some(id.as_str()) {
-            layout::push_rounded_rect(out, row, 6.0, theme.palette_selected);
-        }
-        layout::push_icon_centered(
-            out,
-            atlas,
-            Viewport {
-                x,
-                y: y + 4.0,
-                width: 28.0,
-                height: 34.0,
-            },
-            *icon,
-            theme.accent,
-        );
-        let (x, list_w) = (x + 38.0, list_w - 38.0);
-        text(out, atlas, x, y + 4.0, list_w - 90.0, name, theme.text);
-        layout::push_ui_text_right(
-            out,
-            atlas,
-            Viewport {
-                x: x + list_w - 150.0,
-                y: y + 4.0,
-                width: 150.0,
-                height: 20.0,
-            },
-            state,
-            dim,
-        );
-        text(out, atlas, x, y + 22.0, list_w, id, dim);
-        hits.push((row, Action::Select(id.clone())));
-        y += ROW;
-    }
-    if rows.is_empty() {
-        let empty = match page.registry {
-            Registry::Loading => "Nothing installed yet.",
-            _ => "Nothing installed, and nothing in the registry yet.",
-        };
-        text(out, atlas, x, y, list_w, empty, dim);
-    }
+    let _ = bottom;
 
     // Details of the selected one, or the install confirmation.
     let mut y = top;
@@ -594,6 +515,122 @@ pub fn draw(
         }
     }
     page.hits = hits;
+}
+
+/// The sidebar: installed extensions, then what the registry offers that is
+/// not installed or is newer. A row selects it and shows its details.
+pub fn draw_list(
+    page: &mut Page,
+    atlas: &mut Atlas,
+    rect: Viewport,
+    theme: &Theme,
+    out: &mut Vec<GlyphInstance>,
+) {
+    let mut hits = Vec::new();
+    let dim = theme.status_text;
+    let (title, _) = layout::sidebar_switcher(rect);
+    text(
+        out,
+        atlas,
+        title.x + 2.0,
+        title.y + 3.0,
+        title.width,
+        "EXTENSIONS",
+        dim,
+    );
+    let x = rect.x + 12.0;
+    let width = rect.width - 24.0;
+    let bottom = rect.y + rect.height - 8.0;
+    let mut y = title.y + title.height + 14.0;
+
+    let mut rows: Vec<(&'static str, String, String, String, char)> = Vec::new();
+    for i in &page.installed {
+        let mut state = i.manifest.version.clone();
+        if !i.enabled {
+            state.push_str(" \u{b7} off");
+        }
+        if !i.signed {
+            state.push_str(" \u{b7} unsigned");
+        }
+        rows.push((
+            "Installed",
+            i.manifest.id.clone(),
+            i.manifest.name.clone(),
+            state,
+            crate::project::icons::extension_icon(&i.manifest.icon),
+        ));
+    }
+    for e in page.offered() {
+        let state = if page.installed(&e.manifest.id).is_some() {
+            format!("update to {}", e.manifest.version)
+        } else {
+            e.manifest.version.clone()
+        };
+        rows.push((
+            "Available",
+            e.manifest.id.clone(),
+            e.manifest.name.clone(),
+            state,
+            crate::project::icons::extension_icon(&e.manifest.icon),
+        ));
+    }
+    let mut last = "";
+    for (section, id, name, state, icon) in &rows {
+        if *section != last {
+            if y + 22.0 > bottom {
+                break;
+            }
+            text(out, atlas, x, y, width, section, dim);
+            y += 24.0;
+            last = section;
+        }
+        const ROW_H: f32 = 44.0;
+        if y + ROW_H > bottom {
+            break;
+        }
+        let row = Viewport {
+            x: rect.x + 4.0,
+            y,
+            width: rect.width - 8.0,
+            height: ROW_H - 4.0,
+        };
+        if page.selected.as_deref() == Some(id.as_str()) && page.details {
+            layout::push_rounded_rect(out, row, 6.0, theme.sidebar_selected);
+        }
+        layout::push_icon_scaled(
+            out,
+            atlas,
+            Viewport {
+                x,
+                y: y + 3.0,
+                width: 26.0,
+                height: 34.0,
+            },
+            *icon,
+            theme.accent,
+            1.3,
+        );
+        text(
+            out,
+            atlas,
+            x + 36.0,
+            y + 2.0,
+            width - 36.0,
+            name,
+            theme.sidebar_text,
+        );
+        text(out, atlas, x + 36.0, y + 20.0, width - 36.0, state, dim);
+        hits.push((row, Action::Select(id.clone())));
+        y += ROW_H;
+    }
+    if rows.is_empty() {
+        let note = match page.registry {
+            Registry::Loading => "Checking the registry\u{2026}",
+            _ => "Nothing installed yet.",
+        };
+        text(out, atlas, x, y, width, note, dim);
+    }
+    page.list_hits = hits;
 }
 
 #[cfg(test)]
