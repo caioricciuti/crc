@@ -24,6 +24,7 @@ file in crc applies it; there is no settings window and nothing to restart.
 | `caret_blink` | `true`, `false` | `true` | `false` keeps the caret solid. |
 | `update_check` | `true`, `false` | `true` | Once a day at launch, ask GitHub whether a newer release exists. Nothing is downloaded. |
 | `format_on_save` | `true`, `false` | `false` | Format the file with its [language server](/docs/features/language-servers/) when saving. |
+| `organize_imports_on_save` | `true`, `false` | `false` | Sort and prune imports with the [language server](/docs/features/language-servers/#code-actions) when saving, before any format. |
 | `word_wrap` | `"auto"`, `"on"`, `"off"` | `"auto"` | `auto` wraps Markdown and text files only. <kbd>⌥</kbd><kbd>Z</kbd> flips it for one document. |
 | `ssh_auth_sock` | a path | unset | The SSH agent socket Git uses for fetch, pull and push. |
 | `conflict_view` | `"inline"`, `"side-by-side"` | `"inline"` | How a file with [merge conflicts](/docs/features/git/#merge-conflicts) opens. The strip above the file switches either way. |
@@ -55,6 +56,10 @@ update_check = true
 
 # Format the file with its language server when saving it.
 format_on_save = false
+
+# Sort and prune imports with the language server when saving, before any
+# format. Go > Organize Imports (Shift-Option-O) does it by hand.
+organize_imports_on_save = false
 
 # Wrap long lines: "auto" for Markdown and text files, "on" or "off".
 # View > Word Wrap (Option-Z) flips it for one document.

@@ -28,6 +28,7 @@ pub const CHEVRON_RIGHT: char = '\u{eab6}'; // cod-chevron_right
 pub const CHEVRON_DOWN: char = '\u{eab4}'; // cod-chevron_down
 pub const HOME: char = '\u{eb06}'; // cod-home
 pub const SEARCH: char = '\u{ea6d}'; // cod-search
+pub const LIGHTBULB: char = '\u{ea61}'; // cod-lightbulb
 
 // Completion chips: where a suggestion came from, and what it is.
 pub const SYMBOL_METHOD: char = '\u{ea8c}'; // cod-symbol_method

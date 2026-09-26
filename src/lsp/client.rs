@@ -12,10 +12,10 @@ use std::time::Instant;
 
 use super::transport::{Incoming, Transport, Wake};
 use super::{
-    Completion, Diagnostic, Location, Position, Severity, Signature, TextEdit, offset_of, path_for,
-    uri_for,
+    CodeAction, Completion, Diagnostic, Location, Position, Severity, Signature, TextEdit,
+    offset_of, path_for, uri_for,
 };
-use crate::json::{Value, number, object, string};
+use crate::json::{Value, compact, number, object, string};
 
 /// Where a server is in its life.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,14 +31,40 @@ pub enum Phase {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Pending {
     Initialize,
-    Completion { path: PathBuf, at: Position },
+    Completion {
+        path: PathBuf,
+        at: Position,
+    },
     Definition,
-    Hover { path: PathBuf },
+    Hover {
+        path: PathBuf,
+    },
     References,
     Rename,
-    Formatting { path: PathBuf, save: bool },
-    Signature { path: PathBuf },
+    Formatting {
+        path: PathBuf,
+        save: bool,
+    },
+    Signature {
+        path: PathBuf,
+    },
+    /// `invoked` when the person asked, so a refusal is worth saying.
+    CodeActions {
+        path: PathBuf,
+        invoked: bool,
+    },
+    Resolve,
+    Command,
     Shutdown,
+}
+
+/// What running a code action comes to: edits to apply, then a command
+/// for the server to run, as compact JSON.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionSteps {
+    pub title: String,
+    pub edits: Vec<(PathBuf, Vec<TextEdit>)>,
+    pub command: Option<String>,
 }
 
 /// Something the server told us, ready for the window to act on.
@@ -72,6 +98,19 @@ pub enum Event {
     Signature {
         path: PathBuf,
         signature: Option<Signature>,
+    },
+    CodeActions {
+        path: PathBuf,
+        request: u64,
+        actions: Vec<CodeAction>,
+    },
+    /// A resolved code action, ready to run.
+    Action(ActionSteps),
+    /// The server asks for edits, usually while running a command. Answer
+    /// with [`Server::answer_apply_edit`] and `id`, compact JSON.
+    ApplyEdit {
+        id: String,
+        edits: Vec<(PathBuf, Vec<TextEdit>)>,
     },
     /// A request the person made was refused, with the server's reason.
     Refused(String),
@@ -175,6 +214,7 @@ impl Server {
                                 object([("relatedInformation", Value::Bool(false))]),
                             ),
                             ("definition", object([])),
+                            ("codeAction", code_action_capability()),
                         ]),
                     ),
                     (
@@ -182,6 +222,12 @@ impl Server {
                         object([
                             ("configuration", Value::Bool(true)),
                             ("workspaceFolders", Value::Bool(true)),
+                            ("applyEdit", Value::Bool(true)),
+                            (
+                                "workspaceEdit",
+                                object([("documentChanges", Value::Bool(true))]),
+                            ),
+                            ("executeCommand", object([])),
                         ]),
                     ),
                     ("window", object([("workDoneProgress", Value::Bool(true))])),
@@ -413,6 +459,111 @@ impl Server {
         )
     }
 
+    /// Whether the server said it offers code actions.
+    pub fn offers_code_actions(&self) -> bool {
+        provides(&self.capabilities, "codeActionProvider")
+    }
+
+    /// Asks for the code actions between `start` and `end`, telling the
+    /// server about `diagnostics` there. `only` narrows them to one kind,
+    /// `source.organizeImports` say. `invoked` when the person asked rather
+    /// than the caret resting.
+    pub fn code_actions(
+        &mut self,
+        path: &Path,
+        (start, end): (Position, Position),
+        diagnostics: &[Diagnostic],
+        only: Option<&str>,
+        invoked: bool,
+    ) -> u64 {
+        let diagnostics = diagnostics
+            .iter()
+            .filter_map(|d| crate::json::parse(&d.raw).ok())
+            .collect();
+        let mut context = vec![
+            ("diagnostics".to_owned(), Value::Array(diagnostics)),
+            (
+                "triggerKind".to_owned(),
+                number(if invoked { 1 } else { 2 }),
+            ),
+        ];
+        if let Some(kind) = only {
+            context.push(("only".to_owned(), Value::Array(vec![string(kind)])));
+        }
+        let params = object([
+            ("textDocument", Self::text_document(path)),
+            (
+                "range",
+                object([
+                    ("start", Self::position(start)),
+                    ("end", Self::position(end)),
+                ]),
+            ),
+            ("context", Value::Object(context)),
+        ]);
+        self.request(
+            "textDocument/codeAction",
+            params,
+            Pending::CodeActions {
+                path: path.to_path_buf(),
+                invoked,
+            },
+        )
+    }
+
+    /// What running `action` takes, when the action already says. `None`
+    /// when it had to be resolved first: [`Event::Action`] brings the
+    /// answer.
+    pub fn action_steps(&mut self, action: &CodeAction) -> Option<ActionSteps> {
+        let value = crate::json::parse(&action.raw).unwrap_or(Value::Null);
+        let resolves = self
+            .capabilities
+            .path("codeActionProvider.resolveProvider")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        // An action without its edit is resolved when the server keeps
+        // `data` for that, or when it would do nothing as it is. A bare
+        // Command (whose `command` is a string) never is.
+        let bare = value.get("command").and_then(Value::as_str).is_some();
+        let incomplete = value.get("edit").is_none()
+            && (value.get("data").is_some() || value.get("command").is_none());
+        if !bare && incomplete && resolves {
+            self.request("codeAction/resolve", value, Pending::Resolve);
+            return None;
+        }
+        Some(steps_of(&action.title, &value))
+    }
+
+    /// Runs a command, compact JSON with `command` and `arguments`, on the
+    /// server. What it changes comes back as [`Event::ApplyEdit`].
+    pub fn execute_command(&mut self, command: &str) {
+        let Ok(value) = crate::json::parse(command) else {
+            return;
+        };
+        let Some(name) = value.get("command").and_then(Value::as_str) else {
+            return;
+        };
+        let params = object([
+            ("command", string(name)),
+            (
+                "arguments",
+                value
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or(Value::Array(Vec::new())),
+            ),
+        ]);
+        self.request("workspace/executeCommand", params, Pending::Command);
+    }
+
+    /// Answers a `workspace/applyEdit` the server sent.
+    pub fn answer_apply_edit(&mut self, id: &str, applied: bool) {
+        let Ok(id) = crate::json::parse(id) else {
+            return;
+        };
+        self.respond(&id, object([("applied", Value::Bool(applied))]));
+    }
+
     /// Characters after which the server offers signature help.
     pub fn signature_triggers(&self) -> Vec<String> {
         let mut out: Vec<String> = ["triggerCharacters", "retriggerCharacters"]
@@ -540,7 +691,9 @@ impl Server {
             .map(str::to_owned);
         match (id, method) {
             // A request from the server.
-            (Some(id), Some(method)) => self.handle_request(&id, &method, message.get("params")),
+            (Some(id), Some(method)) => {
+                self.handle_request(&id, &method, message.get("params"), events)
+            }
             // A notification.
             (None, Some(method)) => {
                 self.handle_notification(&method, message.get("params"), events)
@@ -562,7 +715,12 @@ impl Server {
                             self.phase = Phase::Failed(reason.clone());
                             events.push(Event::Failed(reason));
                         }
-                        Pending::References | Pending::Rename | Pending::Formatting { .. } => {
+                        Pending::References
+                        | Pending::Rename
+                        | Pending::Formatting { .. }
+                        | Pending::CodeActions { invoked: true, .. }
+                        | Pending::Resolve
+                        | Pending::Command => {
                             events.push(Event::Refused(text));
                         }
                         _ => {}
@@ -643,6 +801,26 @@ impl Server {
                 path,
                 signature: parse_signature(&result),
             }),
+            Pending::CodeActions { path, .. } => {
+                let actions = result
+                    .as_array()
+                    .map(|items| items.iter().filter_map(parse_code_action).collect())
+                    .unwrap_or_default();
+                events.push(Event::CodeActions {
+                    path,
+                    request: id,
+                    actions,
+                });
+            }
+            Pending::Resolve => {
+                let title = result
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                events.push(Event::Action(steps_of(&title, &result)));
+            }
+            Pending::Command => {}
             Pending::Shutdown => {
                 self.notify("exit", Value::Null);
             }
@@ -670,8 +848,22 @@ impl Server {
         // window/logMessage, $/progress and the rest are noise here.
     }
 
-    fn handle_request(&mut self, id: &Value, method: &str, params: Option<&Value>) {
+    fn handle_request(
+        &mut self,
+        id: &Value,
+        method: &str,
+        params: Option<&Value>,
+        events: &mut Vec<Event>,
+    ) {
         match method {
+            // Answered once the window has tried the edits.
+            "workspace/applyEdit" => events.push(Event::ApplyEdit {
+                id: compact(id),
+                edits: params
+                    .and_then(|p| p.get("edit"))
+                    .map(parse_workspace_edit)
+                    .unwrap_or_default(),
+            }),
             "workspace/configuration" => {
                 // Nothing configured: one null per item asked for.
                 let count = params
@@ -727,7 +919,81 @@ fn parse_diagnostic(value: &Value) -> Option<Diagnostic> {
             .get("source")
             .and_then(Value::as_str)
             .map(str::to_owned),
+        raw: compact(value),
     })
+}
+
+/// What a code action's reply lists: a CodeAction, or a bare Command.
+fn parse_code_action(value: &Value) -> Option<CodeAction> {
+    Some(CodeAction {
+        title: value.get("title")?.as_str()?.to_owned(),
+        kind: value
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        preferred: value
+            .get("isPreferred")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        disabled: value
+            .path("disabled.reason")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        raw: compact(value),
+    })
+}
+
+/// A CodeAction's edit and command, or a bare Command as the command.
+fn steps_of(title: &str, value: &Value) -> ActionSteps {
+    let command = match value.get("command") {
+        Some(Value::String(_)) => Some(compact(value)),
+        Some(command @ Value::Object(_)) => Some(compact(command)),
+        _ => None,
+    };
+    ActionSteps {
+        title: title.to_owned(),
+        edits: value
+            .get("edit")
+            .map(parse_workspace_edit)
+            .unwrap_or_default(),
+        command,
+    }
+}
+
+/// What the client says about code actions in `initialize`: the literal
+/// form, the kinds it knows, and that the edit may come later.
+fn code_action_capability() -> Value {
+    let kinds = [
+        "",
+        "quickfix",
+        "refactor",
+        "refactor.extract",
+        "refactor.inline",
+        "refactor.rewrite",
+        "source",
+        "source.organizeImports",
+        "source.fixAll",
+    ];
+    object([
+        (
+            "codeActionLiteralSupport",
+            object([(
+                "codeActionKind",
+                object([(
+                    "valueSet",
+                    Value::Array(kinds.iter().map(|k| string(k)).collect()),
+                )]),
+            )]),
+        ),
+        ("isPreferredSupport", Value::Bool(true)),
+        ("disabledSupport", Value::Bool(true)),
+        ("dataSupport", Value::Bool(true)),
+        (
+            "resolveSupport",
+            object([("properties", Value::Array(vec![string("edit")]))]),
+        ),
+    ])
 }
 
 fn parse_completion(value: &Value) -> Option<Completion> {
@@ -1121,6 +1387,116 @@ mod tests {
         // The server answers shutdown, gets exit, and its stream closes.
         let closed = server.wait_for(Duration::from_secs(5), |e| matches!(e, Event::Failed(_)));
         assert!(closed.is_some(), "the stream closed without a Failed event");
+    }
+
+    #[test]
+    fn code_actions_resolve_run_commands_and_organize() {
+        let Some((mut server, dir)) = fake() else {
+            eprintln!("no python3; skipping the fake server test");
+            return;
+        };
+        assert!(
+            server
+                .wait_for(Duration::from_secs(10), |e| matches!(e, Event::Ready))
+                .is_some()
+        );
+        assert!(server.offers_code_actions());
+        let file = dir.0.join("main.py");
+        server.did_open(&file, "python", "import b\nimport a\nx = 1  # TODO\n");
+        assert!(
+            server
+                .wait_for(Duration::from_secs(5), |e| matches!(
+                    e,
+                    Event::Diagnostics(_)
+                ))
+                .is_some()
+        );
+        let diagnostics = server.diagnostics[&file].clone();
+        assert!(
+            diagnostics[0].raw.contains("\"data\""),
+            "{}",
+            diagnostics[0].raw
+        );
+        let at = |line, character| Position { line, character };
+
+        // The TODO fix only comes back when the diagnostic went back whole.
+        let request = server.code_actions(&file, (at(2, 9), at(2, 9)), &diagnostics, None, true);
+        let Some(Event::CodeActions {
+            request: answered,
+            actions,
+            ..
+        }) = server.wait_for(Duration::from_secs(5), |e| {
+            matches!(e, Event::CodeActions { .. })
+        })
+        else {
+            panic!("no code actions");
+        };
+        assert_eq!(answered, request);
+        let titles: Vec<&str> = actions.iter().map(|a| a.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            [
+                "Organize Imports",
+                "Replace TODO with DONE",
+                "Upper-case this line",
+                "Extract function"
+            ]
+        );
+        assert!(actions[1].preferred);
+        assert_eq!(actions[1].kind, "quickfix");
+        assert_eq!(
+            actions[3].disabled.as_deref(),
+            Some("select an expression first")
+        );
+
+        // No edit given: resolved first.
+        assert_eq!(server.action_steps(&actions[1]), None);
+        let Some(Event::Action(steps)) =
+            server.wait_for(Duration::from_secs(5), |e| matches!(e, Event::Action(_)))
+        else {
+            panic!("not resolved");
+        };
+        assert_eq!(steps.title, "Replace TODO with DONE");
+        assert_eq!(steps.edits.len(), 1);
+        assert_eq!(steps.edits[0].1[0].text, "DONE");
+        assert_eq!(steps.command, None);
+
+        // A command: the server comes back asking for the edit.
+        let steps = server
+            .action_steps(&actions[2])
+            .expect("a command runs as is");
+        assert!(steps.edits.is_empty());
+        server.execute_command(steps.command.as_deref().unwrap());
+        let Some(Event::ApplyEdit { id, edits }) = server.wait_for(Duration::from_secs(5), |e| {
+            matches!(e, Event::ApplyEdit { .. })
+        }) else {
+            panic!("no applyEdit");
+        };
+        assert_eq!(edits[0].1[0].text, "X = 1  # TODO");
+        server.answer_apply_edit(&id, true);
+
+        // Narrowed to one kind, the edit comes with it.
+        server.code_actions(
+            &file,
+            (at(0, 0), at(3, 0)),
+            &[],
+            Some("source.organizeImports"),
+            false,
+        );
+        let Some(Event::CodeActions { actions, .. }) = server
+            .wait_for(Duration::from_secs(5), |e| {
+                matches!(e, Event::CodeActions { .. })
+            })
+        else {
+            panic!("no organize");
+        };
+        assert_eq!(actions.len(), 1);
+        let steps = server.action_steps(&actions[0]).unwrap();
+        let rope = crate::text::rope::Rope::from_text("import b\nimport a\nx = 1  # TODO\n");
+        assert_eq!(
+            super::super::apply_edits(&rope, &steps.edits[0].1).as_deref(),
+            Some("import a\nimport b\nx = 1  # TODO\n")
+        );
     }
 
     #[test]

@@ -2,6 +2,16 @@
 
 One entry per tag, written for people who use the editor.
 
+## Unreleased
+
+- Code actions from the language server: a lightbulb in place of the line
+  number where the caret rests on a line with fixes, and Go > Quick Fix
+  (Cmd-.) to list them in the palette, preferred first. Go > Organize
+  Imports (Shift-Option-O), and `organize_imports_on_save` in the settings,
+  which runs before format-on-save.
+- A rename's edits now refresh the Git gutter marks of the open files they
+  change.
+
 ## v0.2.0-alpha.2, 2026-09-26
 
 - Merge conflicts: a Conflicts group in Source Control, `MERGING` and

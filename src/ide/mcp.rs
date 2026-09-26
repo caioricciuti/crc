@@ -551,6 +551,7 @@ mod tests {
                     severity: Severity::Error,
                     message: "mismatched types".into(),
                     source: Some("rustc".into()),
+                    raw: String::new(),
                 }],
             )];
             all.into_iter()

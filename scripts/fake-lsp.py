@@ -4,8 +4,10 @@
 Speaks just enough of the protocol to exercise the client: initialize,
 document sync, diagnostics for lines containing TODO or ERROR, completion,
 definition, hover, references and rename by whole word, formatting (trailing
-spaces go, `){` gains a space), signature help for one made-up function, a
-server-to-client request, and shutdown. Deliberately
+spaces go, `){` gains a space), signature help for one made-up function, code
+actions (a TODO fix that needs resolving, a command that comes back as
+workspace/applyEdit, a disabled one, organize imports by sorting the leading
+`import` lines), a server-to-client request, and shutdown. Deliberately
 plain: no threads, no library, so the tests depend on nothing but python3,
 which ships with the Xcode command line tools.
 """
@@ -63,6 +65,8 @@ def publish(uri):
                         },
                         "severity": severity,
                         "source": "fake",
+                        "code": word.lower(),
+                        "data": {"fix": "DONE" if word == "TODO" else None},
                         "message": "%s on line %d" % (word.lower(), number + 1),
                     }
                 )
@@ -160,6 +164,8 @@ while True:
                     "referencesProvider": True,
                     "renameProvider": True,
                     "documentFormattingProvider": True,
+                    "codeActionProvider": {"resolveProvider": True},
+                    "executeCommandProvider": {"commands": ["fake.upper"]},
                     "signatureHelpProvider": {
                         "triggerCharacters": ["("],
                         "retriggerCharacters": [","],
@@ -279,6 +285,99 @@ while True:
                     "activeParameter": before[call:].count(","),
                 },
             )
+    elif method == "textDocument/codeAction":
+        uri = params["textDocument"]["uri"]
+        context = params.get("context", {})
+        only = context.get("only")
+        actions = []
+        if only is None or "source.organizeImports" in only:
+            lines = documents.get(uri, "").split("\n")
+            count = 0
+            while count < len(lines) and lines[count].startswith("import "):
+                count += 1
+            if count > 0:
+                block = sorted(set(lines[:count]))
+                actions.append(
+                    {
+                        "title": "Organize Imports",
+                        "kind": "source.organizeImports",
+                        "edit": {
+                            "changes": {
+                                uri: [
+                                    {
+                                        "range": {
+                                            "start": {"line": 0, "character": 0},
+                                            "end": {"line": count, "character": 0},
+                                        },
+                                        "newText": "".join(l + "\n" for l in block),
+                                    }
+                                ]
+                            }
+                        },
+                    }
+                )
+        if only is None:
+            # A fix only for a diagnostic sent back whole, data and all.
+            for diagnostic in context.get("diagnostics", []):
+                fix = (diagnostic.get("data") or {}).get("fix")
+                if diagnostic.get("code") == "todo" and fix:
+                    actions.append(
+                        {
+                            "title": "Replace TODO with %s" % fix,
+                            "kind": "quickfix",
+                            "isPreferred": True,
+                            "diagnostics": [diagnostic],
+                            "data": {"uri": uri, "range": diagnostic["range"], "text": fix},
+                        }
+                    )
+            line = params["range"]["start"]["line"]
+            actions.append(
+                {
+                    "title": "Upper-case this line",
+                    "kind": "refactor.rewrite",
+                    "command": {
+                        "title": "Upper-case",
+                        "command": "fake.upper",
+                        "arguments": [uri, line],
+                    },
+                }
+            )
+            actions.append(
+                {
+                    "title": "Extract function",
+                    "kind": "refactor.extract",
+                    "disabled": {"reason": "select an expression first"},
+                }
+            )
+        reply(message, actions)
+    elif method == "codeAction/resolve":
+        data = params.get("data")
+        resolved = dict(params)
+        if data:
+            resolved["edit"] = {
+                "changes": {data["uri"]: [{"range": data["range"], "newText": data["text"]}]}
+            }
+        reply(message, resolved)
+    elif method == "workspace/executeCommand":
+        uri, line = params["arguments"]
+        text = documents.get(uri, "").split("\n")[line]
+        send(
+            {
+                "jsonrpc": "2.0",
+                "id": next_server_id,
+                "method": "workspace/applyEdit",
+                "params": {
+                    "label": "Upper-case",
+                    "edit": {
+                        "changes": {
+                            uri: [{"range": span(line, 0, len(text)), "newText": text.upper()}]
+                        }
+                    },
+                },
+            }
+        )
+        next_server_id += 1
+        reply(message, None)
     elif method == "shutdown":
         reply(message, None)
     elif method == "exit":

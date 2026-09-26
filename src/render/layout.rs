@@ -1484,6 +1484,80 @@ pub fn push_gutter_marks(
     }
 }
 
+/// The lightbulb on the caret's line, where its number was: the server has
+/// code actions there. The number is the only one drawn in the active
+/// gutter colour, so it is taken back out of `out`, which [`build_full`]
+/// has just filled. Returns where the bulb is, for clicks.
+pub fn push_bulb(
+    out: &mut Vec<GlyphInstance>,
+    atlas: &mut Atlas,
+    buffer: &Buffer,
+    viewport: Viewport,
+    theme: &Theme,
+) -> Option<Viewport> {
+    let m = atlas.metrics;
+    let line = buffer.rope.byte_to_line(buffer.cursor());
+    let row = screen_rows(buffer, viewport, m.line_height)
+        .into_iter()
+        .find(|r| r.line == line && r.first)?;
+    let slot = atlas.slot_for(crate::project::icons::LIGHTBULB)?;
+    let numbers_end = viewport.x + gutter_width(buffer, atlas) - m.advance;
+    let (top, bottom) = (row.y, row.y + m.line_height);
+    out.retain(|g| {
+        !(g.color == theme.gutter_text_active
+            && g.pos[0] >= viewport.x
+            && g.pos[0] < numbers_end
+            && g.pos[1] >= top
+            && g.pos[1] < bottom)
+    });
+    let (cell_w, cell_h) = atlas.cell_size();
+    let size = [cell_w * slot.cells as f32 * 0.8, cell_h * 0.8];
+    let x = m.snap(numbers_end - size[0]);
+    let y = top + (m.line_height - size[1]) * 0.5;
+    if y < viewport.y || y + size[1] > viewport.y + viewport.height {
+        return None;
+    }
+    out.push(GlyphInstance {
+        pos: [x, y],
+        size,
+        uv: slot.uv,
+        flags: slot.flags(),
+        color: theme.syn_constant,
+        ..Default::default()
+    });
+    Some(Viewport {
+        x,
+        y: top,
+        width: size[0],
+        height: m.line_height,
+    })
+}
+
+/// Whether a point in the text area's own coordinates (as
+/// [`offset_at_point`] takes them) is on the caret line's bulb, where
+/// [`push_bulb`] draws it.
+pub fn bulb_at(buffer: &Buffer, atlas: &Atlas, x: f32, y: f32) -> bool {
+    let m = atlas.metrics;
+    let numbers_end = gutter_width(buffer, atlas) - m.advance;
+    let (cell_w, _) = atlas.cell_size();
+    if x < numbers_end - cell_w * 2.0 || x >= numbers_end {
+        return false;
+    }
+    let line = buffer.rope.byte_to_line(buffer.cursor());
+    let rows = screen_rows(
+        buffer,
+        Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: f32::MAX,
+            height: y.max(0.0) + m.line_height,
+        },
+        m.line_height,
+    );
+    rows.iter()
+        .any(|r| r.line == line && r.first && r.y <= y && y < r.y + m.line_height)
+}
+
 /// What a click on the home screen does.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HomeAction {

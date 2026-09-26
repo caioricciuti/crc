@@ -54,6 +54,9 @@ pub struct Settings {
     pub update_check: bool,
     /// Whether saving asks the language server to format the file first.
     pub format_on_save: bool,
+    /// Whether saving asks the language server to organize the imports,
+    /// before any format.
+    pub organize_imports_on_save: bool,
     /// Which documents wrap long lines.
     pub word_wrap: WordWrap,
     /// The SSH agent socket for fetch, pull and push. An app opened from
@@ -81,6 +84,7 @@ impl Default for Settings {
             caret_blink: true,
             update_check: true,
             format_on_save: false,
+            organize_imports_on_save: false,
             word_wrap: WordWrap::Auto,
             ssh_auth_sock: None,
             conflict_side_by_side: false,
@@ -112,6 +116,10 @@ update_check = true
 
 # Format the file with its language server when saving it.
 format_on_save = false
+
+# Sort and prune imports with the language server when saving, before any
+# format. Go > Organize Imports (Shift-Option-O) does it by hand.
+organize_imports_on_save = false
 
 # Wrap long lines: \"auto\" for Markdown and text files, \"on\" or \"off\".
 # View > Word Wrap (Option-Z) flips it for one document.
@@ -211,6 +219,11 @@ impl Settings {
                 "format_on_save" => match value {
                     "true" => settings.format_on_save = true,
                     "false" => settings.format_on_save = false,
+                    _ => {}
+                },
+                "organize_imports_on_save" => match value {
+                    "true" => settings.organize_imports_on_save = true,
+                    "false" => settings.organize_imports_on_save = false,
                     _ => {}
                 },
                 _ => {}
@@ -320,6 +333,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn organize_imports_on_save_defaults_off() {
+        assert!(!Settings::parse("").organize_imports_on_save);
+        assert!(!Settings::parse(TEMPLATE).organize_imports_on_save);
+        assert!(Settings::parse("organize_imports_on_save = true\n").organize_imports_on_save);
+    }
+
+    #[test]
     fn conflict_view_defaults_to_inline() {
         assert!(!Settings::parse("").conflict_side_by_side);
         assert!(Settings::parse("conflict_view = \"side-by-side\"\n").conflict_side_by_side);
@@ -373,6 +393,7 @@ mod tests {
             caret_blink: true,
             update_check: true,
             format_on_save: false,
+            organize_imports_on_save: false,
             word_wrap: WordWrap::Auto,
             ssh_auth_sock: None,
             conflict_side_by_side: false,

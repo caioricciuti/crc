@@ -106,6 +106,25 @@ pub struct Diagnostic {
     pub severity: Severity,
     pub message: String,
     pub source: Option<String>,
+    /// The diagnostic as the server sent it, compact JSON. A code action
+    /// request hands it back whole: servers match their fixes on `code` and
+    /// `data`, which nothing here reads.
+    pub raw: String,
+}
+
+/// A fix or refactoring the server offered at a place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeAction {
+    pub title: String,
+    /// `quickfix`, `refactor.extract`, `source.organizeImports` and so on.
+    pub kind: String,
+    /// The one to pick when there is an obvious one.
+    pub preferred: bool,
+    /// Why it cannot run here, when the server listed it anyway.
+    pub disabled: Option<String>,
+    /// The CodeAction or Command as sent, compact JSON, for running it:
+    /// its edit, its command, or the whole of it for `codeAction/resolve`.
+    pub raw: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

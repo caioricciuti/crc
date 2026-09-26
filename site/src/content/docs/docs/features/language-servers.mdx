@@ -1,6 +1,6 @@
 ---
 title: Language servers
-description: Diagnostics, definition, hover, references, rename, formatting and signature help from the servers you already have installed.
+description: Diagnostics, definition, hover, references, rename, formatting, code actions and signature help from the servers you already have installed.
 ---
 
 import { Aside } from "@astrojs/starlight/components";
@@ -28,6 +28,8 @@ TypeScript, TSX and JavaScript files share one server process.
   <div><span>Hover</span><span><kbd>F1</kbd></span></div>
   <div><span>Rename symbol</span><span><kbd>F2</kbd></span></div>
   <div><span>Format document</span><span><kbd>⇧</kbd><kbd>⌥</kbd><kbd>F</kbd></span></div>
+  <div><span>Quick fix</span><span><kbd>⌘</kbd><kbd>.</kbd></span></div>
+  <div><span>Organize imports</span><span><kbd>⇧</kbd><kbd>⌥</kbd><kbd>O</kbd></span></div>
   <div><span>Completion</span><span><kbd>⌃</kbd><kbd>Space</kbd></span></div>
 </div>
 
@@ -39,6 +41,24 @@ TypeScript, TSX and JavaScript files share one server process.
   [settings](/docs/getting-started/settings/).
 - **Completion** from the server is one of several sources; see
   [Completion](/docs/features/completion/).
+
+## Code actions
+
+When the caret rests on a line where the server has fixes or refactorings,
+a lightbulb takes the place of that line's number. Click it, or press
+<kbd>⌘</kbd><kbd>.</kbd>, to list them in the palette: the server's
+preferred fix first, and actions that cannot run here last, with the
+reason. Type to filter, <kbd>Return</kbd> to run one. With a selection,
+<kbd>⌘</kbd><kbd>.</kbd> asks about the selection.
+
+An action's edits land in open files as one undo step each, left unsaved;
+files that are not open are edited on disk.
+
+**Organize Imports** in the Go menu sorts and prunes the imports of the
+whole file, where the server supports it (gopls, typescript-language-server,
+and others). To do it on every save, set `organize_imports_on_save = true`
+in [settings](/docs/getting-started/settings/); with `format_on_save` too,
+imports are organized first, then the file is formatted.
 
 ## Where crc looks
 
@@ -57,7 +77,3 @@ not run your shell to read your profile. So it looks, in order, in:
   usually a rustup proxy, and the real binary sits in the toolchain folder.
   `rustup component add rust-analyzer` puts it there.
 </Aside>
-
-## Not yet
-
-Code actions are not supported.

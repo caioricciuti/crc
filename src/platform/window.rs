@@ -115,6 +115,7 @@ mod key {
     pub const F2: u16 = 120;
     pub const F12: u16 = 111;
     pub const F: u16 = 3;
+    pub const O: u16 = 31;
 }
 
 /// What a key event's `characters` contributes as typed text.
@@ -259,6 +260,63 @@ impl CompletionPopup {
             .filter(|_| self.chosen)
             .and_then(|label| self.shown.iter().position(|c| c.label == label))
             .unwrap_or(0);
+    }
+}
+
+/// Organize Imports waiting on the server: the request, the document and
+/// its text when asked, and whether a save asked.
+struct Organizing {
+    request: u64,
+    path: std::path::PathBuf,
+    snapshot: crate::text::rope::Rope,
+    save: bool,
+}
+
+/// The lightbulb: code actions the server has at a caret. Empty when it
+/// has none, so the caret is not asked about again.
+struct Bulb {
+    buffer: u64,
+    path: std::path::PathBuf,
+    caret: usize,
+    server: Language,
+    actions: Vec<crate::lsp::CodeAction>,
+}
+
+impl Bulb {
+    /// Whether it is drawn: some action can run.
+    fn shows(&self) -> bool {
+        self.actions.iter().any(|a| a.disabled.is_none())
+    }
+}
+
+/// What applying a workspace edit came to.
+#[derive(Default)]
+struct EditOutcome {
+    /// Open documents edited, and left unsaved.
+    open: usize,
+    /// Files edited on disk.
+    written: usize,
+    failed: Vec<std::path::PathBuf>,
+}
+
+impl EditOutcome {
+    /// "2 files", "1 file, 1 open and unsaved", "; could not edit a.rs".
+    fn describe(&self) -> String {
+        let files = self.open + self.written;
+        let mut text = format!("{files} file{}", if files == 1 { "" } else { "s" });
+        if self.open > 0 && self.failed.is_empty() {
+            text.push_str(&format!(", {} open and unsaved", self.open));
+        }
+        if !self.failed.is_empty() {
+            let names: Vec<String> = self
+                .failed
+                .iter()
+                .filter_map(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .collect();
+            text.push_str(&format!("; could not edit {}", names.join(", ")));
+        }
+        text
     }
 }
 
@@ -450,6 +508,25 @@ struct State {
     /// The palette is picking a branch: the local branches, read when it
     /// opened. `None` in every other mode.
     branch_list: Option<Vec<crate::project::git::Branch>>,
+    /// The palette is picking a code action: the server that offered them
+    /// and the actions. `None` in every other mode.
+    action_list: Option<(Language, Vec<crate::lsp::CodeAction>)>,
+    /// The Quick Fix request the palette waits on.
+    quick_fix_request: Option<u64>,
+    /// Organize Imports in flight.
+    organizing: Option<Organizing>,
+    /// A code action being resolved before it runs; `true` when a save ran
+    /// it, and goes on once it has.
+    resolving: Option<bool>,
+    /// `organize_imports_on_save` from the settings.
+    organize_on_save: bool,
+    /// The code actions at the caret, asked for when it rested there.
+    bulb: Option<Bulb>,
+    /// The caret's document and offset, and since when, so the bulb is
+    /// asked for once the caret rests.
+    bulb_want: Option<(u64, usize, Instant)>,
+    /// The bulb request in flight: request, document and caret.
+    bulb_request: Option<(u64, u64, usize)>,
     /// Who last changed the caret's line: document, line, and what the
     /// status line says.
     blame: Option<(u64, usize, String)>,
@@ -1184,6 +1261,19 @@ define_class!(
                     return;
                 }
                 Some(Hit::Text) => {
+                    // The lightbulb in place of the caret line's number.
+                    let on_bulb = {
+                        let state = self.ivars().state.borrow();
+                        let (tx, ty) = chrome_of(&state).to_text(x, y);
+                        let buffer = state.docs.active();
+                        state.bulb.as_ref().is_some_and(|b| {
+                            (b.buffer, b.caret) == (buffer.id(), buffer.cursor()) && b.shows()
+                        }) && layout::bulb_at(buffer, &state.renderer.atlas, tx, ty)
+                    };
+                    if on_bulb {
+                        self.quick_fix();
+                        return;
+                    }
                     // The fold chevron beside a line number.
                     let fold = {
                         let state = self.ivars().state.borrow();
@@ -1807,6 +1897,7 @@ define_class!(
             self.lsp_flush_changes();
             self.gutter_refresh();
             self.blame_refresh();
+            self.bulb_refresh();
             self.claude_flush_selection();
             {
                 // The link fires on any run-loop iteration, nested modal
@@ -1825,7 +1916,7 @@ define_class!(
                     state.message = None;
                     self.ivars().needs_redraw.set(true);
                 }
-                if !self.ivars().needs_redraw.get() && state.message.is_none() && !state.git.busy() && state.drag_point.is_none() && state.project_search_rx.is_none() && state.project_index_rx.is_none() && state.http.is_none() && state.project_changed_at.is_none() && state.git_changed_at.is_none() && state.lsp_dirty.is_empty() && state.gutter_dirty.is_empty() && state.gutter_pending.is_empty() && state.tree_children_pending.is_empty() && state.claude.as_ref().is_none_or(|c| c.selection_changed_at.is_none()) && state.update.is_none() && state.ignored_rx.is_none() && state.blame_rx.is_none() && state.blame_want.is_none() {
+                if !self.ivars().needs_redraw.get() && state.message.is_none() && !state.git.busy() && state.drag_point.is_none() && state.project_search_rx.is_none() && state.project_index_rx.is_none() && state.http.is_none() && state.project_changed_at.is_none() && state.git_changed_at.is_none() && state.lsp_dirty.is_empty() && state.gutter_dirty.is_empty() && state.gutter_pending.is_empty() && state.tree_children_pending.is_empty() && state.claude.as_ref().is_none_or(|c| c.selection_changed_at.is_none()) && state.update.is_none() && state.ignored_rx.is_none() && state.blame_rx.is_none() && state.blame_want.is_none() && state.bulb_want.is_none() {
                     link.setPaused(true);
                     return;
                 }
@@ -2135,6 +2226,17 @@ define_class!(
         #[unsafe(method(formatDocument:))]
         fn action_format_document(&self, _sender: Option<&AnyObject>) {
             self.format_document(false);
+        }
+
+        #[unsafe(method(quickFix:))]
+        fn action_quick_fix(&self, _sender: Option<&AnyObject>) {
+            self.quick_fix();
+        }
+
+        #[unsafe(method(organizeImports:))]
+        fn action_organize_imports(&self, _sender: Option<&AnyObject>) {
+            self.organize_imports(false);
+            self.request_redraw();
         }
 
         #[unsafe(method(goToSymbol:))]
@@ -2792,7 +2894,11 @@ define_class!(
                 active_conflicts(&state).is_some_and(|v| v.can_resolve())
             } else if action == sel!(triggerCompletion:) {
                 !field_has_keys(&state)
-            } else if action == sel!(goToDefinition:) || action == sel!(showHover:) {
+            } else if action == sel!(goToDefinition:)
+                || action == sel!(showHover:)
+                || action == sel!(quickFix:)
+                || action == sel!(organizeImports:)
+            {
                 !field_has_keys(&state) && lsp_server_for(&state, state.docs.active()).is_some()
             } else {
                 true
@@ -3637,6 +3743,16 @@ impl EditorView {
                     self.format_document(false);
                     return true;
                 }
+                key::O
+                    if shift
+                        && flags.contains(NSEventModifierFlags::Option)
+                        && !flags.contains(NSEventModifierFlags::Command)
+                        && !overlay =>
+                {
+                    self.organize_imports(false);
+                    self.request_redraw();
+                    return true;
+                }
                 key::F1 if plain && !overlay => {
                     self.show_hover();
                     return true;
@@ -4329,8 +4445,26 @@ impl EditorView {
                 );
                 let report = format!(
                     // First: the report ends with the document's text.
-                    "message: {}\nbranch: {}\nconflicts: {}\ngit_conflicts: {}\nblame: {}\nfind_results: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\n{report}",
+                    "message: {}\nbulb: {}\nactions: {}\nbranch: {}\nconflicts: {}\ngit_conflicts: {}\nblame: {}\nfind_results: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\n{report}",
                     state.message.as_ref().map_or("", |(text, _)| text.as_str()),
+                    state.bulb.as_ref().map_or("none".to_string(), |b| format!(
+                        "{} at {}",
+                        b.actions.iter().filter(|a| a.disabled.is_none()).count(),
+                        b.caret
+                    )),
+                    state
+                        .palette
+                        .as_ref()
+                        .filter(|_| state.action_list.is_some())
+                        .map(|(query, _)| palette_rows(
+                            &palette_sources(&state),
+                            &query.rope.to_string()
+                        )
+                        .into_iter()
+                        .map(|(row, _)| row.title)
+                        .collect::<Vec<_>>()
+                        .join("|"))
+                        .unwrap_or_default(),
                     state.git.branch_status(),
                     active_conflicts(&state).map_or("none".to_string(), |v| format!(
                         "{} side={} unmerged={} resolvable={} scroll={}",
@@ -5096,8 +5230,10 @@ impl EditorView {
             // Saved first, formatted after: a server that never answers
             // cannot hold a save hostage. The formatted text is saved again.
             let format = state.format_on_save && !state.saving_formatted;
+            let organize = state.organize_on_save && !state.saving_formatted;
             drop(state);
-            if format {
+            // Organize first; it goes on to format once its edits are in.
+            if !(organize && self.organize_imports(true)) && format {
                 self.format_document(true);
             }
         }
@@ -5858,6 +5994,7 @@ impl EditorView {
             let root = state.tree.root().map(Path::to_path_buf);
             state.symbols.reset(document, root);
             state.branch_list = None;
+            state.action_list = None;
             let mut query = Buffer::new();
             if !prefix.is_empty() {
                 query.insert(prefix);
@@ -5916,7 +6053,10 @@ impl EditorView {
                 .nth(first + row)
                 .map(|(_, pick)| pick)
         };
-        if let Some(Pick::Branch(name)) = chosen {
+        if let Some(Pick::Action(server, action)) = chosen {
+            self.close_palette();
+            self.run_code_action(server, action);
+        } else if let Some(Pick::Branch(name)) = chosen {
             self.close_palette();
             self.switch_branch(name, false);
         } else if let Some(Pick::NewBranch(name)) = chosen {
@@ -5995,6 +6135,7 @@ impl EditorView {
             let mut state = self.ivars().state.borrow_mut();
             state.palette = None;
             state.branch_list = None;
+            state.action_list = None;
         }
         self.request_redraw();
         self.pump();
@@ -6047,7 +6188,9 @@ impl EditorView {
                         .map(|(_, pick)| pick)
                 };
                 self.close_palette();
-                if let Some(Pick::Branch(name)) = chosen {
+                if let Some(Pick::Action(server, action)) = chosen {
+                    self.run_code_action(server, action);
+                } else if let Some(Pick::Branch(name)) = chosen {
                     self.switch_branch(name, false);
                 } else if let Some(Pick::NewBranch(name)) = chosen {
                     self.switch_branch(name, true);
@@ -8094,14 +8237,31 @@ impl EditorView {
     /// each, and left unsaved; files that are not open are edited on disk
     /// through the same save path as everything else.
     fn apply_rename(&self, files: Vec<(std::path::PathBuf, Vec<crate::lsp::TextEdit>)>) {
+        let outcome = self.apply_workspace_edit(&files);
+        self.ivars().state.borrow_mut().message = Some((
+            if files.is_empty() {
+                "the server had nothing to rename".into()
+            } else {
+                format!("renamed in {}", outcome.describe())
+            },
+            Instant::now(),
+        ));
+        self.request_redraw();
+        self.pump();
+    }
+
+    /// Applies a server's edits by file: open documents in place, one undo
+    /// step each, left unsaved; other files on disk.
+    fn apply_workspace_edit(
+        &self,
+        files: &[(std::path::PathBuf, Vec<crate::lsp::TextEdit>)],
+    ) -> EditOutcome {
         let (rows, cols) = self.grid();
-        let mut open = 0;
-        let mut written = 0;
-        let mut failed = Vec::new();
+        let mut outcome = EditOutcome::default();
         {
             let mut state = self.ivars().state.borrow_mut();
             let mut touched = Vec::new();
-            for (path, edits) in &files {
+            for (path, edits) in files {
                 if edits.is_empty() {
                     continue;
                 }
@@ -8113,9 +8273,9 @@ impl EditorView {
                     Some(buffer) => match crate::lsp::edit_ranges(&buffer.rope, edits) {
                         Some(ranges) if buffer.replace_ranges(&ranges) > 0 => {
                             touched.push(buffer.id());
-                            open += 1;
+                            outcome.open += 1;
                         }
-                        _ => failed.push(path.clone()),
+                        _ => outcome.failed.push(path.clone()),
                     },
                     None => {
                         let done = Buffer::open(path.clone()).ok().and_then(|mut buffer| {
@@ -8124,8 +8284,8 @@ impl EditorView {
                             buffer.save(None).ok()
                         });
                         match done {
-                            Some(()) => written += 1,
-                            None => failed.push(path.clone()),
+                            Some(()) => outcome.written += 1,
+                            None => outcome.failed.push(path.clone()),
                         }
                     }
                 }
@@ -8134,37 +8294,10 @@ impl EditorView {
                 state
                     .lsp_dirty
                     .insert(id, Instant::now() - Duration::from_secs(1));
+                state.gutter_dirty.insert(id, Instant::now());
             }
             state.docs.active_mut().scroll_to_cursor(rows, cols);
-            state.message = Some((
-                if files.is_empty() {
-                    "the server had nothing to rename".into()
-                } else if failed.is_empty() {
-                    format!(
-                        "renamed in {} file{}{}",
-                        open + written,
-                        if open + written == 1 { "" } else { "s" },
-                        if open > 0 {
-                            format!(", {open} open and unsaved")
-                        } else {
-                            String::new()
-                        }
-                    )
-                } else {
-                    format!(
-                        "renamed in {} files; could not edit {}",
-                        open + written,
-                        failed
-                            .iter()
-                            .filter_map(|p| p.file_name())
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )
-                },
-                Instant::now(),
-            ));
-            if written > 0 {
+            if outcome.written > 0 {
                 state.git.refresh();
                 if let Some(indexer) = &state.indexer {
                     indexer.poke();
@@ -8174,8 +8307,356 @@ impl EditorView {
         self.lsp_flush_changes();
         self.reparse();
         self.sync_title();
+        outcome
+    }
+
+    /// Asks the server for the active document's code actions at the caret
+    /// or selection, or over the whole document for one `only` kind. The
+    /// request, the server, the document and its text then. Says why not in
+    /// the status line when `invoked`.
+    fn request_code_actions(
+        &self,
+        only: Option<&str>,
+        invoked: bool,
+    ) -> Option<(u64, Language, std::path::PathBuf, crate::text::rope::Rope)> {
+        self.lsp_flush_now();
+        let mut state = self.ivars().state.borrow_mut();
+        let buffer = state.docs.active();
+        let asked = match (buffer.path.clone(), lsp_language(buffer)) {
+            (Some(path), Some(language)) => {
+                let range = match only {
+                    Some(_) => 0..buffer.rope.len_bytes(),
+                    None => buffer
+                        .selection()
+                        .unwrap_or(buffer.cursor()..buffer.cursor()),
+                };
+                let start = crate::lsp::position_of(&buffer.rope, range.start);
+                let end = crate::lsp::position_of(&buffer.rope, range.end);
+                Some((path, language, start, end, buffer.rope.clone()))
+            }
+            _ => None,
+        };
+        let why = "no language server for this file";
+        let Some((path, language, start, end, rope)) = asked else {
+            if invoked {
+                state.message = Some((why.into(), Instant::now()));
+            }
+            return None;
+        };
+        let key = crate::lsp::servers::server_key(language);
+        let server = state
+            .lsp
+            .get_mut(&key)
+            .filter(|s| s.is_ready() && s.knows(&path));
+        let (sent, why) = match server {
+            Some(server) if server.offers_code_actions() => {
+                let diagnostics: Vec<crate::lsp::Diagnostic> = server
+                    .diagnostics
+                    .get(&path)
+                    .map(|list| {
+                        list.iter()
+                            .filter(|d| d.start.line <= end.line && d.end.line >= start.line)
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let id = server.code_actions(&path, (start, end), &diagnostics, only, invoked);
+                (Some(id), why)
+            }
+            Some(_) => (None, "this language server has no code actions"),
+            None => (None, why),
+        };
+        if sent.is_none() && invoked {
+            state.message = Some((why.into(), Instant::now()));
+        }
+        Some((sent?, key, path, rope))
+    }
+
+    /// Cmd-.: the code actions at the caret, in the palette. The bulb's
+    /// when it has them for this caret; otherwise the server is asked.
+    fn quick_fix(&self) {
+        let ready = {
+            let state = self.ivars().state.borrow();
+            let buffer = state.docs.active();
+            state
+                .bulb
+                .as_ref()
+                .filter(|b| {
+                    b.buffer == buffer.id()
+                        && b.caret == buffer.cursor()
+                        && buffer.selection().is_none()
+                        && b.shows()
+                        && !state.lsp_dirty.contains_key(&b.buffer)
+                })
+                .map(|b| (b.server, b.actions.clone()))
+        };
+        if let Some((server, actions)) = ready {
+            self.open_action_list(server, actions);
+            return;
+        }
+        if let Some((request, ..)) = self.request_code_actions(None, true) {
+            let mut state = self.ivars().state.borrow_mut();
+            state.quick_fix_request = Some(request);
+            state.message = Some(("looking for code actions\u{2026}".into(), Instant::now()));
+        }
         self.request_redraw();
         self.pump();
+    }
+
+    /// The palette, listing `actions`: the preferred ones first and the
+    /// ones that cannot run last, otherwise in the server's order.
+    fn open_action_list(&self, server: Language, mut actions: Vec<crate::lsp::CodeAction>) {
+        actions.sort_by_key(|a| (a.disabled.is_some(), !a.preferred));
+        self.open_palette_with("");
+        self.ivars().state.borrow_mut().action_list = Some((server, actions));
+        self.request_redraw();
+        self.pump();
+    }
+
+    /// Runs a code action picked from the list: resolved first when the
+    /// server holds its edit back.
+    fn run_code_action(&self, server: Language, action: crate::lsp::CodeAction) {
+        if let Some(reason) = &action.disabled {
+            self.ivars().state.borrow_mut().message =
+                Some((format!("{}: {reason}", action.title), Instant::now()));
+            self.request_redraw();
+            return;
+        }
+        self.lsp_flush_now();
+        let steps = {
+            let mut state = self.ivars().state.borrow_mut();
+            let steps = state
+                .lsp
+                .get_mut(&server)
+                .filter(|s| s.is_ready())
+                .map(|s| s.action_steps(&action));
+            match &steps {
+                None => {
+                    state.message = Some(("the language server stopped".into(), Instant::now()))
+                }
+                Some(None) => {
+                    state.resolving = Some(false);
+                    state.message = Some((format!("{}\u{2026}", action.title), Instant::now()));
+                }
+                Some(Some(_)) => {}
+            }
+            steps.flatten()
+        };
+        if let Some(steps) = steps {
+            self.run_steps(server, steps, false);
+        }
+        self.request_redraw();
+        self.pump();
+    }
+
+    /// A code action's edits, then its command on the server. `save` when
+    /// Organize Imports ran for a save, which goes on to save and format.
+    fn run_steps(&self, server: Language, steps: crate::lsp::client::ActionSteps, save: bool) {
+        let outcome = self.apply_workspace_edit(&steps.edits);
+        let changed = outcome.open + outcome.written > 0;
+        {
+            let mut state = self.ivars().state.borrow_mut();
+            if let Some(command) = &steps.command
+                && let Some(server) = state.lsp.get_mut(&server).filter(|s| s.is_ready())
+            {
+                server.execute_command(command);
+            }
+            if !save {
+                let title = if steps.title.is_empty() {
+                    "code action"
+                } else {
+                    &steps.title
+                };
+                state.message = Some((
+                    if changed || !outcome.failed.is_empty() {
+                        format!("{title}: changed {}", outcome.describe())
+                    } else if steps.command.is_some() {
+                        format!("{title}\u{2026}")
+                    } else {
+                        format!("{title}: nothing to change")
+                    },
+                    Instant::now(),
+                ));
+            }
+        }
+        if save {
+            self.continue_save(changed);
+        }
+        self.request_redraw();
+        self.pump();
+    }
+
+    /// Code > Organize Imports, and before format-on-save. `false` when the
+    /// file has no server that offers it, so a save goes straight on.
+    fn organize_imports(&self, save: bool) -> bool {
+        let Some((request, _, path, snapshot)) =
+            self.request_code_actions(Some("source.organizeImports"), !save)
+        else {
+            return false;
+        };
+        let mut state = self.ivars().state.borrow_mut();
+        state.organizing = Some(Organizing {
+            request,
+            path,
+            snapshot,
+            save,
+        });
+        if !save {
+            state.message = Some(("organizing imports\u{2026}".into(), Instant::now()));
+        }
+        true
+    }
+
+    /// After Organize Imports ran for a save: save what it changed, then
+    /// format when that is on, which saves again.
+    fn continue_save(&self, changed: bool) {
+        if changed {
+            self.ivars().state.borrow_mut().saving_formatted = true;
+            self.save(false);
+            self.ivars().state.borrow_mut().saving_formatted = false;
+        }
+        if self.ivars().state.borrow().format_on_save {
+            self.format_document(true);
+        }
+    }
+
+    /// A server's answer to a code action request: the palette's list, an
+    /// Organize Imports to run, or the bulb. Stale answers are dropped.
+    fn code_actions_arrived(
+        &self,
+        server: Language,
+        request: u64,
+        actions: Vec<crate::lsp::CodeAction>,
+    ) {
+        let mut state = self.ivars().state.borrow_mut();
+        if state.quick_fix_request == Some(request) {
+            state.quick_fix_request = None;
+            if actions.is_empty() {
+                state.message = Some(("no code actions here".into(), Instant::now()));
+                return;
+            }
+            state.message = None;
+            drop(state);
+            self.open_action_list(server, actions);
+            return;
+        }
+        if state
+            .organizing
+            .as_ref()
+            .is_some_and(|o| o.request == request)
+        {
+            let Some(asked) = state.organizing.take() else {
+                return;
+            };
+            let unchanged = all_docs(&state)
+                .flat_map(|d| d.iter())
+                .find(|b| b.path.as_deref().is_some_and(|p| same_file(p, &asked.path)))
+                .is_some_and(|b| b.rope.to_string() == asked.snapshot.to_string());
+            let action = actions
+                .into_iter()
+                .find(|a| a.disabled.is_none() && a.kind.starts_with("source.organizeImports"));
+            let steps = match (&action, unchanged) {
+                (Some(action), true) => state
+                    .lsp
+                    .get_mut(&server)
+                    .filter(|s| s.is_ready())
+                    .map(|s| s.action_steps(action)),
+                _ => None,
+            };
+            let note = match (&action, unchanged, &steps) {
+                (None, _, _) => Some("nothing to organize"),
+                (Some(_), false, _) => Some("organize imports skipped: the text changed"),
+                (Some(_), true, None) => Some("the language server stopped"),
+                (Some(_), true, Some(None)) => {
+                    state.resolving = Some(asked.save);
+                    None
+                }
+                (Some(_), true, Some(Some(_))) => None,
+            };
+            if let Some(note) = note
+                && !asked.save
+            {
+                state.message = Some((note.into(), Instant::now()));
+            }
+            drop(state);
+            match steps {
+                Some(Some(steps)) => self.run_steps(server, steps, asked.save),
+                Some(None) => {}
+                None if asked.save => self.continue_save(false),
+                None => {}
+            }
+            return;
+        }
+        if let Some((asked, buffer, caret)) = state.bulb_request
+            && asked == request
+        {
+            state.bulb_request = None;
+            let path = all_docs(&state)
+                .flat_map(|d| d.iter())
+                .find(|b| b.id() == buffer)
+                .and_then(|b| b.path.clone());
+            if let Some(path) = path {
+                state.bulb = Some(Bulb {
+                    buffer,
+                    path,
+                    caret,
+                    server,
+                    actions,
+                });
+                self.ivars().needs_redraw.set(true);
+            }
+        }
+    }
+
+    /// The bulb follows the caret: gone when it moves or the text changes,
+    /// asked for again once it rests. Runs from the display link.
+    fn bulb_refresh(&self) {
+        const REST: Duration = Duration::from_millis(400);
+        let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
+            return;
+        };
+        let buffer = state.docs.active();
+        let (id, caret) = (buffer.id(), buffer.cursor());
+        let selecting = buffer.selection().is_some();
+        let dirty = state.lsp_dirty.contains_key(&id);
+        let here = |b: &Bulb| (b.buffer, b.caret) == (id, caret);
+        if state.bulb.as_ref().is_some_and(|b| !here(b) || dirty) {
+            state.bulb = None;
+            self.ivars().needs_redraw.set(true);
+        }
+        if state.bulb.is_some()
+            || selecting
+            || dirty
+            || state.palette.is_some()
+            || state
+                .bulb_request
+                .is_some_and(|(_, b, c)| (b, c) == (id, caret))
+        {
+            state.bulb_want = None;
+            return;
+        }
+        match state.bulb_want {
+            Some((b, c, at)) if (b, c) == (id, caret) => {
+                if at.elapsed() < REST {
+                    return;
+                }
+            }
+            _ => {
+                state.bulb_want = Some((id, caret, Instant::now()));
+                return;
+            }
+        }
+        state.bulb_want = None;
+        // Only where a server offers them; asking costs nothing then.
+        let offers =
+            lsp_server_for(&state, state.docs.active()).is_some_and(|s| s.offers_code_actions());
+        drop(state);
+        if !offers {
+            return;
+        }
+        if let Some((request, ..)) = self.request_code_actions(None, false) {
+            self.ivars().state.borrow_mut().bulb_request = Some((request, id, caret));
+        }
     }
 
     /// Asks the server to format the active document. `save` when a save
@@ -9121,16 +9602,46 @@ impl EditorView {
             return;
         };
         let mut events = Vec::new();
-        for server in state.lsp.values_mut() {
-            events.extend(server.poll());
+        for (key, server) in state.lsp.iter_mut() {
+            events.extend(server.poll().into_iter().map(|event| (*key, event)));
         }
         drop(state);
         let mut sync = false;
-        for event in events {
+        for (key, event) in events {
             use crate::lsp::client::Event;
             match event {
                 Event::Ready => sync = true,
-                Event::Diagnostics(_) => {}
+                Event::Diagnostics(path) => {
+                    // New problems can mean new fixes.
+                    let mut state = self.ivars().state.borrow_mut();
+                    if state
+                        .bulb
+                        .as_ref()
+                        .is_some_and(|b| same_file(&b.path, &path))
+                    {
+                        state.bulb = None;
+                    }
+                }
+                Event::CodeActions {
+                    request, actions, ..
+                } => self.code_actions_arrived(key, request, actions),
+                Event::Action(steps) => {
+                    let save = self.ivars().state.borrow_mut().resolving.take();
+                    if let Some(save) = save {
+                        self.run_steps(key, steps, save);
+                    }
+                }
+                Event::ApplyEdit { id, edits } => {
+                    let outcome = self.apply_workspace_edit(&edits);
+                    let mut state = self.ivars().state.borrow_mut();
+                    if let Some(server) = state.lsp.get_mut(&key) {
+                        server.answer_apply_edit(&id, outcome.failed.is_empty());
+                    }
+                    if outcome.open + outcome.written > 0 || !outcome.failed.is_empty() {
+                        state.message =
+                            Some((format!("changed {}", outcome.describe()), Instant::now()));
+                    }
+                }
                 Event::Completions { items, request, .. } => {
                     let mut state = self.ivars().state.borrow_mut();
                     let caret = state.docs.active().cursor();
@@ -10263,6 +10774,7 @@ impl EditorView {
             caret_blink: self.ivars().state.borrow().caret_blink,
             update_check: true,
             format_on_save: self.ivars().state.borrow().format_on_save,
+            organize_imports_on_save: false,
             word_wrap: self.ivars().state.borrow().word_wrap,
             ssh_auth_sock: None,
             conflict_side_by_side: false,
@@ -10321,6 +10833,7 @@ impl EditorView {
             state.theme_choice = settings.theme;
             state.caret_blink = settings.caret_blink;
             state.format_on_save = settings.format_on_save;
+            state.organize_on_save = settings.organize_imports_on_save;
             state.word_wrap = settings.word_wrap;
             state.ssh_auth_sock = settings.ssh_auth_sock.clone();
             state.conflict_side = settings.conflict_side_by_side;
@@ -10477,6 +10990,8 @@ impl EditorView {
             signature,
             word_wrap,
             branch_list,
+            action_list,
+            bulb,
             blame,
             preview,
             live_line,
@@ -10725,6 +11240,13 @@ impl EditorView {
                     theme,
                     &marks.marks,
                 );
+            }
+            if palette.is_none()
+                && bulb.as_ref().is_some_and(|b| {
+                    (b.buffer, b.caret) == (buffer.id(), buffer.cursor()) && b.shows()
+                })
+            {
+                layout::push_bulb(glyphs, &mut renderer.atlas, buffer, editor_rect, theme);
             }
             // Conflicts: washes under the text, which was drawn first into
             // a cleared list, so they go in at the front; the buttons on
@@ -11493,19 +12015,19 @@ impl EditorView {
         // The palette floats over everything, so it is drawn last.
         if let Some((query, selected)) = palette {
             let text = query.rope.to_string();
-            let rows: Vec<layout::PaletteRow> = palette_rows(
-                &PaletteSources {
-                    finder,
-                    commands: command_list,
-                    symbols: symbol_list,
-                    root: tree.root(),
-                    branches: branch_list.as_deref(),
-                },
-                &text,
-            )
-            .into_iter()
-            .map(|(row, _)| row)
-            .collect();
+            let sources = PaletteSources {
+                finder,
+                commands: command_list,
+                symbols: symbol_list,
+                root: tree.root(),
+                branches: branch_list.as_deref(),
+                actions: action_list.as_ref(),
+            };
+            let mode = PaletteMode::of(&sources);
+            let rows: Vec<layout::PaletteRow> = palette_rows(&sources, &text)
+                .into_iter()
+                .map(|(row, _)| row)
+                .collect();
             let rect = layout::palette_rect(viewport, rows.len());
             layout::push_rect(
                 glyphs,
@@ -11517,16 +12039,18 @@ impl EditorView {
             layout::build_palette(
                 layout::PaletteView {
                     rows: &rows,
-                    heading: palette_heading(&text, branch_list.is_some()).0,
-                    empty: palette_heading(&text, branch_list.is_some()).1,
-                    placeholder: if branch_list.is_some() {
-                        "Branch name"
-                    } else {
-                        "Find a file  ·  > commands  ·  @ symbols  ·  # in project"
+                    heading: palette_heading(&text, mode).0,
+                    empty: palette_heading(&text, mode).1,
+                    placeholder: match mode {
+                        PaletteMode::Branch => "Branch name",
+                        PaletteMode::Action => "Filter actions",
+                        PaletteMode::Open => {
+                            "Find a file  ·  > commands  ·  @ symbols  ·  # in project"
+                        }
                     },
-                    action: if branch_list.is_some() {
+                    action: if mode == PaletteMode::Branch {
                         "Switch"
-                    } else if commands::query(&text).is_some() {
+                    } else if mode == PaletteMode::Action || commands::query(&text).is_some() {
                         "Run"
                     } else {
                         "Open"
@@ -12636,6 +13160,54 @@ enum Pick {
     Symbol(Option<std::path::PathBuf>, u32),
     Branch(String),
     NewBranch(String),
+    /// A code action, and the server that offered it.
+    Action(Language, crate::lsp::CodeAction),
+}
+
+/// The code action picker's rows: the actions whose titles match, in the
+/// order given.
+fn action_rows(
+    server: Language,
+    actions: &[crate::lsp::CodeAction],
+    query: &str,
+) -> Vec<(layout::PaletteRow, Pick)> {
+    let needle: Vec<char> = query.trim().to_lowercase().chars().collect();
+    let mut hits: Vec<(i32, usize)> = actions
+        .iter()
+        .enumerate()
+        .filter_map(|(i, a)| {
+            crate::project::finder::score(&a.title.to_lowercase(), &needle).map(|(p, _)| (p, i))
+        })
+        .collect();
+    if !needle.is_empty() {
+        hits.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    }
+    hits.into_iter()
+        .map(|(_, i)| {
+            let action = &actions[i];
+            let kind = action.kind.split('.').next().unwrap_or("");
+            let detail = match (&action.disabled, action.preferred) {
+                (Some(reason), _) => reason.clone(),
+                (None, true) => "preferred".into(),
+                (None, false) => match kind {
+                    "quickfix" => "quick fix",
+                    "refactor" => "refactor",
+                    "source" => "source",
+                    _ => "",
+                }
+                .into(),
+            };
+            (
+                layout::PaletteRow {
+                    icon: (kind == "quickfix").then_some(crate::project::icons::LIGHTBULB),
+                    title: action.title.clone(),
+                    detail,
+                    shortcut: String::new(),
+                },
+                Pick::Action(server, action.clone()),
+            )
+        })
+        .collect()
 }
 
 /// The branch picker's rows: branches matching the query, then a row to
@@ -12695,6 +13267,8 @@ struct PaletteSources<'a> {
     root: Option<&'a Path>,
     /// Set while picking a branch.
     branches: Option<&'a [crate::project::git::Branch]>,
+    /// Set while picking a code action.
+    actions: Option<&'a (Language, Vec<crate::lsp::CodeAction>)>,
 }
 
 fn palette_sources(state: &State) -> PaletteSources<'_> {
@@ -12704,13 +13278,37 @@ fn palette_sources(state: &State) -> PaletteSources<'_> {
         symbols: &state.symbols,
         root: state.tree.root(),
         branches: state.branch_list.as_deref(),
+        actions: state.action_list.as_ref(),
+    }
+}
+
+/// Which list the palette is picking from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PaletteMode {
+    /// Files, and commands and symbols by prefix.
+    Open,
+    Branch,
+    Action,
+}
+
+impl PaletteMode {
+    fn of(sources: &PaletteSources<'_>) -> PaletteMode {
+        if sources.branches.is_some() {
+            PaletteMode::Branch
+        } else if sources.actions.is_some() {
+            PaletteMode::Action
+        } else {
+            PaletteMode::Open
+        }
     }
 }
 
 /// The palette's heading and what it says when nothing matches, by mode.
-fn palette_heading(query: &str, branches: bool) -> (&'static str, &'static str) {
-    if branches {
-        return ("Switch branch, or type a new name", "No branches");
+fn palette_heading(query: &str, mode: PaletteMode) -> (&'static str, &'static str) {
+    match mode {
+        PaletteMode::Branch => return ("Switch branch, or type a new name", "No branches"),
+        PaletteMode::Action => return ("Code actions", "No matching actions"),
+        PaletteMode::Open => {}
     }
     match symbols::query(query) {
         Some((symbols::Scope::Document, _)) => ("Symbols in this file", "No matching symbols"),
@@ -12730,9 +13328,13 @@ fn palette_rows(sources: &PaletteSources<'_>, query: &str) -> Vec<(layout::Palet
         symbols: symbol_list,
         root,
         branches,
+        actions,
     } = *sources;
     if let Some(branches) = branches {
         return branch_rows(branches, query);
+    }
+    if let Some((server, actions)) = actions {
+        return action_rows(*server, actions, query);
     }
     if let Some((scope, needle)) = symbols::query(query) {
         return symbol_list
@@ -13112,6 +13714,11 @@ fn install_menu(mtm: MainThreadMarker, app: &NSApplication) {
     let format = item("Format Document", sel!(formatDocument:), "f", false);
     format.setKeyEquivalentModifierMask(NSEventModifierFlags::Shift | NSEventModifierFlags::Option);
     go_menu.addItem(&format);
+    go_menu.addItem(&item("Quick Fix\u{2026}", sel!(quickFix:), ".", false));
+    let organize = item("Organize Imports", sel!(organizeImports:), "o", false);
+    organize
+        .setKeyEquivalentModifierMask(NSEventModifierFlags::Shift | NSEventModifierFlags::Option);
+    go_menu.addItem(&organize);
     go_menu.addItem(&NSMenuItem::separatorItem(mtm));
     go_menu.addItem(&item("Go to Symbol\u{2026}", sel!(goToSymbol:), "r", false));
     go_menu.addItem(&item(
@@ -13374,6 +13981,14 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         word_wrap: crate::platform::settings::Settings::load().word_wrap,
         ssh_auth_sock: crate::platform::settings::Settings::load().ssh_auth_sock,
         branch_list: None,
+        action_list: None,
+        quick_fix_request: None,
+        organizing: None,
+        resolving: None,
+        organize_on_save: crate::platform::settings::Settings::load().organize_imports_on_save,
+        bulb: None,
+        bulb_want: None,
+        bulb_request: None,
         blame: None,
         blame_want: None,
         blame_rx: None,
