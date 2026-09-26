@@ -159,15 +159,75 @@ impl Diff {
         let mut staged = false;
         let mut active_hunk = None;
         let mut ordinal = 0;
+        // Lines still to come in the current hunk, old and new side, from
+        // its header. Inside a hunk every line is content, even one that
+        // reads `--- a comment` or `diff --git`.
+        let mut remaining = (0usize, 0usize);
+        // Prefix columns: one, or one per parent in a combined (`@@@`)
+        // diff of an unmerged path.
+        let mut columns = 1;
+        // A header without counts: the hunk ends at the first line that
+        // does not look like content.
+        let mut uncounted = false;
         for raw_line in text.split_terminator('\n') {
             // Preserve CRLF bytes for `git apply`, while the visible diff
             // remains the same text without the line terminator.
             let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
-            if let Some(rest) = line.strip_prefix("@@") {
+            if line == "… Diff preview truncated at 512 KiB." {
+                diff.truncated = true;
+                active_hunk = None;
+                remaining = (0, 0);
+                diff.push(DiffKind::Note, None, None, line);
+                continue;
+            }
+            if uncounted && !line.starts_with([' ', '+', '-', '\\']) {
+                remaining = (0, 0);
+                uncounted = false;
+            }
+            if remaining != (0, 0) {
+                let prefix: String = line.chars().take(columns).collect();
+                let body = line.get(prefix.len()..).unwrap_or("");
+                if let Some(index) = active_hunk {
+                    let hunk: &mut Hunk = &mut diff.hunks[index];
+                    hunk.raw.push_str(raw_line);
+                    hunk.raw.push('\n');
+                }
+                if line.starts_with('\\') {
+                    diff.push(DiffKind::Note, None, None, line);
+                } else if prefix.contains('-') {
+                    remaining.0 = remaining.0.saturating_sub(1);
+                    old += 1;
+                    diff.push(DiffKind::Removed, Some(old), None, body);
+                } else if prefix.contains('+') {
+                    remaining.1 = remaining.1.saturating_sub(1);
+                    new += 1;
+                    diff.push(DiffKind::Added, None, Some(new), body);
+                } else {
+                    // A space, or nothing where an editor stripped it.
+                    remaining = (
+                        remaining.0.saturating_sub(1),
+                        remaining.1.saturating_sub(1),
+                    );
+                    old += 1;
+                    new += 1;
+                    diff.push(DiffKind::Context, Some(old), Some(new), body);
+                }
+                continue;
+            }
+            if let Some(after) = line.strip_prefix("@@") {
                 // `@@ -12,7 +12,9 @@ fn name()` — the trailing text is the
-                // enclosing context git found, which is worth keeping.
-                let (counts, caption) = rest.split_once("@@").unwrap_or((rest, ""));
+                // enclosing context git found, which is worth keeping. A
+                // combined diff has one more `@` per extra parent.
+                let extra = after.len() - after.trim_start_matches('@').len();
+                let rest = &after[extra..];
+                let fence = "@".repeat(2 + extra);
+                let (counts, caption) = rest.split_once(fence.as_str()).unwrap_or((rest, ""));
+                columns = 1 + extra;
                 (old, new) = hunk_start(counts);
+                (remaining, uncounted) = match hunk_lengths(counts) {
+                    Some(lengths) => (lengths, false),
+                    None => ((usize::MAX, usize::MAX), true),
+                };
                 diff.push(DiffKind::Hunk, None, None, caption.trim());
                 let index = diff.hunks.len();
                 diff.lines.last_mut().expect("hunk line").hunk = Some(index);
@@ -207,34 +267,44 @@ impl Diff {
                 active_hunk = None;
                 continue;
             }
-            if line == "… Diff preview truncated at 512 KiB." {
-                diff.truncated = true;
-                active_hunk = None;
-            }
-            if let Some(index) = active_hunk {
+            // "\ No newline at end of file" after a hunk, "Binary files
+            // ... differ", git's own remarks.
+            if line.starts_with('\\')
+                && let Some(index) = active_hunk
+            {
                 diff.hunks[index].raw.push_str(raw_line);
                 diff.hunks[index].raw.push('\n');
             }
-            match line.as_bytes()[0] {
-                b'+' => {
-                    new += 1;
-                    diff.push(DiffKind::Added, None, Some(new), &line[1..]);
-                }
-                b'-' => {
-                    old += 1;
-                    diff.push(DiffKind::Removed, Some(old), None, &line[1..]);
-                }
-                b' ' => {
-                    old += 1;
-                    new += 1;
-                    diff.push(DiffKind::Context, Some(old), Some(new), &line[1..]);
-                }
-                // "\ No newline at end of file", "Binary files ... differ".
-                _ => diff.push(DiffKind::Note, None, None, line),
-            }
+            diff.push(DiffKind::Note, None, None, line);
         }
         diff
     }
+}
+
+/// The `-12,7 +12,9` of a hunk header, as the number of lines on each side
+/// (a missing count is one line). The old side of a combined diff is the
+/// longest of its parents.
+fn hunk_lengths(counts: &str) -> Option<(usize, usize)> {
+    let mut old = None;
+    let mut new = None;
+    for field in counts.split_whitespace() {
+        let Some(rest) = field.strip_prefix(['-', '+']) else {
+            continue;
+        };
+        let length = match rest.split_once(',') {
+            Some((start, n)) => start.parse::<usize>().and(n.parse::<usize>()).ok(),
+            None => rest.parse::<usize>().ok().map(|_| 1),
+        };
+        let Some(length) = length else {
+            continue;
+        };
+        if field.starts_with('-') {
+            old = Some(old.unwrap_or(0).max(length));
+        } else {
+            new = Some(length);
+        }
+    }
+    Some((old?, new?))
 }
 
 /// The `-12,7 +12,9` of a hunk header, as the first line number on each side.
@@ -265,6 +335,8 @@ fn command(root: &Path) -> Command {
         .arg(root)
         .args(["-c", "core.fsmonitor=false", "-c", "color.ui=false"])
         .env("GIT_OPTIONAL_LOCKS", "0")
+        // Messages are shown, not parsed, but keep them the same everywhere.
+        .env("LC_ALL", "C")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_LITERAL_PATHSPECS", "1");
     cmd
@@ -353,6 +425,27 @@ pub fn toplevel(directory: &Path) -> Result<PathBuf, String> {
 /// a new file, or a repository with no commits yet. Line endings are
 /// normalised to what the editor keeps in its rope, so a CRLF file does
 /// not read as changed on every line.
+/// The Git directories of the repository `directory` is in: its own and,
+/// for a linked worktree, the common one. Empty outside a repository.
+pub fn git_dirs(directory: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for args in [
+        &["rev-parse", "--absolute-git-dir"][..],
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"][..],
+    ] {
+        if let Ok(mut bytes) = run(directory, args) {
+            if bytes.last() == Some(&b'\n') {
+                bytes.pop();
+            }
+            let dir = PathBuf::from(std::ffi::OsString::from_vec(bytes));
+            if !dir.as_os_str().is_empty() && !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        }
+    }
+    dirs
+}
+
 pub fn head_text(root: &Path, path: &Path) -> Result<Option<String>, String> {
     let relative = path
         .strip_prefix(root)
@@ -363,20 +456,27 @@ pub fn head_text(root: &Path, path: &Path) -> Result<Option<String>, String> {
         .output()
         .map_err(|e| e.to_string())?;
     if output.status.success() {
-        let text = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+        // Line breaks as the buffer has them: CRLF and a lone CR are LF.
+        let text = String::from_utf8_lossy(&output.stdout)
+            .replace("\r\n", "\n")
+            .replace('\r', "\n");
         return Ok(Some(text));
     }
-    let error = String::from_utf8_lossy(&output.stderr);
-    if error.contains("does not exist")
-        || error.contains("exists on disk")
-        || error.contains("but not in")
-        || error.contains("Needed a single revision")
-        || error.contains("bad revision")
+    // Why it failed, from exit statuses rather than from git's wording,
+    // which changes between versions and languages. No commit yet, or no
+    // such file in it: the whole file is new.
+    let succeeds = |args: &[&str]| {
+        command(root)
+            .args(args)
+            .output()
+            .is_ok_and(|o| o.status.success())
+    };
+    if !succeeds(&["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
+        || !succeeds(&["cat-file", "-e", &spec])
     {
-        Ok(None)
-    } else {
-        Err(error.trim().to_owned())
+        return Ok(None);
     }
+    Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
 }
 
 /// What a gutter mark says about a line of the current text.
@@ -449,17 +549,21 @@ pub fn marks(diff: &Diff) -> Vec<Mark> {
 pub fn snapshot(directory: &Path) -> Result<Snapshot, String> {
     // One process for both: the top level, and the Git directory, which is
     // not `<root>/.git` in a linked worktree.
-    let located = run(
-        directory,
-        &["rev-parse", "--show-toplevel", "--absolute-git-dir"],
-    )?;
-    let mut lines = located.split(|&b| b == b'\n').filter(|l| !l.is_empty());
-    let root = PathBuf::from(std::ffi::OsString::from_vec(
-        lines.next().ok_or("Git returned no top level")?.to_vec(),
-    ));
-    let in_progress = lines
-        .next()
-        .map(|dir| PathBuf::from(std::ffi::OsString::from_vec(dir.to_vec())))
+    // One question per call: a path may itself contain a newline, so two
+    // answers on two lines cannot be told apart.
+    let answer = |args: &[&str]| -> Result<PathBuf, String> {
+        let mut bytes = run(directory, args)?;
+        if bytes.last() == Some(&b'\n') {
+            bytes.pop();
+        }
+        if bytes.is_empty() {
+            return Err("Git returned no path".into());
+        }
+        Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+    };
+    let root = answer(&["rev-parse", "--show-toplevel"])?;
+    let in_progress = answer(&["rev-parse", "--absolute-git-dir"])
+        .ok()
         .and_then(|dir| InProgress::read(&dir));
     let bytes = run(
         &root,
@@ -538,6 +642,16 @@ pub fn diff(root: &Path, change: &Change) -> Result<String, String> {
         .arg(&change.path)
         .current_dir(root);
         return diff_output(cmd, true);
+    }
+    if change.conflicted() {
+        // `git diff` of an unmerged path is a combined diff and `--cached`
+        // only says "Unmerged path". Against HEAD it is an ordinary diff of
+        // the file as it stands, markers and all.
+        let mut cmd = command(root);
+        cmd.args(["diff", "--no-ext-diff", "--no-textconv", "HEAD", "--"])
+            .arg(&change.path);
+        let preview = diff_output(cmd, false)?;
+        return Ok(format!("WORKING TREE\n\n{preview}\n"));
     }
     let mut text = String::new();
     for (staged, title) in [(true, "STAGED"), (false, "WORKING TREE")] {
@@ -1154,6 +1268,13 @@ mod tests {
             found[0].resolution(&rope, crate::project::conflict::Take::Base),
             "x = 0\n"
         );
+        // The unmerged file reads as an ordinary diff against HEAD.
+        let shown = Diff::parse(&diff(&s.root, change).unwrap());
+        assert!(shown.lines.iter().any(|l| l.kind == DiffKind::Added
+            && l.text.starts_with("<<<<<<<")));
+        assert!(shown.lines.iter().any(|l| l.kind == DiffKind::Context
+            && l.text == "x = 1"
+            && l.old == Some(2)));
 
         std::fs::write(dir.join("f.txt"), "a\nx = 2\nz\n").unwrap();
         stage(&s.root, change, true).unwrap();
@@ -1221,6 +1342,63 @@ mod tests {
         assert!(s.changes[1].unstaged());
         assert_eq!(s.changes[2].path, Path::new("-file"));
     }
+    #[test]
+    fn content_that_looks_like_a_header_is_content() {
+        // A removed `-- comment` line comes out as `--- comment`.
+        let diff = Diff::parse(concat!(
+            "diff --git a/q.sql b/q.sql\n",
+            "--- a/q.sql\n",
+            "+++ b/q.sql\n",
+            "@@ -1,3 +1,3 @@\n",
+            "--- old comment\n",
+            "+++ new comment\n",
+            " select 1;\n",
+            "-diff --git looks like a header\n",
+            "+x\n",
+        ));
+        let kinds: Vec<_> = diff.lines.iter().map(|l| (l.kind, l.old, l.new)).collect();
+        assert_eq!(
+            kinds,
+            [
+                (DiffKind::Hunk, None, None),
+                (DiffKind::Removed, Some(1), None),
+                (DiffKind::Added, None, Some(1)),
+                (DiffKind::Context, Some(2), Some(2)),
+                (DiffKind::Removed, Some(3), None),
+                (DiffKind::Added, None, Some(3)),
+            ]
+        );
+        assert_eq!(diff.lines[1].text, "-- old comment");
+        assert_eq!(diff.hunks[0].raw.lines().count(), 6, "the whole hunk");
+    }
+
+    #[test]
+    fn combined_diffs_strip_one_column_per_parent() {
+        let diff = Diff::parse(concat!(
+            "@@@ -1,2 -1,2 +1,3 @@@\n",
+            "  a\n",
+            "++<<<<<<< ours\n",
+            " -x\n",
+        ));
+        assert_eq!(diff.lines[1].text, "a");
+        assert_eq!(diff.lines[2].kind, DiffKind::Added);
+        assert_eq!(diff.lines[2].text, "<<<<<<< ours");
+        assert_eq!(diff.lines[3].kind, DiffKind::Removed);
+        assert_eq!(diff.lines[3].text, "x");
+    }
+
+    #[test]
+    fn head_text_of_a_repository_without_commits_is_a_new_file() {
+        let root = std::env::temp_dir().join(format!("caio-unborn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        run(&root, &["init", "--quiet"]).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        assert_eq!(head_text(&root, &root.join("a.txt")), Ok(None));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn diff_parsing_drops_command_headers_and_numbers_both_sides() {
         let diff = Diff::parse(concat!(

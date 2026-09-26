@@ -10892,14 +10892,14 @@ impl EditorView {
                     state.project_changed_at = Some(Instant::now());
                 }
                 crate::project::watch::Change::Git => {
-                    // The panel's own operations change the repository too;
-                    // those it already re-read. Read with the panel closed
-                    // as well: a merge in the terminal that leaves
-                    // conflicts is found here, and so are the status bar's
-                    // branch and the gutter's HEAD.
-                    if !state.git.busy() && !state.git.settled_recently() {
-                        state.git_changed_at = Some(Instant::now());
-                    }
+                    // Read with the panel closed as well: a merge in the
+                    // terminal that leaves conflicts is found here, and so
+                    // are the status bar's branch and the gutter's HEAD.
+                    // The panel's own operations land here too; re-reading
+                    // after them costs one status, which writes nothing
+                    // under .git (optional locks are off), so it cannot
+                    // come back round.
+                    state.git_changed_at = Some(Instant::now());
                 }
             }
         }
@@ -10913,14 +10913,15 @@ impl EditorView {
         let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
             return;
         };
+        // While Git is busy the change waits: it may be someone else's,
+        // arriving during the panel's own operation.
         if let Some(at) = state.git_changed_at
             && at.elapsed() >= SETTLE
+            && !state.git.busy()
         {
             state.git_changed_at = None;
             state.gutter.clear();
-            if !state.git.busy() && !state.git.settled_recently() {
-                state.git.refresh();
-            }
+            state.git.refresh();
         }
         let Some(at) = state.project_changed_at else {
             return;

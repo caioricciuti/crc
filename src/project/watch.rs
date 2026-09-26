@@ -77,6 +77,11 @@ const FLAG_NO_DEFER: u32 = 0x02;
 const FLAG_IGNORE_SELF: u32 = 0x08;
 const FLAG_FILE_EVENTS: u32 = 0x10;
 
+/// Event flags that mean "rescan": the kernel or FSEvents dropped events
+/// (a burst larger than its queue), or the watched root itself changed.
+/// The path is then the root, and no finer detail is coming.
+const RESCAN: u32 = 0x01 | 0x02 | 0x04 | 0x20;
+
 /// How long FSEvents coalesces before calling back, in seconds. A checkout
 /// touching a thousand files becomes one callback.
 const LATENCY: f64 = 0.25;
@@ -90,8 +95,13 @@ pub type OnChange = Box<dyn Fn(Change)>;
 /// a few times per session; the bytes are not worth the race.
 struct Shared {
     root: PathBuf,
+    /// The repository's Git directories: its own, and the common one of a
+    /// linked worktree. Outside `root` when the project is a subfolder of
+    /// the repository or a linked worktree, and then watched as well.
+    git_dirs: Vec<PathBuf>,
     closed: AtomicBool,
-    pending: Mutex<Option<Change>>,
+    /// Tree and Git changes since the last delivery.
+    pending: Mutex<(bool, bool)>,
     on_change: MainThreadOnly<OnChange>,
 }
 
@@ -112,10 +122,21 @@ impl Watcher {
     /// once per batch of events, with the coarsest change in the batch.
     pub fn new(root: &Path, on_change: OnChange) -> Option<Self> {
         let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let git_dirs: Vec<PathBuf> = crate::project::git::git_dirs(&root)
+            .into_iter()
+            .map(|d| std::fs::canonicalize(&d).unwrap_or(d))
+            .collect();
+        let mut watched = vec![root.clone()];
+        for dir in &git_dirs {
+            if !dir.starts_with(&root) && !watched.contains(dir) {
+                watched.push(dir.clone());
+            }
+        }
         let shared: *const Shared = Box::into_raw(Box::new(Shared {
             root: root.clone(),
+            git_dirs,
             closed: AtomicBool::new(false),
-            pending: Mutex::new(None),
+            pending: Mutex::new((false, false)),
             on_change: MainThreadOnly(on_change),
         }));
         let context = StreamContext {
@@ -125,8 +146,11 @@ impl Watcher {
             release: None,
             copy_description: None,
         };
-        let path = CFString::from_str(&root.to_string_lossy());
-        let paths: CFRetained<CFArray<CFString>> = CFArray::from_retained_objects(&[path]);
+        let names: Vec<CFRetained<CFString>> = watched
+            .iter()
+            .map(|p| CFString::from_str(&p.to_string_lossy()))
+            .collect();
+        let paths: CFRetained<CFArray<CFString>> = CFArray::from_retained_objects(&names);
         let queue = unsafe { dispatch_queue_create(c"crc.watch".as_ptr(), std::ptr::null()) };
         let stream = unsafe {
             FSEventStreamCreate(
@@ -183,7 +207,7 @@ unsafe extern "C" fn on_events(
     info: *mut c_void,
     count: usize,
     paths: *mut c_void,
-    _flags: *const u32,
+    flags: *const u32,
     _ids: *const u64,
 ) {
     let shared = unsafe { &*(info as *const Shared) };
@@ -191,31 +215,32 @@ unsafe extern "C" fn on_events(
         return;
     }
     let paths = paths as *const *const c_char;
-    let mut change = None;
+    let (mut tree, mut git) = (false, false);
     for index in 0..count {
+        if !flags.is_null() && unsafe { *flags.add(index) } & RESCAN != 0 {
+            (tree, git) = (true, true);
+            break;
+        }
         let raw = unsafe { *paths.add(index) };
         if raw.is_null() {
             continue;
         }
         let path = unsafe { CStr::from_ptr(raw) }.to_string_lossy();
-        match classify(&shared.root, Path::new(path.as_ref())) {
-            Some(Change::Tree) => {
-                change = Some(Change::Tree);
-                break;
-            }
-            Some(Change::Git) => change = Some(Change::Git),
+        match classify(&shared.root, &shared.git_dirs, Path::new(path.as_ref())) {
+            Some(Change::Tree) => tree = true,
+            Some(Change::Git) => git = true,
             None => {}
         }
+        if tree && git {
+            break;
+        }
     }
-    let Some(change) = change else {
+    if !tree && !git {
         return;
-    };
+    }
     let mut pending = shared.pending.lock().unwrap_or_else(|e| e.into_inner());
-    let already_queued = pending.is_some();
-    *pending = Some(match (*pending, change) {
-        (Some(Change::Tree), _) | (_, Change::Tree) => Change::Tree,
-        _ => Change::Git,
-    });
+    let already_queued = pending.0 || pending.1;
+    *pending = (pending.0 || tree, pending.1 || git);
     drop(pending);
     if !already_queued {
         // `info` is the never-freed shared block.
@@ -229,33 +254,47 @@ unsafe extern "C" fn deliver(info: *mut c_void) {
     if shared.closed.load(Ordering::SeqCst) {
         return;
     }
-    let change = shared
-        .pending
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take();
-    if let Some(change) = change {
-        (shared.on_change.0)(change);
+    let (tree, git) = std::mem::take(&mut *shared.pending.lock().unwrap_or_else(|e| e.into_inner()));
+    if tree {
+        (shared.on_change.0)(Change::Tree);
+    }
+    if git {
+        (shared.on_change.0)(Change::Git);
     }
 }
 
 /// What an event at `path` means for the editor, or `None` when it is in a
 /// directory the sidebar never shows anyway.
-pub fn classify(root: &Path, path: &Path) -> Option<Change> {
-    let relative = path.strip_prefix(root).unwrap_or(path);
+pub fn classify(root: &Path, git_dirs: &[PathBuf], path: &Path) -> Option<Change> {
+    // Only what changes the panel: the branch, the index, refs. Object
+    // writes and lock files churn constantly during any operation. A
+    // linked worktree keeps its HEAD and index under `worktrees/<name>`.
+    let bookkeeping = |inside: Vec<String>| {
+        let inside = match inside.first().map(String::as_str) {
+            Some("worktrees") if inside.len() > 2 => inside[2..].to_vec(),
+            _ => inside,
+        };
+        (matches!(
+            inside.first().map(String::as_str),
+            Some("HEAD" | "index" | "refs" | "packed-refs" | "ORIG_HEAD" | "MERGE_HEAD")
+        ) && !inside.last().is_some_and(|last| last.ends_with(".lock")))
+        .then_some(Change::Git)
+    };
+    let names = |p: &Path| -> Vec<String> {
+        p.components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect()
+    };
+    if let Some(inside) = git_dirs.iter().find_map(|d| path.strip_prefix(d).ok()) {
+        return bookkeeping(names(inside));
+    }
+    let relative = path.strip_prefix(root).ok()?;
     let mut components = relative
         .components()
         .map(|c| c.as_os_str().to_string_lossy());
     let first = components.next()?;
     if first == ".git" {
-        // Only what changes the panel: the branch, the index, refs. Object
-        // writes and lock files churn constantly during any operation.
-        let inside: Vec<_> = components.collect();
-        let bookkeeping = matches!(
-            inside.first().map(|s| s.as_ref()),
-            Some("HEAD") | Some("index") | Some("refs") | Some("packed-refs") | Some("ORIG_HEAD")
-        ) && !inside.last().is_some_and(|last| last.ends_with(".lock"));
-        return bookkeeping.then_some(Change::Git);
+        return bookkeeping(components.map(|c| c.into_owned()).collect());
     }
     let noisy = ["target", "node_modules", "vendor", ".DS_Store"];
     if noisy.contains(&first.as_ref()) {
@@ -280,31 +319,55 @@ mod tests {
     fn classifies_tree_git_and_noise() {
         let root = Path::new("/p");
         assert_eq!(
-            classify(root, Path::new("/p/src/main.rs")),
+            classify(root, &[], Path::new("/p/src/main.rs")),
             Some(Change::Tree)
         );
-        assert_eq!(classify(root, Path::new("/p/.env")), Some(Change::Tree));
-        assert_eq!(classify(root, Path::new("/p/.git/HEAD")), Some(Change::Git));
+        assert_eq!(classify(root, &[], Path::new("/p/.env")), Some(Change::Tree));
+        assert_eq!(classify(root, &[], Path::new("/p/.git/HEAD")), Some(Change::Git));
         assert_eq!(
-            classify(root, Path::new("/p/.git/index")),
+            classify(root, &[], Path::new("/p/.git/index")),
             Some(Change::Git)
         );
         assert_eq!(
-            classify(root, Path::new("/p/.git/refs/heads/main")),
+            classify(root, &[], Path::new("/p/.git/refs/heads/main")),
             Some(Change::Git)
         );
-        assert_eq!(classify(root, Path::new("/p/.git/index.lock")), None);
-        assert_eq!(classify(root, Path::new("/p/.git/objects/ab/cd")), None);
+        assert_eq!(classify(root, &[], Path::new("/p/.git/index.lock")), None);
+        assert_eq!(classify(root, &[], Path::new("/p/.git/objects/ab/cd")), None);
         assert_eq!(
-            classify(root, Path::new("/p/node_modules/x/index.js")),
+            classify(root, &[], Path::new("/p/node_modules/x/index.js")),
             None
         );
-        assert_eq!(classify(root, Path::new("/p/target/debug/app")), None);
-        assert_eq!(classify(root, Path::new("/p/src/.crc-1-2-3.tmp")), None);
+        assert_eq!(classify(root, &[], Path::new("/p/target/debug/app")), None);
+        assert_eq!(classify(root, &[], Path::new("/p/src/.crc-1-2-3.tmp")), None);
         assert_eq!(
-            classify(root, Path::new("/p")),
+            classify(root, &[], Path::new("/p")),
             None,
             "the root itself is nothing"
+        );
+    }
+
+    #[test]
+    fn git_directories_outside_the_project_are_bookkeeping_too() {
+        // A subfolder of a repository, and a linked worktree.
+        let root = Path::new("/repo/app");
+        let dirs = [PathBuf::from("/repo/.git")];
+        assert_eq!(classify(root, &dirs, Path::new("/repo/.git/HEAD")), Some(Change::Git));
+        assert_eq!(classify(root, &dirs, Path::new("/repo/.git/objects/ab")), None);
+        assert_eq!(classify(root, &dirs, Path::new("/repo/app/x.rs")), Some(Change::Tree));
+        assert_eq!(classify(root, &dirs, Path::new("/repo/other/y.rs")), None);
+        let dirs = [
+            PathBuf::from("/main/.git/worktrees/wt"),
+            PathBuf::from("/main/.git"),
+        ];
+        let root = Path::new("/wt");
+        assert_eq!(
+            classify(root, &dirs, Path::new("/main/.git/worktrees/wt/index")),
+            Some(Change::Git)
+        );
+        assert_eq!(
+            classify(root, &dirs, Path::new("/main/.git/refs/heads/topic")),
+            Some(Change::Git)
         );
     }
 

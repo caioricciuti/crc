@@ -58,7 +58,8 @@ pub struct Panel {
     announces: bool,
     /// A path to mark resolved once the worker is free: Mark Resolved saves
     /// first, and the save starts a refresh of its own.
-    resolve_queued: Option<PathBuf>,
+    /// Files marked resolved while Git was busy, added in order after.
+    resolve_queued: std::collections::VecDeque<PathBuf>,
     /// A change clicked while Git was busy, shown once it is done.
     select_queued: Option<PathBuf>,
     /// Counts the worker's answers, so a view derived from the snapshot
@@ -211,20 +212,13 @@ impl Panel {
             finished_at: None,
             announcement: None,
             announces: false,
-            resolve_queued: None,
+            resolve_queued: Default::default(),
             select_queued: None,
             generation: 0,
         };
         panel.refresh();
         panel
     }
-    /// Whether the worker answered within the last moment, which is when
-    /// a repository change on disk is the panel's own doing.
-    pub fn settled_recently(&self) -> bool {
-        self.finished_at
-            .is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(1500))
-    }
-
     /// How many times the worker has answered.
     pub fn generation(&self) -> u64 {
         self.generation
@@ -236,7 +230,7 @@ impl Panel {
     pub fn branch(&self) -> String {
         self.snapshot
             .as_ref()
-            .map(|s| s.branch.split("...").next().unwrap_or(&s.branch).to_owned())
+            .map(|s| branch_name(&s.branch))
             .unwrap_or_else(|| "Git".into())
     }
     /// The branch and how far it is from its upstream: `main ↑2 ↓1`.
@@ -286,7 +280,9 @@ impl Panel {
     /// or as soon as the operation in flight finishes.
     pub fn mark_resolved(&mut self, path: PathBuf) {
         if self.busy() {
-            self.resolve_queued = Some(path);
+            if !self.resolve_queued.contains(&path) {
+                self.resolve_queued.push_back(path);
+            }
             return;
         }
         match self.conflicted_change(&path).cloned() {
@@ -705,10 +701,16 @@ impl Panel {
                 });
             }
             Err(error) => {
+                // A menu-driven Fetch or Switch that failed before its
+                // command ran is said in the status line too, where it can
+                // be seen with the panel closed.
+                if self.announces {
+                    self.announcement = Some(error.clone());
+                }
                 self.note = error;
             }
         }
-        if let Some(path) = self.resolve_queued.take() {
+        if let Some(path) = self.resolve_queued.pop_front() {
             self.mark_resolved(path);
         } else if let Some(path) = self.select_queued.take() {
             self.start(Operation::Select(path));
@@ -1220,6 +1222,21 @@ pub fn draw_diff_lines(
     }
 }
 
+/// The branch from the status header: `main` from `main...origin/main
+/// [ahead 1]`, `No commits yet on main` or `Initial commit on main`, and
+/// `detached HEAD` for `HEAD (no branch)`.
+fn branch_name(header: &str) -> String {
+    let header = header
+        .strip_prefix("No commits yet on ")
+        .or_else(|| header.strip_prefix("Initial commit on "))
+        .unwrap_or(header);
+    if header.starts_with("HEAD (no branch)") {
+        return "detached HEAD".into();
+    }
+    let name = header.split("...").next().unwrap_or(header);
+    name.split(" [").next().unwrap_or(name).to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1256,10 +1273,18 @@ mod tests {
             finished_at: None,
             announcement: None,
             announces: false,
-            resolve_queued: None,
+            resolve_queued: Default::default(),
             select_queued: None,
             generation: 0,
         }
+    }
+
+    #[test]
+    fn branch_names_read_plainly() {
+        assert_eq!(branch_name("main...origin/main [ahead 2]"), "main");
+        assert_eq!(branch_name("topic"), "topic");
+        assert_eq!(branch_name("No commits yet on main"), "main");
+        assert_eq!(branch_name("HEAD (no branch)"), "detached HEAD");
     }
 
     #[test]
