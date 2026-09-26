@@ -944,10 +944,15 @@ pub fn draw_side(
 mod tests {
     use super::*;
 
+    /// A buffer on a file of its own. The name was the text's length, so
+    /// two tests with the same text wrote one file at once, and one could
+    /// read it truncated, empty, mid-write: a flake under parallel load.
     fn buffer(text: &str) -> Buffer {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!("crc-conflicts-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(format!("f{}.txt", text.len()));
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = dir.join(format!("f{n}.txt"));
         std::fs::write(&path, text).unwrap();
         Buffer::open(path).unwrap()
     }
