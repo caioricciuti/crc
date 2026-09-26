@@ -1,0 +1,78 @@
+---
+title: Extensions
+description: Install extensions that can only do what they declare, from the signed registry or a folder.
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+An extension adds commands to crc. It is WebAssembly, run by crc's own
+interpreter in a sandbox, and it can do only what its manifest declares and
+you agreed to at install. No extension can read your files, reach the
+network or start programs. How and why is in the
+[extensions design](/extensions/).
+
+## The Extensions page
+
+**Extensions > Extensions…** (<kbd>⌘</kbd><kbd>⇧</kbd><kbd>X</kbd>) opens
+the page in the editor column. It lists what is installed and what the
+official registry offers; pick one to see what it does, what it may touch,
+its commands and its README. <kbd>Esc</kbd> or a tab closes the page.
+
+- **Install** shows exactly what the extension will be able to do and waits
+  for your yes.
+- **Disable** keeps it installed with its commands gone; **Enable** brings
+  them back.
+- **Uninstall** removes it.
+- **Update** appears when the registry has a newer version. Updates are
+  never installed on their own.
+
+<Aside type="caution" title="The registry is not live yet">
+  The official registry opens with its first signed release. Until then the
+  page says the registry is unavailable, and extensions install from a
+  folder.
+</Aside>
+
+## Running commands
+
+An extension's commands are in the **Extensions** menu and in the palette
+(<kbd>⌘</kbd><kbd>P</kbd>, then `>`). A command works on the selection, or
+on the whole document when nothing is selected, if the extension may read
+it. The result replaces the text as one undo step, and only if the document
+has not changed while the extension ran. A command that runs too long is
+stopped.
+
+## What an extension may do
+
+| Capability | Lets it |
+|---|---|
+| Read the selected text | see the selection |
+| Replace the selected text | change the selection |
+| Read the whole document | see the whole document |
+| Replace the whole document | change the whole document |
+
+That is the whole list today. There is no capability for files, the network
+or other programs.
+
+## Signed and unsigned
+
+Extensions from the official registry are built from source in CI and
+signed; crc checks the signature against a key built into the app before
+trusting the list, and each module's checksum before installing it.
+
+**Install from Folder…** installs an extension you have on disk: one you
+are writing, or one published somewhere else. It is unsigned, crc says so
+before installing, and the page marks it.
+
+## Official extensions
+
+| Extension | Commands | May |
+|---|---|---|
+| Sort Lines | Sort Lines, Sort Lines Descending, Remove Duplicate Lines | read and replace the selection or the document |
+
+The source is in [crc-extensions](https://github.com/caioricciuti/crc-extensions).
+To make your own, see [Writing an extension](/docs/features/writing-extensions/).
+
+## Where they live
+
+`~/Library/Application Support/crc/extensions/`, one folder per extension.
+Never inside a project, so cloning a repository cannot install code.

@@ -70,10 +70,33 @@ mod tests {
 
     #[test]
     fn capabilities_decide_what_goes_in_and_comes_out() {
-        let mut ext = sort_lines();
-        // Sort Lines has selection.* only: no whole document.
+        // Sort Lines with only the selection capabilities: no whole
+        // document goes in.
+        let package = super::store::Package::from_folder(&fixture()).unwrap();
+        let mut manifest = package.manifest.clone();
+        manifest.capabilities.retain(|c| {
+            matches!(
+                c,
+                super::manifest::Capability::SelectionRead
+                    | super::manifest::Capability::SelectionReplace
+            )
+        });
+        let mut ext = load(manifest, &package.wasm).unwrap();
         let error = ext.run(&request("sort", "b\na\n", false)).unwrap_err();
         assert_eq!(error, "Sort Lines may not read the whole document");
+        // Read but not replace: the answer's text is dropped.
+        let mut manifest = package.manifest.clone();
+        manifest
+            .capabilities
+            .retain(|c| *c != super::manifest::Capability::DocumentEdit);
+        let mut ext = load(manifest, &package.wasm).unwrap();
+        let out = ext.run(&request("sort", "b\na\n", false)).unwrap();
+        assert_eq!(out.replace, None);
+        assert_eq!(
+            out.message.as_deref(),
+            Some("Sort Lines may not change the text")
+        );
+        let mut ext = sort_lines();
         let error = ext.run(&request("nope", "x", true)).unwrap_err();
         assert!(error.contains("no command nope"), "{error}");
     }

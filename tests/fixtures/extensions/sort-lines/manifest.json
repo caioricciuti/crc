@@ -7,7 +7,7 @@
   "license": "MIT OR Apache-2.0",
   "api": 1,
   "entry": "sort_lines.wasm",
-  "capabilities": ["selection.read", "selection.replace"],
+  "capabilities": ["selection.read", "selection.replace", "document.read", "document.edit"],
   "commands": [
     { "id": "sort", "title": "Sort Lines" },
     { "id": "sort_reverse", "title": "Sort Lines Descending" },

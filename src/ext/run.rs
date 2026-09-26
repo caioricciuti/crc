@@ -175,6 +175,9 @@ pub struct Job {
     pub tag: u64,
     pub manifest: Manifest,
     pub wasm: std::path::PathBuf,
+    /// What is installed, as a number that changes with it: a new one
+    /// drops every loaded instance, so a reinstall is picked up.
+    pub generation: u64,
     pub request: Request,
 }
 
@@ -194,7 +197,12 @@ pub fn spawn(wake: Box<dyn Fn() + Send>) -> (mpsc::Sender<Job>, mpsc::Receiver<D
         .name("crc-extensions".into())
         .spawn(move || {
             let mut loaded: HashMap<(String, String), Loaded> = HashMap::new();
+            let mut generation = 0;
             for job in inbox {
+                if job.generation != generation {
+                    loaded.clear();
+                    generation = job.generation;
+                }
                 let key = (job.manifest.id.clone(), job.manifest.version.clone());
                 let id = job.manifest.id.clone();
                 if !loaded.contains_key(&key) {

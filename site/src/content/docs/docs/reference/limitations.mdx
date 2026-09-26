@@ -60,6 +60,7 @@ import { Aside } from "@astrojs/starlight/components";
 - **Updates are announced, not installed.** Once a day crc asks GitHub whether
   a newer release exists and says so in the status line. Nothing is
   downloaded. `update_check = false` turns the check off.
-- **No extensions.** Extensions as WASM with declared capabilities is one of
-  [the project's bets](/vision/), and not built yet. The
-  [design](/extensions/) says how they will work.
+- **Extensions are new and narrow.** They can read and replace the
+  selection or the document and add commands; nothing else yet. The signed
+  registry is not live until its first release, so for now they install from
+  a folder. See [Extensions](/docs/features/extensions/).

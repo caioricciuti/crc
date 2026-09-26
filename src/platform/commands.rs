@@ -24,6 +24,8 @@ pub struct Command {
     pub keywords: &'static str,
     /// The menu item's action, sent the way the menu would send it.
     pub action: Sel,
+    /// The menu item's tag: which extension command, for those.
+    pub tag: isize,
 }
 
 /// Words people type for a command whose menu title says something else.
@@ -87,6 +89,7 @@ pub fn from_menu(mtm: MainThreadMarker, enabled: impl Fn(&NSMenuItem) -> bool) -
                 ),
                 keywords: keywords(action),
                 action,
+                tag: item.tag(),
             });
         }
     }
@@ -185,6 +188,7 @@ mod tests {
             shortcut: String::new(),
             keywords,
             action: sel!(copy:),
+            tag: 0,
         }
     }
 

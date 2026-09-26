@@ -263,6 +263,23 @@ impl CompletionPopup {
     }
 }
 
+/// An extension command the Extensions menu and the palette offer.
+#[derive(Clone)]
+struct ExtCommand {
+    installed: crate::ext::store::Installed,
+    command: String,
+    title: String,
+}
+
+/// An extension call waiting for its answer: where its text came from, and
+/// the whole document then, so a changed document is left alone.
+struct ExtCall {
+    buffer: u64,
+    range: std::ops::Range<usize>,
+    snapshot: crate::text::rope::Rope,
+    title: String,
+}
+
 /// Organize Imports waiting on the server: the request, the document and
 /// its text when asked, and whether a save asked.
 struct Organizing {
@@ -520,6 +537,26 @@ struct State {
     resolving: Option<bool>,
     /// `organize_imports_on_save` from the settings.
     organize_on_save: bool,
+    /// The Extensions page, when it has the editor column.
+    extensions: Option<crate::platform::extensions::Page>,
+    /// The registry list being fetched, and a download being installed.
+    ext_registry_rx: Option<mpsc::Receiver<Result<Vec<crate::ext::registry::Entry>, String>>>,
+    ext_install_rx: Option<mpsc::Receiver<Result<crate::ext::store::Package, String>>>,
+    /// The extension thread, started on the first command.
+    ext_worker: Option<(
+        mpsc::Sender<crate::ext::run::Job>,
+        mpsc::Receiver<crate::ext::run::Done>,
+    )>,
+    /// Extension commands by menu tag.
+    ext_commands: Vec<ExtCommand>,
+    /// Calls in flight, by job tag.
+    ext_pending: HashMap<u64, ExtCall>,
+    ext_next_job: u64,
+    /// Bumped whenever what is installed changes, so the extension thread
+    /// drops instances of what was replaced.
+    ext_generation: u64,
+    /// Recent log lines per extension.
+    ext_logs: HashMap<String, Vec<String>>,
     /// The code actions at the caret, asked for when it rested there.
     bulb: Option<Bulb>,
     /// The caret's document and offset, and since when, so the bulb is
@@ -1023,6 +1060,23 @@ define_class!(
             // A press only starts a text selection if it lands in the text.
             self.ivars().state.borrow_mut().selecting = None;
 
+            // The Extensions page owns the editor column while it is open.
+            let page_action = {
+                let state = self.ivars().state.borrow();
+                match &state.extensions {
+                    Some(page) if state.palette.is_none() && chrome.text.contains(x, y) => {
+                        Some(page.hit(x, y))
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(action) = page_action {
+                if let Some(action) = action {
+                    self.extensions_action(action);
+                }
+                return;
+            }
+
             // The scrollbar thumb, before anything that treats a press in
             // the text as a caret placement. A press on the track outside
             // the thumb brings the thumb to the pointer.
@@ -1225,6 +1279,7 @@ define_class!(
                     return;
                 }
                 Some(Hit::Tab(index)) => {
+                    self.ivars().state.borrow_mut().extensions = None;
                     self.ivars().state.borrow_mut().tab_drag = Some(index);
                     self.tab_click(x);
                     return;
@@ -1898,6 +1953,7 @@ define_class!(
             self.gutter_refresh();
             self.blame_refresh();
             self.bulb_refresh();
+            self.ext_poll();
             self.claude_flush_selection();
             {
                 // The link fires on any run-loop iteration, nested modal
@@ -1916,7 +1972,7 @@ define_class!(
                     state.message = None;
                     self.ivars().needs_redraw.set(true);
                 }
-                if !self.ivars().needs_redraw.get() && state.message.is_none() && !state.git.busy() && state.drag_point.is_none() && state.project_search_rx.is_none() && state.project_index_rx.is_none() && state.http.is_none() && state.project_changed_at.is_none() && state.git_changed_at.is_none() && state.lsp_dirty.is_empty() && state.gutter_dirty.is_empty() && state.gutter_pending.is_empty() && state.tree_children_pending.is_empty() && state.claude.as_ref().is_none_or(|c| c.selection_changed_at.is_none()) && state.update.is_none() && state.ignored_rx.is_none() && state.blame_rx.is_none() && state.blame_want.is_none() && state.bulb_want.is_none() {
+                if !self.ivars().needs_redraw.get() && state.message.is_none() && !state.git.busy() && state.drag_point.is_none() && state.project_search_rx.is_none() && state.project_index_rx.is_none() && state.http.is_none() && state.project_changed_at.is_none() && state.git_changed_at.is_none() && state.lsp_dirty.is_empty() && state.gutter_dirty.is_empty() && state.gutter_pending.is_empty() && state.tree_children_pending.is_empty() && state.claude.as_ref().is_none_or(|c| c.selection_changed_at.is_none()) && state.update.is_none() && state.ignored_rx.is_none() && state.blame_rx.is_none() && state.blame_want.is_none() && state.bulb_want.is_none() && state.ext_registry_rx.is_none() && state.ext_install_rx.is_none() && state.ext_pending.is_empty() {
                     link.setPaused(true);
                     return;
                 }
@@ -2226,6 +2282,19 @@ define_class!(
         #[unsafe(method(formatDocument:))]
         fn action_format_document(&self, _sender: Option<&AnyObject>) {
             self.format_document(false);
+        }
+
+        #[unsafe(method(openExtensions:))]
+        fn action_open_extensions(&self, _sender: Option<&AnyObject>) {
+            self.open_extensions();
+        }
+
+        #[unsafe(method(runExtensionCommand:))]
+        fn action_run_extension_command(&self, sender: Option<&AnyObject>) {
+            let tag = sender
+                .and_then(|s| s.downcast_ref::<NSMenuItem>())
+                .map_or(-1, |item| item.tag());
+            self.run_extension(tag);
         }
 
         #[unsafe(method(quickFix:))]
@@ -3770,6 +3839,29 @@ impl EditorView {
         if self.ivars().state.borrow().git_open {
             return self.handle_git_key(event);
         }
+        // The Extensions page has the column: Escape leaves its
+        // confirmation, then the page; nothing types into the document
+        // underneath. The palette, opened over it, keeps its own keys.
+        if self.ivars().state.borrow().extensions.is_some()
+            && self.ivars().state.borrow().palette.is_none()
+            && !event
+                .modifierFlags()
+                .contains(NSEventModifierFlags::Command)
+        {
+            const ESCAPE: u16 = 53;
+            if event.keyCode() == ESCAPE {
+                let confirming = {
+                    let mut state = self.ivars().state.borrow_mut();
+                    let page = state.extensions.as_mut();
+                    page.is_some_and(|p| p.confirm.take().is_some())
+                };
+                if !confirming {
+                    self.ivars().state.borrow_mut().extensions = None;
+                }
+                self.request_redraw();
+            }
+            return true;
+        }
         const ESCAPE_KEY: u16 = 53;
         if event.keyCode() == ESCAPE_KEY {
             let state = self.ivars().state.borrow();
@@ -4180,7 +4272,10 @@ impl EditorView {
             Step::ClickNamed { name, count } => {
                 let target = {
                     let mut state = self.ivars().state.borrow_mut();
-                    frame_of(&mut state).named(name)
+                    match state.extensions.as_ref() {
+                        Some(page) if name.starts_with("extensions.") => page.named(name),
+                        _ => frame_of(&mut state).named(name),
+                    }
                 };
                 let Some(rect) = target else {
                     eprintln!("selftest: no region named {name} in this frame");
@@ -4445,8 +4540,43 @@ impl EditorView {
                 );
                 let report = format!(
                     // First: the report ends with the document's text.
-                    "message: {}\nbulb: {}\nactions: {}\nbranch: {}\nconflicts: {}\ngit_conflicts: {}\nblame: {}\nfind_results: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\n{report}",
+                    "message: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nconflicts: {}\ngit_conflicts: {}\nblame: {}\nfind_results: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\n{report}",
                     state.message.as_ref().map_or("", |(text, _)| text.as_str()),
+                    state.extensions.as_ref().map_or("closed".to_string(), |page| {
+                        use crate::platform::extensions::Registry;
+                        format!(
+                            "open selected={} installed={} registry={} confirm={} busy={} note={}",
+                            page.selected.as_deref().unwrap_or("-"),
+                            page.installed
+                                .iter()
+                                .map(|i| format!(
+                                    "{}:{}:{}:{}",
+                                    i.manifest.id,
+                                    i.manifest.version,
+                                    if i.enabled { "on" } else { "off" },
+                                    if i.signed { "signed" } else { "unsigned" }
+                                ))
+                                .collect::<Vec<_>>()
+                                .join(","),
+                            match &page.registry {
+                                Registry::Loading => "loading".to_string(),
+                                Registry::Ready(e) => format!(
+                                    "ready:{}",
+                                    e.iter().map(|e| e.manifest.id.as_str()).collect::<Vec<_>>().join(",")
+                                ),
+                                Registry::Failed(why) => format!("failed:{why}"),
+                            },
+                            page.confirm.as_ref().map_or("-", |c| c.manifest().id.as_str()),
+                            page.busy.as_deref().unwrap_or("-"),
+                            page.note.as_deref().unwrap_or("-"),
+                        )
+                    }),
+                    state
+                        .ext_commands
+                        .iter()
+                        .map(|c| c.title.as_str())
+                        .collect::<Vec<_>>()
+                        .join("|"),
                     state.bulb.as_ref().map_or("none".to_string(), |b| format!(
                         "{} at {}",
                         b.actions.iter().filter(|a| a.disabled.is_none()).count(),
@@ -6065,9 +6195,9 @@ impl EditorView {
         } else if let Some(Pick::Symbol(path, line)) = chosen {
             self.close_palette();
             self.go_to_symbol(path, line);
-        } else if let Some(Pick::Command(at)) = chosen {
+        } else if let Some(Pick::Command(at, tag)) = chosen {
             self.close_palette();
-            self.run_command(at);
+            self.run_command(at, tag);
         } else if let Some(Pick::File(path)) = chosen {
             self.close_palette();
             self.load_path(&path.to_string_lossy());
@@ -6083,7 +6213,13 @@ impl EditorView {
     /// it handles it, otherwise down the responder chain to the window and
     /// the app. The editor first, because it is where the palette lives
     /// whether or not its window is key.
-    fn run_command(&self, action: Sel) {
+    fn run_command(&self, action: Sel, tag: isize) {
+        // The palette has no menu item to send: an extension command is
+        // told by its tag.
+        if action == sel!(runExtensionCommand:) {
+            self.run_extension(tag);
+            return;
+        }
         let handles: bool = unsafe { msg_send![self, respondsToSelector: action] };
         if handles {
             let _: () =
@@ -6196,8 +6332,8 @@ impl EditorView {
                     self.switch_branch(name, true);
                 } else if let Some(Pick::Symbol(path, line)) = chosen {
                     self.go_to_symbol(path, line);
-                } else if let Some(Pick::Command(at)) = chosen {
-                    self.run_command(at);
+                } else if let Some(Pick::Command(at, tag)) = chosen {
+                    self.run_command(at, tag);
                 } else if let Some(Pick::File(path)) = chosen {
                     self.load_path(&path.to_string_lossy());
                     self.ivars().state.borrow_mut().title_sync_pending = true;
@@ -8608,6 +8744,428 @@ impl EditorView {
         }
     }
 
+    /// crc > Extensions…: the page, with what is installed now and the
+    /// registry being fetched.
+    fn open_extensions(&self) {
+        let installed = crate::ext::store::list();
+        {
+            let mut state = self.ivars().state.borrow_mut();
+            let mut page = crate::platform::extensions::Page::new(installed);
+            page.logs = state.ext_logs.clone();
+            state.extensions = Some(page);
+            state.palette = None;
+            state.completion = None;
+        }
+        self.refresh_registry();
+        self.request_redraw();
+        self.pump();
+    }
+
+    fn refresh_registry(&self) {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::ext::registry::fetch_index());
+        });
+        let mut state = self.ivars().state.borrow_mut();
+        state.ext_registry_rx = Some(rx);
+        if let Some(page) = &mut state.extensions {
+            page.registry = crate::platform::extensions::Registry::Loading;
+        }
+        drop(state);
+        self.resume_display_link();
+    }
+
+    /// After anything that changes what is installed: the page's list, the
+    /// Extensions menu, and the extension thread's loaded instances.
+    fn extensions_changed(&self) {
+        let installed = crate::ext::store::list();
+        {
+            let mut state = self.ivars().state.borrow_mut();
+            state.ext_generation += 1;
+            if let Some(page) = &mut state.extensions {
+                if page.selected.as_ref().is_some_and(|id| {
+                    !installed.iter().any(|i| &i.manifest.id == id) && page.available(id).is_none()
+                }) {
+                    page.selected = installed.first().map(|i| i.manifest.id.clone());
+                }
+                page.installed = installed;
+            }
+        }
+        self.rebuild_extension_menu();
+    }
+
+    fn extensions_action(&self, action: crate::platform::extensions::Action) {
+        use crate::platform::extensions::{Action, Pending};
+        match action {
+            Action::Select(id) => {
+                let mut state = self.ivars().state.borrow_mut();
+                if let Some(page) = &mut state.extensions {
+                    page.selected = Some(id);
+                    page.confirm = None;
+                }
+            }
+            Action::Install(id) => {
+                let mut state = self.ivars().state.borrow_mut();
+                if let Some(page) = &mut state.extensions
+                    && let Some(entry) = page.available(&id).cloned()
+                {
+                    page.selected = Some(id);
+                    page.confirm = Some(Pending::Registry(Box::new(entry)));
+                }
+            }
+            Action::Cancel => {
+                let mut state = self.ivars().state.borrow_mut();
+                if let Some(page) = &mut state.extensions {
+                    page.confirm = None;
+                }
+            }
+            Action::Confirm => {
+                let pending = {
+                    let mut state = self.ivars().state.borrow_mut();
+                    state.extensions.as_mut().and_then(|p| p.confirm.take())
+                };
+                match pending {
+                    Some(Pending::Registry(entry)) => {
+                        let name = entry.manifest.name.clone();
+                        let (tx, rx) = mpsc::channel();
+                        std::thread::spawn(move || {
+                            let _ = tx.send(crate::ext::registry::download(&entry));
+                        });
+                        let mut state = self.ivars().state.borrow_mut();
+                        state.ext_install_rx = Some(rx);
+                        if let Some(page) = &mut state.extensions {
+                            page.busy = Some(format!("Installing {name}\u{2026}"));
+                        }
+                        drop(state);
+                        self.resume_display_link();
+                    }
+                    Some(Pending::Folder(package)) => self.finish_install(Ok(*package)),
+                    None => {}
+                }
+            }
+            Action::Uninstall(id) => {
+                let installed = self
+                    .ivars()
+                    .state
+                    .borrow()
+                    .extensions
+                    .as_ref()
+                    .and_then(|p| p.installed(&id).cloned());
+                if let Some(installed) = installed {
+                    let note = match crate::ext::store::uninstall(&installed) {
+                        Ok(()) => format!("Removed {}", installed.manifest.name),
+                        Err(e) => e,
+                    };
+                    self.extensions_changed();
+                    let mut state = self.ivars().state.borrow_mut();
+                    if let Some(page) = &mut state.extensions {
+                        page.note = Some(note);
+                    }
+                }
+            }
+            Action::Toggle(id) => {
+                let installed = self
+                    .ivars()
+                    .state
+                    .borrow()
+                    .extensions
+                    .as_ref()
+                    .and_then(|p| p.installed(&id).cloned());
+                if let Some(installed) = installed {
+                    let on = !installed.enabled;
+                    let note = match crate::ext::store::set_enabled(&installed, on) {
+                        Ok(()) => format!(
+                            "{} is {}",
+                            installed.manifest.name,
+                            if on { "on" } else { "off" }
+                        ),
+                        Err(e) => e,
+                    };
+                    self.extensions_changed();
+                    let mut state = self.ivars().state.borrow_mut();
+                    if let Some(page) = &mut state.extensions {
+                        page.note = Some(note);
+                    }
+                }
+            }
+            Action::InstallFolder => {
+                let folder = self.choose_extension_folder();
+                if let Some(folder) = folder {
+                    let result = crate::ext::store::Package::from_folder(&folder);
+                    let mut state = self.ivars().state.borrow_mut();
+                    if let Some(page) = &mut state.extensions {
+                        match result {
+                            Ok(package) => {
+                                page.selected = Some(package.manifest.id.clone());
+                                page.confirm = Some(Pending::Folder(Box::new(package)));
+                            }
+                            Err(e) => page.note = Some(format!("Not installed: {e}")),
+                        }
+                    }
+                }
+            }
+            Action::Refresh => self.refresh_registry(),
+        }
+        self.request_redraw();
+        self.pump();
+    }
+
+    /// The folder to install from. A test instance never shows the panel:
+    /// `CRC_EXT_FOLDER` names it instead.
+    fn choose_extension_folder(&self) -> Option<std::path::PathBuf> {
+        if self.ivars().testing {
+            return std::env::var_os("CRC_EXT_FOLDER").map(Into::into);
+        }
+        let mtm = MainThreadMarker::from(self);
+        let panel = NSOpenPanel::openPanel(mtm);
+        panel.setCanChooseFiles(false);
+        panel.setCanChooseDirectories(true);
+        panel.setAllowsMultipleSelection(false);
+        panel.setMessage(Some(&NSString::from_str(
+            "Choose a folder with manifest.json, README.md and the extension's .wasm",
+        )));
+        const MODAL_RESPONSE_OK: isize = 1;
+        if panel.runModal() != MODAL_RESPONSE_OK {
+            return None;
+        }
+        Some(panel.URL()?.path()?.to_string().into())
+    }
+
+    fn finish_install(&self, result: Result<crate::ext::store::Package, String>) {
+        let note = match result.and_then(|p| crate::ext::store::install(&p)) {
+            Ok(installed) => {
+                let id = installed.manifest.id.clone();
+                let note = format!(
+                    "Installed {} {}{}",
+                    installed.manifest.name,
+                    installed.manifest.version,
+                    if installed.signed { "" } else { ", unsigned" }
+                );
+                self.extensions_changed();
+                let mut state = self.ivars().state.borrow_mut();
+                if let Some(page) = &mut state.extensions {
+                    page.selected = Some(id);
+                }
+                drop(state);
+                note
+            }
+            Err(e) => format!("Not installed: {e}"),
+        };
+        let mut state = self.ivars().state.borrow_mut();
+        if let Some(page) = &mut state.extensions {
+            page.busy = None;
+            page.note = Some(note.clone());
+        } else {
+            state.message = Some((note, Instant::now()));
+        }
+    }
+
+    /// The Extensions menu: its first two items, then every enabled
+    /// extension's commands. The palette reads them from here.
+    fn rebuild_extension_menu(&self) {
+        let installed = crate::ext::store::list();
+        let mut commands = Vec::new();
+        for i in installed.iter().filter(|i| i.enabled) {
+            for c in &i.manifest.commands {
+                commands.push(ExtCommand {
+                    installed: i.clone(),
+                    command: c.id.clone(),
+                    title: c.title.clone(),
+                });
+            }
+        }
+        let mtm = MainThreadMarker::from(self);
+        // Top-level holders have no title of their own; the submenu does.
+        let menu = NSApplication::sharedApplication(mtm)
+            .mainMenu()
+            .and_then(|bar| {
+                (0..bar.numberOfItems())
+                    .filter_map(|i| bar.itemAtIndex(i).and_then(|item| item.submenu()))
+                    .find(|menu| menu.title().to_string() == "Extensions")
+            });
+        if let Some(menu) = menu {
+            while menu.numberOfItems() > 2 {
+                menu.removeItemAtIndex(2);
+            }
+            for (tag, command) in commands.iter().enumerate() {
+                let item = menu_item(mtm, &command.title, sel!(runExtensionCommand:));
+                item.setTag(tag as isize);
+                menu.addItem(&item);
+            }
+        }
+        self.ivars().state.borrow_mut().ext_commands = commands;
+    }
+
+    /// Runs extension command `tag` on the selection, or the whole document
+    /// when nothing is selected, on the extension thread.
+    fn run_extension(&self, tag: isize) {
+        let mut state = self.ivars().state.borrow_mut();
+        let Some(command) = usize::try_from(tag)
+            .ok()
+            .and_then(|t| state.ext_commands.get(t))
+            .cloned()
+        else {
+            return;
+        };
+        let buffer = state.docs.active();
+        let selection = buffer.selection();
+        let range = selection.clone().unwrap_or(0..buffer.rope.len_bytes());
+        let manifest = &command.installed.manifest;
+        if !manifest.may_read(selection.is_some()) {
+            state.message = Some((
+                if selection.is_none() {
+                    format!("{}: select some text first", command.title)
+                } else {
+                    format!("{} does not work on a selection", manifest.name)
+                },
+                Instant::now(),
+            ));
+            drop(state);
+            self.request_redraw();
+            return;
+        }
+        let request = crate::ext::run::Request {
+            command: command.command.clone(),
+            text: buffer.rope.slice_to_string(range.clone()),
+            selection: selection.is_some(),
+            language: buffer
+                .extension()
+                .and_then(|e| Language::from_extension(&e))
+                .map(|l| format!("{l:?}").to_lowercase())
+                .unwrap_or_else(|| "text".into()),
+        };
+        let call = ExtCall {
+            buffer: buffer.id(),
+            range,
+            snapshot: buffer.rope.clone(),
+            title: command.title.clone(),
+        };
+        if state.ext_worker.is_none() {
+            state.ext_worker = Some(crate::ext::run::spawn(Box::new(|| {})));
+        }
+        let job = state.ext_next_job;
+        state.ext_next_job += 1;
+        let sent = state.ext_worker.as_ref().is_some_and(|(tx, _)| {
+            tx.send(crate::ext::run::Job {
+                tag: job,
+                manifest: command.installed.manifest.clone(),
+                wasm: command.installed.wasm(),
+                generation: state.ext_generation,
+                request,
+            })
+            .is_ok()
+        });
+        if sent {
+            state.ext_pending.insert(job, call);
+        } else {
+            state.ext_worker = None;
+            state.message = Some(("the extension thread stopped".into(), Instant::now()));
+        }
+        drop(state);
+        self.resume_display_link();
+        self.request_redraw();
+    }
+
+    /// Everything extensions sent back: the registry, a download, command
+    /// answers. Runs from the display link.
+    fn ext_poll(&self) {
+        let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
+            return;
+        };
+        if let Some(rx) = &state.ext_registry_rx
+            && let Ok(result) = rx.try_recv()
+        {
+            state.ext_registry_rx = None;
+            if let Some(page) = &mut state.extensions {
+                page.registry = match result {
+                    Ok(entries) => crate::platform::extensions::Registry::Ready(entries),
+                    Err(e) => crate::platform::extensions::Registry::Failed(e),
+                };
+                if page.selected.is_none()
+                    && let crate::platform::extensions::Registry::Ready(entries) = &page.registry
+                {
+                    page.selected = entries.first().map(|e| e.manifest.id.clone());
+                }
+            }
+            self.ivars().needs_redraw.set(true);
+        }
+        let download = state
+            .ext_install_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok());
+        let mut done = Vec::new();
+        if let Some((_, rx)) = &state.ext_worker {
+            while let Ok(answer) = rx.try_recv() {
+                done.push(answer);
+            }
+        }
+        drop(state);
+        if let Some(result) = download {
+            self.ivars().state.borrow_mut().ext_install_rx = None;
+            self.finish_install(result);
+            self.ivars().needs_redraw.set(true);
+        }
+        for answer in done {
+            self.ext_answer(answer);
+        }
+    }
+
+    /// Applies an extension's answer, as one undo step, if its document has
+    /// not changed since the call.
+    fn ext_answer(&self, done: crate::ext::run::Done) {
+        let (rows, cols) = self.grid();
+        let mut state = self.ivars().state.borrow_mut();
+        if !done.log.is_empty() {
+            state.ext_logs.insert(done.id.clone(), done.log.clone());
+            if let Some(page) = &mut state.extensions {
+                page.logs.insert(done.id.clone(), done.log);
+            }
+        }
+        let Some(call) = state.ext_pending.remove(&done.tag) else {
+            return;
+        };
+        let response = match done.result {
+            Ok(r) => r,
+            Err(e) => {
+                state.message = Some((e, Instant::now()));
+                self.ivars().needs_redraw.set(true);
+                return;
+            }
+        };
+        let mut changed = false;
+        let mut note = response.message.clone();
+        if let Some(text) = response.replace {
+            let buffer = all_docs_mut(&mut state)
+                .into_iter()
+                .flat_map(|d| d.iter_mut())
+                .find(|b| b.id() == call.buffer);
+            match buffer {
+                Some(b) if b.rope.to_string() == call.snapshot.to_string() => {
+                    if b.rope.slice_to_string(call.range.clone()) != text {
+                        changed = b.replace_ranges(&[(call.range.clone(), text)]) > 0;
+                        b.scroll_to_cursor(rows, cols);
+                    } else if note.is_none() {
+                        note = Some(format!("{}: nothing to change", call.title));
+                    }
+                }
+                Some(_) => note = Some(format!("{}: skipped, the text changed", call.title)),
+                None => {}
+            }
+        }
+        if changed {
+            state.lsp_dirty.insert(call.buffer, Instant::now());
+            state.gutter_dirty.insert(call.buffer, Instant::now());
+        }
+        state.message = Some((note.unwrap_or_else(|| call.title.clone()), Instant::now()));
+        let active = state.docs.active().id() == call.buffer;
+        drop(state);
+        if changed && active {
+            self.reparse();
+            self.sync_title();
+        }
+        self.ivars().needs_redraw.set(true);
+    }
+
     /// The bulb follows the caret: gone when it moves or the text changes,
     /// asked for again once it rests. Runs from the display link.
     fn bulb_refresh(&self) {
@@ -10992,6 +11550,7 @@ impl EditorView {
             branch_list,
             action_list,
             bulb,
+            extensions,
             blame,
             preview,
             live_line,
@@ -11105,7 +11664,16 @@ impl EditorView {
         let diffing = *git_open && git.showing_diff;
         let reviewing = claude.as_ref().and_then(|c| c.reviews.get(&buffer.id()));
 
-        if diffing {
+        if let Some(page) = extensions.as_mut() {
+            glyphs.clear();
+            crate::platform::extensions::draw(
+                page,
+                &mut renderer.atlas,
+                editor_rect,
+                theme,
+                glyphs,
+            );
+        } else if diffing {
             glyphs.clear();
             layout::push_rect(
                 glyphs,
@@ -13153,8 +13721,8 @@ fn restore_summary(documents: &[recovery::Recovered]) -> String {
 /// What choosing a palette row does.
 enum Pick {
     File(std::path::PathBuf),
-    /// A menu item's action.
-    Command(Sel),
+    /// A menu item's action, and its tag.
+    Command(Sel, isize),
     /// A definition: in another file, or in the active document (`None`),
     /// and its zero-based line.
     Symbol(Option<std::path::PathBuf>, u32),
@@ -13366,7 +13934,7 @@ fn palette_rows(sources: &PaletteSources<'_>, query: &str) -> Vec<(layout::Palet
                         detail: command.group.clone(),
                         shortcut: command.shortcut.clone(),
                     },
-                    Pick::Command(command.action),
+                    Pick::Command(command.action, command.tag),
                 )
             })
             .collect();
@@ -13740,6 +14308,19 @@ fn install_menu(mtm: MainThreadMarker, app: &NSApplication) {
     go_item.setSubmenu(Some(&go_menu));
     menubar.addItem(&go_item);
 
+    // Filled by `rebuild_extension_menu` with each enabled extension's
+    // commands, after the first two items.
+    let (extensions_item, extensions_menu) = submenu("Extensions");
+    extensions_menu.addItem(&item(
+        "Extensions\u{2026}",
+        sel!(openExtensions:),
+        "x",
+        true,
+    ));
+    extensions_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    extensions_item.setSubmenu(Some(&extensions_menu));
+    menubar.addItem(&extensions_item);
+
     let (run_item, run_menu) = submenu("Run");
     // Cmd-Return. Greyed out unless the active document is a `.http` file,
     // so it never eats the key anywhere else.
@@ -13986,6 +14567,15 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         organizing: None,
         resolving: None,
         organize_on_save: crate::platform::settings::Settings::load().organize_imports_on_save,
+        extensions: None,
+        ext_registry_rx: None,
+        ext_install_rx: None,
+        ext_worker: None,
+        ext_commands: Vec::new(),
+        ext_pending: HashMap::new(),
+        ext_next_job: 1,
+        ext_generation: 0,
+        ext_logs: HashMap::new(),
         bulb: None,
         bulb_want: None,
         bulb_request: None,
@@ -14034,6 +14624,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
     view.watch_project();
     view.apply_theme();
     view.lsp_sync_open();
+    view.rebuild_extension_menu();
     // The delegate must outlive this function; NSApplication only holds a
     // weak reference to it, so it is leaked deliberately rather than dropped
     // at the end of `run` while AppKit still calls into it.

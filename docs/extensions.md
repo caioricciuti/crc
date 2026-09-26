@@ -1,6 +1,10 @@
 # Extensions: design
 
-Status: **design, not built.** crc has no extensions yet. This is the
+Status: **the first version is built**: the interpreter, manifests and
+capabilities for the selection and the document, the Extensions page,
+installs from a folder and from the signed registry (which goes live with
+its first release), and commands in the palette. Host functions beyond
+`log`, and the capabilities after the document, come next. This is the
 concrete version of [vision](vision.md) section 2: an extension is
 WebAssembly with a manifest that says what it may read, write and reach,
 and a host that enforces it. Installing one never means handing a stranger

@@ -1,0 +1,43 @@
+---
+title: Writing an extension
+description: An extension is a Rust function from text to text, compiled to WebAssembly.
+---
+
+An extension is a small Rust library compiled to WebAssembly with the
+`crc-extension` crate. Each command is a function:
+
+```rust
+use crc_extension::{Input, Output};
+
+fn shout(input: Input) -> Output {
+    Output::replace(input.text.to_uppercase())
+}
+
+crc_extension::commands! {
+    "shout" => shout,
+}
+```
+
+`Input` carries the text (the selection, or the whole document), whether it
+was a selection, and the language. An `Output` replaces the text, shows a
+message, or both.
+
+Next to the code, a `manifest.json` names the extension, lists its commands
+and the capabilities it needs, and a `README.md` says what it does; crc
+shows both before anyone installs it.
+
+Build it:
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo build --release --target wasm32-unknown-unknown
+```
+
+Then in crc, **Extensions > Extensions…**, **Install from Folder…**, and
+pick the folder with the manifest, the README and the `.wasm`.
+
+The full guide, the manifest reference and the rules for publishing to the
+official registry are in
+[crc-extensions](https://github.com/caioricciuti/crc-extensions/blob/main/docs/writing-an-extension.md).
+Everything there is MIT or Apache 2.0, so your extension can use any
+licence.

@@ -70,6 +70,13 @@ export default defineConfig({
           ],
         },
         {
+          label: "Extensions",
+          items: [
+            { label: "Using extensions", slug: "docs/features/extensions", badge: { text: "New", variant: "success" } },
+            { label: "Writing an extension", slug: "docs/features/writing-extensions" },
+          ],
+        },
+        {
           label: "Reference",
           items: [
             { label: "Keyboard shortcuts", slug: "docs/reference/keyboard-shortcuts" },

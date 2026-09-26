@@ -11,6 +11,13 @@ One entry per tag, written for people who use the editor.
   which runs before format-on-save.
 - A rename's edits now refresh the Git gutter marks of the open files they
   change.
+- Extensions: Extensions > Extensions… (Cmd-Shift-X) lists what is
+  installed and what the signed registry offers, shows what each may do,
+  and installs only after you agree to it. Extensions are WebAssembly run by
+  crc's own interpreter and can read and replace the selection or the
+  document, nothing else; their commands are in the Extensions menu and the
+  palette. Install from Folder… installs unsigned ones, marked as such. The
+  registry goes live with its first signed release.
 
 ## v0.2.0-alpha.2, 2026-09-26
 
