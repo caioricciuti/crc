@@ -55,6 +55,10 @@ pub struct Manifest {
     pub description: String,
     pub authors: Vec<String>,
     pub license: String,
+    /// A name from crc's extension icon set; `extensions` when not given.
+    pub icon: String,
+    /// Where to read more, https only; shown, never opened by itself.
+    pub homepage: Option<String>,
     pub entry: String,
     pub capabilities: Vec<Capability>,
     pub commands: Vec<Command>,
@@ -173,7 +177,30 @@ pub fn parse(value: &Value) -> Result<Manifest, String> {
     if commands.is_empty() {
         return Err("the manifest has no commands".into());
     }
+    let icon = value
+        .get("icon")
+        .and_then(Value::as_str)
+        .unwrap_or("extensions")
+        .to_owned();
+    if !crate::project::icons::EXTENSION_ICONS
+        .iter()
+        .any(|(name, _)| *name == icon)
+    {
+        return Err(format!("unknown icon {icon:?}"));
+    }
+    let homepage = value
+        .get("homepage")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if homepage
+        .as_ref()
+        .is_some_and(|h| !h.starts_with("https://"))
+    {
+        return Err("the homepage must be an https address".into());
+    }
     Ok(Manifest {
+        icon,
+        homepage,
         name: text("name")?,
         description: text("description")?,
         license: text("license")?,
@@ -240,6 +267,7 @@ mod tests {
         let m = parse(&crate::json::parse(SORT).unwrap()).unwrap();
         assert_eq!(m.id, "crc.sort-lines");
         assert_eq!(m.commands[0].title, "Sort Lines");
+        assert_eq!(m.icon, "extensions", "the default icon");
         assert!(m.may_read(true) && m.may_replace(true));
         assert!(!m.may_read(false) && !m.may_replace(false));
     }
@@ -255,5 +283,7 @@ mod tests {
         assert!(with("sort_lines.wasm", "../x.wasm").contains(".wasm file name"));
         assert!(with("\"0.1.0\"", "\"1\"").contains("x.y.z"));
         assert!(with("\"id\": \"sort\"", "\"id\": \"Sort-It\"").contains("command"));
+        assert!(with("\"api\": 1,", "\"api\": 1, \"icon\": \"skull\",").contains("unknown icon"));
+        assert!(with("\"api\": 1,", "\"api\": 1, \"homepage\": \"http://x\",").contains("https"));
     }
 }

@@ -1394,6 +1394,7 @@ quit
 SCRIPT
 CRC_LSP_FAKE="$PWD/scripts/fake-lsp.py" CRC_SELFTEST="$T/lsp3.script" "$BIN" "$T/lsp3proj/main.py" 2> "$T/lsp3.err"
 expect "$T/lsp3-bulb.out" bulb "3 at 18"
+expect "$T/lsp3-bulb.out" pointer_targets 1
 expect "$T/lsp3-list.out" actions "Replace TODO with DONE|Organize Imports|Upper-case this line|Extract function"
 expect_line "$T/lsp3-fixed.out" 3 "x = 1  # DONE"
 expect "$T/lsp3-fixed.out" message "Replace TODO with DONE: changed 1 file, 1 open and unsaved"
@@ -1502,6 +1503,8 @@ quit
 SCRIPT
 HOME="$T/exthome" CRC_EXT_REGISTRY="file://$T/extreg/" CRC_EXT_REGISTRY_KEY="$T/extreg/pub.pem" CRC_EXT_FOLDER="$T/extfolder" CRC_SELFTEST="$T/ext.script" "$BIN" "$T/extproj/notes.txt" 2> "$T/ext.err"
 expect "$T/ext-open.out" extensions "open selected=crc.sort-lines installed= registry=ready:crc.sort-lines confirm=- busy=- note=-"
+# Refresh, Install from Folder, the row and Install: each a pointing hand.
+expect "$T/ext-open.out" pointer_targets 4
 expect "$T/ext-confirm.out" extensions "open selected=crc.sort-lines installed= registry=ready:crc.sort-lines confirm=crc.sort-lines busy=- note=-"
 expect "$T/ext-installed.out" extensions "open selected=crc.sort-lines installed=crc.sort-lines:0.1.0:on:signed registry=ready:crc.sort-lines confirm=- busy=- note=Installed Sort Lines 0.1.0"
 expect "$T/ext-installed.out" ext_commands "Sort Lines|Sort Lines Descending|Remove Duplicate Lines"

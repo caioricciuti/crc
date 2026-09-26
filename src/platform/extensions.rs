@@ -284,7 +284,7 @@ pub fn draw(
     let top = y;
 
     let offered = page.offered();
-    let mut rows: Vec<(&'static str, String, String, String, bool)> = Vec::new();
+    let mut rows: Vec<(&'static str, String, String, String, char)> = Vec::new();
     for i in &page.installed {
         let mut state = i.manifest.version.clone();
         if !i.enabled {
@@ -298,7 +298,7 @@ pub fn draw(
             i.manifest.id.clone(),
             i.manifest.name.clone(),
             state,
-            true,
+            crate::project::icons::extension_icon(&i.manifest.icon),
         ));
     }
     for e in &offered {
@@ -312,11 +312,11 @@ pub fn draw(
             e.manifest.id.clone(),
             e.manifest.name.clone(),
             state,
-            false,
+            crate::project::icons::extension_icon(&e.manifest.icon),
         ));
     }
     let mut last_section = "";
-    for (section, id, name, state, _) in &rows {
+    for (section, id, name, state, icon) in &rows {
         if *section != last_section {
             if y + 22.0 > bottom {
                 break;
@@ -337,6 +337,19 @@ pub fn draw(
         if page.selected.as_deref() == Some(id.as_str()) {
             layout::push_rounded_rect(out, row, 6.0, theme.palette_selected);
         }
+        layout::push_icon_centered(
+            out,
+            atlas,
+            Viewport {
+                x,
+                y: y + 4.0,
+                width: 28.0,
+                height: 34.0,
+            },
+            *icon,
+            theme.accent,
+        );
+        let (x, list_w) = (x + 38.0, list_w - 38.0);
         text(out, atlas, x, y + 4.0, list_w - 90.0, name, theme.text);
         layout::push_ui_text_right(
             out,

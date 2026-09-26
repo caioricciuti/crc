@@ -25,7 +25,7 @@ use crate::text::columns::{TAB_WIDTH, advance};
 ///
 /// Panels need an origin now that the sidebar exists; the editor no longer
 /// starts at x = 0.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Viewport {
     pub x: f32,
     pub y: f32,

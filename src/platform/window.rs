@@ -579,6 +579,11 @@ struct State {
     conflict_side: bool,
     /// What the conflict controls' cursor rects were built for.
     conflict_cursor_key: Option<(u64, usize, usize, usize, usize, bool)>,
+    /// The Extensions page's targets and the bulb, as last drawn, so their
+    /// pointing-hand cursor rects are rebuilt when they move.
+    pointer_targets: Vec<Viewport>,
+    /// Where the bulb was last drawn.
+    bulb_rect: Option<Viewport>,
     /// The code font as asked for, and its size in points. The atlas holds
     /// the resolved face; this is what a rebuild at a new size starts from.
     font: String,
@@ -1780,7 +1785,11 @@ define_class!(
                     add(rect, &NSCursor::pointingHandCursor());
                 }
             }
-            if state.native_preview.is_none() && !(state.git_open && state.git.showing_diff) && active_review(&state).is_none() && !side_by_side(&state) {
+            // The Extensions page's buttons and rows, and the bulb.
+            for target in &state.pointer_targets {
+                add(*target, &NSCursor::pointingHandCursor());
+            }
+            if state.extensions.is_none() && state.native_preview.is_none() && !(state.git_open && state.git.showing_diff) && active_review(&state).is_none() && !side_by_side(&state) {
                 let gutter = layout::gutter_width(state.docs.active(), &state.renderer.atlas);
                 add(chrome.text.inset_left(gutter), &NSCursor::IBeamCursor());
             }
@@ -3623,6 +3632,16 @@ impl EditorView {
             state.conflict_cursor_key = conflict_key;
             state.cursor_rects_for = None;
         }
+        let pointer_targets: Vec<Viewport> = state
+            .extensions
+            .iter()
+            .flat_map(|page| page.hits.iter().map(|(r, _)| *r))
+            .chain(state.bulb_rect)
+            .collect();
+        if state.pointer_targets != pointer_targets {
+            state.pointer_targets = pointer_targets;
+            state.cursor_rects_for = None;
+        }
         if state.cursor_rects_for != Some(key) {
             state.cursor_rects_for = Some(key);
             if let Some(window) = self.window() {
@@ -4540,8 +4559,9 @@ impl EditorView {
                 );
                 let report = format!(
                     // First: the report ends with the document's text.
-                    "message: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nconflicts: {}\ngit_conflicts: {}\nblame: {}\nfind_results: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\n{report}",
+                    "message: {}\npointer_targets: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nconflicts: {}\ngit_conflicts: {}\nblame: {}\nfind_results: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\n{report}",
                     state.message.as_ref().map_or("", |(text, _)| text.as_str()),
+                    state.pointer_targets.len(),
                     state.extensions.as_ref().map_or("closed".to_string(), |page| {
                         use crate::platform::extensions::Registry;
                         format!(
@@ -11550,6 +11570,7 @@ impl EditorView {
             branch_list,
             action_list,
             bulb,
+            bulb_rect,
             extensions,
             blame,
             preview,
@@ -11814,7 +11835,10 @@ impl EditorView {
                     (b.buffer, b.caret) == (buffer.id(), buffer.cursor()) && b.shows()
                 })
             {
-                layout::push_bulb(glyphs, &mut renderer.atlas, buffer, editor_rect, theme);
+                *bulb_rect =
+                    layout::push_bulb(glyphs, &mut renderer.atlas, buffer, editor_rect, theme);
+            } else {
+                *bulb_rect = None;
             }
             // Conflicts: washes under the text, which was drawn first into
             // a cleared list, so they go in at the front; the buttons on
@@ -14586,6 +14610,8 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         conflict_scans: HashMap::new(),
         conflict_side: crate::platform::settings::Settings::load().conflict_side_by_side,
         conflict_cursor_key: None,
+        pointer_targets: Vec::new(),
+        bulb_rect: None,
         font: font.to_owned(),
         font_size: size_pt,
         theme_choice: crate::platform::settings::Settings::load().theme,

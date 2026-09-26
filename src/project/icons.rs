@@ -42,6 +42,95 @@ pub const HISTORY: char = '\u{ea82}'; // cod-history
 pub const FILE: char = '\u{ea7b}'; // cod-file
 pub const FOLDER_OUTLINE: char = '\u{ea83}'; // cod-folder
 
+/// The icons an extension may name in its manifest (`"icon": "wand"`).
+/// A name, never an image: crc does not decode files from extensions, and
+/// a glyph from the bundled font is tinted like every other icon. Each
+/// code point was read from the font's own glyph names (`cod-<name>`), and
+/// crc-extensions' `scripts/build-registry.py` checks against the same list.
+pub const EXTENSION_ICONS: &[(&str, char)] = &[
+    ("extensions", '\u{eae6}'),       // cod-extensions
+    ("sort-precedence", '\u{eb55}'),  // cod-sort_precedence
+    ("case-sensitive", '\u{eab1}'),   // cod-case_sensitive
+    ("preserve-case", '\u{eb2e}'),    // cod-preserve_case
+    ("symbol-string", '\u{eb8d}'),    // cod-symbol_string
+    ("symbol-key", '\u{ea93}'),       // cod-symbol_key
+    ("symbol-method", '\u{ea8c}'),    // cod-symbol_method
+    ("symbol-class", '\u{eb5b}'),     // cod-symbol_class
+    ("symbol-color", '\u{eb5c}'),     // cod-symbol_color
+    ("symbol-numeric", '\u{ea90}'),   // cod-symbol_numeric
+    ("symbol-ruler", '\u{ea96}'),     // cod-symbol_ruler
+    ("symbol-namespace", '\u{ea8b}'), // cod-symbol_namespace
+    ("json", '\u{eb0f}'),             // cod-json
+    ("code", '\u{eac4}'),             // cod-code
+    ("file-code", '\u{eae9}'),        // cod-file_code
+    ("list-ordered", '\u{eb16}'),     // cod-list_ordered
+    ("list-unordered", '\u{eb17}'),   // cod-list_unordered
+    ("list-flat", '\u{eb84}'),        // cod-list_flat
+    ("filter", '\u{eaf1}'),           // cod-filter
+    ("search", '\u{ea6d}'),           // cod-search
+    ("replace", '\u{eb3d}'),          // cod-replace
+    ("wand", '\u{ebcf}'),             // cod-wand
+    ("lightbulb", '\u{ea61}'),        // cod-lightbulb
+    ("checklist", '\u{eab3}'),        // cod-checklist
+    ("check", '\u{eab2}'),            // cod-check
+    ("tools", '\u{eb6d}'),            // cod-tools
+    ("gear", '\u{eaf8}'),             // cod-gear
+    ("beaker", '\u{ea79}'),           // cod-beaker
+    ("bug", '\u{eaaf}'),              // cod-bug
+    ("book", '\u{eaa4}'),             // cod-book
+    ("note", '\u{eb26}'),             // cod-note
+    ("comment", '\u{ea6b}'),          // cod-comment
+    ("quote", '\u{eb33}'),            // cod-quote
+    ("tag", '\u{ea66}'),              // cod-tag
+    ("link", '\u{eb15}'),             // cod-link
+    ("lock", '\u{ea75}'),             // cod-lock
+    ("key", '\u{eb11}'),              // cod-key
+    ("globe", '\u{eb01}'),            // cod-globe
+    ("calendar", '\u{eab0}'),         // cod-calendar
+    ("whole-word", '\u{eb7e}'),       // cod-whole_word
+    ("regex", '\u{eb38}'),            // cod-regex
+    ("text-size", '\u{eb69}'),        // cod-text_size
+    ("word-wrap", '\u{eb80}'),        // cod-word_wrap
+    ("edit", '\u{ea73}'),             // cod-edit
+    ("copy", '\u{ebcc}'),             // cod-copy
+    ("git-merge", '\u{eafe}'),        // cod-git_merge
+    ("terminal", '\u{ea85}'),         // cod-terminal
+    ("database", '\u{eace}'),         // cod-database
+    ("table", '\u{ebb7}'),            // cod-table
+    ("graph", '\u{eb03}'),            // cod-graph
+    ("pulse", '\u{eb31}'),            // cod-pulse
+    ("rocket", '\u{eb44}'),           // cod-rocket
+    ("heart", '\u{eb05}'),            // cod-heart
+    ("star-full", '\u{eb59}'),        // cod-star_full
+    ("paintcan", '\u{eb2a}'),         // cod-paintcan
+    ("color-mode", '\u{eac6}'),       // cod-color_mode
+    ("symbol-event", '\u{ea86}'),     // cod-symbol_event
+    ("symbol-array", '\u{ea8a}'),     // cod-symbol_array
+    ("symbol-boolean", '\u{ea8f}'),   // cod-symbol_boolean
+];
+
+#[cfg(test)]
+#[test]
+fn extension_icon_names_are_unique_and_kebab_case() {
+    let mut names: Vec<&str> = EXTENSION_ICONS.iter().map(|(n, _)| *n).collect();
+    assert!(
+        names
+            .iter()
+            .all(|n| n.bytes().all(|b| b.is_ascii_lowercase() || b == b'-'))
+    );
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(names.len(), EXTENSION_ICONS.len());
+}
+
+/// The glyph for an extension icon name, or the extensions icon.
+pub fn extension_icon(name: &str) -> char {
+    EXTENSION_ICONS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map_or('\u{eae6}', |(_, c)| *c)
+}
+
 /// The chip icon for a definition kind as the index names it.
 pub fn for_kind(kind: &str) -> char {
     match kind {
