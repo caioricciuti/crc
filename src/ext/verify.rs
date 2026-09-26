@@ -212,6 +212,12 @@ pub(crate) mod tests {
     use std::process::Command;
 
     #[test]
+    fn the_built_in_registry_key_is_a_p256_key() {
+        let der = pem_der(REGISTRY_KEY).expect("src/ext/registry-key.pem holds a key");
+        assert!(p256_point(&der).is_some(), "not a P-256 public key");
+    }
+
+    #[test]
     fn sha256_matches_the_known_answer() {
         assert_eq!(
             hex(&sha256(b"abc").unwrap()),
