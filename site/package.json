@@ -4,7 +4,7 @@
   "description": "crceditor.com: the handbook and docs for crc, built with Starlight from the Markdown in ../docs.",
   "type": "module",
   "scripts": {
-    "sync": "bun run scripts/sync-docs.mjs",
+    "sync": "bun run scripts/sync-docs.mjs && bun run scripts/sync-extensions.mjs",
     "dev": "bun run sync && astro dev",
     "build": "bun run sync && astro build",
     "preview": "astro preview"

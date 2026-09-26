@@ -5,6 +5,7 @@
   "description": "Sort the selected lines, or the whole document, and remove duplicates.",
   "authors": ["crc"],
   "license": "MIT OR Apache-2.0",
+  "icon": "sort-precedence",
   "api": 1,
   "entry": "sort_lines.wasm",
   "capabilities": ["selection.read", "selection.replace", "document.read", "document.edit"],

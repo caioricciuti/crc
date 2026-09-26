@@ -1,0 +1,316 @@
+---
+import Landing from "../layouts/Landing.astro";
+import registry from "../data/extensions.json";
+import iconSet from "../data/extension-icons.json";
+
+// What crc's install prompt says each capability grants, word for word.
+const grants: Record<string, string> = {
+  "selection.read": "Read the selected text",
+  "selection.replace": "Replace the selected text",
+  "document.read": "Read the whole document",
+  "document.edit": "Replace the whole document",
+};
+
+type Icon = { viewBox: string; d: string };
+const icons = iconSet.icons as Record<string, Icon>;
+const iconFor = (name?: string): Icon => icons[name ?? "extensions"] ?? icons.extensions;
+
+const extensions = [...registry.extensions].sort((a, b) => a.name.localeCompare(b.name));
+const live = registry.source === "registry";
+const repo = "https://github.com/caioricciuti/crc-extensions";
+---
+
+<Landing
+  title="Extensions for crc: they ask first"
+  description="crc extensions are WebAssembly that can do only what they declare. The official ones are built from source and signed."
+>
+  <section class="ext-hero">
+    <div class="container">
+      <span class="eyebrow">Extensions</span>
+      <h1 class="ext-h1">Extensions that <span class="grad">ask first.</span></h1>
+      <p class="ext-sub">
+        Each one is WebAssembly run by crc's own interpreter. It says what it may read and change,
+        crc shows you before you install it, and holds it to that after. No files, no network,
+        no other programs.
+      </p>
+      <div class="ext-cta">
+        <a class="btn btn-light" href="/docs/features/extensions/">Using extensions</a>
+        <a class="btn btn-ghost" href="/docs/features/writing-extensions/">Write your own <span class="arrow">→</span></a>
+      </div>
+    </div>
+  </section>
+
+  <section class="section tight">
+    <div class="container">
+      <div class="promises">
+        <div>
+          <h3>Declared</h3>
+          <p>A manifest lists what the extension may touch. Anything it did not ask for is not even linked in.</p>
+        </div>
+        <div>
+          <h3>Sandboxed</h3>
+          <p>It runs off the main thread with a time and memory budget, and gets only the text you give it.</p>
+        </div>
+        <div>
+          <h3>Signed</h3>
+          <p>Official extensions are built from source in CI and signed; crc checks the signature and every checksum.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section tight" id="official">
+    <div class="container">
+      <div class="section-head">
+        <span class="eyebrow">Official</span>
+        <h2 class="h2">{extensions.length} extensions, {extensions.reduce((n, e) => n + e.commands.length, 0)} commands.</h2>
+        <p class="lead">
+          In crc: <b>Extensions › Extensions…</b> (<kbd>⌘</kbd><kbd>⇧</kbd><kbd>X</kbd>), pick one, Install.
+          {!live && " The signed registry opens with its first published release; until then these install from a folder."}
+        </p>
+      </div>
+      <div class="cards">
+        {extensions.map((e) => {
+          const icon = iconFor(e.icon);
+          return (
+            <article class="ext" id={e.id}>
+              <header>
+                <span class="ext-icon" aria-hidden="true">
+                  <svg viewBox={icon.viewBox} width="26" height="26"><path fill="currentColor" d={icon.d} /></svg>
+                </span>
+                <div>
+                  <h3>{e.name}</h3>
+                  <span class="ext-meta">{e.id} · {e.version}</span>
+                </div>
+              </header>
+              <p class="ext-desc">{e.description}</p>
+              <div class="ext-commands">
+                {e.commands.map((c) => <span class="chip">{c.title}</span>)}
+              </div>
+              <div class="ext-may">
+                <span>May</span>
+                <ul>
+                  {e.capabilities.map((c) => <li>{grants[c] ?? c}</li>)}
+                </ul>
+              </div>
+              <footer>
+                <span>{e.license}</span>
+                <a href={`${repo}/tree/main/extensions/${e.id.split(".").slice(1).join("-")}`}>Source →</a>
+              </footer>
+            </article>
+          );
+        })}
+      </div>
+    </div>
+  </section>
+
+  <section class="section tight">
+    <div class="container write">
+      <div>
+        <span class="eyebrow">Make one</span>
+        <h2 class="h2">A Rust function from text to text.</h2>
+        <p class="lead">
+          The scaffold asks for the name, description, icon and commands, and writes an extension that
+          builds and installs as it is. Everything in crc-extensions is MIT or Apache 2.0, so yours can
+          use any licence.
+        </p>
+        <a class="more" href={`${repo}/blob/main/docs/writing-an-extension.md`}>The full guide <span>→</span></a>
+      </div>
+      <pre class="term"><code><span class="c"># in a clone of crc-extensions</span>
+python3 scripts/new-extension.py
+cargo build --release \
+  --target wasm32-unknown-unknown
+<span class="c"># then in crc: Install from Folder…</span></code></pre>
+    </div>
+  </section>
+
+  <section class="section tight">
+    <div class="container foot">
+      <p>
+        Why WebAssembly, why crc's own interpreter, and how signing works:{" "}
+        <a href="/extensions/design/">the extensions design →</a>
+      </p>
+    </div>
+  </section>
+</Landing>
+
+<style>
+  /* The home page's sections are big blocks; these are a list. */
+  .section {
+    padding-block: clamp(2rem, 4vw, 3.25rem);
+  }
+  .ext-hero {
+    padding: clamp(7rem, 14vw, 9rem) 0 0.5rem;
+    background: radial-gradient(60% 50% at 50% 0%, var(--mint-glow), transparent 70%);
+  }
+  .ext-h1 {
+    font-size: clamp(2.4rem, 6vw, 4.2rem);
+    line-height: 1.02;
+    letter-spacing: -0.035em;
+    font-weight: 700;
+    margin: 0.6rem 0 1rem;
+  }
+  .grad {
+    background: linear-gradient(90deg, var(--mint), var(--fn) 55%, var(--kw));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  .ext-sub {
+    max-width: 40rem;
+    color: var(--text-2);
+    font-size: 1.1rem;
+    line-height: 1.6;
+  }
+  .ext-cta {
+    display: flex;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+    margin-top: 1.75rem;
+  }
+  .promises {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+    gap: 1rem;
+  }
+  .promises > div {
+    border: 1px solid var(--line);
+    background: var(--bg-1);
+    border-radius: 14px;
+    padding: 1.25rem 1.35rem;
+  }
+  .promises h3 {
+    margin: 0 0 0.4rem;
+    font-size: 1rem;
+    color: var(--mint);
+  }
+  .promises p {
+    margin: 0;
+    color: var(--text-2);
+    line-height: 1.55;
+  }
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(19rem, 1fr));
+    gap: 1rem;
+    margin-top: 2rem;
+  }
+  .ext {
+    display: flex;
+    flex-direction: column;
+    gap: 0.9rem;
+    border: 1px solid var(--line);
+    background: var(--bg-1);
+    border-radius: 16px;
+    padding: 1.35rem;
+    transition: border-color 0.2s;
+  }
+  .ext:hover {
+    border-color: var(--line-2);
+  }
+  .ext header {
+    display: flex;
+    align-items: center;
+    gap: 0.85rem;
+  }
+  .ext-icon {
+    display: grid;
+    place-items: center;
+    width: 44px;
+    height: 44px;
+    border-radius: 12px;
+    background: var(--raised);
+    color: var(--mint);
+    flex: none;
+  }
+  .ext h3 {
+    margin: 0;
+    font-size: 1.1rem;
+  }
+  .ext-meta {
+    color: var(--dim);
+    font-size: 0.82rem;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  .ext-desc {
+    margin: 0;
+    color: var(--text-2);
+    line-height: 1.55;
+  }
+  .ext-commands {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+  }
+  .chip {
+    font-size: 0.8rem;
+    padding: 0.2rem 0.55rem;
+    border-radius: 999px;
+    background: var(--bg-2);
+    border: 1px solid var(--line);
+    color: var(--text-2);
+  }
+  .ext-may {
+    font-size: 0.88rem;
+  }
+  .ext-may > span {
+    color: var(--muted);
+  }
+  .ext-may ul {
+    margin: 0.3rem 0 0;
+    padding-left: 1.1rem;
+    color: var(--text-2);
+  }
+  .ext footer {
+    margin-top: auto;
+    display: flex;
+    justify-content: space-between;
+    padding-top: 0.75rem;
+    border-top: 1px solid var(--line);
+    color: var(--dim);
+    font-size: 0.82rem;
+  }
+  .ext footer a {
+    color: var(--mint);
+  }
+  .write {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr));
+    gap: 2rem;
+    align-items: center;
+  }
+  .term {
+    margin: 0;
+    padding: 1.25rem 1.4rem;
+    border-radius: 14px;
+    background: var(--editor);
+    border: 1px solid var(--line);
+    overflow-x: auto;
+    font-size: 0.9rem;
+    line-height: 1.7;
+    color: var(--text);
+  }
+  .term .c {
+    color: var(--dim);
+  }
+  .more {
+    color: var(--mint);
+    display: inline-block;
+    margin-top: 0.75rem;
+  }
+  .foot p {
+    color: var(--muted);
+    text-align: center;
+  }
+  .foot a {
+    color: var(--mint);
+  }
+  kbd {
+    font-family: inherit;
+    font-size: 0.85em;
+    padding: 0.05rem 0.35rem;
+    border-radius: 5px;
+    border: 1px solid var(--line-2);
+    background: var(--bg-2);
+  }
+</style>

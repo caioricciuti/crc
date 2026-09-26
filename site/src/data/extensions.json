@@ -1,0 +1,133 @@
+{
+  "source": "snapshot",
+  "extensions": [
+    {
+      "id": "crc.change-case",
+      "name": "Change Case",
+      "version": "0.1.0",
+      "description": "Change the case of the selection or document: upper, lower, title, snake_case, kebab-case, camelCase, PascalCase and CONSTANT_CASE.",
+      "authors": [
+        "crc"
+      ],
+      "license": "MIT OR Apache-2.0",
+      "icon": "case-sensitive",
+      "capabilities": [
+        "selection.read",
+        "selection.replace",
+        "document.read",
+        "document.edit"
+      ],
+      "commands": [
+        {
+          "id": "upper",
+          "title": "Upper Case"
+        },
+        {
+          "id": "lower",
+          "title": "Lower Case"
+        },
+        {
+          "id": "title",
+          "title": "Title Case"
+        },
+        {
+          "id": "snake",
+          "title": "snake_case"
+        },
+        {
+          "id": "kebab",
+          "title": "kebab-case"
+        },
+        {
+          "id": "camel",
+          "title": "camelCase"
+        },
+        {
+          "id": "pascal",
+          "title": "PascalCase"
+        },
+        {
+          "id": "constant",
+          "title": "CONSTANT_CASE"
+        }
+      ],
+      "readme": "# Change Case\n\nChange the case of the selection or document: upper, lower, title, snake_case, kebab-case, camelCase, PascalCase and CONSTANT_CASE.\n\nWorks on the selection, or on the whole document when nothing is selected:\n\n- **Upper Case**: what it does.\n- **Lower Case**: what it does.\n- **Title Case**: what it does.\n- **snake_case**: what it does.\n- **kebab-case**: what it does.\n- **camelCase**: what it does.\n- **PascalCase**: what it does.\n- **CONSTANT_CASE**: what it does.\n\nReads and replaces the text you give it. Nothing else: no files, no\nnetwork.\n"
+    },
+    {
+      "id": "crc.encode",
+      "name": "Encode and Decode",
+      "version": "0.1.0",
+      "description": "Base64, URL and HTML encoding of the selection or document, both ways.",
+      "authors": [
+        "crc"
+      ],
+      "license": "MIT OR Apache-2.0",
+      "icon": "symbol-string",
+      "capabilities": [
+        "selection.read",
+        "selection.replace",
+        "document.read",
+        "document.edit"
+      ],
+      "commands": [
+        {
+          "id": "base64_encode",
+          "title": "Base64 Encode"
+        },
+        {
+          "id": "base64_decode",
+          "title": "Base64 Decode"
+        },
+        {
+          "id": "url_encode",
+          "title": "URL Encode"
+        },
+        {
+          "id": "url_decode",
+          "title": "URL Decode"
+        },
+        {
+          "id": "html_escape",
+          "title": "HTML Escape"
+        },
+        {
+          "id": "html_unescape",
+          "title": "HTML Unescape"
+        }
+      ],
+      "readme": "# Encode and Decode\n\nBase64, URL and HTML encoding of the selection or document, both ways.\n\nWorks on the selection, or on the whole document when nothing is selected:\n\n- **Base64 Encode**: what it does.\n- **Base64 Decode**: what it does.\n- **URL Encode**: what it does.\n- **URL Decode**: what it does.\n- **HTML Escape**: what it does.\n- **HTML Unescape**: what it does.\n\nReads and replaces the text you give it. Nothing else: no files, no\nnetwork.\n"
+    },
+    {
+      "id": "crc.sort-lines",
+      "name": "Sort Lines",
+      "version": "0.1.0",
+      "description": "Sort the selected lines, or the whole document, and remove duplicates.",
+      "authors": [
+        "crc"
+      ],
+      "license": "MIT OR Apache-2.0",
+      "icon": "sort-precedence",
+      "capabilities": [
+        "selection.read",
+        "selection.replace",
+        "document.read",
+        "document.edit"
+      ],
+      "commands": [
+        {
+          "id": "sort",
+          "title": "Sort Lines"
+        },
+        {
+          "id": "sort_reverse",
+          "title": "Sort Lines Descending"
+        },
+        {
+          "id": "unique",
+          "title": "Remove Duplicate Lines"
+        }
+      ],
+      "readme": "# Sort Lines\n\nThree commands on the selection, or on the whole document when nothing is\nselected:\n\n- **Sort Lines**: A to Z, by Unicode code point.\n- **Sort Lines Descending**: Z to A.\n- **Remove Duplicate Lines**: keeps the first of each, in order.\n\nReads and replaces the text you give it. Nothing else: no files, no\nnetwork.\n"
+    }
+  ]
+}
