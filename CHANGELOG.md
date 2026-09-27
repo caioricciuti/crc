@@ -2,6 +2,45 @@
 
 One entry per tag, written for people who use the editor.
 
+## v0.2.0-alpha.4, 2026-09-27
+
+A release of fixes: a full review of the code found close to two hundred
+problems, and all of them are fixed but one on the release process, left
+for later.
+
+- No more crashes from: pressing Up after going to a line inside a fold,
+  clicking right of a wrapped Chinese or Japanese line, a language server's
+  malformed reply, or an extension that declares its functions wrong.
+- Edits that could be lost or damaged are safe: formatting a CRLF file no
+  longer doubles its line endings, a crash-recovery file cut short is never
+  offered back, a settings file with one odd byte is no longer rewritten,
+  a rename from the language server is not applied over text typed since,
+  and saving a hard-linked file or a file in a read-only folder is safe.
+- Home is a page: typing there no longer makes an Untitled document.
+- A Source Control diff opens in a tab of its own, named after the file.
+- Git: staging a renamed file, fetches with a lot of output, diffs of
+  lines that start with `--`, conflicts shown as a plain diff, a new
+  repository's gutter, and repositories whose Git folder is elsewhere
+  (worktrees, a project inside a repository) all work.
+- With Source Control open, typing, Paste and Undo go to the document
+  until you click the commit message. Cmd-W in a split closes the pane,
+  not the window; a tab's close button works on any tab.
+- Much less waiting: find in large files, project search, references,
+  renames across many files, branch lists, big reloads, the Git gutter,
+  Markdown previews, symbols and undo no longer stall the window.
+- Rendering: long words and wide code in Markdown previews, selections of
+  empty lines, the scrollbar with wrapping or folds, split panes showing
+  two files, italic letters and CJK text while scrolling.
+- The terminal answers colour queries, sends F1-F12, keeps history when
+  the panel shrinks under full-screen programs, and a pasted wall of text
+  no longer freezes the editor.
+- .http requests are limited to http and https, and a body file must be in
+  the project.
+- Extensions run inside a tighter budget, and the registry cannot be
+  replayed with an older signed list.
+- crc no longer offers itself in Open With for every kind of file, only
+  for text and folders.
+
 ## v0.2.0-alpha.3, 2026-09-26
 
 - Extensions. They are WebAssembly run by crc's own interpreter, and each
