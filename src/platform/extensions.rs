@@ -58,6 +58,10 @@ pub struct Page {
     /// Whether the details have the editor column. Escape and a tab give
     /// the column back; the list stays in the sidebar.
     pub details: bool,
+    /// The README's first block shown: it scrolls under the wheel.
+    pub readme_scroll: usize,
+    /// Where the README was drawn, for the wheel.
+    pub readme_rect: Option<Viewport>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -72,6 +76,9 @@ pub enum Action {
     Cancel,
     /// Gives the editor column back; the list stays in the sidebar.
     Close,
+    /// Back to the page's home: what is installed and offered, and the
+    /// actions that are about all of them.
+    Home,
 }
 
 impl Action {
@@ -87,17 +94,18 @@ impl Action {
             Action::Confirm => "extensions.confirm".into(),
             Action::Cancel => "extensions.cancel".into(),
             Action::Close => "extensions.close".into(),
+            Action::Home => "extensions.home".into(),
         }
     }
 }
 
 impl Page {
     pub fn new(installed: Vec<Installed>) -> Page {
-        let selected = installed.first().map(|i| i.manifest.id.clone());
+        // Opens on its home, not on whichever extension came first.
         Page {
             installed,
             registry: Registry::Loading,
-            selected,
+            selected: None,
             confirm: None,
             busy: None,
             note: None,
@@ -105,7 +113,14 @@ impl Page {
             hits: Vec::new(),
             list_hits: Vec::new(),
             details: true,
+            readme_scroll: 0,
+            readme_rect: None,
         }
+    }
+
+    /// Scrolls the README by `blocks`, as the wheel over it asks.
+    pub fn scroll_readme(&mut self, blocks: isize) {
+        self.readme_scroll = self.readme_scroll.saturating_add_signed(blocks);
     }
 
     pub fn installed(&self, id: &str) -> Option<&Installed> {
@@ -191,21 +206,25 @@ fn button(
 
 /// `text` broken into lines that fit `width`, at spaces.
 fn wrap(atlas: &mut Atlas, text: &str, width: f32) -> Vec<String> {
+    // Measured a word at a time: the UI width of a whole line stops
+    // counting at 120 characters, so a long one never seemed to overflow.
+    let space = layout::ui_text_width(atlas, " ");
     let mut lines = Vec::new();
     for paragraph in text.lines() {
         let mut line = String::new();
+        let mut line_w = 0.0;
         for word in paragraph.split_whitespace() {
-            let candidate = if line.is_empty() {
-                word.to_owned()
-            } else {
-                format!("{line} {word}")
-            };
-            if !line.is_empty() && layout::ui_text_width(atlas, &candidate) > width {
+            let word_w = layout::ui_text_width(atlas, word);
+            if !line.is_empty() && line_w + space + word_w > width {
                 lines.push(std::mem::take(&mut line));
-                line = word.to_owned();
-            } else {
-                line = candidate;
+                line_w = 0.0;
             }
+            if !line.is_empty() {
+                line.push(' ');
+                line_w += space;
+            }
+            line.push_str(word);
+            line_w += word_w;
         }
         lines.push(line);
     }
@@ -261,22 +280,8 @@ pub fn draw_details(
     let right = rect.x + rect.width - PAD;
     let bottom = rect.y + rect.height - 12.0;
     let mut y = rect.y + 22.0;
-
-    // Header: the title, and the two actions that are always there.
-    text(out, atlas, x, y, 200.0, "Extensions", theme.text);
-    let mut bx = right;
-    for (label, action) in [
-        ("Close", Action::Close),
-        ("Refresh", Action::Refresh),
-        ("Install from Folder\u{2026}", Action::InstallFolder),
-    ] {
-        let w = layout::ui_text_width(atlas, label) + 24.0;
-        bx -= w;
-        let r = button(out, atlas, theme, bx, y - 4.0, label, false);
-        hits.push((r, action));
-        bx -= 8.0;
-    }
-    y += 26.0;
+    page.readme_rect = None;
+    let home = page.selected.is_none() && page.confirm.is_none();
     let status = match (&page.busy, &page.note, &page.registry) {
         (Some(busy), _, _) => busy.clone(),
         (None, Some(note), _) => note.clone(),
@@ -288,10 +293,37 @@ pub fn draw_details(
             entries.len()
         ),
     };
-    text(out, atlas, x, y, right - x, &status, dim);
-    y += 28.0;
-    layout::push_rect(out, atlas, [x, y], [right - x, 1.0], theme.hairline);
-    y += 12.0;
+    if home {
+        // The header is the home page's: the title, the count, and the
+        // actions that are about extensions in general.
+        text(out, atlas, x, y, 200.0, "Extensions", theme.text);
+        let mut bx = right;
+        for (label, action) in [
+            ("Close", Action::Close),
+            ("Refresh", Action::Refresh),
+            ("Install from Folder\u{2026}", Action::InstallFolder),
+        ] {
+            let w = layout::ui_text_width(atlas, label) + 24.0;
+            bx -= w;
+            let r = button(out, atlas, theme, bx, y - 4.0, label, false);
+            hits.push((r, action));
+            bx -= 8.0;
+        }
+        y += 26.0;
+        text(out, atlas, x, y, right - x, &status, dim);
+        y += 28.0;
+        layout::push_rect(out, atlas, [x, y], [right - x, 1.0], theme.hairline);
+        y += 12.0;
+    } else {
+        // One extension: a way back to the home, and what just happened
+        // (an install, an error) when something did.
+        let r = link(out, atlas, theme, x, y - 4.0, "\u{2039} Extensions");
+        hits.push((r, Action::Home));
+        if page.busy.is_some() || page.note.is_some() {
+            text(out, atlas, r.x + r.width + 16.0, y, right - x, &status, dim);
+        }
+        y += 34.0;
+    }
 
     // The details take the column; the list is in the sidebar.
     // Prose keeps a readable measure rather than the width of a wide window.
@@ -358,15 +390,14 @@ pub fn draw_details(
         return;
     }
     let Some(id) = page.selected.clone() else {
-        text(
-            out,
+        for line in wrap(
             atlas,
-            dx,
-            y,
+            "Extensions add commands to crc. Pick one in the list to see what it does and what it may touch. Installed ones run from the Extensions menu, from the editor's right-click menu, and from the palette.",
             detail_w,
-            "Pick an extension to see what it does and what it may touch.",
-            dim,
-        );
+        ) {
+            text(out, atlas, dx, y, detail_w, &line, dim);
+            y += 20.0;
+        }
         page.hits = hits;
         return;
     };
@@ -458,7 +489,7 @@ pub fn draw_details(
         dx,
         y,
         detail_w,
-        "Commands, in the palette and the Extensions menu:",
+        "Commands, in the Extensions menu, the right-click menu and the palette:",
         dim,
     );
     y += 22.0;
@@ -491,34 +522,65 @@ pub fn draw_details(
     if !readme.trim().is_empty() {
         y += 16.0;
         layout::push_rect(out, atlas, [dx, y], [detail_w, 1.0], theme.hairline);
-        y += 12.0;
-        for raw in readme.lines() {
-            // Plain text: headings brighter, `- ` items as bullets, bold
-            // markers dropped.
-            let heading = raw.starts_with('#');
-            let line = raw.trim_start_matches('#').trim().replace("**", "");
-            let line = match line.strip_prefix("- ") {
-                Some(item) => format!("\u{2022} {item}"),
-                None => line,
+        y += 4.0;
+        // The README as the Markdown preview draws a document: headings,
+        // lists, code, tables. It scrolls under the wheel.
+        if bottom > y + 40.0 {
+            let blocks = crate::markdown::parse_spanned(&readme);
+            page.readme_scroll = page.readme_scroll.min(blocks.len().saturating_sub(1));
+            let view = Viewport {
+                x: dx - 28.0,
+                y,
+                width: detail_w + 56.0,
+                height: bottom - y,
             };
-            for part in wrap(atlas, &line, detail_w) {
-                if y + 20.0 > bottom {
-                    break;
-                }
-                text(
-                    out,
-                    atlas,
-                    dx,
-                    y,
-                    detail_w,
-                    &part,
-                    if heading { theme.text } else { dim },
-                );
-                y += 20.0;
-            }
+            let mut md_hits = Vec::new();
+            layout::build_markdown_appending(
+                &blocks,
+                &readme,
+                None,
+                None,
+                page.readme_scroll,
+                atlas,
+                view,
+                theme,
+                out,
+                &mut md_hits,
+            );
+            page.readme_rect = Some(view);
         }
     }
     page.hits = hits;
+}
+
+/// A borderless text button, for the way back.
+fn link(
+    out: &mut Vec<GlyphInstance>,
+    atlas: &mut Atlas,
+    theme: &Theme,
+    x: f32,
+    y: f32,
+    label: &str,
+) -> Viewport {
+    let width = layout::ui_text_width(atlas, label) + 12.0;
+    let r = Viewport {
+        x: x - 6.0,
+        y,
+        width,
+        height: BUTTON_H,
+    };
+    layout::push_ui_text(
+        out,
+        atlas,
+        Viewport {
+            x,
+            width: width - 6.0,
+            ..r
+        },
+        label,
+        theme.accent,
+    );
+    r
 }
 
 /// The sidebar: installed extensions, then what the registry offers that is

@@ -9,7 +9,7 @@
 use crate::project::finder;
 use objc2::runtime::Sel;
 use objc2::sel;
-use objc2_app_kit::{NSApplication, NSEventModifierFlags, NSMenuItem};
+use objc2_app_kit::{NSApplication, NSEventModifierFlags, NSMenu, NSMenuItem};
 use objc2_foundation::MainThreadMarker;
 
 /// One menu item, as the palette shows it.
@@ -61,10 +61,30 @@ pub fn from_menu(mtm: MainThreadMarker, enabled: impl Fn(&NSMenuItem) -> bool) -
             continue;
         };
         let group = submenu.title().to_string();
-        for index in 0..submenu.numberOfItems() {
-            let Some(item) = submenu.itemAtIndex(index) else {
+        collect(&submenu, &group, &enabled, &mut commands);
+    }
+    commands
+}
+
+/// The commands in `menu`, and in the submenus inside it (an extension's
+/// commands sit under its name in the Extensions menu), grouped as
+/// "Extensions: Sort Lines" there.
+fn collect(
+    menu: &NSMenu,
+    group: &str,
+    enabled: &impl Fn(&NSMenuItem) -> bool,
+    commands: &mut Vec<Command>,
+) {
+    for index in 0..menu.numberOfItems() {
+        {
+            let Some(item) = menu.itemAtIndex(index) else {
                 continue;
             };
+            if let Some(inner) = item.submenu() {
+                let inner_group = format!("{group}: {}", item.title());
+                collect(&inner, &inner_group, enabled, commands);
+                continue;
+            }
             let Some(action) = item.action() else {
                 continue;
             };
@@ -82,7 +102,7 @@ pub fn from_menu(mtm: MainThreadMarker, enabled: impl Fn(&NSMenuItem) -> bool) -
             }
             commands.push(Command {
                 title: item.title().to_string(),
-                group: group.clone(),
+                group: group.to_owned(),
                 shortcut: shortcut(
                     &item.keyEquivalent().to_string(),
                     item.keyEquivalentModifierMask(),
@@ -93,7 +113,6 @@ pub fn from_menu(mtm: MainThreadMarker, enabled: impl Fn(&NSMenuItem) -> bool) -
             });
         }
     }
-    commands
 }
 
 /// A key equivalent as a menu shows it.

@@ -66,6 +66,7 @@ impl ChromeFrame {
         layout::build_breadcrumbs(
             buffer,
             &self.tree,
+            false,
             atlas,
             self.rects.breadcrumbs,
             theme,

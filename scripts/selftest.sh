@@ -758,6 +758,8 @@ key 35 cmd p
 text after.txt
 key 36
 dump $T/title-opened.out
+click @breadcrumb.0
+dump $T/title-crumb.out
 quit
 SCRIPT
 HOME="$T/titlehome" CRC_SELFTEST="$T/title-menu.script" "$BIN" "$T/personal-project-with-a-long-folder-name" 2> "$T/title-menu.err"
@@ -770,6 +772,10 @@ expect "$T/title-stale.out" finder_entries 1
 expect "$T/title-refreshed.out" finder_entries 2
 expect "$T/title-opened.out" tabs after.txt
 expect "$T/title-opened.out" key_handler_draws 0
+# The breadcrumb's file part lists the folder it is in.
+grep -q '^crumb_menu: .*/personal-project-with-a-long-folder-name$' "$T/title-crumb.out" \
+    || { echo "FAIL title-crumb: the breadcrumb did not offer its folder"; fail=1; }
+expect "$T/title-menu.out" crumb_menu none
 expect "$T/title-opened.out" window_title after.txt
 
 # A sidebar drag must never replace an existing entry, including a dangling
@@ -1538,6 +1544,9 @@ key 7 cmd,shift x
 wait 600
 wait 300
 dump $T/ext-open.out
+click @extensions.select.crc.sort-lines
+wait 200
+dump $T/ext-details.out
 click @extensions.install.crc.sort-lines
 wait 200
 dump $T/ext-confirm.out
@@ -1567,9 +1576,14 @@ dump $T/ext-whole.out
 key 7 cmd,shift x
 wait 600
 wait 300
+click @extensions.select.crc.sort-lines
+wait 200
 click @extensions.toggle.crc.sort-lines
 wait 200
 dump $T/ext-off.out
+click @extensions.home
+wait 200
+dump $T/ext-home.out
 click @extensions.folder
 wait 200
 dump $T/ext-folder.out
@@ -1582,10 +1596,13 @@ dump $T/ext-removed.out
 quit
 SCRIPT
 HOME="$T/exthome" CRC_EXT_REGISTRY="file://$T/extreg/" CRC_EXT_REGISTRY_KEY="$T/extreg/pub.pem" CRC_EXT_FOLDER="$T/extfolder" CRC_SELFTEST="$T/ext.script" "$BIN" "$T/extproj/notes.txt" 2> "$T/ext.err"
-expect "$T/ext-open.out" extensions "open selected=crc.sort-lines installed= registry=ready:crc.sort-lines confirm=- busy=- note=-"
-# Close, Refresh, Install from Folder, Install and the row in the sidebar:
-# each a pointing hand.
-expect "$T/ext-open.out" pointer_targets 5
+# The page opens on its home: the header with Close, Refresh and Install
+# from Folder, and the row in the sidebar, each a pointing hand.
+expect "$T/ext-open.out" extensions "open selected=- installed= registry=ready:crc.sort-lines confirm=- busy=- note=-"
+expect "$T/ext-open.out" pointer_targets 4
+# One extension: the way back, Install, and the row; no header.
+expect "$T/ext-details.out" extensions "open selected=crc.sort-lines installed= registry=ready:crc.sort-lines confirm=- busy=- note=-"
+expect "$T/ext-details.out" pointer_targets 3
 expect "$T/ext-confirm.out" extensions "open selected=crc.sort-lines installed= registry=ready:crc.sort-lines confirm=crc.sort-lines busy=- note=-"
 expect "$T/ext-installed.out" extensions "open selected=crc.sort-lines installed=crc.sort-lines:0.1.0:on:signed registry=ready:crc.sort-lines confirm=- busy=- note=Installed Sort Lines 0.1.0"
 expect "$T/ext-installed.out" ext_commands "Sort Lines|Sort Lines Descending|Remove Duplicate Lines"
@@ -1602,6 +1619,7 @@ expect_line "$T/ext-whole.out" 2 "fig"
 expect_line "$T/ext-whole.out" 3 "pear"
 expect "$T/ext-whole.out" message "removed 1 duplicate line"
 expect "$T/ext-off.out" ext_commands ""
+expect "$T/ext-home.out" extensions "open selected=- installed=crc.sort-lines:0.1.0:off:signed registry=ready:crc.sort-lines confirm=- busy=- note=Sort Lines is off"
 expect "$T/ext-folder.out" extensions "open selected=crc.sort-lines installed=crc.sort-lines:0.1.0:off:signed registry=ready:crc.sort-lines confirm=crc.sort-lines busy=- note=Sort Lines is off"
 expect "$T/ext-unsigned.out" extensions "open selected=crc.sort-lines installed=crc.sort-lines:0.1.0:off:unsigned registry=ready:crc.sort-lines confirm=- busy=- note=Installed Sort Lines 0.1.0, unsigned"
 expect "$T/ext-removed.out" extensions "open selected=crc.sort-lines installed= registry=ready:crc.sort-lines confirm=- busy=- note=Removed Sort Lines"

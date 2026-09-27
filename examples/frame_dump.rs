@@ -331,6 +331,7 @@ fn main() -> std::io::Result<()> {
     layout::build_breadcrumbs(
         docs.active(),
         &tree,
+        docs.is_home(),
         &mut renderer.atlas,
         chrome.breadcrumbs,
         &theme,
@@ -384,6 +385,7 @@ fn main() -> std::io::Result<()> {
         layout::build_breadcrumbs(
             docs.active(),
             &tree,
+            docs.is_home(),
             &mut renderer.atlas,
             chrome.breadcrumbs,
             &theme,

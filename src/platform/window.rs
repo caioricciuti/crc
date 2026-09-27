@@ -746,6 +746,10 @@ struct State {
     selftest: std::collections::VecDeque<Step>,
     /// Confirms that a scripted click reached the native project menu action.
     project_menu_requested: bool,
+    /// The folder a breadcrumb click would list, under the self-test.
+    crumb_menu_requested: Option<String>,
+    /// The paths behind the open breadcrumb menu's items, by tag.
+    crumb_paths: Vec<std::path::PathBuf>,
     /// Where the last scripted press was, for drags given relative to it.
     selftest_pointer: (f64, f64),
     /// Duration of the most recent scripted click through the AppKit handler.
@@ -1316,6 +1320,10 @@ define_class!(
                     self.activate(index);
                     return;
                 }
+                Some(Hit::Breadcrumb(index)) => {
+                    self.breadcrumb_menu(index, event);
+                    return;
+                }
                 Some(Hit::SidebarAction(slot)) => {
                     match slot {
                         0 => { if self.new_file() { self.request_redraw(); self.pump(); } }
@@ -1831,7 +1839,8 @@ define_class!(
                     Some(project_menu(mtm))
                 }
             } else {
-                Some(editor_context_menu(mtm))
+                let commands = self.ivars().state.borrow().ext_commands.clone();
+                Some(editor_context_menu(mtm, &commands))
             }
         }
 
@@ -1907,6 +1916,7 @@ define_class!(
                         | Hit::TerminalTab(_)
                         | Hit::TerminalClose(_)
                         | Hit::TerminalNew
+                        | Hit::Breadcrumb(_)
                 );
                 if pointing {
                     add(rect, &NSCursor::pointingHandCursor());
@@ -1971,6 +1981,22 @@ define_class!(
             if self.ivars().state.borrow().palette.is_some() {
                 self.palette_wheel(event);
                 return;
+            }
+            {
+                // An extension's README scrolls a block at a time.
+                let point = self.convertPoint_fromView(event.locationInWindow(), None);
+                let mut state = self.ivars().state.borrow_mut();
+                if let Some(page) = state.extensions.as_mut().filter(|p| p.details)
+                    && page.readme_rect.is_some_and(|r| r.contains(point.x as f32, point.y as f32))
+                {
+                    if lines != 0 {
+                        page.scroll_readme(lines.signum());
+                        drop(state);
+                        self.request_redraw();
+                        self.pump();
+                    }
+                    return;
+                }
             }
             {
                 let point = self.convertPoint_fromView(event.locationInWindow(), None);
@@ -2442,6 +2468,19 @@ define_class!(
         #[unsafe(method(openExtensions:))]
         fn action_open_extensions(&self, _sender: Option<&AnyObject>) {
             self.open_extensions();
+        }
+
+        #[unsafe(method(openBreadcrumbPath:))]
+        fn action_open_breadcrumb_path(&self, sender: Option<&AnyObject>) {
+            let tag = sender
+                .and_then(|s| s.downcast_ref::<NSMenuItem>())
+                .map_or(-1, |item| item.tag());
+            let path = usize::try_from(tag)
+                .ok()
+                .and_then(|i| self.ivars().state.borrow().crumb_paths.get(i).cloned());
+            if let Some(path) = path {
+                self.open_crumb_path(&path);
+            }
         }
 
         #[unsafe(method(runExtensionCommand:))]
@@ -4669,7 +4708,7 @@ impl EditorView {
                     )
                     .is_some();
                 let report = format!(
-                    "git_open: {}\ngit_focus: {}\ngit_diff: {}\ngit_pending: {}\ngit_changes: {}\ngit_staged: {}\ngit_hunks_staged: {}\ngit_hunks_working: {}\ngit_message: {}\nproject_menu_requested: {}\nlast_click_ms: {:.3}\nfinder_entries: {}\nsidebar_edit: {}\npalette_query: {}\npalette_first: {}\npalette_scroll: {}\npanes: {}\nfocused_pane: {}\nlsp: {}\ndiagnostics: {}\ncompletion: {}\nkey_handler_draws: {}\nwindow_title: {}\nshaping_pending: {}\ncaret_shaped: {}\nclaude: {}\nterminal: {}\n{}",
+                    "git_open: {}\ngit_focus: {}\ngit_diff: {}\ngit_pending: {}\ngit_changes: {}\ngit_staged: {}\ngit_hunks_staged: {}\ngit_hunks_working: {}\ngit_message: {}\nproject_menu_requested: {}\ncrumb_menu: {}\nlast_click_ms: {:.3}\nfinder_entries: {}\nsidebar_edit: {}\npalette_query: {}\npalette_first: {}\npalette_scroll: {}\npanes: {}\nfocused_pane: {}\nlsp: {}\ndiagnostics: {}\ncompletion: {}\nkey_handler_draws: {}\nwindow_title: {}\nshaping_pending: {}\ncaret_shaped: {}\nclaude: {}\nterminal: {}\n{}",
                     state.git_open,
                     state.git_focus,
                     diffing(&state),
@@ -4684,6 +4723,7 @@ impl EditorView {
                     state.git.hunk_counts().1,
                     state.git.message.rope,
                     state.project_menu_requested,
+                    state.crumb_menu_requested.as_deref().unwrap_or("none"),
                     state.last_selftest_click_ms,
                     state.finder.len(),
                     state
@@ -9262,6 +9302,77 @@ impl EditorView {
 
     /// A click on the icon strip. The panel the sidebar already shows hides
     /// the sidebar, and brings it back; any other panel is shown.
+    /// A click on a part of the breadcrumb path: what is in that folder,
+    /// or for the file itself, what is beside it, as a menu under it.
+    fn breadcrumb_menu(&self, index: usize, event: &NSEvent) {
+        let crumbs = {
+            let mut state = self.ivars().state.borrow_mut();
+            let rect = chrome_of(&state).breadcrumbs;
+            let State {
+                docs,
+                tree,
+                renderer,
+                ..
+            } = &mut *state;
+            layout::breadcrumb_segments(docs.active(), tree, &mut renderer.atlas, rect)
+        };
+        let Some(crumb) = crumbs.get(index) else {
+            return;
+        };
+        let (folder, current) = if crumb.path.is_dir() {
+            (crumb.path.clone(), None)
+        } else {
+            match crumb.path.parent() {
+                Some(parent) => (parent.to_path_buf(), Some(crumb.path.clone())),
+                None => return,
+            }
+        };
+        if self.ivars().testing {
+            // A real popup runs its own event loop, which a script cannot
+            // step past; the dump says which folder it would list.
+            self.ivars().state.borrow_mut().crumb_menu_requested =
+                Some(folder.display().to_string());
+            return;
+        }
+        let mtm = MainThreadMarker::from(self);
+        let mut paths = Vec::new();
+        let menu = crumb_folder_menu(mtm, &folder, current.as_deref(), 1, &mut paths);
+        self.ivars().state.borrow_mut().crumb_paths = paths;
+        let _ = event;
+        let at = NSPoint::new(
+            crumb.rect.x as f64,
+            (crumb.rect.y + crumb.rect.height) as f64,
+        );
+        menu.popUpMenuPositioningItem_atLocation_inView(None, at, Some(self));
+    }
+
+    /// Opens a file picked from a breadcrumb menu, or shows a folder in the
+    /// Explorer.
+    fn open_crumb_path(&self, path: &Path) {
+        if path.is_dir() {
+            let explorer = {
+                let state = self.ivars().state.borrow();
+                state.extensions.is_none() && !state.git_open
+            };
+            if !explorer {
+                self.activate(0);
+            }
+            let mut state = self.ivars().state.borrow_mut();
+            state.sidebar = true;
+            state.tree.reveal(path);
+            let rows = chrome_of(&state).sidebar.map_or(0, layout::sidebar_rows);
+            state.tree.scroll_to_selection(rows);
+            drop(state);
+        } else {
+            self.load_path(&path.to_string_lossy());
+            self.sync_title();
+            self.reparse();
+            self.ivars().state.borrow_mut().tree.reveal(path);
+        }
+        self.request_redraw();
+        self.pump();
+    }
+
     fn activate(&self, index: usize) {
         let (showing, current) = {
             let state = self.ivars().state.borrow();
@@ -9340,7 +9451,7 @@ impl EditorView {
                 if page.selected.as_ref().is_some_and(|id| {
                     !installed.iter().any(|i| &i.manifest.id == id) && page.available(id).is_none()
                 }) {
-                    page.selected = installed.first().map(|i| i.manifest.id.clone());
+                    page.selected = None;
                 }
                 page.installed = installed;
             }
@@ -9354,7 +9465,18 @@ impl EditorView {
             Action::Select(id) => {
                 let mut state = self.ivars().state.borrow_mut();
                 if let Some(page) = &mut state.extensions {
+                    if page.selected.as_ref() != Some(&id) {
+                        page.readme_scroll = 0;
+                    }
                     page.selected = Some(id);
+                    page.confirm = None;
+                    page.details = true;
+                }
+            }
+            Action::Home => {
+                let mut state = self.ivars().state.borrow_mut();
+                if let Some(page) = &mut state.extensions {
+                    page.selected = None;
                     page.confirm = None;
                     page.details = true;
                 }
@@ -9549,9 +9671,7 @@ impl EditorView {
             while menu.numberOfItems() > 2 {
                 menu.removeItemAtIndex(2);
             }
-            for (tag, command) in commands.iter().enumerate() {
-                let item = menu_item(mtm, &command.title, sel!(runExtensionCommand:));
-                item.setTag(tag as isize);
+            for item in extension_items(mtm, &commands) {
                 menu.addItem(&item);
             }
         }
@@ -9643,11 +9763,6 @@ impl EditorView {
                     Ok(entries) => crate::platform::extensions::Registry::Ready(entries),
                     Err(e) => crate::platform::extensions::Registry::Failed(e),
                 };
-                if page.selected.is_none()
-                    && let crate::platform::extensions::Registry::Ready(entries) = &page.registry
-                {
-                    page.selected = entries.first().map(|e| e.manifest.id.clone());
-                }
             }
             self.ivars().needs_redraw.set(true);
         }
@@ -12661,6 +12776,7 @@ impl EditorView {
             layout::build_breadcrumbs(
                 buffer,
                 tree,
+                home,
                 &mut renderer.atlas,
                 breadcrumb_rect,
                 theme,
@@ -14251,6 +14367,7 @@ fn draw_other_pane(
     layout::build_breadcrumbs(
         buffer,
         tree,
+        store.docs.is_home(),
         &mut renderer.atlas,
         rects.breadcrumbs,
         theme,
@@ -14401,6 +14518,7 @@ fn frame_of(state: &mut State) -> Frame {
         tab_hits,
         sidebar_edit,
         extensions,
+        diff_tab,
         ..
     } = state;
     for (index, item) in layout::activity_items(chrome.activity)
@@ -14500,6 +14618,17 @@ fn frame_of(state: &mut State) -> Frame {
         );
     }
     frame.push(Hit::TabStrip, chrome.tabs);
+    if !covered && !docs.is_home() && *diff_tab != Some(docs.active().id()) {
+        let crumbs = layout::breadcrumb_segments(
+            docs.active(),
+            tree,
+            &mut renderer.atlas,
+            chrome.breadcrumbs,
+        );
+        for (index, crumb) in crumbs.into_iter().enumerate() {
+            frame.push(Hit::Breadcrumb(index), crumb.rect);
+        }
+    }
     if let Some(strip) = chrome.response
         && let Some(view) = responses.get(&docs.active().id())
     {
@@ -14958,6 +15087,75 @@ fn project_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
     menu
 }
 
+/// What is in `folder`, for a breadcrumb: folders first, then files, by
+/// name. A file opens; a folder is a submenu of its own, `depth` levels
+/// down, and below that shows the folder in the Explorer. Each item's tag
+/// indexes `paths`.
+fn crumb_folder_menu(
+    mtm: MainThreadMarker,
+    folder: &Path,
+    current: Option<&Path>,
+    depth: usize,
+    paths: &mut Vec<std::path::PathBuf>,
+) -> Retained<NSMenu> {
+    const LIMIT: usize = 200;
+    let menu = NSMenu::new(mtm);
+    menu.setAllowsContextMenuPlugIns(false);
+    let add = |menu: &NSMenu, title: &str, path: &Path, paths: &mut Vec<std::path::PathBuf>| {
+        let item = menu_item(mtm, title, sel!(openBreadcrumbPath:));
+        item.setTag(paths.len() as isize);
+        paths.push(path.to_path_buf());
+        menu.addItem(&item);
+        item
+    };
+    add(&menu, "Reveal in Sidebar", folder, paths);
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
+    let mut entries: Vec<(bool, String, std::path::PathBuf)> = std::fs::read_dir(folder)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name == ".git" || name == ".DS_Store" {
+                return None;
+            }
+            let dir = entry.file_type().ok()?.is_dir();
+            Some((dir, name, entry.path()))
+        })
+        .collect();
+    entries.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase()))
+    });
+    let total = entries.len();
+    for (dir, name, path) in entries.into_iter().take(LIMIT) {
+        if dir && depth > 0 {
+            let holder = menu_item(mtm, &name, sel!(openBreadcrumbPath:));
+            holder.setTag(paths.len() as isize);
+            paths.push(path.clone());
+            let sub = crumb_folder_menu(mtm, &path, current, depth - 1, paths);
+            holder.setSubmenu(Some(&sub));
+            menu.addItem(&holder);
+        } else {
+            let item = add(&menu, &name, &path, paths);
+            if current == Some(path.as_path()) {
+                let _: () = unsafe { msg_send![&*item, setState: 1isize] };
+            }
+        }
+    }
+    if total > LIMIT {
+        let more = menu_item(
+            mtm,
+            &format!("{} more\u{2026}", total - LIMIT),
+            sel!(openBreadcrumbPath:),
+        );
+        more.setTag(paths.len() as isize);
+        paths.push(folder.to_path_buf());
+        menu.addItem(&more);
+    }
+    menu
+}
+
 fn sidebar_item_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
     let menu = NSMenu::new(mtm);
     menu.setAllowsContextMenuPlugIns(false);
@@ -14971,7 +15169,7 @@ fn sidebar_item_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
     menu
 }
 
-fn editor_context_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
+fn editor_context_menu(mtm: MainThreadMarker, commands: &[ExtCommand]) -> Retained<NSMenu> {
     let menu = NSMenu::new(mtm);
     menu.addItem(&menu_item(mtm, "Cut", sel!(cut:)));
     menu.addItem(&menu_item(mtm, "Copy", sel!(copy:)));
@@ -14980,7 +15178,59 @@ fn editor_context_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
     menu.addItem(&menu_item(mtm, "Select All", sel!(selectAll:)));
     menu.addItem(&NSMenuItem::separatorItem(mtm));
     menu.addItem(&menu_item(mtm, "Find…", sel!(performFindPanelAction:)));
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
+    // Extensions, right where the text is: each installed extension, then
+    // its commands, run on the selection (or the document) under the
+    // pointer. Two clicks rather than the palette and a typed name.
+    let extensions = NSMenu::new(mtm);
+    extensions.setTitle(&NSString::from_str("Extensions"));
+    let items = extension_items(mtm, commands);
+    if items.is_empty() {
+        let none = menu_item(mtm, "No extensions installed", sel!(openExtensions:));
+        none.setEnabled(false);
+        extensions.addItem(&none);
+    }
+    for item in items {
+        extensions.addItem(&item);
+    }
+    extensions.addItem(&NSMenuItem::separatorItem(mtm));
+    extensions.addItem(&menu_item(mtm, "Manage Extensions…", sel!(openExtensions:)));
+    let holder = menu_item(mtm, "Extensions", sel!(openExtensions:));
+    holder.setSubmenu(Some(&extensions));
+    menu.addItem(&holder);
     menu
+}
+
+/// One item per enabled extension, named for it, holding its commands; each
+/// command's tag is its index in `commands`, which `runExtensionCommand:`
+/// runs. The menu bar's Extensions menu and the editor's context menu both
+/// list them this way.
+fn extension_items(mtm: MainThreadMarker, commands: &[ExtCommand]) -> Vec<Retained<NSMenuItem>> {
+    let mut items: Vec<(String, Retained<NSMenu>)> = Vec::new();
+    for (tag, command) in commands.iter().enumerate() {
+        let id = &command.installed.manifest.id;
+        let at = match items.iter().position(|(seen, _)| seen == id) {
+            Some(at) => at,
+            None => {
+                let submenu = NSMenu::new(mtm);
+                submenu.setTitle(&NSString::from_str(&command.installed.manifest.name));
+                items.push((id.clone(), submenu));
+                items.len() - 1
+            }
+        };
+        let item = menu_item(mtm, &command.title, sel!(runExtensionCommand:));
+        item.setTag(tag as isize);
+        items[at].1.addItem(&item);
+    }
+    items
+        .into_iter()
+        .map(|(_, submenu)| {
+            let holder = NSMenuItem::new(mtm);
+            holder.setTitle(&submenu.title());
+            holder.setSubmenu(Some(&submenu));
+            holder
+        })
+        .collect()
 }
 
 /// Builds the menu bar.
@@ -15464,6 +15714,8 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         marked_caret: 0,
         selftest: std::collections::VecDeque::new(),
         project_menu_requested: false,
+        crumb_menu_requested: None,
+        crumb_paths: Vec::new(),
         last_selftest_click_ms: 0.0,
         selftest_pointer: (0.0, 0.0),
         cursor_rects_for: None,

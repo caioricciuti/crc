@@ -3530,6 +3530,8 @@ pub enum Hit {
     /// Resolves conflict `n` of the active document one way, from its
     /// marker line or its header in the columns.
     ConflictTake(usize, crate::project::conflict::Take),
+    /// A part of the breadcrumb path, left to right.
+    Breadcrumb(usize),
     Find,
     Text,
     Status,
@@ -3576,6 +3578,7 @@ impl Hit {
             .into(),
             Hit::ConflictResolve => "conflict.resolve".into(),
             Hit::ConflictTake(i, take) => format!("conflict.{}.{i}", take.name()),
+            Hit::Breadcrumb(i) => format!("breadcrumb.{i}"),
             Hit::Find => "find".into(),
             Hit::Text => "text".into(),
             Hit::Status => "status".into(),
@@ -5601,40 +5604,133 @@ pub fn build_response_strip(
     );
 }
 
+/// One part of the breadcrumb path: the folder or file it names, and
+/// where its label is, so a click can offer what is in it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Crumb {
+    pub path: std::path::PathBuf,
+    pub label: String,
+    pub rect: Viewport,
+}
+
+const CRUMB_SEPARATOR: &str = "  \u{203a}  ";
+
+/// The breadcrumb row's parts, left to right, as drawn: relative to the
+/// project root when the file is in it. Parts past the row's right edge
+/// are left out.
+pub fn breadcrumb_segments(
+    buffer: &Buffer,
+    tree: &Tree,
+    atlas: &mut Atlas,
+    rect: Viewport,
+) -> Vec<Crumb> {
+    let Some(path) = buffer.path.as_deref() else {
+        return Vec::new();
+    };
+    let within = |root: &std::path::Path, path: &std::path::Path| {
+        path.strip_prefix(root)
+            .ok()
+            .map(|rel| (root.to_path_buf(), rel.to_path_buf()))
+    };
+    // The root and the file may name the same folder differently (a
+    // symlinked /var and /private/var); only then is it worth asking the
+    // file system.
+    let found = tree.root().and_then(|root| {
+        within(root, path).or_else(|| {
+            let root = std::fs::canonicalize(root).ok()?;
+            let path = std::fs::canonicalize(path).ok()?;
+            within(&root, &path)
+        })
+    });
+    let (mut base, relative) =
+        found.unwrap_or_else(|| (std::path::PathBuf::new(), path.to_path_buf()));
+    let separator = ui_text_width(atlas, CRUMB_SEPARATOR);
+    let right = rect.x + rect.width - 20.0;
+    let mut x = rect.x + 20.0;
+    let mut crumbs = Vec::new();
+    for part in relative.components() {
+        base.push(part);
+        let label = part.as_os_str().to_string_lossy().into_owned();
+        let width = ui_text_width(atlas, &label);
+        if x >= right {
+            break;
+        }
+        crumbs.push(Crumb {
+            path: base.clone(),
+            label,
+            rect: Viewport {
+                x: x - 4.0,
+                width: (width + 8.0).min(right - x + 4.0),
+                ..rect
+            },
+        });
+        x += width + separator;
+    }
+    crumbs
+}
+
+/// The row under the tabs naming the open file, each part a target. Home
+/// has no file, so the row is empty there.
 pub fn build_breadcrumbs(
     buffer: &Buffer,
     tree: &Tree,
+    home: bool,
     atlas: &mut Atlas,
     rect: Viewport,
     theme: &Theme,
     out: &mut Vec<GlyphInstance>,
 ) {
-    let path = buffer.path.as_deref();
-    let label = path
-        .map(|path| {
-            tree.root()
-                .and_then(|root| path.strip_prefix(root).ok())
-                .unwrap_or(path)
-        })
-        .map(|path| {
-            path.components()
-                .map(|part| part.as_os_str().to_string_lossy())
-                .collect::<Vec<_>>()
-                .join("  ›  ")
-        })
-        .or_else(|| buffer.label.clone())
-        .unwrap_or_else(|| "Untitled".into());
-    push_ui_text(
-        out,
-        atlas,
-        Viewport {
-            x: rect.x + 20.0,
-            width: (rect.width - 40.0).max(0.0),
-            ..rect
-        },
-        &label,
-        theme.status_text,
-    );
+    let crumbs = breadcrumb_segments(buffer, tree, atlas, rect);
+    if crumbs.is_empty() && !home {
+        let label = buffer.label.clone().unwrap_or_else(|| "Untitled".into());
+        push_ui_text(
+            out,
+            atlas,
+            Viewport {
+                x: rect.x + 20.0,
+                width: (rect.width - 40.0).max(0.0),
+                ..rect
+            },
+            &label,
+            theme.status_text,
+        );
+    }
+    let right = rect.x + rect.width - 20.0;
+    let last = crumbs.len().saturating_sub(1);
+    for (index, crumb) in crumbs.iter().enumerate() {
+        let x = crumb.rect.x + 4.0;
+        // The file itself reads brighter than the folders leading to it.
+        let color = if index == last {
+            theme.text
+        } else {
+            theme.status_text
+        };
+        push_ui_text(
+            out,
+            atlas,
+            Viewport {
+                x,
+                width: (right - x).max(0.0),
+                ..rect
+            },
+            &crumb.label,
+            color,
+        );
+        if index < last {
+            let sx = x + ui_text_width(atlas, &crumb.label);
+            push_ui_text(
+                out,
+                atlas,
+                Viewport {
+                    x: sx,
+                    width: (right - sx).max(0.0),
+                    ..rect
+                },
+                CRUMB_SEPARATOR,
+                theme.gutter_text,
+            );
+        }
+    }
     push_rect(
         out,
         atlas,
