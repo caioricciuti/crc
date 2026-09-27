@@ -4131,80 +4131,20 @@ pub fn sidebar_row_at(tree: &Tree, _atlas: &Atlas, viewport: Viewport, y: f32) -
     (index < tree.len()).then_some(index)
 }
 
-#[derive(Clone, Debug)]
-pub struct MarkdownHit {
-    pub rect: Viewport,
-    pub lines: std::ops::Range<usize>,
-    pub copy: Option<(Viewport, String)>,
-    /// Source byte offset and screen position for each visible caret stop.
-    pub caret_stops: Vec<(usize, [f32; 2])>,
-}
-
-/// Renders parsed Markdown into `out`, replacing its contents.
-///
-/// One monospace atlas means structure is carried by colour, indentation and
-/// spacing rather than by type size and weight. That is a real limitation:
-/// proportional text with real bold and heading sizes needs a second atlas,
-/// which is its own piece of work. What is here is legible and honest about
-/// what it is.
-#[allow(clippy::too_many_arguments)]
-pub fn build_markdown(
-    blocks: &[SpannedBlock],
-    source: &str,
-    active: Option<usize>,
-    copied_block: Option<usize>,
-    scroll: usize,
-    atlas: &mut Atlas,
-    viewport: Viewport,
-    theme: &Theme,
-    out: &mut Vec<GlyphInstance>,
-    hits: &mut Vec<MarkdownHit>,
-) -> usize {
-    out.clear();
-    atlas.begin_frame();
-    build_markdown_appending(
-        blocks,
-        source,
-        active,
-        copied_block,
-        scroll,
-        atlas,
-        viewport,
-        theme,
-        out,
-        hits,
-    )
-}
-
-/// [`build_markdown`] without clearing the frame first. What it adds is
-/// cut to `viewport`: a code line wider than the pane, or a block's
+/// Draws parsed Markdown, read only, from block `scroll`, appending to
+/// `out`: an extension's README. What it adds is cut to `viewport`: a code line wider than the pane, or a block's
 /// background, must not draw into the next pane or over the status bar.
 #[allow(clippy::too_many_arguments)]
 pub fn build_markdown_appending(
     blocks: &[SpannedBlock],
-    source: &str,
-    active: Option<usize>,
-    copied_block: Option<usize>,
     scroll: usize,
     atlas: &mut Atlas,
     viewport: Viewport,
     theme: &Theme,
     out: &mut Vec<GlyphInstance>,
-    hits: &mut Vec<MarkdownHit>,
 ) -> usize {
     let first = out.len();
-    let rows = build_markdown_unclipped(
-        blocks,
-        source,
-        active,
-        copied_block,
-        scroll,
-        atlas,
-        viewport,
-        theme,
-        out,
-        hits,
-    );
+    let rows = build_markdown_unclipped(blocks, scroll, atlas, viewport, theme, out);
     let (left, right) = (viewport.x, viewport.x + viewport.width);
     let (top, bottom) = (viewport.y, viewport.y + viewport.height);
     for quad in &mut out[first..] {
@@ -4217,18 +4157,13 @@ pub fn build_markdown_appending(
 #[allow(clippy::too_many_arguments)]
 fn build_markdown_unclipped(
     blocks: &[SpannedBlock],
-    source: &str,
-    active: Option<usize>,
-    copied_block: Option<usize>,
     scroll: usize,
     atlas: &mut Atlas,
     viewport: Viewport,
     theme: &Theme,
     out: &mut Vec<GlyphInstance>,
-    hits: &mut Vec<MarkdownHit>,
 ) -> usize {
     atlas.finish_shaping_frame();
-    hits.clear();
     let m = atlas.metrics;
     let (cell_w, cell_h) = atlas.cell_size();
     let solid = atlas.solid_uv();
@@ -4245,94 +4180,11 @@ fn build_markdown_unclipped(
     let bottom = viewport.y + viewport.height;
     let mut rows_drawn = 0usize;
 
-    let line_starts: Vec<usize> = std::iter::once(0)
-        .chain(source.match_indices('\n').map(|(at, _)| at + 1))
-        .collect();
-    // Line `i` of the source, without its line break, as `str::lines` has
-    // it; only the lines of visible blocks are ever asked for.
-    let source_line = |i: usize| -> &str {
-        let Some(&start) = line_starts.get(i) else {
-            return "";
-        };
-        let end = line_starts
-            .get(i + 1)
-            .map_or(source.len(), |&next| next - 1);
-        let line = &source[start..end.max(start)];
-        line.strip_suffix('\r').unwrap_or(line)
-    };
-    let active_line = active.map(|at| {
-        source[..at.min(source.len())]
-            .bytes()
-            .filter(|b| *b == b'\n')
-            .count()
-    });
     for spanned in blocks.iter().skip(scroll) {
         if y >= bottom {
             break;
         }
-
-        let start_y = y;
-        let mut copy = None;
-        let mut visual: Option<(String, Vec<[f32; 2]>)> = None;
-        let mut visual_range: Option<std::ops::Range<usize>> = None;
         let block = &spanned.block;
-        let pretty_editable = matches!(
-            block,
-            Block::Heading { .. }
-                | Block::Paragraph { .. }
-                | Block::ListItem { .. }
-                | Block::Quote { .. }
-                | Block::Code { .. }
-                | Block::TableRow { .. }
-        );
-        if let Some(line) =
-            active_line.filter(|line| spanned.lines.contains(line) && !pretty_editable)
-        {
-            let raw: Vec<&str> = spanned.lines.clone().map(source_line).collect();
-            let height = m.line_height * raw.len().max(1) as f32 + m.line_height * 0.4;
-            out.push(GlyphInstance {
-                pos: [left, y],
-                size: [usable, height],
-                uv: solid,
-                color: theme.md_code_background,
-                ..Default::default()
-            });
-            y += m.line_height * 0.2;
-            for (index, text) in raw.iter().enumerate() {
-                push_text(out, atlas, left + m.advance, y, text, theme.text);
-                if spanned.lines.start + index == line {
-                    // From the table: summing line lengths plus one is a
-                    // byte short per CRLF line.
-                    let line_start = line_starts.get(line).copied().unwrap_or(0);
-                    let column = source[line_start..active.unwrap_or(line_start)]
-                        .chars()
-                        .count();
-                    push_rect(
-                        out,
-                        atlas,
-                        [left + m.advance * (column as f32 + 1.0), y],
-                        [hairline.max(1.0), m.line_height],
-                        theme.cursor,
-                    );
-                }
-                y += m.line_height;
-            }
-            y += m.line_height * 0.2;
-            hits.push(MarkdownHit {
-                rect: Viewport {
-                    x: left,
-                    y: start_y,
-                    width: usable,
-                    height: y - start_y,
-                },
-                lines: spanned.lines.clone(),
-                copy: None,
-                caret_stops: Vec::new(),
-            });
-            rows_drawn += 1;
-            continue;
-        }
-
         match block {
             Block::Blank => {
                 y += m.snap(m.line_height * 0.5);
@@ -4358,7 +4210,7 @@ fn build_markdown_unclipped(
                 // not monospace bitmaps stretched by the quad size, which is
                 // what made them soft.
                 let size = MD_BODY_PT * md_heading_scale(*level);
-                let (text, positions, end) = draw_prose(
+                let (_, _, end) = draw_prose(
                     out,
                     atlas,
                     runs,
@@ -4371,7 +4223,6 @@ fn build_markdown_unclipped(
                     Some(theme.md_heading),
                     bottom,
                 );
-                visual = Some((text, positions));
                 y = end;
 
                 // A rule under the top two levels, as a document would have.
@@ -4389,7 +4240,7 @@ fn build_markdown_unclipped(
             }
 
             Block::Paragraph { runs } => {
-                let (text, positions, end) = draw_prose(
+                let (_, _, end) = draw_prose(
                     out,
                     atlas,
                     runs,
@@ -4402,7 +4253,6 @@ fn build_markdown_unclipped(
                     None,
                     bottom,
                 );
-                visual = Some((text, positions));
                 y = end;
                 rows_drawn += 1;
             }
@@ -4413,7 +4263,7 @@ fn build_markdown_unclipped(
                 // nested quote reads as nested instead of showing a literal
                 // ">" in the text.
                 let indent = MD_QUOTE_INDENT * (*depth as f32 + 1.0);
-                let (text, positions, end) = draw_prose(
+                let (_, _, end) = draw_prose(
                     out,
                     atlas,
                     runs,
@@ -4426,7 +4276,6 @@ fn build_markdown_unclipped(
                     Some(theme.syn_comment),
                     bottom,
                 );
-                visual = Some((text, positions));
                 // One bar per level, each spanning however many rows the text
                 // wrapped onto.
                 for level in 0..=*depth {
@@ -4455,74 +4304,14 @@ fn build_markdown_unclipped(
                 if !lang.is_empty() {
                     push_text(out, atlas, left + m.advance, y, lang, theme.gutter_text);
                 }
-                let copied = copied_block == Some(spanned.lines.start);
-                let label = if copied { "✓ Copied" } else { "⧉ Copy" };
-                let button_width = 10.0 * m.advance;
-                let copy_x = left + usable - button_width;
-                push_rect(
-                    out,
-                    atlas,
-                    [copy_x, y],
-                    [button_width, m.line_height],
-                    theme.tab_hover,
-                );
-                push_text(
-                    out,
-                    atlas,
-                    copy_x + m.advance,
-                    y,
-                    label,
-                    if copied {
-                        theme.syn_string
-                    } else {
-                        theme.accent
-                    },
-                );
-                copy = Some((
-                    Viewport {
-                        x: copy_x,
-                        y,
-                        width: button_width,
-                        height: m.line_height,
-                    },
-                    lines.join("\n"),
-                ));
                 y += m.line_height;
-                let mut shown = String::new();
-                let mut positions = Vec::new();
-                let mut last_x = left + m.advance;
-                let mut last_y = y;
-                for (index, line) in lines.iter().enumerate() {
+                for line in lines {
                     if y >= bottom {
                         break;
                     }
                     push_text(out, atlas, left + m.advance, y, line, theme.syn_string);
-                    let mut column = 0usize;
-                    for ch in line.chars() {
-                        positions.push([left + m.advance * (column + 1) as f32, y]);
-                        shown.push(ch);
-                        column += display_width(ch);
-                    }
-                    last_x = left + m.advance * (column + 1) as f32;
-                    last_y = y;
-                    if index + 1 < lines.len() {
-                        positions.push([last_x, y]);
-                        shown.push('\n');
-                    }
                     y += m.line_height;
                 }
-                positions.push([last_x, last_y]);
-                visual = Some((shown, positions));
-                let opening = {
-                    let trimmed = source_line(spanned.lines.start).trim_start();
-                    trimmed.starts_with("```") || trimmed.starts_with("~~~")
-                };
-                let first_body = spanned.lines.start + usize::from(opening);
-                let after_body = first_body + lines.len();
-                visual_range = Some(
-                    *line_starts.get(first_body).unwrap_or(&source.len())
-                        ..*line_starts.get(after_body).unwrap_or(&source.len()),
-                );
                 y += m.line_height * 0.2;
                 rows_drawn += 1;
             }
@@ -4542,7 +4331,7 @@ fn build_markdown_unclipped(
                 };
                 push_text(out, atlas, indent, y, &marker, theme.accent);
                 let text_x = indent + marker.chars().count() as f32 * m.advance;
-                let (text, positions, end) = draw_prose(
+                let (_, _, end) = draw_prose(
                     out,
                     atlas,
                     runs,
@@ -4555,7 +4344,6 @@ fn build_markdown_unclipped(
                     None,
                     bottom,
                 );
-                visual = Some((text, positions));
                 y = end;
                 rows_drawn += 1;
             }
@@ -4566,9 +4354,6 @@ fn build_markdown_unclipped(
                 // deliberately does not give us.
                 let per = (columns / cells.len().max(1)).max(4);
                 let mut x = left;
-                let mut shown = String::new();
-                let mut positions = Vec::new();
-                let mut last_x = x;
                 for cell in cells {
                     let color = if *header {
                         Some(theme.md_heading)
@@ -4576,20 +4361,8 @@ fn build_markdown_unclipped(
                         None
                     };
                     draw_runs(out, atlas, cell, x, y, per.saturating_sub(1), theme, color);
-                    let mut column = 0usize;
-                    for ch in cell.iter().flat_map(|run| run.text.chars()) {
-                        if column >= per.saturating_sub(1) {
-                            break;
-                        }
-                        positions.push([x + column as f32 * m.advance, y]);
-                        shown.push(ch);
-                        column += display_width(ch);
-                    }
-                    last_x = x + column as f32 * m.advance;
                     x += per as f32 * m.advance;
                 }
-                positions.push([last_x, y]);
-                visual = Some((shown, positions));
                 y += m.line_height;
                 if *header {
                     out.push(GlyphInstance {
@@ -4604,49 +4377,6 @@ fn build_markdown_unclipped(
                 rows_drawn += 1;
             }
         }
-        let caret_stops = visual
-            .map(|(text, positions)| {
-                let range = visual_range.unwrap_or_else(|| {
-                    *line_starts
-                        .get(spanned.lines.start)
-                        .unwrap_or(&source.len())
-                        ..*line_starts.get(spanned.lines.end).unwrap_or(&source.len())
-                });
-                let offsets = crate::markdown::source_offsets_in_range(source, range, &text);
-                let stops: Vec<_> = offsets.into_iter().zip(positions).collect();
-                if let Some(at) = active
-                    && active_line.is_some_and(|line| spanned.lines.contains(&line))
-                {
-                    let position = stops
-                        .iter()
-                        .take_while(|(offset, _)| *offset <= at)
-                        .last()
-                        .or_else(|| stops.first())
-                        .map(|(_, point)| *point);
-                    if let Some([x, y]) = position {
-                        push_rect(
-                            out,
-                            atlas,
-                            [x, y],
-                            [hairline.max(1.0), m.line_height],
-                            theme.cursor,
-                        );
-                    }
-                }
-                stops
-            })
-            .unwrap_or_default();
-        hits.push(MarkdownHit {
-            rect: Viewport {
-                x: left,
-                y: start_y,
-                width: usable,
-                height: (y - start_y).max(m.line_height * 0.5),
-            },
-            lines: spanned.lines.clone(),
-            copy,
-            caret_stops,
-        });
         let _ = (cell_w, cell_h, glyph_dy);
     }
 
@@ -6878,25 +6608,14 @@ mod tests {
         let mut atlas = atlas();
         let source = format!("```\n{}\n```\n", "x".repeat(400));
         let blocks = crate::markdown::parse_spanned(&source);
-        let (mut glyphs, mut hits) = (Vec::new(), Vec::new());
+        let mut glyphs = Vec::new();
         let view = Viewport {
             x: 100.0,
             y: 50.0,
             width: 300.0,
             height: 200.0,
         };
-        build_markdown(
-            &blocks,
-            &source,
-            None,
-            None,
-            0,
-            &mut atlas,
-            view,
-            &Theme::default(),
-            &mut glyphs,
-            &mut hits,
-        );
+        build_markdown_appending(&blocks, 0, &mut atlas, view, &Theme::default(), &mut glyphs);
         assert!(!glyphs.is_empty());
         for quad in &glyphs {
             assert!(
@@ -6916,79 +6635,18 @@ mod tests {
         let url = format!("https://example.invalid/{}", "a".repeat(700));
         let source = format!("{url} after\n");
         let blocks = crate::markdown::parse_spanned(&source);
-        let (mut glyphs, mut hits) = (Vec::new(), Vec::new());
-        build_markdown(
-            &blocks,
-            &source,
-            None,
-            None,
-            0,
-            &mut atlas,
-            Viewport::new(800.0, 2000.0),
-            &Theme::default(),
-            &mut glyphs,
-            &mut hits,
-        );
-        let stops = &hits[0].caret_stops;
-        // The word wraps over several rows, and "after" comes after it
-        // rather than over its first letters.
-        let rows: std::collections::BTreeSet<i64> =
-            stops.iter().map(|(_, p)| p[1] as i64).collect();
-        assert!(rows.len() > 2, "the long word wraps");
-        let last = stops.last().unwrap().1;
-        assert!(last[1] > stops[0].1[1], "after is below the start");
-    }
-
-    #[test]
-    fn markdown_code_has_a_copy_target_and_live_block_keeps_other_blocks_rendered() {
-        let mut atlas = atlas();
-        let source = "# Title\n\n```rs\nlet x = 1;\n```\n\nAfter\n";
-        let blocks = crate::markdown::parse_spanned(source);
         let mut glyphs = Vec::new();
-        let mut hits = Vec::new();
-        build_markdown(
-            &blocks,
-            source,
-            None,
-            None,
-            0,
-            &mut atlas,
-            Viewport::new(800.0, 600.0),
-            &Theme::default(),
-            &mut glyphs,
-            &mut hits,
-        );
-        let code = hits
-            .iter()
-            .find(|hit| hit.lines == (2..5))
-            .expect("code block");
-        let (button, copied) = code.copy.as_ref().expect("copy control");
-        assert!(button.width > 0.0);
-        assert_eq!(copied, "let x = 1;");
+        let view = Viewport::new(800.0, 2000.0);
+        build_markdown_appending(&blocks, 0, &mut atlas, view, &Theme::default(), &mut glyphs);
+        // The word wraps over several rows rather than running off the
+        // side, and "after" comes after it.
+        let rows: std::collections::BTreeSet<i64> =
+            glyphs.iter().map(|q| q.pos[1] as i64).collect();
+        assert!(rows.len() > 2, "the long word wraps");
         assert!(
-            !code.caret_stops.is_empty(),
-            "code stays rendered while editing"
-        );
-        assert!(hits.iter().any(|hit| hit.lines == (6..7)));
-        let heading = hits.iter().find(|hit| hit.lines == (0..1)).unwrap();
-        assert_eq!(heading.caret_stops.first().unwrap().0, 2);
-        assert_eq!(heading.caret_stops.last().unwrap().0, 7);
-
-        build_markdown(
-            &blocks,
-            source,
-            Some(3),
-            None,
-            0,
-            &mut atlas,
-            Viewport::new(800.0, 600.0),
-            &Theme::default(),
-            &mut glyphs,
-            &mut hits,
-        );
-        assert!(
-            hits.iter().any(|hit| hit.lines == (6..7)),
-            "the rest of the page stays rendered"
+            glyphs
+                .iter()
+                .all(|q| q.pos[0] + q.size[0] <= view.width + 0.01)
         );
     }
 

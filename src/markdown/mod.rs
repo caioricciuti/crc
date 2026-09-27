@@ -86,40 +86,6 @@ pub struct SpannedBlock {
     pub lines: Range<usize>,
 }
 
-/// Maps each visible character boundary back to a UTF-8 source offset.
-/// The renderer uses this for editing a formatted block without exposing its
-/// Markdown delimiters. The source remains the sole stored representation.
-pub fn source_offsets(source: &str, lines: Range<usize>, visible: &str) -> Vec<usize> {
-    let starts: Vec<usize> = std::iter::once(0)
-        .chain(source.match_indices('\n').map(|(at, _)| at + 1))
-        .collect();
-    let start = *starts.get(lines.start).unwrap_or(&source.len());
-    let end = *starts.get(lines.end).unwrap_or(&source.len());
-    source_offsets_in_range(source, start..end, visible)
-}
-
-pub fn source_offsets_in_range(source: &str, range: Range<usize>, visible: &str) -> Vec<usize> {
-    let (start, end) = (range.start, range.end);
-    let part = &source[start..end];
-    let mut cursor = 0;
-    let mut offsets = Vec::with_capacity(visible.chars().count() + 1);
-    for ch in visible.chars() {
-        // The space shown between two joined source lines is the line
-        // break in the source; matching it to the next real space skipped
-        // the next line's first word.
-        let same = |c: char| c == ch || (ch == ' ' && c.is_whitespace());
-        if let Some((relative, _)) = part[cursor..].char_indices().find(|(_, c)| same(*c)) {
-            cursor += relative;
-            offsets.push(start + cursor);
-            cursor += part[cursor..].chars().next().map_or(0, char::len_utf8);
-        } else {
-            offsets.push(start + cursor);
-        }
-    }
-    offsets.push(start + cursor);
-    offsets
-}
-
 /// Whether a file extension, lowercase and without the dot, is Markdown.
 pub fn is_markdown_extension(extension: &str) -> bool {
     matches!(extension, "md" | "markdown" | "mdown" | "mkd")
@@ -768,15 +734,6 @@ mod tests {
     }
 
     #[test]
-    fn a_joined_line_break_maps_to_the_break() {
-        let source = "foo\nbar baz\n";
-        let offsets = source_offsets_in_range(source, 0..source.len(), "foo bar baz");
-        // "b" of bar is the fifth shown character.
-        assert_eq!(offsets[4], 4);
-        assert_eq!(&source[offsets[4]..offsets[4] + 3], "bar");
-    }
-
-    #[test]
     fn a_rule_under_a_list_item_or_quote_is_a_rule() {
         for source in ["- last item\n---\n", "> quote\n---\n", "1. one\n---\n"] {
             let blocks = parse(source);
@@ -789,15 +746,6 @@ mod tests {
             parse("Title\n---\n")[0],
             Block::Heading { level: 2, .. }
         ));
-    }
-
-    #[test]
-    fn visible_cursor_maps_through_heading_and_link_markup() {
-        let source = "## Hello **café** [site](https://example.com)\n";
-        let offsets = source_offsets(source, 0..1, "Hello café site");
-        assert_eq!(&source[offsets[0]..offsets[0] + 1], "H");
-        assert_eq!(&source[offsets[6]..offsets[6] + 1], "c");
-        assert_eq!(&source[offsets[11]..offsets[11] + 1], "s");
     }
 
     #[test]

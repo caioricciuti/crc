@@ -337,34 +337,21 @@ fn main() -> std::io::Result<()> {
         &theme,
         &mut glyphs,
     );
-    // The rendered Markdown view of the given file, drawn through the same
-    // call the window makes. `--live=N` shows line N as its own source, the
-    // way the preview does for the line being edited.
+    // The Markdown renderer extensions' READMEs use, on the given file.
     if std::env::args().any(|arg| arg == "--markdown") {
         let source = docs.active().rope.to_string();
         let blocks = crc::markdown::parse_spanned(&source);
-        let active = std::env::args()
-            .find_map(|arg| arg.strip_prefix("--live=").map(str::to_owned))
-            .and_then(|line| line.parse::<usize>().ok())
-            .map(|line| docs.active().rope.line_to_byte(line.saturating_sub(1)));
-        let mut md_hits = Vec::new();
-        let drawn = layout::build_markdown(
+        glyphs.clear();
+        renderer.atlas.begin_frame();
+        let drawn = layout::build_markdown_appending(
             &blocks,
-            &source,
-            active,
-            None,
             0,
             &mut renderer.atlas,
             viewport,
             &theme,
             &mut glyphs,
-            &mut md_hits,
         );
-        println!(
-            "markdown    {} blocks, {drawn} drawn, {} hits",
-            blocks.len(),
-            md_hits.len()
-        );
+        println!("markdown    {} blocks, {drawn} drawn", blocks.len());
         layout::build_toolbar(
             &tree,
             &mut renderer.atlas,

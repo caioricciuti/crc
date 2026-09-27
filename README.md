@@ -136,8 +136,9 @@ the size and write it back.
   open, and `>` in the same box to run any menu command.
 - **HTTP requests from `.http` files** (`Cmd-Return`) in the JetBrains and
   VS Code REST Client format, with environments and a response tab.
-- **Markdown** renders in place as you edit; images, PDFs, audio, video and
-  office files open as Quick Look previews.
+- **Markdown** is styled where it is written, fenced code coloured by its
+  language; images, PDFs, audio, video and office files open as Quick Look
+  previews.
 - **A native, themed UI**: system-font chrome, light and dark following the
   system or your setting, a home screen with recent projects, overlay
   scrollbars, font zoom, and the right pointer for every control.

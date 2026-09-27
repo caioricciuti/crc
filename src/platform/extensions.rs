@@ -534,19 +534,7 @@ pub fn draw_details(
                 width: detail_w + 56.0,
                 height: bottom - y,
             };
-            let mut md_hits = Vec::new();
-            layout::build_markdown_appending(
-                &blocks,
-                &readme,
-                None,
-                None,
-                page.readme_scroll,
-                atlas,
-                view,
-                theme,
-                out,
-                &mut md_hits,
-            );
+            layout::build_markdown_appending(&blocks, page.readme_scroll, atlas, view, theme, out);
             page.readme_rect = Some(view);
         }
     }

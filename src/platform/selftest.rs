@@ -292,17 +292,14 @@ pub fn report(
     active: usize,
     marked: Option<&str>,
     layout: &str,
-    previews: (bool, bool),
-    live: bool,
+    native_preview: bool,
 ) -> String {
     let (line, column) = buffer.cursor_position();
     let mut out = String::new();
     out.push_str(&format!("layout: {layout}\n"));
     out.push_str(&format!("tabs: {}\n", titles.join(" | ")));
     out.push_str(&format!("active: {active}\n"));
-    out.push_str(&format!("preview: {}\n", previews.0));
-    out.push_str(&format!("native_preview: {}\n", previews.1));
-    out.push_str(&format!("live: {live}\n"));
+    out.push_str(&format!("native_preview: {native_preview}\n"));
     out.push_str(&format!("cursor: {}:{}\n", line + 1, column + 1));
     out.push_str(&format!("cursors: {}\n", buffer.cursor_count()));
     out.push_str(&format!("scroll: {}\n", buffer.scroll_line));

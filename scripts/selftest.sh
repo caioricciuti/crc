@@ -575,8 +575,8 @@ if [ ! -s "$T/cursors.out" ]; then
 fi
 
 # Markdown opens as styled text: the heading's marker and text have kinds
-# of their own, and the fenced block a band. Cmd-E shows it rendered and
-# back. Tabs can then be dragged to a new position without changing which
+# of their own, and the fenced block a band. Cmd-E only says the rendered
+# view is an extension's. Tabs can then be dragged to a new position without changing which
 # file is active.
 printf '# One\n\nBody\n\n```rust\nfn main() {}\n```\n' > "$T/proj/one.md"
 printf 'two\n' > "$T/proj/two.txt"
@@ -585,7 +585,6 @@ key 11 cmd b
 dump $T/source.out
 key 14 cmd e
 dump $T/preview.out
-key 14 cmd e
 key 124 cmd
 text X
 dump $T/live-edit.out
@@ -602,15 +601,12 @@ dump $T/new-tab.out
 quit
 SCRIPT
 CRC_SELFTEST="$T/tabs.script" "$BIN" "$T/proj/one.md" 2> "$T/tabs.err"
-expect "$T/source.out" preview "false"
 expect "$T/source.out" md "MdMarker,MdHeading bands=1"
-expect "$T/preview.out" preview "true"
-expect "$T/live-edit.out" preview "false"
+expect "$T/preview.out" message "Markdown opens as styled text; a rendered preview is coming as an extension"
 expect_line "$T/live-edit.out" 1 "# OneX"
 expect "$T/two.out" tabs "one.md | two.txt"
 expect "$T/reordered.out" tabs "two.txt | one.md"
 expect "$T/reordered.out" active "1"
-expect "$T/reordered.out" preview "false"
 expect "$T/new-tab.out" tabs "two.txt | one.md | Untitled"
 expect "$T/new-tab.out" active "2"
 
@@ -973,7 +969,6 @@ SCRIPT
 CRC_SELFTEST="$T/http.script" "$BIN" "$T/httpproj/probe.http" 2> "$T/http.err"
 expect "$T/http.out" tabs "probe.http | GET Closed port"
 expect "$T/http.out" active 1
-expect "$T/http.out" preview false
 expect "$T/http.out" dirty false
 # The body segment shows curl's own error when nothing came back; the
 # Request segment shows what was sent.

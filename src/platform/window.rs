@@ -31,7 +31,6 @@ use objc2_foundation::{
 use objc2_metal::MTLCreateSystemDefaultDevice;
 use objc2_quartz_core::{CADisplayLink, CALayer, CAMetalLayer};
 
-use crate::markdown;
 use crate::platform::clipboard;
 use crate::platform::commands::{self, Command};
 use crate::platform::latency::Latency;
@@ -410,10 +409,8 @@ unsafe extern "C" fn claude_wake_on_main(context: *mut std::ffi::c_void) {
 /// The per-pane state of a pane that does not have the keyboard.
 struct PaneStore {
     docs: Documents,
-    preview: Option<usize>,
     tab_scroll: usize,
     tab_hits: Vec<layout::TabHit>,
-    live_line: Option<(u64, usize)>,
 }
 
 fn pane_count(state: &State) -> usize {
@@ -425,10 +422,8 @@ fn pane_count(state: &State) -> usize {
 fn take_panes(state: &mut State) -> Vec<PaneStore> {
     let focused = PaneStore {
         docs: std::mem::replace(&mut state.docs, Documents::new(Buffer::new())),
-        preview: state.preview.take(),
         tab_scroll: std::mem::take(&mut state.tab_scroll),
         tab_hits: std::mem::take(&mut state.tab_hits),
-        live_line: state.live_line.take(),
     };
     let mut all = std::mem::take(&mut state.panes);
     let at = state.focused_pane.min(all.len());
@@ -441,10 +436,8 @@ fn restore_panes(state: &mut State, mut all: Vec<PaneStore>, focus: usize) {
     let focus = focus.min(all.len().saturating_sub(1));
     let focused = all.remove(focus);
     state.docs = focused.docs;
-    state.preview = focused.preview;
     state.tab_scroll = focused.tab_scroll;
     state.tab_hits = focused.tab_hits;
-    state.live_line = focused.live_line;
     state.panes = all;
     state.focused_pane = focus;
 }
@@ -781,17 +774,10 @@ struct State {
     tab_scroll_carry: f64,
     /// Tab being dragged across the strip.
     tab_drag: Option<usize>,
-    /// Markdown preview: `Some(scroll)` when showing the rendered view of
-    /// the active document rather than its source.
-    preview: Option<usize>,
-    /// Only the block under the caret reveals its Markdown markers.
-    live_line: Option<(u64, usize)>,
-    md_hits: Vec<layout::MarkdownHit>,
     /// The home screen's rows, as of the last frame that drew it.
     home_hits: Vec<layout::HomeHit>,
     /// Project folders opened before, most recent first.
     recent_projects: Vec<std::path::PathBuf>,
-    copied_code: Option<(usize, Instant)>,
     /// Which tab a context menu was opened on. The menu action fires later,
     /// by which time the pointer has moved, so the target has to be recorded
     /// at click time rather than looked up again.
@@ -927,7 +913,6 @@ fn show_response(state: &mut State, title: &str, view: crate::http::curl::View) 
     buffer.display_ext = ext;
     let id = buffer.id();
     state.responses.insert(id, view);
-    state.preview = None;
     reveal_active_tab(state);
     id
 }
@@ -1169,12 +1154,7 @@ define_class!(
             };
             self.ivars().handling_key.set(false);
             if changed {
-                let mut state = self.ivars().state.borrow_mut();
-                if state.preview.is_some() && is_markdown(state.docs.active()) {
-                    state.live_line = Some((state.docs.active().id(), state.docs.active().cursor_position().0));
-                }
-                let edited = state.docs.active().has_pending_edits();
-                drop(state);
+                let edited = self.ivars().state.borrow().docs.active().has_pending_edits();
                 self.lsp_after_key(edited);
                 self.reparse();
                 self.note_input(started);
@@ -1435,7 +1415,6 @@ define_class!(
                     if event.clickCount() >= 2 {
                         let mut state = self.ivars().state.borrow_mut();
                         state.docs.push(Buffer::new());
-                        state.preview = None;
                         state.tab_scroll = state.docs.active_index();
                         drop(state);
                         self.sync_title();
@@ -1561,54 +1540,6 @@ define_class!(
                             self.load_folder_path(&path.to_string_lossy());
                         }
                     }
-                    self.request_redraw();
-                    self.pump();
-                    return;
-                }
-            }
-            {
-                let mut state = self.ivars().state.borrow_mut();
-                if state.preview.is_some() && is_markdown(state.docs.active()) {
-                    let hit = state.md_hits.iter().find(|h| h.rect.contains(x, y)).cloned();
-                    if let Some(hit) = hit {
-                        if let Some((button, code)) = hit.copy
-                            && button.contains(x, y) {
-                            clipboard::write_text(&code);
-                            state.copied_code = Some((hit.lines.start, Instant::now()));
-                            state.message = Some(("copied code block".to_string(), Instant::now()));
-                        } else {
-                            let offset = if hit.caret_stops.is_empty() {
-                                let m = state.renderer.atlas.metrics;
-                                let row = ((y - hit.rect.y) / m.line_height).floor().max(0.0) as usize;
-                                // The hit is from the last drawn frame; an edit since may
-                                // have removed lines.
-                                let last = state.docs.active().rope.len_lines().saturating_sub(1);
-                                let line = (hit.lines.start + row).min(hit.lines.end.saturating_sub(1)).min(last);
-                                let column = ((x - hit.rect.x - m.advance) / m.advance).round().max(0.0) as usize;
-                                let source = state.docs.active().rope.line(line);
-                                let content = source.trim_end_matches('\n').trim_end_matches('\r');
-                                let byte = content.chars().take(column).map(char::len_utf8).sum::<usize>();
-                                state.docs.active().rope.line_to_byte(line) + byte
-                            } else {
-                                hit.caret_stops.iter().min_by(|(_, a), (_, b)| {
-                                    let da = (a[1] - y).abs() * 1000.0 + (a[0] - x).abs();
-                                    let db = (b[1] - y).abs() * 1000.0 + (b[0] - x).abs();
-                                    da.total_cmp(&db)
-                                }).map_or(0, |(at, _)| *at)
-                            };
-                            let line = state.docs.active().rope.byte_to_line(offset);
-                            let id = state.docs.active().id();
-                            state.docs.active_mut().place_cursor(offset, Motion::Move);
-                            state.live_line = Some((id, line));
-                        }
-                    } else {
-                        let buffer = state.docs.active_mut();
-                        let end = buffer.rope.len_bytes();
-                        buffer.place_cursor(end, Motion::Move);
-                        let at = (buffer.id(), buffer.cursor_position().0);
-                        state.live_line = Some(at);
-                    }
-                    drop(state);
                     self.request_redraw();
                     self.pump();
                     return;
@@ -2243,21 +2174,17 @@ define_class!(
         fn action_toggle_preview(&self, _sender: Option<&AnyObject>) {
             {
                 let mut state = self.ivars().state.borrow_mut();
-                // Only where there is something to preview. Toggling the flag
-                // on a buffer the renderer will not preview changed hidden
-                // state and drew nothing, so the command looked dead and the
-                // next Markdown file opened in whichever mode it had left.
-                if !is_markdown(state.docs.active()) {
-                    state.message = Some((
-                        "Preview is for Markdown files".to_string(),
-                        Instant::now(),
-                    ));
-                } else {
-                    state.preview = match state.preview {
-                        Some(_) => None,
-                        None => Some(0),
-                    };
-                }
+                // Rendering belongs to an extension; until one is
+                // installed, the command says where to get it.
+                state.message = Some((
+                    if is_markdown(state.docs.active()) {
+                        "Markdown opens as styled text; a rendered preview is coming as an extension"
+                    } else {
+                        "Preview is for Markdown files"
+                    }
+                    .to_string(),
+                    Instant::now(),
+                ));
             }
             self.request_redraw();
             self.pump();
@@ -2544,7 +2471,6 @@ define_class!(
         fn action_next_tab(&self, _sender: Option<&AnyObject>) {
             let mut state = self.ivars().state.borrow_mut();
             state.docs.cycle(1);
-            state.preview = None;
             reveal_active_tab(&mut state);
             drop(state);
             self.sync_title();
@@ -2557,7 +2483,6 @@ define_class!(
         fn action_prev_tab(&self, _sender: Option<&AnyObject>) {
             let mut state = self.ivars().state.borrow_mut();
             state.docs.cycle(-1);
-            state.preview = None;
             reveal_active_tab(&mut state);
             drop(state);
             self.sync_title();
@@ -2822,7 +2747,6 @@ define_class!(
                         for docs in all_docs_mut(&mut state) {
                             docs.close_under(&source_key);
                         }
-                        state.preview = None;
                         reveal_active_tab(&mut state);
                         state.message = Some((format!("moved {name} to Trash"), Instant::now()));
                     }
@@ -3499,9 +3423,8 @@ impl EditorView {
             (1.0 / WHEEL_LINES_PER_NOTCH, 1.0 / WHEEL_LINES_PER_NOTCH)
         };
         // A trackpad moves the text itself by points. Wheel notches, the
-        // sidebar and the Markdown blocks still go a whole line at a time.
+        // sidebar still goes a whole line at a time.
         let over_sidebar = chrome.sidebar.is_some_and(|r| r.contains(x, y));
-        let previewing = state.preview.is_some() && is_markdown(state.docs.active());
         // The columns scroll by their own rows.
         if !over_sidebar && chrome.text.contains(x, y) && side_by_side(&state) {
             let per_row = if precise {
@@ -3522,7 +3445,7 @@ impl EditorView {
             self.pump();
             return;
         }
-        if precise && !over_sidebar && !previewing {
+        if precise && !over_sidebar {
             state.scroll_carry.1 = 0.0;
             state
                 .docs
@@ -3557,20 +3480,6 @@ impl EditorView {
                 state.docs.active().scroll_line,
                 state.docs.active().rope.len_lines(),
             );
-        }
-
-        if state.preview.is_some()
-            && is_markdown(state.docs.active())
-            && !chrome.sidebar.is_some_and(|r| r.contains(x, y))
-        {
-            let (_, blocks) = markdown_of(state.docs.active());
-            let last = blocks.len().saturating_sub(1);
-            let current = state.preview.unwrap_or(0);
-            state.preview = Some(current.saturating_add_signed(lines).min(last));
-            drop(state);
-            self.request_redraw();
-            self.pump();
-            return;
         }
 
         match chrome.sidebar {
@@ -4408,7 +4317,6 @@ impl EditorView {
                     let mut state = self.ivars().state.borrow_mut();
                     let switched = state.docs.switch(digit as usize - 1);
                     if switched {
-                        state.preview = None;
                         reveal_active_tab(&mut state);
                     }
                     switched
@@ -4822,13 +4730,7 @@ impl EditorView {
                         state.docs.active_index(),
                         state.marked.as_deref(),
                         &layout,
-                        (
-                            state.preview.is_some() && is_markdown(state.docs.active()),
-                            state.native_preview.is_some(),
-                        ),
-                        state
-                            .live_line
-                            .is_some_and(|(id, _)| id == state.docs.active().id()),
+                        state.native_preview.is_some(),
                     )
                 );
                 let activity = format!(
@@ -5149,7 +5051,6 @@ impl EditorView {
             self.focus_pane(pane);
             let mut state = self.ivars().state.borrow_mut();
             state.docs.switch(tab);
-            state.preview = None;
             reveal_active_tab(&mut state);
             drop(state);
             self.sync_title();
@@ -5160,7 +5061,6 @@ impl EditorView {
         let mut state = self.ivars().state.borrow_mut();
         match state.docs.open(path) {
             Ok(()) => {
-                state.preview = None;
                 reveal_active_tab(&mut state);
                 let format = state.docs.active().disk_format();
                 let note = if state.docs.active().is_read_only() {
@@ -5606,9 +5506,7 @@ impl EditorView {
                 state.gutter_dirty.insert(id, Instant::now());
             }
             state.completion = None;
-            if announce {
-                state.preview = None;
-            }
+            if announce {}
         }
         self.request_redraw();
     }
@@ -6489,7 +6387,6 @@ impl EditorView {
             } else if diffing(&state) {
                 let index = state.docs.active_index();
                 state.docs.close(index);
-                state.preview = None;
                 reveal_active_tab(&mut state);
                 drop(state);
                 self.sync_title();
@@ -7694,7 +7591,6 @@ impl EditorView {
         } else {
             let mut state = self.ivars().state.borrow_mut();
             state.docs.switch(hit.index);
-            state.preview = None;
             drop(state);
             self.sync_title();
             self.reparse();
@@ -7774,7 +7670,6 @@ impl EditorView {
                 forget_document(&mut state, id);
             }
             state.completion = None;
-            state.preview = None;
             reveal_active_tab(&mut state);
         }
         // A pane whose last tab just closed goes with it, unless it is
@@ -7834,10 +7729,8 @@ impl EditorView {
                 at,
                 PaneStore {
                     docs: Documents::new(Buffer::new()),
-                    preview: None,
                     tab_scroll: 0,
                     tab_hits: Vec::new(),
-                    live_line: None,
                 },
             );
             restore_panes(&mut state, all, at);
@@ -11819,7 +11712,6 @@ impl EditorView {
                 }
                 Err(e) => format!("created but not opened: {e}"),
             };
-            state.preview = None;
             reveal_active_tab(&mut state);
             state.message = Some((message, Instant::now()));
         }
@@ -11895,7 +11787,6 @@ impl EditorView {
                     state.message = Some((format!("created but not opened: {e}"), Instant::now()));
                 }
             }
-            state.preview = None;
             reveal_active_tab(&mut state);
             // The directory walk and finder rebuild happen off the UI thread.
             state.project_index_rx = Some(spawn_project_refresh(
@@ -12005,11 +11896,6 @@ impl EditorView {
                 }
             }
             _ => state.completion = None,
-        }
-        if state.preview.is_some() && is_markdown(state.docs.active()) {
-            let id = state.docs.active().id();
-            let line = state.docs.active().cursor_position().0;
-            state.live_line = Some((id, line));
         }
         state.docs.active_mut().scroll_to_cursor(rows, cols);
         drop(state);
@@ -12142,7 +12028,6 @@ impl EditorView {
         let mut state = self.ivars().state.borrow_mut();
         match state.docs.open(&path) {
             Ok(()) => {
-                state.preview = None;
                 reveal_active_tab(&mut state);
             }
             Err(e) => {
@@ -12335,10 +12220,6 @@ impl EditorView {
             bulb_rect,
             extensions,
             blame,
-            preview,
-            live_line,
-            md_hits,
-            copied_code,
             renderer,
             glyphs,
             theme,
@@ -12426,11 +12307,6 @@ impl EditorView {
             .as_ref()
             .and_then(|bar| find_matches(find_cache, bar, buffer));
 
-        // Markdown preview replaces the editor body. Parsing per frame is
-        // fine: a README is kilobytes, and the alternative is a cache that
-        // has to be invalidated on every edit.
-        let previewing = preview.is_some() && is_markdown(buffer);
-
         // Nothing open: the home screen, drawn by the same renderer. There is
         // no home "mode" to get stuck in. Typing lands in the untouched buffer
         // underneath, which stops being untouched, and the editor is back.
@@ -12516,26 +12392,6 @@ impl EditorView {
                 tree.root(),
                 recent_projects,
                 home_hits,
-            );
-        } else if previewing {
-            let (source, blocks) = markdown_of(buffer);
-            let scroll = preview.unwrap_or(0).min(blocks.len().saturating_sub(1));
-            let active = live_line
-                .filter(|(id, _)| *id == buffer.id())
-                .map(|_| buffer.cursor());
-            layout::build_markdown(
-                &blocks,
-                &source,
-                active,
-                copied_code.and_then(|(index, at)| {
-                    (at.elapsed() < Duration::from_secs(3)).then_some(index)
-                }),
-                scroll,
-                &mut renderer.atlas,
-                editor_rect,
-                theme,
-                glyphs,
-                md_hits,
             );
         } else {
             // Highlight only what is on screen. Querying a whole file to draw
@@ -12844,25 +12700,6 @@ impl EditorView {
                     strip,
                     theme,
                     glyphs,
-                );
-            }
-            // A shortcut nobody can see is a shortcut nobody uses. The
-            // breadcrumb row has the space, and it is the row that belongs to
-            // the open file, which is what the command acts on.
-            if is_markdown(buffer) {
-                layout::push_ui_text_right(
-                    glyphs,
-                    &mut renderer.atlas,
-                    Viewport {
-                        width: (breadcrumb_rect.width - 14.0).max(0.0),
-                        ..breadcrumb_rect
-                    },
-                    if preview.is_some() {
-                        "⌘E  Edit"
-                    } else {
-                        "⌘E  Preview"
-                    },
-                    theme.gutter_text,
                 );
             }
         }
@@ -13835,11 +13672,9 @@ fn active_conflicts_mut(state: &mut State) -> Option<&mut crate::platform::confl
 }
 
 /// The columns are showing: side-by-side mode, on a document that has
-/// conflicts, with no Markdown preview over it.
+/// conflicts.
 fn side_by_side(state: &State) -> bool {
-    state.conflict_side
-        && !(state.preview.is_some() && is_markdown(state.docs.active()))
-        && active_conflicts(state).is_some_and(|v| !v.conflicts.is_empty())
+    state.conflict_side && active_conflicts(state).is_some_and(|v| !v.conflicts.is_empty())
 }
 
 /// The review in the active tab, when it is one.
@@ -13887,7 +13722,6 @@ fn open_diff_tab(state: &mut State, change: usize, staged: bool) {
             state.docs.push(tab);
         }
     }
-    state.preview = None;
     state.completion = None;
     reveal_active_tab(state);
 }
@@ -13946,51 +13780,6 @@ fn claude_selection(state: &State) -> Option<crate::ide::mcp::Selection> {
         text,
         start: crate::lsp::position_of(&buffer.rope, range.start),
         end: crate::lsp::position_of(&buffer.rope, range.end),
-    })
-}
-
-thread_local! {
-    /// Parsed Markdown by document and text, a few at a time (one per pane
-    /// showing a preview). Drawing and every wheel event want the blocks;
-    /// parsing a multi-megabyte file each time was the cost of a frame.
-    static MARKDOWN: RefCell<Vec<MarkdownParse>> = const { RefCell::new(Vec::new()) };
-}
-
-struct MarkdownParse {
-    id: u64,
-    text: crate::text::rope::Rope,
-    source: std::rc::Rc<String>,
-    blocks: std::rc::Rc<Vec<markdown::SpannedBlock>>,
-}
-
-/// `buffer`'s text and its Markdown blocks, parsed once per change.
-fn markdown_of(
-    buffer: &Buffer,
-) -> (
-    std::rc::Rc<String>,
-    std::rc::Rc<Vec<markdown::SpannedBlock>>,
-) {
-    MARKDOWN.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if let Some(hit) = cache
-            .iter()
-            .find(|p| p.id == buffer.id() && p.text.same_as(&buffer.rope))
-        {
-            return (hit.source.clone(), hit.blocks.clone());
-        }
-        let source = std::rc::Rc::new(buffer.rope.to_string());
-        let blocks = std::rc::Rc::new(markdown::parse_spanned(&source));
-        cache.retain(|p| p.id != buffer.id());
-        if cache.len() >= 4 {
-            cache.remove(0);
-        }
-        cache.push(MarkdownParse {
-            id: buffer.id(),
-            text: buffer.rope.clone(),
-            source: source.clone(),
-            blocks: blocks.clone(),
-        });
-        (source, blocks)
     })
 }
 
@@ -14244,7 +14033,6 @@ impl crate::ide::mcp::Host for ClaudeHost<'_> {
                 bridge.reviews.insert(id, review);
             }
             // The review takes the editor column, so nothing may cover it.
-            state.preview = None;
             state.completion = None;
             state.message = Some((
                 format!("Claude proposes a change to {name}"),
@@ -14408,27 +14196,6 @@ fn draw_other_pane(
             theme,
             tree.root(),
             &[],
-            &mut hits,
-        );
-        return;
-    }
-    if store.preview.is_some() && is_markdown(buffer) {
-        let (source, blocks) = markdown_of(buffer);
-        let scroll = store
-            .preview
-            .unwrap_or(0)
-            .min(blocks.len().saturating_sub(1));
-        let mut hits = Vec::new();
-        layout::build_markdown_appending(
-            &blocks,
-            &source,
-            None,
-            None,
-            scroll,
-            &mut renderer.atlas,
-            text,
-            theme,
-            glyphs,
             &mut hits,
         );
         return;
@@ -15700,7 +15467,6 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         }
     }
 
-    let initial_preview = None;
     let git = crate::platform::git_panel::Panel::new(
         tree.root()
             .map(Path::to_path_buf)
@@ -15758,12 +15524,8 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         ephemeral_session: launched_with_file,
         discard_confirmed: false,
         quit_session: None,
-        preview: initial_preview,
-        live_line: None,
-        md_hits: Vec::new(),
         home_hits: Vec::new(),
         recent_projects,
-        copied_code: None,
         syntax: SyntaxStore::new(),
         spans: Vec::new(),
         finder,
