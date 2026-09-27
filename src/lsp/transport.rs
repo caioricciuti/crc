@@ -2,9 +2,10 @@
 //!
 //! A reader thread turns the byte stream into messages and hands them over
 //! a channel; after each one it calls the wake-up the owner gave it, which
-//! in the app queues a main-thread poll. Writes happen on the caller's
-//! thread. The process is killed when the transport is dropped, so a server
-//! never outlives the editor.
+//! in the app queues a main-thread poll. Writes go through a writer thread,
+//! so a server that stops reading never blocks the caller. The process is
+//! killed when the transport is dropped, so a server never outlives the
+//! editor.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
@@ -25,8 +26,12 @@ pub enum Incoming {
 pub type Wake = Box<dyn Fn() + Send + Sync>;
 
 pub struct Transport {
-    child: Child,
-    stdin: ChildStdin,
+    /// `None` only while being dropped.
+    child: Option<Child>,
+    /// Frames for the writer thread; `None` once it has stopped.
+    writer: Option<mpsc::Sender<Vec<u8>>>,
+    /// Set by the writer thread when a write failed: the server is gone.
+    broken: std::sync::Arc<std::sync::atomic::AtomicBool>,
     rx: mpsc::Receiver<Incoming>,
     /// The last lines the server wrote to stderr, for the error shown when
     /// it dies.
@@ -65,12 +70,15 @@ impl Transport {
             let mut reader = BufReader::new(stdout);
             loop {
                 match read_message(&mut reader) {
-                    Ok(Some(value)) => {
+                    Ok(Some(Ok(value))) => {
                         if tx.send(Incoming::Message(value)).is_err() {
                             break;
                         }
                         wake();
                     }
+                    // One message the parser refused is one lost message,
+                    // not the end of the server.
+                    Ok(Some(Err(_))) => {}
                     Ok(None) | Err(_) => {
                         let _ = tx.send(Incoming::Closed);
                         wake();
@@ -90,19 +98,34 @@ impl Transport {
                 }
             }
         });
+        let broken = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (writer, frames) = mpsc::channel::<Vec<u8>>();
+        let failed = broken.clone();
+        std::thread::spawn(move || write_frames(stdin, frames, &failed));
         Ok(Transport {
-            child,
-            stdin,
+            child: Some(child),
+            writer: Some(writer),
+            broken,
             rx,
             stderr_tail,
         })
     }
 
-    /// Writes one message. A failure means the server is gone.
+    /// Queues one message for the writer thread. A failure means the
+    /// server is gone: an earlier write failed, or the thread stopped.
     pub fn send(&mut self, message: &Value) -> std::io::Result<()> {
+        let gone = || std::io::Error::new(std::io::ErrorKind::BrokenPipe, "server is gone");
+        if self.broken.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(gone());
+        }
         let body = json::compact(message);
-        write!(self.stdin, "Content-Length: {}\r\n\r\n{}", body.len(), body)?;
-        self.stdin.flush()
+        let mut frame = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+        frame.extend_from_slice(body.as_bytes());
+        self.writer
+            .as_ref()
+            .ok_or_else(gone)?
+            .send(frame)
+            .map_err(|_| gone())
     }
 
     pub fn try_recv(&self) -> Option<Incoming> {
@@ -122,19 +145,51 @@ impl Transport {
     }
 
     pub fn is_running(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None))
+        self.child
+            .as_mut()
+            .is_some_and(|c| matches!(c.try_wait(), Ok(None)))
     }
 }
 
 impl Drop for Transport {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // Closing the writer ends its thread once what was queued is out;
+        // the child is killed now and reaped on a thread of its own, so
+        // closing a project never waits on a server's exit.
+        self.writer = None;
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
     }
 }
 
-/// One framed message, `None` at end of stream.
-fn read_message<R: BufRead>(reader: &mut R) -> std::io::Result<Option<Value>> {
+/// Writes frames to the server in order until the channel closes or a
+/// write fails.
+fn write_frames(
+    mut stdin: ChildStdin,
+    frames: mpsc::Receiver<Vec<u8>>,
+    broken: &std::sync::atomic::AtomicBool,
+) {
+    for frame in frames {
+        if stdin
+            .write_all(&frame)
+            .and_then(|()| stdin.flush())
+            .is_err()
+        {
+            broken.store(true, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+    }
+}
+
+/// One framed message, `None` at end of stream. A message whose body is not
+/// JSON, or is too large to take, comes back as `Some(Err(..))`, and the
+/// stream carries on after it. Lines before a header (a wrapper's banner, a
+/// runtime's warning on stdout) are skipped.
+fn read_message<R: BufRead>(reader: &mut R) -> std::io::Result<Option<Result<Value, String>>> {
     let mut length: Option<usize> = None;
     let mut line = String::new();
     loop {
@@ -147,7 +202,7 @@ fn read_message<R: BufRead>(reader: &mut R) -> std::io::Result<Option<Value>> {
             if length.is_some() {
                 break;
             }
-            return Err(std::io::Error::other("frame without Content-Length"));
+            continue;
         }
         if let Some(value) = trimmed
             .split_once(':')
@@ -158,17 +213,20 @@ fn read_message<R: BufRead>(reader: &mut R) -> std::io::Result<Option<Value>> {
         }
     }
     let Some(length) = length else {
-        return Err(std::io::Error::other("frame without Content-Length"));
+        return Ok(Some(Err("frame without Content-Length".into())));
     };
     if length > 64 * 1024 * 1024 {
-        return Err(std::io::Error::other("frame too large"));
+        // Read past it, so the next header is where the stream resumes.
+        let mut rest = <&mut R as std::io::Read>::take(reader, length as u64);
+        std::io::copy(&mut rest, &mut std::io::sink())?;
+        return Ok(Some(Err("frame too large".into())));
     }
     let mut body = vec![0u8; length];
     reader.read_exact(&mut body)?;
     let text = String::from_utf8_lossy(&body);
-    json::parse(&text)
-        .map(Some)
-        .map_err(|e| std::io::Error::other(format!("bad JSON from server: {e}")))
+    Ok(Some(
+        json::parse(&text).map_err(|e| format!("bad JSON from server: {e}")),
+    ))
 }
 
 #[cfg(test)]
@@ -182,11 +240,22 @@ mod tests {
         let mut reader = BufReader::new(&stream[..]);
         assert_eq!(
             read_message(&mut reader).unwrap(),
-            Some(json::parse("{\"a\":[1,2,3]}").unwrap())
+            Some(Ok(json::parse("{\"a\":[1,2,3]}").unwrap()))
         );
-        assert_eq!(read_message(&mut reader).unwrap(), Some(Value::Null));
+        assert_eq!(read_message(&mut reader).unwrap(), Some(Ok(Value::Null)));
         assert_eq!(read_message(&mut reader).unwrap(), None);
-        let mut bad = BufReader::new(&b"Foo: 1\r\n\r\n{}"[..]);
-        assert!(read_message(&mut bad).is_err());
+    }
+
+    #[test]
+    fn a_banner_or_a_bad_body_does_not_end_the_stream() {
+        let stream =
+            b"Starting server v1\n\nContent-Length: 3\r\n\r\n{x}Content-Length: 4\r\n\r\ntrue";
+        let mut reader = BufReader::new(&stream[..]);
+        assert!(matches!(read_message(&mut reader), Ok(Some(Err(_)))));
+        assert_eq!(
+            read_message(&mut reader).unwrap(),
+            Some(Ok(Value::Bool(true)))
+        );
+        assert_eq!(read_message(&mut reader).unwrap(), None);
     }
 }

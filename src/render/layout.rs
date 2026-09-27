@@ -3957,10 +3957,21 @@ pub fn build_markdown_appending(
     let bottom = viewport.y + viewport.height;
     let mut rows_drawn = 0usize;
 
-    let source_lines: Vec<&str> = source.lines().collect();
     let line_starts: Vec<usize> = std::iter::once(0)
         .chain(source.match_indices('\n').map(|(at, _)| at + 1))
         .collect();
+    // Line `i` of the source, without its line break, as `str::lines` has
+    // it; only the lines of visible blocks are ever asked for.
+    let source_line = |i: usize| -> &str {
+        let Some(&start) = line_starts.get(i) else {
+            return "";
+        };
+        let end = line_starts
+            .get(i + 1)
+            .map_or(source.len(), |&next| next - 1);
+        let line = &source[start..end.max(start)];
+        line.strip_suffix('\r').unwrap_or(line)
+    };
     let active_line = active.map(|at| {
         source[..at.min(source.len())]
             .bytes()
@@ -3989,7 +4000,7 @@ pub fn build_markdown_appending(
         if let Some(line) =
             active_line.filter(|line| spanned.lines.contains(line) && !pretty_editable)
         {
-            let raw = &source_lines[spanned.lines.clone()];
+            let raw: Vec<&str> = spanned.lines.clone().map(source_line).collect();
             let height = m.line_height * raw.len().max(1) as f32 + m.line_height * 0.4;
             out.push(GlyphInstance {
                 pos: [left, y],
@@ -4002,11 +4013,9 @@ pub fn build_markdown_appending(
             for (index, text) in raw.iter().enumerate() {
                 push_text(out, atlas, left + m.advance, y, text, theme.text);
                 if spanned.lines.start + index == line {
-                    let line_start = source
-                        .lines()
-                        .take(line)
-                        .map(|line| line.len() + 1)
-                        .sum::<usize>();
+                    // From the table: summing line lengths plus one is a
+                    // byte short per CRLF line.
+                    let line_start = line_starts.get(line).copied().unwrap_or(0);
                     let column = source[line_start..active.unwrap_or(line_start)]
                         .chars()
                         .count();
@@ -4216,10 +4225,10 @@ pub fn build_markdown_appending(
                 }
                 positions.push([last_x, last_y]);
                 visual = Some((shown, positions));
-                let opening = source_lines.get(spanned.lines.start).is_some_and(|line| {
-                    let trimmed = line.trim_start();
+                let opening = {
+                    let trimmed = source_line(spanned.lines.start).trim_start();
                     trimmed.starts_with("```") || trimmed.starts_with("~~~")
-                });
+                };
                 let first_body = spanned.lines.start + usize::from(opening);
                 let after_body = first_body + lines.len();
                 visual_range = Some(

@@ -21,21 +21,37 @@ pub struct Match {
     pub replacement: String,
 }
 
-fn utf16_to_byte(text: &str, utf16: usize) -> Option<usize> {
-    if utf16 == 0 {
-        return Some(0);
-    }
-    let mut units = 0;
-    for (byte, ch) in text.char_indices() {
-        units += ch.len_utf16();
-        if units == utf16 {
-            return Some(byte + ch.len_utf8());
+/// UTF-16 offsets to UTF-8 byte offsets, for offsets asked in rising
+/// order: each answer walks on from the last, so a whole list of matches
+/// costs one pass over the text rather than one per match.
+struct Utf16Walker<'a> {
+    text: &'a str,
+    byte: usize,
+    units: usize,
+}
+
+impl<'a> Utf16Walker<'a> {
+    fn new(text: &'a str) -> Self {
+        Utf16Walker {
+            text,
+            byte: 0,
+            units: 0,
         }
-        if units > utf16 {
-            return None;
-        }
     }
-    (units == utf16).then_some(text.len())
+
+    /// The byte offset of UTF-16 offset `utf16`, or `None` inside a
+    /// surrogate pair or past the end.
+    fn byte(&mut self, utf16: usize) -> Option<usize> {
+        if utf16 < self.units {
+            (self.byte, self.units) = (0, 0);
+        }
+        while self.units < utf16 {
+            let ch = self.text[self.byte..].chars().next()?;
+            self.units += ch.len_utf16();
+            self.byte += ch.len_utf8();
+        }
+        (self.units == utf16).then_some(self.byte)
+    }
 }
 
 /// Returns non-overlapping matches and their expanded replacement text.
@@ -44,6 +60,18 @@ pub fn find(
     query: &str,
     template: &str,
     options: Options,
+) -> Result<Vec<Match>, String> {
+    find_first(text, query, template, options, usize::MAX)
+}
+
+/// [`find`], stopping after `limit` matches: project search, which shows
+/// a few hundred, need not convert every match of a minified file.
+pub fn find_first(
+    text: &str,
+    query: &str,
+    template: &str,
+    options: Options,
+    limit: usize,
 ) -> Result<Vec<Match>, String> {
     if query.is_empty() {
         return Ok(Vec::new());
@@ -75,13 +103,17 @@ pub fn find(
     let ns_template = NSString::from_str(template);
     let range = NSRange::new(0, text.encode_utf16().count());
     let matches = regex.matchesInString_options_range(&ns_text, NSMatchingOptions::empty(), range);
-    let mut out = Vec::with_capacity(matches.count());
+    let mut out = Vec::with_capacity(matches.count().min(limit));
+    let mut walker = Utf16Walker::new(text);
     for found in matches.iter() {
+        if out.len() >= limit {
+            break;
+        }
         let r = found.range();
-        let Some(start) = utf16_to_byte(text, r.location) else {
+        let Some(start) = walker.byte(r.location) else {
             continue;
         };
-        let Some(end) = utf16_to_byte(text, r.location + r.length) else {
+        let Some(end) = walker.byte(r.location + r.length) else {
             continue;
         };
         if start == end {

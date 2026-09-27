@@ -134,6 +134,21 @@ impl DiskStamp {
     }
 }
 
+/// A file read for a reload, not yet taken by the buffer.
+pub struct DiskRead {
+    rope: Rope,
+    format: DiskFormat,
+    stamp: Option<DiskStamp>,
+}
+
+impl DiskRead {
+    /// What `stat` said when it was read: still the file's, or it changed
+    /// again while the read was on its way.
+    pub fn stamp(&self) -> Option<DiskStamp> {
+        self.stamp
+    }
+}
+
 /// Files past this open read-only, with the status line saying why.
 pub const READ_ONLY_BYTES: u64 = 512 * 1024 * 1024;
 /// Files past this are not opened at all.
@@ -552,11 +567,33 @@ impl Buffer {
         if self.preview_file {
             return Ok(());
         }
-        let raw = std::fs::read(&path)?;
+        let read = Buffer::read_disk(&path)?;
+        self.apply_disk(read);
+        Ok(())
+    }
+
+    /// The file at `path` as a reload would take it. Touches nothing of a
+    /// buffer, so a large file can be read on another thread.
+    pub fn read_disk(path: &std::path::Path) -> std::io::Result<DiskRead> {
+        let raw = std::fs::read(path)?;
         let (text, format) = file_format::decode(&raw)?;
-        let stamp = DiskStamp::of(&path).ok();
+        Ok(DiskRead {
+            rope: Rope::from_text(&text),
+            format,
+            stamp: DiskStamp::of(path).ok(),
+        })
+    }
+
+    /// Takes the text [`Buffer::read_disk`] read, keeping the old text under
+    /// undo.
+    pub fn apply_disk(&mut self, read: DiskRead) {
+        let DiskRead {
+            rope,
+            format,
+            stamp,
+        } = read;
         let before = self.snapshot();
-        self.rope = Rope::from_text(&text);
+        self.rope = rope;
         self.format = format;
         self.extra.clear();
         self.clamp_positions();
@@ -570,7 +607,6 @@ impl Buffer {
         self.stamp = stamp;
         self.conflict_noticed = false;
         self.dirty = false;
-        Ok(())
     }
 
     /// The file behind the buffer was deleted by something else. The text

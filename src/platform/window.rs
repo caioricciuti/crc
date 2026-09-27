@@ -572,6 +572,8 @@ struct State {
     /// The palette is picking a branch: the local branches, read when it
     /// opened. `None` in every other mode.
     branch_list: Option<Vec<crate::project::git::Branch>>,
+    /// The branch picker's list, being read by a worker.
+    branch_rx: Option<mpsc::Receiver<Result<Vec<crate::project::git::Branch>, String>>>,
     /// The palette is picking a code action: the server that offered them
     /// and the actions. `None` in every other mode.
     action_list: Option<(Language, Vec<crate::lsp::CodeAction>)>,
@@ -667,6 +669,14 @@ struct State {
     /// Buffers whose HEAD text is being fetched on a worker.
     gutter_pending: HashSet<u64>,
     gutter_channel: (mpsc::Sender<HeadText>, mpsc::Receiver<HeadText>),
+    /// Large files changed on disk, being read by a worker for a reload,
+    /// by buffer id.
+    reload_channel: (mpsc::Sender<ReloadRead>, mpsc::Receiver<ReloadRead>),
+    reloading: HashSet<u64>,
+    /// Gutter marks computed on a worker: document, the text they are for,
+    /// the marks.
+    marks_channel: (mpsc::Sender<GutterMarks>, mpsc::Receiver<GutterMarks>),
+    gutter_diffing: HashSet<u64>,
     /// The completion list, while one is open.
     completion: Option<CompletionPopup>,
     /// When the watcher last reported a tree change that has not been
@@ -699,6 +709,9 @@ struct State {
     /// gets the cursor, selection and boundary behaviour that already exists
     /// rather than two more, worse, text inputs.
     find: Option<FindBar>,
+    /// The find bar's matches in the active document, kept while neither
+    /// changes: drawing asks for them every frame.
+    find_cache: Option<FindCache>,
     /// Whether the sidebar is showing.
     sidebar: bool,
     /// Sidebar width in logical points, draggable.
@@ -784,6 +797,8 @@ struct State {
     finder: Finder,
     project_index_rx: Option<mpsc::Receiver<ProjectIndexResult>>,
     project_search_rx: Option<mpsc::Receiver<Result<Vec<ProjectHit>, String>>>,
+    /// The search running is Find References, not a text search.
+    project_search_references: bool,
     project_search_cancel: Option<Arc<AtomicBool>>,
     /// A request in flight: the id of its response tab's buffer, and where
     /// the reply arrives.
@@ -820,6 +835,10 @@ struct State {
     /// The palette's first visible row, and the part of a scroll that has
     /// not made a whole row yet.
     palette_scroll: usize,
+    /// How many rows the palette showed at the last frame. The ranking is
+    /// a search over every file and command; cursor rects and the wheel
+    /// only need its length.
+    palette_count: usize,
     palette_scroll_carry: f64,
     /// Cmd-L's line-number field. `None` when closed.
     goto: Option<Buffer>,
@@ -932,6 +951,45 @@ fn reveal_active_tab(state: &mut State) {
 }
 
 /// The find bar's state: two fields and which one has focus.
+struct FindCache {
+    buffer: u64,
+    text: crate::text::rope::Rope,
+    query: String,
+    options: SearchOptions,
+    matches: Vec<search::Match>,
+}
+
+/// The find bar's matches in `buffer`, from the cache while the text, the
+/// query and the options are the ones it was made for. `None` without a
+/// query, for an invalid pattern, or past the size find works on.
+fn find_matches<'a>(
+    cache: &'a mut Option<FindCache>,
+    bar: &FindBar,
+    buffer: &Buffer,
+) -> Option<&'a [search::Match]> {
+    if bar.query.rope.len_bytes() == 0 || buffer.rope.len_bytes() > 2 * 1024 * 1024 {
+        return None;
+    }
+    let query = bar.query.rope.to_string();
+    let fresh = cache.as_ref().is_some_and(|c| {
+        c.buffer == buffer.id()
+            && c.text.same_as(&buffer.rope)
+            && c.query == query
+            && c.options == bar.options
+    });
+    if !fresh {
+        let matches = search::find(&buffer.rope.to_string(), &query, "", bar.options).ok()?;
+        *cache = Some(FindCache {
+            buffer: buffer.id(),
+            text: buffer.rope.clone(),
+            query,
+            options: bar.options,
+            matches,
+        });
+    }
+    cache.as_ref().map(|c| c.matches.as_slice())
+}
+
 struct FindBar {
     query: Buffer,
     replacement: Buffer,
@@ -981,6 +1039,9 @@ struct ProjectHit {
     path: std::path::PathBuf,
     range: std::ops::Range<usize>,
     line: usize,
+    /// Bytes from the start of `line` to the match: how the hit is found
+    /// again in an open document edited since the search read the disk.
+    column: usize,
     snippet: String,
 }
 
@@ -1812,8 +1873,8 @@ define_class!(
                     add(hit.rect, &NSCursor::pointingHandCursor());
                 }
             }
-            if let Some((query, _)) = &state.palette {
-                let count = palette_rows(&palette_sources(&state), &query.rope.to_string()).len();
+            if state.palette.is_some() {
+                let count = state.palette_count;
                 let rect = layout::palette_rect(state.viewport, count);
                 add(Viewport { x: rect.x + 12.0, y: rect.y + 8.0, width: rect.width - 68.0, height: 40.0 }, &NSCursor::IBeamCursor());
                 add(Viewport { x: rect.x + rect.width - 52.0, y: rect.y + 8.0, width: 40.0, height: 40.0 }, &NSCursor::pointingHandCursor());
@@ -2026,6 +2087,8 @@ define_class!(
             }
             self.poll_project_index();
             self.poll_project_search();
+            self.poll_branches();
+            self.poll_reloads();
             self.poll_http();
             self.poll_update();
             self.poll_ignored();
@@ -2053,7 +2116,7 @@ define_class!(
                     state.message = None;
                     self.ivars().needs_redraw.set(true);
                 }
-                if !self.ivars().needs_redraw.get() && state.message.is_none() && !state.git.busy() && state.drag_point.is_none() && state.project_search_rx.is_none() && state.project_index_rx.is_none() && state.http.is_none() && state.project_changed_at.is_none() && state.git_changed_at.is_none() && state.lsp_dirty.is_empty() && state.gutter_dirty.is_empty() && state.gutter_pending.is_empty() && state.tree_children_pending.is_empty() && state.claude.as_ref().is_none_or(|c| c.selection_changed_at.is_none()) && state.update.is_none() && state.ignored_rx.is_none() && state.blame_rx.is_none() && state.blame_want.is_none() && state.bulb_want.is_none() && state.ext_registry_rx.is_none() && state.ext_install_rx.is_none() && state.ext_pending.is_empty() {
+                if !self.ivars().needs_redraw.get() && state.message.is_none() && !state.git.busy() && state.drag_point.is_none() && state.project_search_rx.is_none() && state.project_index_rx.is_none() && state.http.is_none() && state.project_changed_at.is_none() && state.git_changed_at.is_none() && state.lsp_dirty.is_empty() && state.gutter_dirty.is_empty() && state.gutter_pending.is_empty() && state.tree_children_pending.is_empty() && state.claude.as_ref().is_none_or(|c| c.selection_changed_at.is_none()) && state.update.is_none() && state.ignored_rx.is_none() && state.blame_rx.is_none() && state.blame_want.is_none() && state.bulb_want.is_none() && state.ext_registry_rx.is_none() && state.ext_install_rx.is_none() && state.ext_pending.is_empty() && state.branch_rx.is_none() && state.reloading.is_empty() && state.gutter_diffing.is_empty() {
                     link.setPaused(true);
                     return;
                 }
@@ -3276,7 +3339,7 @@ type HeadText = (u64, Option<String>);
 struct GutterState {
     /// The file as of HEAD, with a file HEAD lacks as the empty string.
     /// `None` means the file is not in a repository, so there are no marks.
-    head: Option<String>,
+    head: Option<std::sync::Arc<String>>,
     marks: Vec<crate::project::git::Mark>,
 }
 
@@ -3449,7 +3512,7 @@ impl EditorView {
             && default_preview(state.docs.active()).is_some()
             && !chrome.sidebar.is_some_and(|r| r.contains(x, y))
         {
-            let blocks = markdown::parse(&state.docs.active().rope.to_string());
+            let (_, blocks) = markdown_of(state.docs.active());
             let last = blocks.len().saturating_sub(1);
             let current = state.preview.unwrap_or(0);
             state.preview = Some(current.saturating_add_signed(lines).min(last));
@@ -5312,6 +5375,7 @@ impl EditorView {
             return;
         };
         let active_id = state.docs.active().id();
+        let mut background = Vec::new();
         let mut reloaded = Vec::new();
         let mut conflicts = Vec::new();
         let mut missing = Vec::new();
@@ -5333,6 +5397,17 @@ impl EditorView {
                         if !buffer.conflict_noticed {
                             buffer.conflict_noticed = true;
                             conflicts.push(name);
+                        }
+                    }
+                    // A large file is read on a worker; its tab is replaced
+                    // when the read is done (`poll_reloads`).
+                    DiskState::Changed
+                        if buffer.path.as_deref().is_some_and(|p| {
+                            std::fs::metadata(p).is_ok_and(|m| m.len() > RELOAD_INLINE_BYTES)
+                        }) =>
+                    {
+                        if let Some(path) = buffer.path.clone() {
+                            background.push((buffer.id(), path));
                         }
                     }
                     DiskState::Changed => match buffer.reload() {
@@ -5361,6 +5436,15 @@ impl EditorView {
             state.lsp_dirty.insert(id, Instant::now());
             state.gutter_dirty.insert(id, Instant::now());
         }
+        for (id, path) in background {
+            if !state.reloading.insert(id) {
+                continue;
+            }
+            let tx = state.reload_channel.0.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send((id, Buffer::read_disk(&path)));
+            });
+        }
         let message = match (reloaded.len(), conflicts.len(), missing.len()) {
             (0, 0, 0) => None,
             (1, 0, 0) => Some(format!("{} changed on disk, reloaded", reloaded[0])),
@@ -5381,6 +5465,60 @@ impl EditorView {
         }
         self.sync_title();
         self.resume_display_link();
+        self.request_redraw();
+    }
+
+    /// Takes the large files read for a reload by `check_open_files`, into
+    /// tabs that are still clean and whose file has not changed again.
+    fn poll_reloads(&self) {
+        let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
+            return;
+        };
+        let mut names = Vec::new();
+        let mut active_changed = false;
+        let active_id = state.docs.active().id();
+        while let Ok((id, read)) = state.reload_channel.1.try_recv() {
+            state.reloading.remove(&id);
+            let Ok(read) = read else { continue };
+            let mut all = all_docs_mut(&mut state);
+            let Some(buffer) = all
+                .iter_mut()
+                .flat_map(|d| d.iter_mut())
+                .find(|b| b.id() == id)
+            else {
+                continue;
+            };
+            let current = buffer
+                .path
+                .as_deref()
+                .and_then(|p| crate::text::buffer::DiskStamp::of(p).ok());
+            if buffer.is_dirty() || current != read.stamp() {
+                continue;
+            }
+            buffer.apply_disk(read);
+            if let Some(name) = buffer.path.as_ref().and_then(|p| p.file_name()) {
+                names.push(name.to_string_lossy().into_owned());
+            }
+            active_changed |= id == active_id;
+            drop(all);
+            state.lsp_dirty.insert(id, Instant::now());
+            state.gutter_dirty.insert(id, Instant::now());
+        }
+        if names.is_empty() {
+            return;
+        }
+        state.message = Some((
+            match names.as_slice() {
+                [one] => format!("{one} changed on disk, reloaded"),
+                many => format!("{} files changed on disk, reloaded", many.len()),
+            },
+            Instant::now(),
+        ));
+        drop(state);
+        if active_changed {
+            self.after_reload(false);
+        }
+        self.sync_title();
         self.request_redraw();
     }
 
@@ -6476,10 +6614,10 @@ impl EditorView {
 
     fn palette_wheel_by(&self, dy: f64, precise: bool) {
         let mut state = self.ivars().state.borrow_mut();
-        let Some((query, _)) = &state.palette else {
+        if state.palette.is_none() {
             return;
-        };
-        let count = palette_rows(&palette_sources(&state), &query.rope.to_string()).len();
+        }
+        let count = state.palette_count;
         let visible = layout::palette_visible_rows(layout::palette_rect(state.viewport, count));
         state.palette_scroll_carry -= if precise {
             dy / (layout::PALETTE_ROW as f64 * 0.5)
@@ -6743,24 +6881,48 @@ impl EditorView {
                 let Ok((text, _)) = crate::text::file_format::decode(&bytes) else {
                     continue;
                 };
-                let matches = match search::find(&text, &query, "", options) {
+                let room = 500 - results.len();
+                let matches = match search::find_first(&text, &query, "", options, room) {
                     Ok(found) => found,
                     Err(error) => {
                         let _ = tx.send(Err(error));
                         return;
                     }
                 };
+                // Lines counted on from the previous match, not from the
+                // top of the file each time.
+                let (mut counted_to, mut line, mut line_start) = (0, 0, 0);
                 for found in matches {
-                    let line = text[..found.range.start]
-                        .bytes()
-                        .filter(|b| *b == b'\n')
-                        .count();
-                    let start = text[..found.range.start].rfind('\n').map_or(0, |i| i + 1);
-                    let end = text[found.range.end..]
+                    if worker_cancel.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let span = &text[counted_to..found.range.start];
+                    line += span.bytes().filter(|b| *b == b'\n').count();
+                    if let Some(i) = span.rfind('\n') {
+                        line_start = counted_to + i + 1;
+                    }
+                    counted_to = found.range.start;
+                    // The snippet is a hundred characters: look no further
+                    // than a couple of hundred bytes either way for the line's
+                    // ends, or a minified file is walked from its start for
+                    // every match.
+                    let mut lo = found.range.start.saturating_sub(200);
+                    while !text.is_char_boundary(lo) {
+                        lo += 1;
+                    }
+                    let mut hi = (found.range.end + 200).min(text.len());
+                    while !text.is_char_boundary(hi) {
+                        hi -= 1;
+                    }
+                    let start = text[lo..found.range.start]
+                        .rfind('\n')
+                        .map_or(lo, |i| lo + i + 1);
+                    let end = text[found.range.end..hi]
                         .find('\n')
-                        .map_or(text.len(), |i| found.range.end + i);
+                        .map_or(hi, |i| found.range.end + i);
                     results.push(ProjectHit {
                         path: path.clone(),
+                        column: found.range.start - line_start,
                         range: found.range,
                         line,
                         snippet: text[start..end].trim().chars().take(100).collect(),
@@ -6782,6 +6944,7 @@ impl EditorView {
             old.store(true, Ordering::Relaxed);
         }
         state.project_search_rx = Some(rx);
+        state.project_search_references = false;
         if let Some(bar) = &mut state.find {
             bar.results.clear();
             bar.selected = 0;
@@ -6937,13 +7100,15 @@ impl EditorView {
                     bar.results = results;
                     bar.selected = 0;
                     bar.result_scroll = 0;
-                    state.message = Some((
+                    let text = if state.project_search_references {
+                        format!("{count} reference{}", if count == 1 { "" } else { "s" })
+                    } else {
                         format!(
                             "{count} project matches{}",
                             if count == 500 { " (first 500)" } else { "" }
-                        ),
-                        Instant::now(),
-                    ));
+                        )
+                    };
+                    state.message = Some((text, Instant::now()));
                 }
                 Err(error) => {
                     state.message = Some((format!("project search: {error}"), Instant::now()))
@@ -6961,14 +7126,24 @@ impl EditorView {
                 .find
                 .as_ref()
                 .and_then(|bar| bar.results.get(index))
-                .map(|hit| (hit.path.clone(), hit.range.clone()))
+                .map(|hit| (hit.path.clone(), hit.line, hit.column, hit.range.len()))
         };
-        let Some((path, range)) = target else { return };
+        let Some((path, line, column, len)) = target else {
+            return;
+        };
         self.load_path(&path.to_string_lossy());
         let (rows, cols) = self.grid();
         {
+            // By line and column: the open document may have been edited
+            // above the hit since the search read the file from disk.
             let mut state = self.ivars().state.borrow_mut();
-            state.docs.active_mut().select_range(range.start, range.end);
+            let buffer = state.docs.active_mut();
+            let line = line.min(buffer.rope.len_lines().saturating_sub(1));
+            let line_start = buffer.rope.line_to_byte(line);
+            let line_end = crate::text::wrap::line_end(&buffer.rope, line);
+            let start = (line_start + column).min(line_end);
+            let end = (start + len).min(buffer.rope.len_bytes());
+            buffer.select_range(start, end);
             state.docs.active_mut().scroll_to_cursor(rows, cols);
         }
         self.sync_title();
@@ -7199,51 +7374,49 @@ impl EditorView {
         {
             let mut state = self.ivars().state.borrow_mut();
             let mut touched = Vec::new();
+            let edit = |_: &Path, buffer: &mut Buffer| -> Option<usize> {
+                let text = buffer.rope.to_string();
+                let found = search::find(&text, &needle, &replacement, options).ok()?;
+                let edits: Vec<_> = found
+                    .into_iter()
+                    .map(|m| (m.range, m.replacement))
+                    .collect();
+                Some(if edits.is_empty() {
+                    0
+                } else {
+                    buffer.replace_ranges(&edits)
+                })
+            };
+            let mut on_disk = Vec::new();
             for path in &files {
+                let found = open_doc_index(&all_docs(&state).collect::<Vec<_>>(), path);
+                let Some((d, i)) = found else {
+                    on_disk.push(path.clone());
+                    continue;
+                };
                 let buffer = all_docs_mut(&mut state)
                     .into_iter()
-                    .flat_map(|d| d.iter_mut())
-                    .find(|b| b.path.as_deref().is_some_and(|p| same_file(p, path)));
-                let edit = |buffer: &mut Buffer| -> Option<usize> {
-                    let text = buffer.rope.to_string();
-                    let found = search::find(&text, &needle, &replacement, options).ok()?;
-                    let edits: Vec<_> = found
-                        .into_iter()
-                        .map(|m| (m.range, m.replacement))
-                        .collect();
-                    Some(if edits.is_empty() {
-                        0
-                    } else {
-                        buffer.replace_ranges(&edits)
-                    })
-                };
-                match buffer {
-                    Some(buffer) => match edit(buffer) {
-                        Some(0) => {}
-                        Some(n) => {
-                            replaced += n;
-                            open += 1;
-                            touched.push(buffer.id());
-                        }
-                        None => failed.push(path.clone()),
-                    },
-                    None => {
-                        let done = Buffer::open(path.clone()).ok().and_then(|mut buffer| {
-                            let n = edit(&mut buffer)?;
-                            if n > 0 {
-                                buffer.save(None).ok()?;
-                            }
-                            Some(n)
-                        });
-                        match done {
-                            Some(0) => {}
-                            Some(n) => {
-                                replaced += n;
-                                written += 1;
-                            }
-                            None => failed.push(path.clone()),
-                        }
+                    .nth(d)
+                    .and_then(|docs| docs.iter_mut().nth(i));
+                let Some(buffer) = buffer else { continue };
+                match edit(path, buffer) {
+                    Some(0) => {}
+                    Some(n) => {
+                        replaced += n;
+                        open += 1;
+                        touched.push(buffer.id());
                     }
+                    None => failed.push(path.clone()),
+                }
+            }
+            for (path, done) in on_disk.iter().zip(edit_on_disk(&on_disk, edit)) {
+                match done {
+                    Some(0) => {}
+                    Some(n) => {
+                        replaced += n;
+                        written += 1;
+                    }
+                    None => failed.push(path.clone()),
                 }
             }
             for id in touched {
@@ -8196,16 +8369,39 @@ impl EditorView {
             self.request_redraw();
             return;
         };
-        let branches = match crate::project::git::branches(&root) {
-            Ok(list) => list,
+        // Read on a worker, like every other Git command: the palette
+        // opens when the list arrives.
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::project::git::branches(&root));
+        });
+        self.ivars().state.borrow_mut().branch_rx = Some(rx);
+        self.resume_display_link();
+    }
+
+    fn poll_branches(&self) {
+        let reply = {
+            let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
+                return;
+            };
+            let Some(rx) = &state.branch_rx else { return };
+            let reply = match rx.try_recv() {
+                Ok(reply) => reply,
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Disconnected) => Err("could not list branches".into()),
+            };
+            state.branch_rx = None;
+            reply
+        };
+        match reply {
+            Ok(branches) => {
+                self.open_palette_with("");
+                self.ivars().state.borrow_mut().branch_list = Some(branches);
+            }
             Err(error) => {
                 self.ivars().state.borrow_mut().message = Some((error, Instant::now()));
-                self.request_redraw();
-                return;
             }
-        };
-        self.open_palette_with("");
-        self.ivars().state.borrow_mut().branch_list = Some(branches);
+        }
         self.request_redraw();
         self.pump();
     }
@@ -8451,56 +8647,74 @@ impl EditorView {
             self.request_redraw();
             return;
         }
-        let mut texts: HashMap<std::path::PathBuf, Option<crate::text::rope::Rope>> =
-            HashMap::new();
-        let mut results = Vec::new();
-        for location in &locations {
-            let rope = texts.entry(location.path.clone()).or_insert_with(|| {
-                all_docs(&state)
-                    .flat_map(|d| d.iter())
-                    .find(|b| {
-                        b.path
-                            .as_deref()
-                            .is_some_and(|p| same_file(p, &location.path))
-                    })
-                    .map(|b| b.rope.clone())
-                    .or_else(|| {
-                        let bytes = std::fs::read(&location.path).ok()?;
-                        let (text, _) = crate::text::file_format::decode(&bytes).ok()?;
-                        Some(crate::text::rope::Rope::from_text(&text))
-                    })
-            });
-            let Some(rope) = rope else {
-                continue;
-            };
-            let start = crate::lsp::offset_of(rope, location.start);
-            let end = crate::lsp::offset_of(rope, location.end).max(start);
-            let line = rope.byte_to_line(start);
-            let line_start = rope.line_to_byte(line);
-            let line_end = if line + 1 < rope.len_lines() {
-                rope.line_to_byte(line + 1)
-            } else {
-                rope.len_bytes()
-            };
-            results.push(ProjectHit {
-                path: location.path.clone(),
-                range: start..end,
-                line,
-                snippet: rope
-                    .slice_to_string(line_start..line_end)
-                    .trim()
-                    .chars()
-                    .take(100)
-                    .collect(),
-            });
+        // The references' lines are read on a worker: a symbol used in a
+        // few hundred files not open would otherwise be read from disk here.
+        // Open documents are passed as they stand, so the lines match.
+        let open: Vec<(std::path::PathBuf, crate::text::rope::Rope)> = all_docs(&state)
+            .flat_map(|d| d.iter())
+            .filter_map(|b| Some((b.path.clone()?, b.rope.clone())))
+            .collect();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut texts: HashMap<std::path::PathBuf, Option<crate::text::rope::Rope>> =
+                HashMap::new();
+            let mut results = Vec::new();
+            for location in &locations {
+                if worker_cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                let rope = texts.entry(location.path.clone()).or_insert_with(|| {
+                    open.iter()
+                        .find(|(p, _)| same_file(p, &location.path))
+                        .map(|(_, rope)| rope.clone())
+                        .or_else(|| {
+                            let bytes = std::fs::read(&location.path).ok()?;
+                            let (text, _) = crate::text::file_format::decode(&bytes).ok()?;
+                            Some(crate::text::rope::Rope::from_text(&text))
+                        })
+                });
+                let Some(rope) = rope else {
+                    continue;
+                };
+                let start = crate::lsp::offset_of(rope, location.start);
+                let end = crate::lsp::offset_of(rope, location.end).max(start);
+                let line = rope.byte_to_line(start);
+                let line_start = rope.line_to_byte(line);
+                let line_end = if line + 1 < rope.len_lines() {
+                    rope.line_to_byte(line + 1)
+                } else {
+                    rope.len_bytes()
+                };
+                results.push(ProjectHit {
+                    path: location.path.clone(),
+                    range: start..end,
+                    line,
+                    column: start - line_start,
+                    snippet: rope
+                        .slice_to_string(line_start..line_end)
+                        .trim()
+                        .chars()
+                        .take(100)
+                        .collect(),
+                });
+            }
+            let _ = tx.send(Ok(results));
+        });
+        // One search at a time: a project search still running would
+        // otherwise land over the references.
+        if let Some(old) = state.project_search_cancel.replace(cancel) {
+            old.store(true, Ordering::Relaxed);
         }
+        state.project_search_rx = Some(rx);
+        state.project_search_references = true;
         let buffer = state.docs.active();
         let name = buffer
             .rope
             .slice_to_string(buffer.word_range_at(buffer.cursor()));
         let mut query = Buffer::new();
         query.insert(&name);
-        let count = results.len();
         state.find = Some(FindBar {
             query,
             replacement: Buffer::new(),
@@ -8511,16 +8725,13 @@ impl EditorView {
                 regex: false,
             },
             project: true,
-            results,
+            results: Vec::new(),
             selected: 0,
             result_scroll: 0,
-            searching: false,
+            searching: true,
         });
-        state.message = Some((
-            format!("{count} reference{}", if count == 1 { "" } else { "s" }),
-            Instant::now(),
-        ));
         drop(state);
+        self.resume_display_link();
         self.request_redraw();
         self.pump();
     }
@@ -8649,14 +8860,20 @@ impl EditorView {
         {
             let mut state = self.ivars().state.borrow_mut();
             let mut touched = Vec::new();
+            let mut on_disk: Vec<&crate::lsp::FileEdits> = Vec::new();
             for file in files {
                 let (path, edits) = (&file.path, &file.edits);
                 if edits.is_empty() {
                     continue;
                 }
+                let found = open_doc_index(&all_docs(&state).collect::<Vec<_>>(), path);
+                let Some((d, i)) = found else {
+                    on_disk.push(file);
+                    continue;
+                };
                 let open = all_docs(&state)
-                    .flat_map(|d| d.iter())
-                    .find(|b| b.path.as_deref().is_some_and(|p| same_file(p, path)))
+                    .nth(d)
+                    .and_then(|docs| docs.iter().nth(i))
                     .map(|b| (b.id(), b.path.clone()));
                 if let Some((id, own_path)) = open {
                     let sent = own_path
@@ -8670,27 +8887,28 @@ impl EditorView {
                 }
                 let buffer = all_docs_mut(&mut state)
                     .into_iter()
-                    .flat_map(|d| d.iter_mut())
-                    .find(|b| b.path.as_deref().is_some_and(|p| same_file(p, path)));
-                match buffer {
-                    Some(buffer) => match crate::lsp::edit_ranges(&buffer.rope, edits) {
-                        Some(ranges) if buffer.replace_ranges(&ranges) > 0 => {
-                            touched.push(buffer.id());
-                            outcome.open += 1;
-                        }
-                        _ => outcome.failed.push(path.clone()),
-                    },
-                    None => {
-                        let done = Buffer::open(path.clone()).ok().and_then(|mut buffer| {
-                            let ranges = crate::lsp::edit_ranges(&buffer.rope, edits)?;
-                            (buffer.replace_ranges(&ranges) > 0).then_some(())?;
-                            buffer.save(None).ok()
-                        });
-                        match done {
-                            Some(()) => outcome.written += 1,
-                            None => outcome.failed.push(path.clone()),
-                        }
+                    .nth(d)
+                    .and_then(|docs| docs.iter_mut().nth(i));
+                let Some(buffer) = buffer else { continue };
+                match crate::lsp::edit_ranges(&buffer.rope, edits) {
+                    Some(ranges) if buffer.replace_ranges(&ranges) > 0 => {
+                        touched.push(buffer.id());
+                        outcome.open += 1;
                     }
+                    _ => outcome.failed.push(path.clone()),
+                }
+            }
+            let paths: Vec<std::path::PathBuf> = on_disk.iter().map(|f| f.path.clone()).collect();
+            let done = edit_on_disk(&paths, |path, buffer| {
+                let file = on_disk.iter().find(|f| f.path == path)?;
+                let ranges = crate::lsp::edit_ranges(&buffer.rope, &file.edits)?;
+                let n = buffer.replace_ranges(&ranges);
+                (n > 0).then_some(n)
+            });
+            for (path, done) in paths.into_iter().zip(done) {
+                match done {
+                    Some(_) => outcome.written += 1,
+                    None => outcome.failed.push(path),
                 }
             }
             for id in touched {
@@ -10339,6 +10557,18 @@ impl EditorView {
         let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
             return;
         };
+        // Marks worked out on a worker, for text that has not moved on.
+        while let Ok((id, text, marks)) = state.marks_channel.1.try_recv() {
+            state.gutter_diffing.remove(&id);
+            let current = all_docs(&state)
+                .flat_map(|d| d.iter())
+                .find(|b| b.id() == id)
+                .is_some_and(|b| b.rope.same_as(&text));
+            if current && let Some(entry) = state.gutter.get_mut(&id) {
+                entry.marks = marks;
+                self.ivars().needs_redraw.set(true);
+            }
+        }
         // Fetched HEAD texts landing.
         while let Ok((id, head)) = state.gutter_channel.1.try_recv() {
             state.gutter_pending.remove(&id);
@@ -10346,7 +10576,7 @@ impl EditorView {
             state.gutter.insert(
                 id,
                 GutterState {
-                    head,
+                    head: head.map(std::sync::Arc::new),
                     marks: Vec::new(),
                 },
             );
@@ -10392,16 +10622,22 @@ impl EditorView {
         let State {
             gutter,
             gutter_dirty,
+            gutter_diffing,
+            marks_channel,
             docs,
             panes,
             ..
         } = &mut *state;
         for id in due {
+            // One diff per document at a time; the next pause asks again.
+            if gutter_diffing.contains(&id) {
+                continue;
+            }
             gutter_dirty.remove(&id);
             let Some(entry) = gutter.get_mut(&id) else {
                 continue;
             };
-            let Some(head) = &entry.head else {
+            let Some(head) = entry.head.clone() else {
                 continue;
             };
             let buffer = std::iter::once(&*docs)
@@ -10415,9 +10651,16 @@ impl EditorView {
                 entry.marks.clear();
                 continue;
             }
-            let text = buffer.rope.to_string();
-            entry.marks = crate::project::git::marks(&crate::ide::diff::diff(head, &text));
-            self.ivars().needs_redraw.set(true);
+            // Myers over a couple of megabytes with hundreds of changes is
+            // tens to hundreds of milliseconds: not on the main thread.
+            let snapshot = buffer.rope.clone();
+            let tx = marks_channel.0.clone();
+            gutter_diffing.insert(id);
+            std::thread::spawn(move || {
+                let text = snapshot.to_string();
+                let marks = crate::project::git::marks(&crate::ide::diff::diff(&head, &text));
+                let _ = tx.send((id, snapshot, marks));
+            });
         }
     }
 
@@ -10454,6 +10697,15 @@ impl EditorView {
             let Some(buffer) = buffer else {
                 continue;
             };
+            // Grown past the limit: the servers that have it let it go.
+            if buffer.rope.len_bytes() > LSP_MAX_BYTES
+                && let Some(path) = &buffer.path
+            {
+                for server in lsp.values_mut().filter(|s| s.knows(path)) {
+                    server.did_close(path);
+                }
+                continue;
+            }
             let (Some(path), Some(language)) = (&buffer.path, lsp_language(buffer)) else {
                 continue;
             };
@@ -11873,6 +12125,7 @@ impl EditorView {
             git,
             git_open,
             find,
+            find_cache,
             tab_hits,
             tab_scroll,
             hovered_tab,
@@ -11884,6 +12137,7 @@ impl EditorView {
             commands: command_list,
             symbols: symbol_list,
             palette_scroll,
+            palette_count,
             goto,
             rename,
             signature,
@@ -11981,18 +12235,9 @@ impl EditorView {
             }
         }
         let buffer = docs.active();
-        let search_matches = find.as_ref().and_then(|bar| {
-            if bar.query.rope.len_bytes() == 0 || buffer.rope.len_bytes() > 2 * 1024 * 1024 {
-                return None;
-            }
-            search::find(
-                &buffer.rope.to_string(),
-                &bar.query.rope.to_string(),
-                "",
-                bar.options,
-            )
-            .ok()
-        });
+        let search_matches = find
+            .as_ref()
+            .and_then(|bar| find_matches(find_cache, bar, buffer));
 
         // Markdown preview replaces the editor body. Parsing per frame is
         // fine: a README is kilobytes, and the alternative is a cache that
@@ -12086,8 +12331,7 @@ impl EditorView {
                 home_hits,
             );
         } else if previewing {
-            let source = buffer.rope.to_string();
-            let blocks = markdown::parse_spanned(&source);
+            let (source, blocks) = markdown_of(buffer);
             let scroll = preview.unwrap_or(0).min(blocks.len().saturating_sub(1));
             let active = live_line
                 .filter(|(id, _)| *id == buffer.id())
@@ -13013,6 +13257,7 @@ impl EditorView {
                 .into_iter()
                 .map(|(row, _)| row)
                 .collect();
+            *palette_count = rows.len();
             let rect = layout::palette_rect(viewport, rows.len());
             layout::push_rect(
                 glyphs,
@@ -13194,11 +13439,16 @@ fn wraps_by_default(buffer: &Buffer) -> bool {
 }
 
 /// The language a buffer's server speaks, from its extension.
+/// Documents past this are not given to a language server: every pause in
+/// typing would send the whole text again (full sync), and servers choke on
+/// generated files that size anyway.
+const LSP_MAX_BYTES: usize = 8 * 1024 * 1024;
+
 fn lsp_language(buffer: &Buffer) -> Option<Language> {
     buffer
         .extension()
         .and_then(|e| Language::from_extension(&e))
-        .filter(|_| buffer.path.is_some())
+        .filter(|_| buffer.path.is_some() && buffer.rope.len_bytes() <= LSP_MAX_BYTES)
 }
 
 /// The server that knows `buffer`, when there is one and it is ready.
@@ -13481,6 +13731,108 @@ fn claude_selection(state: &State) -> Option<crate::ide::mcp::Selection> {
         text,
         start: crate::lsp::position_of(&buffer.rope, range.start),
         end: crate::lsp::position_of(&buffer.rope, range.end),
+    })
+}
+
+thread_local! {
+    /// Parsed Markdown by document and text, a few at a time (one per pane
+    /// showing a preview). Drawing and every wheel event want the blocks;
+    /// parsing a multi-megabyte file each time was the cost of a frame.
+    static MARKDOWN: RefCell<Vec<MarkdownParse>> = const { RefCell::new(Vec::new()) };
+}
+
+struct MarkdownParse {
+    id: u64,
+    text: crate::text::rope::Rope,
+    source: std::rc::Rc<String>,
+    blocks: std::rc::Rc<Vec<markdown::SpannedBlock>>,
+}
+
+/// `buffer`'s text and its Markdown blocks, parsed once per change.
+fn markdown_of(
+    buffer: &Buffer,
+) -> (
+    std::rc::Rc<String>,
+    std::rc::Rc<Vec<markdown::SpannedBlock>>,
+) {
+    MARKDOWN.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(hit) = cache
+            .iter()
+            .find(|p| p.id == buffer.id() && p.text.same_as(&buffer.rope))
+        {
+            return (hit.source.clone(), hit.blocks.clone());
+        }
+        let source = std::rc::Rc::new(buffer.rope.to_string());
+        let blocks = std::rc::Rc::new(markdown::parse_spanned(&source));
+        cache.retain(|p| p.id != buffer.id());
+        if cache.len() >= 4 {
+            cache.remove(0);
+        }
+        cache.push(MarkdownParse {
+            id: buffer.id(),
+            text: buffer.rope.clone(),
+            source: source.clone(),
+            blocks: blocks.clone(),
+        });
+        (source, blocks)
+    })
+}
+
+/// A file read for a reload, by buffer id.
+type ReloadRead = (u64, std::io::Result<crate::text::buffer::DiskRead>);
+/// Gutter marks worked out on a worker: buffer id, the text they are for,
+/// the marks.
+type GutterMarks = (u64, crate::text::rope::Rope, Vec<crate::project::git::Mark>);
+
+/// Files changed on disk up to this size are reloaded at once; larger ones
+/// are read on a worker so the window stays responsive.
+const RELOAD_INLINE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Opens, edits and saves each of `paths` that is not open, on up to eight
+/// threads at once: most of a save is waiting on the disk, and a rename
+/// across a few hundred files would otherwise wait on each in turn. `edit`
+/// answers how many changes it made, or `None` when it could not. Results
+/// come back in the order of `paths`.
+fn edit_on_disk<F>(paths: &[std::path::PathBuf], edit: F) -> Vec<Option<usize>>
+where
+    F: Fn(&Path, &mut Buffer) -> Option<usize> + Sync,
+{
+    let run = |path: &std::path::PathBuf| {
+        Buffer::open(path.clone()).ok().and_then(|mut buffer| {
+            let n = edit(path, &mut buffer)?;
+            if n > 0 {
+                buffer.save(None).ok()?;
+            }
+            Some(n)
+        })
+    };
+    if paths.len() < 4 {
+        return paths.iter().map(run).collect();
+    }
+    let chunk = paths.len().div_ceil(8);
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = paths
+            .chunks(chunk)
+            .map(|part| scope.spawn(|| part.iter().map(run).collect::<Vec<_>>()))
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|w| w.join().unwrap_or_default())
+            .collect()
+    })
+}
+
+/// The open document for `path`, found by one canonical key: open
+/// documents keep canonical paths, so only `path` needs resolving.
+fn open_doc_index(docs: &[&Documents], path: &Path) -> Option<(usize, usize)> {
+    let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    docs.iter().enumerate().find_map(|(d, docs)| {
+        docs.iter()
+            .position(|b| {
+                b.path.as_deref() == Some(key.as_path()) || b.path.as_deref() == Some(path)
+            })
+            .map(|i| (d, i))
     })
 }
 
@@ -13839,8 +14191,7 @@ fn draw_other_pane(
         return;
     }
     if store.preview.is_some() && default_preview(buffer).is_some() {
-        let source = buffer.rope.to_string();
-        let blocks = markdown::parse_spanned(&source);
+        let (source, blocks) = markdown_of(buffer);
         let scroll = store
             .preview
             .unwrap_or(0)
@@ -15015,6 +15366,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         tree_children_rx,
         tree_children_pending: HashSet::new(),
         find: None,
+        find_cache: None,
         sidebar,
         sidebar_width: session.sidebar_width,
         dragging_divider: false,
@@ -15059,6 +15411,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         finder,
         project_index_rx,
         project_search_rx: None,
+        project_search_references: false,
         project_search_cancel: None,
         http: None,
         responses: HashMap::new(),
@@ -15079,6 +15432,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         word_wrap: crate::platform::settings::Settings::load().word_wrap,
         ssh_auth_sock: crate::platform::settings::Settings::load().ssh_auth_sock,
         branch_list: None,
+        branch_rx: None,
         action_list: None,
         quick_fix_request: None,
         organizing: None,
@@ -15120,6 +15474,10 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         gutter_dirty: HashMap::new(),
         gutter_pending: HashSet::new(),
         gutter_channel: mpsc::channel(),
+        reload_channel: mpsc::channel(),
+        reloading: HashSet::new(),
+        marks_channel: mpsc::channel(),
+        gutter_diffing: HashSet::new(),
         completion: None,
         project_changed_at: None,
         git_changed_at: None,
@@ -15129,6 +15487,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         commands: Vec::new(),
         symbols: symbols::Symbols::default(),
         palette_scroll: 0,
+        palette_count: 0,
         palette_scroll_carry: 0.0,
         goto: None,
         last_draw: None,
