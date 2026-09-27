@@ -219,8 +219,8 @@ if [ "$MODE" = "--install" ]; then
     fi
     mv "$NEW" "$DEST"
     rm -rf "$OLD"
-    built=$(codesign -dv "$APP" 2>&1 | sed -n 's/^CDHash=//p')
-    installed=$(codesign -dv "$DEST" 2>&1 | sed -n 's/^CDHash=//p')
+    built=$(codesign -dvvv "$APP" 2>&1 | sed -n 's/^CDHash=//p')
+    installed=$(codesign -dvvv "$DEST" 2>&1 | sed -n 's/^CDHash=//p')
     echo "    $DEST"
     echo "    built     CDHash $built"
     echo "    installed CDHash $installed"
