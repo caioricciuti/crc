@@ -57,15 +57,14 @@ impl Latency {
 
     /// Percentile in milliseconds. `p` is 0.0..=1.0.
     pub fn percentile_ms(&self, p: f64) -> f64 {
-        if self.samples.is_empty() {
-            return 0.0;
-        }
+        nearest_rank(&self.sorted_ms(), p)
+    }
+
+    /// The window in milliseconds, ascending.
+    fn sorted_ms(&self) -> Vec<f64> {
         let mut sorted: Vec<f64> = self.samples.iter().map(|d| d.as_secs_f64() * 1e3).collect();
-        sorted.sort_by(|a, b| a.partial_cmp(b).expect("no NaN in durations"));
-        // Nearest-rank, which for a window this small is more honest than
-        // interpolating between two samples.
-        let rank = (p * sorted.len() as f64).ceil().max(1.0) as usize;
-        sorted[(rank - 1).min(sorted.len() - 1)]
+        sorted.sort_by(f64::total_cmp);
+        sorted
     }
 
     pub fn max_ms(&self) -> f64 {
@@ -80,14 +79,26 @@ impl Latency {
         if self.is_empty() {
             return "latency  --".to_string();
         }
+        // One sort for both percentiles.
+        let sorted = self.sorted_ms();
         format!(
             "latency p50 {:.2}ms  p99 {:.2}ms  max {:.2}ms  n={}",
-            self.percentile_ms(0.50),
-            self.percentile_ms(0.99),
+            nearest_rank(&sorted, 0.50),
+            nearest_rank(&sorted, 0.99),
             self.max_ms(),
             self.count()
         )
     }
+}
+
+/// Nearest-rank percentile of ascending `sorted`, which for a window this
+/// small is more honest than interpolating between two samples.
+fn nearest_rank(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let rank = (p * sorted.len() as f64).ceil().max(1.0) as usize;
+    sorted[(rank - 1).min(sorted.len() - 1)]
 }
 
 #[cfg(test)]

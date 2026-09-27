@@ -62,21 +62,38 @@ pub struct Symbols {
     document: Option<(Language, Rope)>,
     root: Option<PathBuf>,
     outline: RefCell<Option<Vec<Definition>>>,
-    reader: RefCell<Option<Reader>>,
+    /// The outline being parsed on a worker, from the moment the palette
+    /// opens: a few megabytes of tree-sitter is not a main-thread job.
+    parsing: Option<std::sync::mpsc::Receiver<Vec<Definition>>>,
     project: RefCell<Option<(String, Vec<Hit>)>>,
+    /// The index file, when it is not the root's usual one (tests).
+    index: Option<PathBuf>,
+    /// A `#` query being answered on a worker: a substring match over
+    /// every symbol in the index cannot use its index, so it scans.
+    project_rx: RefCell<Option<(String, std::sync::mpsc::Receiver<Vec<Hit>>)>>,
 }
 
 impl Symbols {
     /// Forgets the last palette's lists and remembers what this one opens on.
     pub fn reset(&mut self, document: Option<(Language, Rope)>, root: Option<PathBuf>) {
-        let root_changed = self.root != root;
         self.document = document;
         self.root = root;
         *self.outline.get_mut() = None;
-        *self.project.get_mut() = None;
-        if root_changed {
-            *self.reader.get_mut() = None;
+        *self.project_rx.get_mut() = None;
+        self.parsing = None;
+        if let Some((language, rope)) = &self.document {
+            if rope.len_bytes() <= MAX_DOCUMENT_BYTES {
+                let (language, rope) = (*language, rope.clone());
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = tx.send(defs::definitions(language, &rope.to_string()));
+                });
+                self.parsing = Some(rx);
+            } else {
+                *self.outline.get_mut() = Some(Vec::new());
+            }
         }
+        *self.project.get_mut() = None;
     }
 
     /// The rows for `needle` in `scope`, best first.
@@ -87,14 +104,55 @@ impl Symbols {
         }
     }
 
-    fn document_hits(&self, needle: &str) -> Vec<Hit> {
-        let mut outline = self.outline.borrow_mut();
-        let definitions = outline.get_or_insert_with(|| match &self.document {
-            Some((language, rope)) if rope.len_bytes() <= MAX_DOCUMENT_BYTES => {
-                defs::definitions(*language, &rope.to_string())
+    /// Takes the outline once the worker has it. `true` when it just
+    /// arrived, so the palette is drawn again with it.
+    pub fn poll(&mut self) -> bool {
+        let mut arrived = false;
+        let answered =
+            self.project_rx
+                .get_mut()
+                .as_ref()
+                .and_then(|(needle, rx)| match rx.try_recv() {
+                    Ok(hits) => Some(Some((needle.clone(), hits))),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(None),
+                });
+        if let Some(answer) = answered {
+            *self.project_rx.get_mut() = None;
+            if let Some(answer) = answer {
+                *self.project.get_mut() = Some(answer);
             }
-            _ => Vec::new(),
-        });
+            arrived = true;
+        }
+        let Some(rx) = &self.parsing else {
+            return arrived;
+        };
+        match rx.try_recv() {
+            Ok(definitions) => {
+                *self.outline.get_mut() = Some(definitions);
+                self.parsing = None;
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => arrived,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                *self.outline.get_mut() = Some(Vec::new());
+                self.parsing = None;
+                true
+            }
+        }
+    }
+
+    /// Whether the outline is still being parsed.
+    pub fn pending(&self) -> bool {
+        self.parsing.is_some() || self.project_rx.borrow().is_some()
+    }
+
+    fn document_hits(&self, needle: &str) -> Vec<Hit> {
+        let outline = self.outline.borrow();
+        // Still parsing: nothing yet, and the palette fills in when it lands.
+        let Some(definitions) = outline.as_ref() else {
+            return Vec::new();
+        };
         let hits = rank(definitions.iter(), needle, |d| &d.name);
         hits.into_iter()
             .map(|d| Hit {
@@ -108,43 +166,59 @@ impl Symbols {
 
     fn project_hits(&self, needle: &str) -> Vec<Hit> {
         let needle = needle.trim();
+        let shown = || {
+            self.project
+                .borrow()
+                .as_ref()
+                .map(|(_, hits)| hits.clone())
+                .unwrap_or_default()
+        };
         if let Some((cached, hits)) = &*self.project.borrow()
             && cached == needle
         {
             return hits.clone();
         }
-        let hits = self.read_project(needle);
-        *self.project.borrow_mut() = Some((needle.to_string(), hits.clone()));
-        hits
+        // Asked already: the last answer stands in until this one lands.
+        if self
+            .project_rx
+            .borrow()
+            .as_ref()
+            .is_some_and(|(asked, _)| asked == needle)
+        {
+            return shown();
+        }
+        let (Some(root), false) = (self.root.clone(), needle.is_empty()) else {
+            *self.project.borrow_mut() = Some((needle.to_string(), Vec::new()));
+            return Vec::new();
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let asked = needle.to_string();
+        let index = self.index.clone().or_else(|| store::db_path(&root));
+        std::thread::spawn(move || {
+            let _ = tx.send(read_project(&root, index.as_deref(), &asked));
+        });
+        *self.project_rx.borrow_mut() = Some((needle.to_string(), rx));
+        shown()
     }
+}
 
-    fn read_project(&self, needle: &str) -> Vec<Hit> {
-        if needle.is_empty() {
-            return Vec::new();
-        }
-        let Some(root) = &self.root else {
-            return Vec::new();
-        };
-        let mut reader = self.reader.borrow_mut();
-        if reader.is_none() {
-            *reader = store::db_path(root).and_then(|path| Reader::open(&path));
-        }
-        let Some(reader) = reader.as_ref() else {
-            return Vec::new();
-        };
-        let found = reader
-            .containing(&needle.to_lowercase(), CANDIDATES)
-            .unwrap_or_default();
-        rank(found.iter(), needle, |s| &s.name)
-            .into_iter()
-            .map(|s| Hit {
-                name: s.name.clone(),
-                kind: s.kind.clone(),
-                path: Some(resolve(root, &s.path)),
-                line: s.line,
-            })
-            .collect()
-    }
+/// `#` rows for `needle`, from the index on disk. On a worker.
+fn read_project(root: &Path, index: Option<&Path>, needle: &str) -> Vec<Hit> {
+    let Some(reader) = index.and_then(Reader::open) else {
+        return Vec::new();
+    };
+    let found = reader
+        .containing(&needle.to_lowercase(), CANDIDATES)
+        .unwrap_or_default();
+    rank(found.iter(), needle, |s| &s.name)
+        .into_iter()
+        .map(|s| Hit {
+            name: s.name.clone(),
+            kind: s.kind.clone(),
+            path: Some(resolve(root, &s.path)),
+            line: s.line,
+        })
+        .collect()
 }
 
 /// The index stores paths relative to the root; an absolute one is kept.
@@ -214,6 +288,15 @@ mod tests {
         assert_eq!(query(">commit"), None);
     }
 
+    /// Waits for the outline's worker, as the display link would.
+    fn settle(symbols: &mut Symbols) {
+        let started = std::time::Instant::now();
+        while symbols.pending() && started.elapsed().as_secs() < 10 {
+            symbols.poll();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
     #[test]
     fn empty_document_query_is_the_outline_in_order() {
         let mut symbols = Symbols::default();
@@ -224,6 +307,8 @@ mod tests {
             )),
             None,
         );
+        assert!(symbols.search(Scope::Document, "").is_empty() || !symbols.pending());
+        settle(&mut symbols);
         let names: Vec<String> = symbols
             .search(Scope::Document, "")
             .into_iter()
@@ -242,6 +327,7 @@ mod tests {
             )),
             None,
         );
+        settle(&mut symbols);
         let hits = symbols.search(Scope::Document, "parse");
         assert_eq!(hits[0].name, "parse");
         assert_eq!(hits[0].line, 1);
@@ -266,11 +352,13 @@ mod tests {
             .unwrap();
         drop(store);
 
-        let symbols = Symbols {
+        let mut symbols = Symbols {
             root: Some(dir.clone()),
-            reader: RefCell::new(Reader::open(&db)),
+            index: Some(db.clone()),
             ..Symbols::default()
         };
+        symbols.search(Scope::Project, "revpa");
+        settle(&mut symbols);
         let hits = symbols.search(Scope::Project, "revpa");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].name, "reveal_path");

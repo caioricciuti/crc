@@ -313,19 +313,39 @@ pub fn draw(
     let Some(tab) = panel.active_tab() else {
         return;
     };
-    let term = tab.session.term.lock().unwrap_or_else(|e| e.into_inner());
     let m = atlas.metrics;
     let advance = m.advance;
     let row_h = row_height(atlas);
     // push_text centres a glyph in an editor line; move it up to sit in a
     // terminal row instead.
     let text_dy = -m.glyph_dy(m.line_height) + m.glyph_dy(row_h);
-    let rows = term.rows().min((screen.height / row_h).floor() as usize);
-    let cols = term.cols();
-    let back = panel.back.min(term.scrollback_len());
+    // What is on screen, copied out under the lock and drawn after it is
+    // let go: the reader thread takes the same lock for every burst of
+    // output, and a frame's glyph work would hold it up.
+    let (rows, cols, back, visible, cursor, cursor_visible) = {
+        let term = tab.session.term.lock().unwrap_or_else(|e| e.into_inner());
+        let rows = term.rows().min((screen.height / row_h).floor() as usize);
+        let back = panel.back.min(term.scrollback_len());
+        let visible: Vec<(Vec<crate::term::Cell>, u64)> = (0..rows)
+            .map(|row| {
+                (
+                    term.visible_row(row, back).to_vec(),
+                    term.view_line(row, back),
+                )
+            })
+            .collect();
+        (
+            rows,
+            term.cols(),
+            back,
+            visible,
+            term.cursor(),
+            term.modes.cursor_visible,
+        )
+    };
     let mut run = String::new();
-    for row in 0..rows {
-        let cells = term.visible_row(row, back);
+    for (row, (cells, line)) in visible.iter().enumerate() {
+        let line = *line;
         let y = screen.y + row as f32 * row_h;
         // Backgrounds, merged into runs of one colour.
         let mut col = 0;
@@ -348,7 +368,6 @@ pub fn draw(
         // The selection, over the backgrounds and under the text.
         if let Some((a, b)) = panel.selection {
             let (start, end) = if a <= b { (a, b) } else { (b, a) };
-            let line = term.view_line(row, back);
             if (start.0..=end.0).contains(&line) {
                 let from = if line == start.0 { start.1 } else { 0 };
                 let to = if line == end.0 { end.1 } else { cols };
@@ -402,8 +421,8 @@ pub fn draw(
         }
     }
     // The cursor, where the program left it, when it is showing.
-    let (row, col) = term.cursor();
-    if back == 0 && term.modes.cursor_visible && row < rows && !tab.session.has_exited() {
+    let (row, col) = cursor;
+    if back == 0 && cursor_visible && row < rows && !tab.session.has_exited() {
         let x = screen.x + col as f32 * advance;
         let y = screen.y + row as f32 * row_h;
         if panel.focus {

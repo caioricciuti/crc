@@ -183,7 +183,24 @@ pub fn parse(rope: &Rope) -> Vec<Conflict> {
         let mut separator_line = None;
         let mut found = None;
         let last = total.min(line + MAX_CONFLICT_LINES);
-        for n in line + 1..last {
+        // Only lines that start with a marker matter. Searching the region
+        // for each marker is far cheaper than reading every line of it,
+        // which an opening marker that never closes made a hundred
+        // thousand allocations per keystroke.
+        let region = first_end..if last < total {
+            rope.line_to_byte(last)
+        } else {
+            len
+        };
+        let mut candidates: Vec<usize> = ["<<<<<<<", "|||||||", "=======", ">>>>>>>"]
+            .iter()
+            .flat_map(|m| rope.find_in(m, region.clone()))
+            .filter(|&at| rope.line_to_byte(rope.byte_to_line(at)) == at)
+            .map(|at| rope.byte_to_line(at))
+            .collect();
+        candidates.sort_unstable();
+        candidates.dedup();
+        for n in candidates {
             let (text, line_start, line_end) = text_of(n);
             match marker(&text) {
                 // Another opening before this one closed: this one is not a

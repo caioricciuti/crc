@@ -124,17 +124,23 @@ pub fn parse_spanned(source: &str) -> Vec<SpannedBlock> {
     let lines: Vec<&str> = source.lines().collect();
     let mut blocks: Vec<SpannedBlock> = Vec::new();
     let mut i = 0;
+    // The last block that was not a blank line, kept up as blocks are
+    // appended (they only ever are): looking back past every blank line
+    // made a file of blank lines quadratic.
+    let (mut seen, mut last_content): (usize, Option<usize>) = (0, None);
 
     while i < lines.len() {
         let start = i;
         let line = lines[i];
-        // The last block that was not a blank line, which is what decides
-        // whether an indented line continues a list or opens a code block.
-        let previous = blocks
-            .iter()
-            .rev()
-            .map(|b| &b.block)
-            .find(|b| !matches!(b, Block::Blank));
+        while seen < blocks.len() {
+            if !matches!(blocks[seen].block, Block::Blank) {
+                last_content = Some(seen);
+            }
+            seen += 1;
+        }
+        // What decides whether an indented line continues a list or opens
+        // a code block.
+        let previous = last_content.map(|at| &blocks[at].block);
         // Spaces and tabs only. Markdown indentation is made of those, and
         // `trim_start` also strips the ideographic space that Chinese and
         // Japanese paragraphs open with: two of them measured as six bytes of
@@ -494,6 +500,7 @@ pub fn parse_inline(text: &str) -> Vec<Run> {
     let chars: Vec<char> = text.chars().collect();
     let mut plain = String::new();
     let mut i = 0;
+    let mut misses = Misses::default();
 
     let flush = |plain: &mut String, runs: &mut Vec<Run>| {
         if !plain.is_empty() {
@@ -520,9 +527,9 @@ pub fn parse_inline(text: &str) -> Vec<Run> {
         // An image, before the link rule can claim its `[`.
         if chars[i] == '!'
             && chars.get(i + 1) == Some(&'[')
-            && let Some(close) = find_from(&chars, i + 2, ']')
+            && let Some(close) = misses.find_from(&chars, i + 2, ']')
             && chars.get(close + 1) == Some(&'(')
-            && let Some(paren) = find_from(&chars, close + 2, ')')
+            && let Some(paren) = misses.find_from(&chars, close + 2, ')')
         {
             flush(&mut plain, &mut runs);
             runs.push(Run {
@@ -535,7 +542,7 @@ pub fn parse_inline(text: &str) -> Vec<Run> {
 
         // Inline code wins over everything inside it.
         if chars[i] == '`'
-            && let Some(end) = find_from(&chars, i + 1, '`')
+            && let Some(end) = misses.find_from(&chars, i + 1, '`')
         {
             flush(&mut plain, &mut runs);
             runs.push(Run {
@@ -547,7 +554,7 @@ pub fn parse_inline(text: &str) -> Vec<Run> {
         }
 
         if let Some((marker, style)) = delimiter_at(&chars, i)
-            && let Some(end) = find_run(&chars, i + marker, &chars[i], marker)
+            && let Some(end) = misses.find_run(&chars, i + marker, &chars[i], marker)
         {
             flush(&mut plain, &mut runs);
             // Emphasis nests: `**bold with *both* inside**`. Parsing the
@@ -565,9 +572,9 @@ pub fn parse_inline(text: &str) -> Vec<Run> {
 
         // A link: [text](target). Only the text is shown.
         if chars[i] == '['
-            && let Some(close) = find_from(&chars, i + 1, ']')
+            && let Some(close) = misses.find_from(&chars, i + 1, ']')
             && chars.get(close + 1) == Some(&'(')
-            && let Some(paren) = find_from(&chars, close + 2, ')')
+            && let Some(paren) = misses.find_from(&chars, close + 2, ')')
         {
             flush(&mut plain, &mut runs);
             runs.push(Run {
@@ -631,6 +638,56 @@ fn delimiter_at(chars: &[char], i: usize) -> Option<(usize, Style)> {
 ///
 /// The closer has to be *right-flanking*: preceded by something that is not
 /// whitespace. `_` additionally may not close inside a word.
+/// Searches that found nothing, by what they looked for and where they
+/// started. Every later search for the same thing starts further on, so it
+/// cannot find anything either: without this, a paragraph with many lone
+/// `*` or backticks searched to its end once for each.
+#[derive(Default)]
+struct Misses(Vec<((char, usize), usize)>);
+
+impl Misses {
+    fn missed(&self, key: (char, usize), from: usize) -> bool {
+        self.0.iter().any(|&(k, at)| k == key && from >= at)
+    }
+
+    fn note(&mut self, key: (char, usize), from: usize) {
+        match self.0.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, at)) => *at = (*at).min(from),
+            None => self.0.push((key, from)),
+        }
+    }
+
+    fn find_from(&mut self, chars: &[char], from: usize, needle: char) -> Option<usize> {
+        let key = (needle, 0);
+        if self.missed(key, from) {
+            return None;
+        }
+        let found = find_from(chars, from, needle);
+        if found.is_none() {
+            self.note(key, from);
+        }
+        found
+    }
+
+    fn find_run(
+        &mut self,
+        chars: &[char],
+        from: usize,
+        marker: &char,
+        len: usize,
+    ) -> Option<usize> {
+        let key = (*marker, len);
+        if self.missed(key, from) {
+            return None;
+        }
+        let found = find_run(chars, from, marker, len);
+        if found.is_none() {
+            self.note(key, from);
+        }
+        found
+    }
+}
+
 fn find_run(chars: &[char], from: usize, marker: &char, len: usize) -> Option<usize> {
     let mut i = from;
     while i + len <= chars.len() {

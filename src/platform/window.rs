@@ -2089,6 +2089,14 @@ define_class!(
             self.poll_project_search();
             self.poll_branches();
             self.poll_reloads();
+            if self
+                .ivars()
+                .state
+                .try_borrow_mut()
+                .is_ok_and(|mut state| state.symbols.poll())
+            {
+                self.request_redraw();
+            }
             self.poll_http();
             self.poll_update();
             self.poll_ignored();
@@ -2116,7 +2124,7 @@ define_class!(
                     state.message = None;
                     self.ivars().needs_redraw.set(true);
                 }
-                if !self.ivars().needs_redraw.get() && state.message.is_none() && !state.git.busy() && state.drag_point.is_none() && state.project_search_rx.is_none() && state.project_index_rx.is_none() && state.http.is_none() && state.project_changed_at.is_none() && state.git_changed_at.is_none() && state.lsp_dirty.is_empty() && state.gutter_dirty.is_empty() && state.gutter_pending.is_empty() && state.tree_children_pending.is_empty() && state.claude.as_ref().is_none_or(|c| c.selection_changed_at.is_none()) && state.update.is_none() && state.ignored_rx.is_none() && state.blame_rx.is_none() && state.blame_want.is_none() && state.bulb_want.is_none() && state.ext_registry_rx.is_none() && state.ext_install_rx.is_none() && state.ext_pending.is_empty() && state.branch_rx.is_none() && state.reloading.is_empty() && state.gutter_diffing.is_empty() {
+                if !self.ivars().needs_redraw.get() && state.message.is_none() && !state.git.busy() && state.drag_point.is_none() && state.project_search_rx.is_none() && state.project_index_rx.is_none() && state.http.is_none() && state.project_changed_at.is_none() && state.git_changed_at.is_none() && state.lsp_dirty.is_empty() && state.gutter_dirty.is_empty() && state.gutter_pending.is_empty() && state.tree_children_pending.is_empty() && state.claude.as_ref().is_none_or(|c| c.selection_changed_at.is_none()) && state.update.is_none() && state.ignored_rx.is_none() && state.blame_rx.is_none() && state.blame_want.is_none() && state.bulb_want.is_none() && state.ext_registry_rx.is_none() && state.ext_install_rx.is_none() && state.ext_pending.is_empty() && state.branch_rx.is_none() && state.reloading.is_empty() && state.gutter_diffing.is_empty() && !state.symbols.pending() {
                     link.setPaused(true);
                     return;
                 }
@@ -7038,7 +7046,7 @@ impl EditorView {
         let Some(view) = responses.get_mut(&id) else {
             return;
         };
-        view.outcome = Some(outcome);
+        view.set_outcome(outcome);
         let note = format!("{}: {}", view.request.title(), view.status());
         let (text, ext) = view.text(view.segment);
         if let Some(buffer) = docs.iter_mut().find(|b| b.id() == id) {
@@ -7692,6 +7700,9 @@ impl EditorView {
                 for server in state.lsp.values_mut() {
                     server.did_close(&path);
                 }
+            }
+            if let Some(id) = closed.as_ref().map(Buffer::id) {
+                forget_document(&mut state, id);
             }
             state.completion = None;
             state.preview = default_preview(state.docs.active());
@@ -13688,6 +13699,19 @@ fn open_diff_tab(state: &mut State, change: usize, staged: bool) {
     state.preview = None;
     state.completion = None;
     reveal_active_tab(state);
+}
+
+/// Drops what was kept about a closed document: its HEAD text for the
+/// gutter (up to 2 MB each), and the timers that would work on it.
+fn forget_document(state: &mut State, id: u64) {
+    if all_docs(state).any(|d| d.iter().any(|b| b.id() == id)) {
+        return;
+    }
+    state.gutter.remove(&id);
+    state.gutter_dirty.remove(&id);
+    state.gutter_pending.remove(&id);
+    state.lsp_dirty.remove(&id);
+    state.conflict_scans.remove(&id);
 }
 
 /// Whether the Source Control diff has the editor column: its tab is the

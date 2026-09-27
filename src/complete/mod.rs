@@ -140,6 +140,17 @@ pub fn rank(
     limit: usize,
 ) -> Vec<Candidate> {
     let mut scored: Vec<(f32, Candidate)> = Vec::new();
+    // Where each label already is in `scored`, and the boosts by text:
+    // thousands of server items after a `.` made both lookups quadratic.
+    let mut by_label: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut boosts_by_text: std::collections::HashMap<&str, Vec<&Boost>> =
+        std::collections::HashMap::new();
+    for boost in boosts {
+        boosts_by_text
+            .entry(boost.text.as_str())
+            .or_default()
+            .push(boost);
+    }
     for mut candidate in candidates {
         if candidate.label == prefix || candidate.insert == prefix {
             continue;
@@ -148,9 +159,15 @@ pub fn rank(
             continue;
         };
         let mut score = matched * 0.6 + candidate.weight * 0.4;
-        let best = boosts
-            .iter()
-            .filter(|b| b.text == candidate.insert || b.text == candidate.label)
+        let for_insert = boosts_by_text.get(candidate.insert.as_str());
+        let for_label = (candidate.label != candidate.insert)
+            .then(|| boosts_by_text.get(candidate.label.as_str()))
+            .flatten();
+        let best = for_insert
+            .into_iter()
+            .chain(for_label)
+            .flatten()
+            .copied()
             .max_by(|a, b| {
                 a.same_context
                     .cmp(&b.same_context)
@@ -171,7 +188,11 @@ pub fn rank(
                 format!("{picked} · {}", candidate.why)
             };
         }
-        match scored.iter_mut().find(|(_, c)| c.label == candidate.label) {
+        match by_label
+            .get(&candidate.label)
+            .copied()
+            .and_then(|at| scored.get_mut(at))
+        {
             Some((best, existing)) => {
                 // The most specific source speaks for the name: the server
                 // (which carries the edit), then a definition, then your
@@ -192,7 +213,10 @@ pub fn rank(
                 }
                 *best = best.max(score);
             }
-            None => scored.push((score, candidate)),
+            None => {
+                by_label.insert(candidate.label.clone(), scored.len());
+                scored.push((score, candidate));
+            }
         }
     }
     scored.sort_by(|(a, x), (b, y)| {

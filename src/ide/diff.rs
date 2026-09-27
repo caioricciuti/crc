@@ -15,6 +15,10 @@ use crate::project::git::{Diff, DiffKind, DiffLine};
 const CONTEXT: usize = 3;
 /// The largest edit distance searched for a minimal diff.
 const MAX_EDITS: usize = 2000;
+/// Steps of the search before it gives up, whatever the distance: bounds
+/// the time on the main thread (a review opens synchronously) to tens of
+/// milliseconds.
+const MAX_WORK: usize = 20_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Op {
@@ -90,7 +94,23 @@ fn script(a: &[&str], b: &[&str]) -> Vec<Op> {
         .count();
     let (mid_a, mid_b) = (&a[prefix..a.len() - suffix], &b[prefix..b.len() - suffix]);
     let mut ops: Vec<Op> = (0..prefix).map(|i| Op::Equal(i, i)).collect();
-    match myers(mid_a, mid_b) {
+    // Lines as numbers, so the search compares integers, not strings.
+    fn numbered<'a>(
+        ids: &mut std::collections::HashMap<&'a str, u32>,
+        lines: &[&'a str],
+    ) -> Vec<u32> {
+        lines
+            .iter()
+            .map(|&line| {
+                let next = ids.len() as u32;
+                *ids.entry(line).or_insert(next)
+            })
+            .collect()
+    }
+    let mut ids = std::collections::HashMap::new();
+    let mid_a = numbered(&mut ids, mid_a);
+    let mid_b = numbered(&mut ids, mid_b);
+    match myers(&mid_a, &mid_b) {
         Some(middle) => ops.extend(middle.into_iter().map(|op| match op {
             Op::Equal(i, j) => Op::Equal(i + prefix, j + prefix),
             Op::Delete(i) => Op::Delete(i + prefix),
@@ -107,9 +127,14 @@ fn script(a: &[&str], b: &[&str]) -> Vec<Op> {
 }
 
 /// A shortest edit script, or `None` past [`MAX_EDITS`].
-fn myers(a: &[&str], b: &[&str]) -> Option<Vec<Op>> {
+fn myers(a: &[u32], b: &[u32]) -> Option<Vec<Op>> {
     let (n, m) = (a.len() as isize, b.len() as isize);
+    // The difference in length alone is a lower bound on the distance.
+    if a.len().abs_diff(b.len()) > MAX_EDITS {
+        return None;
+    }
     let max = (a.len() + b.len()).min(MAX_EDITS) as isize;
+    let mut work = 0usize;
     let offset = max + 1;
     let mut v = vec![0isize; (2 * max + 3) as usize];
     // trace[d] holds v[-d-1..=d+1] as it was before step d.
@@ -125,9 +150,14 @@ fn myers(a: &[&str], b: &[&str]) -> Option<Vec<Op>> {
                 v[at(k - 1)] + 1
             };
             let mut y = x - k;
+            let from = x;
             while x < n && y < m && a[x as usize] == b[y as usize] {
                 x += 1;
                 y += 1;
+            }
+            work += 1 + (x - from) as usize;
+            if work > MAX_WORK {
+                return None;
             }
             v[at(k)] = x;
             if x >= n && y >= m {

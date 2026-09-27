@@ -267,9 +267,22 @@ impl Panel {
     }
     fn conflicted_change(&self, path: &std::path::Path) -> Option<&Change> {
         let snapshot = self.snapshot.as_ref()?;
-        let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        let root = std::fs::canonicalize(&snapshot.root).unwrap_or_else(|_| snapshot.root.clone());
-        let relative = path.strip_prefix(&root).ok()?;
+        // Asked for every open document when Git changes: nothing to find,
+        // and no path to resolve, in the usual case of no conflicts.
+        if !snapshot.changes.iter().any(Change::conflicted) {
+            return None;
+        }
+        // Open documents' paths and Git's top level are already resolved;
+        // the disk is asked only when they do not line up.
+        let relative = match path.strip_prefix(&snapshot.root) {
+            Ok(relative) => relative.to_path_buf(),
+            Err(_) => {
+                let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+                let root =
+                    std::fs::canonicalize(&snapshot.root).unwrap_or_else(|_| snapshot.root.clone());
+                path.strip_prefix(&root).ok()?.to_path_buf()
+            }
+        };
         snapshot
             .changes
             .iter()

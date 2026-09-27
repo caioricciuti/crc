@@ -256,6 +256,9 @@ pub struct View {
     /// `None` while the request is in flight.
     pub outcome: Option<Result<Response, String>>,
     pub segment: Segment,
+    /// The body as shown, worked out once: pretty-printing a few megabytes
+    /// of JSON is not a job for every switch between segments.
+    body: std::cell::OnceCell<(String, Option<&'static str>)>,
 }
 
 impl View {
@@ -264,7 +267,14 @@ impl View {
             request,
             outcome: None,
             segment: Segment::Body,
+            body: std::cell::OnceCell::new(),
         }
+    }
+
+    /// The answer, replacing whatever was there.
+    pub fn set_outcome(&mut self, outcome: Result<Response, String>) {
+        self.outcome = Some(outcome);
+        self.body = std::cell::OnceCell::new();
     }
 
     pub fn verdict(&self) -> Verdict {
@@ -333,7 +343,7 @@ impl View {
                 None => (String::new(), None),
             },
             Segment::Body => match &self.outcome {
-                Some(Ok(r)) => body_text(r),
+                Some(Ok(r)) => self.body.get_or_init(|| body_text(r)).clone(),
                 Some(Err(e)) => (e.trim().to_owned(), None),
                 None => (String::new(), None),
             },
@@ -382,11 +392,14 @@ pub fn body_text(response: &Response) -> (String, Option<&'static str>) {
         .unwrap_or_default();
     let (mut text, ext) = match std::str::from_utf8(&response.body) {
         Ok(text) => {
-            if content_type.contains("json") || looks_like_json(text) {
-                match json::parse(text) {
-                    Ok(value) => (json::pretty(&value), Some("json")),
-                    Err(_) => (text.to_owned(), Some("json")),
-                }
+            // Parsed once: the guess and the pretty print share it.
+            let parsed = (content_type.contains("json") || starts_like_json(text))
+                .then(|| json::parse(text).ok())
+                .flatten();
+            if let Some(value) = parsed {
+                (json::pretty(&value), Some("json"))
+            } else if content_type.contains("json") {
+                (text.to_owned(), Some("json"))
             } else if content_type.contains("html") {
                 (text.to_owned(), Some("html"))
             } else if content_type.contains("javascript") {
@@ -454,9 +467,10 @@ pub fn request_text(request: &Prepared) -> String {
     out
 }
 
-fn looks_like_json(text: &str) -> bool {
+/// Worth trying as JSON without a content type saying so.
+fn starts_like_json(text: &str) -> bool {
     let t = text.trim_start();
-    (t.starts_with('{') || t.starts_with('[')) && json::parse(text).is_ok()
+    t.starts_with('{') || t.starts_with('[')
 }
 
 fn millis(seconds: f64) -> String {

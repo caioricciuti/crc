@@ -1623,19 +1623,28 @@ mod tests {
     }
 
     #[test]
-    fn undo_invalidates_edits_and_forces_a_full_reparse() {
-        use crate::text::buffer::Buffer;
-
-        let mut buffer = Buffer::from_text("fn a() {}\n");
-        buffer.insert("x");
-        assert!(buffer.drain_edits().is_some());
-
-        buffer.insert("y");
-        buffer.undo();
-        assert!(
-            buffer.drain_edits().is_none(),
-            "undo replaces the rope wholesale; edits cannot describe that"
+    fn undo_and_redo_are_described_as_one_edit_and_parse_incrementally() {
+        let mut store = SyntaxStore::new();
+        let mut buffer = rust_buffer("fn a() {}\nfn b() { let 日本 = 1; }\n", "u.rs");
+        store.update(&mut buffer, BUDGET);
+        buffer.place_cursor(
+            buffer.rope.len_bytes() - 4,
+            crate::text::buffer::Motion::Move,
         );
+        buffer.insert("struct S;\n");
+        store.update(&mut buffer, BUDGET);
+        buffer.undo();
+        let edits = buffer
+            .drain_edits()
+            .expect("undo is an edit, not a full reparse");
+        assert_eq!(edits.len(), 1);
+        buffer.redo();
+        buffer.undo();
+        store.update(&mut buffer, BUDGET);
+        assert_store_matches_a_full_parse(&store, &buffer);
+        buffer.redo();
+        store.update(&mut buffer, BUDGET);
+        assert_store_matches_a_full_parse(&store, &buffer);
     }
 
     #[test]

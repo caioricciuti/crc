@@ -33,6 +33,47 @@ fn is_continuation(b: u8) -> bool {
     b & 0xC0 == 0x80
 }
 
+/// Bytes `a` and `b` share at the start, up to `limit`, compared a window
+/// at a time.
+fn common_prefix(a: &Rope, b: &Rope, limit: usize) -> usize {
+    const WINDOW: usize = 64 * 1024;
+    let mut at = 0;
+    while at < limit {
+        let end = (at + WINDOW).min(limit);
+        let (x, y) = (window(a, at..end), window(b, at..end));
+        match x.iter().zip(&y).position(|(p, q)| p != q) {
+            Some(i) => return at + i,
+            None => at = end,
+        }
+    }
+    limit
+}
+
+/// Bytes `a` and `b` share at the end, up to `limit`.
+fn common_suffix(a: &Rope, b: &Rope, limit: usize) -> usize {
+    const WINDOW: usize = 64 * 1024;
+    let (la, lb) = (a.len_bytes(), b.len_bytes());
+    let mut same = 0;
+    while same < limit {
+        let step = WINDOW.min(limit - same);
+        let x = window(a, la - same - step..la - same);
+        let y = window(b, lb - same - step..lb - same);
+        match x.iter().rev().zip(y.iter().rev()).position(|(p, q)| p != q) {
+            Some(i) => return same + i,
+            None => same += step,
+        }
+    }
+    limit
+}
+
+fn window(rope: &Rope, range: std::ops::Range<usize>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(range.len());
+    for chunk in rope.bytes_in(range) {
+        out.extend_from_slice(chunk);
+    }
+    out
+}
+
 /// `text` with CRLF and lone CR as LF, the only line break the rope holds.
 fn normalize_newlines(text: &str) -> std::borrow::Cow<'_, str> {
     if text.contains('\r') {
@@ -1220,11 +1261,11 @@ impl Buffer {
             return false;
         };
         self.redo_stack.push(self.snapshot());
+        let before = self.rope.clone();
         self.restore(snapshot);
-        // The whole rope was replaced, so queued edits no longer describe
-        // how to get from the old text to the new. Force a full re-parse.
-        self.invalidate_edits();
-        self.pending_edits.clear();
+        // The whole rope was replaced; described as one edit over what
+        // differs, the parser can still work incrementally.
+        self.record_replacement(&before);
         // Break coalescing, so the next keystroke starts a fresh undo step
         // instead of folding into the one we just reverted.
         self.last_edit = None;
@@ -1241,9 +1282,9 @@ impl Buffer {
             return false;
         };
         self.undo_stack.push(self.snapshot());
+        let before = self.rope.clone();
         self.restore(snapshot);
-        self.invalidate_edits();
-        self.pending_edits.clear();
+        self.record_replacement(&before);
         self.last_edit = None;
         self.goal_column = None;
         self.dirty = true;
@@ -2133,6 +2174,39 @@ impl Buffer {
     /// Whether the text changed since the last [`Buffer::drain_edits`].
     /// The text changed in a way edits cannot describe. Folds cannot follow
     /// such a change either, so they open.
+    /// Records the change from `before` to the current text as one edit:
+    /// from where they first differ to where they last do. Queued edits
+    /// stay valid, since this one follows them.
+    fn record_replacement(&mut self, before: &Rope) {
+        let (old_len, new_len) = (before.len_bytes(), self.rope.len_bytes());
+        let shorter = old_len.min(new_len);
+        let mut prefix = common_prefix(before, &self.rope, shorter);
+        let mut suffix = common_suffix(before, &self.rope, shorter - prefix);
+        // Whole characters on both sides.
+        while prefix > 0 && self.rope.byte_at(prefix).is_some_and(is_continuation) {
+            prefix -= 1;
+        }
+        while suffix > 0
+            && (self
+                .rope
+                .byte_at(new_len - suffix)
+                .is_some_and(is_continuation)
+                || before
+                    .byte_at(old_len - suffix)
+                    .is_some_and(is_continuation))
+        {
+            suffix -= 1;
+        }
+        let old_end = old_len - suffix;
+        let new_end = new_len - suffix;
+        if prefix == old_end && prefix == new_end {
+            return;
+        }
+        let old_row = before.byte_to_line(old_end);
+        let old_end_point = (old_row, old_end - before.line_to_byte(old_row));
+        self.record_edit(prefix, old_end, old_end_point, new_end);
+    }
+
     fn invalidate_edits(&mut self) {
         self.edits_invalidated = true;
         self.folds.clear();
@@ -2461,7 +2535,13 @@ impl Buffer {
         }
         let base = self.indent_columns(line)?;
         let mut last = line;
-        for l in line + 1..self.rope.len_lines() {
+        // A block longer than this (a whole generated JSON under its first
+        // brace) is not worth the scan on the main thread to fold.
+        let limit = self.rope.len_lines().min(line + 1 + FOLD_ALL_MAX_LINES);
+        for l in line + 1..limit {
+            if l + 1 == limit && limit < self.rope.len_lines() {
+                return None;
+            }
             match self.indent_columns(l) {
                 Some(indent) if indent <= base => break,
                 Some(_) => last = l,
@@ -2655,6 +2735,14 @@ impl Buffer {
 
     /// The furthest scroll position, with the last row at the bottom of a
     /// view `rows` tall.
+    /// Whether a view `rows` tall starting at `line` could reach past the
+    /// end, which is when [`Buffer::max_scroll_row`] is worth its cost:
+    /// every visible line has at least one row, so only the last `rows`
+    /// lines can. Folded lines have none, so with folds it always could.
+    fn near_end(&self, line: usize, rows: usize) -> bool {
+        !self.folds.is_empty() || line + rows.max(1) >= self.rope.len_lines()
+    }
+
     fn max_scroll_row(&self, rows: usize) -> (usize, usize) {
         let last = self.rope.len_lines().saturating_sub(1);
         let end = (last, self.row_starts(last).len().saturating_sub(1));
@@ -2814,14 +2902,15 @@ impl Buffer {
     /// last position there is none, since nothing is below to reveal.
     pub fn scroll_by(&mut self, lines: isize, rows: usize) {
         if self.row_mode() {
-            let max = self.max_scroll_row(rows);
-            let at = self
-                .step_rows((self.scroll_line, self.scroll_row), lines)
-                .min(max);
-            (self.scroll_line, self.scroll_row) = at;
-            if at >= max {
-                self.scroll_fraction = 0.0;
+            let mut at = self.step_rows((self.scroll_line, self.scroll_row), lines);
+            if self.near_end(at.0, rows) {
+                let max = self.max_scroll_row(rows);
+                at = at.min(max);
+                if at >= max {
+                    self.scroll_fraction = 0.0;
+                }
             }
+            (self.scroll_line, self.scroll_row) = at;
             return;
         }
         let max = self.rope.len_lines().saturating_sub(rows.max(1));
@@ -2843,9 +2932,14 @@ impl Buffer {
             // Rows here, not lines: a wrapped paragraph scrolls row by row.
             let total = self.scroll_fraction as f64 + lines as f64;
             let whole = total.floor();
-            let max = self.max_scroll_row(rows);
             let from = (self.scroll_line, self.scroll_row);
-            let to = self.step_rows(from, whole as isize).min(max);
+            let mut to = self.step_rows(from, whole as isize);
+            let max = if self.near_end(to.0, rows) {
+                self.max_scroll_row(rows)
+            } else {
+                (usize::MAX, usize::MAX)
+            };
+            to = to.min(max);
             (self.scroll_line, self.scroll_row) = to;
             self.scroll_fraction = (total - whole) as f32;
             // Stopped short at either end: nothing more to reveal.

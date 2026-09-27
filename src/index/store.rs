@@ -253,7 +253,9 @@ impl Reader {
         if !path.exists() {
             return None;
         }
-        Db::open(path).ok().map(|db| Reader { db })
+        // Read-only: the completion worker and the palette only query, and
+        // a crash in either must not leave a hot journal behind.
+        Db::open_readonly(path).ok().map(|db| Reader { db })
     }
 
     /// Definitions whose name starts with `prefix`, shortest names first.

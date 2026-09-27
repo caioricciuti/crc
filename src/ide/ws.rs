@@ -13,7 +13,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
 /// Called after an event is queued, from a server thread.
@@ -31,6 +31,8 @@ pub enum Event {
 /// Largest message accepted, after reassembly. `openDiff` carries a whole
 /// file, so this is generous.
 const MAX_MESSAGE: usize = 64 * 1024 * 1024;
+/// Connections allowed to sit in their handshake at once.
+const MAX_HANDSHAKES: usize = 16;
 /// Largest upgrade request accepted.
 const MAX_REQUEST: usize = 16 * 1024;
 
@@ -56,6 +58,10 @@ impl Server {
         let wake: Arc<dyn Fn() + Send + Sync> = Arc::from(wake);
         std::thread::spawn(move || {
             let next = AtomicU64::new(1);
+            // Connections still in their handshake. Any local process can
+            // connect; without the token it gets no further, and a flood of
+            // them gets no more threads than this.
+            let waiting = Arc::new(AtomicUsize::new(0));
             for stream in listener.incoming() {
                 if stopped.load(Ordering::Relaxed) {
                     break;
@@ -63,13 +69,25 @@ impl Server {
                 let Ok(stream) = stream else {
                     continue;
                 };
+                if waiting.load(Ordering::Relaxed) >= MAX_HANDSHAKES {
+                    let _ = stream.shutdown(Shutdown::Both);
+                    continue;
+                }
+                waiting.fetch_add(1, Ordering::Relaxed);
                 let id = next.fetch_add(1, Ordering::Relaxed);
-                let (tx, shared, wake, token) =
-                    (tx.clone(), shared.clone(), wake.clone(), token.clone());
+                let (tx, shared, wake, token, waiting) = (
+                    tx.clone(),
+                    shared.clone(),
+                    wake.clone(),
+                    token.clone(),
+                    waiting.clone(),
+                );
                 // The handshake reads from the socket, so it gets its own
                 // thread: a client that connects and says nothing must not
                 // hold up the next one.
-                std::thread::spawn(move || serve(stream, id, &token, &shared, &tx, &*wake));
+                std::thread::spawn(move || {
+                    serve(stream, id, &token, &shared, &tx, &*wake, &waiting)
+                });
             }
         });
         Ok(Server {
@@ -94,9 +112,9 @@ impl Server {
         if write_frame(stream, OP_TEXT, text.as_bytes()).is_ok() {
             return true;
         }
-        if let Some((_, stream)) = writer.take() {
-            let _ = stream.shutdown(Shutdown::Both);
-        }
+        // Shut down, not taken: the reader thread then ends, finds itself
+        // still the owner and reports `Closed`, so the bridge lets go.
+        let _ = stream.shutdown(Shutdown::Both);
         false
     }
 
@@ -136,8 +154,29 @@ fn serve(
     writer: &Writer,
     tx: &mpsc::Sender<Event>,
     wake: &(dyn Fn() + Send + Sync),
+    waiting: &AtomicUsize,
 ) {
+    // Counted out of the handshake however it ends.
+    struct Done<'a>(&'a AtomicUsize, bool);
+    impl Done<'_> {
+        fn finish(&mut self) {
+            if !self.1 {
+                self.1 = true;
+                self.0.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+    }
+    impl Drop for Done<'_> {
+        fn drop(&mut self) {
+            self.finish();
+        }
+    }
+    let mut handshaking = Done(waiting, false);
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+    // Writes come from the main thread. A client that stops reading (a
+    // suspended `claude`) fails them after this rather than blocking the
+    // editor until the socket buffer drains.
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(250)));
     let Ok(mut write_half) = stream.try_clone() else {
         return;
     };
@@ -160,15 +199,22 @@ fn serve(
         return;
     }
     let _ = reader.get_ref().set_read_timeout(None);
-    // Replace whoever was connected.
+    handshaking.finish();
+    // Replace whoever was connected, and say so under the same lock: two
+    // clients finishing together must not leave the bridge believing one
+    // while the other owns the socket.
     {
         let mut current = writer.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((_, old)) = current.replace((id, write_half)) {
+            // A close frame first: the client it replaces ends its calls
+            // (an open diff waiting on a decision) instead of waiting on a
+            // socket that went quiet.
+            let _ = write_frame(&mut &old, OP_CLOSE, &[]);
             let _ = old.shutdown(Shutdown::Both);
         }
-    }
-    if tx.send(Event::Connected(id)).is_err() {
-        return;
+        if tx.send(Event::Connected(id)).is_err() {
+            return;
+        }
     }
     wake();
     let mut message: Vec<u8> = Vec::new();
@@ -176,11 +222,14 @@ fn serve(
     while let Ok(frame) = read_frame(&mut reader) {
         match frame.opcode {
             OP_TEXT | OP_CONTINUATION => {
+                // A new message inside a fragmented one, or a continuation
+                // of nothing, fails the connection (RFC 6455, 5.4).
+                if (frame.opcode == OP_TEXT) == in_text {
+                    break;
+                }
                 if frame.opcode == OP_TEXT {
                     message.clear();
                     in_text = true;
-                } else if !in_text {
-                    break;
                 }
                 if message.len() + frame.payload.len() > MAX_MESSAGE {
                     break;
@@ -372,6 +421,10 @@ fn read_frame<R: Read>(reader: &mut R) -> std::io::Result<Frame> {
     reader.read_exact(&mut head)?;
     let fin = head[0] & 0x80 != 0;
     let opcode = head[0] & 0x0F;
+    // No extension was negotiated, so no reserved bit may be set.
+    if head[0] & 0x70 != 0 {
+        return Err(std::io::Error::other("reserved bits set"));
+    }
     if head[1] & 0x80 == 0 {
         return Err(std::io::Error::other("unmasked client frame"));
     }
@@ -393,8 +446,13 @@ fn read_frame<R: Read>(reader: &mut R) -> std::io::Result<Frame> {
     }
     let mut mask = [0u8; 4];
     reader.read_exact(&mut mask)?;
-    let mut payload = vec![0u8; len as usize];
-    reader.read_exact(&mut payload)?;
+    // Read as it arrives rather than allocated at the declared length: a
+    // header claiming 64 MB costs nothing until the bytes are there.
+    let mut payload = Vec::new();
+    reader.take(len).read_to_end(&mut payload)?;
+    if payload.len() as u64 != len {
+        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+    }
     for (i, byte) in payload.iter_mut().enumerate() {
         *byte ^= mask[i % 4];
     }
@@ -603,6 +661,8 @@ mod tests {
         // The first reader ends, but its close is not reported: it no
         // longer owns the connection.
         assert_eq!(server.recv_timeout(Duration::from_millis(300)), None);
+        // It is told first, so its calls end instead of waiting.
+        assert_eq!(first.recv(), (OP_CLOSE, Vec::new()));
         let mut byte = [0u8; 1];
         assert_eq!(first.stream.read(&mut byte).unwrap_or(0), 0);
 

@@ -69,23 +69,52 @@ impl Pattern {
 
 /// Wildcard match. `*` and `?` stop at `/`; `**` crosses it.
 fn glob(pattern: &[u8], text: &[u8]) -> bool {
+    glob_in(pattern, text, &mut std::collections::HashSet::new())
+}
+
+/// [`glob`], remembering which (pattern, text) suffixes do not match. Each
+/// is then tried once, where plain backtracking tried `**/**/**/x` or
+/// `*a*a*a*b` exponentially often; they are suffixes of the originals, so
+/// their lengths name them.
+fn glob_in(
+    pattern: &[u8],
+    text: &[u8],
+    failed: &mut std::collections::HashSet<(usize, usize)>,
+) -> bool {
+    if failed.contains(&(pattern.len(), text.len())) {
+        return false;
+    }
+    let matched = glob_step(pattern, text, failed);
+    if !matched {
+        failed.insert((pattern.len(), text.len()));
+    }
+    matched
+}
+
+fn glob_step(
+    pattern: &[u8],
+    text: &[u8],
+    failed: &mut std::collections::HashSet<(usize, usize)>,
+) -> bool {
     match pattern.first() {
         None => text.is_empty(),
         Some(b'*') if pattern.get(1) == Some(&b'*') => {
             // `**/` also matches nothing at all: `**/foo` is `foo` too.
             let rest = &pattern[2..];
             let rest_after_slash = rest.strip_prefix(b"/").unwrap_or(rest);
-            if glob(rest_after_slash, text) {
+            if glob_in(rest_after_slash, text, failed) {
                 return true;
             }
-            (0..text.len())
-                .any(|i| glob(rest, &text[i + 1..]) || glob(rest_after_slash, &text[i + 1..]))
+            (0..text.len()).any(|i| {
+                glob_in(rest, &text[i + 1..], failed)
+                    || glob_in(rest_after_slash, &text[i + 1..], failed)
+            })
         }
         Some(b'*') => {
             let rest = &pattern[1..];
             let mut i = 0;
             loop {
-                if glob(rest, &text[i..]) {
+                if glob_in(rest, &text[i..], failed) {
                     return true;
                 }
                 if i == text.len() || text[i] == b'/' {
@@ -94,7 +123,9 @@ fn glob(pattern: &[u8], text: &[u8]) -> bool {
                 i += 1;
             }
         }
-        Some(b'?') => text.first().is_some_and(|&c| c != b'/') && glob(&pattern[1..], &text[1..]),
+        Some(b'?') => {
+            text.first().is_some_and(|&c| c != b'/') && glob_in(&pattern[1..], &text[1..], failed)
+        }
         Some(b'[') => {
             let Some(close) = pattern
                 .iter()
@@ -102,7 +133,7 @@ fn glob(pattern: &[u8], text: &[u8]) -> bool {
                 .position(|&c| c == b']')
                 .map(|p| p + 1)
             else {
-                return text.first() == Some(&b'[') && glob(&pattern[1..], &text[1..]);
+                return text.first() == Some(&b'[') && glob_in(&pattern[1..], &text[1..], failed);
             };
             let Some(&c) = text.first() else {
                 return false;
@@ -123,9 +154,9 @@ fn glob(pattern: &[u8], text: &[u8]) -> bool {
                     i += 1;
                 }
             }
-            hit != negate && c != b'/' && glob(&pattern[close + 1..], &text[1..])
+            hit != negate && c != b'/' && glob_in(&pattern[close + 1..], &text[1..], failed)
         }
-        Some(&p) => text.first() == Some(&p) && glob(&pattern[1..], &text[1..]),
+        Some(&p) => text.first() == Some(&p) && glob_in(&pattern[1..], &text[1..], failed),
     }
 }
 
@@ -135,6 +166,21 @@ mod tests {
 
     fn m(line: &str, path: &str, is_dir: bool) -> bool {
         parse(line).is_some_and(|p| p.matches(path, is_dir))
+    }
+
+    #[test]
+    fn pathological_patterns_finish_at_once() {
+        let started = std::time::Instant::now();
+        assert!(!glob(
+            b"**/**/**/**/**/x",
+            b"a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q/y"
+        ));
+        assert!(!glob(b"*a*a*a*a*a*a*a*a*b", "a".repeat(30).as_bytes()));
+        assert!(glob(
+            b"*a*a*a*a*a*a*a*a*b",
+            format!("{}b", "a".repeat(30)).as_bytes()
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
     }
 
     #[test]

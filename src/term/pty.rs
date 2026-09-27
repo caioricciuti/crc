@@ -75,10 +75,19 @@ pub type Wake = Box<dyn Fn() + Send + Sync>;
 /// A running program and its screen.
 pub struct Session {
     pub term: Arc<Mutex<Term>>,
-    writer: File,
+    /// Input for the writer thread: a program that stops reading (a paste
+    /// into one that is busy) blocks that thread, never the editor.
+    input: std::sync::mpsc::Sender<Vec<u8>>,
+    /// The master, for the window-size ioctl.
+    control: File,
     pid: i32,
-    /// Set by the reader when the program's side closed.
+    /// Set when the program's side closed, or the program itself exited:
+    /// a background job it left holding the terminal keeps the first from
+    /// ever happening.
     exited: Arc<AtomicBool>,
+    /// The program has been waited for; its pid may belong to another
+    /// process by now.
+    reaped: Arc<AtomicBool>,
     /// A wake-up is queued and not yet taken by [`Session::drain_wake`].
     woken: Arc<AtomicBool>,
 }
@@ -146,18 +155,38 @@ impl Session {
         }
         let child = command.spawn()?;
         let pid = child.id() as i32;
-        // Reaped on a thread of its own, so it never lingers as a zombie.
-        std::thread::spawn(move || {
-            let mut child = child;
-            let _ = child.wait();
-        });
-
-        let master = File::from(master);
-        let writer = master.try_clone()?;
-        let mut replies = master.try_clone()?;
-        let term = Arc::new(Mutex::new(Term::new(cols, rows)));
+        let wake: Arc<dyn Fn() + Send + Sync> = Arc::from(wake);
         let exited = Arc::new(AtomicBool::new(false));
         let woken = Arc::new(AtomicBool::new(false));
+        let reaped = Arc::new(AtomicBool::new(false));
+        // Reaped on a thread of its own, so it never lingers as a zombie.
+        {
+            let (exited, woken, reaped, wake) =
+                (exited.clone(), woken.clone(), reaped.clone(), wake.clone());
+            std::thread::spawn(move || {
+                let mut child = child;
+                let _ = child.wait();
+                reaped.store(true, Ordering::Release);
+                exited.store(true, Ordering::Release);
+                if !woken.swap(true, Ordering::AcqRel) {
+                    wake();
+                }
+            });
+        }
+
+        let master = File::from(master);
+        let mut writer = master.try_clone()?;
+        let control = master.try_clone()?;
+        let mut replies = master.try_clone()?;
+        let term = Arc::new(Mutex::new(Term::new(cols, rows)));
+        let (input, typed) = std::sync::mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            for bytes in typed {
+                if writer.write_all(&bytes).is_err() {
+                    return;
+                }
+            }
+        });
         let (shared, done, pending) = (term.clone(), exited.clone(), woken.clone());
         std::thread::spawn(move || {
             let mut reader = master;
@@ -186,16 +215,18 @@ impl Session {
         });
         Ok(Session {
             term,
-            writer,
+            input,
+            control,
             pid,
             exited,
+            reaped,
             woken,
         })
     }
 
-    /// Sends input, as typed or pasted.
+    /// Sends input, as typed or pasted, through the writer thread.
     pub fn write(&mut self, bytes: &[u8]) {
-        let _ = self.writer.write_all(bytes);
+        let _ = self.input.send(bytes.to_vec());
     }
 
     /// Changes the terminal's size; the program hears SIGWINCH.
@@ -203,7 +234,7 @@ impl Session {
         let mut term = self.term.lock().unwrap_or_else(|e| e.into_inner());
         if (term.cols(), term.rows()) != (cols.max(2), rows.max(1)) {
             term.resize(cols, rows);
-            set_size(self.writer.as_raw_fd(), cols, rows);
+            set_size(self.control.as_raw_fd(), cols, rows);
         }
     }
 
@@ -219,8 +250,12 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        // The whole process group, as closing a terminal window does.
-        unsafe { kill(-self.pid, SIGHUP) };
+        // The whole process group, as closing a terminal window does; not
+        // once the program is gone, since its pid may have been reused. A
+        // background job it left behind keeps the terminal until it closes.
+        if !self.reaped.load(Ordering::Acquire) {
+            unsafe { kill(-self.pid, SIGHUP) };
+        }
     }
 }
 
