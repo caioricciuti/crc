@@ -121,17 +121,24 @@ pub fn column_in_row(rope: &Rope, row_start: usize, byte: usize) -> usize {
 /// The byte on the row `row_start..row_end` closest to `column` columns
 /// from the row's start, measured as [`column_in_row`] does.
 pub fn byte_at_column(rope: &Rope, row_start: usize, row_end: usize, column: usize) -> usize {
+    byte_at_fraction(rope, row_start, row_end, column as f32)
+}
+
+/// [`byte_at_column`] for a column with a fraction, as a click gives: at or
+/// past the middle of a character is after it. The one rule every click
+/// and every row motion uses, so a click lands on the same side with
+/// wrapping on or off.
+pub fn byte_at_fraction(rope: &Rope, row_start: usize, row_end: usize, column: f32) -> usize {
     let line_start = rope.line_to_byte(rope.byte_to_line(row_start));
     let base = columns_between(rope, line_start, row_start);
-    let column = column + base;
+    let column = column.max(0.0) + base as f32;
     let mut at = base;
     let mut byte = row_start;
     for chunk in rope.chunks_in(row_start..row_end) {
         for ch in chunk.chars() {
             let next = columns::advance(at, ch);
-            if next > column {
-                // Past the middle of the character: after it.
-                return if column - at > (next - at) / 2 {
+            if next as f32 > column {
+                return if after_middle(column, at, next) {
                     byte + ch.len_utf8()
                 } else {
                     byte
@@ -142,6 +149,12 @@ pub fn byte_at_column(rope: &Rope, row_start: usize, row_end: usize, column: usi
         }
     }
     row_end
+}
+
+/// Whether `column` is at or past the middle of a character spanning the
+/// columns `at..next`.
+pub fn after_middle(column: f32, at: usize, next: usize) -> bool {
+    column * 2.0 >= (at + next) as f32
 }
 
 #[cfg(test)]

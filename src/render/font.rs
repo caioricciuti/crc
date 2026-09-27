@@ -125,6 +125,8 @@ pub struct ShapedLine {
     line: CFRetained<CTLine>,
     #[cfg(test)]
     scale: f32,
+    /// Each font used, with its glyph-cache key: the PostScript name and the
+    /// size, worked out once here rather than per glyph per frame.
     fonts: Vec<(String, CFRetained<CTFont>)>,
     pub glyphs: Vec<ShapedGlyph>,
     /// Visual caret edges; order is left/right, not bidi primary/secondary.
@@ -315,9 +317,13 @@ fn shape(font: &CTFont, source: &str, scale: f32, cancel: &AtomicBool) -> Option
         }
         let font_index = *font_indices.entry(font_ptr as usize).or_insert_with(|| {
             let index = fonts.len();
-            fonts.push((unsafe { font.full_name() }.to_string(), unsafe {
-                CFRetained::retain(NonNull::from(font))
-            }));
+            // Keyed by size as well as face. The PostScript name is the same
+            // for every size of a font, so a heading and body text drawn from
+            // one family would otherwise share a cached bitmap and the second
+            // one rendered would come out at the first one's size.
+            let key = format!("{}@{}", unsafe { font.full_name() }, unsafe { font.size() }
+                as u32);
+            fonts.push((key, unsafe { CFRetained::retain(NonNull::from(font)) }));
             index
         });
         for ((glyph, pos), index) in glyphs.into_iter().zip(positions).zip(indices) {
@@ -417,6 +423,65 @@ pub const MAX_ATLAS_PAGES: usize = 8;
 pub const MAX_SHAPED_LINE_BYTES: usize = 2 * 1024 * 1024;
 const SYNC_SHAPED_BYTES: usize = 4096;
 const MAX_CACHED_UTF16: usize = 4 * 1024 * 1024 + 1;
+/// Shaped lines kept, editor and UI together: enough for two tall panes.
+const MAX_SHAPED_ENTRIES: usize = 512;
+/// "Needs no shaping" markers kept for the current document.
+const MAX_EDITOR_MARKERS: usize = 16 * 1024;
+/// Documents whose shaped lines are kept while another is drawn.
+const MAX_PARKED: usize = 3;
+
+/// Shaped text by key, bounded by what was drawn lately: when full, what
+/// was not used this frame or the last goes. Clearing it all at the limit
+/// meant a page with more distinct words than that shaped every word again,
+/// every frame.
+struct RecentCache<K> {
+    limit: usize,
+    lines: HashMap<K, (Rc<ShapedLine>, u64)>,
+}
+
+impl<K: std::hash::Hash + Eq> RecentCache<K> {
+    fn new(limit: usize) -> Self {
+        RecentCache {
+            limit,
+            lines: HashMap::new(),
+        }
+    }
+
+    fn get<Q>(&mut self, key: &Q, frame: u64) -> Option<Rc<ShapedLine>>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        let (line, used) = self.lines.get_mut(key)?;
+        *used = frame;
+        Some(line.clone())
+    }
+
+    fn insert(&mut self, key: K, line: Rc<ShapedLine>, frame: u64) {
+        if self.lines.len() >= self.limit {
+            self.lines.retain(|_, (_, used)| *used + 1 >= frame);
+            // Everything is in use: a page with more than the limit on it.
+            if self.lines.len() >= self.limit {
+                self.lines.clear();
+            }
+        }
+        self.lines.insert(key, (line, frame));
+    }
+}
+
+/// A document's shaped lines, kept while another document is drawn.
+struct Parked {
+    id: u64,
+    rope: Rope,
+    lines: HashMap<usize, Option<Rc<ShapedLine>>>,
+}
+
+impl Parked {
+    /// What its lines count against the cache's budget.
+    fn utf16(&self) -> usize {
+        self.lines.values().flatten().map(|l| l.offsets.len()).sum()
+    }
+}
 
 /// Transparent gutter around each cell, so sampling at a cell edge cannot
 /// bleed a neighbouring glyph in.
@@ -577,6 +642,10 @@ pub struct Slot {
     /// Whether the glyph carries its own colour and must not be tinted.
     pub color: bool,
     pub page: u32,
+    /// Where the quad starts relative to the glyph's pen position, in
+    /// points: negative when ink reaches left of it (an italic `f`), which
+    /// the cell was shifted to hold.
+    pub dx: f32,
 }
 
 impl Slot {
@@ -589,7 +658,30 @@ struct Page {
     pixels: Vec<u8>,
     next_cell: usize,
     last_used: u64,
-    dirty: bool,
+    dirty: Dirty,
+}
+
+/// What of a page has to reach its texture.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Dirty {
+    #[default]
+    Clean,
+    /// Glyphs were added in these rows of pixels, into cells no frame has
+    /// used: they can be copied into the texture in place.
+    Rows(usize, usize),
+    /// New, or evicted and refilled: a new texture, so frames still in
+    /// flight keep the old pixels.
+    Whole,
+}
+
+impl Dirty {
+    fn add_rows(&mut self, from: usize, to: usize) {
+        *self = match *self {
+            Dirty::Clean => Dirty::Rows(from, to),
+            Dirty::Rows(a, b) => Dirty::Rows(a.min(from), b.max(to)),
+            Dirty::Whole => Dirty::Whole,
+        };
+    }
 }
 
 pub struct Atlas {
@@ -605,13 +697,13 @@ pub struct Atlas {
 
     font: CFRetained<CTFont>,
     ui_font: CFRetained<CTFont>,
-    ui_lines: HashMap<String, Rc<ShapedLine>>,
+    ui_lines: RecentCache<String>,
     /// Proportional faces for the Markdown view, built on first use and kept
     /// for the life of the atlas. A preview drawn in one monospace weight
     /// cannot show a heading as a heading or bold as bold; it reads as a
     /// terminal rather than as a document.
     prose_fonts: HashMap<(u16, Face), CFRetained<CTFont>>,
-    prose_lines: HashMap<(String, u16, Face), Rc<ShapedLine>>,
+    prose_lines: RecentCache<(String, u16, Face)>,
     max_prose: Option<f32>,
     /// Where private-use characters come from. `None` if CoreGraphics
     /// refused the bytes, in which case those characters are simply missing.
@@ -619,11 +711,16 @@ pub struct Atlas {
     /// Cell size in device pixels, including padding.
     cell_px: (usize, usize),
     slots: HashMap<char, Slot>,
-    shaped_slots: HashMap<(String, u16), Slot>,
+    /// By font key, then glyph: looked up without building a key per glyph.
+    shaped_slots: HashMap<String, HashMap<u16, Slot>>,
     shaped_lines: HashMap<String, Rc<ShapedLine>>,
     cached_utf16: usize,
     editor_snapshot: Option<(u64, Rope)>,
     editor_lines: HashMap<usize, Option<Rc<ShapedLine>>>,
+    /// Other documents' shaped lines, kept while another is drawn: a split
+    /// shows two documents a frame, and dropping one's lines to draw the
+    /// other re-shaped both every frame. The oldest goes past a few.
+    parked: Vec<Parked>,
     worker: Option<worker::Worker>,
     raster_worker: Option<raster::Worker>,
     /// Next free cell index.
@@ -631,7 +728,7 @@ pub struct Atlas {
     pages: Vec<Page>,
     max_pages: usize,
     frame: u64,
-    primary_dirty: bool,
+    primary_dirty: Dirty,
     exhausted: bool,
     /// Characters no font on this system can draw, remembered so they are not
     /// retried on every frame they appear in.
@@ -696,9 +793,9 @@ impl Atlas {
                     std::ptr::null(),
                 )
             },
-            ui_lines: HashMap::new(),
+            ui_lines: RecentCache::new(512),
             prose_fonts: HashMap::new(),
-            prose_lines: HashMap::new(),
+            prose_lines: RecentCache::new(4096),
             max_prose: None,
             font,
             icons: load_icon_font(ui_pt * scale),
@@ -709,13 +806,14 @@ impl Atlas {
             cached_utf16: 0,
             editor_snapshot: None,
             editor_lines: HashMap::new(),
+            parked: Vec::new(),
             worker: None,
             raster_worker: None,
             next_cell: 0,
             pages: Vec::new(),
             max_pages: (MAX_ATLAS_BYTES / (width * height * 4)).clamp(1, MAX_ATLAS_PAGES),
             frame: 1,
-            primary_dirty: true,
+            primary_dirty: Dirty::Whole,
             exhausted: false,
             missing: HashSet::new(),
             solid: [0.0; 4],
@@ -739,6 +837,7 @@ impl Atlas {
             atlas.slots.insert(
                 ch,
                 Slot {
+                    dx: 0.0,
                     uv,
                     cells: 1,
                     color: false,
@@ -767,6 +866,7 @@ impl Atlas {
                         self.slots.insert(
                             ch,
                             Slot {
+                                dx: 0.0,
                                 uv: self.cell_uv(cell, bitmap.cells),
                                 page: (cell / CELLS) as u32,
                                 cells: bitmap.cells as u8,
@@ -789,6 +889,18 @@ impl Atlas {
                     .is_some_and(|(id, snapshot)| *id == owner.0 && snapshot.same_snapshot(&rope))
                 {
                     self.cache_editor_line(owner.1, shaped.map(Rc::new));
+                } else if let Some(parked) = self
+                    .parked
+                    .iter_mut()
+                    .find(|p| p.id == owner.0 && p.rope.same_snapshot(&rope))
+                {
+                    // Shaped for the other pane's document while this one
+                    // was drawn: kept for when that one is.
+                    let units = shaped.as_ref().map_or(0, |s| s.offsets.len());
+                    if let Some(old) = parked.lines.insert(owner.1, shaped.map(Rc::new)).flatten() {
+                        self.cached_utf16 -= old.offsets.len();
+                    }
+                    self.cached_utf16 += units;
                 }
             }
         }
@@ -806,7 +918,7 @@ impl Atlas {
         }
     }
 
-    pub fn page_dirty(&self, page: usize) -> bool {
+    pub fn page_dirty(&self, page: usize) -> Dirty {
         if page == 0 {
             self.primary_dirty
         } else {
@@ -816,9 +928,9 @@ impl Atlas {
 
     pub fn mark_uploaded(&mut self) {
         self.dirty = false;
-        self.primary_dirty = false;
+        self.primary_dirty = Dirty::Clean;
         for page in &mut self.pages {
-            page.dirty = false;
+            page.dirty = Dirty::Clean;
         }
     }
 
@@ -902,7 +1014,7 @@ impl Atlas {
 
     /// How many glyphs are currently resident.
     pub fn resident(&self) -> usize {
-        self.slots.len() + self.shaped_slots.len()
+        self.slots.len() + self.shaped_slots.values().map(HashMap::len).sum::<usize>()
     }
 
     /// Synchronous shaping for bounded short strings and explicit offline callers.
@@ -998,8 +1110,8 @@ impl Atlas {
             return None;
         }
         let key = (text.to_owned(), (size_pt * 10.0) as u16, face);
-        if let Some(line) = self.prose_lines.get(&key) {
-            return Some(line.clone());
+        if let Some(line) = self.prose_lines.get(&key, self.frame) {
+            return Some(line);
         }
         let font = self.prose_font(size_pt, face);
         let line = Rc::new(shape(
@@ -1010,10 +1122,7 @@ impl Atlas {
         )?);
         // Bounded like every other shaping cache here: a document is not
         // allowed to grow the atlas without limit just by being long.
-        if self.prose_lines.len() >= 512 {
-            self.prose_lines.clear();
-        }
-        self.prose_lines.insert(key, line.clone());
+        self.prose_lines.insert(key, line.clone(), self.frame);
         Some(line)
     }
 
@@ -1023,8 +1132,8 @@ impl Atlas {
         if text.len() > 512 {
             return None;
         }
-        if let Some(line) = self.ui_lines.get(text) {
-            return Some(line.clone());
+        if let Some(line) = self.ui_lines.get(text, self.frame) {
+            return Some(line);
         }
         let line = Rc::new(shape(
             &self.ui_font,
@@ -1032,10 +1141,8 @@ impl Atlas {
             self.metrics.scale,
             &AtomicBool::new(false),
         )?);
-        if self.ui_lines.len() >= 128 {
-            self.ui_lines.clear();
-        }
-        self.ui_lines.insert(text.to_owned(), line.clone());
+        self.ui_lines
+            .insert(text.to_owned(), line.clone(), self.frame);
         Some(line)
     }
 
@@ -1052,7 +1159,24 @@ impl Atlas {
             .as_ref()
             .is_some_and(|(id, old)| *id == owner.0 && old.same_snapshot(rope))
         {
-            let old = self.editor_snapshot.take();
+            let mut old = self.editor_snapshot.take();
+            // Another document: park this one's lines and take that one's,
+            // if they were kept.
+            if old.as_ref().is_some_and(|(id, _)| *id != owner.0) {
+                if let Some((id, rope)) = old.take() {
+                    let lines = std::mem::take(&mut self.editor_lines);
+                    self.parked.push(Parked { id, rope, lines });
+                }
+                if let Some(at) = self.parked.iter().position(|p| p.id == owner.0) {
+                    let parked = self.parked.remove(at);
+                    self.editor_lines = parked.lines;
+                    old = Some((parked.id, parked.rope));
+                }
+                while self.parked.len() > MAX_PARKED {
+                    let dropped = self.parked.remove(0);
+                    self.cached_utf16 -= dropped.utf16();
+                }
+            }
             let mapping = old
                 .as_ref()
                 .filter(|(id, _)| *id == owner.0)
@@ -1111,29 +1235,54 @@ impl Atlas {
     }
 
     pub fn cached_editor_line(&self, owner: (u64, usize), rope: &Rope) -> Option<&ShapedLine> {
-        if !self
+        if self
             .editor_snapshot
             .as_ref()
             .is_some_and(|(id, old)| *id == owner.0 && old.same_snapshot(rope))
         {
-            return None;
+            return self.editor_lines.get(&owner.1)?.as_deref();
         }
-        self.editor_lines.get(&owner.1)?.as_deref()
+        // The other pane's document, while this one was drawn last: a click
+        // there lands by its shaping too, not by monospace column math.
+        self.parked
+            .iter()
+            .find(|p| p.id == owner.0 && p.rope.same_snapshot(rope))?
+            .lines
+            .get(&owner.1)?
+            .as_deref()
     }
 
     fn make_cache_room(&mut self, units: usize) {
-        while self.shaped_lines.len() + self.editor_lines.len() >= 256
-            || self.cached_utf16 + units > MAX_CACHED_UTF16
-        {
+        // Shaped lines count against the limit; the marker that an ASCII
+        // line needs no shaping costs nothing and does not, or a tall
+        // window evicted every frame what it had just shaped.
+        let shaped_editor = self.editor_lines.values().filter(|l| l.is_some()).count();
+        let mut over = self.shaped_lines.len() + shaped_editor >= MAX_SHAPED_ENTRIES;
+        while over || self.cached_utf16 + units > MAX_CACHED_UTF16 {
+            if !self.parked.is_empty() {
+                let dropped = self.parked.remove(0);
+                self.cached_utf16 -= dropped.utf16();
+                continue;
+            }
+            over = false;
             if let Some(key) = self.shaped_lines.keys().next().cloned() {
                 self.cached_utf16 -= self.shaped_lines.remove(&key).unwrap().offsets.len();
-            } else if let Some(key) = self.editor_lines.keys().next().copied() {
+            } else if let Some(key) = self
+                .editor_lines
+                .iter()
+                .find(|(_, l)| l.is_some())
+                .map(|(k, _)| *k)
+            {
                 if let Some(shaped) = self.editor_lines.remove(&key).flatten() {
                     self.cached_utf16 -= shaped.offsets.len();
                 }
             } else {
                 break;
             }
+        }
+        // The markers are bounded on their own.
+        if self.editor_lines.len() > MAX_EDITOR_MARKERS {
+            self.editor_lines.retain(|_, l| l.is_some());
         }
     }
 
@@ -1173,16 +1322,13 @@ impl Atlas {
     /// Rasterize only glyphs the layout actually emits. Shaping a long line
     /// must not fill the atlas with thousands of offscreen glyphs.
     pub fn slot_for_shaped(&mut self, shaped: &ShapedLine, glyph: &ShapedGlyph) -> Option<Slot> {
-        let (font_name, font) = &shaped.fonts[glyph.font];
-        // Keyed by size as well as face. The PostScript name is the same for
-        // every size of a font, so a heading and body text drawn from one
-        // family would otherwise share a cached bitmap and the second one
-        // rendered would come out at the first one's size.
-        let cache_key = (
-            format!("{font_name}@{}", unsafe { font.size() } as u32),
-            glyph.glyph,
-        );
-        if let Some(slot) = self.shaped_slots.get(&cache_key).copied() {
+        let (font_key, font) = &shaped.fonts[glyph.font];
+        if let Some(slot) = self
+            .shaped_slots
+            .get(font_key.as_str())
+            .and_then(|glyphs| glyphs.get(&glyph.glyph))
+            .copied()
+        {
             self.touch_page(slot.page);
             return Some(slot);
         }
@@ -1195,13 +1341,12 @@ impl Atlas {
                 1,
             )
         };
-        let cells = if ink.origin.x < -1.0
-            || ink.origin.x + ink.size.width > (self.cell_px.0 - PAD) as CGFloat
-        {
-            2
-        } else {
-            1
-        };
+        // Ink left of the pen (an italic `f`'s tail) is kept by shifting the
+        // glyph right in its cell and drawing the quad that much further
+        // left; ink wider than two cells gets the cells it needs, up to four.
+        let shift = (-ink.origin.x).ceil().max(0.0) as usize;
+        let needed = shift as f64 + (ink.origin.x + ink.size.width).max(0.0) + PAD as f64;
+        let cells = ((needed / self.cell_px.0 as f64).ceil() as usize).clamp(1, 4);
         let cell = self.alloc(cells)?;
         // The glyph's own font decides where its baseline sits. Using the
         // monospace ascent for every face put a larger proportional face's
@@ -1217,15 +1362,19 @@ impl Atlas {
         } else {
             ascent.max(self.metrics.ascent * self.metrics.scale)
         };
-        self.draw_glyph_into(cell, font, glyph.glyph, ascent_px, cells);
+        self.draw_glyph_shifted(cell, font, glyph.glyph, ascent_px, cells, shift as f32);
         let slot = Slot {
+            dx: -(shift as f32) / self.metrics.scale,
             uv: self.cell_uv(cell, cells),
             page: (cell / CELLS) as u32,
             cells: cells as u8,
             color: unsafe { font.symbolic_traits() }
                 .contains(CTFontSymbolicTraits::ColorGlyphsTrait),
         };
-        self.shaped_slots.insert(cache_key, slot);
+        self.shaped_slots
+            .entry(font_key.clone())
+            .or_default()
+            .insert(glyph.glyph, slot);
         Some(slot)
     }
 
@@ -1264,7 +1413,7 @@ impl Atlas {
                 pixels: vec![0; self.pixels.len()],
                 next_cell: cells,
                 last_used: self.frame,
-                dirty: true,
+                dirty: Dirty::Whole,
             });
             self.dirty = true;
             return Some(self.pages.len() * CELLS);
@@ -1279,12 +1428,14 @@ impl Atlas {
         if let Some(index) = victim {
             let number = (index + 1) as u32;
             self.slots.retain(|_, slot| slot.page != number);
-            self.shaped_slots.retain(|_, slot| slot.page != number);
+            for glyphs in self.shaped_slots.values_mut() {
+                glyphs.retain(|_, slot| slot.page != number);
+            }
             let page = &mut self.pages[index];
             page.pixels.fill(0);
             page.next_cell = cells;
             page.last_used = self.frame;
-            page.dirty = true;
+            page.dirty = Dirty::Whole;
             self.dirty = true;
             return Some((index + 1) * CELLS);
         }
@@ -1353,6 +1504,7 @@ impl Atlas {
             let cell = self.alloc(cells)?;
             self.draw_icon_into(cell, &icons, glyph, cells);
             return Some(Slot {
+                dx: 0.0,
                 uv: self.cell_uv(cell, cells),
                 page: (cell / CELLS) as u32,
                 cells: cells as u8,
@@ -1380,6 +1532,7 @@ impl Atlas {
         self.draw_glyph_into(cell, &font, glyph, ascent, cells);
 
         Some(Slot {
+            dx: 0.0,
             uv: self.cell_uv(cell, cells),
             page: (cell / CELLS) as u32,
             cells: cells as u8,
@@ -1440,9 +1593,23 @@ impl Atlas {
         ascent_px: f32,
         cells: usize,
     ) {
+        self.draw_glyph_shifted(cell, font, glyph, ascent_px, cells, 0.0);
+    }
+
+    /// [`Atlas::draw_glyph_into`], with the pen `shift` pixels right of the
+    /// usual spot.
+    fn draw_glyph_shifted(
+        &mut self,
+        cell: usize,
+        font: &CTFont,
+        glyph: u16,
+        ascent_px: f32,
+        cells: usize,
+        shift: f32,
+    ) {
         // CoreGraphics puts the origin at the bottom left.
         let origin = CGPoint {
-            x: (PAD / 2) as CGFloat,
+            x: ((PAD / 2) as f32 + shift) as CGFloat,
             y: (self.cell_px.1 as f32 - (PAD / 2) as f32 - ascent_px) as CGFloat,
         };
         self.draw_glyph_at(cell, font, glyph, origin, cells);
@@ -1469,11 +1636,12 @@ impl Atlas {
         let (x0, y0) = self.cell_origin(cell);
         let atlas_w = self.width as usize;
         let page_index = cell / CELLS;
+        let rows = (y0, (y0 + h).min(self.height as usize));
         let pixels = if page_index == 0 {
-            self.primary_dirty = true;
+            self.primary_dirty.add_rows(rows.0, rows.1);
             &mut self.pixels
         } else {
-            self.pages[page_index - 1].dirty = true;
+            self.pages[page_index - 1].dirty.add_rows(rows.0, rows.1);
             &mut self.pages[page_index - 1].pixels
         };
         for y in 0..h {
@@ -1983,6 +2151,33 @@ mod tests {
     }
 
     #[test]
+    fn two_documents_in_a_split_keep_their_shaping() {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let a = Rope::from_text("é first\n");
+        let b = Rope::from_text("ü second\n");
+        assert!(
+            atlas
+                .shape_editor_line((1, 0), &a, 0..a.len_bytes())
+                .is_some()
+        );
+        assert!(
+            atlas
+                .shape_editor_line((2, 0), &b, 0..b.len_bytes())
+                .is_some()
+        );
+        // Both are still there, whichever was drawn last.
+        assert!(atlas.cached_editor_line((1, 0), &a).is_some());
+        assert!(atlas.cached_editor_line((2, 0), &b).is_some());
+        let before = atlas.cached_utf16;
+        assert!(
+            atlas
+                .shape_editor_line((1, 0), &a, 0..a.len_bytes())
+                .is_some()
+        );
+        assert_eq!(atlas.cached_utf16, before, "taken back, not shaped again");
+    }
+
+    #[test]
     fn editor_and_standalone_geometry_share_cache_bounds() {
         let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
         let rope = Rope::from_text(&"ascii\né\t漢\n".repeat(300));
@@ -1992,7 +2187,9 @@ mod tests {
                 &rope,
                 rope.line_to_byte(line)..rope.line_to_byte(line + 1),
             );
-            assert!(atlas.editor_lines.len() + atlas.shaped_lines.len() <= 256);
+            let shaped = atlas.editor_lines.values().filter(|l| l.is_some()).count();
+            assert!(shaped + atlas.shaped_lines.len() <= MAX_SHAPED_ENTRIES);
+            assert!(atlas.editor_lines.len() <= MAX_EDITOR_MARKERS + MAX_SHAPED_ENTRIES);
             assert!(atlas.cached_utf16 <= MAX_CACHED_UTF16);
             let actual: usize = atlas
                 .editor_lines

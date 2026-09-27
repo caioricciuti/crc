@@ -38,6 +38,17 @@ pub enum Predicate {
 }
 
 impl Predicate {
+    /// The capture this predicate is about; `None` for one not understood,
+    /// which no match satisfies.
+    pub fn capture(&self) -> Option<u32> {
+        match self {
+            Predicate::Match { capture, .. }
+            | Predicate::EqString { capture, .. }
+            | Predicate::AnyOf { capture, .. } => Some(*capture),
+            Predicate::Unsupported => None,
+        }
+    }
+
     /// Whether `text`, captured by `capture`, satisfies this predicate.
     /// Predicates about other captures do not constrain this one.
     pub fn accepts(&self, capture: u32, text: &str) -> bool {
@@ -72,12 +83,16 @@ pub struct Pattern {
 struct Item {
     class: Class,
     repeat: Repeat,
+    /// `+?`, `*?`, `??`: as few as will do.
+    lazy: bool,
 }
 
 #[derive(Debug, Clone)]
 enum Class {
     Any,
     Literal(char),
+    /// `\w`: a letter or digit of any script, or `_`.
+    Word,
     /// Ranges plus negation, e.g. `[^A-Za-z_]`.
     Set {
         ranges: Vec<(char, char)>,
@@ -133,6 +148,8 @@ impl Pattern {
                 // Alternation, groups and counted repeats are outside the
                 // subset. Refuse rather than mis-compile.
                 '(' | ')' | '|' | '{' | '}' => return None,
+                // A quantifier with nothing before it to repeat.
+                '+' | '*' | '?' => return None,
                 c => {
                     i += 1;
                     Class::Literal(c)
@@ -154,7 +171,15 @@ impl Pattern {
                 }
                 _ => Repeat::One,
             };
-            items.push(Item { class, repeat });
+            let lazy = repeat != Repeat::One && chars.get(i) == Some(&'?') && i < end;
+            if lazy {
+                i += 1;
+            }
+            items.push(Item {
+                class,
+                repeat,
+                lazy,
+            });
         }
         Some(Pattern {
             anchored_start,
@@ -165,22 +190,28 @@ impl Pattern {
 
     pub fn matches(&self, text: &str) -> bool {
         let chars: Vec<char> = text.chars().collect();
+        // Failed (items left, position) pairs: each is tried once, so
+        // optional items cannot make the backtracking exponential.
+        let mut failed = std::collections::HashSet::new();
         if self.anchored_start {
-            return self.match_at(&chars, 0);
+            return self.match_items(&self.items, &chars, 0, &mut failed);
         }
-        (0..=chars.len()).any(|start| self.match_at(&chars, start))
+        (0..=chars.len()).any(|start| self.match_items(&self.items, &chars, start, &mut failed))
     }
 
-    /// Backtracking match. Patterns here are a handful of items long, so the
-    /// exponential worst case is not reachable in practice.
-    fn match_at(&self, chars: &[char], start: usize) -> bool {
-        self.match_items(&self.items, chars, start)
-    }
-
-    fn match_items(&self, items: &[Item], chars: &[char], at: usize) -> bool {
+    fn match_items(
+        &self,
+        items: &[Item],
+        chars: &[char],
+        at: usize,
+        failed: &mut std::collections::HashSet<(usize, usize)>,
+    ) -> bool {
         let Some((item, rest)) = items.split_first() else {
             return !self.anchored_end || at == chars.len();
         };
+        if failed.contains(&(items.len(), at)) {
+            return false;
+        }
 
         let (min, max) = match item.repeat {
             Repeat::One => (1, 1),
@@ -189,21 +220,25 @@ impl Pattern {
             Repeat::ZeroOrOne => (0, 1),
         };
 
-        let mut taken = 0;
-        while taken < max && at + taken < chars.len() && item.class.matches(chars[at + taken]) {
-            taken += 1;
+        let mut most = 0;
+        while most < max && at + most < chars.len() && item.class.matches(chars[at + most]) {
+            most += 1;
         }
-        // Greedy, giving back one at a time.
-        while taken + 1 > min {
-            if self.match_items(rest, chars, at + taken) {
-                return true;
+        if most >= min {
+            // Greedy gives back one at a time; lazy takes one more at a time.
+            let counts: Box<dyn Iterator<Item = usize>> = if item.lazy {
+                Box::new(min..=most)
+            } else {
+                Box::new((min..=most).rev())
+            };
+            for taken in counts {
+                if self.match_items(rest, chars, at + taken, failed) {
+                    return true;
+                }
             }
-            if taken == 0 {
-                break;
-            }
-            taken -= 1;
         }
-        min == 0 && self.match_items(rest, chars, at)
+        failed.insert((items.len(), at));
+        false
     }
 }
 
@@ -212,8 +247,15 @@ impl Class {
         match self {
             Class::Any => true,
             Class::Literal(l) => *l == c,
+            Class::Word => c.is_alphanumeric() || c == '_',
             Class::Set { ranges, negated } => {
-                let inside = ranges.iter().any(|(lo, hi)| c >= *lo && c <= *hi);
+                // A set of the ASCII letters also takes the letters of other
+                // scripts in the same case: highlight queries say `^[A-Z]`
+                // for "a type's name", and `Über` or `Σύνολο` is one too.
+                let inside = ranges.iter().any(|(lo, hi)| c >= *lo && c <= *hi)
+                    || (!c.is_ascii()
+                        && ((c.is_uppercase() && ranges.contains(&('A', 'Z')))
+                            || (c.is_lowercase() && ranges.contains(&('a', 'z')))));
                 inside != *negated
             }
         }
@@ -226,10 +268,7 @@ fn escape_class(c: char) -> Option<Class> {
             ranges: vec![('0', '9')],
             negated: false,
         },
-        'w' => Class::Set {
-            ranges: vec![('a', 'z'), ('A', 'Z'), ('0', '9'), ('_', '_')],
-            negated: false,
-        },
+        'w' => Class::Word,
         's' => Class::Set {
             ranges: vec![(' ', ' '), ('\t', '\t'), ('\n', '\n'), ('\r', '\r')],
             negated: false,
@@ -260,6 +299,12 @@ fn parse_set(chars: &[char], open: usize, end: usize) -> Option<(Class, usize)> 
                 // A shorthand class inside a set contributes its own ranges.
                 Class::Set { ranges: r, .. } => {
                     ranges.extend(r);
+                    continue;
+                }
+                // `\w` in a set: its ASCII ranges, which the set widens to
+                // other scripts' letters as it does for `A-Z` and `a-z`.
+                Class::Word => {
+                    ranges.extend([('a', 'z'), ('A', 'Z'), ('0', '9'), ('_', '_')]);
                     continue;
                 }
                 Class::Any => return None,
@@ -295,6 +340,25 @@ mod tests {
     }
 
     /// The two patterns the vendored Rust grammar actually uses.
+    #[test]
+    fn lazy_unicode_and_many_optional_items() {
+        let lazy = Pattern::compile("^a+?b$").unwrap();
+        assert!(lazy.matches("aaab"));
+        assert!(Pattern::compile("*a").is_none(), "nothing to repeat");
+        let types = Pattern::compile("^[A-Z]").unwrap();
+        assert!(types.matches("Über") && types.matches("Σύνολο") && !types.matches("über"));
+        assert!(Pattern::compile("^\\w+$").unwrap().matches("naïve_日本"));
+        let optional = Pattern::compile(&"a?".repeat(30)).unwrap();
+        let started = std::time::Instant::now();
+        assert!(
+            !Pattern::compile(&format!("^{}b$", "a?".repeat(30)))
+                .unwrap()
+                .matches(&"a".repeat(30))
+        );
+        assert!(optional.matches("x"));
+        assert!(started.elapsed() < std::time::Duration::from_millis(200));
+    }
+
     #[test]
     fn matches_the_grammars_own_patterns() {
         assert!(m("^[A-Z]", "Mixed"));

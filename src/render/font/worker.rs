@@ -108,8 +108,13 @@ impl Worker {
     pub fn rebase(&mut self, document: u64, mapping: Option<&LineReuse<'_>>) {
         let mut retained = HashMap::new();
         for (owner, mut pending) in self.pending.drain() {
-            if owner.0 == document
-                && let Some(mapping) = mapping
+            // Another document's lines are that document's business: in a
+            // split both are drawn every frame.
+            if owner.0 != document {
+                retained.insert(owner, pending);
+                continue;
+            }
+            if let Some(mapping) = mapping
                 && let Some((line, range)) = mapping.map(owner.1)
             {
                 pending.rope = mapping.new.clone();
@@ -257,7 +262,7 @@ mod tests {
     }
 
     #[test]
-    fn rebasing_cancels_changed_paragraphs_and_other_documents() {
+    fn rebasing_cancels_changed_paragraphs_and_leaves_other_documents() {
         let mut worker = Worker::new("Menlo".into(), 26.0, 2.0);
         let old = Rope::from_text("é old\nאב unchanged");
         worker.request((1, 0), &old, 0..old.line_to_byte(1));
@@ -269,7 +274,12 @@ mod tests {
         worker.rebase(1, Some(&LineReuse::new(&old, &new)));
         assert!(changed.load(Ordering::Relaxed));
         assert!(!retained.load(Ordering::Relaxed));
+        // A split draws another document: its rebase leaves this one's work.
         worker.rebase(2, None);
+        assert!(!retained.load(Ordering::Relaxed));
+        assert!(worker.is_pending());
+        // Its own rebase without a mapping (the text was replaced) cancels.
+        worker.rebase(1, None);
         assert!(retained.load(Ordering::Relaxed));
         assert!(!worker.is_pending());
         assert!(worker.poll().is_empty());

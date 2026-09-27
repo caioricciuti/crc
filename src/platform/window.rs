@@ -12473,23 +12473,20 @@ impl EditorView {
                 && let Some(list) = server.diagnostics.get(path)
             {
                 use crate::lsp::Severity;
-                for diagnostic in list {
-                    let start = crate::lsp::offset_of(&buffer.rope, diagnostic.start);
-                    let end = crate::lsp::offset_of(&buffer.rope, diagnostic.end);
-                    let color = match diagnostic.severity {
-                        Severity::Error => theme.diff_removed,
-                        Severity::Warning => theme.syn_constant,
-                        Severity::Information | Severity::Hint => theme.status_text,
-                    };
-                    layout::push_underline(
-                        glyphs,
-                        &renderer.atlas,
-                        buffer,
-                        editor_rect,
-                        start..end,
-                        color,
-                    );
-                }
+                let marks: Vec<_> = list
+                    .iter()
+                    .map(|diagnostic| {
+                        let start = crate::lsp::offset_of(&buffer.rope, diagnostic.start);
+                        let end = crate::lsp::offset_of(&buffer.rope, diagnostic.end);
+                        let color = match diagnostic.severity {
+                            Severity::Error => theme.diff_removed,
+                            Severity::Warning => theme.syn_constant,
+                            Severity::Information | Severity::Hint => theme.status_text,
+                        };
+                        (start..end, color)
+                    })
+                    .collect();
+                layout::push_underlines(glyphs, &renderer.atlas, buffer, editor_rect, &marks);
             }
 
             // Completion: ghost text at the caret, chips under the line.
@@ -14175,6 +14172,12 @@ fn draw_other_pane(
     );
     apply_wrap(store.docs.active_mut(), word_wrap, cols);
     store.docs.active_mut().clamp_scroll(rows, cols);
+    // A document here can change without the focus (regenerated, reloaded
+    // from disk): its tree follows before it is drawn, or colours land on
+    // the neighbouring tokens.
+    if store.docs.active().has_pending_edits() {
+        syntax.update(store.docs.active_mut(), reparse_budget());
+    }
     layout::build_tab_bar_in(
         &store.docs,
         store.tab_scroll,

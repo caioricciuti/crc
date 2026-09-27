@@ -644,12 +644,22 @@ impl Highlighter {
                     .map(Vec::as_slice)
                     .unwrap_or(&[]);
                 if !predicates.is_empty() {
-                    let satisfied = captures.iter().all(|capture| {
-                        let start = ffi::ts_node_start_byte(capture.node) as usize;
-                        let end = ffi::ts_node_end_byte(capture.node) as usize;
-                        let text = source(start..end);
-                        predicates.iter().all(|p| p.accepts(capture.index, &text))
-                    });
+                    // Text only for the captures a predicate is about: most
+                    // captures in a match are not, and copying each one's
+                    // text per match per frame was most of the cost.
+                    let satisfied = !predicates.iter().any(|p| p.capture().is_none())
+                        && captures.iter().all(|capture| {
+                            if !predicates
+                                .iter()
+                                .any(|p| p.capture() == Some(capture.index))
+                            {
+                                return true;
+                            }
+                            let start = ffi::ts_node_start_byte(capture.node) as usize;
+                            let end = ffi::ts_node_end_byte(capture.node) as usize;
+                            let text = source(start..end);
+                            predicates.iter().all(|p| p.accepts(capture.index, &text))
+                        });
                     if !satisfied {
                         continue;
                     }

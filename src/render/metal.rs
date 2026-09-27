@@ -11,16 +11,16 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSString, ns_string};
 use objc2_metal::{
-    MTLBlendFactor, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-    MTLCompileOptions, MTLDevice, MTLLibrary, MTLLoadAction, MTLPixelFormat, MTLPrimitiveType,
-    MTLRegion, MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLRenderPipelineDescriptor,
-    MTLRenderPipelineState, MTLResourceOptions, MTLSamplerDescriptor, MTLSamplerMinMagFilter,
-    MTLSamplerState, MTLSize, MTLStorageMode, MTLStoreAction, MTLTexture, MTLTextureDescriptor,
-    MTLTextureUsage,
+    MTLBlendFactor, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
+    MTLCommandQueue, MTLCompileOptions, MTLDevice, MTLLibrary, MTLLoadAction, MTLPixelFormat,
+    MTLPrimitiveType, MTLRegion, MTLRenderCommandEncoder, MTLRenderPassDescriptor,
+    MTLRenderPipelineDescriptor, MTLRenderPipelineState, MTLResourceOptions, MTLSamplerDescriptor,
+    MTLSamplerMinMagFilter, MTLSamplerState, MTLSize, MTLStorageMode, MTLStoreAction, MTLTexture,
+    MTLTextureDescriptor, MTLTextureUsage,
 };
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 
-use crate::render::font::Atlas;
+use crate::render::font::{Atlas, Dirty};
 
 /// The pixel format of the drawable. BGRA8 unorm is the native format for a
 /// `CAMetalLayer` on macOS; anything else costs a conversion on present.
@@ -53,6 +53,10 @@ pub struct GlyphInstance {
 pub const COLORED: u32 = 1;
 /// Analytic rounded rectangle; `_pad[0]` stores its logical-point radius.
 pub const ROUNDED: u32 = 1 << 31;
+
+/// Frames the GPU may be drawing while the next is written: one instance
+/// buffer each.
+const FRAMES_IN_FLIGHT: usize = 3;
 
 const _: () = assert!(
     size_of::<GlyphInstance>() == 64,
@@ -92,9 +96,14 @@ pub struct Renderer {
     pipeline: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     sampler: Retained<ProtocolObject<dyn MTLSamplerState>>,
     atlas_textures: Vec<Retained<ProtocolObject<dyn MTLTexture>>>,
-    /// Shared-storage instance buffer, written directly by the CPU each frame.
-    instances: Retained<ProtocolObject<dyn MTLBuffer>>,
-    instance_capacity: usize,
+    /// Shared-storage instance buffers, written directly by the CPU, one per
+    /// frame the GPU may still be drawing: up to three drawables are in
+    /// flight, and writing the one buffer they read tore a frame under load.
+    instances: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    instance_capacity: Vec<usize>,
+    /// The command buffer that last read each instance buffer.
+    in_flight: Vec<Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>>,
+    next_instances: usize,
     /// Reused offscreen render target, keyed by size. Allocating a texture
     /// per frame would show up in any timing taken through this path.
     offscreen: Option<OffscreenTarget>,
@@ -159,13 +168,18 @@ impl Renderer {
 
         let atlas_textures = vec![upload_atlas(&device, &atlas, 0)];
 
-        let instance_capacity = 16_384;
-        let instances = device
-            .newBufferWithLength_options(
-                instance_capacity * size_of::<GlyphInstance>(),
-                MTLResourceOptions::StorageModeShared,
-            )
-            .expect("could not allocate the instance buffer");
+        let capacity = 16_384;
+        let instances: Vec<_> = (0..FRAMES_IN_FLIGHT)
+            .map(|_| {
+                device
+                    .newBufferWithLength_options(
+                        capacity * size_of::<GlyphInstance>(),
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                    .expect("could not allocate the instance buffer")
+            })
+            .collect();
+        let instance_capacity = vec![capacity; FRAMES_IN_FLIGHT];
 
         Renderer {
             device,
@@ -175,25 +189,27 @@ impl Renderer {
             atlas_textures,
             instances,
             instance_capacity,
+            in_flight: vec![None; FRAMES_IN_FLIGHT],
+            next_instances: 0,
             offscreen: None,
             atlas,
         }
     }
 
     /// Grows the instance buffer if a frame needs more glyphs than it holds.
-    fn reserve(&mut self, needed: usize) {
-        if needed <= self.instance_capacity {
+    fn reserve(&mut self, slot: usize, needed: usize) {
+        if needed <= self.instance_capacity[slot] {
             return;
         }
         let capacity = needed.next_power_of_two();
-        self.instances = self
+        self.instances[slot] = self
             .device
             .newBufferWithLength_options(
                 capacity * size_of::<GlyphInstance>(),
                 MTLResourceOptions::StorageModeShared,
             )
             .expect("could not grow the instance buffer");
-        self.instance_capacity = capacity;
+        self.instance_capacity[slot] = capacity;
     }
 
     /// Draws one frame into the layer's next drawable.
@@ -337,8 +353,18 @@ impl Renderer {
             if page == self.atlas_textures.len() {
                 self.atlas_textures
                     .push(upload_atlas(&self.device, &self.atlas, page));
-            } else if self.atlas.page_dirty(page) {
-                self.atlas_textures[page] = upload_atlas(&self.device, &self.atlas, page);
+                continue;
+            }
+            match self.atlas.page_dirty(page) {
+                Dirty::Clean => {}
+                // New glyphs in cells nothing has drawn from: copied in place,
+                // rather than a new texture of the whole page for each one.
+                Dirty::Rows(from, to) => {
+                    upload_rows(&self.atlas_textures[page], &self.atlas, page, from, to)
+                }
+                Dirty::Whole => {
+                    self.atlas_textures[page] = upload_atlas(&self.device, &self.atlas, page);
+                }
             }
         }
         self.atlas.mark_uploaded();
@@ -354,12 +380,25 @@ impl Renderer {
     ) -> Retained<ProtocolObject<dyn MTLCommandBuffer>> {
         // Layout runs before this and may have rasterized new characters.
         self.sync_atlas();
-        self.reserve(glyphs.len());
+        // The next buffer in the ring, once the GPU is done with the frame
+        // that last used it: normally long since, since frames are three
+        // apart; waiting here is the back-pressure of a GPU that is behind.
+        let slot = self.next_instances;
+        self.next_instances = (slot + 1) % FRAMES_IN_FLIGHT;
+        if let Some(previous) = self.in_flight[slot].take()
+            && !matches!(
+                previous.status(),
+                MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error
+            )
+        {
+            previous.waitUntilCompleted();
+        }
+        self.reserve(slot, glyphs.len());
         if !glyphs.is_empty() {
             // Shared storage means this is a plain memcpy into memory the GPU
             // will read; no staging buffer, no blit encoder.
             unsafe {
-                let dst = self.instances.contents().as_ptr() as *mut GlyphInstance;
+                let dst = self.instances[slot].contents().as_ptr() as *mut GlyphInstance;
                 std::ptr::copy_nonoverlapping(glyphs.as_ptr(), dst, glyphs.len());
             }
         }
@@ -393,7 +432,7 @@ impl Renderer {
             };
             unsafe {
                 encoder.setRenderPipelineState(&self.pipeline);
-                encoder.setVertexBuffer_offset_atIndex(Some(&self.instances), 0, 0);
+                encoder.setVertexBuffer_offset_atIndex(Some(&self.instances[slot]), 0, 0);
                 encoder.setVertexBytes_length_atIndex(
                     std::ptr::NonNull::from(&uniforms).cast(),
                     size_of::<Uniforms>(),
@@ -413,11 +452,48 @@ impl Renderer {
         }
 
         encoder.endEncoding();
+        self.in_flight[slot] = Some(command_buffer.clone());
         command_buffer
     }
 }
 
 /// Uploads one RGBA atlas page as a shared-storage texture.
+/// Copies rows `from..to` of atlas page `page` into its texture.
+fn upload_rows(
+    texture: &ProtocolObject<dyn MTLTexture>,
+    atlas: &Atlas,
+    page: usize,
+    from: usize,
+    to: usize,
+) {
+    let to = to.min(atlas.height as usize);
+    if from >= to {
+        return;
+    }
+    let row_bytes = atlas.width as usize * 4;
+    let region = MTLRegion {
+        origin: objc2_metal::MTLOrigin {
+            x: 0,
+            y: from,
+            z: 0,
+        },
+        size: MTLSize {
+            width: atlas.width as usize,
+            height: to - from,
+            depth: 1,
+        },
+    };
+    let pixels = &atlas.page_pixels(page)[from * row_bytes..to * row_bytes];
+    unsafe {
+        texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+            region,
+            0,
+            std::ptr::NonNull::new(pixels.as_ptr() as *mut _).expect("rows are non-empty"),
+            row_bytes,
+        );
+    }
+}
+
 fn upload_atlas(
     device: &ProtocolObject<dyn MTLDevice>,
     atlas: &Atlas,

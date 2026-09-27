@@ -1005,6 +1005,11 @@ pub fn build_text_appending(
         // shared by text, selection, search bands, and the caret.
         let shaped_line =
             atlas.shape_editor_line((buffer.id(), line), &buffer.rope, line_start..line_end);
+        // A shaped line is laid out whole, in visual order; a row cut out of
+        // it is wrong once a right-to-left run crosses the break. Such a
+        // line is drawn cell by cell while it wraps.
+        let shaped_line = shaped_line
+            .filter(|_| !(wrapping && !(row.first && row.last) && has_rtl(buffer, line)));
         if shaped_line.is_none()
             && line_end - line_start > crate::render::font::MAX_SHAPED_LINE_BYTES
             && buffer.rope.byte_to_char(line_end) - buffer.rope.byte_to_char(line_start)
@@ -1035,7 +1040,12 @@ pub fn build_text_appending(
         // Current-line highlight, behind everything on this row. Suppressed
         // while there is a selection: two overlapping washes on the same row
         // read as a rendering bug rather than as two pieces of information.
-        if focused && line == cursor_line && selection.is_none() {
+        // Any cursor's selection counts, not only the primary's: an extra
+        // cursor's range on this row would draw its band over the wash.
+        let selected_here = selections
+            .iter()
+            .any(|&(a, b)| a < b && a <= row_end && b >= row_start);
+        if focused && line == cursor_line && selection.is_none() && !selected_here {
             out.push(GlyphInstance {
                 pos: [viewport.x, y],
                 size: [viewport.width, m.line_height],
@@ -1088,6 +1098,26 @@ pub fn build_text_appending(
         for &(sel_start, sel_end) in &selections {
             let from = sel_start.max(row_start);
             let to = sel_end.min(row_end);
+            // The newline itself selected, on a row that has no selected
+            // text: an empty line in a block, or a selection that starts at
+            // a line's end. Half a cell says so, as it does after text.
+            let newline_only = from >= to
+                && row.last
+                && sel_start <= line_end
+                && sel_end > line_end
+                && line + 1 < total_lines;
+            if newline_only {
+                let x0 = text_x + offset_at(line_end) - scroll_x;
+                if x0 >= text_x && x0 < viewport.x + viewport.width {
+                    out.push(GlyphInstance {
+                        pos: [x0, y],
+                        size: [m.advance * 0.5, m.line_height],
+                        uv: solid,
+                        color: theme.selection,
+                        ..Default::default()
+                    });
+                }
+            }
             if from < to {
                 let intervals = if let Some(shaped) = &shaped_line {
                     let extend = if row.last && sel_end > line_end && line + 1 < total_lines {
@@ -1281,7 +1311,7 @@ pub fn build_text_appending(
                     continue;
                 };
                 out.push(GlyphInstance {
-                    pos: [x, y + glyph_dy],
+                    pos: [x + slot.dx, y + glyph_dy],
                     size: [cell_w * slot.cells as f32, cell_h],
                     uv: slot.uv,
                     flags: slot.flags(),
@@ -1348,8 +1378,10 @@ pub fn build_text_appending(
                     break 'line;
                 }
                 // Scrolled off to the left: skip rather than draw under the
-                // gutter. Still costs the walk, but not a quad.
-                if x + cell_w <= text_x {
+                // gutter. Still costs the walk, but not a quad. By the
+                // character's own width: a wide one half in view is drawn,
+                // and the clip below trims its left half.
+                if x + cell_w * display_width(ch).max(1) as f32 <= text_x {
                     column += display_width(ch);
                     byte += advance_bytes;
                     continue;
@@ -1955,9 +1987,66 @@ pub fn scrollbar_track(viewport: Viewport) -> Viewport {
 /// of the lines, and its position is the scroll's share of the way to the
 /// last position, which is what makes the bottom of the thumb meet the
 /// bottom of the track exactly when the last line is in view.
+/// Files up to this many lines have their wrapped rows counted for the
+/// scrollbar; past it, lines outnumber the view anyway and count as one.
+const COUNT_ROWS_UP_TO: usize = 4000;
+
+/// What the scrollbar measures in, and where the view is in it: screen rows
+/// for a small wrapped file (a line may be several), shown lines otherwise
+/// (a folded line is none). With rows counted, the line each row is in, to
+/// map a drag back to a line.
+fn scroll_extent(buffer: &Buffer) -> (usize, f32, Vec<usize>) {
+    let total = buffer.rope.len_lines();
+    if !buffer.row_mode() {
+        let at = buffer.scroll_line as f32 + buffer.scroll_fraction;
+        return (total, at, Vec::new());
+    }
+    if buffer.wrap.is_some() && total <= COUNT_ROWS_UP_TO {
+        let mut units = Vec::new();
+        let mut at = 0.0;
+        for line in 0..total {
+            if line == buffer.scroll_line {
+                at = (units.len() + buffer.scroll_row) as f32 + buffer.scroll_fraction;
+            }
+            let rows = buffer.row_starts(line).len();
+            units.extend(std::iter::repeat_n(line, rows));
+        }
+        return (units.len(), at, units);
+    }
+    // Lines, less the ones folds hide, from the fold list alone.
+    let hidden_before = |line: usize| -> usize {
+        buffer
+            .folds
+            .iter()
+            .map(|&(a, b)| (b + 1).min(line).saturating_sub(a))
+            .sum()
+    };
+    let shown = total - hidden_before(total);
+    let at =
+        (buffer.scroll_line - hidden_before(buffer.scroll_line)) as f32 + buffer.scroll_fraction;
+    (shown, at, Vec::new())
+}
+
+/// The line at shown position `unit`: the inverse of [`scroll_extent`].
+fn line_at_unit(buffer: &Buffer, unit: usize, units: &[usize]) -> usize {
+    if !units.is_empty() {
+        return units
+            .get(unit)
+            .copied()
+            .unwrap_or(buffer.rope.len_lines().saturating_sub(1));
+    }
+    let mut line = unit;
+    for &(a, b) in &buffer.folds {
+        if a <= line {
+            line += b + 1 - a;
+        }
+    }
+    line
+}
+
 pub fn scrollbar_thumb(buffer: &Buffer, viewport: Viewport, line_height: f32) -> Option<Viewport> {
     let rows = viewport.rows(line_height);
-    let total = buffer.rope.len_lines();
+    let (total, at, _) = scroll_extent(buffer);
     if rows == 0 || total <= rows {
         return None;
     }
@@ -1967,7 +2056,7 @@ pub fn scrollbar_thumb(buffer: &Buffer, viewport: Viewport, line_height: f32) ->
     }
     let height = (track.height * rows as f32 / total as f32).max(SCROLLBAR_MIN_THUMB);
     let max_scroll = (total - rows) as f32;
-    let at = ((buffer.scroll_line as f32 + buffer.scroll_fraction) / max_scroll).clamp(0.0, 1.0);
+    let at = (at / max_scroll).clamp(0.0, 1.0);
     Some(Viewport {
         x: track.x,
         y: track.y + (track.height - height) * at,
@@ -1980,7 +2069,7 @@ pub fn scrollbar_thumb(buffer: &Buffer, viewport: Viewport, line_height: f32) ->
 /// drag: the inverse of [`scrollbar_thumb`].
 pub fn scrollbar_line_at(buffer: &Buffer, viewport: Viewport, line_height: f32, y: f32) -> usize {
     let rows = viewport.rows(line_height);
-    let total = buffer.rope.len_lines();
+    let (total, _, units) = scroll_extent(buffer);
     let Some(thumb) = scrollbar_thumb(buffer, viewport, line_height) else {
         return 0;
     };
@@ -1990,7 +2079,8 @@ pub fn scrollbar_line_at(buffer: &Buffer, viewport: Viewport, line_height: f32, 
         return 0;
     }
     let at = ((y - track.y) / run).clamp(0.0, 1.0);
-    ((total - rows) as f32 * at).round() as usize
+    let unit = ((total - rows) as f32 * at).round() as usize;
+    line_at_unit(buffer, unit, &units)
 }
 
 /// Results the Cmd-P palette lists; more than fit, so the list scrolls.
@@ -2811,10 +2901,14 @@ pub fn build_tab_bar_in(
         let shown: String = if label_cells > room && room > 1 {
             // Middle ellipsis keeps the extension visible, which is the half
             // people actually scan for.
+            // Budgeted in cells, as `room` is: a CJK or emoji name takes two
+            // per character, and counting characters drew it twice as wide.
             let keep = room - 1;
-            let head = keep / 2;
-            let tail = keep - head;
+            let head_cells = keep / 2;
+            let tail_cells = keep - head_cells;
             let chars: Vec<char> = title.chars().collect();
+            let head = fit_cells(chars.iter(), head_cells);
+            let tail = fit_cells(chars[head..].iter().rev(), tail_cells);
             chars[..head]
                 .iter()
                 .chain(std::iter::once(&'\u{2026}'))
@@ -3532,11 +3626,43 @@ impl Frame {
 
 /// A line under `range` of `buffer`'s text, on every visible row it
 /// touches: how a diagnostic is shown.
-pub fn push_underline(
+/// Squiggles under each of `marks`, a range and its colour: the visible
+/// rows are worked out once for all of them, and a range off screen costs
+/// two line lookups.
+pub fn push_underlines(
     out: &mut Vec<GlyphInstance>,
     atlas: &Atlas,
     buffer: &Buffer,
     text: Viewport,
+    marks: &[(std::ops::Range<usize>, [f32; 4])],
+) {
+    let rows = screen_rows(buffer, text, atlas.metrics.line_height);
+    let (Some(first), Some(last)) = (rows.first(), rows.last()) else {
+        return;
+    };
+    let (first, last) = (first.line, last.line);
+    for (range, color) in marks {
+        push_underline_on(
+            out,
+            atlas,
+            buffer,
+            text,
+            &rows,
+            (first, last),
+            range.clone(),
+            *color,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_underline_on(
+    out: &mut Vec<GlyphInstance>,
+    atlas: &Atlas,
+    buffer: &Buffer,
+    text: Viewport,
+    rows: &[ScreenRow],
+    (first, last): (usize, usize),
     range: std::ops::Range<usize>,
     color: [f32; 4],
 ) {
@@ -3549,8 +3675,11 @@ pub fn push_underline(
     let end_line = buffer
         .rope
         .byte_to_line(range.end.min(buffer.rope.len_bytes()));
-    for row in screen_rows(buffer, text, m.line_height)
-        .into_iter()
+    if end_line < first || start_line > last {
+        return;
+    }
+    for row in rows
+        .iter()
         .filter(|r| r.line >= start_line && r.line <= end_line)
     {
         let line = row.line;
@@ -3606,6 +3735,47 @@ pub fn push_underline(
             up = !up;
         }
     }
+}
+
+/// Whether a row break of `line` falls in or against right-to-left text
+/// (Hebrew, Arabic and the scripts after them): a wrapped row cut out of
+/// the whole line's shaping is wrong there, and only there.
+fn has_rtl(buffer: &Buffer, line: usize) -> bool {
+    let rtl = |c: char| {
+        matches!(c as u32,
+            0x0590..=0x08FF | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFF | 0x10800..=0x10FFF | 0x1E800..=0x1EFFF)
+    };
+    let starts = buffer.row_starts(line);
+    starts.iter().skip(1).any(|&at| {
+        // The letters either side of the break, past any spaces.
+        let before = buffer.rope.slice_to_string(at.saturating_sub(16)..at);
+        let after_end = (at + 16).min(buffer.rope.len_bytes());
+        let after = buffer.rope.slice_to_string(at..after_end);
+        before.trim_end().chars().next_back().is_some_and(rtl)
+            || after.trim_start().chars().next().is_some_and(rtl)
+    })
+}
+
+/// How many of `chars` fit in `cells`, without ending between the parts of
+/// a joined emoji (a zero-width joiner or a variation selector and what it
+/// joins stay together).
+fn fit_cells<'a>(chars: impl Iterator<Item = &'a char>, cells: usize) -> usize {
+    let joins = |c: char| c == '\u{200d}' || ('\u{fe00}'..='\u{fe0f}').contains(&c);
+    let chars: Vec<char> = chars.copied().collect();
+    let (mut count, mut used) = (0, 0);
+    while count < chars.len() {
+        let width = display_width(chars[count]);
+        if used + width > cells {
+            break;
+        }
+        used += width;
+        count += 1;
+    }
+    // Back off to a boundary that is not inside a joined sequence.
+    while count > 0 && count < chars.len() && (joins(chars[count]) || joins(chars[count - 1])) {
+        count -= 1;
+    }
+    count
 }
 
 /// One suggestion as the ribbon draws it.
@@ -3925,9 +4095,46 @@ pub fn build_markdown(
     )
 }
 
-/// [`build_markdown`] without clearing the frame first.
+/// [`build_markdown`] without clearing the frame first. What it adds is
+/// cut to `viewport`: a code line wider than the pane, or a block's
+/// background, must not draw into the next pane or over the status bar.
 #[allow(clippy::too_many_arguments)]
 pub fn build_markdown_appending(
+    blocks: &[SpannedBlock],
+    source: &str,
+    active: Option<usize>,
+    copied_block: Option<usize>,
+    scroll: usize,
+    atlas: &mut Atlas,
+    viewport: Viewport,
+    theme: &Theme,
+    out: &mut Vec<GlyphInstance>,
+    hits: &mut Vec<MarkdownHit>,
+) -> usize {
+    let first = out.len();
+    let rows = build_markdown_unclipped(
+        blocks,
+        source,
+        active,
+        copied_block,
+        scroll,
+        atlas,
+        viewport,
+        theme,
+        out,
+        hits,
+    );
+    let (left, right) = (viewport.x, viewport.x + viewport.width);
+    let (top, bottom) = (viewport.y, viewport.y + viewport.height);
+    for quad in &mut out[first..] {
+        clip_horizontal(quad, left, right);
+        clip_vertical(quad, top, bottom);
+    }
+    rows
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_markdown_unclipped(
     blocks: &[SpannedBlock],
     source: &str,
     active: Option<usize>,
@@ -4437,8 +4644,10 @@ fn draw_prose(
             Face::BoldItalic => base.with_bold(true).with_italic(true),
         };
         let code = style_is_code(run.style);
-        // Wrap on whitespace, so words stay whole.
-        for word in run.text.split_inclusive(' ') {
+        // Wrap on whitespace, so words stay whole; a "word" longer than
+        // shaping takes (a URL, a hash) is cut into pieces that each shape
+        // and can wrap, where it used to have no width and vanish.
+        for word in run.text.split_inclusive(' ').flat_map(prose_pieces) {
             let advance = if code {
                 word.chars().map(display_width).sum::<usize>() as f32 * m.advance
             } else {
@@ -4581,7 +4790,7 @@ fn push_prose(
             continue;
         };
         let mut quad = GlyphInstance {
-            pos: [m.snap(x + glyph.x * scale), y],
+            pos: [m.snap(x + (glyph.x + slot.dx) * scale), y],
             size: [cw * slot.cells as f32 * scale, ch * scale],
             uv: slot.uv,
             flags: slot.flags(),
@@ -4617,6 +4826,24 @@ fn prose_fit(atlas: &mut Atlas, size_pt: f32) -> (f32, f32) {
 }
 
 /// Width of a prose run without drawing it, at the size that was asked for.
+/// `word` in pieces short enough to shape, cut on character boundaries.
+fn prose_pieces(word: &str) -> impl Iterator<Item = &str> {
+    const PIECE: usize = 128;
+    let mut rest = word;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let mut cut = rest.len().min(PIECE);
+        while !rest.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let (piece, tail) = rest.split_at(cut);
+        rest = tail;
+        Some(piece)
+    })
+}
+
 pub fn prose_width(atlas: &mut Atlas, text: &str, size_pt: f32, face: Face) -> f32 {
     let (shaped_pt, scale) = prose_fit(atlas, size_pt);
     atlas
@@ -4674,7 +4901,11 @@ pub fn offset_at_point(buffer: &Buffer, atlas: &Atlas, x: f32, y: f32) -> usize 
         let line_start = buffer.rope.line_to_byte(row.line);
         let content_end = crate::text::wrap::line_end(&buffer.rope, row.line);
         let row_end = if row.last { content_end } else { row.end };
-        if let Some(shaped) = atlas.cached_editor_line((buffer.id(), row.line), &buffer.rope) {
+        let split_rtl = !(row.first && row.last) && has_rtl(buffer, row.line);
+        if let Some(shaped) = atlas
+            .cached_editor_line((buffer.id(), row.line), &buffer.rope)
+            .filter(|_| !split_rtl)
+        {
             let index = shaped
                 .source_bytes
                 .partition_point(|&b| b < row.start - line_start);
@@ -4696,12 +4927,7 @@ pub fn offset_at_point(buffer: &Buffer, atlas: &Atlas, x: f32, y: f32) -> usize 
             );
         }
         let column = ((x - text_x + scrolled) / m.advance).max(0.0);
-        let at = crate::text::wrap::byte_at_column(
-            &buffer.rope,
-            row.start,
-            row_end,
-            column.round() as usize,
-        );
+        let at = crate::text::wrap::byte_at_fraction(&buffer.rope, row.start, row_end, column);
         // The end of a continued row is the next row's start: a click past
         // the text stays on the row that was clicked.
         return if !row.last && at >= row_end {
@@ -4726,7 +4952,7 @@ pub fn offset_at_point(buffer: &Buffer, atlas: &Atlas, x: f32, y: f32) -> usize 
         let target_x = x - text_x + buffer.scroll_column as f32 * m.advance;
         return start + shaped.byte_at_x(target_x);
     }
-    let column = (((x - text_x) / m.advance).round()).max(0.0) as usize + buffer.scroll_column;
+    let column = ((x - text_x) / m.advance).max(0.0) + buffer.scroll_column as f32;
 
     byte_at_visual_column(buffer, line, column)
 }
@@ -4768,7 +4994,11 @@ pub fn caret_rect(buffer: &Buffer, atlas: &Atlas, text: Viewport) -> Option<View
             .into_iter()
             .find(|r| r.holds(line, caret))?;
         let line_start = buffer.rope.line_to_byte(line);
-        let x = if let Some(shaped) = atlas.cached_editor_line((buffer.id(), line), &buffer.rope) {
+        let split_rtl = !(row.first && row.last) && has_rtl(buffer, line);
+        let x = if let Some(shaped) = atlas
+            .cached_editor_line((buffer.id(), line), &buffer.rope)
+            .filter(|_| !split_rtl)
+        {
             let at = |byte: usize| {
                 let index = shaped
                     .source_bytes
@@ -4869,7 +5099,8 @@ pub fn push_marked_text(
 
 /// Descends tab-aware rope summaries to `target` visual column, and
 /// returns the byte offset there. Clamps to the end of the line.
-fn byte_at_visual_column(buffer: &Buffer, line: usize, target: usize) -> usize {
+fn byte_at_visual_column(buffer: &Buffer, line: usize, column: f32) -> usize {
+    let target = column.floor() as usize;
     let start = buffer.rope.line_to_byte(line);
     let end = if line + 1 < buffer.rope.len_lines() {
         buffer.rope.line_to_byte(line + 1)
@@ -4877,7 +5108,7 @@ fn byte_at_visual_column(buffer: &Buffer, line: usize, target: usize) -> usize {
         buffer.rope.len_bytes()
     };
 
-    let (byte, column) = buffer.rope.visual_seek(start..end, target);
+    let (byte, column_at) = buffer.rope.visual_seek(start..end, target);
     let Some(ch) = buffer
         .rope
         .chunks_in(byte..end)
@@ -4886,14 +5117,15 @@ fn byte_at_visual_column(buffer: &Buffer, line: usize, target: usize) -> usize {
     else {
         return byte;
     };
-    if ch == '\r' || ch == '\n' || column >= target {
+    if ch == '\r' || ch == '\n' {
         return byte;
     }
-    let next = advance(column, ch);
-    if target - column < next - target {
-        byte
-    } else {
+    let (at, clicked) = (column_at, column);
+    let next = advance(at, ch);
+    if crate::text::wrap::after_middle(clicked, at, next) {
         byte + ch.len_utf8()
+    } else {
+        byte
     }
 }
 
@@ -5114,7 +5346,10 @@ pub fn push_ui_text(
             continue;
         };
         let mut quad = GlyphInstance {
-            pos: [m.snap(rect.x + glyph.x), rect.y + m.glyph_dy(rect.height)],
+            pos: [
+                m.snap(rect.x + glyph.x + slot.dx),
+                rect.y + m.glyph_dy(rect.height),
+            ],
             size: [cw * slot.cells as f32, ch],
             uv: slot.uv,
             flags: slot.flags(),
@@ -6465,6 +6700,72 @@ mod tests {
     }
 
     #[test]
+    fn a_wide_code_block_stays_inside_the_preview() {
+        let mut atlas = atlas();
+        let source = format!("```\n{}\n```\n", "x".repeat(400));
+        let blocks = crate::markdown::parse_spanned(&source);
+        let (mut glyphs, mut hits) = (Vec::new(), Vec::new());
+        let view = Viewport {
+            x: 100.0,
+            y: 50.0,
+            width: 300.0,
+            height: 200.0,
+        };
+        build_markdown(
+            &blocks,
+            &source,
+            None,
+            None,
+            0,
+            &mut atlas,
+            view,
+            &Theme::default(),
+            &mut glyphs,
+            &mut hits,
+        );
+        assert!(!glyphs.is_empty());
+        for quad in &glyphs {
+            assert!(
+                quad.pos[0] >= view.x - 0.01
+                    && quad.pos[0] + quad.size[0] <= view.x + view.width + 0.01
+            );
+            assert!(
+                quad.pos[1] >= view.y - 0.01
+                    && quad.pos[1] + quad.size[1] <= view.y + view.height + 0.01
+            );
+        }
+    }
+
+    #[test]
+    fn a_word_too_long_to_shape_still_takes_its_room() {
+        let mut atlas = atlas();
+        let url = format!("https://example.invalid/{}", "a".repeat(700));
+        let source = format!("{url} after\n");
+        let blocks = crate::markdown::parse_spanned(&source);
+        let (mut glyphs, mut hits) = (Vec::new(), Vec::new());
+        build_markdown(
+            &blocks,
+            &source,
+            None,
+            None,
+            0,
+            &mut atlas,
+            Viewport::new(800.0, 2000.0),
+            &Theme::default(),
+            &mut glyphs,
+            &mut hits,
+        );
+        let stops = &hits[0].caret_stops;
+        // The word wraps over several rows, and "after" comes after it
+        // rather than over its first letters.
+        let rows: std::collections::BTreeSet<i64> =
+            stops.iter().map(|(_, p)| p[1] as i64).collect();
+        assert!(rows.len() > 2, "the long word wraps");
+        let last = stops.last().unwrap().1;
+        assert!(last[1] > stops[0].1[1], "after is below the start");
+    }
+
+    #[test]
     fn markdown_code_has_a_copy_target_and_live_block_keeps_other_blocks_rendered() {
         let mut atlas = atlas();
         let source = "# Title\n\n```rs\nlet x = 1;\n```\n\nAfter\n";
@@ -6734,6 +7035,69 @@ mod tests {
 
         let bands = out.iter().filter(|q| q.color == theme.selection).count();
         assert_eq!(bands, 3, "one band per selected line with content");
+    }
+
+    #[test]
+    fn a_selected_empty_line_shows_its_newline() {
+        let mut atlas = atlas();
+        let mut buffer = Buffer::from_text("one\n\nthree\n");
+        buffer.select_all();
+        let mut out = Vec::new();
+        let theme = Theme::default();
+        build(
+            &buffer,
+            &mut atlas,
+            Viewport::new(800.0, 600.0),
+            &theme,
+            &mut out,
+        );
+        let rows: std::collections::BTreeSet<i64> = out
+            .iter()
+            .filter(|q| q.color == theme.selection)
+            .map(|q| q.pos[1] as i64)
+            .collect();
+        assert_eq!(rows.len(), 3, "the empty middle line is marked too");
+    }
+
+    #[test]
+    fn the_scrollbar_counts_rows_when_wrapping_and_skips_folds() {
+        let vp = Viewport::new(400.0, 200.0);
+        let line_height = 20.0;
+        // Three lines, each wrapping into many rows: taller than the view.
+        let mut wrapped = Buffer::from_text(&format!("{0}\n{0}\n{0}\n", "word ".repeat(100)));
+        wrapped.wrap = Some(40);
+        assert!(scrollbar_thumb(&wrapped, vp, line_height).is_some());
+        // A fold hides lines: fewer to scroll through.
+        let text: String = (0..40)
+            .map(|i| {
+                if i % 20 == 0 {
+                    "fn f() {\n".to_string()
+                } else {
+                    "    x;\n".to_string()
+                }
+            })
+            .collect();
+        let mut folded = Buffer::from_text(&text);
+        let open = scrollbar_thumb(&folded, vp, line_height).unwrap();
+        folded.fold(0);
+        let closed = scrollbar_thumb(&folded, vp, line_height).unwrap();
+        assert!(closed.height > open.height);
+        let (shown, _, _) = scroll_extent(&folded);
+        assert_eq!(line_at_unit(&folded, 1, &[]), 20, "the line after the fold");
+        assert!(shown < 41);
+    }
+
+    #[test]
+    fn ellipsis_budgets_cells_and_keeps_joined_emoji_whole() {
+        let wide: Vec<char> = "日本語のファイル名.txt".chars().collect();
+        // Four cells hold two wide characters, not four.
+        assert_eq!(fit_cells(wide.iter(), 4), 2);
+        let family: Vec<char> = "a👨\u{200d}👩\u{200d}👧b".chars().collect();
+        let n = fit_cells(family.iter(), 4);
+        assert!(
+            n == 1 || n == family.len() - 1,
+            "not inside the family: {n}"
+        );
     }
 
     #[test]
