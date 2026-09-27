@@ -13,6 +13,8 @@
 //! so a tree would only have to be flattened again; blocks carry their own
 //! indent depth instead.
 
+pub mod source;
+
 use std::ops::Range;
 
 /// A styled run of text within one line.
@@ -116,6 +118,11 @@ pub fn source_offsets_in_range(source: &str, range: Range<usize>, visible: &str)
     }
     offsets.push(start + cursor);
     offsets
+}
+
+/// Whether a file extension, lowercase and without the dot, is Markdown.
+pub fn is_markdown_extension(extension: &str) -> bool {
+    matches!(extension, "md" | "markdown" | "mdown" | "mkd")
 }
 
 /// Parses Markdown into blocks.

@@ -902,11 +902,12 @@ impl NativePreview {
     }
 }
 
-fn default_preview(buffer: &Buffer) -> Option<usize> {
+/// Whether `buffer` is Markdown, which Cmd-E shows rendered. It opens as
+/// styled text: the rendered view cannot select, find or scroll by line.
+fn is_markdown(buffer: &Buffer) -> bool {
     buffer
         .extension()
-        .filter(|e| matches!(e.as_str(), "md" | "markdown" | "mdown"))
-        .map(|_| 0)
+        .is_some_and(|e| crate::markdown::is_markdown_extension(&e))
 }
 
 /// Opens `view` in the response tab titled `title`, reusing the tab that
@@ -926,7 +927,7 @@ fn show_response(state: &mut State, title: &str, view: crate::http::curl::View) 
     buffer.display_ext = ext;
     let id = buffer.id();
     state.responses.insert(id, view);
-    state.preview = default_preview(state.docs.active());
+    state.preview = None;
     reveal_active_tab(state);
     id
 }
@@ -1169,7 +1170,7 @@ define_class!(
             self.ivars().handling_key.set(false);
             if changed {
                 let mut state = self.ivars().state.borrow_mut();
-                if state.preview.is_some() && default_preview(state.docs.active()).is_some() {
+                if state.preview.is_some() && is_markdown(state.docs.active()) {
                     state.live_line = Some((state.docs.active().id(), state.docs.active().cursor_position().0));
                 }
                 let edited = state.docs.active().has_pending_edits();
@@ -1567,7 +1568,7 @@ define_class!(
             }
             {
                 let mut state = self.ivars().state.borrow_mut();
-                if state.preview.is_some() && default_preview(state.docs.active()).is_some() {
+                if state.preview.is_some() && is_markdown(state.docs.active()) {
                     let hit = state.md_hits.iter().find(|h| h.rect.contains(x, y)).cloned();
                     if let Some(hit) = hit {
                         if let Some((button, code)) = hit.copy
@@ -2246,7 +2247,7 @@ define_class!(
                 // on a buffer the renderer will not preview changed hidden
                 // state and drew nothing, so the command looked dead and the
                 // next Markdown file opened in whichever mode it had left.
-                if default_preview(state.docs.active()).is_none() {
+                if !is_markdown(state.docs.active()) {
                     state.message = Some((
                         "Preview is for Markdown files".to_string(),
                         Instant::now(),
@@ -2543,7 +2544,7 @@ define_class!(
         fn action_next_tab(&self, _sender: Option<&AnyObject>) {
             let mut state = self.ivars().state.borrow_mut();
             state.docs.cycle(1);
-            state.preview = default_preview(state.docs.active());
+            state.preview = None;
             reveal_active_tab(&mut state);
             drop(state);
             self.sync_title();
@@ -2556,7 +2557,7 @@ define_class!(
         fn action_prev_tab(&self, _sender: Option<&AnyObject>) {
             let mut state = self.ivars().state.borrow_mut();
             state.docs.cycle(-1);
-            state.preview = default_preview(state.docs.active());
+            state.preview = None;
             reveal_active_tab(&mut state);
             drop(state);
             self.sync_title();
@@ -2821,7 +2822,7 @@ define_class!(
                         for docs in all_docs_mut(&mut state) {
                             docs.close_under(&source_key);
                         }
-                        state.preview = default_preview(state.docs.active());
+                        state.preview = None;
                         reveal_active_tab(&mut state);
                         state.message = Some((format!("moved {name} to Trash"), Instant::now()));
                     }
@@ -3500,7 +3501,7 @@ impl EditorView {
         // A trackpad moves the text itself by points. Wheel notches, the
         // sidebar and the Markdown blocks still go a whole line at a time.
         let over_sidebar = chrome.sidebar.is_some_and(|r| r.contains(x, y));
-        let previewing = state.preview.is_some() && default_preview(state.docs.active()).is_some();
+        let previewing = state.preview.is_some() && is_markdown(state.docs.active());
         // The columns scroll by their own rows.
         if !over_sidebar && chrome.text.contains(x, y) && side_by_side(&state) {
             let per_row = if precise {
@@ -3559,7 +3560,7 @@ impl EditorView {
         }
 
         if state.preview.is_some()
-            && default_preview(state.docs.active()).is_some()
+            && is_markdown(state.docs.active())
             && !chrome.sidebar.is_some_and(|r| r.contains(x, y))
         {
             let (_, blocks) = markdown_of(state.docs.active());
@@ -4407,7 +4408,7 @@ impl EditorView {
                     let mut state = self.ivars().state.borrow_mut();
                     let switched = state.docs.switch(digit as usize - 1);
                     if switched {
-                        state.preview = default_preview(state.docs.active());
+                        state.preview = None;
                         reveal_active_tab(&mut state);
                     }
                     switched
@@ -4822,8 +4823,7 @@ impl EditorView {
                         state.marked.as_deref(),
                         &layout,
                         (
-                            state.preview.is_some()
-                                && default_preview(state.docs.active()).is_some(),
+                            state.preview.is_some() && is_markdown(state.docs.active()),
                             state.native_preview.is_some(),
                         ),
                         state
@@ -4842,9 +4842,28 @@ impl EditorView {
                     },
                     if state.sidebar { "on" } else { "off" }
                 );
+                // Markdown styled in the source: the kinds on the first
+                // line, and whether any code block has a band.
+                let md = {
+                    let buffer = state.docs.active();
+                    let first_line = buffer.rope.line_to_byte(1.min(buffer.rope.len_lines()));
+                    let kinds: Vec<String> = state
+                        .syntax
+                        .spans_with(buffer.id(), 0..first_line, |r| {
+                            buffer.rope.slice_to_string(r)
+                        })
+                        .iter()
+                        .map(|s| format!("{:?}", s.kind))
+                        .collect();
+                    format!(
+                        "{} bands={}",
+                        kinds.join(","),
+                        state.syntax.code_bands(buffer.id()).len()
+                    )
+                };
                 let report = format!(
                     // First: the report ends with the document's text.
-                    "message: {}\nactivity: {}\npointer_targets: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nconflicts: {}\ngit_conflicts: {}\nblame: {}\nfind_results: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\n{report}",
+                    "message: {}\nmd: {md}\nactivity: {}\npointer_targets: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nconflicts: {}\ngit_conflicts: {}\nblame: {}\nfind_results: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\n{report}",
                     state.message.as_ref().map_or("", |(text, _)| text.as_str()),
                     activity,
                     state.pointer_targets.len(),
@@ -5130,7 +5149,7 @@ impl EditorView {
             self.focus_pane(pane);
             let mut state = self.ivars().state.borrow_mut();
             state.docs.switch(tab);
-            state.preview = default_preview(state.docs.active());
+            state.preview = None;
             reveal_active_tab(&mut state);
             drop(state);
             self.sync_title();
@@ -5141,7 +5160,7 @@ impl EditorView {
         let mut state = self.ivars().state.borrow_mut();
         match state.docs.open(path) {
             Ok(()) => {
-                state.preview = default_preview(state.docs.active());
+                state.preview = None;
                 reveal_active_tab(&mut state);
                 let format = state.docs.active().disk_format();
                 let note = if state.docs.active().is_read_only() {
@@ -5588,7 +5607,7 @@ impl EditorView {
             }
             state.completion = None;
             if announce {
-                state.preview = default_preview(state.docs.active());
+                state.preview = None;
             }
         }
         self.request_redraw();
@@ -6470,7 +6489,7 @@ impl EditorView {
             } else if diffing(&state) {
                 let index = state.docs.active_index();
                 state.docs.close(index);
-                state.preview = default_preview(state.docs.active());
+                state.preview = None;
                 reveal_active_tab(&mut state);
                 drop(state);
                 self.sync_title();
@@ -7675,7 +7694,7 @@ impl EditorView {
         } else {
             let mut state = self.ivars().state.borrow_mut();
             state.docs.switch(hit.index);
-            state.preview = default_preview(state.docs.active());
+            state.preview = None;
             drop(state);
             self.sync_title();
             self.reparse();
@@ -7755,7 +7774,7 @@ impl EditorView {
                 forget_document(&mut state, id);
             }
             state.completion = None;
-            state.preview = default_preview(state.docs.active());
+            state.preview = None;
             reveal_active_tab(&mut state);
         }
         // A pane whose last tab just closed goes with it, unless it is
@@ -11800,7 +11819,7 @@ impl EditorView {
                 }
                 Err(e) => format!("created but not opened: {e}"),
             };
-            state.preview = default_preview(state.docs.active());
+            state.preview = None;
             reveal_active_tab(&mut state);
             state.message = Some((message, Instant::now()));
         }
@@ -11876,7 +11895,7 @@ impl EditorView {
                     state.message = Some((format!("created but not opened: {e}"), Instant::now()));
                 }
             }
-            state.preview = default_preview(state.docs.active());
+            state.preview = None;
             reveal_active_tab(&mut state);
             // The directory walk and finder rebuild happen off the UI thread.
             state.project_index_rx = Some(spawn_project_refresh(
@@ -11987,7 +12006,7 @@ impl EditorView {
             }
             _ => state.completion = None,
         }
-        if state.preview.is_some() && default_preview(state.docs.active()).is_some() {
+        if state.preview.is_some() && is_markdown(state.docs.active()) {
             let id = state.docs.active().id();
             let line = state.docs.active().cursor_position().0;
             state.live_line = Some((id, line));
@@ -12123,7 +12142,7 @@ impl EditorView {
         let mut state = self.ivars().state.borrow_mut();
         match state.docs.open(&path) {
             Ok(()) => {
-                state.preview = default_preview(state.docs.active());
+                state.preview = None;
                 reveal_active_tab(&mut state);
             }
             Err(e) => {
@@ -12410,7 +12429,7 @@ impl EditorView {
         // Markdown preview replaces the editor body. Parsing per frame is
         // fine: a README is kilobytes, and the alternative is a cache that
         // has to be invalidated on every edit.
-        let previewing = preview.is_some() && default_preview(buffer).is_some();
+        let previewing = preview.is_some() && is_markdown(buffer);
 
         // Nothing open: the home screen, drawn by the same renderer. There is
         // no home "mode" to get stuck in. Typing lands in the untouched buffer
@@ -12554,6 +12573,7 @@ impl EditorView {
                 &query,
                 find.as_ref().map(|_| ranges.as_slice()),
                 spans,
+                syntax.code_bands(buffer.id()),
                 carets_on,
                 glyphs,
             );
@@ -12829,7 +12849,7 @@ impl EditorView {
             // A shortcut nobody can see is a shortcut nobody uses. The
             // breadcrumb row has the space, and it is the row that belongs to
             // the open file, which is what the command acts on.
-            if default_preview(buffer).is_some() {
+            if is_markdown(buffer) {
                 layout::push_ui_text_right(
                     glyphs,
                     &mut renderer.atlas,
@@ -13818,7 +13838,7 @@ fn active_conflicts_mut(state: &mut State) -> Option<&mut crate::platform::confl
 /// conflicts, with no Markdown preview over it.
 fn side_by_side(state: &State) -> bool {
     state.conflict_side
-        && !(state.preview.is_some() && default_preview(state.docs.active()).is_some())
+        && !(state.preview.is_some() && is_markdown(state.docs.active()))
         && active_conflicts(state).is_some_and(|v| !v.conflicts.is_empty())
 }
 
@@ -14392,7 +14412,7 @@ fn draw_other_pane(
         );
         return;
     }
-    if store.preview.is_some() && default_preview(buffer).is_some() {
+    if store.preview.is_some() && is_markdown(buffer) {
         let (source, blocks) = markdown_of(buffer);
         let scroll = store
             .preview
@@ -14436,6 +14456,7 @@ fn draw_other_pane(
         "",
         None,
         &spans,
+        syntax.code_bands(buffer.id()),
         false,
         false,
         glyphs,
@@ -15679,7 +15700,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         }
     }
 
-    let initial_preview = default_preview(docs.active());
+    let initial_preview = None;
     let git = crate::platform::git_panel::Panel::new(
         tree.root()
             .map(Path::to_path_buf)

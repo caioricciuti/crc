@@ -42,9 +42,43 @@ pub enum Kind {
     Punctuation,
     Variable,
     Property,
+    // Markdown, styled in the source rather than by a grammar.
+    /// The characters that make the syntax: `#`, `**`, backticks, pipes.
+    MdMarker,
+    MdHeading,
+    MdStrong,
+    MdEmphasis,
+    MdStrongEmphasis,
+    /// Inline code, drawn on a tinted background.
+    MdCode,
+    /// A fenced block's code where no grammar colours it.
+    MdCodeBlock,
+    MdLink,
+    MdUrl,
+    MdQuote,
+    MdList,
+    MdStrike,
+    MdRule,
+    MdTableHeader,
 }
 
 impl Kind {
+    /// Drawn in the bold face.
+    pub fn bold(self) -> bool {
+        matches!(
+            self,
+            Kind::MdHeading | Kind::MdStrong | Kind::MdStrongEmphasis | Kind::MdTableHeader
+        )
+    }
+
+    /// Drawn in the italic face.
+    pub fn italic(self) -> bool {
+        matches!(
+            self,
+            Kind::MdEmphasis | Kind::MdStrongEmphasis | Kind::MdQuote
+        )
+    }
+
     /// Maps a tree-sitter capture name onto a highlight kind.
     ///
     /// Capture names are dotted and hierarchical (`function.method`,
@@ -861,6 +895,12 @@ fn build_predicate(run: &[(u32, u32)], string_at: &dyn Fn(u32) -> String) -> Pre
 }
 
 /// Row/column pair to tree-sitter's point type.
+/// The row and byte column of `byte` in `rope`.
+fn point_at(rope: &Rope, byte: usize) -> ffi::TSPoint {
+    let row = rope.byte_to_line(byte);
+    point((row, byte - rope.line_to_byte(row)))
+}
+
 fn point((row, column): (usize, usize)) -> ffi::TSPoint {
     ffi::TSPoint {
         row: row as u32,
@@ -883,7 +923,7 @@ fn _assert_cstring_in_scope(s: &str) -> Option<CString> {
 /// next begins, so given nesting it drew the outer colour throughout and
 /// never reached the inner one. Cutting the outer span around its children
 /// gives it the list it expects, and says what was meant.
-fn flatten(mut spans: Vec<Span>) -> Vec<Span> {
+pub(crate) fn flatten(mut spans: Vec<Span>) -> Vec<Span> {
     spans.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
 
     let mut out: Vec<Span> = Vec::with_capacity(spans.len());
@@ -936,8 +976,11 @@ pub struct SyntaxStore {
 
 /// Everything parsed for one document.
 struct DocumentTrees {
-    language: Language,
-    tree: Tree,
+    /// The document's own grammar; none for Markdown, whose own styling
+    /// is `markdown` and whose code blocks are layers.
+    language: Option<Language>,
+    tree: Option<Tree>,
+    markdown: Option<crate::markdown::source::Styled>,
     /// One tree per language embedded in the document: the JavaScript in an
     /// HTML file's `<script>` elements, the CSS in its `<style>`. Each covers
     /// all of that language's pieces at once and nothing in between.
@@ -972,6 +1015,13 @@ impl SyntaxStore {
         let id = buffer.id();
         let rope = &buffer.rope;
 
+        if buffer
+            .extension()
+            .is_some_and(|e| crate::markdown::is_markdown_extension(&e))
+        {
+            self.update_markdown(id, rope, edits.as_deref(), budget);
+            return;
+        }
         let language = buffer
             .extension()
             .and_then(|e| Language::from_extension(&e));
@@ -984,14 +1034,20 @@ impl SyntaxStore {
         // while `self` is borrowed for a highlighter. Incremental only onto
         // this document's own trees, in the same language, with a complete
         // account of what changed since.
-        let old = self.trees.remove(&id).filter(|t| t.language == language);
+        let old = self
+            .trees
+            .remove(&id)
+            .filter(|t| t.language == Some(language) && t.tree.is_some());
         let old = old.as_ref().zip(edits.as_deref());
 
         let Some(host) = self.highlighter(language) else {
             return;
         };
         let tree = match old {
-            Some((trees, edits)) => host.parse_incremental(rope, &trees.tree, edits),
+            Some((trees, edits)) => match &trees.tree {
+                Some(tree) => host.parse_incremental(rope, tree, edits),
+                None => host.parse(rope),
+            },
             None => host.parse(rope),
         };
         let Some(tree) = tree else {
@@ -1017,11 +1073,77 @@ impl SyntaxStore {
         self.trees.insert(
             id,
             DocumentTrees {
-                language,
-                tree,
+                language: Some(language),
+                tree: Some(tree),
+                markdown: None,
                 layers,
             },
         );
+    }
+
+    /// A Markdown document: its own styling, and a layer per language its
+    /// fenced code blocks name.
+    fn update_markdown(
+        &mut self,
+        id: u64,
+        rope: &Rope,
+        edits: Option<&[crate::text::buffer::Edit]>,
+        budget: usize,
+    ) {
+        let old = self.trees.remove(&id).filter(|t| t.markdown.is_some());
+        // Styling reads the whole text on every edit; past this a Markdown
+        // file is plain text rather than a slow one.
+        if rope.len_bytes() > budget.min(256 * 1024) {
+            return;
+        }
+        let source = rope.to_string();
+        let styled = crate::markdown::source::style(&source);
+        let mut by_language: Vec<(Language, Vec<ffi::TSRange>)> = Vec::new();
+        for fence in &styled.fences {
+            let Some(language) = fence.language else {
+                continue;
+            };
+            let range = ffi::TSRange {
+                start_point: point_at(rope, fence.content.start),
+                end_point: point_at(rope, fence.content.end),
+                start_byte: fence.content.start as u32,
+                end_byte: fence.content.end as u32,
+            };
+            match by_language.iter_mut().find(|(l, _)| *l == language) {
+                Some((_, ranges)) => ranges.push(range),
+                None => by_language.push((language, vec![range])),
+            }
+        }
+        let mut layers = Vec::new();
+        for (language, ranges) in by_language {
+            let previous = old.as_ref().zip(edits).and_then(|(trees, edits)| {
+                let (_, tree) = trees.layers.iter().find(|(l, _)| *l == language)?;
+                Some((tree, edits))
+            });
+            let Some(highlighter) = self.highlighter(language) else {
+                continue;
+            };
+            if let Some(layer) = highlighter.parse_ranges(rope, &ranges, previous) {
+                layers.push((language, layer));
+            }
+        }
+        self.trees.insert(
+            id,
+            DocumentTrees {
+                language: None,
+                tree: None,
+                markdown: Some(styled),
+                layers,
+            },
+        );
+    }
+
+    /// A Markdown document's code blocks, for the band behind them.
+    pub fn code_bands(&self, id: u64) -> &[std::ops::Range<usize>] {
+        self.trees
+            .get(&id)
+            .and_then(|t| t.markdown.as_ref())
+            .map_or(&[], |m| m.bands.as_slice())
     }
 
     /// Whether the document has been parsed.
@@ -1040,7 +1162,8 @@ impl SyntaxStore {
         let Some(trees) = self.trees.get(&id) else {
             return Vec::new();
         };
-        let all = std::iter::once((trees.language, &trees.tree)).chain(
+        let host = trees.language.zip(trees.tree.as_ref());
+        let all = host.into_iter().chain(
             trees
                 .layers
                 .iter()
@@ -1048,6 +1171,15 @@ impl SyntaxStore {
         );
 
         let mut spans = Vec::new();
+        if let Some(markdown) = &trees.markdown {
+            let first = markdown.spans.partition_point(|s| s.end <= range.start);
+            spans.extend(
+                markdown.spans[first..]
+                    .iter()
+                    .take_while(|s| s.start < range.end)
+                    .copied(),
+            );
+        }
         for (language, tree) in all {
             if let Some(h) = self.highlighters.iter().find(|h| h.language == language) {
                 spans.extend(h.spans_with(tree, range.clone(), &source));

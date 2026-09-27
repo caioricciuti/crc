@@ -711,6 +711,10 @@ pub struct Atlas {
     /// Cell size in device pixels, including padding.
     cell_px: (usize, usize),
     slots: HashMap<char, Slot>,
+    /// The editor font's bold and italic, for Markdown styled in the source;
+    /// `None` where the family has no such face.
+    code_faces: HashMap<Face, Option<CFRetained<CTFont>>>,
+    face_slots: HashMap<(char, Face), Slot>,
     /// By font key, then glyph: looked up without building a key per glyph.
     shaped_slots: HashMap<String, HashMap<u16, Slot>>,
     shaped_lines: HashMap<String, Rc<ShapedLine>>,
@@ -795,6 +799,8 @@ impl Atlas {
             },
             ui_lines: RecentCache::new(512),
             prose_fonts: HashMap::new(),
+            code_faces: HashMap::new(),
+            face_slots: HashMap::new(),
             prose_lines: RecentCache::new(4096),
             max_prose: None,
             font,
@@ -992,6 +998,63 @@ impl Atlas {
         });
         worker.request(ch);
         self.peek('?')
+    }
+
+    /// A character in the editor font's bold or italic, in the same cell
+    /// as the regular one. The regular glyph where the family has no such
+    /// face or the face lacks the character.
+    pub fn slot_for_face(&mut self, ch: char, face: Face) -> Option<Slot> {
+        if face == Face::Regular || is_icon(ch) {
+            return self.slot_for_fallback(ch);
+        }
+        if let Some(slot) = self.face_slots.get(&(ch, face)).copied() {
+            self.touch_page(slot.page);
+            return Some(slot);
+        }
+        let font = self
+            .code_faces
+            .entry(face)
+            .or_insert_with(|| {
+                let mut traits = CTFontSymbolicTraits::empty();
+                if face.bold() {
+                    traits |= CTFontSymbolicTraits::BoldTrait;
+                }
+                if face.italic() {
+                    traits |= CTFontSymbolicTraits::ItalicTrait;
+                }
+                let mask = CTFontSymbolicTraits::BoldTrait | CTFontSymbolicTraits::ItalicTrait;
+                // SAFETY: the same font at its own size; null matrix.
+                unsafe {
+                    self.font.copy_with_symbolic_traits(
+                        self.font.size(),
+                        std::ptr::null(),
+                        traits,
+                        mask,
+                    )
+                }
+            })
+            .clone();
+        let mut utf16 = [0u16; 2];
+        let glyph = font
+            .as_ref()
+            .and_then(|font| glyph_in(font, ch.encode_utf16(&mut utf16)));
+        let (Some(font), Some(glyph)) = (font, glyph) else {
+            return self.slot_for_fallback(ch);
+        };
+        let cells = display_width(ch).max(1);
+        let cell = self.alloc(cells)?;
+        let ascent = self.metrics.ascent * self.metrics.scale;
+        self.draw_glyph_into(cell, &font, glyph, ascent, cells);
+        let slot = Slot {
+            dx: 0.0,
+            uv: self.cell_uv(cell, cells),
+            page: (cell / CELLS) as u32,
+            cells: cells as u8,
+            color: false,
+        };
+        self.face_slots.insert((ch, face), slot);
+        self.dirty = true;
+        Some(slot)
     }
 
     /// Read-only lookup, for callers that cannot rasterize.
@@ -1428,6 +1491,7 @@ impl Atlas {
         if let Some(index) = victim {
             let number = (index + 1) as u32;
             self.slots.retain(|_, slot| slot.page != number);
+            self.face_slots.retain(|_, slot| slot.page != number);
             for glyphs in self.shaped_slots.values_mut() {
                 glyphs.retain(|_, slot| slot.page != number);
             }

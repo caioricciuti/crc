@@ -547,6 +547,20 @@ impl Theme {
             Kind::Punctuation => self.syn_punctuation,
             Kind::Variable => self.syn_variable,
             Kind::Property => self.syn_property,
+            // Markdown: the syntax faint, what it makes in the text's own
+            // colour with the weight doing the work, and the few things
+            // that are not prose (code, links, list markers) set apart.
+            Kind::MdMarker | Kind::MdUrl | Kind::MdStrike => self.gutter_text,
+            Kind::MdHeading | Kind::MdList => self.accent,
+            Kind::MdStrong
+            | Kind::MdEmphasis
+            | Kind::MdStrongEmphasis
+            | Kind::MdCodeBlock
+            | Kind::MdTableHeader => self.text,
+            Kind::MdCode => self.syn_string,
+            Kind::MdLink => self.syn_function,
+            Kind::MdQuote => self.syn_comment,
+            Kind::MdRule => self.md_rule,
         }
     }
 }
@@ -822,7 +836,16 @@ pub fn build_full(
     out: &mut Vec<GlyphInstance>,
 ) -> Stats {
     build_full_search(
-        buffer, atlas, viewport, theme, query, None, spans, true, out,
+        buffer,
+        atlas,
+        viewport,
+        theme,
+        query,
+        None,
+        spans,
+        &[],
+        true,
+        out,
     )
 }
 
@@ -838,6 +861,7 @@ pub fn build_full_search(
     query: &str,
     search_ranges: Option<&[std::ops::Range<usize>]>,
     spans: &[Span],
+    bands: &[std::ops::Range<usize>],
     carets: bool,
     out: &mut Vec<GlyphInstance>,
 ) -> Stats {
@@ -851,6 +875,7 @@ pub fn build_full_search(
         query,
         search_ranges,
         spans,
+        bands,
         true,
         carets,
         out,
@@ -870,6 +895,7 @@ pub fn build_text_appending(
     query: &str,
     search_ranges: Option<&[std::ops::Range<usize>]>,
     spans: &[Span],
+    bands: &[std::ops::Range<usize>],
     focused: bool,
     carets: bool,
     out: &mut Vec<GlyphInstance>,
@@ -1091,6 +1117,48 @@ pub fn build_text_appending(
                     color: theme.bracket_match,
                     ..Default::default()
                 });
+            }
+        }
+
+        // Markdown: a band behind a code block's rows, and a tint behind
+        // inline code, under the selection like the current line's wash.
+        if bands
+            .iter()
+            .any(|b| b.start < row_end.max(row_start + 1) && b.end >= row_start)
+        {
+            out.push(GlyphInstance {
+                pos: [text_x, y],
+                size: [
+                    (viewport.x + viewport.width - text_x).max(0.0),
+                    m.line_height,
+                ],
+                uv: solid,
+                color: theme.md_code_background,
+                ..Default::default()
+            });
+        }
+        let first_span = spans.partition_point(|s| s.end <= row_start);
+        for span in spans[first_span..]
+            .iter()
+            .take_while(|s| s.start < row_end)
+            .filter(|s| s.kind == Kind::MdCode)
+        {
+            let x0 = text_x + offset_at(span.start.max(row_start)) - scroll_x - 2.0;
+            let x1 = text_x + offset_at(span.end.min(row_end)) - scroll_x + 2.0;
+            let x0 = x0.max(text_x);
+            let x1 = x1.min(viewport.x + viewport.width);
+            if x1 > x0 {
+                push_rounded_rect(
+                    out,
+                    Viewport {
+                        x: x0,
+                        y: y + 2.0,
+                        width: x1 - x0,
+                        height: m.line_height - 4.0,
+                    },
+                    3.0,
+                    theme.md_code_background,
+                );
             }
         }
 
@@ -1355,10 +1423,15 @@ pub fn build_text_appending(
                 while span_at < spans.len() && spans[span_at].end <= byte {
                     span_at += 1;
                 }
-                let color = spans
+                let span = spans
                     .get(span_at)
-                    .filter(|s| s.start <= byte && byte < s.end)
-                    .map_or(theme.text, |s| theme.syntax(s.kind));
+                    .filter(|s| s.start <= byte && byte < s.end);
+                let color = span.map_or(theme.text, |s| theme.syntax(s.kind));
+                let face = span.map_or(Face::Regular, |s| {
+                    Face::Regular
+                        .with_bold(s.kind.bold())
+                        .with_italic(s.kind.italic())
+                });
                 let advance_bytes = ch.len_utf8();
                 match ch {
                     '\n' | '\r' => {
@@ -1387,7 +1460,12 @@ pub fn build_text_appending(
                     continue;
                 }
 
-                match atlas.slot_for_fallback(ch) {
+                let slot = if face == Face::Regular {
+                    atlas.slot_for_fallback(ch)
+                } else {
+                    atlas.slot_for_face(ch, face)
+                };
+                match slot {
                     Some(slot) => out.push(GlyphInstance {
                         pos: [x, y + glyph_dy],
                         size: [cell_w * slot.cells as f32, cell_h],

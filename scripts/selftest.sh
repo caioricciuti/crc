@@ -574,15 +574,19 @@ if [ ! -s "$T/cursors.out" ]; then
     fail=1
 fi
 
-# Markdown opens as a preview; clicking it enters source editing. Tabs can
-# then be dragged to a new position without changing which file is active.
-printf '# One\n\nBody\n' > "$T/proj/one.md"
+# Markdown opens as styled text: the heading's marker and text have kinds
+# of their own, and the fenced block a band. Cmd-E shows it rendered and
+# back. Tabs can then be dragged to a new position without changing which
+# file is active.
+printf '# One\n\nBody\n\n```rust\nfn main() {}\n```\n' > "$T/proj/one.md"
 printf 'two\n' > "$T/proj/two.txt"
 cat > "$T/tabs.script" <<SCRIPT
 key 11 cmd b
-dump $T/preview.out
-click 144 160
 dump $T/source.out
+key 14 cmd e
+dump $T/preview.out
+key 14 cmd e
+key 124 cmd
 text X
 dump $T/live-edit.out
 key 35 cmd p
@@ -598,15 +602,15 @@ dump $T/new-tab.out
 quit
 SCRIPT
 CRC_SELFTEST="$T/tabs.script" "$BIN" "$T/proj/one.md" 2> "$T/tabs.err"
+expect "$T/source.out" preview "false"
+expect "$T/source.out" md "MdMarker,MdHeading bands=1"
 expect "$T/preview.out" preview "true"
-expect "$T/source.out" preview "true"
-expect "$T/source.out" live "true"
-expect "$T/live-edit.out" preview "true"
+expect "$T/live-edit.out" preview "false"
 expect_line "$T/live-edit.out" 1 "# OneX"
 expect "$T/two.out" tabs "one.md | two.txt"
 expect "$T/reordered.out" tabs "two.txt | one.md"
 expect "$T/reordered.out" active "1"
-expect "$T/reordered.out" preview "true"
+expect "$T/reordered.out" preview "false"
 expect "$T/new-tab.out" tabs "two.txt | one.md | Untitled"
 expect "$T/new-tab.out" active "2"
 
