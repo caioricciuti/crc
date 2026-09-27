@@ -14,4 +14,3 @@ src/content/docs/contributing.md
 # The repository ignores PNGs at the root; the site ships these three.
 !src/assets/*.png
 
-/asdasd

@@ -102,10 +102,14 @@ pub fn source_offsets_in_range(source: &str, range: Range<usize>, visible: &str)
     let mut cursor = 0;
     let mut offsets = Vec::with_capacity(visible.chars().count() + 1);
     for ch in visible.chars() {
-        if let Some((relative, _)) = part[cursor..].char_indices().find(|(_, c)| *c == ch) {
+        // The space shown between two joined source lines is the line
+        // break in the source; matching it to the next real space skipped
+        // the next line's first word.
+        let same = |c: char| c == ch || (ch == ' ' && c.is_whitespace());
+        if let Some((relative, _)) = part[cursor..].char_indices().find(|(_, c)| same(*c)) {
             cursor += relative;
             offsets.push(start + cursor);
-            cursor += ch.len_utf8();
+            cursor += part[cursor..].chars().next().map_or(0, char::len_utf8);
         } else {
             offsets.push(start + cursor);
         }
@@ -253,7 +257,10 @@ pub fn parse_spanned(source: &str) -> Vec<SpannedBlock> {
             // in favour of the heading, and we only reach here with content
             // above, since a bare rule was already claimed by the check
             // further up.
+            // Only paragraph text takes an underline: under a list item, a
+            // quote or a table row, `---` is a rule (CommonMark 4.3).
             let underlined = !next.is_empty()
+                && !opens_container(trimmed)
                 && (next.chars().all(|c| c == '=') || next.chars().all(|c| c == '-'));
             if underlined {
                 i += 2;
@@ -484,10 +491,33 @@ fn is_table_delimiter(line: &str) -> bool {
 }
 
 fn split_row(line: &str) -> Vec<Vec<Run>> {
-    line.trim_matches('|')
-        .split('|')
+    cells(line.trim_matches('|'))
+        .into_iter()
         .map(|cell| parse_inline(cell.trim()))
         .collect()
+}
+
+/// A table row's cells: split on `|`, but not an escaped `\|` (which is
+/// the pipe itself) nor one inside a code span.
+fn cells(row: &str) -> Vec<String> {
+    let mut out = vec![String::new()];
+    let mut chars = row.chars().peekable();
+    let mut in_code = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if chars.peek() == Some(&'|') => {
+                chars.next();
+                out.last_mut().unwrap().push('|');
+            }
+            '`' => {
+                in_code = !in_code;
+                out.last_mut().unwrap().push(c);
+            }
+            '|' if !in_code => out.push(String::new()),
+            c => out.last_mut().unwrap().push(c),
+        }
+    }
+    out
 }
 
 /// Splits a line into styled runs.
@@ -638,6 +668,16 @@ fn delimiter_at(chars: &[char], i: usize) -> Option<(usize, Style)> {
 ///
 /// The closer has to be *right-flanking*: preceded by something that is not
 /// whitespace. `_` additionally may not close inside a word.
+/// Whether `line` starts a list item, a quote or a table row rather than
+/// a paragraph.
+fn opens_container(line: &str) -> bool {
+    let bullet = ["- ", "* ", "+ "].iter().any(|b| line.starts_with(b));
+    let digits = line.chars().take_while(char::is_ascii_digit).count();
+    let ordered =
+        digits > 0 && (line[digits..].starts_with(". ") || line[digits..].starts_with(") "));
+    bullet || ordered || line.starts_with('>') || line.starts_with('|')
+}
+
 /// Searches that found nothing, by what they looked for and where they
 /// started. Every later search for the same thing starts further on, so it
 /// cannot find anything either: without this, a paragraph with many lone
@@ -714,6 +754,35 @@ fn find_from(chars: &[char], from: usize, needle: char) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn table_cells_keep_escaped_and_code_pipes() {
+        assert_eq!(cells("a | `x|y` | b\\|c"), ["a ", " `x|y` ", " b|c"]);
+    }
+
+    #[test]
+    fn a_joined_line_break_maps_to_the_break() {
+        let source = "foo\nbar baz\n";
+        let offsets = source_offsets_in_range(source, 0..source.len(), "foo bar baz");
+        // "b" of bar is the fifth shown character.
+        assert_eq!(offsets[4], 4);
+        assert_eq!(&source[offsets[4]..offsets[4] + 3], "bar");
+    }
+
+    #[test]
+    fn a_rule_under_a_list_item_or_quote_is_a_rule() {
+        for source in ["- last item\n---\n", "> quote\n---\n", "1. one\n---\n"] {
+            let blocks = parse(source);
+            assert!(
+                !blocks.iter().any(|b| matches!(b, Block::Heading { .. })),
+                "{source:?}: {blocks:?}"
+            );
+        }
+        assert!(matches!(
+            parse("Title\n---\n")[0],
+            Block::Heading { level: 2, .. }
+        ));
+    }
 
     #[test]
     fn visible_cursor_maps_through_heading_and_link_markup() {

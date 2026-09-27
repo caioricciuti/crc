@@ -550,6 +550,9 @@ struct State {
     lsp: HashMap<Language, crate::lsp::client::Server>,
     /// Languages whose server could not be started, and why. Said once.
     lsp_unavailable: HashMap<Language, String>,
+    /// How often each language's server has stopped this session: it is
+    /// started again a few times, then left alone.
+    lsp_restarts: HashMap<Language, u32>,
     /// Buffers edited since their server last heard, and when. Changes are
     /// sent once typing pauses.
     lsp_dirty: HashMap<u64, Instant>,
@@ -5104,7 +5107,7 @@ impl EditorView {
                 let note = if state.docs.active().is_read_only() {
                     format!(
                         "opened {path} read-only: it is over {}",
-                        crate::text::buffer::human_size(crate::text::buffer::READ_ONLY_BYTES)
+                        crate::text::buffer::human_size(crate::text::buffer::read_only_limit())
                     )
                 } else if format.encoding == crate::text::file_format::Encoding::Windows1252 {
                     format!("opened {path} as Windows-1252; unsupported characters cannot be saved")
@@ -7039,6 +7042,7 @@ impl EditorView {
         // The tab may have been closed while the request was out.
         let State {
             docs,
+            panes,
             responses,
             message,
             ..
@@ -7049,7 +7053,13 @@ impl EditorView {
         view.set_outcome(outcome);
         let note = format!("{}: {}", view.request.title(), view.status());
         let (text, ext) = view.text(view.segment);
-        if let Some(buffer) = docs.iter_mut().find(|b| b.id() == id) {
+        // In whichever pane the tab is: the focus may have moved to another
+        // since the request went out.
+        let buffer = std::iter::once(&mut *docs)
+            .chain(panes.iter_mut().map(|p| &mut p.docs))
+            .flat_map(|d| d.iter_mut())
+            .find(|b| b.id() == id);
+        if let Some(buffer) = buffer {
             buffer.regenerate(&text);
             buffer.display_ext = ext;
         }
@@ -7975,6 +7985,16 @@ impl EditorView {
         // the tree may have changed what is ignored.
         tree.set_ignored(state.tree.ignored_set());
         state.tree = tree;
+        // Said once per scan: Go to File does not list everything.
+        if finder.is_truncated() && !state.finder.is_truncated() {
+            state.message = Some((
+                format!(
+                    "Go to File lists the first {} files of this project",
+                    finder.len()
+                ),
+                Instant::now(),
+            ));
+        }
         state.finder = finder;
         state.tree_version += 1;
         state.ignored_rx = Some(spawn_ignored(root));
@@ -10844,7 +10864,29 @@ impl EditorView {
                     self.ivars().state.borrow_mut().message = Some((reason, Instant::now()));
                 }
                 Event::Failed(reason) => {
-                    self.ivars().state.borrow_mut().message = Some((reason, Instant::now()));
+                    // A server that died is dropped (its process with it),
+                    // not kept as a dead entry: it gets another start, up to
+                    // a few, and nothing more is written to its closed pipe
+                    // nor read from its last diagnostics.
+                    let mut state = self.ivars().state.borrow_mut();
+                    let restarts = state.lsp_restarts.entry(key).or_insert(0);
+                    *restarts += 1;
+                    let restarts = *restarts;
+                    // Dropping it kills a process that is still there (one
+                    // that never answered initialize). One that died soon
+                    // after starting will only die again: not restarted.
+                    let short_lived = state
+                        .lsp
+                        .remove(&key)
+                        .is_some_and(|server| server.uptime() < LSP_RESTART_AFTER);
+                    if short_lived || restarts >= LSP_MAX_RESTARTS {
+                        state
+                            .lsp_unavailable
+                            .insert(key, format!("{reason}; not started again"));
+                    } else {
+                        sync = true;
+                    }
+                    state.message = Some((reason, Instant::now()));
                 }
             }
         }
@@ -13131,11 +13173,14 @@ impl EditorView {
                 "{}   {}{}{}",
                 name,
                 if buffer.is_read_only() {
-                    "Read-only: over 512 MB"
+                    format!(
+                        "Read-only: over {}",
+                        crate::text::buffer::human_size(crate::text::buffer::read_only_limit())
+                    )
                 } else if buffer.is_dirty() {
-                    "Unsaved changes"
+                    "Unsaved changes".to_string()
                 } else {
-                    "All changes saved"
+                    "All changes saved".to_string()
                 },
                 // Known only from drawing: finding such a line up front
                 // would mean scanning the whole file.
@@ -13371,8 +13416,16 @@ define_class!(
             if !ephemeral && let Some(session) = session {
                 session.save();
             }
-            for server in view.ivars().state.borrow_mut().lsp.values_mut() {
-                server.shutdown();
+            {
+                let mut state = view.ivars().state.borrow_mut();
+                for server in state.lsp.values_mut() {
+                    server.shutdown();
+                }
+                // A moment, shared by all of them, to answer and exit.
+                let until = Instant::now() + Duration::from_millis(300);
+                for server in state.lsp.values_mut() {
+                    server.finish_shutdown(until);
+                }
             }
             view.claude_shutdown();
             NSApplicationTerminateReply::TerminateNow
@@ -13447,6 +13500,11 @@ fn wraps_by_default(buffer: &Buffer) -> bool {
 }
 
 /// The language a buffer's server speaks, from its extension.
+/// Times a language server is started again after stopping, per session.
+const LSP_MAX_RESTARTS: u32 = 3;
+/// A server that stopped sooner than this after starting is not restarted.
+const LSP_RESTART_AFTER: Duration = Duration::from_secs(30);
+
 /// Documents past this are not given to a language server: every pause in
 /// typing would send the whole text again (full sync), and servers choke on
 /// generated files that size anyway.
@@ -15450,6 +15508,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         watcher: None,
         lsp: HashMap::new(),
         lsp_unavailable: HashMap::new(),
+        lsp_restarts: HashMap::new(),
         lsp_dirty: HashMap::new(),
         rename: None,
         signature: None,

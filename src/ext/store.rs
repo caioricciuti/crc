@@ -86,6 +86,11 @@ pub struct Package {
     pub source: String,
 }
 
+/// The largest module an extension may bring.
+const MAX_MODULE_BYTES: usize = 16 << 20;
+/// A README past this is not shown.
+const MAX_README_BYTES: usize = 1 << 20;
+
 impl Package {
     /// A package from a folder holding manifest.json, README.md and the
     /// module. Unsigned.
@@ -95,9 +100,22 @@ impl Package {
         let value =
             crate::json::parse(&manifest_json).map_err(|e| format!("manifest.json: {e}"))?;
         let manifest = manifest::parse(&value)?;
-        let wasm = std::fs::read(folder.join(&manifest.entry))
-            .map_err(|_| format!("the folder has no {}", manifest.entry))?;
-        let readme = std::fs::read_to_string(folder.join("README.md")).unwrap_or_default();
+        // The size first: this runs just after the folder is picked, and a
+        // multi-gigabyte `entry` was read whole before being refused.
+        let module = folder.join(&manifest.entry);
+        let size = std::fs::metadata(&module)
+            .map_err(|_| format!("the folder has no {}", manifest.entry))?
+            .len();
+        if size > MAX_MODULE_BYTES as u64 {
+            return Err("the module is over 16 MB".into());
+        }
+        let wasm =
+            std::fs::read(&module).map_err(|_| format!("the folder has no {}", manifest.entry))?;
+        let readme = std::fs::read(folder.join("README.md"))
+            .ok()
+            .filter(|bytes| bytes.len() <= MAX_README_BYTES)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default();
         let package = Package {
             manifest_json,
             manifest,
@@ -112,7 +130,7 @@ impl Package {
 
     /// The module parses and matches the manifest.
     pub fn check(&self) -> Result<(), String> {
-        if self.wasm.len() > 16 << 20 {
+        if self.wasm.len() > MAX_MODULE_BYTES {
             return Err("the module is over 16 MB".into());
         }
         let module = super::wasm::Module::parse(&self.wasm)

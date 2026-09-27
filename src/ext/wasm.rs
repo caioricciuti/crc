@@ -34,6 +34,16 @@ fn trap<T>(what: impl Into<String>) -> Result<T, Trap> {
 const PAGE: usize = 65536;
 const MAX_FRAMES: usize = 2048;
 const MAX_STACK: usize = 1 << 20;
+/// Table entries a module may declare.
+const MAX_TABLE: usize = 1 << 16;
+/// What a module's start function may spend, like a command.
+const START_FUEL: u64 = 500_000_000;
+const START_TIME: std::time::Duration = std::time::Duration::from_secs(2);
+/// Open blocks, loops and ifs at once, across every frame.
+const MAX_LABELS: usize = 1 << 16;
+/// Bytes of bulk memory work one unit of fuel pays for: `memory.fill` of
+/// 64 MB is a million instructions' worth, not one.
+const BYTES_PER_FUEL: u64 = 64;
 
 // ---- decoding ----------------------------------------------------------
 
@@ -320,6 +330,10 @@ fn decode_body(body: &[u8], types: &[FuncType], ty: FuncType) -> Result<Func, Tr
                 let at = *open.last().ok_or_else(|| Trap("else outside if".into()))?;
                 let here = code.len() as u32;
                 match &mut code[at] {
+                    // One `else` per `if`: a second one was left pointing at
+                    // pc 0, a jump to the function's start with the `if`'s
+                    // label still pushed, over and over.
+                    Op::If { else_, .. } if *else_ != 0 => return trap("second else in one if"),
                     Op::If { else_, .. } => *else_ = here,
                     _ => return trap("else outside if"),
                 }
@@ -697,12 +711,16 @@ impl Instance {
                 .ok_or_else(|| Trap("data segment out of bounds".into()))?
                 .copy_from_slice(bytes);
         }
-        let size = module
-            .tables
-            .first()
-            .map_or(0, |t| t.0 as usize)
-            .min(1 << 16);
-        let mut table = vec![None; size];
+        // A table past crc's limit is refused as that, not as the element
+        // segment that would have filled it later being "out of bounds",
+        // which blamed the module for crc's own limit.
+        let wanted = module.tables.first().map_or(0, |t| t.0 as usize);
+        if wanted > MAX_TABLE {
+            return trap(format!(
+                "its table has {wanted} entries; crc allows {MAX_TABLE}"
+            ));
+        }
+        let mut table = vec![None; wanted];
         for (_, offset, items) in &module.elements {
             for (i, f) in items.iter().enumerate() {
                 *table
@@ -721,8 +739,19 @@ impl Instance {
             table,
             fuel: u64::MAX,
         };
+        // The start function gets the same budget as a command: a module
+        // whose start loops would otherwise never finish loading, and the
+        // extension thread would be gone for the rest of the process.
         if let Some(start) = instance.module.start {
-            instance.call(start, &[])?;
+            instance.fuel = START_FUEL;
+            instance.deadline = Some(Instant::now() + START_TIME);
+            let started = instance.call(start, &[]);
+            instance.fuel = u64::MAX;
+            instance.deadline = None;
+            started.map_err(|t| match t.0.as_str() {
+                "out of fuel" | "took too long" => Trap("its start function took too long".into()),
+                _ => t,
+            })?;
         }
         Ok(instance)
     }
@@ -929,6 +958,7 @@ impl Instance {
                     if old + by > self.max_pages {
                         push!(u32::MAX as u64);
                     } else {
+                        self.spend((by * PAGE) as u64 / BYTES_PER_FUEL)?;
                         self.memory.resize((old + by) * PAGE, 0);
                         push!(old as u64);
                     }
@@ -943,12 +973,14 @@ impl Instance {
                     if src + n > self.memory.len() || dst + n > self.memory.len() {
                         return trap("memory.copy out of bounds");
                     }
+                    self.spend(n as u64 / BYTES_PER_FUEL)?;
                     self.memory.copy_within(src..src + n, dst);
                 }
                 Op::MemoryFill => {
                     let n = pop!() as u32 as usize;
                     let v = pop!() as u8;
                     let dst = pop!() as u32 as usize;
+                    self.spend(n as u64 / BYTES_PER_FUEL)?;
                     self.memory
                         .get_mut(dst..dst + n)
                         .ok_or_else(|| Trap("memory.fill out of bounds".into()))?
@@ -958,6 +990,27 @@ impl Instance {
             if stack.len() > MAX_STACK {
                 return trap("value stack overflow");
             }
+            if labels.len() > MAX_LABELS {
+                return trap("too many nested blocks");
+            }
+        }
+        Ok(())
+    }
+
+    /// Pays `units` of fuel for work bigger than one instruction, and looks
+    /// at the clock straight away: a few such instructions can take longer
+    /// than the 65 536 ordinary ones between the loop's own checks.
+    fn spend(&mut self, units: u64) -> Result<(), Trap> {
+        if units == 0 {
+            return Ok(());
+        }
+        if self.fuel < units {
+            self.fuel = 0;
+            return trap("out of fuel");
+        }
+        self.fuel -= units;
+        if self.deadline.is_some_and(|d| Instant::now() >= d) {
+            return trap("took too long");
         }
         Ok(())
     }
@@ -1006,7 +1059,9 @@ impl Instance {
             .len()
             .checked_sub(f.ty.params)
             .ok_or_else(|| Trap("stack underflow".into()))?;
-        stack.resize(stack.len() + f.locals, 0);
+        let locals = f.locals;
+        self.spend(locals as u64 / 8)?;
+        stack.resize(stack.len() + locals, 0);
         frames.push(Frame {
             func,
             pc: 0,

@@ -15,9 +15,9 @@ use std::path::{Path, PathBuf};
 /// same reason: they are enormous and nobody opens files in them by name.
 const SKIP_DIRS: &[&str] = &["target", "node_modules", "vendor", "third_party", ".git"];
 
-/// How deep to walk. A guard against a symlink loop or a pathological tree
-/// rather than a real limit.
-const MAX_DEPTH: usize = 12;
+/// How deep to walk. A guard against a pathological tree rather than a real
+/// limit; symlink loops are caught by the folders already walked.
+const MAX_DEPTH: usize = 64;
 
 /// Cap on indexed files, so opening `/` does not hang the editor.
 const MAX_FILES: usize = 20_000;
@@ -47,6 +47,8 @@ pub struct Match {
 pub struct Finder {
     entries: Vec<Entry>,
     root: Option<PathBuf>,
+    /// The walk stopped at a limit, so some files are not listed.
+    truncated: bool,
 }
 
 impl Finder {
@@ -62,6 +64,12 @@ impl Finder {
         self.entries.is_empty()
     }
 
+    /// Whether the last scan stopped at a limit (too many files, or too
+    /// deep) and so does not list everything.
+    pub fn is_truncated(&self) -> bool {
+        self.truncated
+    }
+
     pub fn entry(&self, index: usize) -> Option<&Entry> {
         self.entries.get(index)
     }
@@ -70,7 +78,12 @@ impl Finder {
     pub fn scan(&mut self, root: impl Into<PathBuf>) {
         let root = root.into();
         self.entries.clear();
-        walk(&root, &root, 0, &mut self.entries);
+        let mut walk_state = Walk {
+            seen: std::collections::HashSet::new(),
+            truncated: false,
+        };
+        walk(&root, &root, 0, &mut self.entries, &mut walk_state);
+        self.truncated = walk_state.truncated;
         // Shortest path first, so an exact-ish query surfaces the top-level
         // file rather than a deeply nested one that happens to score alike.
         self.entries.sort_by(|a, b| {
@@ -153,13 +166,33 @@ const NAME_MATCH_BONUS: i32 = 10_000;
 /// context.
 fn score_entry(entry: &Entry, needle: &[char]) -> Option<(i32, Vec<usize>)> {
     let name_start = entry.lower.rfind('/').map(|slash| slash + 1).unwrap_or(0);
-    if let Some((points, positions)) = score(&entry.lower[name_start..], needle) {
-        return Some((
+    let (points, positions) = match score(&entry.lower[name_start..], needle) {
+        Some((points, positions)) => (
             points + NAME_MATCH_BONUS,
             positions.into_iter().map(|at| at + name_start).collect(),
-        ));
+        ),
+        None => score(&entry.lower, needle)?,
+    };
+    Some((points, to_relative(entry, positions)))
+}
+
+/// Offsets into `lower` as offsets into `relative`, which they describe.
+/// Lowercasing changes some characters' length (`İ` becomes two), and a
+/// position taken as-is could land inside a character of the original.
+fn to_relative(entry: &Entry, positions: Vec<usize>) -> Vec<usize> {
+    if entry.lower.len() == entry.relative.len() {
+        return positions;
     }
-    score(&entry.lower, needle)
+    let mut map = Vec::with_capacity(entry.lower.len());
+    for (at, ch) in entry.relative.char_indices() {
+        for lower in ch.to_lowercase() {
+            map.extend(std::iter::repeat_n(at, lower.len_utf8()));
+        }
+    }
+    positions
+        .into_iter()
+        .map(|p| map.get(p).copied().unwrap_or(entry.relative.len()))
+        .collect()
 }
 
 /// Scores `needle` against `haystack`, or `None` if it is not a subsequence.
@@ -221,8 +254,22 @@ pub fn score(haystack: &str, needle: &[char]) -> Option<(i32, Vec<usize>)> {
 
 /// Recursively collects files, including dotfiles and configuration directories.
 /// Git internals and known dependency/build directories remain excluded.
-fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<Entry>) {
+/// What a walk carries along: the folders it has been through, by their
+/// real path, and whether it had to stop early.
+struct Walk {
+    seen: std::collections::HashSet<PathBuf>,
+    truncated: bool,
+}
+
+fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<Entry>, state: &mut Walk) {
     if depth > MAX_DEPTH || out.len() >= MAX_FILES {
+        state.truncated = true;
+        return;
+    }
+    // A symlinked folder can point at its own ancestor, or at a folder
+    // walked already: each real folder is walked once.
+    let real = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    if !state.seen.insert(real) {
         return;
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -231,26 +278,27 @@ fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<Entry>) {
 
     for entry in entries.flatten() {
         if out.len() >= MAX_FILES {
+            state.truncated = true;
             return;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
         let path = entry.path();
-        let Ok(kind) = entry.file_type() else {
+        let Ok(mut kind) = entry.file_type() else {
             continue;
         };
-
-        // Not followed: a symlinked directory can point at its own ancestor,
-        // and the depth cap alone would still let it index the same tree many
-        // times over.
+        // A symlink counts as what it points at; a broken one is skipped.
         if kind.is_symlink() {
-            continue;
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+            kind = meta.file_type();
         }
 
         if kind.is_dir() {
             if SKIP_DIRS.contains(&name.as_str()) {
                 continue;
             }
-            walk(root, &path, depth + 1, out);
+            walk(root, &path, depth + 1, out, state);
         } else if kind.is_file() {
             let relative = path
                 .strip_prefix(root)
@@ -306,6 +354,45 @@ mod tests {
         let mut finder = Finder::new();
         finder.scan(&f.0);
         finder
+    }
+
+    #[test]
+    fn match_positions_point_into_the_path_as_written() {
+        let e = Entry {
+            path: PathBuf::from("İx/İdea.txt"),
+            relative: "İx/İdea.txt".to_string(),
+            lower: "İx/İdea.txt".to_lowercase(),
+        };
+        let (_, positions) = score_entry(&e, &['d', 'e', 'a']).unwrap();
+        for p in &positions {
+            assert!(e.relative.is_char_boundary(*p), "{p} in {:?}", e.relative);
+        }
+        assert_eq!(&e.relative[positions[0]..positions[0] + 1], "d");
+    }
+
+    #[test]
+    fn symlinks_are_followed_once_and_loops_end() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("caio-finder-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::fs::write(root.join("real/a.txt"), "x").unwrap();
+        symlink(root.join("real/a.txt"), root.join("linked.txt")).unwrap();
+        // A folder linking back to its ancestor.
+        symlink(&root, root.join("real/loop")).unwrap();
+        let mut finder = Finder::new();
+        finder.scan(&root);
+        let names: Vec<&str> = (0..finder.len())
+            .map(|i| finder.entry(i).unwrap().relative.as_str())
+            .collect();
+        assert!(names.contains(&"linked.txt"), "{names:?}");
+        assert_eq!(
+            names.iter().filter(|n| n.ends_with("a.txt")).count(),
+            1,
+            "{names:?}"
+        );
+        assert!(!finder.is_truncated());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

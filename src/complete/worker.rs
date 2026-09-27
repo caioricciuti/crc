@@ -66,7 +66,7 @@ impl Worker {
         std::thread::Builder::new()
             .name("crc-complete".into())
             .spawn(move || {
-                let history = history.and_then(|path| History::open(&path).ok());
+                let history = history.and_then(|path| History::open_or_recreate(&path));
                 let mut reader: Option<(PathBuf, Reader)> = None;
                 while let Ok(mut job) = jobs.recv() {
                     // Skip to the newest question, doing any bookkeeping on
@@ -198,6 +198,11 @@ pub fn answer(query: &Query, reader: Option<&Reader>, history: Option<&History>)
     } else {
         total
     };
+    // Whole lines, but not a whole minified file on one line: no further
+    // than twice the window either side of the caret. A word cut at an end
+    // is at worst one candidate less.
+    let from = from.max(query.anchor.saturating_sub(2 * WINDOW));
+    let to = to.min(query.caret + 2 * WINDOW).min(total);
     let text = query.rope.slice_to_string(from..to);
     let skip = query.anchor.saturating_sub(from)..query.caret.saturating_sub(from);
     for (word, count) in super::words(&text, &query.prefix, Some(skip)) {

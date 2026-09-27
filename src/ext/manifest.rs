@@ -94,8 +94,12 @@ fn is_id(id: &str) -> bool {
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
     };
     let parts: Vec<&str> = id.split('.').collect();
-    parts.len() >= 2 && parts.iter().all(|p| word(p))
+    // It names the extension's folder: well inside a file name's 255 bytes.
+    id.len() <= MAX_ID_LEN && parts.len() >= 2 && parts.iter().all(|p| word(p))
 }
+
+/// The longest extension id.
+pub const MAX_ID_LEN: usize = 100;
 
 fn is_version(v: &str) -> bool {
     let parts: Vec<&str> = v.split('.').collect();
@@ -168,6 +172,11 @@ pub fn parse(value: &Value) -> Result<Manifest, String> {
             return Err(format!(
                 "a command needs an id like sort_lines and a title, got {id:?}"
             ));
+        }
+        // Two entries with one id would run the same export under two
+        // names; the second is a mistake to report, not to collapse.
+        if commands.iter().any(|c: &Command| c.id == id) {
+            return Err(format!("the command {id} is listed twice"));
         }
         commands.push(Command {
             id: id.to_owned(),

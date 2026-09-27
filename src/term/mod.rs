@@ -140,6 +140,10 @@ pub struct Term {
     /// G0 is DEC Special Graphics: `q` draws a line.
     line_drawing: bool,
     pub title: String,
+    /// Default text and background colours, as OSC 10 and 11 report them
+    /// to a program that asks (neovim, prompts that pick a palette). The
+    /// panel keeps them in step with the theme.
+    pub colors: ([u8; 3], [u8; 3]),
     replies: Vec<u8>,
     state: State,
     params: Vec<Vec<u16>>,
@@ -181,6 +185,7 @@ impl Term {
             },
             line_drawing: false,
             title: String::new(),
+            colors: ([0xdd, 0xe1, 0xe1], [0x1c, 0x1e, 0x1f]),
             replies: Vec::new(),
             state: State::Ground,
             params: Vec::new(),
@@ -362,7 +367,16 @@ impl Term {
         }
         for screen in [&mut self.screen, &mut self.other] {
             for line in screen.iter_mut() {
+                // A wrapped line says so on its last cell; widened, that
+                // cell is mid-line and the mark has to move with the end,
+                // or a copy splits what was one line.
+                let old = line.len();
+                let wrapped = line.last().is_some_and(|c| c.flags & WRAPPED != 0);
                 line.resize(cols, Cell::default());
+                if wrapped && cols > old && old > 0 {
+                    line[old - 1].flags &= !WRAPPED;
+                    line[cols - 1].flags |= WRAPPED;
+                }
             }
         }
         if rows < self.rows {
@@ -375,7 +389,14 @@ impl Term {
             self.screen.truncate(rows);
             self.row -= lost;
             let lost_other = self.other.len() - rows;
-            self.other.drain(..lost_other);
+            // With the alternate screen showing, `other` is the shell's
+            // screen: its top lines go to history as they would have with
+            // it showing, not away.
+            for line in self.other.drain(..lost_other) {
+                if self.alternate && push_history(&mut self.scrollback, line) {
+                    self.dropped += 1;
+                }
+            }
         } else {
             self.screen.resize(rows, vec![Cell::default(); cols]);
             self.other.resize(rows, vec![Cell::default(); cols]);
@@ -406,6 +427,11 @@ impl Term {
                 self.string_escape = false;
                 if byte == b'\\' {
                     self.end_string();
+                    return;
+                }
+                // ESC ESC inside a device-control string is tmux passing an
+                // escape through to the outer terminal: part of the string.
+                if byte == 0x1B && self.state == State::Ignore {
                     return;
                 }
                 // ESC and anything but a backslash: the string was cut.
@@ -568,7 +594,11 @@ impl Term {
                 if params.is_empty() {
                     params.push(0);
                 }
-                params.push(0);
+                // Bounded like `;`: `cat` of a binary could send megabytes
+                // of colons.
+                if params.len() < MAX_PARAMS {
+                    params.push(0);
+                }
             }
             b'<' | b'=' | b'>' | b'?' => self.private = Some(byte),
             0x20..=0x2F => self.intermediate = Some(byte),
@@ -1092,10 +1122,23 @@ impl Term {
     fn end_string(&mut self) {
         if self.state == State::Osc {
             let text = String::from_utf8_lossy(&self.osc).into_owned();
-            if let Some((kind, value)) = text.split_once(';')
-                && matches!(kind, "0" | "2")
-            {
-                self.title = value.to_owned();
+            if let Some((kind, value)) = text.split_once(';') {
+                match (kind, value) {
+                    ("0" | "2", _) => self.title = value.to_owned(),
+                    // A query: answered, or the program waits out its timeout.
+                    ("10" | "11", "?") => {
+                        let [r, g, b] = if kind == "10" {
+                            self.colors.0
+                        } else {
+                            self.colors.1
+                        };
+                        let reply = format!(
+                            "\x1b]{kind};rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}\x1b\\"
+                        );
+                        self.replies.extend_from_slice(reply.as_bytes());
+                    }
+                    _ => {}
+                }
             }
         }
         self.osc.clear();
@@ -1243,6 +1286,13 @@ mod tests {
         let mut t = Term::new(20, 5);
         t.advance(input.as_bytes());
         t
+    }
+
+    #[test]
+    fn colour_queries_are_answered() {
+        let mut t = term("\x1b]11;?\x07");
+        let reply = String::from_utf8(t.take_replies()).unwrap();
+        assert!(reply.starts_with("\x1b]11;rgb:1c1c/1e1e/1f1f"), "{reply:?}");
     }
 
     #[test]

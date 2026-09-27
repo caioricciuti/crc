@@ -169,7 +169,7 @@ impl Settings {
                     if let Some(name) = unquote(value)
                         && !name.is_empty()
                     {
-                        settings.font = name.to_owned();
+                        settings.font = name.into_owned();
                     }
                 }
                 "font_size" => {
@@ -180,7 +180,7 @@ impl Settings {
                     }
                 }
                 "theme" => {
-                    if let Some(choice) = unquote(value).and_then(ThemeChoice::parse) {
+                    if let Some(choice) = unquote(value).and_then(|v| ThemeChoice::parse(&v)) {
                         settings.theme = choice;
                     }
                 }
@@ -194,7 +194,7 @@ impl Settings {
                     "false" => settings.update_check = false,
                     _ => {}
                 },
-                "word_wrap" => match unquote(value).unwrap_or(value) {
+                "word_wrap" => match unquote(value).as_deref().unwrap_or(value) {
                     "auto" => settings.word_wrap = WordWrap::Auto,
                     "on" | "true" => settings.word_wrap = WordWrap::On,
                     "off" | "false" => settings.word_wrap = WordWrap::Off,
@@ -207,11 +207,11 @@ impl Settings {
                                 .map(PathBuf::from)
                                 .unwrap_or_default()
                                 .join(rest),
-                            None => PathBuf::from(path),
+                            None => PathBuf::from(path.as_ref()),
                         });
                     }
                 }
-                "conflict_view" => match unquote(value).unwrap_or(value) {
+                "conflict_view" => match unquote(value).as_deref().unwrap_or(value) {
                     "inline" => settings.conflict_side_by_side = false,
                     "side-by-side" | "side" => settings.conflict_side_by_side = true,
                     _ => {}
@@ -277,12 +277,12 @@ impl Settings {
     /// `existing` with our keys replaced in place, or appended.
     fn merged_into(&self, existing: &str) -> String {
         let lines = [
-            ("font", format!("font = {:?}", self.font)),
+            ("font", format!("font = {}", quote(&self.font))),
             (
                 "font_size",
                 format!("font_size = {}", format_size(self.font_size)),
             ),
-            ("theme", format!("theme = {:?}", self.theme.name())),
+            ("theme", format!("theme = {}", quote(self.theme.name()))),
         ];
         let mut wrote = [false; 3];
         let mut out = String::new();
@@ -321,16 +321,71 @@ fn split_line(line: &str) -> Option<(&str, &str)> {
     let (key, value) = line.split_once('=')?;
     let value = value.trim();
     // A comment after the value goes; a `#` inside quotes is part of the
-    // string, so a quoted value ends at its closing quote instead.
-    let value = match value.strip_prefix('"').and_then(|rest| rest.find('"')) {
-        Some(close) => &value[..close + 2],
+    // string, so a quoted value ends at its closing quote instead: the
+    // first unescaped `"`, or the next `'` for a literal string.
+    let closing = match value.chars().next() {
+        Some('"') => {
+            let mut escaped = false;
+            value[1..].char_indices().find_map(|(i, c)| {
+                let end = !escaped && c == '"';
+                escaped = !escaped && c == '\\';
+                end.then_some(i + 1)
+            })
+        }
+        Some('\'') => value[1..].find('\'').map(|i| i + 1),
+        _ => None,
+    };
+    let value = match closing {
+        Some(close) => &value[..close + 1],
         None => value.find('#').map_or(value, |at| &value[..at]),
     };
     Some((key.trim(), value.trim()))
 }
 
-fn unquote(value: &str) -> Option<&str> {
-    value.strip_prefix('"')?.strip_suffix('"')
+/// A TOML string's contents: `"basic"` with its escapes, or `'literal'`
+/// as written.
+fn unquote(value: &str) -> Option<std::borrow::Cow<'_, str>> {
+    if let Some(inner) = value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')) {
+        return Some(inner.into());
+    }
+    let inner = value.strip_prefix('"')?.strip_suffix('"')?;
+    if !inner.contains('\\') {
+        return Some(inner.into());
+    }
+    let mut out = String::new();
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next()? {
+            'n' => out.push('\n'),
+            't' => out.push('\t'),
+            'r' => out.push('\r'),
+            'u' => {
+                let hex: String = chars.by_ref().take(4).collect();
+                out.push(char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?);
+            }
+            other => out.push(other),
+        }
+    }
+    Some(out.into())
+}
+
+/// `text` as a TOML basic string, which [`unquote`] reads back as it was.
+fn quote(text: &str) -> String {
+    let mut out = String::from('"');
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// `13` rather than `13.0`, `13.5` when it is.
@@ -345,6 +400,17 @@ fn format_size(size: f32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn font_names_with_quotes_round_trip_and_literal_strings_read() {
+        let odd = "Foo \"Bar\" \\ Baz # not a comment";
+        let written = format!("font = {}\n", quote(odd));
+        assert_eq!(Settings::parse(&written).font, odd);
+        assert_eq!(
+            Settings::parse("font = 'SF Mono' # comment\n").font,
+            "SF Mono"
+        );
+    }
 
     #[test]
     fn a_settings_file_that_is_not_utf8_is_left_alone() {

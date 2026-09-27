@@ -240,7 +240,11 @@ impl Parser<'_> {
                                     return Err(self.error("lone surrogate"));
                                 }
                             }
-                            out.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
+                            // A low surrogate on its own is not a character.
+                            match char::from_u32(code) {
+                                Some(c) => out.push(c),
+                                None => return Err(self.error("lone surrogate")),
+                            }
                         }
                         _ => return Err(self.error("invalid escape")),
                     }
@@ -266,6 +270,10 @@ impl Parser<'_> {
         let Some(slice) = self.bytes.get(self.at..end) else {
             return Err(self.error("short \\u escape"));
         };
+        // Four hex digits exactly: `from_str_radix` alone also takes `+41`.
+        if !slice.iter().all(u8::is_ascii_hexdigit) {
+            return Err(self.error("bad \\u escape"));
+        }
         let text = std::str::from_utf8(slice).map_err(|_| self.error("bad \\u escape"))?;
         let code = u32::from_str_radix(text, 16).map_err(|_| self.error("bad \\u escape"))?;
         self.at = end;
@@ -470,6 +478,13 @@ fn write_string(s: &str, out: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unicode_escapes_are_strict() {
+        assert!(parse(r#""\u+041""#).is_err());
+        assert!(parse(r#""\udc00""#).is_err());
+        assert_eq!(parse(r#""\u0041""#).unwrap(), Value::String("A".into()));
+    }
 
     #[test]
     fn parses_nested_documents_in_order() {

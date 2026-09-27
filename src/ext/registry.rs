@@ -70,7 +70,40 @@ pub fn fetch_index() -> Result<Vec<Entry>, String> {
     if !super::verify::registry_signed(&index, &signature) {
         return Err("the registry's signature does not verify; nothing was trusted".into());
     }
-    parse_index(&index)
+    let entries = parse_index(&index)?;
+    // A signature proves the list was once published, not that it is the
+    // latest: an older signed list served again could keep a withdrawn
+    // extension on offer. Each list carries a rising serial, and one below
+    // the highest seen is refused.
+    let serial = serial_of(&index);
+    let seen_file =
+        super::store::root().and_then(|r| r.parent().map(|p| p.join("registry-serial")));
+    let seen = seen_file
+        .as_ref()
+        .and_then(|f| std::fs::read_to_string(f).ok())
+        .and_then(|t| t.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    if serial < seen {
+        return Err(
+            "the registry offered an older list than one crc has already seen; nothing was trusted"
+                .into(),
+        );
+    }
+    if serial > seen
+        && let Some(file) = seen_file
+    {
+        let _ = crate::platform::write_atomically(&file, serial.to_string().as_bytes());
+    }
+    Ok(entries)
+}
+
+/// The index's serial, 0 for one published before serials were.
+pub fn serial_of(bytes: &[u8]) -> u64 {
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|text| crate::json::parse(text).ok())
+        .and_then(|value| value.get("serial").and_then(Value::as_u64))
+        .unwrap_or(0)
 }
 
 pub fn parse_index(bytes: &[u8]) -> Result<Vec<Entry>, String> {

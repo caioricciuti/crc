@@ -96,8 +96,16 @@ fn main() -> std::io::Result<()> {
             arg.strip_prefix("--window-width=")
                 .and_then(|value| value.parse::<f32>().ok())
         })
-        .filter(|width| *width >= 300.0)
-        .unwrap_or(1100.0);
+        .unwrap_or(1100.0)
+        // The dump always draws the 240pt sidebar, which the layout only
+        // gives a window wide enough for it and a usable editor; narrower
+        // asked for a sidebar that was not there.
+        .max(
+            crc::render::layout::ACTIVITY_WIDTH
+                + 240.0
+                + crc::render::layout::EDITOR_MIN_WIDTH
+                + 1.0,
+        );
     let logical_h = 720.0f32;
     let project_root = std::env::args()
         .find_map(|arg| {

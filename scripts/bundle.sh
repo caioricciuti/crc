@@ -21,6 +21,17 @@
 # (`xcrun notarytool store-credentials crc-notary`). Neither is read from
 # the environment or the repository.
 set -euo pipefail
+
+# Checked before anything is built.
+case "${1:-}" in
+    "" | --install | --dmg | --release) ;;
+    *)
+        # A typo (`--instal`) used to build, say "built", and exit 0 without
+        # doing what was asked.
+        echo "error: unknown option ${1:-} (use --install, --dmg or --release)" >&2
+        exit 2
+        ;;
+esac
 cd "$(dirname "$0")/.."
 
 APP_NAME="crc"
@@ -29,6 +40,9 @@ VERSION=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = //; s/"//g')
 APP="target/${APP_NAME}.app"
 
 echo "==> building release binary"
+# The same floor as LSMinimumSystemVersion below: built for the macOS it
+# says it runs on, not for whatever the build machine has.
+export MACOSX_DEPLOYMENT_TARGET=14.0
 cargo build --release --locked
 
 echo "==> assembling ${APP}"
@@ -63,21 +77,32 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>NSSupportsAutomaticTermination</key> <false/>
     <key>NSSupportsSuddenTermination</key>   <false/>
 
-    <!-- Claim plain text and source files so "Open With" lists us. Viewer
-         rather than Editor: we can open these, but until there is a Save As
-         and a proper dirty-close prompt, claiming to own them overstates it. -->
+    <!-- Text and source files, as an editor (there is Save As and an
+         unsaved-changes prompt), so "Open With" lists us for those. Not
+         public.data: that put crc in the menu for every file there is,
+         pictures and archives included. Folders open as a project. -->
     <key>CFBundleDocumentTypes</key>
     <array>
         <dict>
             <key>CFBundleTypeName</key>      <string>Text Document</string>
+            <key>CFBundleTypeRole</key>      <string>Editor</string>
+            <key>LSHandlerRank</key>         <string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>public.text</string>
+                <string>public.plain-text</string>
+                <string>public.source-code</string>
+                <string>public.script</string>
+                <string>public.json</string>
+                <string>public.xml</string>
+            </array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key>      <string>Folder</string>
             <key>CFBundleTypeRole</key>      <string>Viewer</string>
             <key>LSHandlerRank</key>         <string>Alternate</string>
             <key>LSItemContentTypes</key>
             <array>
-                <string>public.plain-text</string>
-                <string>public.source-code</string>
-                <string>public.script</string>
-                <string>public.data</string>
                 <string>public.folder</string>
             </array>
         </dict>
@@ -91,7 +116,10 @@ PLIST
 # not a surprise at release time. The objects are named by hash; the grammar
 # is read from the symbol each one exports.
 echo "==> size"
-for object in target/release/build/crc-*/out/*-parser.o; do
+# Cargo keeps an out/ per build-script fingerprint; the newest is this
+# build's. Globbing them all listed stale grammars beside the real ones.
+OUT=$(ls -td target/release/build/crc-*/out 2>/dev/null | head -1)
+for object in "$OUT"/*-parser.o; do
     [ -f "$object" ] || continue
     name=$(nm -g "$object" 2>/dev/null | sed -n 's/.* T _tree_sitter_\([a-z_]*\)$/\1/p' | head -1)
     [ -n "$name" ] || continue
@@ -174,9 +202,32 @@ fi
 
 if [ "$MODE" = "--install" ]; then
     echo "==> installing to /Applications"
-    rm -rf "/Applications/${APP_NAME}.app"
-    cp -R "$APP" /Applications/
-    echo "    /Applications/${APP_NAME}.app"
+    # Copied beside the installed app, checked, then swapped in: a copy that
+    # fails part-way (a full disk) leaves the old app, not half of one.
+    DEST="/Applications/${APP_NAME}.app"
+    NEW="/Applications/${APP_NAME}.app.new"
+    OLD="/Applications/${APP_NAME}.app.old"
+    rm -rf "$NEW" "$OLD"
+    ditto "$APP" "$NEW"
+    if ! codesign --verify --deep --strict "$NEW" 2>/dev/null; then
+        rm -rf "$NEW"
+        echo "error: the copy in /Applications does not verify; the installed app was left as it was" >&2
+        exit 1
+    fi
+    if [ -e "$DEST" ]; then
+        mv "$DEST" "$OLD"
+    fi
+    mv "$NEW" "$DEST"
+    rm -rf "$OLD"
+    built=$(codesign -dv "$APP" 2>&1 | sed -n 's/^CDHash=//p')
+    installed=$(codesign -dv "$DEST" 2>&1 | sed -n 's/^CDHash=//p')
+    echo "    $DEST"
+    echo "    built     CDHash $built"
+    echo "    installed CDHash $installed"
+    if [ -z "$built" ] || [ "$built" != "$installed" ]; then
+        echo "error: the installed app is not the one just built" >&2
+        exit 1
+    fi
 fi
 
 echo

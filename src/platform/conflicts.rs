@@ -201,7 +201,11 @@ pub fn strip_hits(view: &View, atlas: &mut Atlas, strip: Viewport) -> Vec<(Hit, 
             width,
             height: 26.0,
         };
-        hits.push((Hit::ConflictResolve, right));
+        // Only where it fits: pushed right of the other buttons in a narrow
+        // strip, it drew past the strip and took clicks meant for the text.
+        if right.x + right.width <= strip.x + strip.width {
+            hits.push((Hit::ConflictResolve, right));
+        }
     }
     hits
 }
@@ -637,6 +641,11 @@ pub fn side_hits(
     for (visible_row, index) in headers {
         let y = body.y + visible_row as f32 * SIDE_LINE + 1.0;
         for (take, column) in &cols {
+            // The Base column is there when any conflict has a base; this
+            // one may not, and a button that does nothing is not drawn.
+            if !view.conflicts.get(index).is_some_and(|c| c.offers(*take)) {
+                continue;
+            }
             let width = layout::ui_text_width(atlas, take.label()) + 16.0;
             let x = column.x + SIDE_GUTTER;
             if x + width <= column.x + column.width - 4.0 {

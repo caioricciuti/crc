@@ -690,6 +690,9 @@ impl Panel {
                 self.selected = reply.selected;
                 self.diff = git::Diff::parse(&reply.diff);
                 self.diff_scroll = 0;
+                // The list may be shorter now (a commit took most of it):
+                // scrolled past its end, it drew as "No changes".
+                self.list_scroll = self.list_scroll.min(self.entries().len().saturating_sub(1));
                 if reply.committed
                     && self.submitted.as_deref() == Some(self.message.rope.to_string().as_str())
                 {

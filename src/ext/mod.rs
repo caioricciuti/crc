@@ -118,6 +118,9 @@ mod tests {
     #[test]
     fn corrupted_modules_never_panic() {
         let base = std::fs::read(fixture().join("sort_lines.wasm")).unwrap();
+        let real_manifest = super::store::Package::from_folder(&fixture())
+            .unwrap()
+            .manifest;
         let mut seed: u64 = 0x9E3779B97F4A7C15;
         let mut rnd = move || {
             seed ^= seed << 13;
@@ -145,6 +148,15 @@ mod tests {
                 instance.call(sort, &[ptr, 16]).ok()
             });
             assert!(outcome.is_ok(), "round {round} panicked");
+            // And through the way crc really runs one: load against its
+            // manifest, marshal a request in, read the answer back out.
+            let manifest = real_manifest.clone();
+            let command = manifest.commands[0].id.clone();
+            let outcome = std::panic::catch_unwind(|| {
+                let mut loaded = load(manifest, &bytes).ok()?;
+                loaded.run(&request(&command, "b\na\n", true)).ok()
+            });
+            assert!(outcome.is_ok(), "round {round} panicked through run::load");
         }
     }
 

@@ -197,12 +197,32 @@ pub const MAX_OPEN_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// `512 MB`, `2.0 GB`: sizes as the status line and alerts say them.
 pub fn human_size(bytes: u64) -> String {
-    const MB: u64 = 1024 * 1024;
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
     if bytes >= 1024 * MB {
         format!("{:.1} GB", bytes as f64 / (1024 * MB) as f64)
-    } else {
+    } else if bytes >= MB {
         format!("{} MB", bytes.div_ceil(MB))
+    } else if bytes >= KB {
+        format!("{} KB", bytes.div_ceil(KB))
+    } else if bytes == 1 {
+        "1 byte".to_string()
+    } else {
+        format!("{bytes} bytes")
     }
+}
+
+/// The size past which a file opens read-only: [`READ_ONLY_BYTES`], or less
+/// when `CRC_READ_ONLY_BYTES` says so (the GUI self-test, which cannot write
+/// half a gigabyte per run). What the messages say is this, not the constant.
+pub fn read_only_limit() -> u64 {
+    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("CRC_READ_ONLY_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(READ_ONLY_BYTES)
+    })
 }
 
 /// The file behind a buffer, compared with what the buffer last saw of it.
@@ -479,11 +499,7 @@ impl Buffer {
     /// machine's memory. `CRC_READ_ONLY_BYTES` lowers the first limit for
     /// the GUI self-test, which cannot write half a gigabyte per run.
     pub fn open(path: impl Into<std::path::PathBuf>) -> std::io::Result<Self> {
-        let read_only_at = std::env::var("CRC_READ_ONLY_BYTES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(READ_ONLY_BYTES);
-        Self::open_with_limits(path.into(), read_only_at, MAX_OPEN_BYTES)
+        Self::open_with_limits(path.into(), read_only_limit(), MAX_OPEN_BYTES)
     }
 
     fn open_with_limits(
@@ -4954,7 +4970,9 @@ mod tests {
     fn sizes_read_the_way_people_say_them() {
         assert_eq!(human_size(READ_ONLY_BYTES), "512 MB");
         assert_eq!(human_size(MAX_OPEN_BYTES), "2.0 GB");
-        assert_eq!(human_size(1), "1 MB");
+        assert_eq!(human_size(1), "1 byte");
+        assert_eq!(human_size(8), "8 bytes");
+        assert_eq!(human_size(3000), "3 KB");
     }
 
     #[test]

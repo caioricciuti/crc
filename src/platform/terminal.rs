@@ -323,7 +323,17 @@ pub fn draw(
     // let go: the reader thread takes the same lock for every burst of
     // output, and a frame's glyph work would hold it up.
     let (rows, cols, back, visible, cursor, cursor_visible) = {
-        let term = tab.session.term.lock().unwrap_or_else(|e| e.into_inner());
+        let mut term = tab.session.term.lock().unwrap_or_else(|e| e.into_inner());
+        let byte = |v: f64| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let rgb = |c: [f32; 4]| [byte(c[0] as f64), byte(c[1] as f64), byte(c[2] as f64)];
+        term.colors = (
+            rgb(theme.text),
+            [
+                byte(theme.background[0]),
+                byte(theme.background[1]),
+                byte(theme.background[2]),
+            ],
+        );
         let rows = term.rows().min((screen.height / row_h).floor() as usize);
         let back = panel.back.min(term.scrollback_len());
         let visible: Vec<(Vec<crate::term::Cell>, u64)> = (0..rows)

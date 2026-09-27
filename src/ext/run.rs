@@ -48,6 +48,9 @@ pub struct Loaded {
     free: u32,
     commands: HashMap<String, u32>,
     pub log: Log,
+    /// Its allocator stopped part-way through a free: whatever it holds is
+    /// suspect, so the next command starts from a fresh instance.
+    pub spoiled: bool,
 }
 
 /// Loads `wasm` as the module `manifest` describes, checking one against
@@ -100,6 +103,7 @@ pub fn load(manifest: Manifest, wasm: &[u8]) -> Result<Loaded, String> {
         free,
         commands,
         log,
+        spoiled: false,
     })
 }
 
@@ -161,8 +165,18 @@ impl Loaded {
             .get(out..out.saturating_add(out_len))
             .ok_or_else(|| format!("{name} answered outside its memory"))?
             .to_vec();
-        // Its buffer is its own to free; a failure here changes nothing.
-        let _ = self.instance.call(self.free, &[out as u64, out_len as u64]);
+        // Its buffer is its own to free, on a budget of its own rather than
+        // what the command left over. A free that stops part-way leaves the
+        // allocator half-updated: the answer stands, the instance does not.
+        self.instance.fuel = FUEL / 10;
+        self.instance.deadline = Some(Instant::now() + DEADLINE / 4);
+        if self
+            .instance
+            .call(self.free, &[out as u64, out_len as u64])
+            .is_err()
+        {
+            self.spoiled = true;
+        }
         let text = String::from_utf8(bytes).map_err(|_| format!("{name} answered in bad UTF-8"))?;
         let value = crate::json::parse(&text).map_err(|_| format!("{name} answered badly"))?;
         let field = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_owned);
@@ -241,7 +255,7 @@ pub fn spawn(wake: Box<dyn Fn() + Send>) -> (mpsc::Sender<Job>, mpsc::Receiver<D
                 // A trap may leave the instance half-way through anything;
                 // the next call starts from a fresh one.
                 let log = extension.log.lock().map(|l| l.clone()).unwrap_or_default();
-                if result.is_err() {
+                if result.is_err() || extension.spoiled {
                     loaded.remove(&key);
                 }
                 let _ = outbox.send(Done {

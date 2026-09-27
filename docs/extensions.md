@@ -79,12 +79,14 @@ sort-lines/
   "api": 1,
   "entry": "sort_lines.wasm",
   "capabilities": ["selection.read", "selection.replace"],
-  "commands": [{ "id": "sort", "title": "Sort Lines", "export": "sort_lines" }]
+  "commands": [{ "id": "sort", "title": "Sort Lines" }]
 }
 ```
 
+A command's `id` is also the name of the function the module exports for it.
+
 Extensions are installed under
-`~/Library/Application Support/crc/extensions/<id>/<version>/`, never inside
+`~/Library/Application Support/crc/extensions/<id>/`, never inside
 a project: cloning a repository must not be a way to install code. They are
 enabled per user and can be turned off per project.
 
@@ -143,7 +145,7 @@ The first extensions that need the network will be hosting integrations
 - Edits are applied on the main thread only if the document has not changed
   since the call, the rule crc already uses for formatting.
 - A trap or an exhausted budget cancels the call and says so in the status
-  line. Three in a row disable the extension until it is turned back on.
+  line. The instance is dropped, and the next call starts from a fresh one.
 
 ## Distribution and signing
 
@@ -151,7 +153,8 @@ The first extensions that need the network will be hosting integrations
   [crc-extensions](https://github.com/caioricciuti/crc-extensions), are built
   from source in CI and signed in a protected release environment, the same
   way crc releases are approved. The registry is a signed static index in
-  that repository. There is no server.
+  that repository. There is no server. Each index has a rising serial, and
+  crc refuses one older than the newest it has seen.
 - **Signatures** are ECDSA P-256, verified with Security.framework, which
   macOS ships. The public key is in the app. No hand-written cryptography
   and no new dependency.

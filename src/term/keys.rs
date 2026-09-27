@@ -36,6 +36,8 @@ const LEFT: u16 = 123;
 const RIGHT: u16 = 124;
 const DOWN: u16 = 125;
 const UP: u16 = 126;
+/// F1 to F12, in order.
+const FUNCTION: [u16; 12] = [122, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111];
 
 /// The bytes for `key`, or `None` when it sends nothing.
 pub fn encode(key: &Key, app_cursor: bool) -> Option<Vec<u8>> {
@@ -79,6 +81,28 @@ pub fn encode(key: &Key, app_cursor: bool) -> Option<Vec<u8>> {
         LEFT => cursor('D'),
         HOME => cursor('H'),
         END => cursor('F'),
+        // F1-F4 as SS3 letters, F5-F12 as xterm's numbered tildes.
+        code if FUNCTION.contains(&code) => {
+            let n = FUNCTION.iter().position(|&c| c == code).unwrap_or(0);
+            match n {
+                0..=3 => {
+                    let letter = b"PQRS"[n] as char;
+                    if modifier > 1 {
+                        format!("\x1b[1;{modifier}{letter}").into_bytes()
+                    } else {
+                        format!("\x1bO{letter}").into_bytes()
+                    }
+                }
+                _ => tilde([15, 17, 18, 19, 20, 21, 23, 24][n - 4]),
+            }
+        }
+        // Option as Meta, as it is for plain keys: ESC before the control
+        // character.
+        _ if key.control && key.option => {
+            let mut bytes = vec![0x1b];
+            bytes.extend(control(&key.bare)?);
+            bytes
+        }
         _ if key.control => control(&key.bare)?,
         _ if key.chars.is_empty() => return None,
         // The private-use characters AppKit gives function keys type nothing.
@@ -137,6 +161,25 @@ mod tests {
     }
 
     #[test]
+    fn function_keys_and_control_option() {
+        let key = |code: u16| Key {
+            code,
+            ..Key::default()
+        };
+        assert_eq!(encode(&key(122), false).unwrap(), b"\x1bOP");
+        assert_eq!(encode(&key(96), false).unwrap(), b"\x1b[15~");
+        assert_eq!(encode(&key(109), false).unwrap(), b"\x1b[21~");
+        let ctrl_opt_a = Key {
+            code: 0,
+            bare: "a".into(),
+            control: true,
+            option: true,
+            ..Key::default()
+        };
+        assert_eq!(encode(&ctrl_opt_a, false).unwrap(), b"\x1b\x01");
+    }
+
+    #[test]
     fn text_and_editing_keys() {
         assert_eq!(encode(&key(0, "a"), false), Some(b"a".to_vec()));
         assert_eq!(encode(&key(0, "é"), false), Some("é".as_bytes().to_vec()));
@@ -179,9 +222,12 @@ mod tests {
         );
         assert_eq!(
             encode(&key(122, "\u{F704}"), false),
-            None,
-            "F1 types nothing yet"
+            Some(b"\x1bOP".to_vec()),
+            "F1 sends xterm's sequence"
         );
+        // A private-use key with no sequence of its own (Help) still sends
+        // nothing.
+        assert_eq!(encode(&key(114, "\u{F746}"), false), None);
     }
 
     #[test]

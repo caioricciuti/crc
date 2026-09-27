@@ -27,6 +27,12 @@ const WORDS_PER_FILE: usize = 2_000;
 /// Files written per transaction, so a reader never waits long.
 const BATCH: usize = 50;
 
+/// The layout `SCHEMA` creates, kept in `PRAGMA user_version`. Raise it
+/// with any change to the tables: an index from another version is thrown
+/// away and rebuilt rather than written into with statements it cannot take.
+/// Nothing in it is lost that the project cannot give back.
+const SCHEMA_VERSION: i64 = 1;
+
 const SCHEMA: &str = "
     PRAGMA journal_mode = WAL;
     PRAGMA synchronous = NORMAL;
@@ -91,7 +97,27 @@ impl Store {
             let _ = std::fs::create_dir_all(dir);
         }
         let db = Db::open(path)?;
+        // 0 is a new file, or one written before versions were kept, which
+        // had this same layout.
+        let version = {
+            let mut statement = db.prepare("PRAGMA user_version")?;
+            if statement.step()? {
+                statement.int(0)
+            } else {
+                0
+            }
+        };
+        if version != 0 && version != SCHEMA_VERSION {
+            drop(db);
+            for suffix in ["", "-wal", "-shm", "-journal"] {
+                let mut file = path.as_os_str().to_owned();
+                file.push(suffix);
+                let _ = std::fs::remove_file(PathBuf::from(file));
+            }
+            return Store::open(path);
+        }
         db.execute(SCHEMA)?;
+        db.execute(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(Store { db })
     }
 
@@ -340,12 +366,20 @@ impl Indexer {
         std::thread::Builder::new()
             .name("crc-index".into())
             .spawn(move || {
-                let Ok(store) = Store::open(&path) else {
-                    return;
+                let store = match Store::open(&path) {
+                    Ok(store) => store,
+                    Err(error) => {
+                        // Completion and symbols fall back to what they can
+                        // read without it; say why, for the logs.
+                        eprintln!("crc: the project index could not open: {error:?}");
+                        return;
+                    }
                 };
                 loop {
                     let files = project_files(&thread_root);
-                    let _ = store.sync(&thread_root, &files);
+                    if let Err(error) = store.sync(&thread_root, &files) {
+                        eprintln!("crc: indexing the project failed: {error:?}");
+                    }
                     // Wait for a poke; then let a burst of them settle.
                     if rx.recv().is_err() {
                         return;
@@ -380,6 +414,25 @@ fn project_files(root: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_index_from_another_version_is_rebuilt() {
+        let dir = std::env::temp_dir().join(format!("caio-index-version-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("index.db");
+        {
+            let db = Db::open(&path).unwrap();
+            db.execute("CREATE TABLE files (old TEXT); PRAGMA user_version = 99;")
+                .unwrap();
+        }
+        let store = Store::open(&path).expect("rebuilt");
+        std::fs::write(dir.join("a.rs"), "fn a() {}\n").unwrap();
+        store
+            .sync(&dir, &[dir.join("a.rs")])
+            .expect("the new layout takes writes");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn indexes_changes_and_forgets_deleted_files() {

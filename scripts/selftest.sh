@@ -34,9 +34,11 @@ export HOME="$T/home"
 unset XDG_CONFIG_HOME
 
 # expect <file> <field> <value>
+# A missing field or dump is a FAIL like any other, not the end of the run:
+# under `set -euo pipefail` grep's exit 1 used to stop everything after it.
 expect() {
     local got
-    got=$(grep -m1 "^$2: " "$1" | sed "s/^$2: //")
+    got=$(grep -m1 "^$2: " "$1" 2>/dev/null | sed "s/^$2: //" || true)
     if [ "$got" != "$3" ]; then
         echo "FAIL $(basename "$1"): $2 is [$got], expected [$3]"
         fail=1
@@ -45,7 +47,7 @@ expect() {
 # expect_line <file> <n> <text>: line n of the document
 expect_line() {
     local got
-    got=$(sed -n '/^text:$/,$p' "$1" | sed -n "$(($2 + 1))p")
+    got=$(sed -n '/^text:$/,$p' "$1" 2>/dev/null | sed -n "$(($2 + 1))p" || true)
     if [ "$got" != "$3" ]; then
         echo "FAIL $(basename "$1"): line $2 is [$got], expected [$3]"
         fail=1
@@ -238,7 +240,8 @@ expect "$T/big.out" read_only "true"
 expect "$T/big.out" dirty "false"
 expect_line "$T/big.out" 1 "first"
 expect_line "$T/big.out" 2 "second"
-grep -q '^message: opened .*big.txt read-only: it is over 512 MB$' "$T/big.out" \
+# The limit in force, which this run lowered to 8 bytes.
+grep -q '^message: opened .*big.txt read-only: it is over 8 bytes$' "$T/big.out" \
     || { echo "FAIL big.out: no read-only note: $(grep '^message:' "$T/big.out")"; fail=1; }
 
 # Past the hard cap (sparse, so nothing is written) it is refused from its
@@ -1224,7 +1227,16 @@ wait 400
 dump $T/watch-after.out
 quit
 SCRIPT
-( sleep 2.2; printf 'two\n' > "$T/watchproj/second.txt" ) &
+# Written once the app has taken its "before" dump, not at a guessed time
+# after launch: a slow launch made the check fail in either direction.
+(
+    for _ in $(seq 1 200); do
+        [ -s "$T/watch-before.out" ] && break
+        sleep 0.05
+    done
+    sleep 0.3
+    printf 'two\n' > "$T/watchproj/second.txt"
+) &
 CRC_SELFTEST="$T/watch.script" "$BIN" "$T/watchproj" 2> "$T/watch.err"
 wait
 expect "$T/watch-before.out" finder_entries 1
@@ -1507,7 +1519,7 @@ X="$PWD/tests/fixtures/extensions/sort-lines"
 mkdir -p "$T/extreg" "$T/exthome" "$T/extproj" "$T/extfolder"
 cp "$X"/* "$T/extfolder/"
 cp "$X/sort_lines.wasm" "$T/extreg/crc.sort-lines-0.1.0.wasm"
-/usr/bin/python3 - "$X" "$T/extreg" <<'PY'
+python3 - "$X" "$T/extreg" <<'PY'
 import hashlib, json, pathlib, sys
 src, out = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
 entry = json.loads((src / "manifest.json").read_text())

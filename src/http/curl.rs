@@ -54,6 +54,11 @@ pub fn command(request: &Prepared) -> Command {
         .arg("10")
         .arg("--request")
         .arg(&request.method)
+        // HTTP only, redirects too: a .http file from a cloned repository
+        // must not read `file:///` or speak `dict://`. Through a proxy the
+        // tunnel's own `200 Connection established` is not the response.
+        .args(["--proto", "=http,https", "--proto-redir", "=http,https"])
+        .arg("--suppress-connect-headers")
         .arg("--write-out")
         .arg(WRITE_OUT);
     if request.method == "HEAD" {
@@ -61,6 +66,10 @@ pub fn command(request: &Prepared) -> Command {
         cmd.arg("--head");
     }
     for (name, value) in &request.headers {
+        // A header name is a token; `@file` as one makes curl read a file.
+        if name.is_empty() || !name.bytes().all(is_token_byte) {
+            continue;
+        }
         if value.is_empty() {
             // `Name:` removes a header in curl's syntax; `Name;` sends it empty.
             cmd.arg("--header").arg(format!("{name};"));
@@ -73,6 +82,11 @@ pub fn command(request: &Prepared) -> Command {
     }
     cmd.arg("--").arg(&request.url);
     cmd
+}
+
+/// A character HTTP allows in a header name (RFC 9110, `tchar`).
+fn is_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
 }
 
 /// Appended after the body by `--write-out`. The separators are control

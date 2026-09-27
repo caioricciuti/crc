@@ -23,7 +23,8 @@ pub fn parse(line: &str) -> Option<Pattern> {
     if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
         return None;
     }
-    let line = line.strip_prefix('\\').unwrap_or(line);
+    // A backslash escapes the next character anywhere in the pattern (`\#`,
+    // `\!`, `my\ file`, `a\*b`); the matcher reads it that way.
     let (line, dir_only) = match line.strip_suffix('/') {
         Some(rest) => (rest, true),
         None => (line, false),
@@ -126,6 +127,13 @@ fn glob_step(
         Some(b'?') => {
             text.first().is_some_and(|&c| c != b'/') && glob_in(&pattern[1..], &text[1..], failed)
         }
+        // `\x` is `x` itself, whatever it would mean unescaped.
+        Some(b'\\') => match pattern.get(1) {
+            Some(&literal) => {
+                text.first() == Some(&literal) && glob_in(&pattern[2..], &text[1..], failed)
+            }
+            None => text.first() == Some(&b'\\') && glob_in(&pattern[1..], &text[1..], failed),
+        },
         Some(b'[') => {
             let Some(close) = pattern
                 .iter()
@@ -166,6 +174,14 @@ mod tests {
 
     fn m(line: &str, path: &str, is_dir: bool) -> bool {
         parse(line).is_some_and(|p| p.matches(path, is_dir))
+    }
+
+    #[test]
+    fn backslash_escapes_anywhere() {
+        assert!(m("my\\ file.txt", "my file.txt", false));
+        assert!(m("a\\*b", "a*b", false));
+        assert!(!m("a\\*b", "axb", false));
+        assert!(m("\\#notes", "#notes", false));
     }
 
     #[test]

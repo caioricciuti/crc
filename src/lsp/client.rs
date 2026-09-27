@@ -251,6 +251,11 @@ impl Server {
         self.phase == Phase::Ready
     }
 
+    /// How long ago it was started.
+    pub fn uptime(&self) -> std::time::Duration {
+        self.started_at.elapsed()
+    }
+
     pub fn knows(&self, path: &Path) -> bool {
         self.versions.contains_key(path)
     }
@@ -402,6 +407,7 @@ impl Server {
     /// Asks for completions at `at`. The reply comes back as
     /// [`Event::Completions`] with the same request id.
     pub fn completion(&mut self, path: &Path, at: Position) -> u64 {
+        self.cancel_pending(|p| matches!(p, Pending::Completion { .. }));
         let params = object([
             ("textDocument", Self::text_document(path)),
             ("position", Self::position(at)),
@@ -613,6 +619,7 @@ impl Server {
     }
 
     pub fn signature_help(&mut self, path: &Path, at: Position) -> u64 {
+        self.cancel_pending(|p| matches!(p, Pending::Signature { .. }));
         let params = object([
             ("textDocument", Self::text_document(path)),
             ("position", Self::position(at)),
@@ -626,11 +633,54 @@ impl Server {
         )
     }
 
+    /// Withdraws the requests `which` picks: a completion or signature asked
+    /// for at the previous keystroke is not wanted once the next is typed.
+    /// The server is told (`$/cancelRequest`) and the entry goes, so a
+    /// server that never answers does not grow the table for ever.
+    fn cancel_pending(&mut self, which: impl Fn(&Pending) -> bool) {
+        let ids: Vec<u64> = self
+            .pending
+            .iter()
+            .filter(|(_, p)| which(p))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            self.pending.remove(&id);
+            self.notify("$/cancelRequest", object([("id", number(id))]));
+        }
+    }
+
     /// Asks the server to stop. The process is killed when the server is
     /// dropped whether or not it answers.
     pub fn shutdown(&mut self) {
         if self.phase == Phase::Ready {
             self.request("shutdown", Value::Null, Pending::Shutdown);
+        }
+    }
+
+    /// Reads replies until the `shutdown` sent by [`Server::shutdown`] is
+    /// answered (which sends `exit`) or `until` passes. Quitting without
+    /// this killed the server before it could exit on its own.
+    pub fn finish_shutdown(&mut self, until: Instant) {
+        let waiting = |server: &Self| {
+            server
+                .pending
+                .values()
+                .any(|p| matches!(p, Pending::Shutdown))
+        };
+        while waiting(self) {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            let Some(incoming) = self
+                .transport
+                .recv_timeout(left.min(std::time::Duration::from_millis(20)))
+            else {
+                continue;
+            };
+            let mut events = Vec::new();
+            self.take(incoming, &mut events);
         }
     }
 

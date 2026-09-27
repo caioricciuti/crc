@@ -164,7 +164,20 @@ fn fetch(url: &str) -> Outcome {
             "--max-time",
             "10",
         ])
-        .args(["--proto", "=https,file"])
+        // file:// only for tests and self-test runs; a release listing is
+        // https, and so is anywhere it redirects. It is a small JSON file.
+        .args([
+            "--proto",
+            if cfg!(test) || std::env::var_os("CRC_SELFTEST").is_some() {
+                "=https,file"
+            } else {
+                "=https"
+            },
+            "--proto-redir",
+            "=https",
+            "--max-filesize",
+            "4194304",
+        ])
         .arg("--header")
         .arg("Accept: application/vnd.github+json")
         .arg("--user-agent")

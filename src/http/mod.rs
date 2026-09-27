@@ -181,8 +181,16 @@ fn parse_block(
 
     let mut parts = request_line.split_whitespace();
     let first = parts.next()?;
-    let (method, url) = if is_method(first) {
-        (first.to_ascii_uppercase(), parts.next()?.to_owned())
+    let second = parts.next();
+    // A known method, or any other all-capitals word before a URL (PURGE,
+    // PROPFIND): sending it as GET of a URL named "PURGE" helped no one.
+    let custom = |word: &str| {
+        !word.is_empty()
+            && word.chars().all(|c| c.is_ascii_uppercase() || c == '-')
+            && second.is_some()
+    };
+    let (method, url) = if is_method(first) || custom(first) {
+        (first.to_ascii_uppercase(), second?.to_owned())
     } else {
         ("GET".to_owned(), first.to_owned())
     };
@@ -234,9 +242,10 @@ fn parse_block(
     let body = if body_lines.is_empty() {
         None
     } else if body_lines.len() == 1
-        && body_lines[0].trim().starts_with('<')
-        && !body_lines[0].trim().starts_with("<>")
+        && (body_lines[0].trim().starts_with("< ") || body_lines[0].trim().starts_with("<@"))
     {
+        // `< path` or `<@ path`, as the reference clients write it: a body
+        // that merely starts with `<` (`<root/>`) is XML, not a file.
         let path = body_lines[0].trim()[1..].trim();
         // `<@ path` means "expand variables in the file"; treated the same.
         let path = path.strip_prefix('@').map_or(path, str::trim);
@@ -313,7 +322,8 @@ pub fn prepare(text: &str, offset: usize, path: Option<&Path>) -> Result<Prepare
         .ok_or("No request under the caret. A request starts with a method and a URL, for example `GET https://example.com`.")?;
     let dir = path.and_then(Path::parent);
     let env = dir
-        .map(|d| load_environment(d, file.environment.as_deref()))
+        .map(|d| load_named_environment(d, file.environment.as_deref()))
+        .transpose()?
         .unwrap_or_default();
     let expand = |s: &str| expand(s, &file.variables, &env);
 
@@ -328,6 +338,23 @@ pub fn prepare(text: &str, offset: usize, path: Option<&Path>) -> Result<Prepare
         Some(Body::File(relative)) => {
             let relative = expand(relative)?;
             let full = dir.map_or_else(|| PathBuf::from(&relative), |d| d.join(&relative));
+            // Inside the repository the .http file is in (its folder, outside
+            // one): a request from a cloned repository must not send
+            // `~/.ssh/id_ed25519` because someone pressed Cmd-Return.
+            if let Some(dir) = dir {
+                let fence =
+                    crate::project::git::toplevel(dir).unwrap_or_else(|_| dir.to_path_buf());
+                let fence = std::fs::canonicalize(&fence).unwrap_or(fence);
+                let real = std::fs::canonicalize(&full)
+                    .map_err(|e| format!("Could not read body file {}: {e}", full.display()))?;
+                if !real.starts_with(&fence) {
+                    return Err(format!(
+                        "The body file {} is outside {}; only files in the project are sent",
+                        full.display(),
+                        fence.display()
+                    ));
+                }
+            }
             Some(
                 std::fs::read(&full)
                     .map_err(|e| format!("Could not read body file {}: {e}", full.display()))?,
@@ -419,11 +446,21 @@ fn pseudo_uuid() -> String {
 /// file wins on a conflict, which is how a token stays out of the committed
 /// one.
 pub fn load_environment(dir: &Path, named: Option<&str>) -> Vec<(String, String)> {
+    load_named_environment(dir, named).unwrap_or_default()
+}
+
+/// [`load_environment`], saying so when `# @env name` names an environment
+/// neither file has: each `{{var}}` reporting itself undefined hid the typo.
+pub fn load_named_environment(
+    dir: &Path,
+    named: Option<&str>,
+) -> Result<Vec<(String, String)>, String> {
     let mut vars: Vec<(String, String)> = Vec::new();
+    let mut found = false;
     let Some(dir) = dir.ancestors().find(|d| {
         d.join("http-client.env.json").is_file() || d.join("http-client.private.env.json").is_file()
     }) else {
-        return vars;
+        return Ok(vars);
     };
     let mut chosen = named.map(str::to_owned);
     for file in ["http-client.env.json", "http-client.private.env.json"] {
@@ -444,6 +481,7 @@ pub fn load_environment(dir: &Path, named: Option<&str>) -> Vec<(String, String)
         else {
             continue;
         };
+        found = true;
         for (k, v) in members {
             let Some(v) = v.as_text() else {
                 continue;
@@ -454,7 +492,12 @@ pub fn load_environment(dir: &Path, named: Option<&str>) -> Vec<(String, String)
             }
         }
     }
-    vars
+    match (named, found) {
+        (Some(name), false) => Err(format!(
+            "No environment named \"{name}\" in http-client.env.json or http-client.private.env.json"
+        )),
+        _ => Ok(vars),
+    }
 }
 
 #[cfg(test)]
@@ -462,6 +505,14 @@ mod tests {
     use super::*;
 
     const SAMPLE: &str = "@host = https://api.example.com\n\n### List users\nGET {{host}}/users?page=1\n    &limit=20\nAccept: application/json\n\n### \n# @name create\nPOST {{host}}/users HTTP/1.1\nContent-Type: application/json\n\n{\"name\": \"Ada\"}\n\n\n###\nhttps://example.com/plain\n\n### From file\nPUT {{host}}/upload\n\n< ./payload.json\n";
+
+    #[test]
+    fn xml_bodies_and_custom_methods() {
+        let file = parse("POST https://x.test\n\n<root/>\n\n###\nPURGE https://x.test/cache\n");
+        assert!(matches!(&file.requests[0].body, Some(Body::Inline(t)) if t == "<root/>"));
+        assert_eq!(file.requests[1].method, "PURGE");
+        assert_eq!(file.requests[1].url, "https://x.test/cache");
+    }
 
     #[test]
     fn parses_blocks_variables_and_bodies() {
@@ -592,6 +643,10 @@ mod tests {
             ]
         );
         assert!(load_environment(&nested, Some("missing")).is_empty());
+        assert!(
+            load_named_environment(&nested, Some("missing"))
+                .is_err_and(|e| e.contains("No environment named \"missing\""))
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

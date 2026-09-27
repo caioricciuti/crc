@@ -96,7 +96,16 @@ pub fn handle(text: &str, host: &mut impl Host) -> Option<String> {
             Ok(Some(content)) => Ok(content),
             // Answered later.
             Ok(None) => return None,
-            Err(message) => Err((-32602, message)),
+            // A tool that fails is a result the model reads, marked as an
+            // error (the MCP spec's `isError`), not a protocol error it
+            // never sees.
+            Err(message) => {
+                let mut result = content(&[&message]);
+                if let Value::Object(fields) = &mut result {
+                    fields.push(("isError".into(), Value::Bool(true)));
+                }
+                Ok(result)
+            }
         },
         _ => Err((-32601, format!("method not found: {method}"))),
     };
@@ -769,9 +778,14 @@ mod tests {
         );
 
         let value = call_tool(&mut host, "openDiff", r#"{"tab_name":"x"}"#);
-        assert_eq!(
-            value.path("error.code").and_then(Value::as_i64),
-            Some(-32602)
+        assert_eq!(value.path("result.isError"), Some(&Value::Bool(true)));
+        assert!(
+            value
+                .path("result.content")
+                .and_then(Value::as_array)
+                .and_then(|items| items[0].get("text"))
+                .and_then(Value::as_str)
+                .is_some_and(|t| t.contains("missing"))
         );
     }
 

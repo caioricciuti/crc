@@ -71,20 +71,35 @@ impl Session {
         let Some(path) = Session::path() else {
             return Session::default();
         };
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        // Bytes, not text: a path that is not UTF-8 is still a path, and one
+        // such line used to lose the whole session.
+        let Ok(bytes) = std::fs::read(&path) else {
             return Session::default();
         };
-        Session::parse(&text)
+        Session::parse_bytes(&bytes)
     }
 
+    #[cfg(test)]
     fn parse(text: &str) -> Session {
+        Session::parse_bytes(text.as_bytes())
+    }
+
+    fn parse_bytes(bytes: &[u8]) -> Session {
+        use std::os::unix::ffi::OsStrExt;
         let mut session = Session::default();
 
-        for line in text.lines() {
-            let Some((key, value)) = line.split_once('=') else {
+        for line in bytes.split(|&b| b == b'\n') {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            let Some(eq) = line.iter().position(|&b| b == b'=') else {
                 continue;
             };
-            let value = value.trim();
+            let (key, raw) = (&line[..eq], &line[eq + 1..]);
+            let key = String::from_utf8_lossy(key);
+            // A path is taken as written: trimming lost a file named with a
+            // trailing space.
+            let path = || PathBuf::from(std::ffi::OsStr::from_bytes(raw));
+            let text = String::from_utf8_lossy(raw);
+            let value = text.trim();
             match key.trim() {
                 "frame" => {
                     // Four comma-separated floats, or the whole entry is
@@ -97,10 +112,10 @@ impl Session {
                         session.frame = Some((parts[0], parts[1], parts[2], parts[3]));
                     }
                 }
-                "folder" if !value.is_empty() => session.folder = Some(PathBuf::from(value)),
-                "file" if !value.is_empty() => session.files.push(PathBuf::from(value)),
-                "recent" if !value.is_empty() && session.recent.len() < RECENT_LIMIT => {
-                    session.recent.push(PathBuf::from(value))
+                "folder" if !raw.is_empty() => session.folder = Some(path()),
+                "file" if !raw.is_empty() => session.files.push(path()),
+                "recent" if !raw.is_empty() && session.recent.len() < RECENT_LIMIT => {
+                    session.recent.push(path())
                 }
                 "active" => session.active = value.parse().unwrap_or(0),
                 "sidebar" => session.sidebar = value != "0",
@@ -131,33 +146,55 @@ impl Session {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let _ = crate::platform::write_atomically(&path, self.serialize().as_bytes());
+        let _ = crate::platform::write_atomically(&path, &self.serialize());
     }
 
-    fn serialize(&self) -> String {
-        let mut out = String::with_capacity(256);
-        out.push_str("# crc session. Safe to delete.\n");
+    /// The session file. Paths are written as their bytes (`display` would
+    /// replace what is not UTF-8); one with a line break cannot be a line
+    /// and is left out.
+    fn serialize(&self) -> Vec<u8> {
+        use std::os::unix::ffi::OsStrExt;
+        let mut out = Vec::with_capacity(256);
+        let path_line = |key: &str, path: &Path, out: &mut Vec<u8>| {
+            let bytes = path.as_os_str().as_bytes();
+            if !bytes.contains(&b'\n') && !bytes.contains(&b'\r') {
+                out.extend_from_slice(key.as_bytes());
+                out.push(b'=');
+                out.extend_from_slice(bytes);
+                out.push(b'\n');
+            }
+        };
+        out.extend_from_slice(b"# crc session. Safe to delete.\n");
         if let Some((x, y, w, h)) = self.frame {
-            out.push_str(&format!("frame={x:.0},{y:.0},{w:.0},{h:.0}\n"));
+            out.extend_from_slice(format!("frame={x:.0},{y:.0},{w:.0},{h:.0}\n").as_bytes());
         }
         if let Some(folder) = &self.folder {
-            out.push_str(&format!("folder={}\n", folder.display()));
+            path_line("folder", folder, &mut out);
         }
         for file in &self.files {
-            out.push_str(&format!("file={}\n", file.display()));
+            path_line("file", file, &mut out);
         }
         for folder in self.recent.iter().take(RECENT_LIMIT) {
-            out.push_str(&format!("recent={}\n", folder.display()));
+            path_line("recent", folder, &mut out);
         }
-        out.push_str(&format!("active={}\n", self.active));
-        out.push_str(&format!("sidebar={}\n", if self.sidebar { 1 } else { 0 }));
-        out.push_str(&format!("sidebar_width={:.0}\n", self.sidebar_width));
+        out.extend_from_slice(format!("active={}\n", self.active).as_bytes());
+        out.extend_from_slice(format!("sidebar={}\n", if self.sidebar { 1 } else { 0 }).as_bytes());
+        out.extend_from_slice(format!("sidebar_width={:.0}\n", self.sidebar_width).as_bytes());
         out
     }
 
     /// Drops files that no longer exist, so a deleted file does not resurrect
     /// as an error tab on every launch.
     pub fn prune(&mut self) {
+        // The active tab stays the same file: every missing one before it
+        // moves it up by one.
+        let removed_before = self
+            .files
+            .iter()
+            .take(self.active)
+            .filter(|p| !p.is_file())
+            .count();
+        self.active -= removed_before;
         self.files.retain(|p| p.is_file());
         self.recent.retain(|p| p.is_dir());
         if self.folder.as_deref().is_some_and(|p| !p.is_dir()) {
@@ -177,6 +214,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn odd_paths_survive_and_pruning_keeps_the_active_file() {
+        use std::os::unix::ffi::OsStrExt;
+        let odd = PathBuf::from(std::ffi::OsStr::from_bytes(b"/tmp/caf\xe9/notes "));
+        let session = Session {
+            files: vec![odd.clone()],
+            ..Session::default()
+        };
+        assert_eq!(Session::parse_bytes(&session.serialize()).files, [odd]);
+
+        let dir = std::env::temp_dir().join(format!("caio-session-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (b, c) = (dir.join("b"), dir.join("c"));
+        std::fs::write(&b, "").unwrap();
+        std::fs::write(&c, "").unwrap();
+        let mut session = Session {
+            files: vec![dir.join("gone"), b.clone(), c],
+            active: 1,
+            ..Session::default()
+        };
+        session.prune();
+        assert_eq!(session.files[session.active], b, "still b, not c");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn round_trips() {
         let session = Session {
             frame: Some((100.0, 200.0, 1200.0, 800.0)),
@@ -187,7 +249,7 @@ mod tests {
             sidebar_width: 310.0,
             recent: vec![PathBuf::from("/tmp/project"), PathBuf::from("/tmp/older")],
         };
-        let parsed = Session::parse(&session.serialize());
+        let parsed = Session::parse_bytes(&session.serialize());
         assert_eq!(parsed, session);
     }
 

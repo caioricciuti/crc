@@ -116,6 +116,23 @@ pub fn remove_stale(dir: &Path) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
+        // `<port>.lock.<pid>.tmp`, left by a crash in the middle of
+        // `update`: the pid is in the name, and the content is ours.
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(pid) = name
+            .strip_suffix(".tmp")
+            .and_then(|rest| rest.rsplit_once(".lock."))
+            .and_then(|(_, pid)| pid.parse::<u64>().ok())
+        {
+            let ours = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| json::parse(&text).ok())
+                .is_some_and(|v| v.get("ideName").and_then(Value::as_str) == Some(IDE_NAME));
+            if ours && !alive(pid) {
+                let _ = std::fs::remove_file(&path);
+            }
+            continue;
+        }
         if path.extension().is_none_or(|e| e != "lock") {
             continue;
         }

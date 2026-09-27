@@ -14,6 +14,9 @@ pub struct History {
     db: Db,
 }
 
+/// Rows kept, most recently used first.
+const MAX_ROWS: usize = 50_000;
+
 impl History {
     pub fn default_path() -> Option<PathBuf> {
         let home = std::env::var_os("HOME")?;
@@ -37,7 +40,40 @@ impl History {
                  PRIMARY KEY (project, language, context, text)
              ) STRICT;",
         )?;
+        // What was picked once and not for a year says nothing any more; a
+        // cap keeps a long life of picks from growing without end.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        db.execute(&format!(
+            "DELETE FROM accepted WHERE count = 1 AND last < {};
+             DELETE FROM accepted WHERE rowid NOT IN
+                 (SELECT rowid FROM accepted ORDER BY last DESC LIMIT {MAX_ROWS});",
+            now - 365 * 86_400
+        ))?;
         Ok(History { db })
+    }
+
+    /// [`History::open`], or a fresh history when the file will not open
+    /// (corrupt, from an older layout, unreadable): the old one is set aside
+    /// as `.broken`, never deleted, and the log says so. Without this a bad
+    /// file meant no history for the session, and every session after.
+    pub fn open_or_recreate(path: &Path) -> Option<History> {
+        match History::open(path) {
+            Ok(history) => Some(history),
+            Err(error) => {
+                eprintln!("crc: completion history unusable ({error:?}); starting a new one");
+                let mut aside = path.as_os_str().to_owned();
+                aside.push(".broken");
+                let _ = std::fs::rename(path, PathBuf::from(aside));
+                for suffix in ["-wal", "-shm"] {
+                    let mut file = path.as_os_str().to_owned();
+                    file.push(suffix);
+                    let _ = std::fs::remove_file(PathBuf::from(file));
+                }
+                History::open(path).ok()
+            }
+        }
     }
 
     /// Counts one acceptance of `text` after `context`.

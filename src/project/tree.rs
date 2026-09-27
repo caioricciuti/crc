@@ -265,8 +265,29 @@ impl Tree {
             return;
         }
         let children = read_dir(&entry.path, entry.depth + 1);
+        let selected = self.selected_path();
         self.rows[index].expanded = true;
         self.rows.splice(index + 1..index + 1, children);
+        self.reselect(selected, index);
+    }
+
+    fn selected_path(&self) -> Option<PathBuf> {
+        self.selected
+            .and_then(|i| self.rows.get(i))
+            .map(|e| e.path.clone())
+    }
+
+    /// The selection follows its row when rows are added or removed above
+    /// it; a row that went (inside a collapsed folder) hands it to `fallback`.
+    fn reselect(&mut self, path: Option<PathBuf>, fallback: usize) {
+        if let Some(path) = path {
+            self.selected = Some(
+                self.rows
+                    .iter()
+                    .position(|e| e.path == path)
+                    .unwrap_or(fallback),
+            );
+        }
     }
 
     fn collapse(&mut self, index: usize) {
@@ -284,8 +305,10 @@ impl Tree {
             .position(|e| e.depth <= depth)
             .map(|offset| index + 1 + offset)
             .unwrap_or(self.rows.len());
+        let selected = self.selected_path();
         self.rows.drain(index + 1..end);
         self.rows[index].expanded = false;
+        self.reselect(selected, index);
     }
 
     /// The directory new files should land in: the selected directory, the
@@ -365,7 +388,12 @@ fn read_dir(path: &Path, depth: usize) -> Vec<Entry> {
         .flatten()
         .filter_map(|entry| {
             let name = entry.file_name().to_string_lossy().into_owned();
-            let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+            // Through a symlink, what it points at: a linked folder is a
+            // folder to expand, not a file to open as text.
+            let is_dir = entry.file_type().is_ok_and(|t| {
+                t.is_dir()
+                    || (t.is_symlink() && std::fs::metadata(entry.path()).is_ok_and(|m| m.is_dir()))
+            });
             if is_dir && SKIP_DIRS.contains(&name.as_str()) {
                 return None;
             }
