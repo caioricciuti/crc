@@ -321,7 +321,43 @@ struct ExtCall {
     range: std::ops::Range<usize>,
     snapshot: crate::text::rope::Rope,
     title: String,
+    /// A run for the preview pane: its answer is a page, and it says
+    /// nothing in the status line unless something is wrong.
+    preview: bool,
 }
+
+/// The preview pane beside a document: the extension command that makes
+/// its page, the web view once WebKit is ready, and the edits it has seen.
+struct HtmlPreview {
+    buffer: u64,
+    command: ExtCommand,
+    /// The document's folder: the page's base URL, and the one place it
+    /// may load files from.
+    folder: Option<std::path::PathBuf>,
+    web: Option<crate::platform::webview::WebPreview>,
+    /// The newest page, not yet in the view.
+    page: Option<String>,
+    /// The text as of the last look; a different tree is an edit.
+    observed: crate::text::rope::Rope,
+    /// The last edit not yet sent for a new page.
+    changed_at: Option<Instant>,
+    running: bool,
+    /// A page has come back. Until one does, a failed run closes the pane.
+    answered: bool,
+}
+
+impl HtmlPreview {
+    /// Something is on its way: keep the display link running.
+    fn busy(&self) -> bool {
+        self.running
+            || self.changed_at.is_some()
+            || self.page.is_some()
+            || self.web.as_ref().is_none_or(|w| !w.is_shown())
+    }
+}
+
+/// Quiet time after an edit before the preview is asked again.
+const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(150);
 
 /// Organize Imports waiting on the server: the request, the document and
 /// its text when asked, and whether a save asked.
@@ -695,6 +731,8 @@ struct State {
     /// Which pane, in the full order, is the one in the fields above.
     focused_pane: usize,
     native_preview: Option<NativePreview>,
+    /// An extension's page beside the active document (Cmd-E).
+    html_preview: Option<HtmlPreview>,
     /// The project tree behind the sidebar.
     tree: Tree,
     tree_version: u64,
@@ -887,6 +925,55 @@ impl NativePreview {
         })
     }
 }
+
+/// crc's name for `buffer`'s language, as extensions are told it.
+fn ext_language(buffer: &Buffer) -> String {
+    if is_markdown(buffer) {
+        return "markdown".into();
+    }
+    buffer
+        .extension()
+        .and_then(|e| Language::from_extension(&e))
+        .map(|l| format!("{l:?}").to_lowercase())
+        .unwrap_or_else(|| "text".into())
+}
+
+/// Sends `request` to the extension thread, starting it if needed, and
+/// files `call` to meet the answer. False when the thread is gone.
+fn send_ext_job(
+    state: &mut State,
+    command: &ExtCommand,
+    request: crate::ext::run::Request,
+    call: ExtCall,
+) -> bool {
+    if state.ext_worker.is_none() {
+        state.ext_worker = Some(crate::ext::run::spawn(Box::new(|| {})));
+    }
+    let job = state.ext_next_job;
+    state.ext_next_job += 1;
+    let sent = state.ext_worker.as_ref().is_some_and(|(tx, _)| {
+        tx.send(crate::ext::run::Job {
+            tag: job,
+            manifest: command.installed.manifest.clone(),
+            wasm: command.installed.wasm(),
+            generation: state.ext_generation,
+            request,
+        })
+        .is_ok()
+    });
+    if sent {
+        state.ext_pending.insert(job, call);
+    } else {
+        state.ext_worker = None;
+        state.message = Some(("the extension thread stopped".into(), Instant::now()));
+    }
+    sent
+}
+
+/// What the self-test's `webjs probe` asks the preview page: each
+/// image's natural width, the scroll offset, the first heading and how
+/// much text there is.
+const PREVIEW_PROBE: &str = "Array.from(document.images).map(function(i){return i.naturalWidth}).join('/') + ' scroll=' + Math.round(scrollY) + ' h1=' + (document.querySelector('h1') ? document.querySelector('h1').textContent : '-') + ' text=' + document.body.innerText.length";
 
 /// Whether `buffer` is Markdown, which Cmd-E shows rendered. It opens as
 /// styled text: the rendered view cannot select, find or scroll by line.
@@ -2012,9 +2099,13 @@ define_class!(
             self.play(&step);
             // Spaced out, so each event is handled and drawn before the next
             // arrives, as a person's would be.
+            let delay = match step {
+                Step::Idle(ms) => ms as f64 / 1000.0,
+                _ => 0.03,
+            };
             let _: () = unsafe {
                 msg_send![self, performSelector: sel!(selfTestStep:),
-                    withObject: None::<&AnyObject>, afterDelay: 0.03f64]
+                    withObject: None::<&AnyObject>, afterDelay: delay]
             };
         }
 
@@ -2067,6 +2158,7 @@ define_class!(
             self.blame_refresh();
             self.bulb_refresh();
             self.ext_poll();
+            self.sync_html_preview();
             self.claude_flush_selection();
             {
                 // The link fires on any run-loop iteration, nested modal
@@ -2085,7 +2177,7 @@ define_class!(
                     state.message = None;
                     self.ivars().needs_redraw.set(true);
                 }
-                if !self.ivars().needs_redraw.get() && state.message.is_none() && !state.git.busy() && state.drag_point.is_none() && state.project_search_rx.is_none() && state.project_index_rx.is_none() && state.http.is_none() && state.project_changed_at.is_none() && state.git_changed_at.is_none() && state.lsp_dirty.is_empty() && state.gutter_dirty.is_empty() && state.gutter_pending.is_empty() && state.tree_children_pending.is_empty() && state.claude.as_ref().is_none_or(|c| c.selection_changed_at.is_none()) && state.update.is_none() && state.ignored_rx.is_none() && state.blame_rx.is_none() && state.blame_want.is_none() && state.bulb_want.is_none() && state.ext_registry_rx.is_none() && state.ext_install_rx.is_none() && state.ext_pending.is_empty() && state.branch_rx.is_none() && state.reloading.is_empty() && state.gutter_diffing.is_empty() && !state.symbols.pending() {
+                if !self.ivars().needs_redraw.get() && state.message.is_none() && !state.git.busy() && state.drag_point.is_none() && state.project_search_rx.is_none() && state.project_index_rx.is_none() && state.http.is_none() && state.project_changed_at.is_none() && state.git_changed_at.is_none() && state.lsp_dirty.is_empty() && state.gutter_dirty.is_empty() && state.gutter_pending.is_empty() && state.tree_children_pending.is_empty() && state.claude.as_ref().is_none_or(|c| c.selection_changed_at.is_none()) && state.update.is_none() && state.ignored_rx.is_none() && state.blame_rx.is_none() && state.blame_want.is_none() && state.bulb_want.is_none() && state.ext_registry_rx.is_none() && state.ext_install_rx.is_none() && state.ext_pending.is_empty() && state.html_preview.as_ref().is_none_or(|p| !p.busy()) && state.branch_rx.is_none() && state.reloading.is_empty() && state.gutter_diffing.is_empty() && !state.symbols.pending() {
                     link.setPaused(true);
                     return;
                 }
@@ -2169,20 +2261,25 @@ define_class!(
             }
         }
 
-        /// Toggles the rendered Markdown view.
+        /// Opens or closes the preview pane. Rendering belongs to an
+        /// extension; with none installed, the command says where to get one.
         #[unsafe(method(togglePreview:))]
         fn action_toggle_preview(&self, _sender: Option<&AnyObject>) {
-            {
-                let mut state = self.ivars().state.borrow_mut();
-                // Rendering belongs to an extension; until one is
-                // installed, the command says where to get it.
-                state.message = Some((
-                    if is_markdown(state.docs.active()) {
-                        "Markdown opens as styled text; a rendered preview is coming as an extension"
-                    } else {
-                        "Preview is for Markdown files"
-                    }
-                    .to_string(),
+            let (open, command) = {
+                let state = self.ivars().state.borrow();
+                let active = state.docs.active().id();
+                (
+                    state.html_preview.as_ref().is_some_and(|p| p.buffer == active),
+                    preview_command(&state),
+                )
+            };
+            if open {
+                self.close_preview();
+            } else if let Some(command) = command {
+                self.open_preview(command);
+            } else {
+                self.ivars().state.borrow_mut().message = Some((
+                    "No preview installed: get Markdown Preview from crc > Extensions".into(),
                     Instant::now(),
                 ));
             }
@@ -3667,6 +3764,7 @@ impl EditorView {
             return;
         }
         self.sync_native_preview();
+        self.sync_html_preview();
         let ready = match self.ivars().state.try_borrow() {
             Ok(state) => match state.last_draw {
                 Some(t) => t.elapsed() >= state.frame_interval,
@@ -4570,6 +4668,15 @@ impl EditorView {
             Step::Trackpad { x, y, dy } => {
                 self.scroll_at(*x as f32, *y as f32, 0.0, *dy, true);
             }
+            Step::Idle(_) => {}
+            Step::WebJs(expression) => {
+                let state = self.ivars().state.borrow();
+                match state.html_preview.as_ref().and_then(|p| p.web.as_ref()) {
+                    Some(web) if expression == "probe" => web.probe(PREVIEW_PROBE),
+                    Some(web) => web.probe(expression),
+                    None => eprintln!("selftest: webjs with no preview page"),
+                }
+            }
             Step::Wait(ms) => {
                 std::thread::sleep(Duration::from_millis(*ms));
                 self.check_open_files();
@@ -4765,8 +4872,19 @@ impl EditorView {
                 };
                 let report = format!(
                     // First: the report ends with the document's text.
-                    "message: {}\nmd: {md}\nactivity: {}\npointer_targets: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nconflicts: {}\ngit_conflicts: {}\nblame: {}\nfind_results: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\n{report}",
+                    "message: {}\npreview: {}\nmd: {md}\nactivity: {}\npointer_targets: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nconflicts: {}\ngit_conflicts: {}\nblame: {}\nfind_results: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\n{report}",
                     state.message.as_ref().map_or("", |(text, _)| text.as_str()),
+                    state.html_preview.as_ref().map_or("closed".to_string(), |p| format!(
+                        "open ext={} view={} probe={}",
+                        p.command.installed.manifest.id,
+                        match &p.web {
+                            None => "none",
+                            Some(web) if web.is_veiled() => "veiled",
+                            Some(web) if web.is_shown() => "shown",
+                            Some(_) => "loading",
+                        },
+                        crate::platform::webview::probe_answer().unwrap_or_default()
+                    )),
                     activity,
                     state.pointer_targets.len(),
                     state.extensions.as_ref().map_or("closed".to_string(), |page| {
@@ -9618,46 +9736,224 @@ impl EditorView {
             self.request_redraw();
             return;
         }
+        // A preview's command opens the pane rather than answering once.
+        if manifest.may_preview() && command.command == crate::ext::manifest::PREVIEW_COMMAND {
+            drop(state);
+            self.open_preview(command);
+            return;
+        }
         let request = crate::ext::run::Request {
             command: command.command.clone(),
             text: buffer.rope.slice_to_string(range.clone()),
             selection: selection.is_some(),
-            language: buffer
-                .extension()
-                .and_then(|e| Language::from_extension(&e))
-                .map(|l| format!("{l:?}").to_lowercase())
-                .unwrap_or_else(|| "text".into()),
+            language: ext_language(buffer),
         };
         let call = ExtCall {
             buffer: buffer.id(),
             range,
             snapshot: buffer.rope.clone(),
             title: command.title.clone(),
+            preview: false,
         };
-        if state.ext_worker.is_none() {
-            state.ext_worker = Some(crate::ext::run::spawn(Box::new(|| {})));
-        }
-        let job = state.ext_next_job;
-        state.ext_next_job += 1;
-        let sent = state.ext_worker.as_ref().is_some_and(|(tx, _)| {
-            tx.send(crate::ext::run::Job {
-                tag: job,
-                manifest: command.installed.manifest.clone(),
-                wasm: command.installed.wasm(),
-                generation: state.ext_generation,
-                request,
-            })
-            .is_ok()
-        });
-        if sent {
-            state.ext_pending.insert(job, call);
-        } else {
-            state.ext_worker = None;
-            state.message = Some(("the extension thread stopped".into(), Instant::now()));
-        }
+        send_ext_job(&mut state, &command, request, call);
         drop(state);
         self.resume_display_link();
         self.request_redraw();
+    }
+
+    /// Opens the preview pane on the active document, made by `command`.
+    fn open_preview(&self, command: ExtCommand) {
+        self.close_preview();
+        {
+            let mut state = self.ivars().state.borrow_mut();
+            let buffer = state.docs.active();
+            let preview = HtmlPreview {
+                buffer: buffer.id(),
+                command,
+                folder: buffer
+                    .path
+                    .as_deref()
+                    .and_then(Path::parent)
+                    .map(Path::to_path_buf),
+                web: None,
+                page: None,
+                observed: buffer.rope.clone(),
+                changed_at: None,
+                running: false,
+                answered: false,
+            };
+            state.html_preview = Some(preview);
+        }
+        self.run_preview();
+        self.resume_display_link();
+        self.request_redraw();
+    }
+
+    fn close_preview(&self) {
+        let preview = self.ivars().state.borrow_mut().html_preview.take();
+        // Out of the state first: the view leaving its superview can call
+        // back into this one.
+        if let Some(web) = preview.and_then(|p| p.web) {
+            web.close();
+        }
+        self.request_redraw();
+    }
+
+    /// Asks the preview's extension for a page of the document as it is.
+    fn run_preview(&self) {
+        let mut state = self.ivars().state.borrow_mut();
+        let Some(command) = state.html_preview.as_ref().map(|p| p.command.clone()) else {
+            return;
+        };
+        let buffer = state.docs.active();
+        if state
+            .html_preview
+            .as_ref()
+            .is_some_and(|p| p.buffer != buffer.id())
+        {
+            return;
+        }
+        let request = crate::ext::run::Request {
+            command: command.command.clone(),
+            text: buffer.rope.to_string(),
+            selection: false,
+            language: ext_language(buffer),
+        };
+        let call = ExtCall {
+            buffer: buffer.id(),
+            range: 0..buffer.rope.len_bytes(),
+            snapshot: buffer.rope.clone(),
+            title: command.title.clone(),
+            preview: true,
+        };
+        let observed = buffer.rope.clone();
+        let sent = send_ext_job(&mut state, &command, request, call);
+        if let Some(preview) = state.html_preview.as_mut() {
+            preview.observed = observed;
+            preview.changed_at = None;
+            preview.running = sent;
+        }
+    }
+
+    /// Keeps the preview pane in step: closes it when its document is no
+    /// longer the active one, asks for a new page after edits, makes the
+    /// web view once WebKit's rules are ready, and hands it each page.
+    fn sync_html_preview(&self) {
+        let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
+            return;
+        };
+        let Some(preview) = &state.html_preview else {
+            return;
+        };
+        let active = state.docs.active();
+        let gone = active.id() != preview.buffer
+            || !state.ext_commands.iter().any(|c| {
+                c.installed.manifest.id == preview.command.installed.manifest.id
+                    && c.command == preview.command.command
+            });
+        if gone {
+            drop(state);
+            self.close_preview();
+            return;
+        }
+        let frame = chrome_of(&state).preview.map(|r| {
+            NSRect::new(
+                NSPoint::new(r.x as f64, r.y as f64),
+                NSSize::new(r.width as f64, r.height as f64),
+            )
+        });
+        // Crc's own overlays are drawn under any native view; the page
+        // steps aside while one is up.
+        let veiled = frame.is_none()
+            || state.palette.is_some()
+            || state.goto.is_some()
+            || state.branch_list.is_some()
+            || state.action_list.is_some();
+        let rope = active.rope.clone();
+        let dark = state.theme.is_dark();
+        let Some(preview) = state.html_preview.as_mut() else {
+            return;
+        };
+        if !rope.same_as(&preview.observed) {
+            preview.observed = rope;
+            preview.changed_at = Some(Instant::now());
+        }
+        let due = !preview.running
+            && preview
+                .changed_at
+                .is_some_and(|t| t.elapsed() >= PREVIEW_DEBOUNCE);
+        let folder = preview.folder.clone();
+        let page_file = crate::platform::webview::page_path(preview.buffer);
+        // Out of the state while AppKit is called: a view can call back.
+        let mut web = preview.web.take();
+        let page = preview.page.take();
+        drop(state);
+        if due {
+            self.run_preview();
+        }
+        if web.is_none()
+            && let Some(frame) = frame
+            && let Some(page_file) = page_file
+        {
+            match crate::platform::webview::rules(folder.as_deref(), &page_file) {
+                // Compiling: next frame.
+                None => {}
+                Some(Ok(rules)) => {
+                    web = crate::platform::webview::WebPreview::new(
+                        frame,
+                        &rules,
+                        folder.as_deref(),
+                        &page_file,
+                    );
+                    match &web {
+                        Some(view) => unsafe {
+                            let _: () = msg_send![self, addSubview: view.view()];
+                        },
+                        None => self.preview_failed("the preview needs WebKit, which did not load"),
+                    }
+                }
+                Some(Err(())) => {
+                    self.preview_failed("the preview could not be set up for this folder");
+                }
+            }
+        }
+        let mut page = page;
+        if let Some(view) = &mut web {
+            view.set_dark(dark);
+            if let Some(frame) = frame {
+                view.set_frame(frame);
+            }
+            if let Some(next) = page.take() {
+                match view.show(&next) {
+                    Ok(true) => {}
+                    Ok(false) => page = Some(next),
+                    Err(why) => {
+                        self.ivars().state.borrow_mut().message = Some((why, Instant::now()));
+                    }
+                }
+            }
+            view.reveal_when_loaded(veiled);
+        }
+        let mut state = self.ivars().state.borrow_mut();
+        match state.html_preview.as_mut() {
+            Some(preview) => {
+                preview.web = web;
+                if preview.page.is_none() {
+                    preview.page = page;
+                }
+            }
+            None => {
+                drop(state);
+                if let Some(view) = web {
+                    view.close();
+                }
+            }
+        }
+    }
+
+    fn preview_failed(&self, why: &str) {
+        self.ivars().state.borrow_mut().message = Some((why.to_string(), Instant::now()));
+        self.close_preview();
     }
 
     /// Everything extensions sent back: the registry, a download, command
@@ -9713,6 +10009,11 @@ impl EditorView {
         let Some(call) = state.ext_pending.remove(&done.tag) else {
             return;
         };
+        if call.preview {
+            drop(state);
+            self.preview_answer(&call, done.result);
+            return;
+        }
         let response = match done.result {
             Ok(r) => r,
             Err(e) => {
@@ -9753,6 +10054,50 @@ impl EditorView {
             self.sync_title();
         }
         self.ivars().needs_redraw.set(true);
+    }
+
+    /// An answer for the preview pane. It says nothing in the status line
+    /// unless the extension did, or something failed; a run that fails
+    /// before any page arrived closes the pane.
+    fn preview_answer(&self, call: &ExtCall, result: Result<crate::ext::run::Response, String>) {
+        let mut state = self.ivars().state.borrow_mut();
+        let Some(preview) = state
+            .html_preview
+            .as_mut()
+            .filter(|p| p.buffer == call.buffer)
+        else {
+            return;
+        };
+        preview.running = false;
+        let (note, close) = match result {
+            Ok(crate::ext::run::Response {
+                html: Some(page),
+                message,
+                ..
+            }) => {
+                preview.page = Some(page);
+                preview.answered = true;
+                (message, false)
+            }
+            Ok(response) => (
+                Some(
+                    response
+                        .message
+                        .unwrap_or_else(|| format!("{} made no page", call.title)),
+                ),
+                !preview.answered,
+            ),
+            Err(error) => (Some(error), !preview.answered),
+        };
+        if let Some(note) = note {
+            state.message = Some((note, Instant::now()));
+        }
+        drop(state);
+        if close {
+            self.close_preview();
+        }
+        self.ivars().needs_redraw.set(true);
+        self.resume_display_link();
     }
 
     /// The bulb follows the caret: gone when it moves or the text changes,
@@ -12279,6 +12624,7 @@ impl EditorView {
             terminal: terminal_rect,
             text: editor_rect,
             status: status_rect,
+            preview: _,
             panes: _,
             others: other_panes,
         } = chrome;
@@ -14495,7 +14841,7 @@ fn chrome_of(state: &State) -> Chrome {
     let response = state.responses.contains_key(&state.docs.active().id())
         || active_review(state).is_some()
         || active_conflicts(state).is_some();
-    Chrome::with_panes(
+    let mut chrome = Chrome::with_panes(
         state.viewport,
         sidebar,
         find_rows,
@@ -14503,7 +14849,37 @@ fn chrome_of(state: &State) -> Chrome {
         pane_count(state),
         state.focused_pane,
         state.terminal.open.then_some(state.terminal.height),
-    )
+    );
+    if state
+        .html_preview
+        .as_ref()
+        .is_some_and(|p| p.buffer == state.docs.active().id())
+        && !preview_displaced(state)
+    {
+        chrome.split_preview();
+    }
+    chrome
+}
+
+/// Something else has the editor column, and the preview gives way.
+fn preview_displaced(state: &State) -> bool {
+    ext_details(state)
+        || diffing(state)
+        || active_review(state).is_some()
+        || side_by_side(state)
+        || state.native_preview.is_some()
+}
+
+/// The command Cmd-E runs: the first installed one that may show a
+/// preview.
+fn preview_command(state: &State) -> Option<ExtCommand> {
+    state
+        .ext_commands
+        .iter()
+        .find(|c| {
+            c.installed.manifest.may_preview() && c.command == crate::ext::manifest::PREVIEW_COMMAND
+        })
+        .cloned()
 }
 
 /// `recent` with `root`, if any, moved to the front, deduplicated by
@@ -15476,6 +15852,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
     let state = State {
         docs,
         native_preview: None,
+        html_preview: None,
         git,
         git_open: false,
         diff_tab: None,

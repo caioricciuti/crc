@@ -2,6 +2,17 @@
 
 One entry per tag, written for people who use the editor.
 
+## Unreleased
+
+- A rendered Markdown preview, as an extension: install Markdown Preview
+  from crc > Extensions, then Cmd-E in a Markdown file opens it beside the
+  text. It follows your edits, keeps its scroll position, loads images
+  from the document's folder, and follows crc's light or dark theme.
+  CommonMark with tables, task lists, strikethrough and footnotes.
+- The page runs no script, loads nothing from the network, reads files
+  only from the document's folder and follows no links. Extensions ask for
+  this with a new capability, `preview.show`, shown before install.
+
 ## v0.2.0-alpha.5, 2026-09-27
 
 Markdown is text again, and extensions are closer to hand.

@@ -575,8 +575,8 @@ if [ ! -s "$T/cursors.out" ]; then
 fi
 
 # Markdown opens as styled text: the heading's marker and text have kinds
-# of their own, and the fenced block a band. Cmd-E only says the rendered
-# view is an extension's. Tabs can then be dragged to a new position without changing which
+# of their own, and the fenced block a band. With no preview extension
+# installed, Cmd-E says where to get one. Tabs can then be dragged to a new position without changing which
 # file is active.
 printf '# One\n\nBody\n\n```rust\nfn main() {}\n```\n' > "$T/proj/one.md"
 printf 'two\n' > "$T/proj/two.txt"
@@ -602,7 +602,7 @@ quit
 SCRIPT
 CRC_SELFTEST="$T/tabs.script" "$BIN" "$T/proj/one.md" 2> "$T/tabs.err"
 expect "$T/source.out" md "MdMarker,MdHeading bands=1"
-expect "$T/preview.out" message "Markdown opens as styled text; a rendered preview is coming as an extension"
+expect "$T/preview.out" message "No preview installed: get Markdown Preview from crc > Extensions"
 expect_line "$T/live-edit.out" 1 "# OneX"
 expect "$T/two.out" tabs "one.md | two.txt"
 expect "$T/reordered.out" tabs "two.txt | one.md"
@@ -1624,6 +1624,82 @@ expect "$T/ext-unsigned.out" extensions "open selected=crc.sort-lines installed=
 expect "$T/ext-removed.out" extensions "open selected=crc.sort-lines installed= registry=ready:crc.sort-lines confirm=- busy=- note=Removed Sort Lines"
 [ -z "$(ls -A "$T/exthome/Library/Application Support/crc/extensions" 2>/dev/null)" ] \
     || { echo "FAIL ext: files left after uninstall: $(ls -A "$T/exthome/Library/Application Support/crc/extensions")"; fail=1; }
+
+# ---- the preview pane ---------------------------------------------------------
+# Markdown Preview, built in crc-extensions, installed from a folder. Cmd-E
+# splits the pane: the text keeps the left half, the page the right. What
+# the page may load is checked from inside it: the image beside the
+# document loads, a remote one and one outside the folder do not, and a
+# link goes nowhere. An edit re-renders without moving the page's scroll;
+# the palette hides the page while it is up; Cmd-E again closes it and
+# deletes the file it was loaded from.
+X="$PWD/tests/fixtures/extensions/markdown-preview"
+mkdir -p "$T/pvhome" "$T/pvproj/img" "$T/pvfolder" "$T/pvreg"
+cp "$X"/* "$T/pvfolder/"
+python3 - "$T" <<'PY'
+import pathlib, struct, sys, zlib
+t = pathlib.Path(sys.argv[1])
+def png(w, h):
+    raw = b"".join(b"\0" + b"\x80\x40\x20" * w for _ in range(h))
+    chunk = lambda k, d: struct.pack(">I", len(d)) + k + d + struct.pack(">I", zlib.crc32(k + d))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+(t / "pvproj/img/dot.png").write_bytes(png(64, 64))
+(t / "outside.png").write_bytes(png(32, 32))
+(t / "pvproj/doc.md").write_text(
+    "# Title\n\n![here](img/dot.png) ![remote](https://example.com/x.png) ![out](../outside.png)\n\n"
+    "[a link](img/dot.png)\n\n" + "".join(f"Paragraph {i} with *some* text.\n\n" for i in range(200)))
+PY
+cat > "$T/pv.script" <<SCRIPT
+wait 600
+key 7 cmd,shift x
+idle 900
+click @extensions.folder
+wait 200
+click @extensions.confirm
+idle 600
+key 53
+key 14 cmd e
+idle 2500
+webjs probe
+idle 300
+dump $T/pv-open.out
+webjs (document.querySelector('a').click(), 'clicked')
+idle 600
+webjs location.href.indexOf('/Library/Caches/crc/preview-') > 0 ? 'stayed' : location.href
+idle 300
+dump $T/pv-link.out
+webjs (scrollTo(0,300),scrollY)
+idle 300
+key 126 cmd
+text X
+idle 1500
+webjs probe
+idle 300
+dump $T/pv-edited.out
+key 35 cmd p
+idle 300
+dump $T/pv-palette.out
+key 53
+idle 300
+dump $T/pv-back.out
+key 14 cmd e
+idle 300
+dump $T/pv-closed.out
+quit
+SCRIPT
+HOME="$T/pvhome" CRC_EXT_REGISTRY="file://$T/pvreg/" CRC_EXT_FOLDER="$T/pvfolder" CRC_SELFTEST="$T/pv.script" "$BIN" "$T/pvproj/doc.md" 2> "$T/pv.err"
+expect "$T/pv-open.out" preview "open ext=crc.markdown-preview view=shown probe=64/0/0 scroll=0 h1=Title text=6107"
+# 1100 wide, sidebar 240: the text's 816 points become 407, a gap, 408.
+grep -q '^layout: window 1100x760 sidebar Some(240.0) text 284,116 407x616 ' "$T/pv-open.out" \
+    || { echo "FAIL preview: the text did not give the page its half: $(grep '^layout:' "$T/pv-open.out")"; fail=1; }
+expect "$T/pv-link.out" preview "open ext=crc.markdown-preview view=shown probe=stayed"
+expect "$T/pv-edited.out" preview "open ext=crc.markdown-preview view=shown probe=64/0/0 scroll=300 h1=- text=6110"
+expect "$T/pv-palette.out" preview "open ext=crc.markdown-preview view=veiled probe=64/0/0 scroll=300 h1=- text=6110"
+expect "$T/pv-back.out" preview "open ext=crc.markdown-preview view=shown probe=64/0/0 scroll=300 h1=- text=6110"
+expect "$T/pv-closed.out" preview "closed"
+[ -z "$(ls "$T/pvhome/Library/Caches/crc" 2>/dev/null | grep '^preview-')" ] \
+    || { echo "FAIL preview: page files left behind: $(ls "$T/pvhome/Library/Caches/crc")"; fail=1; }
 
 # ---- branches, remotes and blame --------------------------------------------
 # A throwaway repository with a bare one as origin. The caret's line is

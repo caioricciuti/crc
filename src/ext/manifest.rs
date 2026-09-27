@@ -16,6 +16,8 @@ pub enum Capability {
     SelectionReplace,
     DocumentRead,
     DocumentEdit,
+    /// Answer with a page for the preview pane beside the editor.
+    PreviewShow,
 }
 
 impl Capability {
@@ -25,6 +27,7 @@ impl Capability {
             "selection.replace" => Capability::SelectionReplace,
             "document.read" => Capability::DocumentRead,
             "document.edit" => Capability::DocumentEdit,
+            "preview.show" => Capability::PreviewShow,
             _ => return None,
         })
     }
@@ -36,6 +39,7 @@ impl Capability {
             Capability::SelectionReplace => "Replace the selected text",
             Capability::DocumentRead => "Read the whole document",
             Capability::DocumentEdit => "Replace the whole document",
+            Capability::PreviewShow => "Show a page beside the editor (no scripts, no network)",
         }
     }
 }
@@ -75,6 +79,11 @@ impl Manifest {
         })
     }
 
+    /// Whether it may answer with a preview page.
+    pub fn may_preview(&self) -> bool {
+        self.capabilities.contains(&Capability::PreviewShow)
+    }
+
     pub fn may_replace(&self, selection: bool) -> bool {
         self.capabilities.contains(&if selection {
             Capability::SelectionReplace
@@ -97,6 +106,9 @@ fn is_id(id: &str) -> bool {
     // It names the extension's folder: well inside a file name's 255 bytes.
     id.len() <= MAX_ID_LEN && parts.len() >= 2 && parts.iter().all(|p| word(p))
 }
+
+/// The command Cmd-E runs in an extension that may show a preview.
+pub const PREVIEW_COMMAND: &str = "preview";
 
 /// The longest extension id.
 pub const MAX_ID_LEN: usize = 100;
@@ -185,6 +197,15 @@ pub fn parse(value: &Value) -> Result<Manifest, String> {
     }
     if commands.is_empty() {
         return Err("the manifest has no commands".into());
+    }
+    // Cmd-E runs the command named `preview`, on the whole document.
+    if capabilities.contains(&Capability::PreviewShow) {
+        if !commands.iter().any(|c| c.id == PREVIEW_COMMAND) {
+            return Err("preview.show needs a command with the id preview".into());
+        }
+        if !capabilities.contains(&Capability::DocumentRead) {
+            return Err("preview.show needs document.read".into());
+        }
     }
     let icon = value
         .get("icon")
@@ -321,5 +342,28 @@ mod tests {
         assert!(with("\"id\": \"sort\"", "\"id\": \"Sort-It\"").contains("command"));
         assert!(with("\"api\": 1,", "\"api\": 1, \"icon\": \"skull\",").contains("unknown icon"));
         assert!(with("\"api\": 1,", "\"api\": 1, \"homepage\": \"http://x\",").contains("https"));
+    }
+
+    #[test]
+    fn a_preview_runs_on_the_whole_document_through_its_preview_command() {
+        let preview = SORT
+            .replace(
+                "[\"selection.read\", \"selection.replace\"]",
+                "[\"document.read\", \"preview.show\"]",
+            )
+            .replace("\"id\": \"sort\"", "\"id\": \"preview\"");
+        let m = parse(&crate::json::parse(&preview).unwrap()).unwrap();
+        assert!(m.may_preview() && m.may_read(false) && !m.may_replace(false));
+        assert!(
+            !parse(&crate::json::parse(SORT).unwrap())
+                .unwrap()
+                .may_preview()
+        );
+        let refused = |text: &str| parse(&crate::json::parse(text).unwrap()).unwrap_err();
+        assert!(
+            refused(&preview.replace("\"id\": \"preview\"", "\"id\": \"show\""))
+                .contains("id preview")
+        );
+        assert!(refused(&preview.replace("\"document.read\", ", "")).contains("document.read"));
     }
 }

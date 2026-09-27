@@ -21,6 +21,8 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rustc-link-lib=framework=QuickLookUI");
+    // WKWebView, for the preview pane an extension's page is shown in.
+    println!("cargo:rustc-link-lib=framework=WebKit");
     // FSEvents, for the project watcher.
     println!("cargo:rustc-link-lib=framework=CoreServices");
     let revision = Command::new("git")

@@ -111,6 +111,12 @@ pub enum Step {
     /// A real panic, so the crash hook and recovery run end to end.
     Panic,
     Wait(u64),
+    /// Waits without blocking: the run loop keeps turning, so work that
+    /// answers through it (WebKit above all) gets its answers in.
+    Idle(u64),
+    /// Evaluates an expression in the preview page; the next dump's
+    /// `preview:` line carries the answer.
+    WebJs(String),
     Quit,
 }
 
@@ -270,6 +276,8 @@ pub fn parse(script: &str) -> Result<Vec<Step>, String> {
             }
             "dump" if !rest.is_empty() => steps.push(Step::Dump(rest.to_string())),
             "wait" => steps.push(Step::Wait(rest.parse().map_err(|_| bad())?)),
+            "idle" => steps.push(Step::Idle(rest.parse().map_err(|_| bad())?)),
+            "webjs" if !rest.is_empty() => steps.push(Step::WebJs(rest.to_string())),
             "wheel" => steps.push(Step::Wheel(rest.trim().parse().map_err(|_| bad())?)),
             "trackpad" => steps.push(Step::Trackpad {
                 x: number().ok_or_else(bad)?,

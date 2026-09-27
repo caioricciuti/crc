@@ -101,6 +101,67 @@ mod tests {
         assert!(error.contains("no command nope"), "{error}");
     }
 
+    /// Markdown Preview, built from crc-extensions, through the interpreter:
+    /// a page comes back only with `preview.show`, and a long document
+    /// renders inside half the deadline.
+    #[test]
+    fn a_preview_answers_with_a_page() {
+        let folder = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/extensions/markdown-preview");
+        let package = super::store::Package::from_folder(&folder).unwrap();
+        let mut ext = load(package.manifest.clone(), &package.wasm).unwrap();
+        let markdown = |text: &str| Request {
+            language: "markdown".into(),
+            ..request("preview", text, false)
+        };
+        let out = ext
+            .run(&markdown(
+                "# Notes\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n<script>x</script>\n",
+            ))
+            .unwrap();
+        let html = out.html.unwrap();
+        assert!(
+            html.contains("<h1>Notes</h1>") && html.contains("<td>1</td>"),
+            "{html}"
+        );
+        assert!(!html.contains("<script>"), "raw HTML stays text: {html}");
+        assert_eq!(out.replace, None);
+        let out = ext
+            .run(&Request {
+                language: "rust".into(),
+                ..markdown("fn main() {}")
+            })
+            .unwrap();
+        assert_eq!(out.html, None);
+        assert!(out.message.unwrap().contains("Markdown"));
+
+        let section = "## Section\n\nSome *text* with `code`, a [link](x.md) and a list:\n\n\
+                       - one\n- two\n  - nested\n\n```rust\nfn main() {}\n```\n\n";
+        let long = section.repeat(100_000 / section.len());
+        let started = std::time::Instant::now();
+        let out = ext.run(&markdown(&long)).unwrap();
+        let took = started.elapsed();
+        assert!(out.html.is_some(), "{:?}", out.message);
+        // About 0.4 s here in release; half the deadline leaves room for a
+        // slow CI machine.
+        assert!(
+            took < std::time::Duration::from_millis(1000),
+            "100 KB took {took:?}"
+        );
+
+        let mut manifest = package.manifest.clone();
+        manifest
+            .capabilities
+            .retain(|c| *c != super::manifest::Capability::PreviewShow);
+        let mut ext = load(manifest, &package.wasm).unwrap();
+        let out = ext.run(&markdown("# x")).unwrap();
+        assert_eq!(out.html, None);
+        assert_eq!(
+            out.message.as_deref(),
+            Some("Markdown Preview may not show a preview")
+        );
+    }
+
     #[test]
     fn a_module_must_match_its_manifest() {
         let package = super::store::Package::from_folder(&fixture()).unwrap();

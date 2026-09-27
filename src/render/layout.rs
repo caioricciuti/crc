@@ -294,6 +294,9 @@ pub struct Chrome {
     pub text: Viewport,
     /// Across the bottom of the whole window.
     pub status: Viewport,
+    /// The preview pane: the right half of the focused pane's text, when
+    /// an extension's page is showing beside it.
+    pub preview: Option<Viewport>,
     /// How many editor panes share the column.
     pub panes: usize,
     /// The panes that do not have the keyboard, by pane index, each with
@@ -440,9 +443,23 @@ impl Chrome {
             terminal,
             text,
             status,
+            preview: None,
             panes,
             others,
         }
+    }
+
+    /// Gives the right half of the focused pane's text to the preview. The
+    /// text keeps the left half, on a whole point.
+    pub fn split_preview(&mut self) {
+        let left = ((self.text.width - PANE_GAP) / 2.0).floor().max(0.0);
+        let preview = Viewport {
+            x: self.text.x + left + PANE_GAP,
+            width: (self.text.width - left - PANE_GAP).max(0.0),
+            ..self.text
+        };
+        self.text.width = left;
+        self.preview = Some(preview);
     }
 
     /// A point in the window, as a point relative to the text area, which is
@@ -5896,6 +5913,29 @@ mod tests {
                 button.y >= toolbar.y && button.y + button.height <= toolbar.y + toolbar.height
             );
         }
+    }
+
+    #[test]
+    fn the_preview_takes_the_right_half_of_the_focused_text() {
+        let window = Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: 1201.0,
+            height: 800.0,
+        };
+        let plain = Chrome::new(window, None, 0);
+        let mut split = Chrome::new(window, None, 0);
+        split.split_preview();
+        let preview = split.preview.unwrap();
+        assert_eq!(split.text.x, plain.text.x);
+        assert_eq!(split.text.width.fract(), 0.0, "text on a whole point");
+        assert_eq!(preview.x, split.text.x + split.text.width + PANE_GAP);
+        assert_eq!(preview.x + preview.width, plain.text.x + plain.text.width);
+        assert_eq!(
+            (preview.y, preview.height),
+            (plain.text.y, plain.text.height)
+        );
+        assert!(plain.preview.is_none());
     }
 
     #[test]

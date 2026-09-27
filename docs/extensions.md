@@ -103,6 +103,13 @@ all, so the module fails to load rather than failing later.
 | `index.query` | read-only queries against the project index |
 | `diagnostics.publish` | underlines and status line counts, like a language server |
 | `status.item` | a short text in the status bar |
+| `preview.show` | returning a page crc shows beside the editor (Cmd-E runs the command `preview`) |
+
+`selection.*`, `document.*` and `preview.show` exist today; the others are
+planned. A preview page is shown by WebKit with script turned off, a rule
+list that blocks every load but files in the document's folder and `data:`
+URLs, no navigation, and no storage on disk. crc writes the first page to
+its cache folder and deletes it when the preview closes.
 
 Commands listed in the manifest appear in the palette.
 

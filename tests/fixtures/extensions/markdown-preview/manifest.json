@@ -1,0 +1,23 @@
+{
+  "id": "crc.markdown-preview",
+  "name": "Markdown Preview",
+  "version": "0.1.0",
+  "description": "A rendered preview of the Markdown document beside the editor, updated as you type.",
+  "authors": [
+    "crc"
+  ],
+  "license": "MIT OR Apache-2.0",
+  "icon": "book",
+  "api": 1,
+  "entry": "markdown_preview.wasm",
+  "capabilities": [
+    "document.read",
+    "preview.show"
+  ],
+  "commands": [
+    {
+      "id": "preview",
+      "title": "Open Preview"
+    }
+  ]
+}

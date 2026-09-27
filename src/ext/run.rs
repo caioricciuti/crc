@@ -19,6 +19,8 @@ const MAX_PAGES: usize = 1024;
 const FUEL: u64 = 500_000_000;
 /// And the wall clock, whatever the fuel says.
 const DEADLINE: Duration = Duration::from_secs(2);
+/// The largest preview page crc shows.
+pub const MAX_HTML: usize = 8 << 20;
 /// Lines of log kept per extension.
 const LOG_LINES: usize = 200;
 
@@ -36,6 +38,8 @@ pub struct Request {
 pub struct Response {
     pub replace: Option<String>,
     pub message: Option<String>,
+    /// A page for the preview pane.
+    pub html: Option<String>,
 }
 
 type Log = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
@@ -183,10 +187,22 @@ impl Loaded {
         let mut response = Response {
             replace: field("replace"),
             message: field("message").map(|m| m.chars().take(200).collect()),
+            html: field("html"),
         };
         if response.replace.is_some() && !self.manifest.may_replace(request.selection) {
             response.replace = None;
             response.message = Some(format!("{name} may not change the text"));
+        }
+        if response.html.is_some() && !self.manifest.may_preview() {
+            response.html = None;
+            response.message = Some(format!("{name} may not show a preview"));
+        }
+        if response.html.as_ref().is_some_and(|h| h.len() > MAX_HTML) {
+            response.html = None;
+            response.message = Some(format!(
+                "{name} made a page over {} MB; it was not shown",
+                MAX_HTML >> 20
+            ));
         }
         Ok(response)
     }

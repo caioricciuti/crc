@@ -18,6 +18,7 @@ pub mod settings;
 pub mod symbols;
 pub mod terminal;
 pub mod update;
+pub mod webview;
 pub mod window;
 
 /// Writes `bytes` to a temporary file beside `path` and renames it over, so
