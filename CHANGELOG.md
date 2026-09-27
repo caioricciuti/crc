@@ -2,6 +2,30 @@
 
 One entry per tag, written for people who use the editor.
 
+## v0.2.0-alpha.5, 2026-09-27
+
+Markdown is text again, and extensions are closer to hand.
+
+- Markdown files open in the editor as text, styled where it is written:
+  headings in bold, bold and italic in the editor font's own faces, inline
+  code on a tint, links and list markers set apart, and the characters
+  that make the syntax (`#`, `**`, backticks, table pipes) drawn faint.
+  Fenced code blocks sit on a band and are coloured by their language;
+  YAML front matter too. Selection, find, multiple cursors and scrolling
+  work as in any other file.
+- The rendered Markdown view (Cmd-E) is gone. It could not select text and
+  scrolled a block at a time. A rendered preview is coming as an
+  extension; until then Cmd-E says so.
+- Right-click in the editor: Extensions, then an extension, then its
+  commands. The Extensions menu groups commands the same way.
+- The Extensions page opens on an overview with Install from Folder,
+  Refresh and Close; an extension's own page has a way back, and its
+  README is rendered, tables and code included, and scrolls.
+- Breadcrumbs are clickable: a folder lists what is in it, the file lists
+  the files beside it. Pick a file to open it, a folder to show it in the
+  Explorer.
+- Home no longer shows "Untitled" under its tab.
+
 ## v0.2.0-alpha.4, 2026-09-27
 
 A release of fixes: a full review of the code found close to two hundred
