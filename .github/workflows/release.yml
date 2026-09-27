@@ -39,8 +39,34 @@ jobs:
       - name: Third-party sources match their checksums
         run: scripts/check-third-party.sh
 
+      - name: Toolchain
+        run: |
+          rustup toolchain install
+          cargo --version
+
+      # The same gate as ci.yml's supply-chain job, here too: a tag can be
+      # pushed on a commit CI never saw. Vendoring is the one step that
+      # fetches (only what Cargo.lock names, checked against it), and no
+      # dependency code has run yet when the build-script allowlist is
+      # checked.
+      - name: Vendor, then build scripts, proc macros, tree size
+        run: ./scripts/vendor.sh
+
+      # Offline from here: everything builds from vendor/.
       - name: Tests
-        run: cargo test --release --locked
+        env:
+          CARGO_NET_OFFLINE: true
+        run: cargo test --release --locked --offline
+
+      # Nothing the build ran may have changed what the signing steps below
+      # read (bundle.sh above all). Checked before the keychain exists.
+      - name: The checkout is as it was
+        run: |
+          if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+            git status --short
+            echo "the build changed tracked files; not signing" >&2
+            exit 1
+          fi
 
       # A throwaway keychain that exists for this job only. The certificate
       # arrives as a secret, is imported, and the file is removed at once;
@@ -53,7 +79,9 @@ jobs:
           keychain="$RUNNER_TEMP/release.keychain-db"
           keychain_password=$(openssl rand -hex 24)
           security create-keychain -p "$keychain_password" "$keychain"
-          security set-keychain-settings -lut 3600 "$keychain"
+          # Locks after 6 hours, the job's own limit: the DMG is signed only
+          # after notarization returns, which has taken over an hour.
+          security set-keychain-settings -lut 21600 "$keychain"
           security unlock-keychain -p "$keychain_password" "$keychain"
           printf '%s' "$APPLE_CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
           security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" \
@@ -78,6 +106,7 @@ jobs:
       - name: Build, sign, notarize and package
         env:
           CRC_NOTARY_KEYCHAIN: ${{ runner.temp }}/release.keychain-db
+          CARGO_NET_OFFLINE: true
         run: scripts/bundle.sh --release
 
       # gh is on the runner already, so no third-party action is needed to
