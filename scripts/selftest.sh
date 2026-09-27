@@ -810,7 +810,12 @@ dump $T/preview-$kind.out
 quit
 SCRIPT
     CRC_SELFTEST="$T/preview.script" "$BIN" "$T/$file" 2> "$T/preview-$kind.err"
-    expect "$T/preview-$kind.out" native_preview true
+    # SVG is XML, opened as text to edit; the others are pictures.
+    if [ "$kind" = svg ]; then
+        expect "$T/preview-$kind.out" native_preview false
+    else
+        expect "$T/preview-$kind.out" native_preview true
+    fi
     expect "$T/preview-$kind.out" dirty false
 done
 

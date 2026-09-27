@@ -35,7 +35,11 @@ pub fn row_starts(rope: &Rope, line: usize, columns: usize) -> Vec<usize> {
         }
     }
     let columns = columns.max(MIN_COLUMNS);
+    // Columns from the line's start, so a tab stops where it would on the
+    // whole line, as `column_in_row` and `byte_at_column` measure; a row's
+    // width is measured from the column it starts at.
     let mut column = 0usize;
+    let mut row_base = 0usize;
     // The last place a row could break: just after whitespace, and the
     // column there.
     let mut after_space: Option<(usize, usize)> = None;
@@ -46,22 +50,22 @@ pub fn row_starts(rope: &Rope, line: usize, columns: usize) -> Vec<usize> {
             // Whitespace hangs past the edge instead of taking the word
             // before it down a row; the row breaks after it.
             let space = ch == ' ' || ch == '\t';
-            if next > columns && column > 0 && !space {
+            if next - row_base > columns && column > row_base && !space {
                 match after_space.filter(|(at, _)| *at > *rows.last().unwrap_or(&start)) {
                     Some((at, at_column)) => {
                         rows.push(at);
-                        column -= at_column;
+                        row_base = at_column;
                     }
                     None => {
                         rows.push(byte);
-                        column = 0;
+                        row_base = column;
                     }
                 }
                 after_space = None;
             }
-            column = columns::advance(column, ch);
+            column = next;
             byte += ch.len_utf8();
-            if ch == ' ' || ch == '\t' {
+            if space {
                 after_space = Some((byte, column));
             }
         }
@@ -153,6 +157,37 @@ mod tests {
             .enumerate()
             .map(|(i, &s)| rope.slice_to_string(s..*starts.get(i + 1).unwrap_or(&end)))
             .collect()
+    }
+
+    #[test]
+    fn rows_never_run_past_the_width_with_tabs_after_a_break() {
+        // A tab after a break stops where it does on the whole line, and the
+        // row's columns, measured the same way, stay within the width.
+        for extra in 0..6 {
+            let text = format!(
+                "{} bb\tcccccccccccccc{} end",
+                "a".repeat(18),
+                "c".repeat(extra)
+            );
+            let rope = Rope::from_text(&text);
+            let starts = row_starts(&rope, 0, 20);
+            let end = line_end(&rope, 0);
+            for (i, &row) in starts.iter().enumerate() {
+                let row_end = starts.get(i + 1).copied().unwrap_or(end);
+                let last = if row_end > row {
+                    let before = rope.slice_to_string(row..row_end);
+                    let trimmed = before.trim_end_matches([' ', '\t']);
+                    row + trimmed.len()
+                } else {
+                    row
+                };
+                assert!(
+                    column_in_row(&rope, row, last) <= 20,
+                    "{text:?} row {i} is {} wide",
+                    column_in_row(&rope, row, last)
+                );
+            }
+        }
     }
 
     #[test]

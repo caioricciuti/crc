@@ -79,13 +79,53 @@ pub fn detect(rope: &Rope) -> Option<Style> {
     Some(Style { tabs: false, width })
 }
 
+/// A file's size and modification time: whether it changed since.
+type Stamp = Option<(u64, std::time::SystemTime)>;
+
+thread_local! {
+    /// `.editorconfig` texts by folder, with what `stat` said when they were
+    /// read: opening files from one project read and parsed the same few
+    /// files again every time.
+    static EDITORCONFIG: std::cell::RefCell<std::collections::HashMap<std::path::PathBuf, (Stamp, Option<String>)>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// The `.editorconfig` in `dir`, from the cache while it is unchanged.
+fn cached_editorconfig(dir: &Path) -> Option<String> {
+    let file = dir.join(".editorconfig");
+    let stamp: Stamp = std::fs::metadata(&file)
+        .ok()
+        .and_then(|m| Some((m.len(), m.modified().ok()?)));
+    EDITORCONFIG.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some((seen, text)) = cache.get(dir)
+            && *seen == stamp
+        {
+            return text.clone();
+        }
+        let text = stamp.and_then(|_| std::fs::read_to_string(&file).ok());
+        cache.insert(dir.to_path_buf(), (stamp, text.clone()));
+        text
+    })
+}
+
 /// The indentation `.editorconfig` files give `path`, nearest file last so
 /// it wins, stopping at one that says `root = true`.
 pub fn editorconfig(path: &Path) -> Option<Style> {
     let mut files = Vec::new();
     let mut dir = path.parent();
+    // Not above the home folder, for a file inside it: `/Users` and `/`
+    // hold no one's .editorconfig, and every open read them.
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let stop = home
+        .as_deref()
+        .filter(|h| path.starts_with(h))
+        .and_then(Path::parent);
     while let Some(d) = dir {
-        if let Ok(text) = std::fs::read_to_string(d.join(".editorconfig")) {
+        if Some(d) == stop {
+            break;
+        }
+        if let Some(text) = cached_editorconfig(d) {
             let root = text.lines().any(|l| {
                 let l = l.trim().to_ascii_lowercase().replace(' ', "");
                 l == "root=true"

@@ -83,6 +83,21 @@ pub fn diff(old: &str, new: &str) -> Diff {
     out
 }
 
+/// Pairs of (line in `old`, line in `new`) that the diff keeps unchanged,
+/// in order. Lines are counted with their line breaks, so line `i` ends
+/// with the `i`th newline.
+pub fn unchanged_lines(old: &str, new: &str) -> Vec<(usize, usize)> {
+    let a: Vec<&str> = old.split_inclusive('\n').collect();
+    let b: Vec<&str> = new.split_inclusive('\n').collect();
+    script(&a, &b)
+        .into_iter()
+        .filter_map(|op| match op {
+            Op::Equal(i, j) => Some((i, j)),
+            _ => None,
+        })
+        .collect()
+}
+
 /// The edit script from `a` to `b`, in order.
 fn script(a: &[&str], b: &[&str]) -> Vec<Op> {
     let prefix = a.iter().zip(b).take_while(|(x, y)| x == y).count();

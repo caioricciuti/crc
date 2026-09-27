@@ -388,7 +388,6 @@ fn is_preview_path(path: &std::path::Path) -> bool {
     matches!(
         extension.to_ascii_lowercase().as_str(),
         "pdf"
-            | "svg"
             | "svgz"
             | "png"
             | "jpg"
@@ -780,6 +779,7 @@ impl Buffer {
         }
 
         file_format::validate(&self.rope, &self.format)?;
+        self.follow_mixed_endings();
         let in_place = existing.as_ref().is_some_and(|m| m.nlink() > 1);
         let atomic = if in_place {
             None
@@ -806,6 +806,30 @@ impl Buffer {
         self.saved = Some(self.rope.clone());
         self.dirty = false;
         Ok(())
+    }
+
+    /// A file with mixed line endings keeps one per newline, by position.
+    /// Lines added or removed since the last save shift those positions, so
+    /// before writing, each line that is still there takes the ending it
+    /// had, and each new one the file's usual ending.
+    fn follow_mixed_endings(&mut self) {
+        let preferred = self.format.preferred;
+        if self.format.endings.iter().all(|e| *e == preferred) {
+            return;
+        }
+        let Some(saved) = &self.saved else { return };
+        if saved.same_as(&self.rope) {
+            return;
+        }
+        let (old, new) = (saved.to_string(), self.rope.to_string());
+        let mut endings = vec![preferred; new.bytes().filter(|b| *b == b'\n').count()];
+        for (was, is) in crate::ide::diff::unchanged_lines(&old, &new) {
+            if let (Some(slot), Some(ending)) = (endings.get_mut(is), self.format.endings.get(was))
+            {
+                *slot = *ending;
+            }
+        }
+        self.format.endings = endings;
     }
 
     /// Writes over the file's own bytes. Nothing is truncated before the new
@@ -1270,8 +1294,18 @@ impl Buffer {
         // instead of folding into the one we just reverted.
         self.last_edit = None;
         self.goal_column = None;
-        self.dirty = true;
+        self.dirty = !self.matches_saved();
         true
+    }
+
+    /// Whether the text is the one last read or written: back there by
+    /// undo or redo, a document has nothing unsaved.
+    fn matches_saved(&self) -> bool {
+        self.saved.as_ref().is_some_and(|saved| {
+            saved.same_as(&self.rope)
+                || (saved.len_bytes() == self.rope.len_bytes()
+                    && common_prefix(saved, &self.rope, saved.len_bytes()) == saved.len_bytes())
+        })
     }
 
     pub fn redo(&mut self) -> bool {
@@ -1287,7 +1321,7 @@ impl Buffer {
         self.record_replacement(&before);
         self.last_edit = None;
         self.goal_column = None;
-        self.dirty = true;
+        self.dirty = !self.matches_saved();
         true
     }
 
@@ -1909,12 +1943,11 @@ impl Buffer {
             let old_end_point = self.point_of(at + take);
             self.rope.delete(at..at + take);
             self.record_edit(at, at + take, old_end_point, at);
-            if at < self.cursor {
-                removed_before_cursor += take;
-            }
-            if at < self.anchor {
-                removed_before_anchor += take;
-            }
+            // Only what was removed before a position moves it: a caret
+            // inside the indentation stops at the line's new start rather
+            // than being pulled back onto the line above.
+            removed_before_cursor += self.cursor.saturating_sub(at).min(take);
+            removed_before_anchor += self.anchor.saturating_sub(at).min(take);
         }
         self.cursor = self.cursor.saturating_sub(removed_before_cursor);
         self.anchor = self.anchor.saturating_sub(removed_before_anchor);
@@ -1958,6 +1991,19 @@ impl Buffer {
             EditKind::Insert
         });
 
+        // Caret and anchor follow the text around them. Lines are edited
+        // bottom up, so each edit is at a position in the original text.
+        let (mut cursor, mut anchor) = (self.cursor as isize, self.anchor as isize);
+        let (original_cursor, original_anchor) = (self.cursor, self.anchor);
+        let shift = |pos: usize, at: usize, removed: usize, inserted: usize| -> isize {
+            if removed > 0 {
+                -(pos.saturating_sub(at).min(removed) as isize)
+            } else if pos > at {
+                inserted as isize
+            } else {
+                0
+            }
+        };
         for &line in non_empty.iter().rev() {
             let start = self.rope.line_to_byte(line);
             let end = self.line_end(line);
@@ -1975,13 +2021,19 @@ impl Buffer {
                 let old_end_point = self.point_of(at + take);
                 self.rope.delete(at..at + take);
                 self.record_edit(at, at + take, old_end_point, at);
+                cursor += shift(original_cursor, at, take, 0);
+                anchor += shift(original_anchor, at, take, 0);
             } else {
                 let insert = format!("{token} ");
                 let old_end_point = self.point_of(at);
                 self.rope.insert(at, &insert);
                 self.record_edit(at, at, old_end_point, at + insert.len());
+                cursor += shift(original_cursor, at, 0, insert.len());
+                anchor += shift(original_anchor, at, 0, insert.len());
             }
         }
+        self.cursor = cursor.max(0) as usize;
+        self.anchor = anchor.max(0) as usize;
         self.clamp_positions();
     }
 
@@ -2031,7 +2083,16 @@ impl Buffer {
         let lines = self.selected_lines();
         let (first, last) = (*lines.start(), *lines.end());
         let total = self.rope.len_lines();
-        if (down && last + 1 >= total) || (!down && first == 0) {
+        // The empty "line" after a final newline is not one to swap with:
+        // doing so moved the newline instead and grew the file a line per
+        // press.
+        let last_text = if total > 1 && self.rope.byte_at(self.rope.len_bytes() - 1) == Some(b'\n')
+        {
+            total - 2
+        } else {
+            total - 1
+        };
+        if (down && last + 1 > last_text) || (!down && (first == 0 || first > last_text)) {
             return;
         }
 
@@ -2450,27 +2511,43 @@ impl Buffer {
         if self.row_mode() {
             return self.move_row(-1, motion);
         }
-        let (line, column) = self.cursor_position();
+        let (line, column) = self.visual_position();
         if line == 0 {
             self.cursor = 0;
         } else {
             let goal = self.goal_column.unwrap_or(column);
-            self.cursor = self.byte_at(line - 1, goal);
+            self.cursor = self.byte_at_visual(line - 1, goal);
             self.goal_column = Some(goal);
         }
         self.after_move(motion);
+    }
+
+    /// The caret's line and its column on screen: tabs to their stops,
+    /// wide characters as two. The goal column of Up and Down is kept in
+    /// these, as it is while wrapping, so the caret does not zig-zag past
+    /// tabs and CJK and does the same with wrapping on or off.
+    fn visual_position(&self) -> (usize, usize) {
+        let line = self.rope.byte_to_line(self.cursor);
+        let start = self.rope.line_to_byte(line);
+        (line, wrap::column_in_row(&self.rope, start, self.cursor))
+    }
+
+    fn byte_at_visual(&self, line: usize, column: usize) -> usize {
+        let start = self.rope.line_to_byte(line);
+        let end = wrap::line_end(&self.rope, line);
+        wrap::byte_at_column(&self.rope, start, end, column)
     }
 
     pub fn move_down(&mut self, motion: Motion) {
         if self.row_mode() {
             return self.move_row(1, motion);
         }
-        let (line, column) = self.cursor_position();
+        let (line, column) = self.visual_position();
         if line + 1 >= self.rope.len_lines() {
             self.cursor = self.rope.len_bytes();
         } else {
             let goal = self.goal_column.unwrap_or(column);
-            self.cursor = self.byte_at(line + 1, goal);
+            self.cursor = self.byte_at_visual(line + 1, goal);
             self.goal_column = Some(goal);
         }
         self.after_move(motion);
@@ -3099,7 +3176,7 @@ mod tests {
     fn media_files_open_as_read_only_previews() {
         let root = std::env::temp_dir().join(format!("caio-preview-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
-        for name in ["picture.PNG", "scan.jpeg", "drawing.svg", "invoice.pdf"] {
+        for name in ["picture.PNG", "scan.jpeg", "drawing.svgz", "invoice.pdf"] {
             let path = root.join(name);
             std::fs::write(&path, b"preview bytes").unwrap();
             let mut buffer = Buffer::open(&path).unwrap();
@@ -3110,6 +3187,10 @@ mod tests {
             assert!(!buffer.is_dirty());
             assert!(buffer.save(None).is_err());
         }
+        // SVG is XML: text to edit, not a picture to look at.
+        let svg = root.join("icon.svg");
+        std::fs::write(&svg, "<svg/>").unwrap();
+        assert!(!Buffer::open(&svg).unwrap().is_preview_file());
         let binary = root.join("unknown.bin");
         std::fs::write(&binary, [0, 0xff]).unwrap();
         assert!(Buffer::open(&binary).unwrap().is_preview_file());
@@ -4177,6 +4258,70 @@ mod tests {
     }
 
     #[test]
+    fn commenting_twice_restores_a_selection_that_ends_mid_line() {
+        let mut b = Buffer::from_text("one\ntwo\nthree\n");
+        b.select_range(0, "one\ntwo\nthr".len());
+        b.toggle_comment("//");
+        assert_eq!(b.rope.to_string(), "// one\n// two\n// three\n");
+        assert_eq!(b.selected_text().as_deref(), Some("// one\n// two\n// thr"));
+        b.toggle_comment("//");
+        assert_eq!(b.rope.to_string(), "one\ntwo\nthree\n");
+    }
+
+    #[test]
+    fn outdent_keeps_a_caret_inside_the_indent_on_its_line() {
+        let mut b = Buffer::from_text("keep\n    foo");
+        b.place_cursor("keep\n  ".len(), Move);
+        b.outdent();
+        assert_eq!(b.rope.to_string(), "keep\nfoo");
+        assert_eq!(b.cursor_position(), (1, 0));
+    }
+
+    #[test]
+    fn mixed_endings_stay_with_their_lines_when_lines_are_added() {
+        let dir = scratch_dir("mixed");
+        let path = dir.join("mixed.txt");
+        std::fs::write(&path, "a\r\nb\nc\r\nd\n").expect("write");
+        let mut b = Buffer::open(&path).expect("open");
+        b.place_cursor(2, Move); // start of "b"
+        b.insert("X\n");
+        b.save(None).expect("save");
+        // Each old line keeps its ending; the new one takes the usual one
+        // (a tie here, so LF).
+        assert_eq!(std::fs::read(&path).unwrap(), b"a\r\nX\nb\nc\r\nd\n");
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn undo_back_to_the_saved_text_is_not_unsaved() {
+        let dir = scratch_dir("undo-saved");
+        let path = dir.join("u.txt");
+        std::fs::write(&path, "x").expect("write");
+        let mut b = Buffer::open(&path).expect("open");
+        b.insert("a");
+        b.save(None).expect("save");
+        b.undo();
+        assert!(b.is_dirty(), "the saved text had the a");
+        b.redo();
+        assert!(!b.is_dirty(), "redo is back at the saved text");
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn up_and_down_keep_the_column_on_screen_past_tabs() {
+        let text = "\tab\nabcdefgh\n";
+        let mut plain = Buffer::from_text(text);
+        plain.place_cursor(1, Move); // after the tab, column 4 on screen
+        plain.move_down(Move);
+        assert_eq!(plain.cursor_position(), (1, 4));
+        let mut wrapped = Buffer::from_text(text);
+        wrapped.wrap = Some(80);
+        wrapped.place_cursor(1, Move);
+        wrapped.move_down(Move);
+        assert_eq!(wrapped.cursor, plain.cursor, "the same with wrapping on");
+    }
+
+    #[test]
     fn comment_preserves_indentation() {
         let mut b = Buffer::from_text("    indented\n");
         b.toggle_comment("//");
@@ -4243,9 +4388,12 @@ mod tests {
             "cannot move the first line up"
         );
         b.goto_line(1);
-        b.move_lines(true);
-        // Line 2 is the empty line after the trailing newline.
-        assert!(b.rope.to_string().starts_with('a') || b.rope.to_string().starts_with('b'));
+        // The last text line stays last; the empty line after the final
+        // newline is not something to move past.
+        for _ in 0..3 {
+            b.move_lines(true);
+        }
+        assert_eq!(b.rope.to_string(), "a\nb\n");
     }
 
     #[test]
