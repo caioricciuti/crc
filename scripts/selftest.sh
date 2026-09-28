@@ -14,11 +14,18 @@
 # includes dead keys: the input system only composes for the active app.
 #
 # Usage: scripts/selftest.sh        (builds first)
+#        scripts/selftest.sh --debug  (a debug build, which checks every
+#                                      Objective-C message's types)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-cargo build --release --locked
-BIN=target/release/crc
+if [ "${1:-}" = "--debug" ]; then
+    cargo build --locked
+    BIN=target/debug/crc
+else
+    cargo build --release --locked
+    BIN=target/release/crc
+fi
 T=$(mktemp -d)
 trap 'result=$?; if [ "$result" -eq 0 ]; then rm -rf "$T"; else echo "Self-test failure artifacts: $T"; fi' EXIT
 fail=0

@@ -353,12 +353,12 @@ impl WebPreview {
         self.shown && self.hidden
     }
 
-    fn evaluate(&self, script: &str, done: Option<*const c_void>) {
+    fn evaluate(&self, script: &str, done: Option<BlockRef>) {
         let script = NSString::from_str(script);
         unsafe {
             let _: () = msg_send![&*self.view,
                 evaluateJavaScript: &*script,
-                completionHandler: done.unwrap_or(std::ptr::null())];
+                completionHandler: done.unwrap_or(BlockRef(std::ptr::null()))];
         }
     }
 
@@ -449,14 +449,26 @@ fn global_block(
     (block as *const Block).cast()
 }
 
-fn compiled_block() -> *const c_void {
-    static BLOCK: OnceLock<usize> = OnceLock::new();
-    *BLOCK.get_or_init(|| global_block(compiled) as usize) as *const c_void
+/// A block pointer, typed as one for the message send: WebKit declares its
+/// completion handlers as blocks (`@?`), and a bare pointer (`^v`) fails
+/// objc2's argument check in debug builds.
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+struct BlockRef(*const c_void);
+
+// SAFETY: a pointer to a block, which is what `@?` describes.
+unsafe impl objc2::encode::Encode for BlockRef {
+    const ENCODING: objc2::encode::Encoding = objc2::encode::Encoding::Block;
 }
 
-fn probed_block() -> *const c_void {
+fn compiled_block() -> BlockRef {
     static BLOCK: OnceLock<usize> = OnceLock::new();
-    *BLOCK.get_or_init(|| global_block(probed) as usize) as *const c_void
+    BlockRef(*BLOCK.get_or_init(|| global_block(compiled) as usize) as *const c_void)
+}
+
+fn probed_block() -> BlockRef {
+    static BLOCK: OnceLock<usize> = OnceLock::new();
+    BlockRef(*BLOCK.get_or_init(|| global_block(probed) as usize) as *const c_void)
 }
 
 /// `^(WKContentRuleList *list, NSError *error)`. The list names its

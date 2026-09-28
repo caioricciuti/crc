@@ -26,6 +26,15 @@ scripts/check-third-party.sh
 scripts/check-build-scripts.sh
 ```
 
+For changes that send Objective-C messages (`msg_send!`, blocks, a new
+AppKit or WebKit call), run the suite once against a debug build too.
+Release builds skip objc2's type checks, so a wrong argument or return
+type only shows up there:
+
+```sh
+scripts/selftest.sh --debug
+```
+
 For changes to the extension interpreter (`src/ext/wasm.rs`), `cargo
 test` already runs the official WebAssembly spec tests in
 `tests/wasm_spec.rs` and the malformed-module and limit corpora; also run

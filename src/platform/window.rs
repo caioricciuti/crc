@@ -20,8 +20,8 @@ use objc2_app_kit::{
     NSAlert, NSAlertStyle, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
     NSApplicationTerminateReply, NSBackingStoreType, NSCursor, NSEvent, NSEventModifierFlags,
     NSEventType, NSMenu, NSMenuItem, NSOpenPanel, NSSavePanel, NSScreen, NSTextInputClient,
-    NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
-    NSWindowTitleVisibility,
+    NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindow, NSWindowCollectionBehavior,
+    NSWindowDelegate, NSWindowStyleMask, NSWindowTitleVisibility,
 };
 use objc2_foundation::{
     NSArray, NSAttributedString, NSAttributedStringKey, NSFileManager, NSNotFound, NSNotification,
@@ -1239,6 +1239,13 @@ define_class!(
     struct EditorView;
 
     impl EditorView {
+        /// A blink toggle, armed by the frame before it.
+        #[unsafe(method(caretBlink:))]
+        fn caret_blink(&self, _sender: Option<&AnyObject>) {
+            self.request_redraw();
+            self.pump();
+        }
+
         #[unsafe(method(acceptsFirstResponder))]
         fn accepts_first_responder(&self) -> bool {
             true
@@ -3541,12 +3548,6 @@ define_class!(
             self.pump();
         }
 
-        /// A blink toggle, armed by the frame before it.
-        #[unsafe(method(caretBlink:))]
-        fn caret_blink(&self, _sender: Option<&AnyObject>) {
-            self.request_redraw();
-            self.pump();
-        }
     }
 );
 
@@ -6488,7 +6489,8 @@ impl EditorView {
         }
         let handles: bool = unsafe { msg_send![self, respondsToSelector: action] };
         if handles {
-            let _: () =
+            // It returns the action's result as an object, void or not.
+            let _: *mut AnyObject =
                 unsafe { msg_send![self, performSelector: action, withObject: None::<&AnyObject>] };
         } else {
             let app = NSApplication::sharedApplication(MainThreadMarker::from(self));
@@ -15064,7 +15066,17 @@ fn spawn_ignored(
 pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_pt: f32) -> ! {
     let mtm = MainThreadMarker::new().expect("run() must be called on the main thread");
     let app = NSApplication::sharedApplication(mtm);
-    app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+    // A test instance stays out of the way of the person at the machine:
+    // no Dock icon, never activated, its window see-through and deaf to the
+    // pointer. The script drives the view directly, so none of that matters
+    // to it. CRC_SELFTEST_VISIBLE shows it, for capturing the live window.
+    let hidden_test = std::env::var_os("CRC_SELFTEST").is_some()
+        && std::env::var_os("CRC_SELFTEST_VISIBLE").is_none();
+    app.setActivationPolicy(if hidden_test {
+        NSApplicationActivationPolicy::Accessory
+    } else {
+        NSApplicationActivationPolicy::Regular
+    });
     install_menu(mtm, &app);
     prefer_key_repeat();
 
@@ -15365,6 +15377,20 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
     if testing {
         // Scripted events target this window directly. Keep the user's
         // keyboard focus in their app while the real test window renders.
+        // A hidden one still has to be on screen, or nothing draws. It is
+        // see-through, deaf to the pointer, and joins whatever Space is
+        // showing, full-screen ones too, so macOS never switches Spaces to
+        // show it.
+        if hidden_test {
+            window.setAlphaValue(0.0);
+            window.setIgnoresMouseEvents(true);
+            window.setCollectionBehavior(
+                NSWindowCollectionBehavior::CanJoinAllSpaces
+                    | NSWindowCollectionBehavior::FullScreenAuxiliary
+                    | NSWindowCollectionBehavior::Stationary
+                    | NSWindowCollectionBehavior::IgnoresCycle,
+            );
+        }
         window.orderFront(None);
     } else {
         window.makeKeyAndOrderFront(None);
