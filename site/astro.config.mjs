@@ -18,6 +18,18 @@ export default defineConfig({
         "A text editor for macOS, drawn on the GPU, with a terminal, local Git and Claude Code built in.",
       logo: { src: "./src/assets/logo.svg", replacesTitle: false },
       favicon: "/favicon.svg",
+      // Page views, cookieless, on the self-hosted Umami. The landing pages
+      // carry the same tag in src/layouts/Landing.astro.
+      head: [
+        {
+          tag: "script",
+          attrs: {
+            defer: true,
+            src: "https://a.caioricciuti.com/b.js",
+            "data-website-id": "3a192d77-0a8b-4a43-8622-8f919ea1c22e",
+          },
+        },
+      ],
       social: [
         { icon: "github", label: "GitHub", href: "https://github.com/caioricciuti/crc" },
       ],
