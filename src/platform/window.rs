@@ -12681,12 +12681,16 @@ impl EditorView {
             // sixty lines of it would cost more than everything else in the
             // frame put together.
             spans.clear();
-            if syntax.has(buffer.id()) {
-                let total = buffer.rope.len_lines();
-                let std::ops::Range {
+            // The rows on screen, worked out once for everything this frame
+            // draws on them.
+            let rows = layout::screen_rows(buffer, editor_rect, renderer.atlas.metrics.line_height);
+            if syntax.has(buffer.id())
+                && let Some(std::ops::Range {
                     start: first,
                     end: last,
-                } = layout::visible_lines(buffer, editor_rect, renderer.atlas.metrics.line_height);
+                }) = layout::lines_of(&rows)
+            {
+                let total = buffer.rope.len_lines();
                 let from = buffer.rope.line_to_byte(first);
                 let to = if last < total {
                     buffer.rope.line_to_byte(last)
@@ -12708,6 +12712,7 @@ impl EditorView {
                 buffer,
                 &mut renderer.atlas,
                 editor_rect,
+                &rows,
                 theme,
                 &query,
                 find.as_ref().map(|_| ranges.as_slice()),
@@ -12721,8 +12726,8 @@ impl EditorView {
                 layout::push_gutter_marks(
                     glyphs,
                     &renderer.atlas,
-                    buffer,
                     editor_rect,
+                    &rows,
                     theme,
                     &marks.marks,
                 );
@@ -12732,8 +12737,14 @@ impl EditorView {
                     (b.buffer, b.caret) == (buffer.id(), buffer.cursor()) && b.shows()
                 })
             {
-                *bulb_rect =
-                    layout::push_bulb(glyphs, &mut renderer.atlas, buffer, editor_rect, theme);
+                *bulb_rect = layout::push_bulb(
+                    glyphs,
+                    &mut renderer.atlas,
+                    buffer,
+                    editor_rect,
+                    &rows,
+                    theme,
+                );
             } else {
                 *bulb_rect = None;
             }
@@ -12771,7 +12782,7 @@ impl EditorView {
                 && find.is_none()
                 && palette.is_none()
                 && goto.is_none()
-                && let Some(at) = layout::caret_rect(buffer, &renderer.atlas, editor_rect)
+                && let Some(at) = layout::caret_rect_on(buffer, &renderer.atlas, editor_rect, &rows)
             {
                 layout::push_marked_text(
                     glyphs,
@@ -12802,7 +12813,14 @@ impl EditorView {
                         (start..end, color)
                     })
                     .collect();
-                layout::push_underlines(glyphs, &renderer.atlas, buffer, editor_rect, &marks);
+                layout::push_underlines(
+                    glyphs,
+                    &renderer.atlas,
+                    buffer,
+                    editor_rect,
+                    &rows,
+                    &marks,
+                );
             }
 
             // Completion: ghost text at the caret, chips under the line.
@@ -12810,7 +12828,8 @@ impl EditorView {
             if let Some(popup) = completion
                 .as_ref()
                 .filter(|p| p.buffer == buffer.id() && !p.shown.is_empty())
-                && let Some(caret) = layout::caret_rect(buffer, &renderer.atlas, editor_rect)
+                && let Some(caret) =
+                    layout::caret_rect_on(buffer, &renderer.atlas, editor_rect, &rows)
             {
                 let cursor = buffer.cursor();
                 let prefix = buffer
@@ -12854,7 +12873,8 @@ impl EditorView {
 
             // Signature help, above the caret's line.
             if let Some(tip) = signature.as_ref().filter(|t| t.buffer == buffer.id())
-                && let Some(caret) = layout::caret_rect(buffer, &renderer.atlas, editor_rect)
+                && let Some(caret) =
+                    layout::caret_rect_on(buffer, &renderer.atlas, editor_rect, &rows)
             {
                 layout::build_signature(
                     &tip.signature.label,
@@ -14485,12 +14505,14 @@ fn draw_other_pane(
         return;
     }
     let mut spans = Vec::new();
-    if syntax.has(buffer.id()) {
-        let total = buffer.rope.len_lines();
-        let std::ops::Range {
+    let rows = layout::screen_rows(buffer, text, renderer.atlas.metrics.line_height);
+    if syntax.has(buffer.id())
+        && let Some(std::ops::Range {
             start: first,
             end: last,
-        } = layout::visible_lines(buffer, text, renderer.atlas.metrics.line_height);
+        }) = layout::lines_of(&rows)
+    {
+        let total = buffer.rope.len_lines();
         let from = buffer.rope.line_to_byte(first);
         let to = if last < total {
             buffer.rope.line_to_byte(last)
@@ -14503,6 +14525,7 @@ fn draw_other_pane(
         buffer,
         &mut renderer.atlas,
         text,
+        &rows,
         theme,
         "",
         None,
@@ -14513,7 +14536,7 @@ fn draw_other_pane(
         glyphs,
     );
     if let Some(entry) = marks.get(&buffer.id()) {
-        layout::push_gutter_marks(glyphs, &renderer.atlas, buffer, text, theme, &entry.marks);
+        layout::push_gutter_marks(glyphs, &renderer.atlas, text, &rows, theme, &entry.marks);
     }
     // The seam between panes.
     layout::push_rect(

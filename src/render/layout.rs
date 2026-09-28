@@ -852,10 +852,12 @@ pub fn build_full(
     spans: &[Span],
     out: &mut Vec<GlyphInstance>,
 ) -> Stats {
+    let rows = screen_rows(buffer, viewport, atlas.metrics.line_height);
     build_full_search(
         buffer,
         atlas,
         viewport,
+        &rows,
         theme,
         query,
         None,
@@ -874,6 +876,7 @@ pub fn build_full_search(
     buffer: &Buffer,
     atlas: &mut Atlas,
     viewport: Viewport,
+    rows: &[ScreenRow],
     theme: &Theme,
     query: &str,
     search_ranges: Option<&[std::ops::Range<usize>]>,
@@ -888,6 +891,7 @@ pub fn build_full_search(
         buffer,
         atlas,
         viewport,
+        rows,
         theme,
         query,
         search_ranges,
@@ -908,6 +912,7 @@ pub fn build_text_appending(
     buffer: &Buffer,
     atlas: &mut Atlas,
     viewport: Viewport,
+    screen: &[ScreenRow],
     theme: &Theme,
     query: &str,
     search_ranges: Option<&[std::ops::Range<usize>]>,
@@ -976,10 +981,7 @@ pub fn build_text_appending(
     } else if !buffer.folds.is_empty() {
         // Line by line: the span from the first to the last row can hold
         // everything a fold hides.
-        let mut lines: Vec<usize> = screen_rows(buffer, viewport, m.line_height)
-            .iter()
-            .map(|r| r.line)
-            .collect();
+        let mut lines: Vec<usize> = screen.iter().map(|r| r.line).collect();
         lines.dedup();
         lines
             .into_iter()
@@ -1009,7 +1011,7 @@ pub fn build_text_appending(
     // lines on screen, so a two-space file gets guides at two.
     // Only lines with a row on screen: a fold can put a million hidden
     // lines between the first and the last.
-    let rows_on_screen = screen_rows(buffer, viewport, m.line_height);
+    let rows_on_screen = screen;
     let mut shown_lines: Vec<usize> = rows_on_screen.iter().map(|r| r.line).collect();
     shown_lines.dedup();
     let indents: Vec<Option<usize>> = shown_lines
@@ -1559,14 +1561,13 @@ pub fn build_text_appending(
 pub fn push_gutter_marks(
     out: &mut Vec<GlyphInstance>,
     atlas: &Atlas,
-    buffer: &Buffer,
     viewport: Viewport,
+    rows: &[ScreenRow],
     theme: &Theme,
     marks: &[crate::project::git::Mark],
 ) {
     use crate::project::git::MarkKind;
     let m = atlas.metrics;
-    let rows = screen_rows(buffer, viewport, m.line_height);
     let (Some(top), Some(bottom)) = (rows.first(), rows.last()) else {
         return;
     };
@@ -1617,13 +1618,12 @@ pub fn push_bulb(
     atlas: &mut Atlas,
     buffer: &Buffer,
     viewport: Viewport,
+    rows: &[ScreenRow],
     theme: &Theme,
 ) -> Option<Viewport> {
     let m = atlas.metrics;
     let line = buffer.rope.byte_to_line(buffer.cursor());
-    let row = screen_rows(buffer, viewport, m.line_height)
-        .into_iter()
-        .find(|r| r.line == line && r.first)?;
+    let row = *rows.iter().find(|r| r.line == line && r.first)?;
     let slot = atlas.slot_for(crate::project::icons::LIGHTBULB)?;
     let numbers_end = viewport.x + gutter_width(buffer, atlas) - m.advance;
     let (top, bottom) = (row.y, row.y + m.line_height);
@@ -3675,9 +3675,9 @@ pub fn push_underlines(
     atlas: &Atlas,
     buffer: &Buffer,
     text: Viewport,
+    rows: &[ScreenRow],
     marks: &[(std::ops::Range<usize>, [f32; 4])],
 ) {
-    let rows = screen_rows(buffer, text, atlas.metrics.line_height);
     let (Some(first), Some(last)) = (rows.first(), rows.last()) else {
         return;
     };
@@ -3688,7 +3688,7 @@ pub fn push_underlines(
             atlas,
             buffer,
             text,
-            &rows,
+            rows,
             (first, last),
             range.clone(),
             *color,
@@ -4764,13 +4764,27 @@ pub fn fold_chevron_at(buffer: &Buffer, atlas: &Atlas, x: f32, y: f32) -> Option
 /// view. The inverse of [`offset_at_point`], and what the input method asks
 /// for so it can put its candidate window next to what is being typed.
 pub fn caret_rect(buffer: &Buffer, atlas: &Atlas, text: Viewport) -> Option<Viewport> {
+    let rows = if buffer.row_mode() {
+        screen_rows(buffer, text, atlas.metrics.line_height)
+    } else {
+        Vec::new()
+    };
+    caret_rect_on(buffer, atlas, text, &rows)
+}
+
+/// [`caret_rect`] with the frame's rows, which it reads while wrapping or
+/// folding.
+pub fn caret_rect_on(
+    buffer: &Buffer,
+    atlas: &Atlas,
+    text: Viewport,
+    rows: &[ScreenRow],
+) -> Option<Viewport> {
     let m = atlas.metrics;
     let (line, _) = buffer.cursor_position();
     if buffer.row_mode() {
         let caret = buffer.cursor();
-        let row = screen_rows(buffer, text, m.line_height)
-            .into_iter()
-            .find(|r| r.holds(line, caret))?;
+        let row = *rows.iter().find(|r| r.holds(line, caret))?;
         let line_start = buffer.rope.line_to_byte(line);
         let split_rtl = !(row.first && row.last) && has_rtl(buffer, line);
         let x = if let Some(shaped) = atlas
@@ -4915,15 +4929,16 @@ pub fn visible_lines(
         return first..first;
     }
     if buffer.row_mode() {
-        let rows = screen_rows(buffer, viewport, line_height);
-        return match (rows.first(), rows.last()) {
-            (Some(a), Some(b)) => a.line..b.line + 1,
-            _ => first..first,
-        };
+        return lines_of(&screen_rows(buffer, viewport, line_height)).unwrap_or(first..first);
     }
     let reach = viewport.height + scroll_offset(buffer, line_height);
     let count = (reach / line_height).ceil() as usize;
     first..(first + count).min(total)
+}
+
+/// The lines `rows` touch, hidden ones inside a fold included.
+pub fn lines_of(rows: &[ScreenRow]) -> Option<std::ops::Range<usize>> {
+    Some(rows.first()?.line..rows.last()?.line + 1)
 }
 
 /// One row of text on screen: a whole line, or one row of a wrapped line.
