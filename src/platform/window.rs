@@ -153,11 +153,11 @@ fn inserted_text(characters: &str) -> String {
 /// hold everything. Scanning and watching those costs more than the
 /// sidebar is worth.
 fn too_broad_to_adopt(dir: &Path) -> bool {
-    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let dir = crate::platform::canonical(dir);
     let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
         return dir.parent().is_none();
     };
-    let home = std::fs::canonicalize(&home).unwrap_or(home);
+    let home = crate::platform::canonical(&home);
     home.starts_with(&dir)
         || ["Desktop", "Documents", "Downloads", "Library"]
             .iter()
@@ -2937,7 +2937,7 @@ define_class!(
                     .map(|entry| entry.path.clone())
             };
             let Some(path) = path else { return };
-            let source_key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            let source_key = crate::platform::canonical(&path);
             let name = path
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
@@ -5294,8 +5294,7 @@ impl EditorView {
         // front there rather than opening a second copy that could diverge.
         let elsewhere = {
             let state = self.ivars().state.borrow();
-            let key =
-                std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
+            let key = crate::platform::canonical(std::path::Path::new(path));
             state
                 .panes
                 .iter()
@@ -6395,7 +6394,7 @@ impl EditorView {
         let target = destination.join(name);
         // Canonical identity before the move, for the same reason rename
         // captures it: afterwards the old path cannot be canonicalised.
-        let source_key = std::fs::canonicalize(&drag.path).unwrap_or_else(|_| drag.path.clone());
+        let source_key = crate::platform::canonical(&drag.path);
         // Unsaved work under the item would be stranded at a path that no
         // longer exists, the same guard Move to Trash uses.
         if self
@@ -8645,9 +8644,7 @@ impl EditorView {
                 Ok(blame) => match blame.author {
                     None => "not committed yet".to_string(),
                     Some(author) => {
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map_or(0, |d| d.as_secs() as i64);
+                        let now = crate::platform::unix_seconds() as i64;
                         format!(
                             "{author}, {}: {}",
                             crate::project::git::ago(blame.time, now),
@@ -9308,9 +9305,14 @@ impl EditorView {
             let Some(asked) = state.organizing.take() else {
                 return;
             };
+            let key = crate::platform::canonical(&asked.path);
             let unchanged = all_docs(&state)
                 .flat_map(|d| d.iter())
-                .find(|b| b.path.as_deref().is_some_and(|p| same_file(p, &asked.path)))
+                .find(|b| {
+                    b.path
+                        .as_deref()
+                        .is_some_and(|p| is_open_path(p, &asked.path, &key))
+                })
                 .is_some_and(|b| b.rope.same_text(&asked.snapshot));
             let action = actions
                 .into_iter()
@@ -12115,7 +12117,7 @@ impl EditorView {
     fn rename_item(&self, path: &Path, destination: &Path) {
         // Open buffers use canonical identities. Capture the source key
         // before the rename makes it impossible to canonicalise.
-        let source_key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let source_key = crate::platform::canonical(path);
         match move_without_replace(path, destination) {
             Ok(()) => {
                 {
@@ -14171,17 +14173,27 @@ where
 /// The open document for `path`, found by one canonical key: open
 /// documents keep canonical paths, so only `path` needs resolving.
 fn open_doc_index(docs: &[&Documents], path: &Path) -> Option<(usize, usize)> {
-    let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let key = crate::platform::canonical(path);
     docs.iter().enumerate().find_map(|(d, docs)| {
         docs.iter()
             .position(|b| {
-                b.path.as_deref() == Some(key.as_path()) || b.path.as_deref() == Some(path)
+                b.path
+                    .as_deref()
+                    .is_some_and(|p| is_open_path(p, path, &key))
             })
             .map(|i| (d, i))
     })
 }
 
-/// Whether `a` and `b` name the same file, by path or by what it resolves to.
+/// Whether an open document's path `open` is `path`, whose canonical form
+/// is `key`: open documents keep canonical paths, so no lookup per
+/// document. Resolve the key once, then call this for each.
+fn is_open_path(open: &Path, path: &Path, key: &Path) -> bool {
+    open == key || open == path
+}
+
+/// Whether `a` and `b` name the same file, by path or by what it resolves
+/// to. Two lookups: for paths that are not both open documents.
 fn same_file(a: &Path, b: &Path) -> bool {
     a == b
         || std::fs::canonicalize(a)
@@ -14249,19 +14261,29 @@ impl crate::ide::mcp::Host for ClaudeHost<'_> {
 
     fn document_state(&self, path: &Path) -> Option<(bool, bool)> {
         let state = self.0.ivars().state.borrow();
+        let key = crate::platform::canonical(path);
         all_docs(&state)
             .flat_map(|docs| docs.iter())
-            .find(|b| b.path.as_deref().is_some_and(|p| same_file(path, p)))
+            .find(|b| {
+                b.path
+                    .as_deref()
+                    .is_some_and(|p| is_open_path(p, path, &key))
+            })
             .map(|b| (b.is_dirty(), false))
     }
 
     fn save(&mut self, path: &Path) -> Result<bool, String> {
         let saved = {
             let mut state = self.0.ivars().state.borrow_mut();
+            let key = crate::platform::canonical(path);
             let result = all_docs_mut(&mut state)
                 .into_iter()
                 .flat_map(|docs| docs.iter_mut())
-                .find(|b| b.path.as_deref().is_some_and(|p| same_file(path, p)))
+                .find(|b| {
+                    b.path
+                        .as_deref()
+                        .is_some_and(|p| is_open_path(p, path, &key))
+                })
                 .map(|b| b.save(None).map(|()| b.path.clone()));
             match result {
                 None => return Ok(false),
@@ -14874,8 +14896,8 @@ fn with_recent(
     root: Option<&Path>,
 ) -> Vec<std::path::PathBuf> {
     if let Some(root) = root {
-        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-        recent.retain(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()) != root);
+        let root = crate::platform::canonical(root);
+        recent.retain(|p| crate::platform::canonical(p) != root);
         recent.insert(0, root);
     }
     recent.truncate(crate::platform::session::RECENT_LIMIT);

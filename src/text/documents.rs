@@ -77,7 +77,7 @@ impl Documents {
                 path.strip_prefix(old).ok().map(|suffix| new.join(suffix))
             };
             if let Some(path) = replacement {
-                buffer.path = Some(std::fs::canonicalize(&path).unwrap_or(path));
+                buffer.path = Some(crate::platform::canonical(&path));
             }
         }
     }

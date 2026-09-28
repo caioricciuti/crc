@@ -8,7 +8,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 /// Where issues are filed.
 pub const ISSUES: &str = "https://github.com/caioricciuti/crc/issues/new";
@@ -19,8 +19,7 @@ const RECENT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// `~/Library/Logs/crc`, where Console.app looks for an app's logs.
 pub fn logs_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join("Library/Logs/crc"))
+    crate::platform::logs()
 }
 
 /// `15.6.1`, from the file the system itself reads it from.
@@ -48,9 +47,7 @@ pub fn write_crash_log(
     backtrace: &str,
 ) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
-    let stamp = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
+    let stamp = crate::platform::unix_seconds();
     let path = dir.join(format!("crash-{stamp}-{}.log", std::process::id()));
     let mut file = std::fs::File::create(&path)?;
     write!(

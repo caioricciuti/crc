@@ -58,7 +58,10 @@ pub fn rules(folder: Option<&Path>, page: &Path) -> Option<Result<Retained<AnyOb
         folder.map(|f| file_url(f, true)).as_deref(),
         &file_url(page, false),
     );
-    let id = format!("crc-preview-{:016x}", fnv(json.as_bytes()));
+    let id = format!(
+        "crc-preview-{:016x}",
+        crate::platform::fnv1a(json.as_bytes())
+    );
     let current = RULES.with(|r| match r.borrow().get(&id) {
         Some(Rules::Ready(list)) => Some(Some(Ok(list.clone()))),
         Some(Rules::Failed) => Some(Some(Err(()))),
@@ -88,12 +91,6 @@ thread_local! {
     /// Identifiers sent to WebKit, oldest first; its answers come back in
     /// the order asked.
     static PENDING: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
-}
-
-fn fnv(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
-        (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3)
-    })
 }
 
 /// A path as the file URL WebKit matches loads against.

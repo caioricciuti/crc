@@ -59,8 +59,7 @@ impl Recovered {
 
 /// Where crash directories are written.
 pub fn default_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join("Library/Application Support/crc/recovery"))
+    Some(crate::platform::app_support()?.join("recovery"))
 }
 
 /// Records the dirty documents among `buffers`, and forgets the rest.
@@ -166,9 +165,7 @@ fn dump(dir: &Path) -> std::io::Result<Option<PathBuf>> {
         return Ok(None);
     }
 
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
+    let stamp = crate::platform::unix_seconds();
     let crash = dir.join(format!("{stamp}-{}", std::process::id()));
     std::fs::create_dir_all(&crash)?;
     // Written before the entries so a failed final write remains detectable.

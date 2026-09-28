@@ -15,7 +15,7 @@ fn main() {
     let folder = args
         .first()
         .filter(|path| std::path::Path::new(path).is_dir())
-        .map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path)));
+        .map(|path| crc::platform::canonical(std::path::Path::new(path)));
     let buffer = match args.first().filter(|_| folder.is_none()) {
         // Buffer::open rather than reading the file here: it records the
         // path, which is what makes Cmd-S save back rather than fail.

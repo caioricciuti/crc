@@ -344,7 +344,7 @@ pub fn prepare(text: &str, offset: usize, path: Option<&Path>) -> Result<Prepare
             if let Some(dir) = dir {
                 let fence =
                     crate::project::git::toplevel(dir).unwrap_or_else(|_| dir.to_path_buf());
-                let fence = std::fs::canonicalize(&fence).unwrap_or(fence);
+                let fence = crate::platform::canonical(&fence);
                 let real = std::fs::canonicalize(&full)
                     .map_err(|e| format!("Could not read body file {}: {e}", full.display()))?;
                 if !real.starts_with(&fence) {
@@ -409,10 +409,7 @@ pub fn expand(
 
 fn builtin(name: &str) -> Option<String> {
     match name {
-        "$timestamp" => std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .map(|d| d.as_secs().to_string()),
+        "$timestamp" => Some(crate::platform::unix_seconds().to_string()),
         "$uuid" | "$guid" => Some(pseudo_uuid()),
         _ => None,
     }

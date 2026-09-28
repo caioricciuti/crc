@@ -61,19 +61,14 @@ const SCHEMA: &str = "
 
 /// Where the index for `root` lives.
 pub fn db_path(root: &Path) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    // FNV-1a over the path: stable, and no crate for a file name.
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in root.as_os_str().as_encoded_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0100_0000_01b3);
-    }
+    // A hash of the path: two projects with one name get two indexes.
+    let hash = crate::platform::fnv1a(root.as_os_str().as_encoded_bytes());
     let name = root
         .file_name()
         .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
     Some(
-        PathBuf::from(home)
-            .join("Library/Caches/crc/index")
+        crate::platform::caches()?
+            .join("index")
             .join(format!("{name}-{hash:016x}.db")),
     )
 }

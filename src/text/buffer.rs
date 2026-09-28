@@ -541,7 +541,7 @@ impl Buffer {
         // the sidebar versus one from Cmd-P are different keys and open a
         // second tab onto identical text, which can then diverge.
         buffer.stamp = DiskStamp::of(&path).ok();
-        buffer.path = Some(std::fs::canonicalize(&path).unwrap_or(path));
+        buffer.path = Some(crate::platform::canonical(&path));
         buffer.saved = Some(buffer.rope.clone());
         buffer.read_only = len > read_only_at;
         if let Some(path) = &buffer.path {
@@ -676,7 +676,7 @@ impl Buffer {
 
     fn preview_file(path: std::path::PathBuf) -> Self {
         let mut buffer = Buffer::new();
-        buffer.path = Some(std::fs::canonicalize(&path).unwrap_or(path));
+        buffer.path = Some(crate::platform::canonical(&path));
         buffer.preview_file = true;
         buffer.saved = Some(buffer.rope.clone());
         buffer
@@ -699,7 +699,7 @@ impl Buffer {
         text: &str,
         stamp: Option<DiskStamp>,
     ) -> Self {
-        let path = path.map(|p| std::fs::canonicalize(&p).unwrap_or(p));
+        let path = path.map(|p| crate::platform::canonical(&p));
         let mut buffer = Buffer::from_text(text);
         if let Some((saved, format)) = path
             .as_deref()
@@ -818,7 +818,7 @@ impl Buffer {
         }
         self.stamp = DiskStamp::of(&target).ok();
         self.conflict_noticed = false;
-        self.path = Some(std::fs::canonicalize(&target).unwrap_or(target));
+        self.path = Some(crate::platform::canonical(&target));
         self.saved = Some(self.rope.clone());
         self.dirty = false;
         Ok(())

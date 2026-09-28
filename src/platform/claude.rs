@@ -70,7 +70,7 @@ impl Bridge {
         let server = ws::Server::start(token.clone(), wake)?;
         let dir = lock::dir().ok_or_else(|| std::io::Error::other("no home directory"))?;
         lock::remove_stale(&dir);
-        let root = canonical(root);
+        let root = crate::platform::canonical(root);
         let lock = Lock::write(&dir, server.port(), &token, std::slice::from_ref(&root))?;
         Ok(Bridge {
             server,
@@ -86,11 +86,11 @@ impl Bridge {
 
     /// Whether this bridge was started for `root`.
     pub fn serves(&self, root: &Path) -> bool {
-        self.root == canonical(root)
+        self.root == crate::platform::canonical(root)
     }
 
     pub fn set_root(&mut self, root: &Path) -> std::io::Result<()> {
-        self.root = canonical(root);
+        self.root = crate::platform::canonical(root);
         self.lock.update(std::slice::from_ref(&self.root))
     }
 
@@ -182,12 +182,6 @@ impl Bridge {
     pub fn lock_path(&self) -> &Path {
         self.lock.path()
     }
-}
-
-/// The folder as `claude` will compare it: canonical, since a symlink or a
-/// different case does not match its working directory.
-fn canonical(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// The Accept and Reject buttons in the strip above a review.

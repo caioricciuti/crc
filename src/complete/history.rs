@@ -19,8 +19,7 @@ const MAX_ROWS: usize = 50_000;
 
 impl History {
     pub fn default_path() -> Option<PathBuf> {
-        let home = std::env::var_os("HOME")?;
-        Some(PathBuf::from(home).join("Library/Application Support/crc/completion.db"))
+        Some(crate::platform::app_support()?.join("completion.db"))
     }
 
     pub fn open(path: &Path) -> Result<History> {
@@ -42,9 +41,7 @@ impl History {
         )?;
         // What was picked once and not for a year says nothing any more; a
         // cap keeps a long life of picks from growing without end.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs() as i64);
+        let now = crate::platform::unix_seconds() as i64;
         db.execute(&format!(
             "DELETE FROM accepted WHERE count = 1 AND last < {};
              DELETE FROM accepted WHERE rowid NOT IN

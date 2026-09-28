@@ -58,12 +58,7 @@ impl Session {
     /// macOS: it is backed up, unlike Caches, and not user-facing, unlike
     /// Documents.
     pub fn path() -> Option<PathBuf> {
-        let home = std::env::var_os("HOME")?;
-        Some(
-            PathBuf::from(home)
-                .join("Library/Application Support/crc")
-                .join("session"),
-        )
+        Some(crate::platform::app_support()?.join("session"))
     }
 
     /// Reads the session, or a default one if anything is missing or wrong.

@@ -10,7 +10,7 @@
 use std::cmp::Ordering;
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 pub const RELEASES_API: &str = "https://api.github.com/repos/caioricciuti/crc/releases?per_page=20";
 
@@ -116,8 +116,7 @@ pub fn compare(a: &str, b: &str) -> Ordering {
 
 /// Where the time of the last launch check is kept.
 fn stamp_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join("Library/Application Support/crc/update-checked"))
+    Some(crate::platform::app_support()?.join("update-checked"))
 }
 
 /// Whether a launch check is due, and if so records that one is starting.
@@ -127,9 +126,7 @@ pub fn launch_check_due() -> bool {
     let Some(path) = stamp_path() else {
         return false;
     };
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
+    let now = crate::platform::unix_seconds();
     let last = std::fs::read_to_string(&path)
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok());

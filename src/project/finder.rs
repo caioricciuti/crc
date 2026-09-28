@@ -268,7 +268,7 @@ fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<Entry>, state: &mut
     }
     // A symlinked folder can point at its own ancestor, or at a folder
     // walked already: each real folder is walked once.
-    let real = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let real = crate::platform::canonical(dir);
     if !state.seen.insert(real) {
         return;
     }

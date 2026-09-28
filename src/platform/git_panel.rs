@@ -277,9 +277,8 @@ impl Panel {
         let relative = match path.strip_prefix(&snapshot.root) {
             Ok(relative) => relative.to_path_buf(),
             Err(_) => {
-                let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-                let root =
-                    std::fs::canonicalize(&snapshot.root).unwrap_or_else(|_| snapshot.root.clone());
+                let path = crate::platform::canonical(path);
+                let root = crate::platform::canonical(&snapshot.root);
                 path.strip_prefix(&root).ok()?.to_path_buf()
             }
         };

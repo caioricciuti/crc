@@ -121,10 +121,10 @@ impl Watcher {
     /// Starts watching `root`. `on_change` runs on the main thread, at most
     /// once per batch of events, with the coarsest change in the batch.
     pub fn new(root: &Path, on_change: OnChange) -> Option<Self> {
-        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let root = crate::platform::canonical(root);
         let git_dirs: Vec<PathBuf> = crate::project::git::git_dirs(&root)
             .into_iter()
-            .map(|d| std::fs::canonicalize(&d).unwrap_or(d))
+            .map(|d| crate::platform::canonical(&d))
             .collect();
         let mut watched = vec![root.clone()];
         for dir in &git_dirs {

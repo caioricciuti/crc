@@ -34,8 +34,7 @@ impl Installed {
 
 /// The folder every extension lives under.
 pub fn root() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join("Library/Application Support/crc/extensions"))
+    Some(crate::platform::app_support()?.join("extensions"))
 }
 
 /// Everything installed, by name. Folders that do not read back (a

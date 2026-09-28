@@ -37,6 +37,29 @@ pub fn caches() -> Option<std::path::PathBuf> {
     Some(home()?.join("Library/Caches/crc"))
 }
 
+/// A path as the file system resolves it (symbolic links followed, `..`
+/// gone), or as given when it cannot be resolved (a file not written yet).
+/// Open documents keep their paths this way, so comparing one key against
+/// them needs no further lookups.
+pub fn canonical(path: &std::path::Path) -> std::path::PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Seconds since 1970, 0 on a clock set before it.
+pub fn unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// FNV-1a: a stable 64-bit hash for names, no crate for it. build.rs keeps
+/// its own copy, as a build script cannot use the crate it builds.
+pub fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
 fn home() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(std::path::PathBuf::from)
 }
