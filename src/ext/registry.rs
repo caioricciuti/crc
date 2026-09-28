@@ -170,9 +170,7 @@ pub fn parse_index(bytes: &[u8]) -> Result<Index, String> {
 /// Blocking.
 pub fn download(entry: &Entry) -> Result<Package, String> {
     let wasm = fetch(&format!("{}{}", base(), entry.wasm), 16 << 20)?;
-    let hash = super::verify::sha256(&wasm)
-        .map(|h| super::verify::hex(&h))
-        .unwrap_or_default();
+    let hash = super::store::digest(&wasm);
     if hash != entry.sha256 {
         return Err(format!(
             "{} does not match the registry; it was not installed",

@@ -106,15 +106,7 @@ pub fn issue_url(body: &str) -> String {
 
 /// Everything but the unreserved characters, as UTF-8 bytes.
 fn percent_encode(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() * 3);
-    for byte in text.bytes() {
-        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
-            out.push(byte as char);
-        } else {
-            out.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    out
+    crate::lsp::percent_encode(text, b"")
 }
 
 #[cfg(test)]

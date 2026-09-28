@@ -170,10 +170,10 @@ impl Page {
     }
 }
 
-/// Whether version `a` is newer than `b`, both x.y.z.
+/// Whether version `a` is newer than `b`, by the same rule crc's own
+/// updates use: numbers first, and a prerelease before its release.
 pub fn newer(a: &str, b: &str) -> bool {
-    let parse = |v: &str| -> Vec<u64> { v.split('.').map(|p| p.parse().unwrap_or(0)).collect() };
-    parse(a) > parse(b)
+    crate::platform::update::compare(a, b) == std::cmp::Ordering::Greater
 }
 
 const PAD: f32 = 28.0;
@@ -705,6 +705,19 @@ pub fn draw_list(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_newer_version_by_the_update_rule() {
+        assert!(newer("0.2.0", "0.1.9"));
+        assert!(newer("0.10.0", "0.9.0"), "numbers, not text");
+        assert!(
+            newer("0.2.0", "0.2.0-rc.1"),
+            "a release after its prerelease"
+        );
+        assert!(!newer("0.2.0-rc.1", "0.2.0"));
+        assert!(!newer("1.0.0", "1.0.0"));
+    }
+
     use super::newer;
 
     #[test]

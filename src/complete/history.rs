@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use super::Boost;
-use crate::index::db::{Db, Result, Value};
+use crate::index::db::{Db, Result, Value, escape_like};
 
 pub struct History {
     db: Db,
@@ -161,18 +161,6 @@ impl History {
         statement.run(&[Value::Text(project)])?;
         Ok(self.db.changes())
     }
-}
-
-/// `prefix` with LIKE's wildcards made literal.
-pub fn escape_like(prefix: &str) -> String {
-    let mut out = String::with_capacity(prefix.len());
-    for c in prefix.chars() {
-        if matches!(c, '%' | '_' | '\\') {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
 }
 
 #[cfg(test)]

@@ -221,7 +221,7 @@ impl Loaded {
         let ptr = first(self.instance.call(self.alloc, &[len]).map_err(trap)?)? as usize;
         self.instance
             .memory
-            .get_mut(ptr..ptr + input.len())
+            .get_mut(ptr..ptr.saturating_add(input.len()))
             .ok_or_else(|| format!("{name} gave memory it does not have"))?
             .copy_from_slice(input.as_bytes());
         let packed = first(self.instance.call(func, &[ptr as u64, len]).map_err(trap)?)?;

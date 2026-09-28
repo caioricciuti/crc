@@ -43,6 +43,18 @@ fn err(code: c_int, message: impl Into<String>) -> Error {
     }
 }
 
+/// `prefix` with LIKE's wildcards made literal.
+pub fn escape_like(prefix: &str) -> String {
+    let mut out = String::with_capacity(prefix.len());
+    for c in prefix.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// An open database. Owns its connection exclusively.
 ///
 /// Not `Sync`: Apple builds SQLite with `THREADSAFE=2` (multi-thread, not

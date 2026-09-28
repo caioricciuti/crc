@@ -167,18 +167,7 @@ impl Server {
             ("rootUri", string(&uri_for(root))),
             (
                 "workspaceFolders",
-                Value::Array(vec![object([
-                    ("uri", string(&uri_for(root))),
-                    (
-                        "name",
-                        string(
-                            &root
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_default(),
-                        ),
-                    ),
-                ])]),
+                Value::Array(vec![super::workspace_folder(root)]),
             ),
             (
                 "clientInfo",
@@ -284,45 +273,21 @@ impl Server {
     fn request(&mut self, method: &str, params: Value, pending: Pending) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
-        let message = object([
-            ("jsonrpc", string("2.0")),
-            ("id", number(id)),
-            ("method", string(method)),
-            ("params", params),
-        ]);
         self.pending.insert(id, pending);
-        self.write(&message);
+        self.write(&crate::json::rpc::request(id, method, params));
         id
     }
 
     fn notify(&mut self, method: &str, params: Value) {
-        let message = object([
-            ("jsonrpc", string("2.0")),
-            ("method", string(method)),
-            ("params", params),
-        ]);
-        self.write(&message);
+        self.write(&crate::json::rpc::notification(method, params));
     }
 
     fn respond(&mut self, id: &Value, result: Value) {
-        let message = object([
-            ("jsonrpc", string("2.0")),
-            ("id", id.clone()),
-            ("result", result),
-        ]);
-        self.write(&message);
+        self.write(&crate::json::rpc::response(id, result));
     }
 
     fn respond_error(&mut self, id: &Value, code: i64, message: &str) {
-        let message = object([
-            ("jsonrpc", string("2.0")),
-            ("id", id.clone()),
-            (
-                "error",
-                object([("code", number(code)), ("message", string(message))]),
-            ),
-        ]);
-        self.write(&message);
+        self.write(&crate::json::rpc::error(id, code, message));
     }
 
     fn write(&mut self, message: &Value) {
@@ -338,10 +303,7 @@ impl Server {
     }
 
     fn position(at: Position) -> Value {
-        object([
-            ("line", number(at.line)),
-            ("character", number(at.character)),
-        ])
+        at.to_json()
     }
 
     /// Tells the server about a document. Sent once per path; later
@@ -981,19 +943,7 @@ impl Server {
             | "workspace/codeLens/refresh"
             | "workspace/diagnostic/refresh" => self.respond(id, Value::Null),
             "workspace/workspaceFolders" => {
-                let folder = object([
-                    ("uri", string(&uri_for(&self.root))),
-                    (
-                        "name",
-                        string(
-                            &self
-                                .root
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_default(),
-                        ),
-                    ),
-                ]);
+                let folder = super::workspace_folder(&self.root);
                 self.respond(id, Value::Array(vec![folder]));
             }
             "window/showMessageRequest" => self.respond(id, Value::Null),

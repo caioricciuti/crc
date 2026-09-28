@@ -131,8 +131,8 @@ pub fn selection_changed(selection: &Selection) -> String {
             (
                 "selection",
                 json::object([
-                    ("start", position(selection.start)),
-                    ("end", position(selection.end)),
+                    ("start", selection.start.to_json()),
+                    ("end", selection.end.to_json()),
                     ("isEmpty", Value::Bool(selection.start == selection.end)),
                 ]),
             ),
@@ -358,8 +358,8 @@ fn call(id: &Value, params: &Value, host: &mut impl Host) -> Result<Option<Value
                 (
                     "selection",
                     json::object([
-                        ("start", position(selection.start)),
-                        ("end", position(selection.end)),
+                        ("start", selection.start.to_json()),
+                        ("end", selection.end.to_json()),
                         ("isEmpty", Value::Bool(selection.start == selection.end)),
                     ]),
                 ),
@@ -474,20 +474,13 @@ fn diagnostic(d: &Diagnostic) -> Value {
         ("severity".to_owned(), json::string(severity)),
         (
             "range".to_owned(),
-            json::object([("start", position(d.start)), ("end", position(d.end))]),
+            json::object([("start", d.start.to_json()), ("end", d.end.to_json())]),
         ),
     ];
     if let Some(source) = &d.source {
         members.push(("source".to_owned(), json::string(source)));
     }
     Value::Object(members)
-}
-
-fn position(p: Position) -> Value {
-    json::object([
-        ("line", json::number(p.line)),
-        ("character", json::number(p.character)),
-    ])
 }
 
 fn content(texts: &[&str]) -> Value {
@@ -503,33 +496,15 @@ fn content(texts: &[&str]) -> Value {
 }
 
 fn response(id: &Value, result: Value) -> String {
-    json::compact(&json::object([
-        ("jsonrpc", json::string("2.0")),
-        ("id", id.clone()),
-        ("result", result),
-    ]))
+    json::compact(&json::rpc::response(id, result))
 }
 
 fn error(id: &Value, code: i64, message: &str) -> String {
-    json::compact(&json::object([
-        ("jsonrpc", json::string("2.0")),
-        ("id", id.clone()),
-        (
-            "error",
-            json::object([
-                ("code", json::number(code)),
-                ("message", json::string(message)),
-            ]),
-        ),
-    ]))
+    json::compact(&json::rpc::error(id, code, message))
 }
 
 fn notification(method: &str, params: Value) -> String {
-    json::compact(&json::object([
-        ("jsonrpc", json::string("2.0")),
-        ("method", json::string(method)),
-        ("params", params),
-    ]))
+    json::compact(&json::rpc::notification(method, params))
 }
 
 #[cfg(test)]

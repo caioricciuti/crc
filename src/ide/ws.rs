@@ -364,17 +364,8 @@ fn same(a: &[u8], b: &[u8]) -> bool {
 /// `Sec-WebSocket-Accept` for a client's key, RFC 6455 section 4.2.2.
 fn accept_key(key: &str) -> String {
     const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-    base64(&sha1(format!("{key}{GUID}").as_bytes()))
-}
-
-fn sha1(data: &[u8]) -> [u8; 20] {
-    // CommonCrypto, part of libSystem.
-    unsafe extern "C" {
-        fn CC_SHA1(data: *const u8, len: u32, md: *mut u8) -> *mut u8;
-    }
-    let mut digest = [0u8; 20];
-    unsafe { CC_SHA1(data.as_ptr(), data.len() as u32, digest.as_mut_ptr()) };
-    digest
+    let digest = crate::ext::verify::sha1(format!("{key}{GUID}").as_bytes()).unwrap_or_default();
+    base64(&digest)
 }
 
 fn base64(bytes: &[u8]) -> String {
@@ -400,7 +391,7 @@ fn base64(bytes: &[u8]) -> String {
 pub fn new_token() -> std::io::Result<String> {
     let mut bytes = [0u8; 16];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+    Ok(crate::ext::verify::hex(&bytes))
 }
 
 const OP_CONTINUATION: u8 = 0x0;

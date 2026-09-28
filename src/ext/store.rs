@@ -98,9 +98,17 @@ fn recover(root: &Path) {
     }
 }
 
+/// A folder's manifest.json: its text and what it says, or why not.
+fn read_manifest(dir: &Path) -> Result<(String, Manifest), String> {
+    let text = std::fs::read_to_string(dir.join("manifest.json"))
+        .map_err(|_| "the folder has no manifest.json".to_owned())?;
+    let value = crate::json::parse(&text).map_err(|e| format!("manifest.json: {e}"))?;
+    let manifest = manifest::parse(&value)?;
+    Ok((text, manifest))
+}
+
 fn read(dir: &Path) -> Option<Installed> {
-    let text = std::fs::read_to_string(dir.join("manifest.json")).ok()?;
-    let manifest = manifest::parse(&crate::json::parse(&text).ok()?).ok()?;
+    let (_, manifest) = read_manifest(dir).ok()?;
     // The folder must be the id it claims.
     if dir.file_name()?.to_str()? != manifest.id || !dir.join(&manifest.entry).is_file() {
         return None;
@@ -195,11 +203,7 @@ impl Package {
     /// A package from a folder holding manifest.json, README.md and the
     /// module. Unsigned.
     pub fn from_folder(folder: &Path) -> Result<Package, String> {
-        let manifest_json = std::fs::read_to_string(folder.join("manifest.json"))
-            .map_err(|_| "the folder has no manifest.json".to_owned())?;
-        let value =
-            crate::json::parse(&manifest_json).map_err(|e| format!("manifest.json: {e}"))?;
-        let manifest = manifest::parse(&value)?;
+        let (manifest_json, manifest) = read_manifest(folder)?;
         // The size first: this runs just after the folder is picked, and a
         // multi-gigabyte `entry` was read whole before being refused.
         let module = folder.join(&manifest.entry);

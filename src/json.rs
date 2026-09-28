@@ -475,6 +475,47 @@ fn write_string(s: &str, out: &mut String) {
     out.push('"');
 }
 
+/// JSON-RPC 2.0 messages, for the language servers and the Claude bridge.
+pub mod rpc {
+    use super::{Value, number, object, string};
+
+    pub fn request(id: u64, method: &str, params: Value) -> Value {
+        object([
+            ("jsonrpc", string("2.0")),
+            ("id", number(id)),
+            ("method", string(method)),
+            ("params", params),
+        ])
+    }
+
+    pub fn notification(method: &str, params: Value) -> Value {
+        object([
+            ("jsonrpc", string("2.0")),
+            ("method", string(method)),
+            ("params", params),
+        ])
+    }
+
+    pub fn response(id: &Value, result: Value) -> Value {
+        object([
+            ("jsonrpc", string("2.0")),
+            ("id", id.clone()),
+            ("result", result),
+        ])
+    }
+
+    pub fn error(id: &Value, code: i64, message: &str) -> Value {
+        object([
+            ("jsonrpc", string("2.0")),
+            ("id", id.clone()),
+            (
+                "error",
+                object([("code", number(code)), ("message", string(message))]),
+            ),
+        ])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

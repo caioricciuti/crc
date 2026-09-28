@@ -281,7 +281,7 @@ impl Reader {
 
     /// Definitions whose name starts with `prefix`, shortest names first.
     pub fn symbols(&self, prefix: &str, limit: usize) -> Result<Vec<Symbol>> {
-        let like = format!("{}%", crate::complete::history::escape_like(prefix));
+        let like = format!("{}%", crate::index::db::escape_like(prefix));
         let mut statement = self.db.prepare(
             "SELECT name, kind, path, line FROM symbols JOIN files ON files.id = symbols.file
              WHERE name LIKE ?1 ESCAPE '\\' ORDER BY length(name), name LIMIT ?2",
@@ -305,7 +305,7 @@ impl Reader {
     pub fn containing(&self, needle: &str, limit: usize) -> Result<Vec<Symbol>> {
         let mut like = String::from("%");
         for c in needle.chars() {
-            like.push_str(&crate::complete::history::escape_like(&c.to_string()));
+            like.push_str(&crate::index::db::escape_like(&c.to_string()));
             like.push('%');
         }
         let mut statement = self.db.prepare(
@@ -328,7 +328,7 @@ impl Reader {
     /// Words starting with `prefix`: the word, how often it is used across
     /// the project, and in how many files.
     pub fn words(&self, prefix: &str, limit: usize) -> Result<Vec<(String, u32, u32)>> {
-        let like = format!("{}%", crate::complete::history::escape_like(prefix));
+        let like = format!("{}%", crate::index::db::escape_like(prefix));
         let mut statement = self.db.prepare(
             "SELECT word, SUM(count), COUNT(*) FROM words WHERE word LIKE ?1 ESCAPE '\\'
              GROUP BY word ORDER BY SUM(count) DESC LIMIT ?2",

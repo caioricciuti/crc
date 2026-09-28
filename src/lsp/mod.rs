@@ -26,6 +26,16 @@ pub struct Position {
     pub character: u32,
 }
 
+impl Position {
+    /// `{"line": .., "character": ..}`, as the protocol writes it.
+    pub fn to_json(self) -> crate::json::Value {
+        crate::json::object([
+            ("line", crate::json::number(self.line)),
+            ("character", crate::json::number(self.character)),
+        ])
+    }
+}
+
 /// Where a byte offset in `rope` is, in protocol terms.
 pub fn position_of(rope: &Rope, byte: usize) -> Position {
     let byte = byte.min(rope.len_bytes());
@@ -62,16 +72,33 @@ pub fn offset_of(rope: &Rope, position: Position) -> usize {
 
 /// A `file://` URI for `path`, percent-encoding what a URI cannot carry.
 pub fn uri_for(path: &Path) -> String {
-    let mut out = String::from("file://");
-    for byte in path.to_string_lossy().bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
-                out.push(byte as char)
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
+    format!("file://{}", percent_encode(&path.to_string_lossy(), b"/"))
+}
+
+/// `text` with every byte percent-encoded but the unreserved ones (letters,
+/// digits, `-._~`) and those in `keep`.
+pub fn percent_encode(text: &str, keep: &[u8]) -> String {
+    let mut out = String::with_capacity(text.len() * 3);
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) || keep.contains(&byte) {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
         }
     }
     out
+}
+
+/// A workspace folder object for `root`: its URI and its name.
+pub fn workspace_folder(root: &Path) -> crate::json::Value {
+    let name = root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    crate::json::object([
+        ("uri", crate::json::string(&uri_for(root))),
+        ("name", crate::json::string(&name)),
+    ])
 }
 
 /// The path of a `file://` URI, or `None` for any other scheme.

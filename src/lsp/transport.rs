@@ -7,7 +7,7 @@
 //! killed when the transport is dropped, so a server never outlives the
 //! editor.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
@@ -189,14 +189,27 @@ fn write_frames(
 /// JSON, or is too large to take, comes back as `Some(Err(..))`, and the
 /// stream carries on after it. Lines before a header (a wrapper's banner, a
 /// runtime's warning on stdout) are skipped.
+/// The most header bytes one message may carry. Real ones are a line or
+/// two; the cap keeps a stream that never ends a line from filling memory.
+const MAX_HEADER_BYTES: u64 = 64 * 1024;
+
 fn read_message<R: BufRead>(reader: &mut R) -> std::io::Result<Option<Result<Value, String>>> {
     let mut length: Option<usize> = None;
     let mut line = String::new();
+    let mut header_bytes = 0u64;
     loop {
         line.clear();
-        if reader.read_line(&mut line)? == 0 {
+        let n = reader
+            .by_ref()
+            .take(MAX_HEADER_BYTES - header_bytes)
+            .read_line(&mut line)?;
+        if n == 0 {
+            if header_bytes >= MAX_HEADER_BYTES {
+                return Err(std::io::Error::other("message headers too long"));
+            }
             return Ok(None);
         }
+        header_bytes += n as u64;
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             if length.is_some() {
@@ -257,5 +270,21 @@ mod tests {
             Some(Ok(Value::Bool(true)))
         );
         assert_eq!(read_message(&mut reader).unwrap(), None);
+    }
+
+    #[test]
+    fn a_header_that_never_ends_is_refused_not_held() {
+        let mut stream = b"Content-Length: 4\r\nX-Junk: ".to_vec();
+        stream.extend(std::iter::repeat_n(b'x', 100 * 1024));
+        let mut reader = BufReader::new(&stream[..]);
+        assert!(read_message(&mut reader).is_err());
+        // A large header set that does end is still read.
+        let mut fine = b"Content-Length: 4\r\n".to_vec();
+        for _ in 0..100 {
+            fine.extend_from_slice(b"X-Pad: 0123456789\r\n");
+        }
+        fine.extend_from_slice(b"\r\nnull");
+        let mut reader = BufReader::new(&fine[..]);
+        assert_eq!(read_message(&mut reader).unwrap(), Some(Ok(Value::Null)));
     }
 }
