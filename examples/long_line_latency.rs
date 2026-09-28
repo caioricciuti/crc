@@ -9,7 +9,7 @@ use std::time::Instant;
 
 fn p99(samples: &mut [f64]) -> f64 {
     samples.sort_by(f64::total_cmp);
-    samples[(samples.len() * 99).div_ceil(100).saturating_sub(1)]
+    crc::platform::latency::nearest_rank(samples, 0.99)
 }
 
 fn measure(label: &str, source: &str, cursor: usize, scroll: usize) {

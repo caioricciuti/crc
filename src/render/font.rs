@@ -66,6 +66,12 @@ unsafe extern "C" {
     ) -> bool;
 }
 
+/// The C bridge asks this whether to stop: `context` is an AtomicBool the
+/// caller keeps for the length of the synchronous call.
+extern "C" fn cancelled(context: *const c_void) -> bool {
+    unsafe { &*context.cast::<AtomicBool>() }.load(Ordering::Relaxed)
+}
+
 #[cfg(test)]
 fn caret_offsets(
     line: &CTLine,
@@ -73,10 +79,6 @@ fn caret_offsets(
     scale: f32,
     cancel: &AtomicBool,
 ) -> Option<(Vec<f32>, Vec<f32>)> {
-    extern "C" fn cancelled(context: *const c_void) -> bool {
-        // The synchronous C bridge borrows this AtomicBool only for this call.
-        unsafe { &*context.cast::<AtomicBool>() }.load(Ordering::Relaxed)
-    }
     let count = text.encode_utf16().count() + 1;
     let mut primary = vec![0.0; count];
     let mut secondary = vec![0.0; count];
@@ -193,6 +195,19 @@ impl ShapedLine {
     }
 }
 
+/// Shapes the paragraph at `range` of `rope`, without its line ending: the
+/// one way a paragraph is shaped, whether now or on the shaping thread.
+pub(crate) fn shape_paragraph(
+    font: &CTFont,
+    rope: &Rope,
+    range: std::ops::Range<usize>,
+    scale: f32,
+    cancel: &AtomicBool,
+) -> Option<ShapedLine> {
+    let text = rope.slice_to_string(range);
+    shape(font, text.trim_end_matches(['\r', '\n']), scale, cancel)
+}
+
 fn shape(font: &CTFont, source: &str, scale: f32, cancel: &AtomicBool) -> Option<ShapedLine> {
     let started = std::time::Instant::now();
     let (text, bytes) = shape_input_bounded(source, MAX_CACHED_UTF16 - 1, cancel)?;
@@ -223,9 +238,6 @@ fn shape(font: &CTFont, source: &str, scale: f32, cancel: &AtomicBool) -> Option
         return None;
     }
     let line_time = started.elapsed();
-    extern "C" fn cancelled(context: *const c_void) -> bool {
-        unsafe { &*context.cast::<AtomicBool>() }.load(Ordering::Relaxed)
-    }
     let count = bytes.len();
     let mut offsets = vec![0.0; count];
     let mut secondary_offsets = vec![0.0; count];
@@ -1275,10 +1287,10 @@ impl Atlas {
             return None;
         }
         if range.len().saturating_mul(4) <= SYNC_SHAPED_BYTES {
-            let text = rope.slice_to_string(range);
-            let shaped = shape(
+            let shaped = shape_paragraph(
                 &self.font,
-                text.trim_end_matches(['\r', '\n']),
+                rope,
+                range,
                 self.metrics.scale,
                 &AtomicBool::new(false),
             )
@@ -1796,16 +1808,8 @@ fn glyph_in(font: &CTFont, text: &[u16]) -> Option<u16> {
 
 /// Finds a font containing `text`, returning it with the glyph id.
 fn resolve_glyph(primary: &CTFont, text: &[u16]) -> Option<(Option<CFRetained<CTFont>>, u16)> {
-    let mut glyphs = [0u16; 2];
-    let ok = unsafe {
-        primary.glyphs_for_characters(
-            NonNull::new(text.as_ptr() as *mut u16)?,
-            NonNull::new(glyphs.as_mut_ptr())?,
-            text.len() as isize,
-        )
-    };
-    if ok && glyphs[0] != 0 {
-        return Some((None, glyphs[0]));
+    if let Some(glyph) = glyph_in(primary, text) {
+        return Some((None, glyph));
     }
 
     // CTFontCreateForString is the system's own fallback chain: it is how
@@ -1817,16 +1821,8 @@ fn resolve_glyph(primary: &CTFont, text: &[u16]) -> Option<(Option<CFRetained<CT
         length: text.len() as isize,
     };
     let fallback = unsafe { CTFont::for_string(primary, &cf, range) };
-
-    let mut glyphs = [0u16; 2];
-    let ok = unsafe {
-        fallback.glyphs_for_characters(
-            NonNull::new(text.as_ptr() as *mut u16)?,
-            NonNull::new(glyphs.as_mut_ptr())?,
-            text.len() as isize,
-        )
-    };
-    (ok && glyphs[0] != 0).then_some((Some(fallback), glyphs[0]))
+    let glyph = glyph_in(&fallback, text)?;
+    Some((Some(fallback), glyph))
 }
 
 /// A font that has been confirmed usable, with its ASCII glyphs resolved.

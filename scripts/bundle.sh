@@ -36,7 +36,7 @@ cd "$(dirname "$0")/.."
 
 APP_NAME="crc"
 BUNDLE_ID="dev.ricciuti.crc"
-VERSION=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = //; s/"//g')
+VERSION=$(scripts/version.sh)
 APP="target/${APP_NAME}.app"
 
 echo "==> building release binary"

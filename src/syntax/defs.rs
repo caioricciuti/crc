@@ -7,10 +7,9 @@
 //! Runs on any thread: it makes its own parser and query each call, which
 //! costs microseconds against the parse itself.
 
-use std::ffi::c_void;
 use std::ptr::NonNull;
 
-use super::{Language, ReadState, ffi, read_rope};
+use super::{Language, ReadState, ffi};
 use crate::text::rope::Rope;
 
 /// One definition.
@@ -138,16 +137,8 @@ pub fn definitions(language: Language, text: &str) -> Vec<Definition> {
     unsafe {
         let parser = ffi::ts_parser_new();
         if !parser.is_null() && ffi::ts_parser_set_language(parser, language.raw()) {
-            let mut state = ReadState {
-                rope: &rope,
-                chunk: Vec::with_capacity(4096),
-            };
-            let input = ffi::TSInput {
-                payload: &mut state as *mut ReadState as *mut c_void,
-                read: Some(read_rope),
-                encoding: ffi::TS_INPUT_ENCODING_UTF8,
-                decode: std::ptr::null(),
-            };
+            let mut state = ReadState::new(&rope);
+            let input = state.input();
             let tree = ffi::ts_parser_parse(parser, std::ptr::null(), input);
             if let Some(tree) = NonNull::new(tree) {
                 collect(query, tree, text, &mut out);

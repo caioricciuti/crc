@@ -93,7 +93,9 @@ impl Latency {
 
 /// Nearest-rank percentile of ascending `sorted`, which for a window this
 /// small is more honest than interpolating between two samples.
-fn nearest_rank(sorted: &[f64], p: f64) -> f64 {
+/// The nearest-rank percentile `p` (0 to 1) of `sorted`, ascending; the
+/// gates in examples/ use the same rule as the status line.
+pub fn nearest_rank(sorted: &[f64], p: f64) -> f64 {
     if sorted.is_empty() {
         return 0.0;
     }

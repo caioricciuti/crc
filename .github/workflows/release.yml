@@ -30,7 +30,7 @@ jobs:
 
       - name: The tag must be the version in Cargo.toml
         run: |
-          version=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = //; s/"//g')
+          version=$(scripts/version.sh)
           if [ "v$version" != "$GITHUB_REF_NAME" ]; then
             echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $version" >&2
             exit 1

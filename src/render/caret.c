@@ -362,11 +362,7 @@ bool crc_line_indexed_carets(CTLineRef line, CFAttributedStringRef attributed,
         CFRelease(window);
         if (aborted) goto done;
     }
-    float next = 0;
-    for (size_t i = count; i-- > 0;) {
-        if (!isfinite(left[i])) left[i] = right[i] = next;
-        next = left[i];
-    }
+    fill_missing_edges(left, right, count);
     complete = !is_cancelled(cancelled, context);
     if (getenv("CRC_SHAPE_PROFILE")) fprintf(stderr, "caret index: fast %zu reused %zu windows %zu whole %zu zeros %zu largest %zu attempts %zu copy %.3f ms query %.3f ms (create %.3f enumerate %.3f primary %.3f)\n",fast,reused,windows,full,zeros,largest,attempts,(copied-began)*1000,(CFAbsoluteTimeGetCurrent()-copied)*1000,creation*1000,enumeration*1000,queries*1000);
 done:

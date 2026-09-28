@@ -114,11 +114,7 @@ fn synth(target_bytes: usize) -> String {
 }
 
 fn percentile(sorted: &[f64], p: f64) -> f64 {
-    if sorted.is_empty() {
-        return 0.0;
-    }
-    let rank = (p * sorted.len() as f64).ceil().max(1.0) as usize;
-    sorted[(rank - 1).min(sorted.len() - 1)]
+    crc::platform::latency::nearest_rank(sorted, p)
 }
 
 fn report(name: &str, mut samples: Vec<f64>) {

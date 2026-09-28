@@ -1,6 +1,6 @@
 //! One cancellable shaping worker per atlas, with bounded, coalesced requests.
 use super::reuse::LineReuse;
-use super::{ShapedLine, load_monospace, shape};
+use super::{ShapedLine, load_monospace};
 use crate::text::rope::Rope;
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
@@ -71,9 +71,13 @@ impl Worker {
                     if job.cancelled.load(Ordering::Relaxed) {
                         continue;
                     }
-                    let source = job.rope.slice_to_string(job.range.clone());
-                    let source = source.trim_end_matches(['\r', '\n']);
-                    let shaped = shape(&font, source, scale, &job.cancelled);
+                    let shaped = super::shape_paragraph(
+                        &font,
+                        &job.rope,
+                        job.range.clone(),
+                        scale,
+                        &job.cancelled,
+                    );
                     if job.cancelled.load(Ordering::Relaxed) {
                         continue;
                     }

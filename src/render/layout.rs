@@ -2551,18 +2551,7 @@ pub fn build_palette(
             [0.0, 0.0, 0.0, alpha],
         );
     }
-    push_rounded_rect(out, viewport, 12.0, theme.palette_border);
-    push_rounded_rect(
-        out,
-        Viewport {
-            x: viewport.x + 0.5,
-            y: viewport.y + 0.5,
-            width: (viewport.width - 1.0).max(0.0),
-            height: (viewport.height - 1.0).max(0.0),
-        },
-        11.5,
-        theme.palette_background,
-    );
+    push_panel(out, viewport, 12.0, theme);
     let input = Viewport {
         x: viewport.x + 18.0,
         y: viewport.y + 8.0,
@@ -3882,18 +3871,7 @@ pub fn build_signature(
         width,
         height,
     };
-    push_rounded_rect(out, panel, 6.0, theme.palette_border);
-    push_rounded_rect(
-        out,
-        Viewport {
-            x: panel.x + 0.5,
-            y: panel.y + 0.5,
-            width: (panel.width - 1.0).max(0.0),
-            height: (panel.height - 1.0).max(0.0),
-        },
-        5.5,
-        theme.palette_background,
-    );
+    push_panel(out, panel, 6.0, theme);
     let active = active.filter(|r| r.start <= r.end && shown.get(r.clone()).is_some());
     let parts: [(&str, [f32; 4]); 3] = match &active {
         Some(r) => [
@@ -4010,18 +3988,7 @@ pub fn build_completion_ribbon(
         10.0,
         [0.0, 0.0, 0.0, 0.16],
     );
-    push_rounded_rect(out, panel, 8.0, theme.palette_border);
-    push_rounded_rect(
-        out,
-        Viewport {
-            x: panel.x + 0.5,
-            y: panel.y + 0.5,
-            width: (panel.width - 1.0).max(0.0),
-            height: (panel.height - 1.0).max(0.0),
-        },
-        7.5,
-        theme.palette_background,
-    );
+    push_panel(out, panel, 8.0, theme);
 
     let (cell_w, cell_h) = atlas.cell_size();
     let glyph_dy = atlas.metrics.glyph_dy(RIBBON_HEIGHT - 6.0);
@@ -5607,6 +5574,23 @@ pub fn build_breadcrumbs(
         [rect.x, rect.y + rect.height - 1.0 / atlas.metrics.scale],
         [rect.width, 1.0 / atlas.metrics.scale],
         theme.hairline,
+    );
+}
+
+/// A floating panel: a hairline in the palette's border colour around its
+/// background, both rounded by `radius`.
+pub fn push_panel(out: &mut Vec<GlyphInstance>, rect: Viewport, radius: f32, theme: &Theme) {
+    push_rounded_rect(out, rect, radius, theme.palette_border);
+    push_rounded_rect(
+        out,
+        Viewport {
+            x: rect.x + 0.5,
+            y: rect.y + 0.5,
+            width: (rect.width - 1.0).max(0.0),
+            height: (rect.height - 1.0).max(0.0),
+        },
+        radius - 0.5,
+        theme.palette_background,
     );
 }
 

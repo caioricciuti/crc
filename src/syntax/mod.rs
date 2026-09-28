@@ -328,6 +328,26 @@ struct ReadState<'a> {
     chunk: Vec<u8>,
 }
 
+impl<'a> ReadState<'a> {
+    fn new(rope: &'a Rope) -> Self {
+        ReadState {
+            rope,
+            chunk: Vec::with_capacity(4096),
+        }
+    }
+
+    /// The input tree-sitter reads `rope` through. It points at `self`,
+    /// which must stay where it is until the parse returns.
+    fn input(&mut self) -> ffi::TSInput {
+        ffi::TSInput {
+            payload: self as *mut ReadState as *mut c_void,
+            read: Some(read_rope),
+            encoding: ffi::TS_INPUT_ENCODING_UTF8,
+            decode: std::ptr::null(),
+        }
+    }
+}
+
 /// Feeds rope text to the parser on demand.
 ///
 /// # Safety
@@ -592,16 +612,8 @@ impl Highlighter {
             unsafe { ffi::ts_tree_edit(old.raw.as_ptr(), &raw) };
         }
 
-        let mut state = ReadState {
-            rope,
-            chunk: Vec::with_capacity(4096),
-        };
-        let input = ffi::TSInput {
-            payload: &mut state as *mut ReadState as *mut c_void,
-            read: Some(read_rope),
-            encoding: ffi::TS_INPUT_ENCODING_UTF8,
-            decode: std::ptr::null(),
-        };
+        let mut state = ReadState::new(rope);
+        let input = state.input();
         // SAFETY: as `parse`, but handing the edited old tree back so its
         // untouched subtrees can be reused.
         let raw = unsafe { ffi::ts_parser_parse(self.parser.as_ptr(), old.raw.as_ptr(), input) };
@@ -610,16 +622,8 @@ impl Highlighter {
 
     /// Parses a rope into a tree.
     pub fn parse(&mut self, rope: &Rope) -> Option<Tree> {
-        let mut state = ReadState {
-            rope,
-            chunk: Vec::with_capacity(4096),
-        };
-        let input = ffi::TSInput {
-            payload: &mut state as *mut ReadState as *mut c_void,
-            read: Some(read_rope),
-            encoding: ffi::TS_INPUT_ENCODING_UTF8,
-            decode: std::ptr::null(),
-        };
+        let mut state = ReadState::new(rope);
+        let input = state.input();
         // SAFETY: the parser is live, the input payload outlives the call
         // because `state` is on this stack frame, and a null old_tree means
         // a fresh parse.
