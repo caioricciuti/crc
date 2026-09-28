@@ -977,6 +977,17 @@ impl Buffer {
         self.cursor
     }
 
+    /// What the document is called: its file name, else its label (a
+    /// response tab), else "Untitled".
+    pub fn display_name(&self) -> String {
+        self.path
+            .as_deref()
+            .and_then(std::path::Path::file_name)
+            .map(|n| n.to_string_lossy().into_owned())
+            .or_else(|| self.label.clone())
+            .unwrap_or_else(|| "Untitled".to_string())
+    }
+
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }

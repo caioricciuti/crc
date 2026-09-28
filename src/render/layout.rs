@@ -5507,7 +5507,7 @@ pub fn build_breadcrumbs(
 ) {
     let crumbs = breadcrumb_segments(buffer, tree, atlas, rect);
     if crumbs.is_empty() && !home {
-        let label = buffer.label.clone().unwrap_or_else(|| "Untitled".into());
+        let label = buffer.display_name();
         push_ui_text(
             out,
             atlas,

@@ -272,16 +272,9 @@ impl Documents {
         if self.is_home() {
             return "Home".to_string();
         }
-        let Some(buffer) = self.buffers.get(index) else {
-            return "Untitled".to_string();
-        };
-        buffer
-            .path
-            .as_ref()
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
-            .or_else(|| buffer.label.clone())
-            .unwrap_or_else(|| "Untitled".to_string())
+        self.buffers
+            .get(index)
+            .map_or_else(|| "Untitled".to_string(), Buffer::display_name)
     }
 
     /// The tab of the generated document titled `label`, if one is open.

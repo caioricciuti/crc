@@ -331,6 +331,38 @@ impl Rope {
         Arc::ptr_eq(&self.root, &other.root)
     }
 
+    /// Whether `other` holds the same text. The same tree answers at once,
+    /// a different length next; otherwise the chunks are compared in step,
+    /// with no copy of either document. An edit then undone is a different
+    /// tree with the same text, and answers true.
+    pub fn same_text(&self, other: &Rope) -> bool {
+        if self.same_as(other) {
+            return true;
+        }
+        if self.len_bytes() != other.len_bytes() {
+            return false;
+        }
+        let mut theirs = other.bytes_in(0..other.len_bytes());
+        let mut pending: &[u8] = &[];
+        for mut mine in self.bytes_in(0..self.len_bytes()) {
+            while !mine.is_empty() {
+                if pending.is_empty() {
+                    match theirs.next() {
+                        Some(next) => pending = next,
+                        None => return false,
+                    }
+                }
+                let n = mine.len().min(pending.len());
+                if mine[..n] != pending[..n] {
+                    return false;
+                }
+                mine = &mine[n..];
+                pending = &pending[n..];
+            }
+        }
+        true
+    }
+
     /// Inserts at a byte offset. Panics if the offset is out of bounds or
     /// lands inside a multi-byte character.
     pub fn insert(&mut self, at: usize, text: &str) {
@@ -1074,6 +1106,34 @@ impl<'a> Iterator for ByteChunks<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_text_compares_content_across_different_chunking() {
+        let source = "é漢🌍 line\n".repeat(50_000);
+        let a = Rope::from_text(&source);
+        assert!(a.same_text(&a.clone()), "the same tree");
+        // Built by edits, so its chunks break at other places.
+        let mut b = Rope::from_text("");
+        for line in source.split_inclusive('\n').collect::<Vec<_>>().chunks(997) {
+            b.insert(b.len_bytes(), &line.concat());
+        }
+        assert!(!a.same_as(&b));
+        assert!(a.same_text(&b) && b.same_text(&a));
+        // An edit then undone: another tree, the same text.
+        let mut c = a.clone();
+        c.insert(10, "x");
+        assert!(!a.same_text(&c));
+        c.delete(10..11);
+        assert!(a.same_text(&c));
+        // Same length, one byte different, near the end.
+        let mut d = a.clone();
+        let at = source.len() - 3;
+        d.delete(at..at + 1);
+        d.insert(at, "L");
+        assert_eq!(d.len_bytes(), a.len_bytes());
+        assert!(!a.same_text(&d));
+        assert!(Rope::new().same_text(&Rope::from_text("")));
+    }
 
     #[test]
     fn unchanged_edges_skip_shared_megabytes_and_bound_unrelated_text() {

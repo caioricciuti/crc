@@ -938,6 +938,52 @@ fn ext_language(buffer: &Buffer) -> String {
         .unwrap_or_else(|| "text".into())
 }
 
+/// Keeps the completion list on the word it was opened for: filtered by
+/// what has been typed since its anchor, closed once the caret is before
+/// the anchor, in another document, or past a space or a `/` (a path
+/// completion starts again after the slash). Whether it is still open.
+fn follow_completion(state: &mut State) -> bool {
+    let buffer = state.docs.active();
+    let (id, caret) = (buffer.id(), buffer.cursor());
+    let prefix = state
+        .completion
+        .as_ref()
+        .filter(|popup| popup.buffer == id && caret >= popup.anchor)
+        .map(|popup| buffer.rope.slice_to_string(popup.anchor..caret))
+        .filter(|prefix| !prefix.contains(char::is_whitespace) && !prefix.contains('/'));
+    match (prefix, &mut state.completion) {
+        (Some(prefix), Some(popup)) => {
+            popup.refilter(&prefix);
+            true
+        }
+        _ => {
+            state.completion = None;
+            false
+        }
+    }
+}
+
+/// After files were written to disk by crc: Git status and the project
+/// index look again.
+fn note_files_written(state: &mut State) {
+    state.git.refresh();
+    if let Some(indexer) = &state.indexer {
+        indexer.poke();
+    }
+}
+
+/// After documents were edited in place by something other than typing:
+/// the server gets the text on its next flush, without waiting out the
+/// pause, and the gutter's change marks are worked out again.
+fn note_documents_edited(state: &mut State, ids: impl IntoIterator<Item = u64>) {
+    for id in ids {
+        state
+            .lsp_dirty
+            .insert(id, Instant::now() - Duration::from_secs(1));
+        state.gutter_dirty.insert(id, Instant::now());
+    }
+}
+
 /// Sends `request` to the extension thread, starting it if needed, and
 /// files `call` to meet the answer. False when the thread is gone.
 fn send_ext_job(
@@ -1050,6 +1096,17 @@ fn find_matches<'a>(
     if bar.query.rope.len_bytes() == 0 || buffer.rope.len_bytes() > 2 * 1024 * 1024 {
         return None;
     }
+    fill_find_cache(cache, bar, buffer).ok()
+}
+
+/// Makes `cache` hold the find bar's matches in `buffer`, searching only
+/// when the text, query or options changed since it was filled. An invalid
+/// pattern is the error.
+fn fill_find_cache<'a>(
+    cache: &'a mut Option<FindCache>,
+    bar: &FindBar,
+    buffer: &Buffer,
+) -> Result<&'a [search::Match], String> {
     let query = bar.query.rope.to_string();
     let fresh = cache.as_ref().is_some_and(|c| {
         c.buffer == buffer.id()
@@ -1058,7 +1115,7 @@ fn find_matches<'a>(
             && c.options == bar.options
     });
     if !fresh {
-        let matches = search::find(&buffer.rope.to_string(), &query, "", bar.options).ok()?;
+        let matches = search::find(&buffer.rope.to_string(), &query, "", bar.options)?;
         *cache = Some(FindCache {
             buffer: buffer.id(),
             text: buffer.rope.clone(),
@@ -1067,7 +1124,7 @@ fn find_matches<'a>(
             matches,
         });
     }
-    cache.as_ref().map(|c| c.matches.as_slice())
+    Ok(cache.as_ref().map_or(&[], |c| c.matches.as_slice()))
 }
 
 struct FindBar {
@@ -5350,17 +5407,7 @@ impl EditorView {
 
     /// Save found the file changed (or gone) since it was opened.
     fn ask_about_conflict(&self, missing: bool) -> Conflict {
-        let name = {
-            let state = self.ivars().state.borrow();
-            state
-                .docs
-                .active()
-                .path
-                .as_ref()
-                .and_then(|p| p.file_name())
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "Untitled".to_string())
-        };
+        let name = self.ivars().state.borrow().docs.active().display_name();
         let mtm = MainThreadMarker::from(self);
         let alert = NSAlert::new(mtm);
         alert.setAlertStyle(NSAlertStyle::Warning);
@@ -5424,17 +5471,7 @@ impl EditorView {
     }
 
     fn confirm_revert(&self) -> bool {
-        let name = {
-            let state = self.ivars().state.borrow();
-            state
-                .docs
-                .active()
-                .path
-                .as_ref()
-                .and_then(|p| p.file_name())
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "Untitled".to_string())
-        };
+        let name = self.ivars().state.borrow().docs.active().display_name();
         let mtm = MainThreadMarker::from(self);
         let alert = NSAlert::new(mtm);
         alert.setAlertStyle(NSAlertStyle::Warning);
@@ -5634,14 +5671,7 @@ impl EditorView {
             let state = self.ivars().state.borrow();
             (
                 state.docs.active().is_dirty(),
-                state
-                    .docs
-                    .active()
-                    .path
-                    .as_ref()
-                    .and_then(|p| p.file_name())
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "Untitled".to_string()),
+                state.docs.active().display_name(),
             )
         };
         if !dirty {
@@ -5771,10 +5801,7 @@ impl EditorView {
             Instant::now(),
         ));
         if ok {
-            state.git.refresh();
-            if let Some(indexer) = &state.indexer {
-                indexer.poke();
-            }
+            note_files_written(&mut state);
         }
         let saved_path = ok.then(|| state.docs.active().path.clone()).flatten();
         drop(state);
@@ -6091,6 +6118,33 @@ impl EditorView {
 
     /// Re-runs the search from the top of the current match, so the selection
     /// tracks the query as it changes, however it changed.
+    /// The find bar's matches in the active document, for an action: the
+    /// needle, and the matches or `None` when there is nothing to do. Find
+    /// reuses the matches drawing keeps; a replacement is expanded per
+    /// match, so replacing searches afresh. No size limit here: an action
+    /// runs once, drawing runs every frame. An invalid pattern says so.
+    fn action_matches(&self, replacement: Option<&str>) -> Option<(String, Vec<search::Match>)> {
+        let mut state = self.ivars().state.borrow_mut();
+        let state = &mut *state;
+        let bar = state.find.as_ref()?;
+        let needle = bar.query.rope.to_string();
+        if needle.is_empty() {
+            return None;
+        }
+        let buffer = state.docs.active();
+        let found = match replacement {
+            None => fill_find_cache(&mut state.find_cache, bar, buffer).map(<[_]>::to_vec),
+            Some(with) => search::find(&buffer.rope.to_string(), &needle, with, bar.options),
+        };
+        match found {
+            Ok(matches) => Some((needle, matches)),
+            Err(error) => {
+                state.message = Some((format!("invalid regex: {error}"), Instant::now()));
+                None
+            }
+        }
+    }
+
     fn refresh_find(&self) {
         {
             let mut state = self.ivars().state.borrow_mut();
@@ -6106,31 +6160,13 @@ impl EditorView {
                 return;
             }
         }
-        let (at, query, options, text) = {
+        let at = {
             let state = self.ivars().state.borrow();
-            let at = state
-                .docs
-                .active()
-                .selection()
-                .map_or(state.docs.active().cursor(), |r| r.start);
-            let Some(bar) = &state.find else { return };
-            (
-                at,
-                bar.query.rope.to_string(),
-                bar.options,
-                state.docs.active().rope.to_string(),
-            )
+            let active = state.docs.active();
+            active.selection().map_or(active.cursor(), |r| r.start)
         };
-        if query.is_empty() {
+        let Some((_, matches)) = self.action_matches(None) else {
             return;
-        }
-        let matches = match search::find(&text, &query, "", options) {
-            Ok(matches) => matches,
-            Err(error) => {
-                self.ivars().state.borrow_mut().message =
-                    Some((format!("invalid regex: {error}"), Instant::now()));
-                return;
-            }
         };
         if let Some(found) = matches
             .iter()
@@ -7361,29 +7397,18 @@ impl EditorView {
 
     /// Replaces the current match, then advances to the next one.
     fn replace_one(&self) {
-        let (needle, replacement, options, text, selected) = {
+        let (replacement, selected) = {
             let state = self.ivars().state.borrow();
             let Some(bar) = &state.find else {
                 return;
             };
             (
-                bar.query.rope.to_string(),
                 bar.replacement.rope.to_string(),
-                bar.options,
-                state.docs.active().rope.to_string(),
                 state.docs.active().selection(),
             )
         };
-        if needle.is_empty() {
+        let Some((_, matches)) = self.action_matches(Some(&replacement)) else {
             return;
-        }
-        let matches = match search::find(&text, &needle, &replacement, options) {
-            Ok(matches) => matches,
-            Err(error) => {
-                self.ivars().state.borrow_mut().message =
-                    Some((format!("invalid regex: {error}"), Instant::now()));
-                return;
-            }
         };
         let replaced = selected
             .and_then(|range| matches.iter().find(|m| m.range == range))
@@ -7511,16 +7536,12 @@ impl EditorView {
                     None => failed.push(path.clone()),
                 }
             }
-            for id in touched {
-                state.lsp_dirty.insert(id, Instant::now());
-            }
+            note_documents_edited(&mut state, touched);
             if written > 0 {
-                state.git.refresh();
-                if let Some(indexer) = &state.indexer {
-                    indexer.poke();
-                }
+                note_files_written(&mut state);
             }
         }
+        self.lsp_flush_changes();
         let mut note = format!(
             "replaced {replaced} in {} file{}",
             open + written,
@@ -7558,26 +7579,13 @@ impl EditorView {
 
     /// Replaces every match in the active document.
     fn replace_all(&self) {
-        let (needle, replacement, options, text) = {
+        let replacement = {
             let state = self.ivars().state.borrow();
             let Some(bar) = &state.find else { return };
-            (
-                bar.query.rope.to_string(),
-                bar.replacement.rope.to_string(),
-                bar.options,
-                state.docs.active().rope.to_string(),
-            )
+            bar.replacement.rope.to_string()
         };
-        if needle.is_empty() {
+        let Some((needle, matches)) = self.action_matches(Some(&replacement)) else {
             return;
-        }
-        let matches = match search::find(&text, &needle, &replacement, options) {
-            Ok(matches) => matches,
-            Err(error) => {
-                self.ivars().state.borrow_mut().message =
-                    Some((format!("invalid regex: {error}"), Instant::now()));
-                return;
-            }
         };
         let edits: Vec<_> = matches
             .into_iter()
@@ -7606,33 +7614,18 @@ impl EditorView {
 
     /// Moves the cursor to the next or previous match and selects it.
     fn find_step(&self, forward: bool) {
-        let (query, options, text, from, selected) = {
+        let (from, selected) = {
             let state = self.ivars().state.borrow();
-            let Some(bar) = &state.find else {
-                return;
-            };
             (
-                bar.query.rope.to_string(),
-                bar.options,
-                state.docs.active().rope.to_string(),
                 state.docs.active().cursor(),
                 state.docs.active().selection(),
             )
         };
-        if query.is_empty() {
+        let Some((query, matches)) = self.action_matches(None) else {
             return;
-        }
-
+        };
         let (rows, cols) = self.grid();
         let mut state = self.ivars().state.borrow_mut();
-
-        let matches = match search::find(&text, &query, "", options) {
-            Ok(matches) => matches,
-            Err(error) => {
-                state.message = Some((format!("invalid regex: {error}"), Instant::now()));
-                return;
-            }
-        };
         let found = if forward {
             let start = selected.map_or(from, |r| r.start.saturating_add(1));
             matches
@@ -8696,11 +8689,13 @@ impl EditorView {
         self.pump();
     }
 
-    /// Sends a request to the server for the active document, about the
-    /// caret. Changes typed so far go first, so it answers about the text
-    /// on screen. Says so in the status line when there is no server.
+    /// Sends a request to the server for the active document, about
+    /// `offset` or the caret. Changes typed so far go first, so it answers
+    /// about the text on screen. Says so in the status line when there is
+    /// no server.
     fn ask_server(
         &self,
+        offset: Option<usize>,
         ask: impl FnOnce(&mut crate::lsp::client::Server, &Path, crate::lsp::Position),
     ) -> bool {
         self.lsp_flush_now();
@@ -8710,7 +8705,7 @@ impl EditorView {
             state.message = Some(("no language server for this file".into(), Instant::now()));
             return false;
         };
-        let at = crate::lsp::position_of(&buffer.rope, buffer.cursor());
+        let at = crate::lsp::position_of(&buffer.rope, offset.unwrap_or(buffer.cursor()));
         let key = crate::lsp::servers::server_key(language);
         match state
             .lsp
@@ -8729,7 +8724,7 @@ impl EditorView {
     }
 
     fn find_references(&self) {
-        if self.ask_server(|server, path, at| {
+        if self.ask_server(None, |server, path, at| {
             server.references(path, at);
         }) {
             self.ivars().state.borrow_mut().message =
@@ -9012,18 +9007,10 @@ impl EditorView {
                     None => outcome.failed.push(path),
                 }
             }
-            for id in touched {
-                state
-                    .lsp_dirty
-                    .insert(id, Instant::now() - Duration::from_secs(1));
-                state.gutter_dirty.insert(id, Instant::now());
-            }
+            note_documents_edited(&mut state, touched);
             state.docs.active_mut().scroll_to_cursor(rows, cols);
             if outcome.written > 0 {
-                state.git.refresh();
-                if let Some(indexer) = &state.indexer {
-                    indexer.poke();
-                }
+                note_files_written(&mut state);
             }
         }
         self.lsp_flush_changes();
@@ -9273,7 +9260,7 @@ impl EditorView {
             let unchanged = all_docs(&state)
                 .flat_map(|d| d.iter())
                 .find(|b| b.path.as_deref().is_some_and(|p| same_file(p, &asked.path)))
-                .is_some_and(|b| b.rope.to_string() == asked.snapshot.to_string());
+                .is_some_and(|b| b.rope.same_text(&asked.snapshot));
             let action = actions
                 .into_iter()
                 .find(|a| a.disabled.is_none() && a.kind.starts_with("source.organizeImports"));
@@ -10030,7 +10017,7 @@ impl EditorView {
                 .flat_map(|d| d.iter_mut())
                 .find(|b| b.id() == call.buffer);
             match buffer {
-                Some(b) if b.rope.to_string() == call.snapshot.to_string() => {
+                Some(b) if b.rope.same_text(&call.snapshot) => {
                     if b.rope.slice_to_string(call.range.clone()) != text {
                         changed = b.replace_ranges(&[(call.range.clone(), text)]) > 0;
                         b.scroll_to_cursor(rows, cols);
@@ -10164,7 +10151,7 @@ impl EditorView {
         };
         let snapshot = self.ivars().state.borrow().docs.active().rope.clone();
         let mut asked = None;
-        let sent = self.ask_server(|server, path, _| {
+        let sent = self.ask_server(None, |server, path, _| {
             if server.formats() {
                 server.formatting(path, tab, spaces, save);
                 asked = Some(path.to_path_buf());
@@ -10191,7 +10178,7 @@ impl EditorView {
         };
         let buffer = state.docs.active_mut();
         let here = asked == path && buffer.path.as_deref() == Some(path);
-        if !here || buffer.rope.to_string() != snapshot.to_string() {
+        if !here || !buffer.rope.same_text(&snapshot) {
             state.message = Some(("format skipped: the text changed".into(), Instant::now()));
             return;
         }
@@ -10227,7 +10214,7 @@ impl EditorView {
     }
 
     fn request_signature(&self) {
-        self.ask_server(|server, path, at| {
+        self.ask_server(None, |server, path, at| {
             server.signature_help(path, at);
         });
     }
@@ -11285,28 +11272,7 @@ impl EditorView {
         if edited && state.docs.active().path.is_some() {
             state.lsp_dirty.insert(id, Instant::now());
         }
-        let caret = state.docs.active().cursor();
-        let prefix = state.completion.as_ref().and_then(|popup| {
-            (popup.buffer == id && caret >= popup.anchor).then(|| {
-                state
-                    .docs
-                    .active()
-                    .rope
-                    .slice_to_string(popup.anchor..caret)
-            })
-        });
-        let still = match prefix {
-            Some(prefix) if !prefix.contains(char::is_whitespace) && !prefix.contains('/') => {
-                if let Some(popup) = &mut state.completion {
-                    popup.refilter(&prefix);
-                }
-                true
-            }
-            _ => {
-                state.completion = None;
-                false
-            }
-        };
+        let still = follow_completion(&mut state);
         drop(state);
         if edited {
             // A shorter prefix can match more than the worker was asked
@@ -11657,47 +11623,17 @@ impl EditorView {
 
     /// Asks where the symbol at `offset` (or the caret) is defined.
     fn goto_definition(&self, offset: Option<usize>) {
-        let mut state = self.ivars().state.borrow_mut();
-        let buffer = state.docs.active();
-        let (Some(path), Some(language)) = (buffer.path.clone(), lsp_language(buffer)) else {
-            return;
-        };
-        let at = crate::lsp::position_of(&buffer.rope, offset.unwrap_or(buffer.cursor()));
-        let key = crate::lsp::servers::server_key(language);
-        match state
-            .lsp
-            .get_mut(&key)
-            .filter(|s| s.is_ready() && s.knows(&path))
-        {
-            Some(server) => {
-                server.definition(&path, at);
-            }
-            None => {
-                state.message = Some(("no language server for this file".into(), Instant::now()));
-            }
-        }
-        drop(state);
-        self.lsp_flush_now();
+        self.ask_server(offset, |server, path, at| {
+            server.definition(path, at);
+        });
         self.request_redraw();
     }
 
     fn show_hover(&self) {
-        let mut state = self.ivars().state.borrow_mut();
-        let buffer = state.docs.active();
-        let (Some(path), Some(language)) = (buffer.path.clone(), lsp_language(buffer)) else {
-            return;
-        };
-        let at = crate::lsp::position_of(&buffer.rope, buffer.cursor());
-        let key = crate::lsp::servers::server_key(language);
-        if let Some(server) = state
-            .lsp
-            .get_mut(&key)
-            .filter(|s| s.is_ready() && s.knows(&path))
-        {
-            server.hover(&path, at);
-        }
-        drop(state);
-        self.lsp_flush_now();
+        self.ask_server(None, |server, path, at| {
+            server.hover(path, at);
+        });
+        self.request_redraw();
     }
 
     /// Starts, or restarts, the FSEvents watcher on the current root.
@@ -12123,24 +12059,7 @@ impl EditorView {
             return true;
         }
 
-        {
-            let mut state = self.ivars().state.borrow_mut();
-            match Buffer::open(&path) {
-                // add, not push: the file may already be open.
-                Ok(buffer) => state.docs.add(buffer),
-                Err(e) => {
-                    state.message = Some((format!("created but not opened: {e}"), Instant::now()));
-                }
-            }
-            reveal_active_tab(&mut state);
-            // The directory walk and finder rebuild happen off the UI thread.
-            state.project_index_rx = Some(spawn_project_refresh(
-                state.tree.clone(),
-                state.tree_version,
-            ));
-        }
-        self.resume_display_link();
-        self.sync_title();
+        self.open_created_file(&path);
         true
     }
 
@@ -12222,26 +12141,7 @@ impl EditorView {
             state.lsp_dirty.insert(id, Instant::now());
             state.gutter_dirty.insert(id, Instant::now());
         }
-        // The list follows the prefix as it is typed and goes away when the
-        // caret leaves the word it was opened for.
-        let caret = state.docs.active().cursor();
-        let prefix = state.completion.as_ref().and_then(|popup| {
-            (popup.buffer == id && caret >= popup.anchor).then(|| {
-                state
-                    .docs
-                    .active()
-                    .rope
-                    .slice_to_string(popup.anchor..caret)
-            })
-        });
-        match prefix {
-            Some(prefix) if !prefix.contains(char::is_whitespace) => {
-                if let Some(popup) = &mut state.completion {
-                    popup.refilter(&prefix);
-                }
-            }
-            _ => state.completion = None,
-        }
+        follow_completion(&mut state);
         state.docs.active_mut().scroll_to_cursor(rows, cols);
         drop(state);
         self.resume_display_link();
@@ -13444,13 +13344,7 @@ impl EditorView {
             }
         };
 
-        let name = buffer
-            .path
-            .as_ref()
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
-            .or_else(|| buffer.label.clone())
-            .unwrap_or_else(|| "Untitled".into());
+        let name = buffer.display_name();
         // The diagnostic under the caret, or the file's counts.
         let (diag_note, diag_counts) = {
             let list =
@@ -14228,13 +14122,7 @@ impl crate::ide::mcp::Host for ClaudeHost<'_> {
             .filter(|b| reviews.is_none_or(|r| !r.contains_key(&b.id())))
             .map(|b| crate::ide::mcp::Editor {
                 path: b.path.clone(),
-                label: b
-                    .path
-                    .as_deref()
-                    .and_then(Path::file_name)
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .or_else(|| b.label.clone())
-                    .unwrap_or_else(|| "Untitled".into()),
+                label: b.display_name(),
                 language_id: lsp_language(b)
                     .map(crate::lsp::servers::language_id)
                     .unwrap_or("plaintext")
@@ -14278,7 +14166,7 @@ impl crate::ide::mcp::Host for ClaudeHost<'_> {
                 None => return Ok(false),
                 Some(Err(e)) => return Err(e.to_string()),
                 Some(Ok(saved)) => {
-                    state.git.refresh();
+                    note_files_written(&mut state);
                     saved
                 }
             }
