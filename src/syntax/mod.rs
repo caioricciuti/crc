@@ -1207,12 +1207,9 @@ impl SyntaxStore {
         );
     }
 
-    /// A Markdown document's code blocks, for the band behind them.
-    pub fn code_bands(&self, id: u64) -> &[std::ops::Range<usize>] {
-        self.trees
-            .get(&id)
-            .and_then(|t| t.markdown.as_ref())
-            .map_or(&[], |m| m.bands.as_slice())
+    /// A Markdown document's styling: code bands, hidden syntax, table pads.
+    pub fn markdown(&self, id: u64) -> Option<&crate::markdown::source::Styled> {
+        self.trees.get(&id).and_then(|t| t.markdown.as_ref())
     }
 
     /// Whether the document has been parsed.

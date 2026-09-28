@@ -610,6 +610,22 @@ expect "$T/reordered.out" active "1"
 expect "$T/new-tab.out" tabs "two.txt | one.md | Untitled"
 expect "$T/new-tab.out" active "2"
 
+# Off the caret's line, Markdown's syntax takes no room: a click lands by
+# what is drawn, "bold end", not by the stars that are hidden.
+printf 'plain\n**bold** end\n' > "$T/conceal.md"
+cat > "$T/conceal.script" <<SCRIPT
+key 11 cmd b
+click 79.2 144
+dump $T/conceal-click.out
+click 68 125
+click 115.2 144 2
+dump $T/conceal-word.out
+quit
+SCRIPT
+CRC_SELFTEST="$T/conceal.script" "$BIN" "$T/conceal.md" 2> "$T/conceal.err"
+expect "$T/conceal-click.out" cursor "2:4"
+expect "$T/conceal-word.out" selection '"end"'
+
 # Home is a page: typing there makes no Untitled document.
 cat > "$T/home-typing.script" <<SCRIPT
 wait 300

@@ -29,6 +29,12 @@ pub struct Styled {
     pub fences: Vec<Fence>,
     /// Code blocks, fences included, for the band behind them.
     pub bands: Vec<Range<usize>>,
+    /// Syntax drawn with no width on lines no caret is on: emphasis, code
+    /// and strike markers, link targets, heading hashes. In document order.
+    pub hidden: Vec<Range<usize>>,
+    /// `(byte, columns)`: blank columns drawn before the pipe at `byte`, so
+    /// a table's columns line up. In document order.
+    pub pads: Vec<(usize, usize)>,
 }
 
 /// Styles a whole document. Linear in its length.
@@ -98,6 +104,12 @@ pub fn style(source: &str) -> Styled {
             i += 1;
             continue;
         }
+        if starts_table {
+            let rows = (i + 2..lines.len())
+                .find(|&j| !text(&lines[j]).contains('|'))
+                .unwrap_or(lines.len());
+            table_pads(&mut out.pads, source, &lines[i..rows]);
+        }
         if starts_table || (in_table && line.contains('|')) {
             table_row(&mut out.spans, source, range.clone(), starts_table);
             in_table = true;
@@ -112,8 +124,10 @@ pub fn style(source: &str) -> Styled {
                 let marker_end =
                     base + hashes + (body[hashes..].len() - body[hashes..].trim_start().len());
                 mark(&mut out.spans, base..marker_end, Kind::MdMarker);
+                out.hidden.push(base..marker_end);
                 inline(
                     &mut out.spans,
+                    &mut out.hidden,
                     source,
                     marker_end..range.end,
                     Some(Kind::MdHeading),
@@ -140,6 +154,7 @@ pub fn style(source: &str) -> Styled {
             mark(&mut out.spans, base..base + quote, Kind::MdMarker);
             inline(
                 &mut out.spans,
+                &mut out.hidden,
                 source,
                 base + quote..range.end,
                 Some(Kind::MdQuote),
@@ -156,11 +171,17 @@ pub fn style(source: &str) -> Styled {
                 .map_or(0, |t| t.len() - 1);
             let after = base + marker + task;
             mark(&mut out.spans, base + marker..after, Kind::MdMarker);
-            inline(&mut out.spans, source, after..range.end, None);
+            inline(
+                &mut out.spans,
+                &mut out.hidden,
+                source,
+                after..range.end,
+                None,
+            );
             i += 1;
             continue;
         }
-        inline(&mut out.spans, source, range.clone(), None);
+        inline(&mut out.spans, &mut out.hidden, source, range.clone(), None);
         i += 1;
     }
     out
@@ -237,18 +258,60 @@ fn table_row(spans: &mut Vec<Span>, source: &str, range: Range<usize>, header: b
         None
     };
     let line = &source[range.clone()];
+    // Markers in a cell keep their width: the pads line up the raw text.
+    let kept = &mut Vec::new();
     let mut cell = range.start;
     let mut escaped = false;
     for (at, c) in line.char_indices() {
         let at = range.start + at;
         if c == '|' && !escaped {
-            inline(spans, source, cell..at, base);
+            inline(spans, kept, source, cell..at, base);
             mark(spans, at..at + 1, Kind::MdMarker);
             cell = at + 1;
         }
         escaped = c == '\\' && !escaped;
     }
-    inline(spans, source, cell..range.end, base);
+    inline(spans, kept, source, cell..range.end, base);
+}
+
+/// Pads the cells of a table's lines (header, delimiter, rows) so each is
+/// as wide as the widest in its column.
+fn table_pads(pads: &mut Vec<(usize, usize)>, source: &str, rows: &[Range<usize>]) {
+    let rows: Vec<Vec<(usize, usize)>> = rows.iter().map(|r| pipes(source, r.clone())).collect();
+    let mut widest: Vec<usize> = Vec::new();
+    for row in &rows {
+        for (column, &(_, width)) in row.iter().enumerate() {
+            match widest.get_mut(column) {
+                Some(w) => *w = (*w).max(width),
+                None => widest.push(width),
+            }
+        }
+    }
+    for row in &rows {
+        for (column, &(at, width)) in row.iter().enumerate() {
+            if widest[column] > width {
+                pads.push((at, widest[column] - width));
+            }
+        }
+    }
+}
+
+/// Each unescaped pipe of a table line, and how many characters stand
+/// between it and the pipe before it (or the line's start).
+fn pipes(source: &str, range: Range<usize>) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut width = 0;
+    let mut escaped = false;
+    for (at, c) in source[range.clone()].char_indices() {
+        if c == '|' && !escaped {
+            out.push((range.start + at, width));
+            width = 0;
+        } else {
+            width += 1;
+        }
+        escaped = c == '\\' && !escaped;
+    }
+    out
 }
 
 /// The kind for text that is both `outer` and `inner`.
@@ -266,7 +329,13 @@ fn combine(outer: Option<Kind>, inner: Kind) -> Kind {
 
 /// Inline Markdown within `range`, all of it `base` where nothing more
 /// specific applies.
-fn inline(spans: &mut Vec<Span>, source: &str, range: Range<usize>, base: Option<Kind>) {
+fn inline(
+    spans: &mut Vec<Span>,
+    hidden: &mut Vec<Range<usize>>,
+    source: &str,
+    range: Range<usize>,
+    base: Option<Kind>,
+) {
     let bytes = source.as_bytes();
     let end = range.end;
     let mut i = range.start;
@@ -282,6 +351,7 @@ fn inline(spans: &mut Vec<Span>, source: &str, range: Range<usize>, base: Option
         if c == b'\\' && i + 1 < end && bytes[i + 1].is_ascii_punctuation() {
             flush(spans, plain, i);
             mark(spans, i..i + 1, Kind::MdMarker);
+            hidden.push(i..i + 1);
             let next = i + 1 + utf8_len(bytes[i + 1]);
             flush(spans, i + 1, next);
             i = next;
@@ -295,6 +365,8 @@ fn inline(spans: &mut Vec<Span>, source: &str, range: Range<usize>, base: Option
                 mark(spans, i..i + run, Kind::MdMarker);
                 mark(spans, i + run..close, Kind::MdCode);
                 mark(spans, close..close + run, Kind::MdMarker);
+                hidden.push(i..i + run);
+                hidden.push(close..close + run);
                 i = close + run;
                 plain = i;
                 continue;
@@ -307,8 +379,10 @@ fn inline(spans: &mut Vec<Span>, source: &str, range: Range<usize>, base: Option
             if let Some((text_end, url_end)) = link_at(bytes, i + open, end) {
                 flush(spans, plain, i);
                 mark(spans, i..i + open, Kind::MdMarker);
+                hidden.push(i..i + open);
                 inline(
                     spans,
+                    hidden,
                     source,
                     i + open..text_end,
                     Some(combine(base, Kind::MdLink)),
@@ -316,6 +390,7 @@ fn inline(spans: &mut Vec<Span>, source: &str, range: Range<usize>, base: Option
                 mark(spans, text_end..text_end + 2, Kind::MdMarker);
                 mark(spans, text_end + 2..url_end, Kind::MdUrl);
                 mark(spans, url_end..url_end + 1, Kind::MdMarker);
+                hidden.push(text_end..url_end + 1);
                 i = url_end + 1;
                 plain = i;
                 continue;
@@ -334,6 +409,8 @@ fn inline(spans: &mut Vec<Span>, source: &str, range: Range<usize>, base: Option
                 mark(spans, i..i + 1, Kind::MdMarker);
                 mark(spans, i + 1..i + 1 + close, Kind::MdUrl);
                 mark(spans, i + 1 + close..i + 2 + close, Kind::MdMarker);
+                hidden.push(i..i + 1);
+                hidden.push(i + 1 + close..i + 2 + close);
                 i += close + 2;
                 plain = i;
                 continue;
@@ -367,13 +444,16 @@ fn inline(spans: &mut Vec<Span>, source: &str, range: Range<usize>, base: Option
             {
                 flush(spans, plain, i);
                 mark(spans, i..i + 2, Kind::MdMarker);
+                hidden.push(i..i + 2);
                 inline(
                     spans,
+                    hidden,
                     source,
                     i + 2..close,
                     Some(combine(base, Kind::MdStrike)),
                 );
                 mark(spans, close..close + 2, Kind::MdMarker);
+                hidden.push(close..close + 2);
                 i = close + 2;
                 plain = i;
                 continue;
@@ -397,8 +477,16 @@ fn inline(spans: &mut Vec<Span>, source: &str, range: Range<usize>, base: Option
                 };
                 flush(spans, plain, i);
                 mark(spans, i..i + len, Kind::MdMarker);
-                inline(spans, source, i + len..close, Some(combine(base, kind)));
+                hidden.push(i..i + len);
+                inline(
+                    spans,
+                    hidden,
+                    source,
+                    i + len..close,
+                    Some(combine(base, kind)),
+                );
                 mark(spans, close..close + len, Kind::MdMarker);
+                hidden.push(close..close + len);
                 i = close + len;
                 plain = i;
                 continue;
@@ -536,6 +624,47 @@ mod tests {
         assert!(got.contains(&("f".into(), Kind::MdUrl)));
         assert!(got.contains(&("g".into(), Kind::MdStrike)));
         assert!(got.contains(&("**".into(), Kind::MdMarker)));
+    }
+
+    fn hidden(source: &str) -> Vec<&str> {
+        style(source)
+            .hidden
+            .iter()
+            .map(|r| &source[r.clone()])
+            .collect()
+    }
+
+    #[test]
+    fn markers_hide_but_quotes_lists_and_tables_do_not() {
+        assert_eq!(
+            hidden("## A **b** `c` [d](e) ~~f~~ <https://g>\n"),
+            vec![
+                "## ", "**", "**", "`", "`", "[", "](e)", "~~", "~~", "<", ">"
+            ]
+        );
+        assert!(hidden("> quote\n- item\n").is_empty());
+        assert!(hidden("| **a** | b |\n|---|---|\n| c | d |\n").is_empty());
+        let styled = style("x *y* z\n");
+        assert!(styled.hidden.windows(2).all(|w| w[0].end <= w[1].start));
+    }
+
+    #[test]
+    fn table_columns_pad_to_the_widest_cell() {
+        let source = "| a | bbb |\n|---|---|\n| cc | d |\nafter\n";
+        let pads = style(source).pads;
+        let at = |line: usize, pipe: usize| {
+            let start = source
+                .split_inclusive('\n')
+                .take(line)
+                .map(str::len)
+                .sum::<usize>();
+            start + source[start..].match_indices('|').nth(pipe).unwrap().0
+        };
+        // Column one is " cc " at its widest, column two " bbb ".
+        assert_eq!(
+            pads,
+            vec![(at(0, 1), 1), (at(1, 1), 1), (at(1, 2), 2), (at(2, 2), 2)]
+        );
     }
 
     #[test]

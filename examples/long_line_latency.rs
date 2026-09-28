@@ -54,8 +54,19 @@ fn measure(label: &str, source: &str, cursor: usize, scroll: usize) {
         let layout_ms = started.elapsed().as_secs_f64() * 1_000.0;
 
         let started = Instant::now();
-        black_box(layout::offset_at_point(&buffer, &atlas, 600.0, 2.0));
-        black_box(layout::caret_rect(&buffer, &atlas, viewport));
+        black_box(layout::offset_at_point(
+            &buffer,
+            &atlas,
+            &layout::Markdown::default(),
+            600.0,
+            2.0,
+        ));
+        black_box(layout::caret_rect(
+            &buffer,
+            &atlas,
+            &layout::Markdown::default(),
+            viewport,
+        ));
         let hit_ms = started.elapsed().as_secs_f64() * 1000.0;
 
         if iteration == 0 {

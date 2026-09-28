@@ -138,7 +138,8 @@ the size and write it back.
   open, and `>` in the same box to run any menu command.
 - **HTTP requests from `.http` files** (`Cmd-Return`) in the JetBrains and
   VS Code REST Client format, with environments and a response tab.
-- **Markdown** is styled where it is written, fenced code coloured by its
+- **Markdown** is styled where it is written: its syntax hidden on lines
+  the caret is not on, table columns lined up, fenced code coloured by its
   language, with a rendered preview beside it (`Cmd-E`) from the Markdown
   Preview extension; images, PDFs, audio, video and office files open as
   Quick Look previews.

@@ -862,7 +862,7 @@ pub fn build_full(
         query,
         None,
         spans,
-        &[],
+        &Markdown::default(),
         true,
         out,
     )
@@ -881,7 +881,7 @@ pub fn build_full_search(
     query: &str,
     search_ranges: Option<&[std::ops::Range<usize>]>,
     spans: &[Span],
-    bands: &[std::ops::Range<usize>],
+    markdown: &Markdown,
     carets: bool,
     out: &mut Vec<GlyphInstance>,
 ) -> Stats {
@@ -896,7 +896,7 @@ pub fn build_full_search(
         query,
         search_ranges,
         spans,
-        bands,
+        markdown,
         true,
         carets,
         out,
@@ -917,7 +917,7 @@ pub fn build_text_appending(
     query: &str,
     search_ranges: Option<&[std::ops::Range<usize>]>,
     spans: &[Span],
-    bands: &[std::ops::Range<usize>],
+    markdown: &Markdown,
     focused: bool,
     carets: bool,
     out: &mut Vec<GlyphInstance>,
@@ -1033,6 +1033,7 @@ pub fn build_text_appending(
         .collect();
     let bracket = if focused { bracket_match(buffer) } else { None };
     let wrapping = buffer.wrap.is_some();
+    let touched = touched_lines(buffer);
     let _ = (offset, first);
 
     for (row_index, row) in rows_on_screen.iter().enumerate() {
@@ -1062,9 +1063,17 @@ pub fn build_text_appending(
         {
             stats.unshaped += 1;
         }
+        // Markdown off the caret: syntax hidden, table cells padded.
+        let map = if shaped_line.is_none() {
+            markdown.line(buffer, &touched, line)
+        } else {
+            None
+        };
         let offset_at = |byte: usize| -> f32 {
             if let Some(shaped) = &shaped_line {
                 shaped.x_of_byte(byte.saturating_sub(line_start))
+            } else if let Some(map) = &map {
+                map.column(&buffer.rope, byte) * m.advance
             } else {
                 buffer.rope.visual_column(line_start..byte) as f32 * m.advance
             }
@@ -1139,7 +1148,8 @@ pub fn build_text_appending(
 
         // Markdown: a band behind a code block's rows, and a tint behind
         // inline code, under the selection like the current line's wash.
-        if bands
+        if markdown
+            .bands
             .iter()
             .any(|b| b.start < row_end.max(row_start + 1) && b.end >= row_start)
         {
@@ -1423,12 +1433,19 @@ pub fn build_text_appending(
         };
         let (mut byte, mut column) = if wrapping {
             (row_start, base_column)
+        } else if map.is_some() {
+            // Hidden syntax pulls later text left: seek from the start.
+            (line_start, 0)
         } else {
             buffer.rope.visual_seek(
                 line_start..line_end,
                 buffer.scroll_column.saturating_sub(margin),
             )
         };
+        // Columns the drawn text sits from where its raw column puts it.
+        let mut shift = map.map_or(0.0, |map| {
+            map.column(&buffer.rope, byte) - buffer.rope.visual_column(line_start..byte) as f32
+        });
         let mut span_at = spans.partition_point(|s| s.end <= byte);
         'line: for chunk in buffer.rope.chunks_in(byte..row_end) {
             for ch in chunk.chars() {
@@ -1458,8 +1475,19 @@ pub fn build_text_appending(
                     }
                     _ => {}
                 }
+                if let Some(map) = &map {
+                    shift += map.pad_at(byte) as f32;
+                    if map.hides(byte) {
+                        shift -= display_width(ch) as f32;
+                        column += display_width(ch);
+                        byte += advance_bytes;
+                        continue;
+                    }
+                }
 
-                let x = text_x + (column - base_column) as f32 * m.advance - (scroll_x - row_x0);
+                // `scroll_x` holds the row's own start, `base_column` in raw
+                // columns plus any shift before it.
+                let x = text_x + (column as f32 + shift) * m.advance - scroll_x;
                 if x > viewport.x + viewport.width {
                     break 'line;
                 }
@@ -1522,6 +1550,9 @@ pub fn build_text_appending(
             shaped_carets.iter().find(|(index, ..)| *index == row_index)
         {
             text_x + shaped.x_of_byte(caret - line_start) - scroll_x - row_x0
+        } else if let Some(map) = markdown.line(buffer, &touched, caret_line) {
+            let column = map.column(&buffer.rope, caret) - map.column(&buffer.rope, row.start);
+            text_x + column * m.advance - scroll_x
         } else {
             let column = buffer.rope.visual_column(line_start..caret)
                 - buffer.rope.visual_column(line_start..row.start);
@@ -4646,7 +4677,13 @@ pub fn gutter_width(buffer: &Buffer, atlas: &Atlas) -> f32 {
 
 /// Byte offset of the character nearest a point in the view, for click and
 /// drag positioning. `x` and `y` are logical points from the view's top-left.
-pub fn offset_at_point(buffer: &Buffer, atlas: &Atlas, x: f32, y: f32) -> usize {
+pub fn offset_at_point(
+    buffer: &Buffer,
+    atlas: &Atlas,
+    markdown: &Markdown,
+    x: f32,
+    y: f32,
+) -> usize {
     let m = atlas.metrics;
     let total_lines = buffer.rope.len_lines();
 
@@ -4699,8 +4736,13 @@ pub fn offset_at_point(buffer: &Buffer, atlas: &Atlas, x: f32, y: f32) -> usize 
                 },
             );
         }
-        let column = ((x - text_x + scrolled) / m.advance).max(0.0);
-        let at = crate::text::wrap::byte_at_fraction(&buffer.rope, row.start, row_end, column);
+        let at = if let Some(map) = markdown.line(buffer, &touched_lines(buffer), row.line) {
+            let column = (x - text_x + scrolled) / m.advance + map.column(&buffer.rope, row.start);
+            map.byte_at(&buffer.rope, row.start, row_end, column)
+        } else {
+            let column = ((x - text_x + scrolled) / m.advance).max(0.0);
+            crate::text::wrap::byte_at_fraction(&buffer.rope, row.start, row_end, column)
+        };
         // The end of a continued row is the next row's start: a click past
         // the text stays on the row that was clicked.
         return if !row.last && at >= row_end {
@@ -4726,6 +4768,10 @@ pub fn offset_at_point(buffer: &Buffer, atlas: &Atlas, x: f32, y: f32) -> usize 
         return start + shaped.byte_at_x(target_x);
     }
     let column = ((x - text_x) / m.advance).max(0.0) + buffer.scroll_column as f32;
+    if let Some(map) = markdown.line(buffer, &touched_lines(buffer), line) {
+        let end = crate::text::wrap::line_end(&buffer.rope, line);
+        return map.byte_at(&buffer.rope, start, end, column);
+    }
 
     crate::text::wrap::byte_at_fraction(
         &buffer.rope,
@@ -4763,13 +4809,18 @@ pub fn fold_chevron_at(buffer: &Buffer, atlas: &Atlas, x: f32, y: f32) -> Option
 /// left of its cell and the cell's size. `None` when it is scrolled out of
 /// view. The inverse of [`offset_at_point`], and what the input method asks
 /// for so it can put its candidate window next to what is being typed.
-pub fn caret_rect(buffer: &Buffer, atlas: &Atlas, text: Viewport) -> Option<Viewport> {
+pub fn caret_rect(
+    buffer: &Buffer,
+    atlas: &Atlas,
+    markdown: &Markdown,
+    text: Viewport,
+) -> Option<Viewport> {
     let rows = if buffer.row_mode() {
         screen_rows(buffer, text, atlas.metrics.line_height)
     } else {
         Vec::new()
     };
-    caret_rect_on(buffer, atlas, text, &rows)
+    caret_rect_on(buffer, atlas, markdown, text, &rows)
 }
 
 /// [`caret_rect`] with the frame's rows, which it reads while wrapping or
@@ -4777,11 +4828,13 @@ pub fn caret_rect(buffer: &Buffer, atlas: &Atlas, text: Viewport) -> Option<View
 pub fn caret_rect_on(
     buffer: &Buffer,
     atlas: &Atlas,
+    markdown: &Markdown,
     text: Viewport,
     rows: &[ScreenRow],
 ) -> Option<Viewport> {
     let m = atlas.metrics;
     let (line, _) = buffer.cursor_position();
+    let map = markdown.line(buffer, &touched_lines(buffer), line);
     if buffer.row_mode() {
         let caret = buffer.cursor();
         let row = *rows.iter().find(|r| r.holds(line, caret))?;
@@ -4792,6 +4845,8 @@ pub fn caret_rect_on(
             .filter(|_| !split_rtl)
         {
             shaped.x_of_byte(caret - line_start) - shaped.x_of_byte(row.start - line_start)
+        } else if let Some(map) = &map {
+            (map.column(&buffer.rope, caret) - map.column(&buffer.rope, row.start)) * m.advance
         } else {
             crate::text::wrap::column_in_row(&buffer.rope, row.start, caret) as f32 * m.advance
         };
@@ -4825,10 +4880,15 @@ pub fn caret_rect_on(
             height: m.line_height,
         });
     }
-    let column = buffer.rope.visual_column(line_start..buffer.cursor());
-    let column = column.checked_sub(buffer.scroll_column)?;
+    let column = match &map {
+        Some(map) => map.column(&buffer.rope, buffer.cursor()),
+        None => buffer.rope.visual_column(line_start..buffer.cursor()) as f32,
+    } - buffer.scroll_column as f32;
+    if column < 0.0 {
+        return None;
+    }
     Some(Viewport {
-        x: text.x + gutter_width(buffer, atlas) + column as f32 * m.advance,
+        x: text.x + gutter_width(buffer, atlas) + column * m.advance,
         y: text.y + row as f32 * m.line_height - scroll_offset(buffer, m.line_height),
         width: m.advance,
         height: m.line_height,
@@ -4967,6 +5027,144 @@ impl ScreenRow {
 /// The rows with any part in `viewport`, top to bottom. Every place that
 /// puts text on screen or finds text under the pointer reads these, so the
 /// two cannot disagree about where a wrapped row is.
+/// What a Markdown document draws beyond its colours: the band behind code
+/// blocks, and on lines no caret or selection touches, its syntax hidden and
+/// its table cells padded. Empty for any other document.
+#[derive(Clone, Copy, Default)]
+pub struct Markdown<'a> {
+    pub bands: &'a [std::ops::Range<usize>],
+    pub hidden: &'a [std::ops::Range<usize>],
+    pub pads: &'a [(usize, usize)],
+}
+
+impl<'a> Markdown<'a> {
+    pub fn of(styled: Option<&'a crate::markdown::source::Styled>) -> Self {
+        styled.map_or_else(Self::default, |s| Markdown {
+            bands: &s.bands,
+            hidden: &s.hidden,
+            pads: &s.pads,
+        })
+    }
+
+    /// `line` drawn off the monospace grid, or `None` when it is drawn as
+    /// written. A line in `touched` shows its syntax; its pads stay.
+    fn line(
+        &self,
+        buffer: &Buffer,
+        touched: &[(usize, usize)],
+        line: usize,
+    ) -> Option<LineMap<'a>> {
+        if self.hidden.is_empty() && self.pads.is_empty() {
+            return None;
+        }
+        let start = buffer.rope.line_to_byte(line);
+        let end = crate::text::wrap::line_end(&buffer.rope, line);
+        let hidden = if touched.iter().any(|&(a, b)| a <= line && line <= b) {
+            &[][..]
+        } else {
+            let from = self.hidden.partition_point(|h| h.end <= start);
+            let to = self.hidden.partition_point(|h| h.start < end);
+            &self.hidden[from..to.max(from)]
+        };
+        let from = self.pads.partition_point(|p| p.0 < start);
+        let to = self.pads.partition_point(|p| p.0 < end);
+        let pads = &self.pads[from..to.max(from)];
+        (!hidden.is_empty() || !pads.is_empty()).then_some(LineMap {
+            start,
+            end,
+            hidden,
+            pads,
+        })
+    }
+}
+
+/// The lines each cursor's selection runs over, a caret's own line included.
+fn touched_lines(buffer: &Buffer) -> Vec<(usize, usize)> {
+    buffer
+        .selections()
+        .into_iter()
+        .map(|(a, b)| (buffer.rope.byte_to_line(a), buffer.rope.byte_to_line(b)))
+        .collect()
+}
+
+/// One Markdown line's hidden syntax and pads, for placing its text.
+#[derive(Clone, Copy)]
+struct LineMap<'a> {
+    start: usize,
+    end: usize,
+    hidden: &'a [std::ops::Range<usize>],
+    pads: &'a [(usize, usize)],
+}
+
+impl LineMap<'_> {
+    fn hides(&self, byte: usize) -> bool {
+        let at = self.hidden.partition_point(|h| h.end <= byte);
+        self.hidden.get(at).is_some_and(|h| h.start <= byte)
+    }
+
+    /// Blank columns drawn before the character at `byte`.
+    fn pad_at(&self, byte: usize) -> usize {
+        self.pads
+            .binary_search_by_key(&byte, |p| p.0)
+            .map_or(0, |at| self.pads[at].1)
+    }
+
+    /// Where the caret at `byte` is drawn, in columns from the line start:
+    /// the pads before it counted, the hidden syntax not.
+    fn column(&self, rope: &crate::text::rope::Rope, byte: usize) -> f32 {
+        let byte = byte.clamp(self.start, self.end);
+        let mut column = rope.visual_column(self.start..byte) as f32;
+        for h in self.hidden.iter().take_while(|h| h.start < byte) {
+            let (from, to) = (h.start.max(self.start), h.end.min(byte));
+            if to > from {
+                column -= (rope.byte_to_char(to) - rope.byte_to_char(from)) as f32;
+            }
+        }
+        for p in self.pads.iter().take_while(|p| p.0 < byte) {
+            column += p.1 as f32;
+        }
+        column.max(0.0)
+    }
+
+    /// The caret stop in `from..=to` drawn nearest `column`; the earliest of
+    /// those drawn at the same place, which a hidden run makes several.
+    fn byte_at(
+        &self,
+        rope: &crate::text::rope::Rope,
+        from: usize,
+        to: usize,
+        column: f32,
+    ) -> usize {
+        let mut at = self.column(rope, from);
+        let mut raw = rope.visual_column(self.start..from);
+        let mut byte = from;
+        let mut best = (from, (at - column).abs());
+        for chunk in rope.chunks_in(from..to) {
+            for ch in chunk.chars() {
+                if ch == '\n' || ch == '\r' {
+                    return best.0;
+                }
+                let width = if ch == '\t' {
+                    TAB_WIDTH - raw % TAB_WIDTH
+                } else {
+                    display_width(ch)
+                };
+                raw += width;
+                at += self.pad_at(byte) as f32;
+                if !self.hides(byte) {
+                    at += width as f32;
+                }
+                byte += ch.len_utf8();
+                let distance = (at - column).abs();
+                if distance < best.1 {
+                    best = (byte, distance);
+                }
+            }
+        }
+        best.0
+    }
+}
+
 pub fn screen_rows(buffer: &Buffer, viewport: Viewport, line_height: f32) -> Vec<ScreenRow> {
     let total = buffer.rope.len_lines();
     let mut rows = Vec::new();
@@ -6276,12 +6474,12 @@ mod tests {
         }
         for x in (24..580).step_by(3) {
             assert_eq!(
-                offset_at_point(&far, &atlas, x as f32, 2.0),
-                prefix.len() + offset_at_point(&near, &atlas, x as f32, 2.0)
+                offset_at_point(&far, &atlas, &Markdown::default(), x as f32, 2.0),
+                prefix.len() + offset_at_point(&near, &atlas, &Markdown::default(), x as f32, 2.0)
             );
         }
-        let a = caret_rect(&far, &atlas, viewport).unwrap();
-        let b = caret_rect(&near, &atlas, viewport).unwrap();
+        let a = caret_rect(&far, &atlas, &Markdown::default(), viewport).unwrap();
+        let b = caret_rect(&near, &atlas, &Markdown::default(), viewport).unwrap();
         assert!((a.x - b.x).abs() <= 0.5);
     }
 
@@ -6336,9 +6534,9 @@ mod tests {
         );
         let after_accent = "e\u{301}".len();
         buffer.place_cursor(after_accent, Motion::Move);
-        let rect = caret_rect(&buffer, &atlas, viewport).unwrap();
+        let rect = caret_rect(&buffer, &atlas, &Markdown::default(), viewport).unwrap();
         assert_eq!(
-            offset_at_point(&buffer, &atlas, rect.x, rect.y + 2.0),
+            offset_at_point(&buffer, &atlas, &Markdown::default(), rect.x, rect.y + 2.0),
             after_accent
         );
         assert!(rect.x < gutter_width(&buffer, &atlas) + atlas.metrics.advance * 2.0);
@@ -6392,9 +6590,9 @@ mod tests {
             &Theme::default(),
             &mut glyphs,
         );
-        let rect = caret_rect(&buffer, &atlas, viewport).unwrap();
+        let rect = caret_rect(&buffer, &atlas, &Markdown::default(), viewport).unwrap();
         assert_eq!(
-            offset_at_point(&buffer, &atlas, rect.x, rect.y + 2.0),
+            offset_at_point(&buffer, &atlas, &Markdown::default(), rect.x, rect.y + 2.0),
             after_accent
         );
         assert!(glyphs.len() < 100, "only visible glyphs emit quads");
@@ -6494,7 +6692,7 @@ mod tests {
         );
         assert!(glyphs.len() < 100);
         assert_eq!(
-            offset_at_point(&buffer, &atlas, 32.0, 2.0),
+            offset_at_point(&buffer, &atlas, &Markdown::default(), 32.0, 2.0),
             "e\u{301}".len()
         );
     }
@@ -6553,7 +6751,7 @@ mod tests {
                 // Use the actual rounded screen coordinate for the scan too.
                 let screen_x = gutter + x;
                 assert_eq!(
-                    offset_at_point(&buffer, &atlas, screen_x, 2.0),
+                    offset_at_point(&buffer, &atlas, &Markdown::default(), screen_x, 2.0),
                     scan(screen_x - gutter),
                     "composed click: {source:?} at {x}"
                 );
@@ -6579,8 +6777,11 @@ mod tests {
             &mut glyphs,
         );
         buffer.place_cursor(2, Motion::Move);
-        let rect = caret_rect(&buffer, &atlas, viewport).unwrap();
-        assert_eq!(offset_at_point(&buffer, &atlas, rect.x, rect.y + 2.0), 2);
+        let rect = caret_rect(&buffer, &atlas, &Markdown::default(), viewport).unwrap();
+        assert_eq!(
+            offset_at_point(&buffer, &atlas, &Markdown::default(), rect.x, rect.y + 2.0),
+            2
+        );
     }
 
     #[test]
@@ -6849,7 +7050,7 @@ mod tests {
         // Middle of the 7th character on line 1 (0-based).
         let x = gutter + 6.5 * m.advance;
         let y = 1.5 * m.line_height;
-        let offset = offset_at_point(&buffer, &atlas, x, y);
+        let offset = offset_at_point(&buffer, &atlas, &Markdown::default(), x, y);
         assert_eq!(buffer.position_of(offset), (1, 7));
     }
 
@@ -6859,7 +7060,7 @@ mod tests {
         let buffer = Buffer::from_text("ab\nlonger line here\n");
         let gutter = gutter_width(&buffer, &atlas);
         // Far to the right of a two-character line.
-        let offset = offset_at_point(&buffer, &atlas, gutter + 400.0, 0.0);
+        let offset = offset_at_point(&buffer, &atlas, &Markdown::default(), gutter + 400.0, 0.0);
         assert_eq!(
             buffer.position_of(offset),
             (0, 2),
@@ -6871,8 +7072,56 @@ mod tests {
     fn clicking_in_the_gutter_lands_at_column_zero() {
         let atlas = atlas();
         let buffer = Buffer::from_text("hello\nworld");
-        let offset = offset_at_point(&buffer, &atlas, 0.0, 0.0);
+        let offset = offset_at_point(&buffer, &atlas, &Markdown::default(), 0.0, 0.0);
         assert_eq!(buffer.position_of(offset), (0, 0));
+    }
+
+    #[test]
+    fn markdown_hides_syntax_off_the_caret_line() {
+        let atlas = atlas();
+        let text = "x\n**bold** end\n";
+        let styled = crate::markdown::source::style(text);
+        let markdown = Markdown::of(Some(&styled));
+        let mut buffer = Buffer::from_text(text);
+        let m = atlas.metrics;
+        let gutter = gutter_width(&buffer, &atlas);
+        let y = m.line_height + 2.0;
+        let at = |buffer: &Buffer, column: f32| {
+            offset_at_point(buffer, &atlas, &markdown, gutter + column * m.advance, y)
+        };
+        // Drawn as "bold end": the stars take no room.
+        assert_eq!(at(&buffer, 0.0), 2, "the start of the hidden stars");
+        assert_eq!(at(&buffer, 2.0), 6, "between o and l");
+        assert_eq!(at(&buffer, 5.0), 11, "after the space");
+        // With the caret on it the line is drawn as written.
+        buffer.place_cursor(11, crate::text::buffer::Motion::Move);
+        assert_eq!(at(&buffer, 2.0), 4, "before b, after the stars");
+        let viewport = Viewport::new(800.0, 600.0);
+        let rect = caret_rect(&buffer, &atlas, &markdown, viewport).unwrap();
+        assert!((rect.x - (gutter + 9.0 * m.advance)).abs() < 0.01);
+    }
+
+    #[test]
+    fn markdown_table_cells_pad_to_their_column() {
+        let atlas = atlas();
+        let text = "| a | bbb |\n|---|---|\n| cc | d |\n";
+        let styled = crate::markdown::source::style(text);
+        let markdown = Markdown::of(Some(&styled));
+        let mut buffer = Buffer::from_text(text);
+        let m = atlas.metrics;
+        let gutter = gutter_width(&buffer, &atlas);
+        // After "| a |", which a blank column widens to "| cc |": the pads
+        // hold on the caret's own line too.
+        buffer.place_cursor(5, crate::text::buffer::Motion::Move);
+        let rect = caret_rect(&buffer, &atlas, &markdown, Viewport::new(800.0, 600.0)).unwrap();
+        assert!((rect.x - (gutter + 6.0 * m.advance)).abs() < 0.01);
+        // Before the pipe: the caret stays by the text, not the pad.
+        buffer.place_cursor(4, crate::text::buffer::Motion::Move);
+        let rect = caret_rect(&buffer, &atlas, &markdown, Viewport::new(800.0, 600.0)).unwrap();
+        assert!((rect.x - (gutter + 4.0 * m.advance)).abs() < 0.01);
+        // A click on the pad lands at the pipe or after it.
+        let at = offset_at_point(&buffer, &atlas, &markdown, gutter + 5.0 * m.advance, 2.0);
+        assert!(matches!(at, 4 | 5), "{at}");
     }
 
     #[test]
@@ -6882,7 +7131,13 @@ mod tests {
         let m = atlas.metrics;
         let gutter = gutter_width(&buffer, &atlas);
         // Column 4 is where 'x' renders, after the tab expands.
-        let offset = offset_at_point(&buffer, &atlas, gutter + 4.0 * m.advance, 0.0);
+        let offset = offset_at_point(
+            &buffer,
+            &atlas,
+            &Markdown::default(),
+            gutter + 4.0 * m.advance,
+            0.0,
+        );
         assert_eq!(offset, 1, "should land between the tab and the x");
     }
 
@@ -7044,6 +7299,7 @@ mod tests {
             offset_at_point(
                 &buffer,
                 &atlas,
+                &Markdown::default(),
                 gutter + column * m.advance,
                 row * m.line_height + 1.0,
             )
@@ -7163,7 +7419,7 @@ mod tests {
             );
             assert!(chrome.text.contains(wx, wy));
             let (x, y) = chrome.to_text(wx, wy);
-            let offset = offset_at_point(&buffer, &atlas, x, y);
+            let offset = offset_at_point(&buffer, &atlas, &Markdown::default(), x, y);
             assert_eq!(buffer.rope.slice_to_string(offset..offset + 3), "two");
 
             // And the glyphs really are where that arithmetic says.

@@ -3470,7 +3470,12 @@ define_class!(
                     };
                     let caret = match field {
                         Some(rect) => Viewport { width: 0.0, ..rect },
-                        None => layout::caret_rect(state.docs.active(), &state.renderer.atlas, text)
+                        None => layout::caret_rect(
+                            state.docs.active(),
+                            &state.renderer.atlas,
+                            &layout::Markdown::of(state.syntax.markdown(state.docs.active().id())),
+                            text,
+                        )
                             .unwrap_or(Viewport { width: 0.0, height: 0.0, ..text }),
                     };
                     ns_rect(caret)
@@ -5051,7 +5056,10 @@ impl EditorView {
                     format!(
                         "{} bands={}",
                         kinds.join(","),
-                        state.syntax.code_bands(buffer.id()).len()
+                        state
+                            .syntax
+                            .markdown(buffer.id())
+                            .map_or(0, |m| m.bands.len())
                     )
                 };
                 let report = format!(
@@ -12228,7 +12236,13 @@ impl EditorView {
             y.clamp(text.y, text.y + (text.height - 1.0).max(0.0)),
         );
         let (tx, ty) = chrome.to_text(inside.0, inside.1);
-        let offset = layout::offset_at_point(state.docs.active(), &state.renderer.atlas, tx, ty);
+        let offset = layout::offset_at_point(
+            state.docs.active(),
+            &state.renderer.atlas,
+            &layout::Markdown::of(state.syntax.markdown(state.docs.active().id())),
+            tx,
+            ty,
+        );
 
         let buffer = state.docs.active_mut();
         let reached = match unit {
@@ -12257,7 +12271,13 @@ impl EditorView {
         // window coordinates is what put every click two rows low and, with
         // the sidebar showing, a sidebar's width to the right.
         let (x, y) = chrome_of(&state).to_text(point.x as f32, point.y as f32);
-        layout::offset_at_point(state.docs.active(), &state.renderer.atlas, x, y)
+        layout::offset_at_point(
+            state.docs.active(),
+            &state.renderer.atlas,
+            &layout::Markdown::of(state.syntax.markdown(state.docs.active().id())),
+            x,
+            y,
+        )
     }
 
     /// Cmd-= and friends: a new code size, remembered in the settings file.
@@ -12704,6 +12724,7 @@ impl EditorView {
                 );
             }
 
+            let markdown = layout::Markdown::of(syntax.markdown(buffer.id()));
             let ranges: Vec<_> = search_matches
                 .as_ref()
                 .map(|found| found.iter().map(|m| m.range.clone()).collect())
@@ -12717,7 +12738,7 @@ impl EditorView {
                 &query,
                 find.as_ref().map(|_| ranges.as_slice()),
                 spans,
-                syntax.code_bands(buffer.id()),
+                &markdown,
                 carets_on,
                 glyphs,
             );
@@ -12782,7 +12803,8 @@ impl EditorView {
                 && find.is_none()
                 && palette.is_none()
                 && goto.is_none()
-                && let Some(at) = layout::caret_rect_on(buffer, &renderer.atlas, editor_rect, &rows)
+                && let Some(at) =
+                    layout::caret_rect_on(buffer, &renderer.atlas, &markdown, editor_rect, &rows)
             {
                 layout::push_marked_text(
                     glyphs,
@@ -12829,7 +12851,7 @@ impl EditorView {
                 .as_ref()
                 .filter(|p| p.buffer == buffer.id() && !p.shown.is_empty())
                 && let Some(caret) =
-                    layout::caret_rect_on(buffer, &renderer.atlas, editor_rect, &rows)
+                    layout::caret_rect_on(buffer, &renderer.atlas, &markdown, editor_rect, &rows)
             {
                 let cursor = buffer.cursor();
                 let prefix = buffer
@@ -12874,7 +12896,7 @@ impl EditorView {
             // Signature help, above the caret's line.
             if let Some(tip) = signature.as_ref().filter(|t| t.buffer == buffer.id())
                 && let Some(caret) =
-                    layout::caret_rect_on(buffer, &renderer.atlas, editor_rect, &rows)
+                    layout::caret_rect_on(buffer, &renderer.atlas, &markdown, editor_rect, &rows)
             {
                 layout::build_signature(
                     &tip.signature.label,
@@ -14530,7 +14552,7 @@ fn draw_other_pane(
         "",
         None,
         &spans,
-        syntax.code_bands(buffer.id()),
+        &layout::Markdown::of(syntax.markdown(buffer.id())),
         false,
         false,
         glyphs,
