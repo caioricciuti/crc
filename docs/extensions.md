@@ -146,13 +146,26 @@ The first extensions that need the network will be hosting integrations
 
 ## Running
 
-- One worker thread runs all extensions. Each call gets fuel and a
-  wall-clock limit; each instance gets a memory cap.
+- Commands run on one worker thread, previews on another, so a slow page
+  never holds up a command. Each call gets fuel and a wall-clock limit (two
+  seconds); each instance gets a memory cap (64 MB).
+- A command is given at most 8 MB of text, refused by its length before
+  anything is copied, and the text is cut from the document on the worker
+  thread, not the main one. A replacement over 16 MB and a preview page
+  over 8 MB are dropped with a message.
 - An instance stays loaded between calls, so an extension can keep state.
 - Edits are applied on the main thread only if the document has not changed
   since the call, the rule crc already uses for formatting.
 - A trap or an exhausted budget cancels the call and says so in the status
   line. The instance is dropped, and the next call starts from a fresh one.
+- Three failures in a row turn an extension off until someone turns it
+  back on in Extensions. Running out of time or instructions does not
+  count: that is the size of what it was given. A preview that runs out of
+  time closes instead of trying again on every edit.
+- Before a module runs, its bytes are checked against the digest recorded
+  when it was installed. A package whose module, manifest or README
+  changed since is marked as changed, never shown as signed, and offers no
+  commands until it is reinstalled.
 
 ## Distribution and signing
 

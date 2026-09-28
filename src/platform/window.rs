@@ -636,10 +636,12 @@ struct State {
     ext_registry_rx: Option<mpsc::Receiver<Result<crate::ext::registry::Index, String>>>,
     ext_install_rx: Option<mpsc::Receiver<Result<crate::ext::store::Package, String>>>,
     /// The extension thread, started on the first command.
-    ext_worker: Option<(
-        mpsc::Sender<crate::ext::run::Job>,
-        mpsc::Receiver<crate::ext::run::Done>,
-    )>,
+    ext_worker: Option<ExtWorker>,
+    /// Previews run on their own thread: a slow page must not hold up a
+    /// command someone asked for.
+    ext_preview_worker: Option<ExtWorker>,
+    /// Failures in a row by extension id. Three turn it off.
+    ext_failures: HashMap<String, u32>,
     /// Extension commands by menu tag.
     ext_commands: Vec<ExtCommand>,
     /// Calls in flight, by job tag.
@@ -1020,24 +1022,47 @@ fn note_documents_edited(state: &mut State, ids: impl IntoIterator<Item = u64>) 
     }
 }
 
-/// Sends `request` to the extension thread, starting it if needed, and
-/// files `call` to meet the answer. False when the thread is gone.
+/// An extension thread: where jobs go, and where answers come back.
+type ExtWorker = (
+    mpsc::Sender<crate::ext::run::Job>,
+    mpsc::Receiver<crate::ext::run::Done>,
+);
+
+/// Consecutive failures that turn an extension off. Running out of time or
+/// instructions does not count: that is the size of what it was given.
+const EXT_FAILURES_TO_DISABLE: u32 = 3;
+
+/// Sends `request` to an extension thread, starting it if needed, and
+/// files `call` to meet the answer: a preview's thread for a preview, the
+/// commands' thread otherwise. False when the thread is gone.
 fn send_ext_job(
     state: &mut State,
     command: &ExtCommand,
     request: crate::ext::run::Request,
     call: ExtCall,
 ) -> bool {
-    if state.ext_worker.is_none() {
-        state.ext_worker = Some(crate::ext::run::spawn(Box::new(|| {})));
+    let preview = call.preview;
+    let slot = if preview {
+        &mut state.ext_preview_worker
+    } else {
+        &mut state.ext_worker
+    };
+    if slot.is_none() {
+        *slot = Some(crate::ext::run::spawn(Box::new(|| {})));
     }
     let job = state.ext_next_job;
     state.ext_next_job += 1;
-    let sent = state.ext_worker.as_ref().is_some_and(|(tx, _)| {
+    let worker = if preview {
+        &state.ext_preview_worker
+    } else {
+        &state.ext_worker
+    };
+    let sent = worker.as_ref().is_some_and(|(tx, _)| {
         tx.send(crate::ext::run::Job {
             tag: job,
             manifest: command.installed.manifest.clone(),
             wasm: command.installed.wasm(),
+            sha256: command.installed.sha256.clone(),
             generation: state.ext_generation,
             request,
         })
@@ -1046,7 +1071,11 @@ fn send_ext_job(
     if sent {
         state.ext_pending.insert(job, call);
     } else {
-        state.ext_worker = None;
+        if preview {
+            state.ext_preview_worker = None;
+        } else {
+            state.ext_worker = None;
+        }
         state.message = Some(("the extension thread stopped".into(), Instant::now()));
     }
     sent
@@ -9680,7 +9709,7 @@ impl EditorView {
     fn rebuild_extension_menu(&self) {
         let installed = crate::ext::store::list();
         let mut commands = Vec::new();
-        for i in installed.iter().filter(|i| i.enabled) {
+        for i in installed.iter().filter(|i| i.enabled && !i.tampered) {
             for c in &i.manifest.commands {
                 commands.push(ExtCommand {
                     installed: i.clone(),
@@ -9743,9 +9772,23 @@ impl EditorView {
             self.open_preview(command);
             return;
         }
+        // Refused here, on the length alone: nothing is copied to find out.
+        if range.len() > crate::ext::run::MAX_REQUEST {
+            state.message = Some((
+                format!(
+                    "{}: the text is over {} MB, more than an extension is given",
+                    command.title,
+                    crate::ext::run::MAX_REQUEST >> 20
+                ),
+                Instant::now(),
+            ));
+            drop(state);
+            self.request_redraw();
+            return;
+        }
         let request = crate::ext::run::Request {
             command: command.command.clone(),
-            text: buffer.rope.slice_to_string(range.clone()),
+            text: crate::ext::run::Text::of(&buffer.rope, range.clone()),
             selection: selection.is_some(),
             language: ext_language(buffer),
         };
@@ -9816,7 +9859,7 @@ impl EditorView {
         }
         let request = crate::ext::run::Request {
             command: command.command.clone(),
-            text: buffer.rope.to_string(),
+            text: crate::ext::run::Text::of(&buffer.rope, 0..buffer.rope.len_bytes()),
             selection: false,
             language: ext_language(buffer),
         };
@@ -9982,7 +10025,7 @@ impl EditorView {
             .as_ref()
             .and_then(|rx| rx.try_recv().ok());
         let mut done = Vec::new();
-        if let Some((_, rx)) = &state.ext_worker {
+        for (_, rx) in state.ext_worker.iter().chain(&state.ext_preview_worker) {
             while let Ok(answer) = rx.try_recv() {
                 done.push(answer);
             }
@@ -10012,9 +10055,45 @@ impl EditorView {
         let Some(call) = state.ext_pending.remove(&done.tag) else {
             return;
         };
+        // Three failures in a row, not counting time or instruction limits,
+        // turn an extension off until someone turns it back on.
+        let broken = match &done.result {
+            Err(_) if !done.over_budget => {
+                let count = state.ext_failures.entry(done.id.clone()).or_insert(0);
+                *count += 1;
+                *count >= EXT_FAILURES_TO_DISABLE
+            }
+            Err(_) => false,
+            Ok(_) => {
+                state.ext_failures.remove(&done.id);
+                false
+            }
+        };
+        if broken {
+            state.ext_failures.remove(&done.id);
+            let installed = state
+                .ext_commands
+                .iter()
+                .find(|c| c.installed.manifest.id == done.id)
+                .map(|c| c.installed.clone());
+            drop(state);
+            if let Some(installed) = installed {
+                let note = match crate::ext::store::set_enabled(&installed, false) {
+                    Ok(()) => format!(
+                        "{} failed three times in a row and was turned off; turn it back on in Extensions",
+                        installed.manifest.name
+                    ),
+                    Err(e) => format!("{} keeps failing: {e}", installed.manifest.name),
+                };
+                self.extensions_changed();
+                self.ivars().state.borrow_mut().message = Some((note, Instant::now()));
+            }
+            self.ivars().needs_redraw.set(true);
+            return;
+        }
         if call.preview {
             drop(state);
-            self.preview_answer(&call, done.result);
+            self.preview_answer(&call, done.result, done.over_budget);
             return;
         }
         let response = match done.result {
@@ -10062,7 +10141,12 @@ impl EditorView {
     /// An answer for the preview pane. It says nothing in the status line
     /// unless the extension did, or something failed; a run that fails
     /// before any page arrived closes the pane.
-    fn preview_answer(&self, call: &ExtCall, result: Result<crate::ext::run::Response, String>) {
+    fn preview_answer(
+        &self,
+        call: &ExtCall,
+        result: Result<crate::ext::run::Response, String>,
+        over_budget: bool,
+    ) {
         let mut state = self.ivars().state.borrow_mut();
         let Some(preview) = state
             .html_preview
@@ -10089,6 +10173,15 @@ impl EditorView {
                         .unwrap_or_else(|| format!("{} made no page", call.title)),
                 ),
                 !preview.answered,
+            ),
+            // Out of time on this document: every edit would be the same,
+            // so the pane closes rather than trying again and again.
+            Err(_) if over_budget => (
+                Some(format!(
+                    "{}: the document is too large to preview",
+                    call.title
+                )),
+                true,
             ),
             Err(error) => (Some(error), !preview.answered),
         };
@@ -15823,6 +15916,8 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         ext_registry_rx: None,
         ext_install_rx: None,
         ext_worker: None,
+        ext_preview_worker: None,
+        ext_failures: HashMap::new(),
         ext_commands: Vec::new(),
         ext_pending: HashMap::new(),
         ext_next_job: 1,

@@ -12,10 +12,18 @@ use crate::json::{Value, object, string};
 pub struct Installed {
     pub manifest: Manifest,
     pub dir: PathBuf,
-    /// Came from the signed registry.
+    /// Came from the signed registry, and its files are still the ones
+    /// installed. Never true for a changed package.
     pub signed: bool,
     pub enabled: bool,
     pub readme: String,
+    /// A file changed since it was installed: the module, the manifest or
+    /// the README no longer has the digest recorded then. It offers no
+    /// commands until reinstalled.
+    pub tampered: bool,
+    /// The module's digest at install, which the extension thread checks
+    /// again on the bytes it loads.
+    pub sha256: String,
 }
 
 impl Installed {
@@ -101,17 +109,58 @@ fn read(dir: &Path) -> Option<Installed> {
     let origin = std::fs::read_to_string(dir.join("origin.json"))
         .ok()
         .and_then(|t| crate::json::parse(&t).ok());
-    Some(Installed {
-        signed: origin
+    let recorded = |key: &str| {
+        origin
+            .as_ref()
+            .and_then(|o| o.get(key))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    // What was installed is what is here: each file against the digest
+    // recorded at install. The module must have one; installs before the
+    // manifest and README were recorded are held to the module alone.
+    let module = read_capped(&dir.join(&manifest.entry), MAX_MODULE_BYTES);
+    let sha256 = recorded("sha256").unwrap_or_default();
+    let module_ok = module.as_deref().is_some_and(|m| digest(m) == sha256);
+    let same = |key: &str, file: &str| {
+        recorded(key).is_none_or(|want| {
+            read_capped(&dir.join(file), MAX_INDEX_TEXT).is_some_and(|b| digest(&b) == want)
+        })
+    };
+    let tampered = !(module_ok
+        && same("manifest_sha256", "manifest.json")
+        && same("readme_sha256", "README.md"));
+    let signed = !tampered
+        && origin
             .as_ref()
             .and_then(|o| o.get("signed"))
             .and_then(Value::as_bool)
-            .unwrap_or(false),
+            .unwrap_or(false);
+    Some(Installed {
+        signed,
         enabled: !dir.join("disabled").exists(),
         readme: read_readme(&dir.join("README.md")),
+        tampered,
+        sha256,
         dir: dir.to_path_buf(),
         manifest,
     })
+}
+
+/// A file's bytes when it is no larger than `max`, checked before reading.
+fn read_capped(path: &Path, max: usize) -> Option<Vec<u8>> {
+    let len = std::fs::metadata(path).ok()?.len();
+    (len <= max as u64)
+        .then(|| std::fs::read(path).ok())
+        .flatten()
+}
+
+/// SHA-256 in hex, empty if the system digest is unavailable (then nothing
+/// matches, which reads as changed: the safe answer).
+pub fn digest(bytes: &[u8]) -> String {
+    super::verify::sha256(bytes)
+        .map(|h| super::verify::hex(&h))
+        .unwrap_or_default()
 }
 
 /// What an install is made of, checked, before anything is written.
@@ -126,6 +175,9 @@ pub struct Package {
 
 /// The largest module an extension may bring.
 const MAX_MODULE_BYTES: usize = 16 << 20;
+/// The largest manifest or README an install writes: the signed index they
+/// come from is itself capped at 4 MB.
+const MAX_INDEX_TEXT: usize = 4 << 20;
 /// A README past this is not shown.
 const MAX_README_BYTES: usize = 1 << 20;
 
@@ -201,17 +253,18 @@ pub fn install_in(root: &Path, package: &Package) -> Result<Installed, String> {
         std::fs::write(staging.join("manifest.json"), &package.manifest_json)?;
         std::fs::write(staging.join(&package.manifest.entry), &package.wasm)?;
         std::fs::write(staging.join("README.md"), &package.readme)?;
+        // The digests of what is written, from the verified package: the
+        // module against the signed index, the manifest and README as the
+        // index carried them. Listing and loading check against these.
         let origin = object([
             ("signed", Value::Bool(package.signed)),
             ("source", string(&package.source)),
+            ("sha256", string(&digest(&package.wasm))),
             (
-                "sha256",
-                string(
-                    &super::verify::sha256(&package.wasm)
-                        .map(|h| super::verify::hex(&h))
-                        .unwrap_or_default(),
-                ),
+                "manifest_sha256",
+                string(&digest(package.manifest_json.as_bytes())),
             ),
+            ("readme_sha256", string(&digest(package.readme.as_bytes()))),
         ]);
         std::fs::write(staging.join("origin.json"), crate::json::pretty(&origin))
     };
@@ -274,6 +327,31 @@ mod tests {
 
     fn fixture() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/extensions/sort-lines")
+    }
+
+    /// A signed install whose files change afterwards is not signed any
+    /// more, and says so: each of the three files, in turn.
+    #[test]
+    fn a_changed_install_is_marked_and_never_signed() {
+        let root = std::env::temp_dir().join(format!("crc-ext-tamper-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut package = Package::from_folder(&fixture()).unwrap();
+        package.signed = true;
+        for file in ["sort_lines.wasm", "manifest.json", "README.md"] {
+            install_in(&root, &package).unwrap();
+            let fresh = &list_in(&root)[0];
+            assert!(fresh.signed && !fresh.tampered, "fresh install");
+            assert_eq!(fresh.sha256, digest(&package.wasm));
+            let path = root.join("crc.sort-lines").join(file);
+            let mut bytes = std::fs::read(&path).unwrap();
+            // Still valid JSON for the manifest: a space at the end.
+            bytes.push(b' ');
+            std::fs::write(&path, bytes).unwrap();
+            let changed = &list_in(&root)[0];
+            assert!(changed.tampered, "{file} changed");
+            assert!(!changed.signed, "{file} changed, still signed");
+        }
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

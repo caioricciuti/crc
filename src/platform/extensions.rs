@@ -431,6 +431,7 @@ pub fn draw_details(
         facts.push(format!("by {}", manifest.authors.join(", ")));
     }
     facts.push(match &installed {
+        Some(i) if i.tampered => "changed since it was installed: reinstall it".into(),
         Some(i) if i.signed => "signed".into(),
         Some(_) => "unsigned".into(),
         None => "signed".into(),
@@ -616,7 +617,9 @@ pub fn draw_list(
         if !i.enabled {
             state.push_str(" \u{b7} off");
         }
-        if !i.signed {
+        if i.tampered {
+            state.push_str(" \u{b7} changed, reinstall");
+        } else if !i.signed {
             state.push_str(" \u{b7} unsigned");
         }
         rows.push((

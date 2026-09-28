@@ -162,6 +162,30 @@ mod tests {
         );
     }
 
+    /// The extension thread runs only the bytes that were installed: a
+    /// module whose digest is not the recorded one is refused.
+    #[test]
+    fn the_worker_refuses_a_module_that_changed() {
+        let package = super::store::Package::from_folder(&fixture()).unwrap();
+        let (jobs, done) = super::run::spawn(Box::new(|| {}));
+        let job = |tag, sha256: String| super::run::Job {
+            tag,
+            manifest: package.manifest.clone(),
+            wasm: fixture().join("sort_lines.wasm"),
+            sha256,
+            generation: 1,
+            request: request("sort", "b\na\n", true),
+        };
+        jobs.send(job(1, "0".repeat(64))).unwrap();
+        let answer = done.recv().unwrap();
+        let error = answer.result.unwrap_err();
+        assert!(error.contains("changed on disk"), "{error}");
+        jobs.send(job(2, super::store::digest(&package.wasm)))
+            .unwrap();
+        let answer = done.recv().unwrap();
+        assert_eq!(answer.result.unwrap().replace.as_deref(), Some("a\nb\n"));
+    }
+
     #[test]
     fn a_module_must_match_its_manifest() {
         let package = super::store::Package::from_folder(&fixture()).unwrap();
@@ -370,6 +394,67 @@ mod tests {
             selection: true,
             language: String::new(),
         })
+    }
+
+    /// What the circuit breaker counts: a command that traps is a failure,
+    /// one that runs out of instructions or time is over budget, which the
+    /// window does not count against the extension. And a text over the
+    /// limit is refused before anything is copied into the module.
+    #[test]
+    fn failures_say_whether_they_were_over_budget() {
+        let zero: &[u8] = &[0x41, 0x00];
+        let nothing: &[u8] = &[];
+        let forever: &[u8] = &[0x03, 0x40, 0x0c, 0x00, 0x0b, 0x41, 0x00];
+        let divide: &[u8] = &[0x41, 0x01, 0x41, 0x00, 0x6d];
+        let types = &[(1, 1), (2, 0), (2, 1)];
+        let bytes = named_module(
+            types,
+            &[],
+            &[
+                (0, 0, zero),
+                (1, 0, nothing),
+                (2, 0, forever),
+                (2, 0, divide),
+            ],
+            &["crc_alloc", "crc_free", "spin", "trap"],
+            true,
+        );
+        let manifest =
+            manifest_for(r#"{"id": "spin", "title": "Spin"}, {"id": "trap", "title": "Trap"}"#);
+        let dir = std::env::temp_dir().join(format!("crc-ext-budget-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wasm = dir.join("t.wasm");
+        std::fs::write(&wasm, &bytes).unwrap();
+        let (jobs, done) = super::run::spawn(Box::new(|| {}));
+        let send = |tag, command: &str| {
+            jobs.send(super::run::Job {
+                tag,
+                manifest: manifest.clone(),
+                wasm: wasm.clone(),
+                sha256: super::store::digest(&bytes),
+                generation: 1,
+                request: request(command, "x", true),
+            })
+            .unwrap();
+            done.recv().unwrap()
+        };
+        let spun = send(1, "spin");
+        assert!(
+            spun.result.is_err() && spun.over_budget,
+            "{:?}",
+            spun.result
+        );
+        let trapped = send(2, "trap");
+        assert!(
+            trapped.result.is_err() && !trapped.over_budget,
+            "{:?}",
+            trapped.result
+        );
+        let mut ext = load(manifest.clone(), &bytes).unwrap();
+        let big = "x".repeat(super::run::MAX_REQUEST + 1);
+        let error = ext.run(&request("trap", &big, true)).unwrap_err();
+        assert!(error.contains("over 8 MB"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

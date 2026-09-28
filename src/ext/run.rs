@@ -21,16 +21,63 @@ const FUEL: u64 = 500_000_000;
 const DEADLINE: Duration = Duration::from_secs(2);
 /// The largest preview page crc shows.
 pub const MAX_HTML: usize = 8 << 20;
+/// The most text a command is given. Its JSON, a copy in the module's
+/// memory and the answer must fit in `MAX_PAGES`.
+pub const MAX_REQUEST: usize = 8 << 20;
+/// The largest replacement crc applies.
+pub const MAX_REPLACE: usize = 16 << 20;
+/// How a command that ran out of instructions or time ends its message.
+const OVER_BUDGET: &str = "took too long and was stopped";
 /// Lines of log kept per extension.
 const LOG_LINES: usize = 200;
 
 /// What a command is asked.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct Request {
     pub command: String,
-    pub text: String,
+    pub text: Text,
     pub selection: bool,
     pub language: String,
+}
+
+/// The text a command is given: a range of a document, cut on the
+/// extension thread. The main thread hands over the rope, a pointer's
+/// worth, and copies nothing however large the document.
+#[derive(Clone)]
+pub struct Text {
+    rope: crate::text::rope::Rope,
+    range: std::ops::Range<usize>,
+}
+
+impl Text {
+    pub fn of(rope: &crate::text::rope::Rope, range: std::ops::Range<usize>) -> Text {
+        Text {
+            rope: rope.clone(),
+            range,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.range.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.range.is_empty()
+    }
+}
+
+impl From<&str> for Text {
+    fn from(text: &str) -> Text {
+        let rope = crate::text::rope::Rope::from_text(text);
+        let range = 0..rope.len_bytes();
+        Text { rope, range }
+    }
+}
+
+impl std::fmt::Debug for Text {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Text({:?})", self.range)
+    }
 }
 
 /// What it answered.
@@ -135,17 +182,27 @@ impl Loaded {
             .commands
             .get(&request.command)
             .ok_or_else(|| format!("{name} has no command {}", request.command))?;
+        if request.text.len() > MAX_REQUEST {
+            return Err(format!(
+                "the text is over {} MB, more than an extension is given",
+                MAX_REQUEST >> 20
+            ));
+        }
+        let text = request
+            .text
+            .rope
+            .slice_to_string(request.text.range.clone());
         let input = crate::json::compact(&object([
             ("api", crate::json::number(manifest::API)),
             ("command", string(&request.command)),
-            ("text", string(&request.text)),
+            ("text", string(&text)),
             ("selection", Value::Bool(request.selection)),
             ("language", string(&request.language)),
         ]));
         self.instance.fuel = FUEL;
         self.instance.deadline = Some(Instant::now() + DEADLINE);
         let trap = |t: Trap| match t.0.as_str() {
-            "out of fuel" | "took too long" => format!("{name} took too long and was stopped"),
+            "out of fuel" | "took too long" => format!("{name} {OVER_BUDGET}"),
             other => format!("{name} failed: {other}"),
         };
         let len = input.len() as u64;
@@ -197,6 +254,17 @@ impl Loaded {
             response.html = None;
             response.message = Some(format!("{name} may not show a preview"));
         }
+        if response
+            .replace
+            .as_ref()
+            .is_some_and(|r| r.len() > MAX_REPLACE)
+        {
+            response.replace = None;
+            response.message = Some(format!(
+                "{name} answered with over {} MB; nothing was changed",
+                MAX_REPLACE >> 20
+            ));
+        }
         if response.html.as_ref().is_some_and(|h| h.len() > MAX_HTML) {
             response.html = None;
             response.message = Some(format!(
@@ -214,6 +282,8 @@ pub struct Job {
     pub tag: u64,
     pub manifest: Manifest,
     pub wasm: std::path::PathBuf,
+    /// The module's digest at install. Bytes that differ are not run.
+    pub sha256: String,
     /// What is installed, as a number that changes with it: a new one
     /// drops every loaded instance, so a reinstall is picked up.
     pub generation: u64,
@@ -225,6 +295,8 @@ pub struct Done {
     pub id: String,
     pub result: Result<Response, String>,
     pub log: Vec<String>,
+    /// It failed by running out of instructions or time.
+    pub over_budget: bool,
 }
 
 /// The thread every extension runs on. Instances stay loaded between calls,
@@ -247,7 +319,18 @@ pub fn spawn(wake: Box<dyn Fn() + Send>) -> (mpsc::Sender<Job>, mpsc::Receiver<D
                 if !loaded.contains_key(&key) {
                     let started = std::fs::read(&job.wasm)
                         .map_err(|e| format!("could not read {}: {e}", job.wasm.display()))
-                        .and_then(|bytes| load(job.manifest.clone(), &bytes));
+                        .and_then(|bytes| {
+                            // Checked on the bytes that run, not only when
+                            // the list was read: a file swapped in between
+                            // is caught here.
+                            if super::store::digest(&bytes) != job.sha256 {
+                                return Err(format!(
+                                    "{} changed on disk since it was installed; reinstall it",
+                                    job.manifest.name
+                                ));
+                            }
+                            load(job.manifest.clone(), &bytes)
+                        });
                     match started {
                         Ok(l) => {
                             loaded.insert(key.clone(), l);
@@ -258,6 +341,7 @@ pub fn spawn(wake: Box<dyn Fn() + Send>) -> (mpsc::Sender<Job>, mpsc::Receiver<D
                                 id,
                                 result: Err(error),
                                 log: Vec::new(),
+                                over_budget: false,
                             });
                             wake();
                             continue;
@@ -268,6 +352,7 @@ pub fn spawn(wake: Box<dyn Fn() + Send>) -> (mpsc::Sender<Job>, mpsc::Receiver<D
                     continue;
                 };
                 let result = extension.run(&job.request);
+                let over_budget = result.as_ref().is_err_and(|e| e.ends_with(OVER_BUDGET));
                 // A trap may leave the instance half-way through anything;
                 // the next call starts from a fresh one.
                 let log = extension.log.lock().map(|l| l.clone()).unwrap_or_default();
@@ -279,6 +364,7 @@ pub fn spawn(wake: Box<dyn Fn() + Send>) -> (mpsc::Sender<Job>, mpsc::Receiver<D
                     id,
                     result,
                     log,
+                    over_budget,
                 });
                 wake();
             }
