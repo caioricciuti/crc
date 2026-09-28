@@ -40,7 +40,9 @@ builds with LTO on Apple Silicon, median of 20 runs:
 | Sort 10,000 lines (451 KB) | 10.9 ms | 97 ms |
 | Spec validation | full | none; every access checked instead |
 
-**Decision: crc's own interpreter, behind a small `Engine` interface.**
+**Decision: crc's own interpreter, behind a small interface.** Nothing in
+crc calls `ext::wasm` except `ext::run`, whose `load` and `Loaded::run` are
+the whole boundary: a module in, a command's answer out.
 
 - It adds no crates, no build scripts and a few thousand lines we read and
   own. wasmi would add seven crates and four build scripts, mostly from one
@@ -48,19 +50,43 @@ builds with LTO on Apple Silicon, median of 20 runs:
 - 97 ms is fine for a command. For work on every keystroke (a linter, a
   completion source), at about 3 ns per instruction a 20 ms budget is some
   six million instructions, off the main thread.
-- If real extensions hit that ceiling, wasmi goes in behind the same
-  interface, after the same dependency review as everything else.
+- If real extensions hit that ceiling, wasmi goes in behind `ext::run`,
+  after the same dependency review as everything else.
 
 How the interpreter stays safe without a spec validator: no `unsafe`; every
 stack pop, index and memory access is checked and any inconsistency is a
 trap, never a panic; calls run on an explicit frame stack with a depth cap,
 so a module cannot overflow crc's own stack; memory is capped by the host;
 fuel bounds the instructions a call may run. A malformed module can compute
-garbage inside its own sandbox, and nothing outside it. A first mutation
-fuzz (20,000 corrupted modules) produced no panics.
+garbage inside its own sandbox, and nothing outside it.
 
-Before it ships: host imports, a long-running fuzz target, and the official
-WebAssembly spec tests for every feature crc claims to support.
+What it runs, and nothing else: the WebAssembly 2.0 core instructions
+rustc emits for wasm32-unknown-unknown (integer and float arithmetic,
+memory, globals, one table of functions, indirect calls, multi-value
+blocks, typed `select`), sign extension, saturating truncation, and bulk
+memory copy and fill, with one 32-bit memory and function imports from
+`crc`. Everything else is refused when the module loads: SIMD, threads and
+shared memory, exceptions, tail calls, reference types and table
+instructions, the other bulk-memory instructions, a second memory or
+table, 64-bit memory. A test holds the engine to that list, both ways.
+
+How it is checked:
+
+- The official spec tests, on every `cargo test` (`tests/wasm_spec.rs`,
+  files pinned in `tests/spec/`): 43 of the testsuite's files for numbers,
+  expressions, literals, control flow, locals, globals, calls and memory,
+  15,044 assertions passing and none failing. What is not run needs a
+  feature crc refuses (tables for `call_indirect`, references, imports,
+  multi-memory), is counted, and may not grow. The validation cases are
+  left out, since there is no validator.
+- Corpora of malformed modules (bad headers, sections that lie about
+  their size or count, every cut of a real extension) and of resource
+  limits (memory, table, value stack, call depth, fuel, the clock), each
+  refused or trapped, never a panic.
+- Fuzzing: 3,000 corrupted modules on every `cargo test`, and 25 minutes
+  every night in CI through the same load and run path crc uses
+  (`examples/ext_fuzz.rs`), with the seed logged and panicking cases kept.
+- Any new instruction or proposal arrives with cases in these tests.
 
 ## A package
 

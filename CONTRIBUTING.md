@@ -26,6 +26,15 @@ scripts/check-third-party.sh
 scripts/check-build-scripts.sh
 ```
 
+For changes to the extension interpreter (`src/ext/wasm.rs`), `cargo
+test` already runs the official WebAssembly spec tests in
+`tests/wasm_spec.rs` and the malformed-module and limit corpora; also run
+the fuzzer for a while, and add cases for any new instruction:
+
+```sh
+cargo run --offline --example ext_fuzz -- --seconds 300
+```
+
 Use temporary repositories for Git regression tests. For a visual change,
 look at a rendered frame or a capture of the real window, not only at the
 tests; say in the pull request which checks you could not run.

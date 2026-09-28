@@ -2,9 +2,18 @@
 //!
 //! Enough of the 2.0 core spec for what rustc emits for
 //! wasm32-unknown-unknown: integer and float arithmetic, memory, globals,
-//! tables and indirect calls, sign extension, saturating truncation, bulk
-//! memory copy and fill, multi-value block types, and imported functions,
-//! which the host supplies when it links the module. No SIMD, no threads.
+//! one table of functions and indirect calls, sign extension, saturating
+//! truncation, bulk memory copy and fill, multi-value block types, typed
+//! `select`, and imported functions, which the host supplies when it links
+//! the module. One 32-bit, unshared memory.
+//!
+//! Everything else is refused at load, never met half-way through a call:
+//! SIMD, threads, exceptions, tail calls, reference types and the table
+//! instructions, the other bulk-memory instructions, a second memory or
+//! table. `ext::tests::only_the_declared_feature_set_loads` holds the list
+//! both ways, `tests/wasm_spec.rs` runs the official spec tests (numbers,
+//! control flow, memory; see tests/spec/SOURCES.md), and a new instruction
+//! arrives with cases in both.
 //! The design and the measurements behind choosing this over a crate are in
 //! `docs/extensions.md`.
 //!
@@ -288,6 +297,24 @@ fn const_expr(r: &mut Reader, globals: &[(bool, u64)]) -> Result<u64, Trap> {
     Ok(value)
 }
 
+/// A table's or memory's limits: a minimum, and a maximum when flag 1 says
+/// so. Other flags are shared memory (threads) or 64-bit memory.
+fn limits(r: &mut Reader) -> Result<(u32, Option<u32>), Trap> {
+    match r.byte()? {
+        0 => Ok((r.u32()?, None)),
+        1 => Ok((r.u32()?, Some(r.u32()?))),
+        flags => trap(format!("limits with flags {flags}: shared or 64-bit")),
+    }
+}
+
+/// The memory index an instruction names, which must be the one memory.
+fn memory_zero(r: &mut Reader) -> Result<(), Trap> {
+    match r.byte()? {
+        0 => Ok(()),
+        _ => trap("a memory other than 0"),
+    }
+}
+
 fn decode_body(body: &[u8], types: &[FuncType], ty: FuncType) -> Result<Func, Trap> {
     let mut r = Reader::new(body);
     let mut locals = 0usize;
@@ -375,7 +402,10 @@ fn decode_body(body: &[u8], types: &[FuncType], ty: FuncType) -> Result<Func, Tr
             0x10 => Op::Call(r.u32()?),
             0x11 => {
                 let ty = r.u32()?;
-                r.u32()?;
+                // One table: another index is the reference-types proposal.
+                if r.u32()? != 0 {
+                    return trap("call_indirect on a table other than 0");
+                }
                 Op::CallIndirect { ty }
             }
             0x1a => Op::Drop,
@@ -392,7 +422,11 @@ fn decode_body(body: &[u8], types: &[FuncType], ty: FuncType) -> Result<Func, Tr
             0x23 => Op::GlobalGet(r.u32()?),
             0x24 => Op::GlobalSet(r.u32()?),
             0x28..=0x3e => {
-                r.u32()?;
+                // Bit 6 of the alignment says a memory index follows: the
+                // multi-memory proposal.
+                if r.u32()? & 0x40 != 0 {
+                    return trap("a memory other than 0");
+                }
                 let offset = r.u32()?;
                 match op {
                     0x28 => Op::Load(Load::I32, offset),
@@ -417,11 +451,11 @@ fn decode_body(body: &[u8], types: &[FuncType], ty: FuncType) -> Result<Func, Tr
                 }
             }
             0x3f => {
-                r.byte()?;
+                memory_zero(&mut r)?;
                 Op::MemorySize
             }
             0x40 => {
-                r.byte()?;
+                memory_zero(&mut r)?;
                 Op::MemoryGrow
             }
             0x41 => Op::Const(r.signed(32)? as i32 as u32 as u64),
@@ -432,12 +466,12 @@ fn decode_body(body: &[u8], types: &[FuncType], ty: FuncType) -> Result<Func, Tr
             0xfc => match r.u32()? {
                 n @ 0..=7 => Op::Sat(n as u8),
                 10 => {
-                    r.byte()?;
-                    r.byte()?;
+                    memory_zero(&mut r)?;
+                    memory_zero(&mut r)?;
                     Op::MemoryCopy
                 }
                 11 => {
-                    r.byte()?;
+                    memory_zero(&mut r)?;
                     Op::MemoryFill
                 }
                 n => return trap(format!("unsupported 0xfc {n}")),
@@ -476,6 +510,7 @@ impl Module {
             start: None,
         };
         let mut declared: Vec<u32> = Vec::new();
+        let mut coded = false;
         while !r.done() {
             let id = r.byte()?;
             let len = r.u32()? as usize;
@@ -517,21 +552,28 @@ impl Module {
                         declared.push(s.u32()?);
                     }
                 }
+                // One table of functions and one memory, 32-bit and not
+                // shared: anything else is a proposal crc does not run.
                 4 => {
-                    for _ in 0..s.u32()? {
-                        s.byte()?;
-                        let flags = s.byte()?;
-                        let min = s.u32()?;
-                        let max = if flags & 1 != 0 { Some(s.u32()?) } else { None };
+                    let count = s.u32()?;
+                    if count > 1 {
+                        return trap("more than one table");
+                    }
+                    if count == 1 {
+                        if s.byte()? != 0x70 {
+                            return trap("a table of something other than functions");
+                        }
+                        let (min, max) = limits(&mut s)?;
                         m.tables.push((min, max));
                     }
                 }
                 5 => {
-                    for _ in 0..s.u32()? {
-                        let flags = s.byte()?;
-                        let min = s.u32()?;
-                        let max = if flags & 1 != 0 { Some(s.u32()?) } else { None };
-                        m.memory = Some((min, max));
+                    let count = s.u32()?;
+                    if count > 1 {
+                        return trap("more than one memory");
+                    }
+                    if count == 1 {
+                        m.memory = Some(limits(&mut s)?);
                     }
                 }
                 6 => {
@@ -572,6 +614,7 @@ impl Module {
                     }
                 }
                 10 => {
+                    coded = true;
                     let count = s.u32()? as usize;
                     if count != declared.len() {
                         return trap("function and code counts differ");
@@ -600,6 +643,11 @@ impl Module {
                 }
                 other => return trap(format!("unknown section {other}")),
             }
+        }
+        // Declared functions with no code section at all: bodies that do
+        // not exist.
+        if !declared.is_empty() && !coded {
+            return trap("function and code counts differ");
         }
         Ok(m)
     }

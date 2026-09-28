@@ -1,0 +1,51 @@
+name: Fuzz
+
+# The extension interpreter is the boundary between crc and code it did not
+# write. Every night: 25 minutes of corrupted real extensions, loaded and run
+# the way crc runs them (examples/ext_fuzz.rs). A panic fails the run and the
+# cases that caused it are kept as an artifact, with the seed in the log to
+# repeat it exactly. `cargo test` runs a short version on every change.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_OFFLINE: true
+
+jobs:
+  fuzz:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Toolchain
+        run: |
+          rustup toolchain install
+          cargo --version
+
+      # The one step allowed to fetch, behind the same gate as CI.
+      - name: Vendor, then build scripts, proc macros, tree size
+        env:
+          CARGO_NET_OFFLINE: false
+        run: ./scripts/vendor.sh
+
+      # The dev profile keeps overflow checks on: an arithmetic overflow in
+      # the interpreter is a panic here, not a wrapped value.
+      - name: Fuzz for 25 minutes
+        run: cargo run --locked --offline --example ext_fuzz -- --seconds 1500
+
+      - name: Keep the cases that panicked
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ext-fuzz-panics
+          path: ext-fuzz-panic-*.wasm
+          if-no-files-found: ignore

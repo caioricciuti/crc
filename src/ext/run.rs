@@ -102,6 +102,10 @@ pub struct Loaded {
     /// Its allocator stopped part-way through a free: whatever it holds is
     /// suspect, so the next command starts from a fresh instance.
     pub spoiled: bool,
+    /// What one command may spend: `FUEL` instructions and `DEADLINE` of
+    /// wall clock. A long fuzz run lowers both, to try more cases.
+    pub fuel: u64,
+    pub deadline: Duration,
 }
 
 /// Loads `wasm` as the module `manifest` describes, checking one against
@@ -155,6 +159,8 @@ pub fn load(manifest: Manifest, wasm: &[u8]) -> Result<Loaded, String> {
         commands,
         log,
         spoiled: false,
+        fuel: FUEL,
+        deadline: DEADLINE,
     })
 }
 
@@ -199,8 +205,8 @@ impl Loaded {
             ("selection", Value::Bool(request.selection)),
             ("language", string(&request.language)),
         ]));
-        self.instance.fuel = FUEL;
-        self.instance.deadline = Some(Instant::now() + DEADLINE);
+        self.instance.fuel = self.fuel;
+        self.instance.deadline = Some(Instant::now() + self.deadline);
         let trap = |t: Trap| match t.0.as_str() {
             "out of fuel" | "took too long" => format!("{name} {OVER_BUDGET}"),
             other => format!("{name} failed: {other}"),
@@ -229,8 +235,8 @@ impl Loaded {
         // Its buffer is its own to free, on a budget of its own rather than
         // what the command left over. A free that stops part-way leaves the
         // allocator half-updated: the answer stands, the instance does not.
-        self.instance.fuel = FUEL / 10;
-        self.instance.deadline = Some(Instant::now() + DEADLINE / 4);
+        self.instance.fuel = self.fuel / 10;
+        self.instance.deadline = Some(Instant::now() + self.deadline / 4);
         if self
             .instance
             .call(self.free, &[out as u64, out_len as u64])

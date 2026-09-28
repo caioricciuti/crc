@@ -555,6 +555,184 @@ mod tests {
         assert!(matches!(refused, Err(t) if t.0.contains("crc.network")));
     }
 
+    /// The feature set crc runs, declared in wasm.rs, is enforced when a
+    /// module loads: everything outside it is refused then, never met
+    /// half-way through a call.
+    #[test]
+    fn only_the_declared_feature_set_loads() {
+        let loads = |body: &[u8]| Module::parse(&module(&[(0, 0)], &[], &[(0, 0, body)]));
+        let refused: &[(&str, &[u8])] = &[
+            ("SIMD", &[0xfd, 0x0c]),
+            ("threads", &[0xfe, 0x00]),
+            ("exceptions: try", &[0x06, 0x40, 0x0b]),
+            ("exceptions: throw", &[0x08, 0x00]),
+            ("tail calls", &[0x12, 0x00]),
+            ("tail calls, indirect", &[0x13, 0x00, 0x00]),
+            ("function references", &[0x14, 0x00]),
+            ("reference types: ref.null", &[0xd0, 0x70, 0x1a]),
+            ("reference types: ref.func", &[0xd2, 0x00, 0x1a]),
+            ("table.get", &[0x41, 0x00, 0x25, 0x00, 0x1a]),
+            ("table.set", &[0x25, 0x00]),
+            ("memory.init", &[0xfc, 0x08, 0x00, 0x00]),
+            ("data.drop", &[0xfc, 0x09, 0x00]),
+            ("table.init", &[0xfc, 0x0c, 0x00, 0x00]),
+            ("table.copy", &[0xfc, 0x0e, 0x00, 0x00]),
+            ("table.grow", &[0xfc, 0x0f, 0x00]),
+            ("table.size", &[0xfc, 0x10, 0x00]),
+            ("table.fill", &[0xfc, 0x11, 0x00]),
+            ("call_indirect on table 1", &[0x41, 0x00, 0x11, 0x00, 0x01]),
+            (
+                "a load from memory 1",
+                &[0x41, 0x00, 0x28, 0x42, 0x01, 0x00, 0x1a],
+            ),
+            ("memory.size of memory 1", &[0x3f, 0x01, 0x1a]),
+            ("memory.grow of memory 1", &[0x41, 0x00, 0x40, 0x01, 0x1a]),
+            (
+                "memory.copy into memory 1",
+                &[0x41, 0x00, 0x41, 0x00, 0x41, 0x00, 0xfc, 0x0a, 0x01, 0x00],
+            ),
+            (
+                "memory.fill of memory 1",
+                &[0x41, 0x00, 0x41, 0x00, 0x41, 0x00, 0xfc, 0x0b, 0x01],
+            ),
+        ];
+        for (what, body) in refused {
+            assert!(loads(body).is_err(), "{what} loaded");
+        }
+        let accepted: &[(&str, &[u8])] = &[
+            ("sign extension", &[0x41, 0x7f, 0xc0, 0x1a]),
+            (
+                "saturating truncation",
+                &[0x43, 0, 0, 0, 0, 0xfc, 0x00, 0x1a],
+            ),
+            (
+                "memory.copy",
+                &[0x41, 0x00, 0x41, 0x00, 0x41, 0x00, 0xfc, 0x0a, 0x00, 0x00],
+            ),
+            (
+                "memory.fill",
+                &[0x41, 0x00, 0x41, 0x00, 0x41, 0x00, 0xfc, 0x0b, 0x00],
+            ),
+            (
+                "typed select",
+                &[0x41, 0x01, 0x41, 0x02, 0x41, 0x00, 0x1c, 0x01, 0x7f, 0x1a],
+            ),
+            ("memory.size and grow", &[0x3f, 0x00, 0x40, 0x00, 0x1a]),
+        ];
+        for (what, body) in accepted {
+            assert!(
+                loads(body).is_ok(),
+                "{what} refused: {:?}",
+                loads(body).err()
+            );
+        }
+        // One memory and one table of functions, 32-bit and not shared.
+        let with = |id: u8, body: &[u8]| {
+            let mut m = b"\0asm\x01\0\0\0".to_vec();
+            section(id, body, &mut m);
+            Module::parse(&m)
+        };
+        assert!(with(5, &[1, 0, 1]).is_ok(), "one memory");
+        assert!(with(5, &[2, 0, 1, 0, 1]).is_err(), "two memories");
+        assert!(with(5, &[1, 3, 1, 2]).is_err(), "shared memory");
+        assert!(with(5, &[1, 4, 1]).is_err(), "64-bit memory");
+        assert!(with(4, &[1, 0x70, 0, 1]).is_ok(), "one table of functions");
+        assert!(with(4, &[2, 0x70, 0, 1, 0x70, 0, 1]).is_err(), "two tables");
+        assert!(
+            with(4, &[1, 0x6f, 0, 1]).is_err(),
+            "a table of external references"
+        );
+    }
+
+    /// Malformed modules are refused, quickly and without a panic: a bad
+    /// header, sections that lie about their size or count, and every cut
+    /// of a real extension.
+    #[test]
+    fn malformed_modules_are_refused() {
+        let header = b"\0asm\x01\0\0\0".to_vec();
+        let with = |bytes: &[u8]| {
+            let mut m = header.clone();
+            m.extend_from_slice(bytes);
+            m
+        };
+        let cases: &[(&str, Vec<u8>)] = &[
+            ("empty", Vec::new()),
+            ("wrong magic", b"\0wsm\x01\0\0\0".to_vec()),
+            ("version 2", b"\0asm\x02\0\0\0".to_vec()),
+            ("a section past the end", with(&[1, 0x7f, 0])),
+            (
+                "a count of four billion types",
+                with(&[1, 5, 0xff, 0xff, 0xff, 0xff, 0x0f]),
+            ),
+            (
+                "a count of four billion functions",
+                with(&[3, 5, 0xff, 0xff, 0xff, 0xff, 0x0f]),
+            ),
+            (
+                "an unending LEB",
+                with(&[1, 6, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]),
+            ),
+            ("an unknown section", with(&[13, 1, 0])),
+            (
+                "functions without code",
+                with(&[1, 4, 1, 0x60, 0, 0, 3, 2, 1, 0]),
+            ),
+            ("code without functions", with(&[10, 4, 1, 2, 0, 0x0b])),
+            (
+                "an unclosed block",
+                with(&[1, 4, 1, 0x60, 0, 0, 3, 2, 1, 0, 10, 5, 1, 3, 0, 0x02, 0x40]),
+            ),
+        ];
+        for (what, bytes) in cases {
+            let started = std::time::Instant::now();
+            assert!(Module::parse(bytes).is_err(), "{what} parsed");
+            assert!(
+                started.elapsed() < std::time::Duration::from_millis(100),
+                "{what} was slow"
+            );
+        }
+        // Every prefix of a real module: refused (or, rarely, a module
+        // that stops at a section boundary), never a panic.
+        let real = std::fs::read(fixture().join("sort_lines.wasm")).unwrap();
+        let cuts = (0..real.len().min(2048)).chain((2048..real.len()).step_by(97));
+        let mut refused = 0;
+        for cut in cuts {
+            if Module::parse(&real[..cut]).is_err() {
+                refused += 1;
+            }
+        }
+        assert!(refused > 2000, "{refused} cuts refused");
+    }
+
+    /// What a module may ask for is bounded: memory past the cap at the
+    /// start, a table past its cap, and a value stack that grows without
+    /// end, each refused or trapped rather than allocated.
+    #[test]
+    fn resource_limits_hold() {
+        let with_sections = |sections: &[(u8, &[u8])]| {
+            let mut m = b"\0asm\x01\0\0\0".to_vec();
+            for (id, body) in sections {
+                section(*id, body, &mut m);
+            }
+            Module::parse(&m).unwrap()
+        };
+        // Memory: 100 pages asked for at the start, 4 allowed.
+        let big = with_sections(&[(5, &[1, 0, 100])]);
+        assert!(Instance::new(big, 4, |_, _| None).is_err());
+        // Table: over 65,536 entries.
+        let wide = with_sections(&[(4, &[1, 0x70, 0, 0x81, 0x80, 0x04])]);
+        assert!(Instance::new(wide, 4, |_, _| None).is_err());
+        // The value stack: over a million values pushed in a row stop at
+        // the cap. (A loop would not do: branching back resets the stack.)
+        let push = [0x41, 0x00].repeat((1 << 20) + 16);
+        let m = module(&[(0, 0)], &[], &[(0, 0, &push)]);
+        let mut i = instance(&m);
+        i.fuel = u64::MAX;
+        i.deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(20));
+        let f = i.func("f0").unwrap();
+        assert_eq!(i.call(f, &[]).unwrap_err().0, "value stack overflow");
+    }
+
     #[test]
     fn traps_instead_of_crashing() {
         let forever: &[u8] = &[0x03, 0x40, 0x0c, 0x00, 0x0b];

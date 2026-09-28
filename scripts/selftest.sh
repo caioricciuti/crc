@@ -859,6 +859,9 @@ wait 500
 dump $T/git-unstage.out
 click 264 259
 wait 500
+# Git answers on its own thread; under load it can take longer than the
+# wait, and the row would still read as unstaged when it is clicked.
+idle 1000
 # Click the row body, not the control: it selects and opens the diff.
 click 104 259
 wait 500
