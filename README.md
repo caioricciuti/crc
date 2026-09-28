@@ -97,7 +97,9 @@ the size and write it back.
   rust-analyzer, gopls, pyright, typescript-language-server and clangd,
   found in the usual install locations without reading your shell profile.
   Find references (`Shift-F12`), rename (`F2`), format (`Shift-Option-F`,
-  or on save) and signature help. No code actions yet.
+  or on save), signature help, and code actions: a lightbulb where the
+  caret rests on a line with fixes, Go > Quick Fix (`Cmd-.`) and Organize
+  Imports (`Shift-Option-O`).
 - **Claude Code inside crc**: type `claude` in any crc terminal and it
   connects to the window by itself, or press `Cmd-Shift-C` for a Claude tab.
   Claude sees the file and selection you are on and the language server
@@ -151,15 +153,14 @@ the size and write it back.
 ## What does not
 
 - **Language coverage is the list above.** A grammar is vendored generated C
-  pinned in `third_party/CHECKSUMS`; SQL and Svelte are not in the alpha.
+  pinned in `third_party/CHECKSUMS`; there is no SQL grammar, and Svelte
+  and Vue files are highlighted as HTML.
 - **Git stops short of history.** No history browser, branch deletion or
   merge and rebase commands of its own (abort and continue are the
   terminal's). Pull is fast-forward only. Hunk staging covers tracked text
   changes; other change types use whole-file actions. Gutter marks compare
   with HEAD, not the index. Conflict markers must be Git's default seven
   characters.
-- **Language servers have no code actions yet**, so no quick fixes or
-  organise imports.
 - **No minimap.** Folding is by indentation, not by syntax.
 - **Panes are a way of looking.** A file is open in one pane at a time, and
   a session restores every pane's files into one pane.

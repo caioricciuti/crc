@@ -1,10 +1,10 @@
 # Extensions: design
 
-Status: **the first version is built**: the interpreter, manifests and
-capabilities for the selection and the document, the Extensions page,
-installs from a folder and from the signed registry (which goes live with
-its first release), and commands in the palette. Host functions beyond
-`log`, and the capabilities after the document, come next. This is the
+Status: **the first version is built and live**: the interpreter,
+manifests and capabilities for the selection, the document and a preview
+page, the Extensions page, installs from a folder and from the signed
+registry, commands in the palette and previews beside the editor. Host
+functions beyond `log`, and the capabilities after these, come next. This is the
 concrete version of [vision](vision.md) section 2: an extension is
 WebAssembly with a manifest that says what it may read, write and reach,
 and a host that enforces it. Installing one never means handing a stranger
@@ -209,10 +209,22 @@ The first extensions that need the network will be hosting integrations
 - **Updates are never automatic.** An update that asks for more shows the
   difference and needs a new yes.
 
-## Order of work
+## Where it stands
 
-1. The interpreter in crc with its tests, fuzz target and host imports.
+Built:
+
+1. The interpreter in crc, checked against the official WebAssembly spec
+   tests, with resource-limit tests and a nightly fuzz run.
 2. Manifests, installing from a folder, the capability prompt.
 3. Extension commands in the palette, run on the worker, edits as one undo
    step. "Sort Lines" as the first official extension.
-4. Signing and the registry index.
+4. Signing and the registry index, which records each extension's source
+   hash so a changed extension cannot keep its version.
+5. Preview pages beside the editor (`preview.show`), with Markdown Preview
+   as the first.
+
+Not yet:
+
+- Host functions beyond `log`.
+- The planned capabilities in the table above (`index.query`,
+  `diagnostics.publish`, `status.item`) and the network.
