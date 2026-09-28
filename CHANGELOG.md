@@ -2,6 +2,44 @@
 
 One entry per tag, written for people who use the editor.
 
+## v0.2.0-alpha.7, 2026-09-28
+
+Fixes where two copies of the same path had drifted apart, a faster
+frame, and extensions that are checked, bounded and kept apart.
+
+- Frames take about half the time they did: the rows on screen are worked
+  out once a frame instead of up to ten times.
+- Typing, deleting and pasting at several cursors keeps folds open or
+  closed as they were, recolours only what changed, and keeps your main
+  cursor as the main one.
+- Selections: a selection that ends at the start of a line now marks the
+  newline it covers, an empty line selected that way shows, and no stray
+  mark appears at the end of the line above. The find bar and the commit
+  message now show their selection.
+- Go to definition and hover answer about the text as it is now, not as it
+  was before your last few keystrokes. Replace in project updates the Git
+  gutter marks and the language server.
+- "Save your changes?" treats an unexpected answer as Cancel, never as
+  Don't Save. The quit and close prompts show the tab they are asking
+  about.
+- Clicks in the sidebar while naming a new file land on the right row. The
+  mouse wheel no longer loses part of a notch, and each view keeps its
+  own scroll remainder.
+- Markdown: a tab after `#` makes a heading, and tables need a proper
+  delimiter row, the same in the text and in the preview. A remote image
+  in Markdown Preview shows as its alt text in a small frame, since the
+  preview loads nothing from the network.
+- The preview pane appears once its page has loaded, not blank before it.
+- Extensions: an installed extension whose files changed on disk is
+  marked, loses its commands and is never shown as signed. A command gets
+  at most 8 MB of text. Previews run apart from commands, and an extension
+  that fails three times in a row is turned off until you turn it back
+  on. An interrupted update no longer loses the extension.
+- The extension engine now passes the official WebAssembly test suite for
+  what it supports and refuses modules that use features it does not.
+- Committing with a long message, or a commit Git refuses, reports Git's
+  own error instead of a broken pipe.
+
 ## v0.2.0-alpha.6, 2026-09-27
 
 Markdown, rendered beside the text again, this time from an extension.
