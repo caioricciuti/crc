@@ -1180,18 +1180,19 @@ pub fn build_text_appending(
         }
 
         // Selection bands for this row, also behind the text.
+        // The last row of a line ends past its newline; the newline is the
+        // byte before `line_end`, and the last line of the file has none.
+        let newline = (row.last && line + 1 < total_lines).then(|| line_end - 1);
         for &(sel_start, sel_end) in &selections {
+            // Half a cell after the text marks a selected newline, so a
+            // selection that takes whole lines shows it does, down to one
+            // ending at the start of the next line (Shift-Down from column 0).
+            let newline_selected = newline.is_some_and(|nl| sel_start <= nl && sel_end > nl);
             let from = sel_start.max(row_start);
-            let to = sel_end.min(row_end);
-            // The newline itself selected, on a row that has no selected
-            // text: an empty line in a block, or a selection that starts at
-            // a line's end. Half a cell says so, as it does after text.
-            let newline_only = from >= to
-                && row.last
-                && sel_start <= line_end
-                && sel_end > line_end
-                && line + 1 < total_lines;
-            if newline_only {
+            let to = sel_end.min(newline.unwrap_or(row_end));
+            // The newline alone: an empty line in a block, or a selection
+            // that starts at a line's end.
+            if from >= to && newline_selected {
                 let x0 = text_x + offset_at(line_end) - scroll_x;
                 if x0 >= text_x && x0 < viewport.x + viewport.width {
                     out.push(GlyphInstance {
@@ -1205,7 +1206,7 @@ pub fn build_text_appending(
             }
             if from < to {
                 let intervals = if let Some(shaped) = &shaped_line {
-                    let extend = if row.last && sel_end > line_end && line + 1 < total_lines {
+                    let extend = if newline_selected {
                         m.advance * 0.5
                     } else {
                         0.0
@@ -1223,12 +1224,7 @@ pub fn build_text_appending(
                 for (index, (left, right)) in intervals.into_iter().enumerate() {
                     let x0 = text_x + left.min(right) - scroll_x;
                     let mut width = (right - left).abs();
-                    if shaped_line.is_none()
-                        && row.last
-                        && index + 1 == interval_count
-                        && sel_end > line_end
-                        && line + 1 < total_lines
-                    {
+                    if shaped_line.is_none() && newline_selected && index + 1 == interval_count {
                         width += m.advance * 0.5;
                     }
                     let clipped = x0.max(text_x);
@@ -2573,45 +2569,19 @@ pub fn build_palette(
         width: (viewport.width - 74.0).max(0.0),
         height: 38.0,
     };
-    let (shown, start) = ui_input_window(query, cursor);
-    // Behind the glyphs, so the text stays readable on top of the band.
-    if let Some(range) = &selection {
-        let from = range.start.max(start).min(start + shown.len());
-        let to = range.end.max(start).min(start + shown.len());
-        if from < to {
-            let x0 = ui_caret_x(atlas, &shown, from - start).min(input.width);
-            let x1 = ui_caret_x(atlas, &shown, to - start).min(input.width);
-            push_rect(
-                out,
-                atlas,
-                [input.x + x0, input.y + 9.0],
-                [(x1 - x0).max(0.0), 20.0],
-                theme.selection,
-            );
-        }
-    }
-    push_ui_text(
+    push_ui_field(
         out,
         atlas,
         input,
-        if query.is_empty() {
-            placeholder
-        } else {
-            &shown
+        (9.0, 20.0),
+        &UiField {
+            text: query,
+            cursor,
+            selection,
+            placeholder,
+            focused: true,
         },
-        if query.is_empty() {
-            theme.status_text
-        } else {
-            theme.text
-        },
-    );
-    let caret_x = ui_caret_x(atlas, &shown, cursor.saturating_sub(start)).min(input.width);
-    push_rect(
-        out,
-        atlas,
-        [input.x + caret_x, input.y + 9.0],
-        [1.0, 20.0],
-        theme.cursor,
+        theme,
     );
     let escape = Viewport {
         x: viewport.x + viewport.width - 48.0,
@@ -3556,30 +3526,19 @@ fn push_sidebar_edit_row(
         width: (field.width - 12.0).max(0.0),
         height: field.height,
     };
-    let (shown, start) = ui_input_window(edit.text, edit.cursor);
-    if let Some(range) = &edit.selection {
-        let from = range.start.max(start).min(start + shown.len());
-        let to = range.end.max(start).min(start + shown.len());
-        if from < to {
-            let x0 = ui_caret_x(atlas, &shown, from - start).min(input.width);
-            let x1 = ui_caret_x(atlas, &shown, to - start).min(input.width);
-            push_rect(
-                out,
-                atlas,
-                [input.x + x0, input.y + 3.0],
-                [(x1 - x0).max(0.0), input.height - 6.0],
-                theme.selection,
-            );
-        }
-    }
-    push_ui_text(out, atlas, input, &shown, theme.text);
-    let caret_x = ui_caret_x(atlas, &shown, edit.cursor.saturating_sub(start)).min(input.width);
-    push_rect(
+    push_ui_field(
         out,
         atlas,
-        [input.x + caret_x, input.y + 3.0],
-        [1.0, input.height - 6.0],
-        theme.cursor,
+        input,
+        (3.0, input.height - 6.0),
+        &UiField {
+            text: edit.text,
+            cursor: edit.cursor,
+            selection: edit.selection.clone(),
+            placeholder: "",
+            focused: true,
+        },
+        theme,
     );
 }
 
@@ -4139,13 +4098,40 @@ pub fn build_completion_ribbon(
 }
 
 /// Which sidebar row is at `y`, or `None` past the last row.
-pub fn sidebar_row_at(tree: &Tree, _atlas: &Atlas, viewport: Viewport, y: f32) -> Option<usize> {
+pub fn sidebar_row_at(
+    tree: &Tree,
+    field: Option<SidebarField>,
+    viewport: Viewport,
+    y: f32,
+) -> Option<usize> {
     if y < viewport.y + SIDEBAR_HEADER_HEIGHT || y >= viewport.y + viewport.height {
         return None;
     }
     let row = ((y - viewport.y - SIDEBAR_HEADER_HEIGHT) / SIDEBAR_ROW_HEIGHT).floor() as usize;
-    let index = tree.scroll + row;
-    (index < tree.len()).then_some(index)
+    let total = tree.len() + usize::from(field.is_some_and(|f| f.inserted));
+    let visible = tree.scroll.min(total.saturating_sub(1)) + row;
+    if visible >= total {
+        return None;
+    }
+    tree_row_at(visible, field)
+}
+
+/// A name field open in the sidebar: the visible row it takes, and whether
+/// it is inserted (New File, New Folder) rather than over a row (Rename).
+#[derive(Clone, Copy, Debug)]
+pub struct SidebarField {
+    pub row: usize,
+    pub inserted: bool,
+}
+
+/// The tree row drawn at visible row `visible`: none where the field is, and
+/// one up below an inserted field, which pushes the rows under it down.
+pub fn tree_row_at(visible: usize, field: Option<SidebarField>) -> Option<usize> {
+    match field {
+        Some(f) if f.row == visible => None,
+        Some(f) if f.inserted && visible > f.row => Some(visible - 1),
+        _ => Some(visible),
+    }
 }
 
 /// Draws parsed Markdown, read only, from block `scroll`, appending to
@@ -5139,6 +5125,65 @@ pub fn ui_input_window(text: &str, cursor: usize) -> (String, usize) {
         .nth(20)
         .map_or(text.len(), |(at, _)| cursor + at);
     (text[start..end].to_owned(), start)
+}
+
+/// A one-line field in the UI font, as every such field draws it.
+pub struct UiField<'a> {
+    pub text: &'a str,
+    pub cursor: usize,
+    pub selection: Option<std::ops::Range<usize>>,
+    /// Shown dimmed while the field is empty.
+    pub placeholder: &'a str,
+    /// The caret is drawn only in the field that has the keyboard.
+    pub focused: bool,
+}
+
+/// Draws `field` in `input`: the text scrolled to keep the caret in view,
+/// the selection band behind it and the caret, both `band` = (top offset,
+/// height) within `input`.
+pub fn push_ui_field(
+    out: &mut Vec<GlyphInstance>,
+    atlas: &mut Atlas,
+    input: Viewport,
+    band: (f32, f32),
+    field: &UiField,
+    theme: &Theme,
+) {
+    let (shown, start) = ui_input_window(field.text, field.cursor);
+    // Behind the glyphs, so the text stays readable on top of the band.
+    if let Some(range) = &field.selection {
+        let from = range.start.max(start).min(start + shown.len());
+        let to = range.end.max(start).min(start + shown.len());
+        if from < to {
+            let x0 = ui_caret_x(atlas, &shown, from - start).min(input.width);
+            let x1 = ui_caret_x(atlas, &shown, to - start).min(input.width);
+            push_rect(
+                out,
+                atlas,
+                [input.x + x0, input.y + band.0],
+                [(x1 - x0).max(0.0), band.1],
+                theme.selection,
+            );
+        }
+    }
+    let empty = field.text.is_empty();
+    push_ui_text(
+        out,
+        atlas,
+        input,
+        if empty { field.placeholder } else { &shown },
+        if empty { theme.status_text } else { theme.text },
+    );
+    if field.focused {
+        let caret = ui_caret_x(atlas, &shown, field.cursor.saturating_sub(start)).min(input.width);
+        push_rect(
+            out,
+            atlas,
+            [input.x + caret, input.y + band.0],
+            [1.0, band.1],
+            theme.cursor,
+        );
+    }
 }
 
 pub fn ui_caret_x(atlas: &mut Atlas, text: &str, cursor: usize) -> f32 {
@@ -6155,20 +6200,27 @@ mod tests {
         let mut tree = Tree::new();
         tree.open(std::env::current_dir().unwrap());
         let rect = Viewport::new(260.0, 500.0);
-        assert!(sidebar_row_at(&tree, &atlas, rect, 20.0).is_none());
-        assert_eq!(
-            sidebar_row_at(&tree, &atlas, rect, SIDEBAR_HEADER_HEIGHT + 13.0),
-            Some(0)
-        );
-        assert_eq!(
-            sidebar_row_at(
-                &tree,
-                &atlas,
-                rect,
-                SIDEBAR_HEADER_HEIGHT + SIDEBAR_ROW_HEIGHT + 13.0
-            ),
-            Some(1)
-        );
+        let _ = atlas;
+        let row = |n: f32| SIDEBAR_HEADER_HEIGHT + SIDEBAR_ROW_HEIGHT * n + 13.0;
+        assert!(sidebar_row_at(&tree, None, rect, 20.0).is_none());
+        assert_eq!(sidebar_row_at(&tree, None, rect, row(0.0)), Some(0));
+        assert_eq!(sidebar_row_at(&tree, None, rect, row(1.0)), Some(1));
+        // New File's field inserted at visible row 1: row 1 is the field,
+        // and what was row 1 is drawn, and hit, one lower.
+        let new_file = Some(SidebarField {
+            row: 1,
+            inserted: true,
+        });
+        assert_eq!(sidebar_row_at(&tree, new_file, rect, row(0.0)), Some(0));
+        assert_eq!(sidebar_row_at(&tree, new_file, rect, row(1.0)), None);
+        assert_eq!(sidebar_row_at(&tree, new_file, rect, row(2.0)), Some(1));
+        // Rename covers its row and moves nothing.
+        let rename = Some(SidebarField {
+            row: 1,
+            inserted: false,
+        });
+        assert_eq!(sidebar_row_at(&tree, rename, rect, row(1.0)), None);
+        assert_eq!(sidebar_row_at(&tree, rename, rect, row(2.0)), Some(2));
     }
 
     #[test]
@@ -6929,6 +6981,55 @@ mod tests {
             .map(|q| q.pos[1] as i64)
             .collect();
         assert_eq!(rows.len(), 3, "the empty middle line is marked too");
+    }
+
+    /// The selection bands in `out`, as (row top, left, width), in order.
+    fn bands(out: &[GlyphInstance], theme: &Theme) -> Vec<(i64, f32, f32)> {
+        let mut bands: Vec<_> = out
+            .iter()
+            .filter(|q| q.color == theme.selection)
+            .map(|q| (q.pos[1] as i64, q.pos[0], q.size[0]))
+            .collect();
+        bands.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        bands
+    }
+
+    #[test]
+    fn a_selection_ending_at_the_next_line_start_marks_the_newline() {
+        let mut atlas = atlas();
+        let theme = Theme::default();
+        let half = atlas.metrics.advance * 0.5;
+        let draw = |atlas: &mut Atlas, text: &str, from: usize, to: usize| {
+            let mut buffer = Buffer::from_text(text);
+            buffer.select_range(from, to);
+            let mut out = Vec::new();
+            build(
+                &buffer,
+                atlas,
+                Viewport::new(800.0, 600.0),
+                &theme,
+                &mut out,
+            );
+            bands(&out, &theme)
+        };
+        let advance = atlas.metrics.advance;
+        // "ab\n" selected the way Shift-Down from column 0 does: its text
+        // and half a cell for the newline, nothing on the next line.
+        let one = draw(&mut atlas, "ab\ncd\n", 0, 3);
+        assert_eq!(one.len(), 1, "{one:?}");
+        assert!((one[0].2 - (2.0 * advance + half)).abs() < 0.01, "{one:?}");
+        // An empty line taken the same way: its newline shows.
+        let empty = draw(&mut atlas, "ab\n\ncd\n", 3, 4);
+        assert_eq!(empty.len(), 1, "{empty:?}");
+        assert!((empty[0].2 - half).abs() < 0.01, "{empty:?}");
+        // A selection starting at the next line's start: this line's
+        // newline is not in it, so nothing is drawn on this line.
+        let next = draw(&mut atlas, "ab\ncd\n", 3, 5);
+        assert_eq!(next.len(), 1, "{next:?}");
+        assert!(
+            (next[0].2 - 2.0 * advance).abs() < 0.01,
+            "only 'cd': {next:?}"
+        );
     }
 
     #[test]

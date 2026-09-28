@@ -512,6 +512,18 @@ impl SidebarEdit {
     fn replaces(&self) -> bool {
         matches!(self.kind, SidebarEditKind::Rename(_))
     }
+
+    fn field(&self) -> layout::SidebarField {
+        layout::SidebarField {
+            row: self.row,
+            inserted: !self.replaces(),
+        }
+    }
+}
+
+/// The sidebar's open name field, for turning a pointer into a tree row.
+fn sidebar_field(state: &State) -> Option<layout::SidebarField> {
+    state.sidebar_edit.as_ref().map(SidebarEdit::field)
 }
 
 /// Which text the Edit menu is acting on.
@@ -938,6 +950,30 @@ fn ext_language(buffer: &Buffer) -> String {
         .unwrap_or_else(|| "text".into())
 }
 
+/// NSModalResponseOK. The constant is not in the generated bindings, and
+/// its value is fixed API.
+const MODAL_RESPONSE_OK: isize = 1;
+
+/// Runs the open panel for one file, or with `directories` one folder, and
+/// answers the path picked.
+fn choose_path(
+    mtm: MainThreadMarker,
+    directories: bool,
+    message: Option<&str>,
+) -> Option<std::path::PathBuf> {
+    let panel = NSOpenPanel::openPanel(mtm);
+    panel.setCanChooseFiles(!directories);
+    panel.setCanChooseDirectories(directories);
+    panel.setAllowsMultipleSelection(false);
+    if let Some(message) = message {
+        panel.setMessage(Some(&NSString::from_str(message)));
+    }
+    if panel.runModal() != MODAL_RESPONSE_OK {
+        return None;
+    }
+    Some(panel.URL()?.path()?.to_string().into())
+}
+
 /// Keeps the completion list on the word it was opened for: filtered by
 /// what has been typed since its anchor, closed once the caret is before
 /// the anchor, in another document, or past a space or a `/` (a path
@@ -1212,9 +1248,19 @@ pub struct Ivars {
     /// wake the CPU 120 times a second. Outside the state so it can be
     /// resumed while the state is borrowed.
     display_link: std::cell::OnceCell<Retained<CADisplayLink>>,
-    /// Trackpad scrolling left over from the last event, in lines, for the
-    /// views that scroll by whole lines (terminal, review, Git).
-    wheel_rest: Cell<f64>,
+    /// Scrolling left over from the last event, in lines, for the views
+    /// that scroll by whole lines, and which one it belongs to: a rest
+    /// built up over the terminal is not paid out in the Git list.
+    wheel_rest: Cell<(Option<WheelTarget>, f64)>,
+}
+
+/// A view that scrolls by whole lines under the wheel.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WheelTarget {
+    Readme,
+    Terminal,
+    Review,
+    Git,
 }
 
 define_class!(
@@ -1628,7 +1674,7 @@ define_class!(
                 // unaffected.
                 {
                     let mut state = self.ivars().state.borrow_mut();
-                    let row = layout::sidebar_row_at(&state.tree, &state.renderer.atlas, rect, y);
+                    let row = layout::sidebar_row_at(&state.tree, sidebar_field(&state), rect, y);
                     state.tree_drag = row
                         .and_then(|index| state.tree.rows().get(index))
                         .map(|entry| TreeDrag {
@@ -1901,7 +1947,7 @@ define_class!(
                 let rect = sidebar.expect("in_sidebar implies a sidebar rectangle");
                 let index = {
                     let state = self.ivars().state.borrow();
-                    layout::sidebar_row_at(&state.tree, &state.renderer.atlas, rect, y)
+                    layout::sidebar_row_at(&state.tree, sidebar_field(&state), rect, y)
                 };
                 if let Some(index) = index {
                     let mut state = self.ivars().state.borrow_mut();
@@ -2051,7 +2097,6 @@ define_class!(
 
         #[unsafe(method(scrollWheel:))]
         fn scroll_wheel(&self, event: &NSEvent) {
-            let lines = self.wheel_lines(event);
             // The palette is modal: the wheel scrolls its list, and never
             // the document or terminal behind it.
             if self.ivars().state.borrow().palette.is_some() {
@@ -2061,16 +2106,19 @@ define_class!(
             {
                 // An extension's README scrolls a block at a time.
                 let point = self.convertPoint_fromView(event.locationInWindow(), None);
-                let mut state = self.ivars().state.borrow_mut();
-                if let Some(page) = state.extensions.as_mut().filter(|p| p.details)
-                    && page.readme_rect.is_some_and(|r| r.contains(point.x as f32, point.y as f32))
-                {
-                    if lines != 0 {
+                let over_readme = self.ivars().state.borrow().extensions.as_ref().is_some_and(|p| {
+                    p.details
+                        && p.readme_rect.is_some_and(|r| r.contains(point.x as f32, point.y as f32))
+                });
+                if over_readme {
+                    let lines = self.wheel_lines(event, WheelTarget::Readme);
+                    if lines != 0
+                        && let Some(page) = self.ivars().state.borrow_mut().extensions.as_mut()
+                    {
                         page.scroll_readme(lines.signum());
-                        drop(state);
-                        self.request_redraw();
-                        self.pump();
                     }
+                    self.request_redraw();
+                    self.pump();
                     return;
                 }
             }
@@ -2078,6 +2126,7 @@ define_class!(
                 let point = self.convertPoint_fromView(event.locationInWindow(), None);
                 let panel = self.chrome().terminal;
                 if panel.is_some_and(|rect| rect.contains(point.x as f32, point.y as f32)) {
+                    let lines = self.wheel_lines(event, WheelTarget::Terminal);
                     let mut state = self.ivars().state.borrow_mut();
                     let history = state.terminal.active_tab().map_or(0, |tab| {
                         tab.session.term.lock().unwrap_or_else(|e| e.into_inner()).scrollback_len()
@@ -2093,12 +2142,19 @@ define_class!(
             {
                 let point = self.convertPoint_fromView(event.locationInWindow(), None);
                 let text = self.chrome().text;
-                let mut state = self.ivars().state.borrow_mut();
-                let id = state.docs.active().id();
-                if text.contains(point.x as f32, point.y as f32)
-                    && let Some(review) = state.claude.as_mut().and_then(|c| c.reviews.get_mut(&id))
-                {
-                    if lines != 0 {
+                let reviewing = text.contains(point.x as f32, point.y as f32) && {
+                    let state = self.ivars().state.borrow();
+                    let id = state.docs.active().id();
+                    state.claude.as_ref().is_some_and(|c| c.reviews.contains_key(&id))
+                };
+                if reviewing {
+                    let lines = self.wheel_lines(event, WheelTarget::Review);
+                    let mut state = self.ivars().state.borrow_mut();
+                    let id = state.docs.active().id();
+                    if lines != 0
+                        && let Some(review) =
+                            state.claude.as_mut().and_then(|c| c.reviews.get_mut(&id))
+                    {
                         review.scroll_by(lines, text);
                         drop(state);
                         self.request_redraw();
@@ -2122,6 +2178,7 @@ define_class!(
                 let over_list = git_open && chrome.sidebar.is_some_and(|r| r.contains(x, y));
                 let over_diff = diff_shown && chrome.text.contains(x, y);
                 if over_list || over_diff {
+                    let lines = self.wheel_lines(event, WheelTarget::Git);
                     let mut state = self.ivars().state.borrow_mut();
                     let g = crate::platform::git_panel::Sidebar::new(chrome.sidebar.unwrap_or(chrome.text));
                     if lines != 0 {
@@ -2756,9 +2813,7 @@ define_class!(
                     .and_then(|b| b.path.clone())
             };
             if let Some(path) = path {
-                let _ = spawn_reaped(std::process::Command::new("/usr/bin/open")
-                    .arg("-R")
-                    .arg(&path));
+                let _ = self.open(true, path.as_os_str());
             }
         }
 
@@ -2776,11 +2831,7 @@ define_class!(
             let Some(path) = path else {
                 return;
             };
-            // `open -R` is the documented way to reveal a path in Finder and
-            // avoids pulling in the NSWorkspace surface for one action.
-            let _ = spawn_reaped(std::process::Command::new("/usr/bin/open")
-                .arg("-R")
-                .arg(&path));
+            let _ = self.open(true, path.as_os_str());
         }
 
         /// Opens a new GitHub issue in the browser with the version, macOS
@@ -2796,7 +2847,7 @@ define_class!(
             let note = if self.ivars().testing {
                 format!("would open {url}")
             } else {
-                match spawn_reaped(std::process::Command::new("/usr/bin/open").arg(&url)) {
+                match self.open(false, url.as_ref()) {
                     Ok(_) => "a new issue is open in your browser; nothing is sent until you submit it".to_string(),
                     Err(e) => format!("could not open the browser: {e}"),
                 }
@@ -2821,16 +2872,14 @@ define_class!(
                 return;
             };
             let _ = std::fs::create_dir_all(&dir);
-            let _ = spawn_reaped(std::process::Command::new("/usr/bin/open").arg(&dir));
+            let _ = self.open(false, dir.as_os_str());
         }
 
         #[unsafe(method(revealProjectInFinder:))]
         fn action_reveal_project(&self, _sender: Option<&AnyObject>) {
             let root = self.ivars().state.borrow().tree.root().map(Path::to_path_buf);
             if let Some(root) = root {
-                let _ = spawn_reaped(std::process::Command::new("/usr/bin/open")
-                    .arg("-R")
-                    .arg(root));
+                let _ = self.open(true, root.as_os_str());
             }
         }
 
@@ -3507,7 +3556,7 @@ impl EditorView {
             deferred_change: Cell::new((false, false)),
             deferred_size: Cell::new(None),
             display_link: std::cell::OnceCell::new(),
-            wheel_rest: Cell::new(0.0),
+            wheel_rest: Cell::new((None, 0.0)),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
 
@@ -3693,7 +3742,7 @@ impl EditorView {
             (Ok(Some(release)), true) => Some(if self.ivars().testing {
                 format!("crc {} is out; would open {}", release.version, release.url)
             } else {
-                let _ = spawn_reaped(std::process::Command::new("/usr/bin/open").arg(&release.url));
+                let _ = self.open(false, release.url.as_ref());
                 format!(
                     "crc {} is out; its release page is open in your browser",
                     release.version
@@ -3761,12 +3810,14 @@ impl EditorView {
         self.ivars().needs_redraw.set(true);
     }
 
-    /// Whole lines to scroll for a wheel event, forward (down the content)
-    /// positive. A trackpad's point deltas add up across events; a mouse
-    /// wheel's notch is three lines.
-    fn wheel_lines(&self, event: &NSEvent) -> isize {
+    /// Whole lines to scroll `target` for a wheel event, forward (down the
+    /// content) positive. A trackpad's point deltas add up across events; a
+    /// mouse wheel's notch is three lines, and a smooth wheel's fraction of
+    /// a notch adds up too. Call with the state not borrowed.
+    fn wheel_lines(&self, event: &NSEvent, target: WheelTarget) -> isize {
         let dy = event.scrollingDeltaY();
-        let rest = self.ivars().wheel_rest.get();
+        let (owner, rest) = self.ivars().wheel_rest.get();
+        let rest = if owner == Some(target) { rest } else { 0.0 };
         let total = if event.hasPreciseScrollingDeltas() {
             let line = self
                 .ivars()
@@ -3775,16 +3826,10 @@ impl EditorView {
                 .map_or(16.0, |s| s.renderer.atlas.metrics.line_height as f64);
             rest - dy / line.max(1.0)
         } else {
-            -dy * 3.0
+            rest - dy * 3.0
         };
         let lines = total.trunc();
-        self.ivars()
-            .wheel_rest
-            .set(if event.hasPreciseScrollingDeltas() {
-                total - lines
-            } else {
-                0.0
-            });
+        self.ivars().wheel_rest.set((Some(target), total - lines));
         lines as isize
     }
 
@@ -3815,6 +3860,21 @@ impl EditorView {
     /// resize storm) would stall the main thread inside AppKit's event
     /// dispatch. Deferring those to the next refresh coalesces them into one
     /// frame instead.
+    /// Hands `target` to `/usr/bin/open`: a URL to the browser, a folder to
+    /// Finder, or with `reveal` a path shown selected in its Finder window.
+    /// The documented tools for each, without NSWorkspace. A test instance
+    /// opens nothing, so a self-test never raises a window of another app.
+    fn open(&self, reveal: bool, target: &std::ffi::OsStr) -> std::io::Result<()> {
+        if self.ivars().testing {
+            return Ok(());
+        }
+        let mut command = std::process::Command::new("/usr/bin/open");
+        if reveal {
+            command.arg("-R");
+        }
+        spawn_reaped(command.arg(target))
+    }
+
     fn pump(&self) {
         if self.ivars().handling_key.get() {
             self.request_redraw();
@@ -5157,24 +5217,16 @@ impl EditorView {
 
     /// Runs the open panel and opens the chosen file in a tab.
     fn open_file(&self) -> bool {
-        let mtm = MainThreadMarker::from(self);
-        let panel = NSOpenPanel::openPanel(mtm);
-        panel.setCanChooseFiles(true);
-        panel.setAllowsMultipleSelection(false);
-        // NSModalResponseOK is 1. The constant is not in the generated
-        // bindings, and its value is fixed API.
-        const MODAL_RESPONSE_OK: isize = 1;
-        if panel.runModal() != MODAL_RESPONSE_OK {
-            return false;
+        // As open_folder: a test instance never shows the panel.
+        if self.ivars().testing {
+            self.ivars().state.borrow_mut().message =
+                Some(("would show the Open panel".into(), Instant::now()));
+            return true;
         }
-
-        let Some(url) = panel.URL() else {
-            return false;
-        };
-        let Some(path) = url.path() else {
-            return false;
-        };
-        self.load_path(&path.to_string())
+        match choose_path(MainThreadMarker::from(self), false, None) {
+            Some(path) => self.load_path(&path.to_string_lossy()),
+            None => false,
+        }
     }
 
     /// Opens `path` in a tab, or switches to its tab when it is already open.
@@ -5726,7 +5778,6 @@ impl EditorView {
                     .unwrap_or_else(|| "Untitled.txt".to_string())
             };
             panel.setNameFieldStringValue(&NSString::from_str(&suggested));
-            const MODAL_RESPONSE_OK: isize = 1;
             if panel.runModal() != MODAL_RESPONSE_OK {
                 return false;
             }
@@ -6258,7 +6309,7 @@ impl EditorView {
         };
         let (changed, active) = 'drag: {
             let mut state = self.ivars().state.borrow_mut();
-            let row = layout::sidebar_row_at(&state.tree, &state.renderer.atlas, rect, y);
+            let row = layout::sidebar_row_at(&state.tree, sidebar_field(&state), rect, y);
             // The destination directory: the folder under the pointer, the
             // parent of a file under it, or the project root below the tree.
             let destination = match row.and_then(|index| state.tree.rows().get(index)) {
@@ -6678,29 +6729,30 @@ impl EditorView {
                 .nth(first + row)
                 .map(|(_, pick)| pick)
         };
-        if let Some(Pick::Action(server, action)) = chosen {
+        if let Some(pick) = chosen {
             self.close_palette();
-            self.run_code_action(server, action);
-        } else if let Some(Pick::Branch(name)) = chosen {
-            self.close_palette();
-            self.switch_branch(name, false);
-        } else if let Some(Pick::NewBranch(name)) = chosen {
-            self.close_palette();
-            self.switch_branch(name, true);
-        } else if let Some(Pick::Symbol(path, line)) = chosen {
-            self.close_palette();
-            self.go_to_symbol(path, line);
-        } else if let Some(Pick::Command(at, tag)) = chosen {
-            self.close_palette();
-            self.run_command(at, tag);
-        } else if let Some(Pick::File(path)) = chosen {
-            self.close_palette();
-            self.load_path(&path.to_string_lossy());
-            self.sync_title();
-            self.reparse();
-            self.ivars().state.borrow_mut().tree.reveal(&path);
-            self.request_redraw();
-            self.pump();
+            self.run_pick(pick);
+        }
+    }
+
+    /// Does what a palette row offers, clicked or chosen with Return.
+    fn run_pick(&self, pick: Pick) {
+        match pick {
+            Pick::Action(server, action) => self.run_code_action(server, action),
+            Pick::Branch(name) => self.switch_branch(name, false),
+            Pick::NewBranch(name) => self.switch_branch(name, true),
+            Pick::Symbol(path, line) => self.go_to_symbol(path, line),
+            Pick::Command(at, tag) => self.run_command(at, tag),
+            Pick::File(path) => {
+                self.load_path(&path.to_string_lossy());
+                // The title follows after the frame that shows the file:
+                // setTitle can take several ms (PERF-001).
+                self.ivars().state.borrow_mut().title_sync_pending = true;
+                self.reparse();
+                self.ivars().state.borrow_mut().tree.reveal(&path);
+                self.request_redraw();
+                self.pump();
+            }
         }
     }
 
@@ -6819,26 +6871,8 @@ impl EditorView {
                         .map(|(_, pick)| pick)
                 };
                 self.close_palette();
-                if let Some(Pick::Action(server, action)) = chosen {
-                    self.run_code_action(server, action);
-                } else if let Some(Pick::Branch(name)) = chosen {
-                    self.switch_branch(name, false);
-                } else if let Some(Pick::NewBranch(name)) = chosen {
-                    self.switch_branch(name, true);
-                } else if let Some(Pick::Symbol(path, line)) = chosen {
-                    self.go_to_symbol(path, line);
-                } else if let Some(Pick::Command(at, tag)) = chosen {
-                    self.run_command(at, tag);
-                } else if let Some(Pick::File(path)) = chosen {
-                    self.load_path(&path.to_string_lossy());
-                    self.ivars().state.borrow_mut().title_sync_pending = true;
-                    self.reparse();
-                    {
-                        let mut state = self.ivars().state.borrow_mut();
-                        state.tree.reveal(&path);
-                    }
-                    self.request_redraw();
-                    self.pump();
+                if let Some(pick) = chosen {
+                    self.run_pick(pick);
                 }
                 return true;
             }
@@ -7896,7 +7930,7 @@ impl EditorView {
     fn sidebar_click(&self, y: f32, rect: Viewport) {
         let index = {
             let state = self.ivars().state.borrow();
-            layout::sidebar_row_at(&state.tree, &state.renderer.atlas, rect, y)
+            layout::sidebar_row_at(&state.tree, sidebar_field(&state), rect, y)
         };
         let Some(index) = index else {
             return;
@@ -7963,22 +7997,10 @@ impl EditorView {
                 Some(("would show the Open Folder panel".into(), Instant::now()));
             return true;
         }
-        let mtm = MainThreadMarker::from(self);
-        let panel = NSOpenPanel::openPanel(mtm);
-        panel.setCanChooseFiles(false);
-        panel.setCanChooseDirectories(true);
-        panel.setAllowsMultipleSelection(false);
-        const MODAL_RESPONSE_OK: isize = 1;
-        if panel.runModal() != MODAL_RESPONSE_OK {
-            return false;
-        }
-        let Some(url) = panel.URL() else {
+        let Some(path) = choose_path(MainThreadMarker::from(self), true, None) else {
             return false;
         };
-        let Some(path) = url.path() else {
-            return false;
-        };
-        self.load_folder_path(&path.to_string());
+        self.load_folder_path(&path.to_string_lossy());
         true
     }
 
@@ -9617,19 +9639,11 @@ impl EditorView {
         if self.ivars().testing {
             return std::env::var_os("CRC_EXT_FOLDER").map(Into::into);
         }
-        let mtm = MainThreadMarker::from(self);
-        let panel = NSOpenPanel::openPanel(mtm);
-        panel.setCanChooseFiles(false);
-        panel.setCanChooseDirectories(true);
-        panel.setAllowsMultipleSelection(false);
-        panel.setMessage(Some(&NSString::from_str(
-            "Choose a folder with manifest.json, README.md and the extension's .wasm",
-        )));
-        const MODAL_RESPONSE_OK: isize = 1;
-        if panel.runModal() != MODAL_RESPONSE_OK {
-            return None;
-        }
-        Some(panel.URL()?.path()?.to_string().into())
+        choose_path(
+            MainThreadMarker::from(self),
+            true,
+            Some("Choose a folder with manifest.json, README.md and the extension's .wasm"),
+        )
     }
 
     fn finish_install(&self, result: Result<crate::ext::store::Package, String>) {
@@ -12041,7 +12055,6 @@ impl EditorView {
             let url = NSURL::fileURLWithPath(&NSString::from_str(&dir.to_string_lossy()));
             panel.setDirectoryURL(Some(&url));
         }
-        const MODAL_RESPONSE_OK: isize = 1;
         if panel.runModal() != MODAL_RESPONSE_OK {
             return false;
         }
@@ -12989,37 +13002,23 @@ impl EditorView {
                     layout::push_ui_text_right(glyphs, atlas, inner, trailing, theme.status_text);
                     room = (room - layout::ui_text_width(atlas, trailing) - 12.0).max(0.0);
                 }
-                let (shown, start) = layout::ui_input_window(&text, buffer.cursor());
-                layout::push_ui_text(
+                layout::push_ui_field(
                     glyphs,
                     atlas,
                     Viewport {
                         width: room,
                         ..inner
                     },
-                    if shown.is_empty() {
-                        placeholder
-                    } else {
-                        &shown
+                    (5.0, box_rect.height - 10.0),
+                    &layout::UiField {
+                        text: &text,
+                        cursor: buffer.cursor(),
+                        selection: buffer.selection(),
+                        placeholder,
+                        focused,
                     },
-                    if shown.is_empty() {
-                        theme.status_text
-                    } else {
-                        theme.text
-                    },
+                    theme,
                 );
-                if focused {
-                    let caret =
-                        layout::ui_caret_x(atlas, &shown, buffer.cursor().saturating_sub(start))
-                            .min(room);
-                    layout::push_rect(
-                        glyphs,
-                        atlas,
-                        [inner.x + caret, box_rect.y + 5.0],
-                        [1.0, box_rect.height - 10.0],
-                        theme.cursor,
-                    );
-                }
             };
 
             // "3 of 17" in the field it belongs to, which the bar never
@@ -13486,8 +13485,15 @@ impl EditorView {
             );
             let x = advance * (label.len() as f32 + 1.0);
             // The field's own caret and selection: Left, Right and Shift
-            // move them.
-            let column = |at: usize| field.rope.byte_to_char(at) as f32 * advance;
+            // move them. By the cells the text takes, as push_text lays it
+            // out: a wide character is two.
+            let column = |at: usize| {
+                let cells: usize = text[..at.min(text.len())]
+                    .chars()
+                    .map(crate::text::columns::display_width)
+                    .sum();
+                cells as f32 * advance
+            };
             if let Some(range) = field.selection() {
                 layout::push_rect(
                     glyphs,
@@ -14589,17 +14595,13 @@ fn frame_of(state: &mut State) -> Frame {
             }
             // Rows as drawn: an inserted name field shifts the rows under
             // it, and is not itself a tree row.
-            let inserted = sidebar_edit.as_ref().is_some_and(|e| !e.replaces());
-            let total = tree.len() + usize::from(inserted);
+            let field = sidebar_edit.as_ref().map(SidebarEdit::field);
+            let total = tree.len() + usize::from(field.is_some_and(|f| f.inserted));
             let visible_rows = layout::sidebar_rows(rect);
             let first = tree.scroll.min(total.saturating_sub(1));
             for visible in first..(first + visible_rows).min(total) {
-                if sidebar_edit.as_ref().is_some_and(|e| e.row == visible) {
+                let Some(index) = layout::tree_row_at(visible, field) else {
                     continue;
-                }
-                let index = match sidebar_edit.as_ref() {
-                    Some(e) if inserted && visible > e.row => visible - 1,
-                    _ => visible,
                 };
                 frame.push(
                     Hit::SidebarRow(index),
@@ -15081,18 +15083,9 @@ fn palette_rows(sources: &PaletteSources<'_>, query: &str) -> Vec<(layout::Palet
 /// Right-click menu for a tab.
 fn tab_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
     let menu = NSMenu::new(mtm);
-    let add = |title: &str, action: objc2::runtime::Sel| {
-        let item = NSMenuItem::alloc(mtm);
-        let item = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                item,
-                &NSString::from_str(title),
-                Some(action),
-                &NSString::from_str(""),
-            )
-        };
-        menu.addItem(&item);
-    };
+    // No AutoFill or Services items: see project_menu.
+    menu.setAllowsContextMenuPlugIns(false);
+    let add = |title: &str, action: Sel| menu.addItem(&menu_item(mtm, title, action));
     add("Close Tab", sel!(closeContextTab:));
     add("Close Other Tabs", sel!(closeOtherTabs:));
     add("Close All Tabs", sel!(closeAllTabs:));

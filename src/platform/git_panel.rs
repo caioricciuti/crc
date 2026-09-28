@@ -786,31 +786,24 @@ impl Panel {
 
         layout::push_rounded_rect(out, g.message, 5.0, theme.tab_active);
         let full = self.message.rope.to_string();
-        let (shown, start) = layout::ui_input_window(&full, self.message.cursor());
         let text_rect = Viewport {
             x: g.message.x + 9.0,
             width: (g.message.width - 18.0).max(0.0),
             ..g.message
         };
-        layout::push_ui_text(
+        layout::push_ui_field(
             out,
             atlas,
             text_rect,
-            if shown.is_empty() { "Message" } else { &shown },
-            if shown.is_empty() {
-                theme.status_text
-            } else {
-                theme.text
+            (6.0, 18.0),
+            &layout::UiField {
+                text: &full,
+                cursor: self.message.cursor(),
+                selection: self.message.selection(),
+                placeholder: "Message",
+                focused: true,
             },
-        );
-        let caret = layout::ui_caret_x(atlas, &shown, self.message.cursor().saturating_sub(start))
-            .min(text_rect.width);
-        layout::push_rect(
-            out,
-            atlas,
-            [text_rect.x + caret, g.message.y + 6.0],
-            [1.0, 18.0],
-            theme.cursor,
+            theme,
         );
 
         let staged = self.staged_count();
