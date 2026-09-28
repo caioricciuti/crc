@@ -218,16 +218,13 @@ pub fn parse(value: &Value) -> Result<Manifest, String> {
     {
         return Err(format!("unknown icon {icon:?}"));
     }
-    let homepage = value
-        .get("homepage")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    if homepage
-        .as_ref()
-        .is_some_and(|h| !h.starts_with("https://"))
-    {
-        return Err("the homepage must be an https address".into());
-    }
+    let homepage = match value.get("homepage") {
+        None => None,
+        Some(h) => match h.as_str() {
+            Some(h) if h.starts_with("https://") => Some(h.to_owned()),
+            _ => return Err("the homepage must be an https address".into()),
+        },
+    };
     Ok(Manifest {
         icon,
         homepage,
@@ -318,6 +315,65 @@ mod tests {
         "capabilities": ["selection.read", "selection.replace"],
         "commands": [{ "id": "sort", "title": "Sort Lines" }]
     }"#;
+
+    /// The contract crc-extensions' build-registry.py also runs: every case
+    /// in tests/fixtures/extensions/contract/manifests.json gets the verdict
+    /// it names.
+    #[test]
+    fn the_shared_contract_cases_get_their_verdicts() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/extensions/contract");
+        let text = std::fs::read_to_string(dir.join("manifests.json")).unwrap();
+        let corpus = crate::json::parse(&text).unwrap();
+        let base = corpus.get("base").unwrap();
+        let cases = corpus.get("cases").and_then(Value::as_array).unwrap();
+        assert!(cases.len() > 30);
+        let mut wrong = Vec::new();
+        for case in cases {
+            let name = case.get("name").and_then(Value::as_str).unwrap();
+            let ok = case.get("ok").and_then(Value::as_bool).unwrap();
+            let mut manifest = base.clone();
+            if let (Value::Object(fields), Some(Value::Object(set))) =
+                (&mut manifest, case.get("set"))
+            {
+                for (key, value) in set {
+                    fields.retain(|(k, _)| k != key);
+                    if *value != Value::Null {
+                        fields.push((key.clone(), value.clone()));
+                    }
+                }
+            }
+            let got = parse(&manifest);
+            if got.is_ok() != ok {
+                wrong.push(format!(
+                    "{name}: expected {}, got {got:?}",
+                    if ok { "ok" } else { "refused" }
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// The icon names a manifest may use, as crc-extensions lists them in
+    /// scripts/icons.txt (copied here; its CI compares the two).
+    #[test]
+    fn the_icon_list_matches_crc_extensions() {
+        let text = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/extensions/contract/icons.txt"),
+        )
+        .unwrap();
+        let listed: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect();
+        let known: Vec<&str> = crate::project::icons::EXTENSION_ICONS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        assert_eq!(listed, known);
+    }
 
     #[test]
     fn reads_a_manifest() {

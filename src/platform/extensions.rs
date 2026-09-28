@@ -18,7 +18,8 @@ use crate::render::metal::GlyphInstance;
 
 pub enum Registry {
     Loading,
-    Ready(Vec<Entry>),
+    /// What it offers, and what this crc cannot use from it.
+    Ready(Vec<Entry>, Vec<crate::ext::registry::Skipped>),
     Failed(String),
 }
 
@@ -129,7 +130,7 @@ impl Page {
 
     pub fn available(&self, id: &str) -> Option<&Entry> {
         match &self.registry {
-            Registry::Ready(entries) => entries.iter().find(|e| e.manifest.id == id),
+            Registry::Ready(entries, _) => entries.iter().find(|e| e.manifest.id == id),
             _ => None,
         }
     }
@@ -137,7 +138,7 @@ impl Page {
     /// Registry entries not installed, or newer than what is.
     fn offered(&self) -> Vec<&Entry> {
         match &self.registry {
-            Registry::Ready(entries) => entries
+            Registry::Ready(entries, _) => entries
                 .iter()
                 .filter(|e| {
                     self.installed(&e.manifest.id)
@@ -287,11 +288,23 @@ pub fn draw_details(
         (None, Some(note), _) => note.clone(),
         (None, None, Registry::Loading) => "Checking the registry\u{2026}".into(),
         (None, None, Registry::Failed(why)) => format!("Registry: {why}"),
-        (None, None, Registry::Ready(entries)) => format!(
-            "{} installed \u{b7} {} in the registry, signed",
-            page.installed.len(),
-            entries.len()
-        ),
+        (None, None, Registry::Ready(entries, skipped)) => {
+            let mut status = format!(
+                "{} installed \u{b7} {} in the registry, signed",
+                page.installed.len(),
+                entries.len()
+            );
+            if let Some(first) = skipped.first() {
+                status.push_str(&format!(
+                    " \u{b7} {} is not shown: {}",
+                    first.name, first.reason
+                ));
+                if skipped.len() > 1 {
+                    status.push_str(&format!(", and {} more", skipped.len() - 1));
+                }
+            }
+            status
+        }
     };
     if home {
         // The header is the home page's: the title, the count, and the

@@ -60,7 +60,7 @@ fn fetch(url: &str, max: u64) -> Result<Vec<u8>, String> {
 }
 
 /// The signed list of extensions. Blocking; call it off the main thread.
-pub fn fetch_index() -> Result<Vec<Entry>, String> {
+pub fn fetch_index() -> Result<Index, String> {
     if !super::verify::has_registry_key() && std::env::var_os("CRC_SELFTEST").is_none() {
         return Err("this build of crc has no registry key yet".into());
     }
@@ -106,26 +106,52 @@ pub fn serial_of(bytes: &[u8]) -> u64 {
         .unwrap_or(0)
 }
 
-pub fn parse_index(bytes: &[u8]) -> Result<Vec<Entry>, String> {
+/// An entry this crc cannot offer, and why: most often one that needs a
+/// newer crc (a capability this one does not know). Shown, so a registry
+/// entry never just vanishes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Skipped {
+    pub name: String,
+    pub reason: String,
+}
+
+/// What a registry offers, and what this crc cannot use from it.
+pub type Index = (Vec<Entry>, Vec<Skipped>);
+
+pub fn parse_index(bytes: &[u8]) -> Result<Index, String> {
     let text = std::str::from_utf8(bytes).map_err(|_| "the registry is not UTF-8")?;
     let value = crate::json::parse(text).map_err(|e| format!("the registry: {e}"))?;
     if value.get("api").and_then(Value::as_u64) != Some(manifest::API) {
         return Err("the registry is for another version of crc".into());
     }
-    let mut entries = Vec::new();
+    let (mut entries, mut skipped) = (Vec::new(), Vec::new());
     for item in value
         .get("extensions")
         .and_then(Value::as_array)
         .unwrap_or_default()
     {
-        // One bad entry is skipped, not the whole registry.
-        let Ok(manifest) = manifest::parse(item) else {
-            continue;
-        };
         let text = |k: &str| item.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
+        let name = [text("name"), text("id")]
+            .into_iter()
+            .find(|n| !n.is_empty())
+            .unwrap_or_else(|| "an entry".into());
+        // One entry this crc cannot use is skipped, not the whole registry:
+        // a newer capability must not take every other extension away from
+        // an older crc. It is reported instead.
+        let manifest = match manifest::parse(item) {
+            Ok(manifest) => manifest,
+            Err(reason) => {
+                skipped.push(Skipped { name, reason });
+                continue;
+            }
+        };
         let wasm = text("wasm");
         let sha256 = text("sha256");
         if wasm.contains('/') || !wasm.ends_with(".wasm") || sha256.len() != 64 {
+            skipped.push(Skipped {
+                name,
+                reason: "its module name or digest is malformed".into(),
+            });
             continue;
         }
         entries.push(Entry {
@@ -137,7 +163,7 @@ pub fn parse_index(bytes: &[u8]) -> Result<Vec<Entry>, String> {
             manifest,
         });
     }
-    Ok(entries)
+    Ok((entries, skipped))
 }
 
 /// Downloads an entry's module and checks it against the signed index.
@@ -197,8 +223,9 @@ mod tests {
             index.as_bytes(),
             &signature
         ));
-        let entries = parse_index(index.as_bytes()).unwrap();
+        let (entries, skipped) = parse_index(index.as_bytes()).unwrap();
         assert_eq!(entries.len(), 1, "the bad entry is skipped, the rest kept");
+        assert_eq!(skipped.len(), 1, "and said so: {skipped:?}");
         assert_eq!(entries[0].manifest.name, "Sort Lines");
         assert_eq!(entries[0].readme, "# Sort");
         let tampered = index.replace("selection.read", "document.read");

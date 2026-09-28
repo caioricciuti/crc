@@ -633,7 +633,7 @@ struct State {
     /// The Extensions page, when it has the editor column.
     extensions: Option<crate::platform::extensions::Page>,
     /// The registry list being fetched, and a download being installed.
-    ext_registry_rx: Option<mpsc::Receiver<Result<Vec<crate::ext::registry::Entry>, String>>>,
+    ext_registry_rx: Option<mpsc::Receiver<Result<crate::ext::registry::Index, String>>>,
     ext_install_rx: Option<mpsc::Receiver<Result<crate::ext::store::Package, String>>>,
     /// The extension thread, started on the first command.
     ext_worker: Option<(
@@ -5023,7 +5023,7 @@ impl EditorView {
                                 .join(","),
                             match &page.registry {
                                 Registry::Loading => "loading".to_string(),
-                                Registry::Ready(e) => format!(
+                                Registry::Ready(e, _) => format!(
                                     "ready:{}",
                                     e.iter().map(|e| e.manifest.id.as_str()).collect::<Vec<_>>().join(",")
                                 ),
@@ -9969,7 +9969,9 @@ impl EditorView {
             state.ext_registry_rx = None;
             if let Some(page) = &mut state.extensions {
                 page.registry = match result {
-                    Ok(entries) => crate::platform::extensions::Registry::Ready(entries),
+                    Ok((entries, skipped)) => {
+                        crate::platform::extensions::Registry::Ready(entries, skipped)
+                    }
                     Err(e) => crate::platform::extensions::Registry::Failed(e),
                 };
             }
