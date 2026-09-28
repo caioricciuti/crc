@@ -117,6 +117,9 @@ pub enum Step {
     /// Evaluates an expression in the preview page; the next dump's
     /// `preview:` line carries the answer.
     WebJs(String),
+    /// Holds the state, as a caller up the stack would, and drives the entry
+    /// points AppKit can re-enter through: each must skip, none may abort.
+    Reenter,
     Quit,
 }
 
@@ -282,6 +285,7 @@ pub fn parse(script: &str) -> Result<Vec<Step>, String> {
                 y: number().ok_or_else(bad)?,
                 dy: number().ok_or_else(bad)?,
             }),
+            "reenter" => steps.push(Step::Reenter),
             "quit" => steps.push(Step::Quit),
             "panic" => steps.push(Step::Panic),
             _ => return Err(bad()),

@@ -1387,7 +1387,9 @@ define_class!(
             // Acting on them here as well would move the caret out from
             // under the text being composed.
             self.ivars().handling_key.set(true);
-            let composing = self.ivars().state.borrow().marked.is_some();
+            let Some(composing) = self.state().map(|state| state.marked.is_some()) else {
+                return;
+            };
             let changed = if composing {
                 self.interpret(event)
             } else {
@@ -1395,7 +1397,9 @@ define_class!(
             };
             self.ivars().handling_key.set(false);
             if changed {
-                let edited = self.ivars().state.borrow().docs.active().has_pending_edits();
+                let Some(edited) = self.state().map(|state| state.docs.active().has_pending_edits()) else {
+                    return;
+                };
                 self.lsp_after_key(edited);
                 self.reparse();
                 self.note_input(started);
@@ -1411,11 +1415,15 @@ define_class!(
             let (x, y) = (point.x as f32, point.y as f32);
             let chrome = self.chrome();
             // A press only starts a text selection if it lands in the text.
-            self.ivars().state.borrow_mut().selecting = None;
+            if let Some(mut state) = self.state_mut() {
+                state.selecting = None;
+            }
 
             // The Extensions page owns the editor column while it is open.
             let page_action = {
-                let state = self.ivars().state.borrow();
+                let Some(state) = self.state() else {
+                    return;
+                };
                 let in_list = chrome.sidebar.is_some_and(|r| r.contains(x, y));
                 match &state.extensions {
                     Some(page)
@@ -1439,7 +1447,9 @@ define_class!(
             // the text as a caret placement. A press on the track outside
             // the thumb brings the thumb to the pointer.
             {
-                let mut state = self.ivars().state.borrow_mut();
+                let Some(mut state) = self.state_mut() else {
+                    return;
+                };
                 let plain = state.palette.is_none() && !state.git_open && state.goto.is_none();
                 let m = state.renderer.atlas.metrics;
                 let track = layout::scrollbar_track(chrome.text);
@@ -1468,7 +1478,9 @@ define_class!(
             // Anywhere but the sidebar takes the keyboard from the tree, and
             // the terminal has it exactly when the press is in the terminal.
             {
-                let mut state = self.ivars().state.borrow_mut();
+                let Some(mut state) = self.state_mut() else {
+                    return;
+                };
                 if !chrome.sidebar.is_some_and(|rect| rect.contains(x, y)) {
                     state.sidebar_keys = false;
                 }
@@ -1478,7 +1490,9 @@ define_class!(
             // Clicking away from a half-typed accent abandons it, here and in
             // the input system, which would otherwise finish it wherever the
             // caret went.
-            let composing = self.ivars().state.borrow_mut().marked.take().is_some();
+            let Some(composing) = self.state_mut().map(|mut state| state.marked.take().is_some()) else {
+                return;
+            };
             if composing && let Some(context) = self.inputContext() {
                 context.discardMarkedText();
             }
@@ -1495,7 +1509,7 @@ define_class!(
                 return;
             }
 
-            if self.ivars().state.borrow().palette.is_some() {
+            if self.state().is_some_and(|state| state.palette.is_some()) {
                 self.palette_click(x, y);
                 return;
             }
@@ -1503,14 +1517,16 @@ define_class!(
             // if there is one, dropped if the field is empty. A click on the
             // tree itself goes no further, so the row it hit cannot shift
             // under it as the field disappears.
-            if self.ivars().state.borrow().sidebar_edit.is_some() {
+            if self.state().is_some_and(|state| state.sidebar_edit.is_some()) {
                 self.finish_sidebar_edit(true);
                 if chrome.sidebar.is_some_and(|rect| rect.contains(x, y)) {
                     return;
                 }
             }
             let hit = {
-                let mut state = self.ivars().state.borrow_mut();
+                let Some(mut state) = self.state_mut() else {
+                    return;
+                };
                 frame_of(&mut state).hit(x, y).cloned()
             };
             match hit {
@@ -1523,7 +1539,9 @@ define_class!(
                     if self.ivars().testing {
                         // A real AppKit popup starts its own event loop; the
                         // script cannot send its next step until it returns.
-                        self.ivars().state.borrow_mut().project_menu_requested = true;
+                        if let Some(mut state) = self.state_mut() {
+                            state.project_menu_requested = true;
+                        }
                     } else {
                         NSMenu::popUpContextMenu_withEvent_forView(&menu, event, self);
                     }
@@ -1535,7 +1553,9 @@ define_class!(
                 }
                 // Grabbing the divider starts a resize rather than anything else.
                 Some(Hit::SidebarDivider) => {
-                    self.ivars().state.borrow_mut().dragging_divider = true;
+                    if let Some(mut state) = self.state_mut() {
+                        state.dragging_divider = true;
+                    }
                     return;
                 }
                 Some(Hit::Activity(index)) => {
@@ -1564,11 +1584,15 @@ define_class!(
                     return;
                 }
                 Some(Hit::TerminalDivider) => {
-                    self.ivars().state.borrow_mut().dragging_terminal = true;
+                    if let Some(mut state) = self.state_mut() {
+                        state.dragging_terminal = true;
+                    }
                     return;
                 }
                 Some(Hit::TerminalTab(index)) => {
-                    let mut state = self.ivars().state.borrow_mut();
+                    let Some(mut state) = self.state_mut() else {
+                        return;
+                    };
                     state.terminal.active = index;
                     state.terminal.back = 0;
                     state.terminal.selection = None;
@@ -1578,7 +1602,9 @@ define_class!(
                     return;
                 }
                 Some(Hit::TerminalClose(index)) => {
-                    self.ivars().state.borrow_mut().terminal.close_tab(index);
+                    if let Some(mut state) = self.state_mut() {
+                        state.terminal.close_tab(index);
+                    }
                     self.after_terminal_layout();
                     return;
                 }
@@ -1608,9 +1634,11 @@ define_class!(
                 }
                 // The columns are a view of the file: a click goes back to
                 // the file, at the line clicked.
-                Some(Hit::Text) if side_by_side(&self.ivars().state.borrow()) => {
+                Some(Hit::Text) if self.state().is_some_and(|state| side_by_side(&state)) => {
                     let line = {
-                        let mut state = self.ivars().state.borrow_mut();
+                        let Some(mut state) = self.state_mut() else {
+                            return;
+                        };
                         let total = state.docs.active().rope.len_lines();
                         let text = chrome.text;
                         active_conflicts_mut(&mut state).and_then(|view| {
@@ -1633,12 +1661,14 @@ define_class!(
                 }
                 // A review draws a diff, not its text: there is no caret
                 // to place in it.
-                Some(Hit::Text) if active_review(&self.ivars().state.borrow()).is_some() => {
+                Some(Hit::Text) if self.state().is_some_and(|state| active_review(&state).is_some()) => {
                     return;
                 }
                 Some(Hit::Tab(index)) => {
                     {
-                        let mut state = self.ivars().state.borrow_mut();
+                        let Some(mut state) = self.state_mut() else {
+                            return;
+                        };
                         if let Some(page) = &mut state.extensions {
                             page.details = false;
                         }
@@ -1648,13 +1678,17 @@ define_class!(
                     return;
                 }
                 Some(Hit::TabClose(_)) => {
-                    self.ivars().state.borrow_mut().tab_drag = None;
+                    if let Some(mut state) = self.state_mut() {
+                        state.tab_drag = None;
+                    }
                     self.tab_click(x);
                     return;
                 }
                 Some(Hit::TabStrip) => {
                     if event.clickCount() >= 2 {
-                        let mut state = self.ivars().state.borrow_mut();
+                        let Some(mut state) = self.state_mut() else {
+                            return;
+                        };
                         state.docs.push(Buffer::new());
                         state.tab_scroll = state.docs.active_index();
                         drop(state);
@@ -1680,7 +1714,9 @@ define_class!(
                 Some(Hit::Text) => {
                     // The lightbulb in place of the caret line's number.
                     let on_bulb = {
-                        let state = self.ivars().state.borrow();
+                        let Some(state) = self.state() else {
+                            return;
+                        };
                         let (tx, ty) = chrome_of(&state).to_text(x, y);
                         let buffer = state.docs.active();
                         state.bulb.as_ref().is_some_and(|b| {
@@ -1693,7 +1729,9 @@ define_class!(
                     }
                     // The fold chevron beside a line number.
                     let fold = {
-                        let state = self.ivars().state.borrow();
+                        let Some(state) = self.state() else {
+                            return;
+                        };
                         let (tx, ty) = chrome_of(&state).to_text(x, y);
                         layout::fold_chevron_at(state.docs.active(), &state.renderer.atlas, tx, ty)
                     };
@@ -1716,7 +1754,7 @@ define_class!(
             if let Some(rect) = chrome.sidebar
                 && rect.contains(x, y)
             {
-                if self.ivars().state.borrow().git_open {
+                if self.state().is_some_and(|state| state.git_open) {
                     self.git_click(rect, x, y);
                     return;
                 }
@@ -1724,7 +1762,9 @@ define_class!(
                 // a drag. Selecting still happens now, so a plain click is
                 // unaffected.
                 {
-                    let mut state = self.ivars().state.borrow_mut();
+                    let Some(mut state) = self.state_mut() else {
+                        return;
+                    };
                     let row = layout::sidebar_row_at(&state.tree, sidebar_field(&state), rect, y);
                     state.tree_drag = row
                         .and_then(|index| state.tree.rows().get(index))
@@ -1740,8 +1780,10 @@ define_class!(
                 return;
             }
 
-            if chrome.text.contains(x, y) && diffing(&self.ivars().state.borrow()) {
-                let mut state = self.ivars().state.borrow_mut();
+            if chrome.text.contains(x, y) && self.state().is_some_and(|state| diffing(&state)) {
+                let Some(mut state) = self.state_mut() else {
+                    return;
+                };
                 if let Some(hunk) = state.git.hunk_action_at(chrome.text, x, y) {
                     state.git.stage_hunk(hunk);
                 }
@@ -1763,7 +1805,9 @@ define_class!(
             }
             {
                 let hit = {
-                    let state = self.ivars().state.borrow();
+                    let Some(state) = self.state() else {
+                        return;
+                    };
                     (state.docs.is_home() && state.palette.is_none() && !state.git_open)
                         .then(|| state.home_hits.iter().find(|h| h.rect.contains(x, y)).cloned())
                         .flatten()
@@ -1793,14 +1837,18 @@ define_class!(
             let option = flags.contains(NSEventModifierFlags::Option);
             if flags.contains(NSEventModifierFlags::Command) && !shift && !option {
                 // Cmd-click: go to the definition of what is under the pointer.
-                self.ivars().state.borrow_mut().docs.active_mut().place_cursor(offset, Motion::Move);
+                if let Some(mut state) = self.state_mut() {
+                    state.docs.active_mut().place_cursor(offset, Motion::Move);
+                }
                 self.goto_definition(Some(offset));
                 self.note_input(started);
                 self.pump();
                 return;
             }
             let chip = {
-                let state = self.ivars().state.borrow();
+                let Some(state) = self.state() else {
+                    return;
+                };
                 let point = self.convertPoint_fromView(event.locationInWindow(), None);
                 state
                     .completion_chips
@@ -1814,9 +1862,13 @@ define_class!(
                 self.pump();
                 return;
             }
-            self.ivars().state.borrow_mut().completion = None;
+            if let Some(mut state) = self.state_mut() {
+                state.completion = None;
+            }
             {
-                let mut state = self.ivars().state.borrow_mut();
+                let Some(mut state) = self.state_mut() else {
+                    return;
+                };
                 let buffer = state.docs.active_mut();
                 // One click places the caret, two take a word, three a line,
                 // and a drag that follows keeps selecting in the same unit.
@@ -1841,7 +1893,9 @@ define_class!(
                 state.selecting = Some((unit, pressed));
             }
             {
-                let mut state = self.ivars().state.borrow_mut();
+                let Some(mut state) = self.state_mut() else {
+                    return;
+                };
                 if option {
                     // Option-click drops an extra cursor instead of moving
                     // the one you have.
@@ -1863,7 +1917,9 @@ define_class!(
             let point = self.convertPoint_fromView(event.locationInWindow(), None);
 
             let moved = {
-                let mut state = self.ivars().state.borrow_mut();
+                let Some(mut state) = self.state_mut() else {
+                    return;
+                };
                 if let Some(from) = state.tab_drag {
                     let x = point.x as f32;
                     let to = state.tab_hits.iter().find(|h| x >= h.x0 && x < h.x1).map(|h| h.index);
@@ -1878,13 +1934,17 @@ define_class!(
                 self.pump();
                 return;
             }
-            if self.ivars().state.borrow().tab_drag.is_some() { return; }
+            if self.state().is_some_and(|state| state.tab_drag.is_some()) { return; }
 
-            let grab = self.ivars().state.borrow().scrollbar_drag;
+            let Some(grab) = self.state().map(|state| state.scrollbar_drag) else {
+                return;
+            };
             if let Some(grab) = grab {
                 let chrome = self.chrome();
                 {
-                    let mut state = self.ivars().state.borrow_mut();
+                    let Some(mut state) = self.state_mut() else {
+                        return;
+                    };
                     let m = state.renderer.atlas.metrics;
                     let rows = chrome.text.rows(m.line_height);
                     let line = layout::scrollbar_line_at(
@@ -1900,20 +1960,22 @@ define_class!(
                 return;
             }
 
-            if self.ivars().state.borrow().tree_drag.is_some() {
+            if self.state().is_some_and(|state| state.tree_drag.is_some()) {
                 self.tree_drag_moved(point.x as f32, point.y as f32);
                 return;
             }
 
-            if self.ivars().state.borrow().terminal.selecting {
+            if self.state().is_some_and(|state| state.terminal.selecting) {
                 self.terminal_drag(point.x as f32, point.y as f32);
                 return;
             }
 
-            if self.ivars().state.borrow().dragging_terminal {
+            if self.state().is_some_and(|state| state.dragging_terminal) {
                 let chrome = self.chrome();
                 {
-                    let mut state = self.ivars().state.borrow_mut();
+                    let Some(mut state) = self.state_mut() else {
+                        return;
+                    };
                     // From the pointer down to the status line, and never
                     // so tall that the editor loses its tabs and a few lines.
                     let bottom = chrome.status.y;
@@ -1926,9 +1988,11 @@ define_class!(
                 return;
             }
 
-            if self.ivars().state.borrow().dragging_divider {
+            if self.state().is_some_and(|state| state.dragging_divider) {
                 {
-                    let mut state = self.ivars().state.borrow_mut();
+                    let Some(mut state) = self.state_mut() else {
+                        return;
+                    };
                     state.sidebar_width =
                         (point.x as f32).clamp(SIDEBAR_MIN, SIDEBAR_MAX);
                 }
@@ -1940,10 +2004,12 @@ define_class!(
             // Only a drag that began in the text selects. One that began on a
             // tab or a sidebar row and wandered over the editor used to select
             // from the old caret to the pointer, in whatever had just opened.
-            if self.ivars().state.borrow().selecting.is_none() {
+            if self.state().is_some_and(|state| state.selecting.is_none()) {
                 return;
             }
-            self.ivars().state.borrow_mut().drag_point = Some((point.x as f32, point.y as f32));
+            if let Some(mut state) = self.state_mut() {
+                state.drag_point = Some((point.x as f32, point.y as f32));
+            }
             self.drag_select();
             self.request_redraw();
             self.pump();
@@ -1957,71 +2023,16 @@ define_class!(
         /// main menu bar, so nothing is duplicated.
         #[unsafe(method_id(menuForEvent:))]
         fn menu_for_event(&self, event: &NSEvent) -> Option<Retained<NSMenu>> {
-            let mtm = MainThreadMarker::from(self);
-            let point = self.convertPoint_fromView(event.locationInWindow(), None);
-            let chrome = self.chrome();
-            let sidebar = chrome.sidebar;
-            let (x, y) = (point.x as f32, point.y as f32);
-
-            let in_sidebar = sidebar.is_some_and(|r| r.contains(x, y));
-            let in_tab_bar = chrome.tabs.contains(x, y);
-            let in_project = if chrome.toolbar.contains(x, y) {
-                let mut state = self.ivars().state.borrow_mut();
-                let State { tree, renderer, .. } = &mut *state;
-                layout::toolbar_project(tree, &mut renderer.atlas, chrome.toolbar).contains(x, y)
-            } else {
-                false
-            };
-
-            // A right-click in a panel should also select what is under the
-            // pointer, so the action applies to what was clicked rather than
-            // to whatever happened to be selected before.
-            if in_project {
-                Some(project_menu(mtm))
-            } else if in_tab_bar {
-                let hit = self
-                    .ivars()
-                    .state
-                    .borrow()
-                    .tab_hits
-                    .iter()
-                    .find(|h| x >= h.x0 && x < h.x1)
-                    .map(|h| h.index);
-                self.ivars().state.borrow_mut().context_tab = hit;
-                // Empty strip still belongs to the bar, so it is consumed
-                // with an empty menu rather than falling through.
-                Some(match hit {
-                    Some(_) => tab_menu(mtm),
-                    None => NSMenu::new(mtm),
-                })
-            } else if in_sidebar {
-                let rect = sidebar.expect("in_sidebar implies a sidebar rectangle");
-                let index = {
-                    let state = self.ivars().state.borrow();
-                    layout::sidebar_row_at(&state.tree, sidebar_field(&state), rect, y)
-                };
-                if let Some(index) = index {
-                    let mut state = self.ivars().state.borrow_mut();
-                    state.tree.select(index);
-                    state.sidebar_keys = true;
-                    drop(state);
-                    self.request_redraw();
-                    self.pump();
-                    Some(sidebar_item_menu(mtm))
-                } else {
-                    Some(project_menu(mtm))
-                }
-            } else {
-                let commands = self.ivars().state.borrow().ext_commands.clone();
-                Some(editor_context_menu(mtm, &commands))
-            }
+            self.context_menu(event)
         }
 
         #[unsafe(method(mouseUp:))]
         fn mouse_up(&self, _event: &NSEvent) {
             if self.ivars().testing && _event.timestamp() != 0.0 { return; }
             let drop = {
-                let mut state = self.ivars().state.borrow_mut();
+                let Some(mut state) = self.state_mut() else {
+                    return;
+                };
                 state.dragging_divider = false;
                 state.dragging_terminal = false;
                 state.scrollbar_drag = None;
@@ -2045,7 +2056,7 @@ define_class!(
         /// A resize cursor over the divider, so it reads as draggable.
         #[unsafe(method(resetCursorRects))]
         fn reset_cursor_rects(&self) {
-            let Ok(mut state) = self.ivars().state.try_borrow_mut() else { return; };
+            let Some(mut state) = self.state_mut() else { return; };
             let chrome = chrome_of(&state);
             let add = |r: Viewport, cursor: &NSCursor| {
                 if r.width > 0.0 && r.height > 0.0 {
@@ -2150,21 +2161,25 @@ define_class!(
         fn scroll_wheel(&self, event: &NSEvent) {
             // The palette is modal: the wheel scrolls its list, and never
             // the document or terminal behind it.
-            if self.ivars().state.borrow().palette.is_some() {
+            if self.state().is_some_and(|state| state.palette.is_some()) {
                 self.palette_wheel(event);
                 return;
             }
             {
                 // An extension's README scrolls a block at a time.
                 let point = self.convertPoint_fromView(event.locationInWindow(), None);
-                let over_readme = self.ivars().state.borrow().extensions.as_ref().is_some_and(|p| {
-                    p.details
-                        && p.readme_rect.is_some_and(|r| r.contains(point.x as f32, point.y as f32))
+                let over_readme = self.state().is_some_and(|state| {
+                    state.extensions.as_ref().is_some_and(|p| {
+                        p.details
+                            && p.readme_rect
+                                .is_some_and(|r| r.contains(point.x as f32, point.y as f32))
+                    })
                 });
                 if over_readme {
                     let lines = self.wheel_lines(event, WheelTarget::Readme);
                     if lines != 0
-                        && let Some(page) = self.ivars().state.borrow_mut().extensions.as_mut()
+                        && let Some(mut state) = self.state_mut()
+                        && let Some(page) = state.extensions.as_mut()
                     {
                         page.scroll_readme(lines.signum());
                     }
@@ -2178,7 +2193,9 @@ define_class!(
                 let panel = self.chrome().terminal;
                 if panel.is_some_and(|rect| rect.contains(point.x as f32, point.y as f32)) {
                     let lines = self.wheel_lines(event, WheelTarget::Terminal);
-                    let mut state = self.ivars().state.borrow_mut();
+                    let Some(mut state) = self.state_mut() else {
+                        return;
+                    };
                     let history = state.terminal.active_tab().map_or(0, |tab| {
                         tab.session.term.lock().unwrap_or_else(|e| e.into_inner()).scrollback_len()
                     });
@@ -2194,13 +2211,17 @@ define_class!(
                 let point = self.convertPoint_fromView(event.locationInWindow(), None);
                 let text = self.chrome().text;
                 let reviewing = text.contains(point.x as f32, point.y as f32) && {
-                    let state = self.ivars().state.borrow();
+                    let Some(state) = self.state() else {
+                        return;
+                    };
                     let id = state.docs.active().id();
                     state.claude.as_ref().is_some_and(|c| c.reviews.contains_key(&id))
                 };
                 if reviewing {
                     let lines = self.wheel_lines(event, WheelTarget::Review);
-                    let mut state = self.ivars().state.borrow_mut();
+                    let Some(mut state) = self.state_mut() else {
+                        return;
+                    };
                     let id = state.docs.active().id();
                     if lines != 0
                         && let Some(review) =
@@ -2215,7 +2236,9 @@ define_class!(
                 }
             }
             let (git_open, diff_shown) = {
-                let state = self.ivars().state.borrow();
+                let Some(state) = self.state() else {
+                    return;
+                };
                 (state.git_open, diffing(&state))
             };
             if git_open || diff_shown {
@@ -2230,7 +2253,9 @@ define_class!(
                 let over_diff = diff_shown && chrome.text.contains(x, y);
                 if over_list || over_diff {
                     let lines = self.wheel_lines(event, WheelTarget::Git);
-                    let mut state = self.ivars().state.borrow_mut();
+                    let Some(mut state) = self.state_mut() else {
+                        return;
+                    };
                     let g = crate::platform::git_panel::Sidebar::new(chrome.sidebar.unwrap_or(chrome.text));
                     if lines != 0 {
                         state.git.scroll(lines, g.list.contains(x, y), g, chrome.text);
@@ -2257,7 +2282,9 @@ define_class!(
         /// Plays the next step of a `CRC_SELFTEST` script. See `selftest.rs`.
         #[unsafe(method(selfTestStep:))]
         fn selftest_step(&self, _sender: Option<&AnyObject>) {
-            let step = self.ivars().state.borrow_mut().selftest.pop_front();
+            let Some(step) = self.state_mut().map(|mut state| state.selftest.pop_front()) else {
+                return;
+            };
             let Some(step) = step else {
                 return;
             };
@@ -2289,7 +2316,7 @@ define_class!(
                 self.project_changed(crate::project::watch::Change::Git);
             }
             self.poll_tree_children();
-            let git_changed = self.ivars().state.try_borrow_mut().is_ok_and(|mut state| {
+            let git_changed = self.state_mut().is_some_and(|mut state| {
                 let changed = state.git.poll();
                 if let Some(note) = state.git.take_announcement() {
                     state.message = Some((note, Instant::now()));
@@ -2307,10 +2334,7 @@ define_class!(
             self.poll_branches();
             self.poll_reloads();
             if self
-                .ivars()
-                .state
-                .try_borrow_mut()
-                .is_ok_and(|mut state| state.symbols.poll())
+                .state_mut().is_some_and(|mut state| state.symbols.poll())
             {
                 self.request_redraw();
             }
@@ -2328,7 +2352,7 @@ define_class!(
             {
                 // The link fires on any run-loop iteration, nested modal
                 // loops included. Busy means try again next refresh.
-                let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
+                let Some(mut state) = self.state_mut() else {
                     return;
                 };
                 // The link knows the real refresh interval, which is not
@@ -2368,8 +2392,9 @@ define_class!(
         #[unsafe(method(viewDidChangeEffectiveAppearance))]
         fn appearance_changed(&self) {
             unsafe { msg_send![super(self), viewDidChangeEffectiveAppearance] }
-            let follows = self.ivars().state.borrow().theme_choice
-                == crate::platform::settings::ThemeChoice::System;
+            let follows = self.state().is_some_and(|state| {
+                state.theme_choice == crate::platform::settings::ThemeChoice::System
+            });
             if follows {
                 self.apply_theme();
             }
@@ -2431,7 +2456,9 @@ define_class!(
         #[unsafe(method(togglePreview:))]
         fn action_toggle_preview(&self, _sender: Option<&AnyObject>) {
             let (open, command) = {
-                let state = self.ivars().state.borrow();
+                let Some(state) = self.state() else {
+                    return;
+                };
                 let active = state.docs.active().id();
                 (
                     state.html_preview.as_ref().is_some_and(|p| p.buffer == active),
@@ -2443,10 +2470,12 @@ define_class!(
             } else if let Some(command) = command {
                 self.open_preview(command);
             } else {
-                self.ivars().state.borrow_mut().message = Some((
+                if let Some(mut state) = self.state_mut() {
+                state.message = Some((
                     "No preview installed: get Markdown Preview from crc > Extensions".into(),
                     Instant::now(),
                 ));
+                }
             }
             self.request_redraw();
             self.pump();
@@ -2495,11 +2524,14 @@ define_class!(
         fn action_replace_all(&self, _sender: Option<&AnyObject>) {
             // Only meaningful with the bar open, since that is where the
             // search and replacement text live.
-            if self.ivars().state.borrow().find.is_none() {
+            if self.state().is_some_and(|state| state.find.is_none()) {
                 self.open_find();
                 return;
             }
-            if self.ivars().state.borrow().find.as_ref().is_some_and(|bar| bar.project) {
+            if self
+                .state()
+                .is_some_and(|state| state.find.as_ref().is_some_and(|bar| bar.project))
+            {
                 self.replace_in_project();
                 return;
             }
@@ -2509,7 +2541,9 @@ define_class!(
         #[unsafe(method(toggleComment:))]
         fn action_toggle_comment(&self, _sender: Option<&AnyObject>) {
             let token = {
-                let state = self.ivars().state.borrow();
+                let Some(state) = self.state() else {
+                    return;
+                };
                 state
                     .docs
                     .active()
@@ -2523,25 +2557,33 @@ define_class!(
             let Some(token) = token else {
                 return;
             };
-            self.ivars().state.borrow_mut().docs.active_mut().toggle_comment(token);
+            if let Some(mut state) = self.state_mut() {
+                state.docs.active_mut().toggle_comment(token);
+            }
             self.after_edit();
         }
 
         #[unsafe(method(duplicateLines:))]
         fn action_duplicate(&self, _sender: Option<&AnyObject>) {
-            self.ivars().state.borrow_mut().docs.active_mut().duplicate_lines();
+            if let Some(mut state) = self.state_mut() {
+                state.docs.active_mut().duplicate_lines();
+            }
             self.after_edit();
         }
 
         #[unsafe(method(moveLineUp:))]
         fn action_move_line_up(&self, _sender: Option<&AnyObject>) {
-            self.ivars().state.borrow_mut().docs.active_mut().move_lines(false);
+            if let Some(mut state) = self.state_mut() {
+                state.docs.active_mut().move_lines(false);
+            }
             self.after_edit();
         }
 
         #[unsafe(method(moveLineDown:))]
         fn action_move_line_down(&self, _sender: Option<&AnyObject>) {
-            self.ivars().state.borrow_mut().docs.active_mut().move_lines(true);
+            if let Some(mut state) = self.state_mut() {
+                state.docs.active_mut().move_lines(true);
+            }
             self.after_edit();
         }
 
@@ -2602,7 +2644,9 @@ define_class!(
 
         #[unsafe(method(toggleConflictColumns:))]
         fn action_toggle_conflict_columns(&self, _sender: Option<&AnyObject>) {
-            let side = self.ivars().state.borrow().conflict_side;
+            let Some(side) = self.state().map(|state| state.conflict_side) else {
+                return;
+            };
             self.set_conflict_side(!side);
         }
 
@@ -2628,7 +2672,9 @@ define_class!(
 
         #[unsafe(method(unfoldAll:))]
         fn action_unfold_all(&self, _sender: Option<&AnyObject>) {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             state.docs.active_mut().folds.clear();
             drop(state);
             self.request_redraw();
@@ -2667,7 +2713,7 @@ define_class!(
                 .map_or(-1, |item| item.tag());
             let path = usize::try_from(tag)
                 .ok()
-                .and_then(|i| self.ivars().state.borrow().crumb_paths.get(i).cloned());
+                .and_then(|i| self.state()?.crumb_paths.get(i).cloned());
             if let Some(path) = path {
                 self.open_crumb_path(&path);
             }
@@ -2710,7 +2756,11 @@ define_class!(
         #[unsafe(method(findInProject:))]
         fn action_find_project(&self, _sender: Option<&AnyObject>) {
             self.open_find();
-            if let Some(bar) = &mut self.ivars().state.borrow_mut().find { bar.project = true; }
+            if let Some(mut state) = self.state_mut()
+                && let Some(bar) = &mut state.find
+            {
+                bar.project = true;
+            }
             self.request_redraw();
             self.pump();
         }
@@ -2746,7 +2796,9 @@ define_class!(
         fn action_close_tab(&self, _sender: Option<&AnyObject>) {
             // Cmd-W in the terminal closes its session, as in any terminal.
             if self.terminal_has_keys() {
-                let mut state = self.ivars().state.borrow_mut();
+                let Some(mut state) = self.state_mut() else {
+                    return;
+                };
                 let active = state.terminal.active;
                 state.terminal.close_tab(active);
                 drop(state);
@@ -2754,7 +2806,9 @@ define_class!(
                 return;
             }
             let (count, active, panes) = {
-                let state = self.ivars().state.borrow();
+                let Some(state) = self.state() else {
+                    return;
+                };
                 (state.docs.len(), state.docs.active_index(), pane_count(&state))
             };
             // In a split the last tab of a pane closes that pane, which
@@ -2773,7 +2827,9 @@ define_class!(
             // Copied out first. As an `if let` scrutinee the borrow would
             // live for the whole block, across the unsaved-changes alert in
             // `close_tab`, whose `borrow_mut` then aborts the process.
-            let index = self.ivars().state.borrow().context_tab;
+            let Some(index) = self.state().map(|state| state.context_tab) else {
+                return;
+            };
             if let Some(index) = index {
                 self.close_tab(index);
             }
@@ -2795,10 +2851,12 @@ define_class!(
         /// ones still to go.
         #[unsafe(method(closeOtherTabs:))]
         fn action_close_other_tabs(&self, _sender: Option<&AnyObject>) {
-            let Some(keep) = self.ivars().state.borrow().context_tab else {
+            let Some(keep) = self.state().and_then(|state| state.context_tab) else {
                 return;
             };
-            let count = self.ivars().state.borrow().docs.len();
+            let Some(count) = self.state().map(|state| state.docs.len()) else {
+                return;
+            };
             for index in (0..count).rev() {
                 if index != keep {
                     self.close_tab(index);
@@ -2812,7 +2870,9 @@ define_class!(
 
         #[unsafe(method(closeAllTabs:))]
         fn action_close_all_tabs(&self, _sender: Option<&AnyObject>) {
-            let count = self.ivars().state.borrow().docs.len();
+            let Some(count) = self.state().map(|state| state.docs.len()) else {
+                return;
+            };
             for index in (0..count).rev() {
                 self.close_tab(index);
             }
@@ -2825,7 +2885,9 @@ define_class!(
         #[unsafe(method(copyContextTabPath:))]
         fn action_copy_context_path(&self, _sender: Option<&AnyObject>) {
             let path = {
-                let state = self.ivars().state.borrow();
+                let Some(state) = self.state() else {
+                    return;
+                };
                 state
                     .context_tab
                     .and_then(|i| state.docs.iter().nth(i))
@@ -2833,8 +2895,10 @@ define_class!(
             };
             if let Some(path) = path {
                 clipboard::write_text(&path.to_string_lossy());
-                self.ivars().state.borrow_mut().message =
+                if let Some(mut state) = self.state_mut() {
+                state.message =
                     Some((format!("copied {}", path.display()), Instant::now()));
+                }
                 self.request_redraw();
                 self.pump();
             }
@@ -2843,7 +2907,9 @@ define_class!(
         #[unsafe(method(revealContextTab:))]
         fn action_reveal_context_tab(&self, _sender: Option<&AnyObject>) {
             let path = {
-                let state = self.ivars().state.borrow();
+                let Some(state) = self.state() else {
+                    return;
+                };
                 state
                     .context_tab
                     .and_then(|i| state.docs.iter().nth(i))
@@ -2857,7 +2923,9 @@ define_class!(
         #[unsafe(method(revealInFinder:))]
         fn action_reveal(&self, _sender: Option<&AnyObject>) {
             let path = {
-                let state = self.ivars().state.borrow();
+                let Some(state) = self.state() else {
+                    return;
+                };
                 state
                     .tree
                     .selected
@@ -2889,7 +2957,9 @@ define_class!(
                     Err(e) => format!("could not open the browser: {e}"),
                 }
             };
-            self.ivars().state.borrow_mut().message = Some((note, Instant::now()));
+            if let Some(mut state) = self.state_mut() {
+                state.message = Some((note, Instant::now()));
+            }
             self.request_redraw();
             self.pump();
         }
@@ -2897,8 +2967,10 @@ define_class!(
         #[unsafe(method(checkForUpdates:))]
         fn action_check_for_updates(&self, _sender: Option<&AnyObject>) {
             self.start_update_check(true);
-            self.ivars().state.borrow_mut().message =
+            if let Some(mut state) = self.state_mut() {
+            state.message =
                 Some(("checking for updates…".to_string(), Instant::now()));
+            }
             self.request_redraw();
             self.pump();
         }
@@ -2914,7 +2986,9 @@ define_class!(
 
         #[unsafe(method(revealProjectInFinder:))]
         fn action_reveal_project(&self, _sender: Option<&AnyObject>) {
-            let root = self.ivars().state.borrow().tree.root().map(Path::to_path_buf);
+            let Some(root) = self.state().map(|state| state.tree.root().map(Path::to_path_buf)) else {
+                return;
+            };
             if let Some(root) = root {
                 let _ = self.open(true, root.as_os_str());
             }
@@ -2923,7 +2997,9 @@ define_class!(
         #[unsafe(method(renameProjectItem:))]
         fn action_rename_project_item(&self, _sender: Option<&AnyObject>) {
             let path = {
-                let state = self.ivars().state.borrow();
+                let Some(state) = self.state() else {
+                    return;
+                };
                 state
                     .tree
                     .selected
@@ -2937,7 +3013,9 @@ define_class!(
         #[unsafe(method(trashProjectItem:))]
         fn action_trash_project_item(&self, _sender: Option<&AnyObject>) {
             let path = {
-                let state = self.ivars().state.borrow();
+                let Some(state) = self.state() else {
+                    return;
+                };
                 state
                     .tree
                     .selected
@@ -2950,7 +3028,10 @@ define_class!(
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| path.display().to_string());
-            if all_docs(&self.ivars().state.borrow()).any(|d| d.has_dirty_under(&source_key)) {
+            if self
+                .state()
+                .is_some_and(|state| all_docs(&state).any(|d| d.has_dirty_under(&source_key)))
+            {
                 ask(
                     MainThreadMarker::from(self),
                     "Unsaved changes are open",
@@ -2976,7 +3057,9 @@ define_class!(
             match result {
                 Ok(()) => {
                     {
-                        let mut state = self.ivars().state.borrow_mut();
+                        let Some(mut state) = self.state_mut() else {
+                            return;
+                        };
                         for docs in all_docs_mut(&mut state) {
                             docs.close_under(&source_key);
                         }
@@ -2988,10 +3071,12 @@ define_class!(
                     self.reparse();
                 }
                 Err(error) => {
-                    self.ivars().state.borrow_mut().message = Some((
+                    if let Some(mut state) = self.state_mut() {
+                    state.message = Some((
                         format!("could not move to Trash: {}", error.localizedDescription()),
                         Instant::now(),
                     ));
+                    }
                 }
             }
             self.request_redraw();
@@ -3030,7 +3115,9 @@ define_class!(
 
         #[unsafe(method(closePane:))]
         fn action_close_pane(&self, _sender: Option<&AnyObject>) {
-            let focused = self.ivars().state.borrow().focused_pane;
+            let Some(focused) = self.state().map(|state| state.focused_pane) else {
+                return;
+            };
             self.close_pane(focused);
         }
 
@@ -3053,9 +3140,13 @@ define_class!(
         /// the keyboard already. Its sessions keep running while hidden.
         #[unsafe(method(toggleTerminal:))]
         fn action_toggle_terminal(&self, _sender: Option<&AnyObject>) {
-            let hide = self.ivars().state.borrow().terminal.has_keys();
+            let Some(hide) = self.state().map(|state| state.terminal.has_keys()) else {
+                return;
+            };
             if hide {
-                let mut state = self.ivars().state.borrow_mut();
+                let Some(mut state) = self.state_mut() else {
+                    return;
+                };
                 state.terminal.open = false;
                 state.terminal.focus = false;
                 drop(state);
@@ -3067,13 +3158,17 @@ define_class!(
 
         #[unsafe(method(zoomIn:))]
         fn action_zoom_in(&self, _sender: Option<&AnyObject>) {
-            let size = self.ivars().state.borrow().font_size + 1.0;
+            let Some(size) = self.state().map(|state| state.font_size + 1.0) else {
+                return;
+            };
             self.set_font_size(size);
         }
 
         #[unsafe(method(zoomOut:))]
         fn action_zoom_out(&self, _sender: Option<&AnyObject>) {
-            let size = self.ivars().state.borrow().font_size - 1.0;
+            let Some(size) = self.state().map(|state| state.font_size - 1.0) else {
+                return;
+            };
             self.set_font_size(size);
         }
 
@@ -3085,7 +3180,9 @@ define_class!(
         #[unsafe(method(toggleSidebar:))]
         fn action_toggle_sidebar(&self, _sender: Option<&AnyObject>) {
             {
-                let mut state = self.ivars().state.borrow_mut();
+                let Some(mut state) = self.state_mut() else {
+                    return;
+                };
                 state.sidebar = !state.sidebar;
             }
             self.request_redraw();
@@ -3108,16 +3205,22 @@ define_class!(
         #[unsafe(method(gitCommit:))]
         fn action_git_commit(&self, _sender: Option<&AnyObject>) {
             let ready = {
-                let state = self.ivars().state.borrow();
+                let Some(state) = self.state() else {
+                    return;
+                };
                 state.git_open && state.git.can_commit()
             };
             if ready {
-                self.ivars().state.borrow_mut().git.commit();
+                if let Some(mut state) = self.state_mut() {
+                    state.git.commit();
+                }
             } else {
-                if !self.ivars().state.borrow().git_open {
+                if !self.state().is_some_and(|state| state.git_open) {
                     self.set_sidebar_view(true);
                 }
-                self.ivars().state.borrow_mut().git_focus = true;
+                if let Some(mut state) = self.state_mut() {
+                    state.git_focus = true;
+                }
             }
             self.request_redraw();
             self.resume_display_link();
@@ -3219,7 +3322,9 @@ define_class!(
             };
             if self.terminal_has_keys() {
                 self.terminal_write(&{
-                    let state = self.ivars().state.borrow();
+                    let Some(state) = self.state() else {
+                        return;
+                    };
                     let bracketed = state.terminal.active_tab().is_some_and(|tab| {
                         tab.session.term.lock().unwrap_or_else(|e| e.into_inner()).modes.bracketed_paste
                     });
@@ -3251,7 +3356,9 @@ define_class!(
             let Some(action) = item.action() else {
                 return Bool::YES;
             };
-            let state = self.ivars().state.borrow();
+            let Some(state) = self.state() else {
+                return Bool::NO;
+            };
             let terminal = state.terminal.has_keys() && !field_has_keys(&state);
             let enabled = if terminal && action == sel!(copy:) {
                 state.terminal.selection.is_some()
@@ -3336,7 +3443,7 @@ define_class!(
         #[unsafe(method(insertText:replacementRange:))]
         fn insert_text(&self, string: &AnyObject, replacement: NSRange) {
             let text = text_of(string);
-            if let Ok(mut state) = self.ivars().state.try_borrow_mut() {
+            if let Some(mut state) = self.state_mut() {
                 state.marked = None;
             }
             self.commit_text(&text, replacement);
@@ -3356,13 +3463,13 @@ define_class!(
             // input methods): that text is selected, so committing the
             // composition replaces it.
             if replacement.location != NSNotFound as usize
-                && self.ivars().state.try_borrow_mut().is_ok()
+                && self.state_mut().is_some()
             {
                 self.edit_focused(|buffer, _| {
                     buffer.select_input_range(replacement.location, replacement.length)
                 });
             }
-            if let Ok(mut state) = self.ivars().state.try_borrow_mut() {
+            if let Some(mut state) = self.state_mut() {
                 // The input method's caret inside the composition, given in
                 // UTF-16 units.
                 let mut units = 0;
@@ -3382,9 +3489,9 @@ define_class!(
         /// Commit whatever is being composed, as it stands.
         #[unsafe(method(unmarkText))]
         fn unmark_text(&self) {
-            let marked = match self.ivars().state.try_borrow_mut() {
-                Ok(mut state) => state.marked.take(),
-                Err(_) => None,
+            let marked = match self.state_mut() {
+                Some(mut state) => state.marked.take(),
+                None => None,
             };
             if let Some(text) = marked {
                 let nowhere = NSRange::new(NSNotFound as usize, 0);
@@ -3395,18 +3502,18 @@ define_class!(
 
         #[unsafe(method(selectedRange))]
         fn selected_range(&self) -> NSRange {
-            match self.ivars().state.try_borrow() {
-                Ok(state) => {
+            match self.state() {
+                Some(state) => {
                     let (location, length) = focused_buffer(&state).input_selection();
                     NSRange::new(location, length)
                 }
-                Err(_) => NSRange::new(NSNotFound as usize, 0),
+                None => NSRange::new(NSNotFound as usize, 0),
             }
         }
 
         #[unsafe(method(markedRange))]
         fn marked_range(&self) -> NSRange {
-            let Ok(state) = self.ivars().state.try_borrow() else {
+            let Some(state) = self.state() else {
                 return NSRange::new(NSNotFound as usize, 0);
             };
             match &state.marked {
@@ -3420,10 +3527,7 @@ define_class!(
 
         #[unsafe(method(hasMarkedText))]
         fn has_marked_text(&self) -> bool {
-            self.ivars()
-                .state
-                .try_borrow()
-                .is_ok_and(|state| state.marked.is_some())
+            self.state().is_some_and(|state| state.marked.is_some())
         }
 
         /// The text around the caret, for input methods that look at context.
@@ -3450,8 +3554,8 @@ define_class!(
         /// candidate window open beside what is being typed.
         #[unsafe(method(firstRectForCharacterRange:actualRange:))]
         fn first_rect(&self, _range: NSRange, _actual: NSRangePointer) -> NSRect {
-            let in_view = match self.ivars().state.try_borrow() {
-                Ok(state) => {
+            let in_view = match self.state() {
+                Some(state) => {
                     let chrome = chrome_of(&state);
                     let text = chrome.text;
                     // Where the keys go: an input method's candidates open
@@ -3480,7 +3584,7 @@ define_class!(
                     };
                     ns_rect(caret)
                 }
-                Err(_) => NSRect::ZERO,
+                None => NSRect::ZERO,
             };
             let in_window = self.convertRect_toView(in_view, None);
             match self.window() {
@@ -3509,7 +3613,7 @@ define_class!(
         #[unsafe(method(windowDidBecomeKey:))]
         fn window_did_become_key(&self, _notification: &NSNotification) {
             self.check_open_files();
-            if let Ok(mut state) = self.ivars().state.try_borrow_mut() {
+            if let Some(mut state) = self.state_mut() {
                 state.caret_since = Instant::now();
             }
             self.request_redraw();
@@ -3569,6 +3673,90 @@ enum Discard {
 }
 
 impl EditorView {
+    /// The body of `menuForEvent:`, outside the class so it can return early.
+    fn context_menu(&self, event: &NSEvent) -> Option<Retained<NSMenu>> {
+        let mtm = MainThreadMarker::from(self);
+        let point = self.convertPoint_fromView(event.locationInWindow(), None);
+        let chrome = self.chrome();
+        let sidebar = chrome.sidebar;
+        let (x, y) = (point.x as f32, point.y as f32);
+
+        let in_sidebar = sidebar.is_some_and(|r| r.contains(x, y));
+        let in_tab_bar = chrome.tabs.contains(x, y);
+        let in_project = chrome.toolbar.contains(x, y)
+            && self.state_mut().is_some_and(|mut state| {
+                let State { tree, renderer, .. } = &mut *state;
+                layout::toolbar_project(tree, &mut renderer.atlas, chrome.toolbar).contains(x, y)
+            });
+
+        // A right-click in a panel should also select what is under the
+        // pointer, so the action applies to what was clicked rather than
+        // to whatever happened to be selected before.
+        if in_project {
+            Some(project_menu(mtm))
+        } else if in_tab_bar {
+            let hit = self
+                .ivars()
+                .state
+                .borrow()
+                .tab_hits
+                .iter()
+                .find(|h| x >= h.x0 && x < h.x1)
+                .map(|h| h.index);
+            if let Some(mut state) = self.state_mut() {
+                state.context_tab = hit;
+            }
+            // Empty strip still belongs to the bar, so it is consumed
+            // with an empty menu rather than falling through.
+            Some(match hit {
+                Some(_) => tab_menu(mtm),
+                None => NSMenu::new(mtm),
+            })
+        } else if in_sidebar {
+            let rect = sidebar.expect("in_sidebar implies a sidebar rectangle");
+            let index = {
+                let state = self.state()?;
+                layout::sidebar_row_at(&state.tree, sidebar_field(&state), rect, y)
+            };
+            if let Some(index) = index {
+                let mut state = self.state_mut()?;
+                state.tree.select(index);
+                state.sidebar_keys = true;
+                drop(state);
+                self.request_redraw();
+                self.pump();
+                Some(sidebar_item_menu(mtm))
+            } else {
+                Some(project_menu(mtm))
+            }
+        } else {
+            let commands = self.state().map(|state| state.ext_commands.clone())?;
+            Some(editor_context_menu(mtm, &commands))
+        }
+    }
+
+    /// The window's state, or `None` while a caller up the stack holds it:
+    /// AppKit re-entered through a menu, a modal panel, a cursor rect or a
+    /// redraw. Every path in goes through here or [`Self::state`], so a
+    /// re-entry skips its work and asks for a redraw; with `panic = "abort"`
+    /// a plain `borrow_mut` there would end the process.
+    fn state_mut(&self) -> Option<std::cell::RefMut<'_, State>> {
+        let state = self.ivars().state.try_borrow_mut().ok();
+        if state.is_none() {
+            self.ivars().needs_redraw.set(true);
+        }
+        state
+    }
+
+    /// [`Self::state_mut`] for reading.
+    fn state(&self) -> Option<std::cell::Ref<'_, State>> {
+        let state = self.ivars().state.try_borrow().ok();
+        if state.is_none() {
+            self.ivars().needs_redraw.set(true);
+        }
+        state
+    }
+
     fn new(mtm: MainThreadMarker, state: State, frame: NSRect) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(Ivars {
             testing: std::env::var_os("CRC_SELFTEST").is_some(),
@@ -3604,7 +3792,9 @@ impl EditorView {
         // Scrolling another pane scrolls it, which means focusing it:
         // there is one scroll position per focused document here.
         let over_pane = {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             match frame_of(&mut state).hit(x, y) {
                 Some(Hit::Pane(index)) => Some(*index),
                 _ => None,
@@ -3616,7 +3806,9 @@ impl EditorView {
         let chrome = self.chrome();
         let (rows, _) = self.grid();
 
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         let m = state.renderer.atlas.metrics;
         if chrome.tabs.contains(x, y) {
             let delta = if dx.abs() > dy.abs() { dx } else { dy };
@@ -3727,7 +3919,9 @@ impl EditorView {
     /// Starts an update check unless one is already out.
     fn start_update_check(&self, manual: bool) {
         {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             match &mut state.update {
                 // Asking while a launch check is out makes it an asked one.
                 Some((asked, _)) => *asked |= manual,
@@ -3742,7 +3936,7 @@ impl EditorView {
     /// the new release's page.
     fn poll_update(&self) {
         let (manual, outcome) = {
-            let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
+            let Some(mut state) = self.state_mut() else {
                 return;
             };
             let Some((manual, rx)) = &state.update else {
@@ -3777,7 +3971,9 @@ impl EditorView {
             (_, false) => None,
         };
         if let Some(note) = note {
-            self.ivars().state.borrow_mut().message = Some((note, Instant::now()));
+            if let Some(mut state) = self.state_mut() {
+                state.message = Some((note, Instant::now()));
+            }
             self.request_redraw();
             self.pump();
         }
@@ -3804,7 +4000,7 @@ impl EditorView {
                 object: None::<&AnyObject>
             ];
         };
-        let Ok(state) = self.ivars().state.try_borrow() else {
+        let Some(state) = self.state() else {
             return;
         };
         if !self.caret_blinks(&state) {
@@ -3828,7 +4024,7 @@ impl EditorView {
     /// how a save dialog left open for three seconds ends up reported as a
     /// three-second keystroke.
     fn request_redraw(&self) {
-        if let Ok(mut state) = self.ivars().state.try_borrow_mut() {
+        if let Some(mut state) = self.state_mut() {
             state.cursor_rects_for = None;
         }
         self.ivars().needs_redraw.set(true);
@@ -3844,9 +4040,7 @@ impl EditorView {
         let rest = if owner == Some(target) { rest } else { 0.0 };
         let total = if event.hasPreciseScrollingDeltas() {
             let line = self
-                .ivars()
-                .state
-                .try_borrow()
+                .state()
                 .map_or(16.0, |s| s.renderer.atlas.metrics.line_height as f64);
             rest - dy / line.max(1.0)
         } else {
@@ -3864,7 +4058,7 @@ impl EditorView {
     /// long the first one waited to appear.
     fn note_input(&self, at: Instant) {
         self.ivars().needs_redraw.set(true);
-        let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
+        let Some(mut state) = self.state_mut() else {
             return;
         };
         state.caret_since = at;
@@ -3917,7 +4111,9 @@ impl EditorView {
     /// strip, named in the title, parsed. Whether it switched.
     fn activate_tab(&self, index: usize) -> bool {
         let switched = {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return false;
+            };
             let switched = state.docs.switch(index);
             if switched {
                 reveal_active_tab(&mut state);
@@ -3934,7 +4130,9 @@ impl EditorView {
     /// The tab `step` along, round from the last to the first.
     fn cycle_tab(&self, step: isize) {
         {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             state.docs.cycle(step);
             reveal_active_tab(&mut state);
         }
@@ -3947,16 +4145,22 @@ impl EditorView {
     /// Saves a document the formatter just changed, without formatting it
     /// again on the way out.
     fn save_formatted(&self) {
-        self.ivars().state.borrow_mut().saving_formatted = true;
+        if let Some(mut state) = self.state_mut() {
+            state.saving_formatted = true;
+        }
         self.save(false);
-        self.ivars().state.borrow_mut().saving_formatted = false;
+        if let Some(mut state) = self.state_mut() {
+            state.saving_formatted = false;
+        }
     }
 
     /// Moves the keyboard `step` panes along, round from the last to the
     /// first.
     fn cycle_pane(&self, step: isize) {
         let (focused, count) = {
-            let state = self.ivars().state.borrow();
+            let Some(state) = self.state() else {
+                return;
+            };
             (state.focused_pane, pane_count(&state))
         };
         self.focus_pane((focused as isize + step).rem_euclid(count as isize) as usize);
@@ -3969,13 +4173,13 @@ impl EditorView {
         }
         self.sync_native_preview();
         self.sync_html_preview();
-        let ready = match self.ivars().state.try_borrow() {
-            Ok(state) => match state.last_draw {
+        let ready = match self.state() {
+            Some(state) => match state.last_draw {
                 Some(t) => t.elapsed() >= state.frame_interval,
                 None => true,
             },
             // Busy: leave it to the display link.
-            Err(_) => false,
+            None => false,
         };
 
         if ready {
@@ -3986,7 +4190,7 @@ impl EditorView {
     }
 
     fn sync_native_preview(&self) {
-        let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
+        let Some(mut state) = self.state_mut() else {
             return;
         };
         let path = state
@@ -4021,7 +4225,9 @@ impl EditorView {
             unsafe {
                 let _: () = msg_send![self, addSubview: &*preview.view];
             }
-            self.ivars().state.borrow_mut().native_preview = Some(preview);
+            if let Some(mut state) = self.state_mut() {
+                state.native_preview = Some(preview);
+            }
         }
     }
 
@@ -4053,7 +4259,7 @@ impl EditorView {
         self.ivars().needs_redraw.set(false);
         self.arm_caret_blink();
 
-        let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
+        let Some(mut state) = self.state_mut() else {
             return;
         };
         if state.renderer.atlas.has_pending_shaping() {
@@ -4200,18 +4406,23 @@ impl EditorView {
         if !event
             .modifierFlags()
             .contains(NSEventModifierFlags::Command)
+            && let Some(mut state) = self.state_mut()
         {
-            self.ivars().state.borrow_mut().sidebar_keys = false;
+            state.sidebar_keys = false;
         }
         let reviewing = {
-            let state = self.ivars().state.borrow();
+            let Some(state) = self.state() else {
+                return false;
+            };
             active_review(&state).is_some() && !field_has_keys(&state)
         };
         if reviewing && let Some(handled) = self.handle_review_key(event) {
             return handled;
         }
         let columns = {
-            let state = self.ivars().state.borrow();
+            let Some(state) = self.state() else {
+                return false;
+            };
             side_by_side(&state) && !field_has_keys(&state)
         };
         if columns && let Some(handled) = self.handle_conflict_side_key(event) {
@@ -4238,7 +4449,7 @@ impl EditorView {
             let option = flags.contains(NSEventModifierFlags::Option);
             if event.keyCode() == key::DELETE
                 && (command || option)
-                && !field_has_keys(&self.ivars().state.borrow())
+                && !self.state().is_some_and(|state| field_has_keys(&state))
             {
                 // The document's own handling below.
             } else if event.keyCode() == key::DELETE && (command || option) {
@@ -4254,14 +4465,18 @@ impl EditorView {
                 return true;
             }
         }
-        if self.ivars().state.borrow().completion.is_some() && self.handle_completion_key(event) {
+        if self.state().is_some_and(|state| state.completion.is_some())
+            && self.handle_completion_key(event)
+        {
             return true;
         }
         {
             let flags = event.modifierFlags();
             let plain = !flags.contains(NSEventModifierFlags::Command)
                 && !flags.contains(NSEventModifierFlags::Option);
-            let overlay = field_has_keys(&self.ivars().state.borrow());
+            let Some(overlay) = self.state().map(|state| field_has_keys(&state)) else {
+                return false;
+            };
             let shift = flags.contains(NSEventModifierFlags::Shift);
             match event.keyCode() {
                 // The menu has these too; handled here as well because a
@@ -4309,14 +4524,19 @@ impl EditorView {
                 _ => {}
             }
         }
-        if self.ivars().state.borrow().sidebar_edit.is_some() {
+        if self
+            .state()
+            .is_some_and(|state| state.sidebar_edit.is_some())
+        {
             return self.handle_sidebar_edit_key(event);
         }
         // Source Control claims its own keys (Escape, Cmd-Return, the
         // message field once clicked); everything else falls through to the
         // document beside it.
         let git_turn = {
-            let state = self.ivars().state.borrow();
+            let Some(state) = self.state() else {
+                return false;
+            };
             // A field opened over it (the palette, find) keeps its keys.
             state.git_open
                 && (state.git_focus
@@ -4331,8 +4551,8 @@ impl EditorView {
         // The Extensions page has the column: Escape leaves its
         // confirmation, then the page; nothing types into the document
         // underneath. The palette, opened over it, keeps its own keys.
-        if ext_details(&self.ivars().state.borrow())
-            && self.ivars().state.borrow().palette.is_none()
+        if self.state().is_some_and(|state| ext_details(&state))
+            && self.state().is_some_and(|state| state.palette.is_none())
             && !event
                 .modifierFlags()
                 .contains(NSEventModifierFlags::Command)
@@ -4340,12 +4560,16 @@ impl EditorView {
             const ESCAPE: u16 = 53;
             if event.keyCode() == ESCAPE {
                 let confirming = {
-                    let mut state = self.ivars().state.borrow_mut();
+                    let Some(mut state) = self.state_mut() else {
+                        return false;
+                    };
                     let page = state.extensions.as_mut();
                     page.is_some_and(|p| p.confirm.take().is_some())
                 };
                 if !confirming {
-                    let mut state = self.ivars().state.borrow_mut();
+                    let Some(mut state) = self.state_mut() else {
+                        return false;
+                    };
                     if let Some(page) = &mut state.extensions {
                         page.details = false;
                     }
@@ -4356,7 +4580,9 @@ impl EditorView {
         }
         const ESCAPE_KEY: u16 = 53;
         if event.keyCode() == ESCAPE_KEY {
-            let state = self.ivars().state.borrow();
+            let Some(state) = self.state() else {
+                return false;
+            };
             let idle = state.palette.is_none()
                 && state.find.is_none()
                 && state.goto.is_none()
@@ -4364,7 +4590,9 @@ impl EditorView {
             let tip = state.signature.is_some();
             drop(state);
             if idle && tip {
-                self.ivars().state.borrow_mut().signature = None;
+                if let Some(mut state) = self.state_mut() {
+                    state.signature = None;
+                }
                 self.request_redraw();
                 return true;
             }
@@ -4381,19 +4609,25 @@ impl EditorView {
 
         // The palette is modal over everything, then the find bar. Only the
         // keys that mean something to each escape it.
-        if self.ivars().state.borrow().rename.is_some() && self.handle_rename_key(event) {
+        if self.state().is_some_and(|state| state.rename.is_some()) && self.handle_rename_key(event)
+        {
             return true;
         }
-        if self.ivars().state.borrow().goto.is_some() && self.handle_goto_key(event) {
+        if self.state().is_some_and(|state| state.goto.is_some()) && self.handle_goto_key(event) {
             return true;
         }
-        if self.ivars().state.borrow().palette.is_some() && self.handle_palette_key(event) {
+        if self.state().is_some_and(|state| state.palette.is_some())
+            && self.handle_palette_key(event)
+        {
             return true;
         }
-        if self.ivars().state.borrow().find.is_some() && self.handle_find_key(event) {
+        if self.state().is_some_and(|state| state.find.is_some()) && self.handle_find_key(event) {
             return true;
         }
-        if self.ivars().state.borrow().docs.active().is_preview_file() {
+        if self
+            .state()
+            .is_some_and(|state| state.docs.active().is_preview_file())
+        {
             return false;
         }
         // Cmd-Return in a request file. A real keypress reaches this through
@@ -4402,7 +4636,7 @@ impl EditorView {
             && event
                 .modifierFlags()
                 .contains(NSEventModifierFlags::Command)
-            && can_send_from(&self.ivars().state.borrow())
+            && self.state().is_some_and(|state| can_send_from(&state))
         {
             self.send_request();
             return true;
@@ -4424,7 +4658,9 @@ impl EditorView {
         };
 
         {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return false;
+            };
             let m = state.renderer.atlas.metrics;
             let gutter = layout::gutter_width(state.docs.active(), &state.renderer.atlas);
             // The text area's rows and columns, not the window's. Measured
@@ -4663,7 +4899,9 @@ impl EditorView {
                 mods,
             } => {
                 let target = {
-                    let mut state = self.ivars().state.borrow_mut();
+                    let Some(mut state) = self.state_mut() else {
+                        return;
+                    };
                     frame_of(&mut state).named(name)
                 };
                 let Some(rect) = target else {
@@ -4754,12 +4992,15 @@ impl EditorView {
                 if let Some(event) = mouse(NSEventType::LeftMouseUp, *x, *y, *count) {
                     let _: () = unsafe { msg_send![self, mouseUp: &*event] };
                 }
-                self.ivars().state.borrow_mut().last_selftest_click_ms =
-                    started.elapsed().as_secs_f64() * 1000.0;
+                if let Some(mut state) = self.state_mut() {
+                    state.last_selftest_click_ms = started.elapsed().as_secs_f64() * 1000.0;
+                }
             }
             Step::ClickNamed { name, count } => {
                 let target = {
-                    let mut state = self.ivars().state.borrow_mut();
+                    let Some(mut state) = self.state_mut() else {
+                        return;
+                    };
                     match state.extensions.as_ref() {
                         Some(page) if name.starts_with("extensions.") => page.named(name),
                         _ => frame_of(&mut state).named(name),
@@ -4782,7 +5023,9 @@ impl EditorView {
             }
             Step::DownNamed { name } => {
                 let target = {
-                    let mut state = self.ivars().state.borrow_mut();
+                    let Some(mut state) = self.state_mut() else {
+                        return;
+                    };
                     frame_of(&mut state).named(name)
                 };
                 let Some(rect) = target else {
@@ -4793,25 +5036,33 @@ impl EditorView {
                     f64::from(rect.x + rect.width / 2.0),
                     f64::from(rect.y + rect.height / 2.0),
                 );
-                self.ivars().state.borrow_mut().selftest_pointer = (x, y);
+                if let Some(mut state) = self.state_mut() {
+                    state.selftest_pointer = (x, y);
+                }
                 if let Some(event) = mouse(NSEventType::LeftMouseDown, x, y, 1) {
                     let _: () = unsafe { msg_send![self, mouseDown: &*event] };
                 }
             }
             Step::DragBy { dx, dy } => {
-                let (x, y) = self.ivars().state.borrow().selftest_pointer;
+                let Some((x, y)) = self.state().map(|state| state.selftest_pointer) else {
+                    return;
+                };
                 if let Some(event) = mouse(NSEventType::LeftMouseDragged, x + dx, y + dy, 1) {
                     let _: () = unsafe { msg_send![self, mouseDragged: &*event] };
                 }
             }
             Step::UpBy { dx, dy } => {
-                let (x, y) = self.ivars().state.borrow().selftest_pointer;
+                let Some((x, y)) = self.state().map(|state| state.selftest_pointer) else {
+                    return;
+                };
                 if let Some(event) = mouse(NSEventType::LeftMouseUp, x + dx, y + dy, 1) {
                     let _: () = unsafe { msg_send![self, mouseUp: &*event] };
                 }
             }
             Step::Down { x, y, count } => {
-                self.ivars().state.borrow_mut().selftest_pointer = (*x, *y);
+                if let Some(mut state) = self.state_mut() {
+                    state.selftest_pointer = (*x, *y);
+                }
                 if let Some(event) = mouse(NSEventType::LeftMouseDown, *x, *y, *count) {
                     let _: () = unsafe { msg_send![self, mouseDown: &*event] };
                 }
@@ -4848,7 +5099,7 @@ impl EditorView {
                 }
             }
             Step::Wheel(dy) => {
-                if self.ivars().state.borrow().palette.is_some() {
+                if self.state().is_some_and(|state| state.palette.is_some()) {
                     self.palette_wheel_by(*dy, false);
                 } else {
                     eprintln!("selftest: wheel only drives the palette");
@@ -4858,8 +5109,70 @@ impl EditorView {
                 self.scroll_at(*x as f32, *y as f32, 0.0, *dy, true);
             }
             Step::Idle(_) => {}
+            Step::Reenter => {
+                let held = self.ivars().state.borrow_mut();
+                let x = NSString::from_str("x");
+                if let Some(event) = NSEvent::keyEventWithType_location_modifierFlags_timestamp_windowNumber_context_characters_charactersIgnoringModifiers_isARepeat_keyCode(
+                    NSEventType::KeyDown,
+                    NSPoint::new(0.0, 0.0),
+                    NSEventModifierFlags::empty(),
+                    0.0,
+                    window.windowNumber(),
+                    None,
+                    &x,
+                    &x,
+                    false,
+                    7,
+                ) {
+                    let _: () = unsafe { msg_send![self, keyDown: &*event] };
+                }
+                let (x, y) = (80.0, 125.0);
+                if let Some(event) = mouse(NSEventType::LeftMouseDown, x, y, 1) {
+                    let _: () = unsafe { msg_send![self, mouseDown: &*event] };
+                    let _: Option<Retained<NSMenu>> =
+                        unsafe { msg_send![self, menuForEvent: &*event] };
+                }
+                if let Some(event) = mouse(NSEventType::LeftMouseDragged, x + 40.0, y, 1) {
+                    let _: () = unsafe { msg_send![self, mouseDragged: &*event] };
+                }
+                if let Some(event) = mouse(NSEventType::LeftMouseUp, x + 40.0, y, 1) {
+                    let _: () = unsafe { msg_send![self, mouseUp: &*event] };
+                }
+                let _: () = unsafe { msg_send![self, resetCursorRects] };
+                let app = NSApplication::sharedApplication(mtm);
+                let target: &AnyObject = self;
+                for action in [
+                    sel!(undo:),
+                    sel!(selectAll:),
+                    sel!(copy:),
+                    sel!(findInProject:),
+                ] {
+                    unsafe { app.sendAction_to_from(action, Some(target), None) };
+                }
+                let range: NSRange = unsafe { msg_send![self, selectedRange] };
+                let drawn = self.render().is_some();
+                let close: bool = unsafe { msg_send![self, windowShouldClose: &*window] };
+                let quit = app.delegate().map(|delegate| {
+                    let reply: NSApplicationTerminateReply =
+                        unsafe { msg_send![&*delegate, applicationShouldTerminate: &*app] };
+                    reply == NSApplicationTerminateReply::TerminateCancel
+                });
+                drop(held);
+                if let Some(mut state) = self.state_mut() {
+                    state.message = Some((
+                        format!(
+                            "reentered: drawn={drawn} range={} close={close} quit_cancelled={}",
+                            range.location == NSNotFound as usize,
+                            quit.unwrap_or(false),
+                        ),
+                        Instant::now(),
+                    ));
+                }
+            }
             Step::WebJs(expression) => {
-                let state = self.ivars().state.borrow();
+                let Some(state) = self.state() else {
+                    return;
+                };
                 match state.html_preview.as_ref().and_then(|p| p.web.as_ref()) {
                     Some(web) if expression == "probe" => web.probe(PREVIEW_PROBE),
                     Some(web) => web.probe(expression),
@@ -4877,11 +5190,17 @@ impl EditorView {
                 self.poll_ignored();
                 self.poll_completion();
                 self.poll_claude();
-                self.ivars().state.borrow_mut().git.poll();
+                if let Some(mut state) = self.state_mut() {
+                    state.git.poll();
+                }
             }
             Step::Dump(path) => {
-                sync_conflicts(&mut self.ivars().state.borrow_mut());
-                let state = self.ivars().state.borrow();
+                if let Some(mut state) = self.state_mut() {
+                    sync_conflicts(&mut state);
+                }
+                let Some(state) = self.state() else {
+                    return;
+                };
                 let titles: Vec<String> =
                     (0..state.docs.len()).map(|i| state.docs.title(i)).collect();
                 // Where things are, so a script whose clicks miss can be told
@@ -5265,8 +5584,9 @@ impl EditorView {
         match focus {
             Focus::FindQuery => self.refresh_find(),
             Focus::Field => {
-                let mut state = self.ivars().state.borrow_mut();
-                if let Some((_, selected)) = &mut state.palette {
+                if let Some(mut state) = self.state_mut()
+                    && let Some((_, selected)) = &mut state.palette
+                {
                     *selected = 0;
                 }
             }
@@ -5294,8 +5614,9 @@ impl EditorView {
     fn open_file(&self) -> bool {
         // As open_folder: a test instance never shows the panel.
         if self.ivars().testing {
-            self.ivars().state.borrow_mut().message =
-                Some(("would show the Open panel".into(), Instant::now()));
+            if let Some(mut state) = self.state_mut() {
+                state.message = Some(("would show the Open panel".into(), Instant::now()));
+            }
             return true;
         }
         match choose_path(MainThreadMarker::from(self), false, None) {
@@ -5319,7 +5640,9 @@ impl EditorView {
         // the file's own directory so the sidebar is useful either way.
         let mut adopted_folder = false;
         {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return false;
+            };
             if state.tree.root().is_none()
                 && let Some(dir) = std::path::Path::new(path).parent()
                 && dir.is_dir()
@@ -5339,7 +5662,9 @@ impl EditorView {
         // A document lives in one pane. Open elsewhere, it comes to the
         // front there rather than opening a second copy that could diverge.
         let elsewhere = {
-            let state = self.ivars().state.borrow();
+            let Some(state) = self.state() else {
+                return false;
+            };
             let key = crate::platform::canonical(std::path::Path::new(path));
             state
                 .panes
@@ -5354,7 +5679,9 @@ impl EditorView {
             return true;
         }
 
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return false;
+        };
         match state.docs.open(path) {
             Ok(()) => {
                 reveal_active_tab(&mut state);
@@ -5397,13 +5724,13 @@ impl EditorView {
     }
 
     /// Snapshots what is open, for the next launch.
-    fn capture_session(&self) -> Session {
-        let state = self.ivars().state.borrow();
+    fn capture_session(&self) -> Option<Session> {
+        let state = self.state()?;
         let frame = self.window().map(|w| {
             let f = w.frame();
             (f.origin.x, f.origin.y, f.size.width, f.size.height)
         });
-        Session {
+        Some(Session {
             frame,
             sidebar_width: state.sidebar_width,
             folder: state.tree.root().map(Path::to_path_buf),
@@ -5431,7 +5758,7 @@ impl EditorView {
             },
             sidebar: state.sidebar,
             recent: state.recent_projects.clone(),
-        }
+        })
     }
 
     /// Asks about every document with unsaved changes, one at a time, showing
@@ -5441,21 +5768,28 @@ impl EditorView {
     /// one in front, so asking about the active document alone let the rest
     /// vanish without a word.
     fn confirm_discard_all(&self) -> bool {
-        if self.ivars().state.borrow().discard_confirmed {
+        if self.state().is_some_and(|state| state.discard_confirmed) {
             return true;
         }
         // Where the person was: the pane, and the document by identity,
         // since the loop moves between panes and closes tabs.
         let (original_pane, original_doc) = {
-            let state = self.ivars().state.borrow();
+            let Some(state) = self.state() else {
+                return false;
+            };
             (state.focused_pane, state.docs.active().id())
         };
-        let session = self.capture_session();
-        self.ivars().state.borrow_mut().quit_session = Some(session);
+        if let Some(session) = self.capture_session()
+            && let Some(mut state) = self.state_mut()
+        {
+            state.quit_session = Some(session);
+        }
         loop {
             // Whichever pane has a dirty document comes to the front first.
             let elsewhere = {
-                let state = self.ivars().state.borrow();
+                let Some(state) = self.state() else {
+                    return false;
+                };
                 (0..pane_count(&state)).find(|p| {
                     *p != state.focused_pane
                         && state.panes[p - usize::from(*p > state.focused_pane)]
@@ -5465,7 +5799,9 @@ impl EditorView {
                 })
             };
             let next = {
-                let state = self.ivars().state.borrow();
+                let Some(state) = self.state() else {
+                    return false;
+                };
                 state.docs.iter().position(|b| b.is_dirty())
             };
             let index = match (next, elsewhere) {
@@ -5486,10 +5822,14 @@ impl EditorView {
 
             match self.ask_about_active() {
                 Discard::Cancel => {
-                    self.ivars().state.borrow_mut().quit_session = None;
+                    if let Some(mut state) = self.state_mut() {
+                        state.quit_session = None;
+                    }
                     self.focus_pane(original_pane);
                     let at = {
-                        let state = self.ivars().state.borrow();
+                        let Some(state) = self.state() else {
+                            return false;
+                        };
                         state.docs.iter().position(|b| b.id() == original_doc)
                     };
                     if let Some(at) = at {
@@ -5504,11 +5844,15 @@ impl EditorView {
                 // Not saved and not wanted. Closing the tab is what stops the
                 // scan finding it again, and the window is going anyway.
                 Discard::Dropped => {
-                    self.ivars().state.borrow_mut().docs.close(index);
+                    if let Some(mut state) = self.state_mut() {
+                        state.docs.close(index);
+                    }
                 }
             }
         }
-        self.ivars().state.borrow_mut().discard_confirmed = true;
+        if let Some(mut state) = self.state_mut() {
+            state.discard_confirmed = true;
+        }
         true
     }
 
@@ -5523,7 +5867,10 @@ impl EditorView {
 
     /// Save found the file changed (or gone) since it was opened.
     fn ask_about_conflict(&self, missing: bool) -> Conflict {
-        let name = self.ivars().state.borrow().docs.active().display_name();
+        let name = self
+            .state()
+            .map(|state| state.docs.active().display_name())
+            .unwrap_or_default();
         let mtm = MainThreadMarker::from(self);
         let answer = if missing {
             ask(
@@ -5552,7 +5899,9 @@ impl EditorView {
     /// that drops unsaved changes.
     fn revert_to_saved(&self) {
         let (has_path, dirty) = {
-            let state = self.ivars().state.borrow();
+            let Some(state) = self.state() else {
+                return;
+            };
             let active = state.docs.active();
             (active.path.is_some(), active.is_dirty())
         };
@@ -5562,9 +5911,16 @@ impl EditorView {
         if dirty && !self.confirm_revert() {
             return;
         }
-        let result = self.ivars().state.borrow_mut().docs.active_mut().reload();
+        let Some(result) = self
+            .state_mut()
+            .map(|mut state| state.docs.active_mut().reload())
+        else {
+            return;
+        };
         self.after_reload(true);
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         state.message = Some((
             match result {
                 Ok(()) => "reverted to the saved version".to_string(),
@@ -5577,7 +5933,9 @@ impl EditorView {
     }
 
     fn confirm_revert(&self) -> bool {
-        let name = self.ivars().state.borrow().docs.active().display_name();
+        let Some(name) = self.state().map(|state| state.docs.active().display_name()) else {
+            return false;
+        };
         ask(
             MainThreadMarker::from(self),
             &format!("Revert \u{201c}{name}\u{201d} to the saved version?"),
@@ -5595,7 +5953,7 @@ impl EditorView {
     /// which Save then asks. A deleted file marks its tab unsaved: the text
     /// in the tab is now the only copy.
     fn check_open_files(&self) {
-        let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
+        let Some(mut state) = self.state_mut() else {
             return;
         };
         let active_id = state.docs.active().id();
@@ -5695,7 +6053,7 @@ impl EditorView {
     /// Takes the large files read for a reload by `check_open_files`, into
     /// tabs that are still clean and whose file has not changed again.
     fn poll_reloads(&self) {
-        let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
+        let Some(mut state) = self.state_mut() else {
             return;
         };
         let mut names = Vec::new();
@@ -5752,7 +6110,9 @@ impl EditorView {
     fn after_reload(&self, announce: bool) {
         self.reparse();
         {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             let active = state.docs.active();
             let id = active.id();
             if active.path.is_some() {
@@ -5767,7 +6127,9 @@ impl EditorView {
 
     fn ask_about_active(&self) -> Discard {
         let (dirty, name) = {
-            let state = self.ivars().state.borrow();
+            let Some(state) = self.state() else {
+                return Discard::Cancel;
+            };
             (
                 state.docs.active().is_dirty(),
                 state.docs.active().display_name(),
@@ -5796,13 +6158,18 @@ impl EditorView {
     /// Saves, falling back to a Save As panel when there is no path yet.
     /// Returns whether the file actually reached disk.
     fn save(&self, force_panel: bool) -> bool {
-        let needs_panel = force_panel || self.ivars().state.borrow().docs.active().path.is_none();
+        let Some(untitled) = self.state().map(|state| state.docs.active().path.is_none()) else {
+            return false;
+        };
+        let needs_panel = force_panel || untitled;
 
         let chosen = if needs_panel {
             let mtm = MainThreadMarker::from(self);
             let panel = NSSavePanel::savePanel(mtm);
             let suggested = {
-                let state = self.ivars().state.borrow();
+                let Some(state) = self.state() else {
+                    return false;
+                };
                 state
                     .docs
                     .active()
@@ -5827,7 +6194,9 @@ impl EditorView {
             None
         };
 
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return false;
+        };
         let mut result = state.docs.active_mut().save(chosen.as_deref());
         // Save As onto the tab's own file is a plain save, conflicts and all.
         let own_file = match (&chosen, &state.docs.active().path) {
@@ -5848,15 +6217,23 @@ impl EditorView {
             drop(state);
             match self.ask_about_conflict(missing) {
                 Conflict::Overwrite => {
-                    state = self.ivars().state.borrow_mut();
+                    let Some(again) = self.state_mut() else {
+                        return false;
+                    };
+                    state = again;
                     result = state.docs.active_mut().save_overwriting(chosen.as_deref());
                 }
                 Conflict::Reload => {
-                    state = self.ivars().state.borrow_mut();
+                    let Some(again) = self.state_mut() else {
+                        return false;
+                    };
+                    state = again;
                     result = state.docs.active_mut().reload();
                     drop(state);
                     self.after_reload(true);
-                    let mut state = self.ivars().state.borrow_mut();
+                    let Some(mut state) = self.state_mut() else {
+                        return false;
+                    };
                     state.message = Some((
                         match &result {
                             Ok(()) => "reloaded from disk".to_string(),
@@ -5869,7 +6246,10 @@ impl EditorView {
                     return false;
                 }
                 Conflict::Cancel => {
-                    state = self.ivars().state.borrow_mut();
+                    let Some(again) = self.state_mut() else {
+                        return false;
+                    };
+                    state = again;
                     state.message = Some(("not saved".to_string(), Instant::now()));
                     return false;
                 }
@@ -5897,7 +6277,9 @@ impl EditorView {
         // The watcher ignores this process's own writes, so a .gitignore
         // saved here would otherwise leave the Explorer showing the old rules.
         if saved_path.as_deref().is_some_and(changes_ignore_rules) {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return false;
+            };
             if let Some(root) = state.tree.root().map(Path::to_path_buf) {
                 state.ignored_rx = Some(spawn_ignored(root));
             }
@@ -5908,7 +6290,9 @@ impl EditorView {
         if let Some(path) = saved_path {
             self.lsp_flush_changes();
             self.lsp_sync_open();
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return false;
+            };
             for server in state.lsp.values_mut() {
                 server.did_save(&path);
             }
@@ -5935,7 +6319,9 @@ impl EditorView {
     /// no highlighting rather than a stalled editor: the first parse is
     /// linear in file size even though later ones are incremental.
     fn reparse(&self) {
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         let State {
             docs,
             syntax,
@@ -5963,7 +6349,9 @@ impl EditorView {
         let Some(window) = self.window() else {
             return;
         };
-        let state = self.ivars().state.borrow();
+        let Some(state) = self.state() else {
+            return;
+        };
         // With nothing open the window is the app, not a document.
         let title = if state.docs.is_home() {
             "crc".to_string()
@@ -5999,7 +6387,9 @@ impl EditorView {
                 .as_ref()
                 .is_some_and(|b| b.project && !b.results.is_empty())
         {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return false;
+            };
             let bar = state.find.as_mut().expect("checked above");
             bar.selected = if code == key::DOWN {
                 (bar.selected + 1).min(bar.results.len() - 1)
@@ -6019,7 +6409,9 @@ impl EditorView {
             }
             TAB => {
                 // Tab crosses between Find and Replace rather than inserting.
-                let mut state = self.ivars().state.borrow_mut();
+                let Some(mut state) = self.state_mut() else {
+                    return false;
+                };
                 if let Some(find) = &mut state.find {
                     find.replacing = !find.replacing;
                 }
@@ -6039,7 +6431,9 @@ impl EditorView {
                     .unwrap_or((false, false));
                 if project {
                     let selected = {
-                        let state = self.ivars().state.borrow();
+                        let Some(state) = self.state() else {
+                            return false;
+                        };
                         state
                             .find
                             .as_ref()
@@ -6068,7 +6462,9 @@ impl EditorView {
                 .charactersIgnoringModifiers()
                 .and_then(|s| s.to_string().chars().next())
                 .map(|c| c.to_ascii_lowercase());
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return false;
+            };
             let Some(bar) = &mut state.find else {
                 return false;
             };
@@ -6135,7 +6531,9 @@ impl EditorView {
         let motion = if shift { Motion::Extend } else { Motion::Move };
         {
             let mut as_text = false;
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return false;
+            };
             let Some(bar) = &mut state.find else {
                 return false;
             };
@@ -6205,7 +6603,7 @@ impl EditorView {
     /// match, so replacing searches afresh. No size limit here: an action
     /// runs once, drawing runs every frame. An invalid pattern says so.
     fn action_matches(&self, replacement: Option<&str>) -> Option<(String, Vec<search::Match>)> {
-        let mut state = self.ivars().state.borrow_mut();
+        let mut state = self.state_mut()?;
         let state = &mut *state;
         let bar = state.find.as_ref()?;
         let needle = bar.query.rope.to_string();
@@ -6228,7 +6626,9 @@ impl EditorView {
 
     fn refresh_find(&self) {
         {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             if let Some(cancel) = state.project_search_cancel.take() {
                 cancel.store(true, Ordering::Relaxed);
             }
@@ -6242,7 +6642,9 @@ impl EditorView {
             }
         }
         let at = {
-            let state = self.ivars().state.borrow();
+            let Some(state) = self.state() else {
+                return;
+            };
             let active = state.docs.active();
             active.selection().map_or(active.cursor(), |r| r.start)
         };
@@ -6255,7 +6657,9 @@ impl EditorView {
             .or_else(|| matches.first())
         {
             let (rows, cols) = self.grid();
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             state
                 .docs
                 .active_mut()
@@ -6266,7 +6670,9 @@ impl EditorView {
 
     /// Opens the go-to-line field.
     fn open_goto(&self) {
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         close_fields(&mut state);
         state.goto = Some(Buffer::new());
         drop(state);
@@ -6290,18 +6696,24 @@ impl EditorView {
 
         match code {
             ESCAPE => {
-                self.ivars().state.borrow_mut().goto = None;
+                if let Some(mut state) = self.state_mut() {
+                    state.goto = None;
+                }
             }
             key::RETURN => {
                 let target = {
-                    let state = self.ivars().state.borrow();
+                    let Some(state) = self.state() else {
+                        return false;
+                    };
                     state
                         .goto
                         .as_ref()
                         .and_then(|b| b.rope.to_string().trim().parse::<usize>().ok())
                 };
                 {
-                    let mut state = self.ivars().state.borrow_mut();
+                    let Some(mut state) = self.state_mut() else {
+                        return false;
+                    };
                     state.goto = None;
                     if let Some(line) = target {
                         // People count lines from one; the buffer counts from
@@ -6318,7 +6730,9 @@ impl EditorView {
                     .scroll_to_cursor(rows, cols);
             }
             key::DELETE => {
-                let mut state = self.ivars().state.borrow_mut();
+                let Some(mut state) = self.state_mut() else {
+                    return false;
+                };
                 if let Some(b) = &mut state.goto {
                     b.backspace();
                 }
@@ -6338,7 +6752,9 @@ impl EditorView {
             return;
         };
         let (changed, active) = 'drag: {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             let row = layout::sidebar_row_at(&state.tree, sidebar_field(&state), rect, y);
             // The destination directory: the folder under the pointer, the
             // parent of a file under it, or the project root below the tree.
@@ -6379,7 +6795,9 @@ impl EditorView {
             return;
         };
         let destination = {
-            let state = self.ivars().state.borrow();
+            let Some(state) = self.state() else {
+                return;
+            };
             match drag.over.and_then(|index| state.tree.rows().get(index)) {
                 Some(entry) if entry.is_dir => Some(entry.path.clone()),
                 Some(entry) => entry.path.parent().map(Path::to_path_buf),
@@ -6406,10 +6824,12 @@ impl EditorView {
             .docs
             .has_dirty_under(&source_key)
         {
-            self.ivars().state.borrow_mut().message = Some((
-                "save the affected tabs before moving this item".into(),
-                Instant::now(),
-            ));
+            if let Some(mut state) = self.state_mut() {
+                state.message = Some((
+                    "save the affected tabs before moving this item".into(),
+                    Instant::now(),
+                ));
+            }
             self.request_redraw();
             self.pump();
             return;
@@ -6417,7 +6837,9 @@ impl EditorView {
         match move_without_replace(&drag.path, &target) {
             Ok(()) => {
                 {
-                    let mut state = self.ivars().state.borrow_mut();
+                    let Some(mut state) = self.state_mut() else {
+                        return;
+                    };
                     for docs in all_docs_mut(&mut state) {
                         docs.rename_path(&source_key, &target);
                     }
@@ -6435,8 +6857,9 @@ impl EditorView {
                 self.reparse();
             }
             Err(error) => {
-                self.ivars().state.borrow_mut().message =
-                    Some((format!("move failed: {error}"), Instant::now()));
+                if let Some(mut state) = self.state_mut() {
+                    state.message = Some((format!("move failed: {error}"), Instant::now()));
+                }
             }
         }
         self.request_redraw();
@@ -6445,7 +6868,9 @@ impl EditorView {
 
     /// Closes every expanded directory in the tree.
     fn collapse_tree(&self) {
-        self.ivars().state.borrow_mut().tree.collapse_all();
+        if let Some(mut state) = self.state_mut() {
+            state.tree.collapse_all();
+        }
         self.invalidate_tab_cursors();
         self.request_redraw();
         self.pump();
@@ -6466,7 +6891,7 @@ impl EditorView {
         let chrome = self.chrome();
         let over = (x.is_finite() && chrome.tabs.contains(x, y))
             .then(|| {
-                let state = self.ivars().state.borrow();
+                let state = self.state()?;
                 state
                     .tab_hits
                     .iter()
@@ -6474,7 +6899,9 @@ impl EditorView {
                     .map(|hit| hit.index)
             })
             .flatten();
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         if state.hovered_tab == over {
             return;
         }
@@ -6494,7 +6921,9 @@ impl EditorView {
     }
 
     fn open_git(&self) {
-        let scm = self.ivars().state.borrow().git_open;
+        let Some(scm) = self.state().map(|state| state.git_open) else {
+            return;
+        };
         self.set_sidebar_view(!scm);
     }
 
@@ -6505,7 +6934,9 @@ impl EditorView {
     /// the active document.
     fn set_sidebar_view(&self, scm: bool) {
         {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             state.extensions = None;
             state.git_open = scm;
             // Typing belongs to the editor until the message field is asked
@@ -6518,7 +6949,7 @@ impl EditorView {
             }
         }
         // A sidebar that has been hidden cannot show either view.
-        if scm && !self.ivars().state.borrow().sidebar {
+        if scm && !self.state().is_some_and(|state| state.sidebar) {
             self.action_toggle_sidebar(sel!(toggleSidebar:), None);
         }
         self.request_redraw();
@@ -6530,7 +6961,9 @@ impl EditorView {
     /// something; the caller falls through to the file tree otherwise.
     fn git_click(&self, column: Viewport, x: f32, y: f32) -> bool {
         use crate::platform::git_panel::{Entry, Group, Sidebar};
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return false;
+        };
         let g = Sidebar::new(column);
         let mut handled = true;
         let mut conflict_file = None;
@@ -6598,8 +7031,10 @@ impl EditorView {
         if flags.contains(NSEventModifierFlags::Command) {
             // Commits from the message field; in a document, Cmd-Return is
             // the document's (a .http file sends its request).
-            if event.keyCode() == key::RETURN && self.ivars().state.borrow().git_focus {
-                self.ivars().state.borrow_mut().git.commit();
+            if event.keyCode() == key::RETURN && self.state().is_some_and(|state| state.git_focus) {
+                if let Some(mut state) = self.state_mut() {
+                    state.git.commit();
+                }
                 self.resume_display_link();
                 return true;
             }
@@ -6609,14 +7044,18 @@ impl EditorView {
             // Escape steps back out: first the diff, then the field, then the
             // view itself. Extra cursors in the document go first.
             {
-                let state = self.ivars().state.borrow();
+                let Some(state) = self.state() else {
+                    return false;
+                };
                 if !state.git_focus
                     && (state.docs.active().cursor_count() > 1 || state.signature.is_some())
                 {
                     return false;
                 }
             }
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return false;
+            };
             if state.git_focus {
                 state.git_focus = false;
             } else if diffing(&state) {
@@ -6636,10 +7075,12 @@ impl EditorView {
             self.request_redraw();
             return true;
         }
-        if !self.ivars().state.borrow().git_focus {
+        if !self.state().is_some_and(|state| state.git_focus) {
             return false;
         }
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return false;
+        };
         let motion = if flags.contains(NSEventModifierFlags::Shift) {
             Motion::Extend
         } else {
@@ -6676,7 +7117,9 @@ impl EditorView {
     /// Opens the palette with `prefix` typed: `@` for the document's
     /// symbols, `#` for the project's.
     fn open_palette_with(&self, prefix: &str) {
-        close_fields(&mut self.ivars().state.borrow_mut());
+        if let Some(mut state) = self.state_mut() {
+            close_fields(&mut state);
+        }
         // Before the field takes the keyboard: validation asks the editor
         // which commands apply, and a focused field changes the answer.
         let commands = commands::from_menu(MainThreadMarker::from(self), |item| {
@@ -6688,7 +7131,9 @@ impl EditorView {
             !handles || unsafe { msg_send![self, validateMenuItem: item] }
         });
         {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             state.commands = commands;
             let document = {
                 let buffer = state.docs.active();
@@ -6714,7 +7159,9 @@ impl EditorView {
 
     fn palette_click(&self, x: f32, y: f32) {
         let chosen = {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             let count = state
                 .palette
                 .as_ref()
@@ -6777,9 +7224,13 @@ impl EditorView {
                 self.load_path(&path.to_string_lossy());
                 // The title follows after the frame that shows the file:
                 // setTitle can take several ms (PERF-001).
-                self.ivars().state.borrow_mut().title_sync_pending = true;
+                if let Some(mut state) = self.state_mut() {
+                    state.title_sync_pending = true;
+                }
                 self.reparse();
-                self.ivars().state.borrow_mut().tree.reveal(&path);
+                if let Some(mut state) = self.state_mut() {
+                    state.tree.reveal(&path);
+                }
                 self.request_redraw();
                 self.pump();
             }
@@ -6816,7 +7267,9 @@ impl EditorView {
     }
 
     fn palette_wheel_by(&self, dy: f64, precise: bool) {
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         if state.palette.is_none() {
             return;
         }
@@ -6845,7 +7298,9 @@ impl EditorView {
 
     fn close_palette(&self) {
         {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             state.palette = None;
             state.branch_list = None;
             state.action_list = None;
@@ -6867,7 +7322,9 @@ impl EditorView {
             // menu item, so returning false here left it doing nothing at all;
             // everything else with Command still belongs to the menus.
             if code == key::DELETE {
-                let mut state = self.ivars().state.borrow_mut();
+                let Some(mut state) = self.state_mut() else {
+                    return false;
+                };
                 if let Some((query, selected)) = &mut state.palette {
                     if query.selection().is_none() {
                         query.move_line_start(Motion::Extend);
@@ -6891,7 +7348,9 @@ impl EditorView {
             }
             key::RETURN => {
                 let chosen = {
-                    let state = self.ivars().state.borrow();
+                    let Some(state) = self.state() else {
+                        return false;
+                    };
                     let Some((query, selected)) = &state.palette else {
                         return false;
                     };
@@ -6907,7 +7366,9 @@ impl EditorView {
                 return true;
             }
             key::UP | key::DOWN => {
-                let mut state = self.ivars().state.borrow_mut();
+                let Some(mut state) = self.state_mut() else {
+                    return false;
+                };
                 let count = state
                     .palette
                     .as_ref()
@@ -6937,7 +7398,9 @@ impl EditorView {
 
         {
             let mut as_text = false;
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return false;
+            };
             let Some((query, selected)) = &mut state.palette else {
                 return false;
             };
@@ -6984,7 +7447,9 @@ impl EditorView {
     /// Opens the find bar, seeding it from the selection when there is one.
     fn open_find(&self) {
         let seed = {
-            let state = self.ivars().state.borrow();
+            let Some(state) = self.state() else {
+                return;
+            };
             state
                 .docs
                 .active()
@@ -6996,24 +7461,30 @@ impl EditorView {
             query.insert(&seed);
             query.select_all();
         }
-        close_fields(&mut self.ivars().state.borrow_mut());
-        self.ivars().state.borrow_mut().find = Some(FindBar {
-            query,
-            replacement: Buffer::new(),
-            replacing: false,
-            options: SearchOptions::default(),
-            project: false,
-            results: Vec::new(),
-            selected: 0,
-            result_scroll: 0,
-            searching: false,
-        });
+        if let Some(mut state) = self.state_mut() {
+            close_fields(&mut state);
+        }
+        if let Some(mut state) = self.state_mut() {
+            state.find = Some(FindBar {
+                query,
+                replacement: Buffer::new(),
+                replacing: false,
+                options: SearchOptions::default(),
+                project: false,
+                results: Vec::new(),
+                selected: 0,
+                result_scroll: 0,
+                searching: false,
+            });
+        }
         self.request_redraw();
         self.pump();
     }
 
     fn close_find(&self) {
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         if let Some(cancel) = state.project_search_cancel.take() {
             cancel.store(true, Ordering::Relaxed);
         }
@@ -7026,7 +7497,9 @@ impl EditorView {
 
     fn search_project(&self) {
         let (query, options, root) = {
-            let state = self.ivars().state.borrow();
+            let Some(state) = self.state() else {
+                return;
+            };
             let Some(bar) = &state.find else { return };
             (
                 bar.query.rope.to_string(),
@@ -7039,8 +7512,9 @@ impl EditorView {
             return;
         }
         if let Err(error) = search::find("", &query, "", options) {
-            self.ivars().state.borrow_mut().message =
-                Some((format!("invalid regex: {error}"), Instant::now()));
+            if let Some(mut state) = self.state_mut() {
+                state.message = Some((format!("invalid regex: {error}"), Instant::now()));
+            }
             return;
         }
         let (tx, rx) = mpsc::channel();
@@ -7124,7 +7598,9 @@ impl EditorView {
                 let _ = tx.send(Ok(results));
             }
         });
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         if let Some(old) = state.project_search_cancel.replace(cancel) {
             old.store(true, Ordering::Relaxed);
         }
@@ -7146,7 +7622,9 @@ impl EditorView {
     /// when curl answers. Re-sending reuses the tab, so a request edited and
     /// sent ten times leaves one tab, not ten.
     fn send_request(&self) {
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         if state.http.is_some() {
             state.message = Some(("a request is still in flight".into(), Instant::now()));
             drop(state);
@@ -7199,7 +7677,9 @@ impl EditorView {
     }
 
     fn poll_http(&self) {
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         let Some((_, rx)) = &state.http else {
             return;
         };
@@ -7244,7 +7724,9 @@ impl EditorView {
 
     /// Shows segment `index` of the active response tab.
     fn response_select(&self, index: usize) {
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         let id = state.docs.active().id();
         let State {
             docs, responses, ..
@@ -7271,7 +7753,9 @@ impl EditorView {
     }
 
     fn poll_project_search(&self) {
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         let Some(rx) = &state.project_search_rx else {
             return;
         };
@@ -7311,7 +7795,9 @@ impl EditorView {
 
     fn open_project_result(&self, index: usize) {
         let target = {
-            let state = self.ivars().state.borrow();
+            let Some(state) = self.state() else {
+                return;
+            };
             state
                 .find
                 .as_ref()
@@ -7326,7 +7812,9 @@ impl EditorView {
         {
             // By line and column: the open document may have been edited
             // above the hit since the search read the file from disk.
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             let buffer = state.docs.active_mut();
             let line = line.min(buffer.rope.len_lines().saturating_sub(1));
             let line_start = buffer.rope.line_to_byte(line);
@@ -7361,7 +7849,9 @@ impl EditorView {
                 continue;
             }
             {
-                let mut state = self.ivars().state.borrow_mut();
+                let Some(mut state) = self.state_mut() else {
+                    return;
+                };
                 if let Some(bar) = &mut state.find {
                     match slot {
                         0 => bar.options.case_sensitive = !bar.options.case_sensitive,
@@ -7383,7 +7873,9 @@ impl EditorView {
         } else if g.previous.contains(x, y) || g.next.contains(x, y) {
             let forward = g.next.contains(x, y);
             if project {
-                let mut state = self.ivars().state.borrow_mut();
+                let Some(mut state) = self.state_mut() else {
+                    return;
+                };
                 if let Some(bar) = &mut state.find
                     && !bar.results.is_empty()
                 {
@@ -7411,7 +7903,9 @@ impl EditorView {
             }
         } else if let Some(row) = g.result_row(y).filter(|_| project) {
             let selected = {
-                let state = self.ivars().state.borrow();
+                let Some(state) = self.state() else {
+                    return;
+                };
                 state
                     .find
                     .as_ref()
@@ -7426,7 +7920,9 @@ impl EditorView {
             // Clicking a field focuses it and puts the caret where the
             // pointer is, measured through the same shaping that drew it.
             let replace = g.replace_field.contains(x, y);
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             let State { find, renderer, .. } = &mut *state;
             if let Some(bar) = find {
                 bar.replacing = replace;
@@ -7455,7 +7951,9 @@ impl EditorView {
     /// Replaces the current match, then advances to the next one.
     fn replace_one(&self) {
         let (replacement, selected) = {
-            let state = self.ivars().state.borrow();
+            let Some(state) = self.state() else {
+                return;
+            };
             let Some(bar) = &state.find else {
                 return;
             };
@@ -7496,7 +7994,9 @@ impl EditorView {
     /// were cut at 500, since files past the cut would be missed.
     fn replace_in_project(&self) {
         let (needle, replacement, options, files, matches) = {
-            let state = self.ivars().state.borrow();
+            let Some(state) = self.state() else {
+                return;
+            };
             let Some(bar) = &state.find else { return };
             let mut files: Vec<std::path::PathBuf> = Vec::new();
             for hit in &bar.results {
@@ -7513,7 +8013,9 @@ impl EditorView {
             )
         };
         let say = |text: String| {
-            self.ivars().state.borrow_mut().message = Some((text, Instant::now()));
+            if let Some(mut state) = self.state_mut() {
+                state.message = Some((text, Instant::now()));
+            }
             self.request_redraw();
         };
         if needle.is_empty() || files.is_empty() {
@@ -7543,7 +8045,9 @@ impl EditorView {
         let (mut replaced, mut open, mut written) = (0, 0, 0);
         let mut failed = Vec::new();
         {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             let mut touched = Vec::new();
             let edit = |_: &Path, buffer: &mut Buffer| -> Option<usize> {
                 let text = buffer.rope.to_string();
@@ -7618,7 +8122,9 @@ impl EditorView {
         // The list described text that is gone. Not searched again: project
         // search reads the disk, and the open files' changes are not saved.
         {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             if let Some(bar) = &mut state.find {
                 bar.reset_results();
             }
@@ -7632,7 +8138,9 @@ impl EditorView {
     /// Replaces every match in the active document.
     fn replace_all(&self) {
         let replacement = {
-            let state = self.ivars().state.borrow();
+            let Some(state) = self.state() else {
+                return;
+            };
             let Some(bar) = &state.find else { return };
             bar.replacement.rope.to_string()
         };
@@ -7645,7 +8153,9 @@ impl EditorView {
             .collect();
 
         let count = {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             let n = state.docs.active_mut().replace_ranges(&edits);
             state.message = Some((
                 match n {
@@ -7667,7 +8177,9 @@ impl EditorView {
     /// Moves the cursor to the next or previous match and selects it.
     fn find_step(&self, forward: bool) {
         let (from, selected) = {
-            let state = self.ivars().state.borrow();
+            let Some(state) = self.state() else {
+                return;
+            };
             (
                 state.docs.active().cursor(),
                 state.docs.active().selection(),
@@ -7677,7 +8189,9 @@ impl EditorView {
             return;
         };
         let (rows, cols) = self.grid();
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         let found = if forward {
             let start = selected.map_or(from, |r| r.start.saturating_add(1));
             matches
@@ -7711,7 +8225,7 @@ impl EditorView {
         // Also re-entrant: AppKit calls resetCursorRects during tracking,
         // which can land mid-edit. An empty layout for one call is invisible;
         // panicking is not.
-        let Ok(state) = self.ivars().state.try_borrow() else {
+        let Some(state) = self.state() else {
             return Chrome::new(Viewport::new(0.0, 0.0), None, 0);
         };
         chrome_of(&state)
@@ -7721,7 +8235,9 @@ impl EditorView {
     /// needs to keep the cursor on screen in both axes.
     fn grid(&self) -> (usize, usize) {
         let chrome = self.chrome();
-        let state = self.ivars().state.borrow();
+        let Some(state) = self.state() else {
+            return (24, 80);
+        };
         let m = state.renderer.atlas.metrics;
         let gutter = layout::gutter_width(state.docs.active(), &state.renderer.atlas);
         (
@@ -7759,7 +8275,9 @@ impl EditorView {
     }
 
     fn move_context_tab(&self, direction: isize) {
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         let Some(from) = state.context_tab else {
             return;
         };
@@ -7778,7 +8296,9 @@ impl EditorView {
     fn close_tab(&self, index: usize) {
         // Closing a review is answering it.
         {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             let id = state.docs.iter().nth(index).map(Buffer::id);
             if let Some(id) = id
                 && let Some(bridge) = state.claude.as_mut()
@@ -7788,7 +8308,9 @@ impl EditorView {
             }
         }
         let dirty = {
-            let state = self.ivars().state.borrow();
+            let Some(state) = self.state() else {
+                return;
+            };
             state.docs.iter().nth(index).is_some_and(|b| b.is_dirty())
         };
         let id = self
@@ -7810,7 +8332,7 @@ impl EditorView {
             }
         }
         {
-            let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
+            let Some(mut state) = self.state_mut() else {
                 return;
             };
             // By identity: the alert's run loop may have opened a tab (a
@@ -7833,11 +8355,15 @@ impl EditorView {
         // A pane whose last tab just closed goes with it, unless it is
         // the only one.
         let emptied = {
-            let state = self.ivars().state.borrow();
+            let Some(state) = self.state() else {
+                return;
+            };
             state.docs.is_home() && pane_count(&state) > 1
         };
         if emptied {
-            let focused = self.ivars().state.borrow().focused_pane;
+            let Some(focused) = self.state().map(|state| state.focused_pane) else {
+                return;
+            };
             self.close_pane(focused);
             return;
         }
@@ -7850,7 +8376,9 @@ impl EditorView {
     /// Gives pane `index` the keyboard.
     fn focus_pane(&self, index: usize) {
         {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             if index == state.focused_pane || index >= pane_count(&state) {
                 return;
             }
@@ -7874,7 +8402,9 @@ impl EditorView {
     /// Home; Cmd-P or the sidebar fills it.
     fn split_pane(&self) {
         {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             if pane_count(&state) >= 4 {
                 state.message = Some(("four panes is the limit".into(), Instant::now()));
                 drop(state);
@@ -7903,14 +8433,16 @@ impl EditorView {
 
     /// Closes pane `index`, asking about its unsaved documents first.
     fn close_pane(&self, index: usize) {
-        if self.ivars().state.borrow().panes.is_empty() {
+        if self.state().is_some_and(|state| state.panes.is_empty()) {
             return;
         }
         self.focus_pane(index);
         // Its documents are asked about one by one, like closing tabs.
         loop {
             let dirty = {
-                let state = self.ivars().state.borrow();
+                let Some(state) = self.state() else {
+                    return;
+                };
                 state.docs.iter().position(|b| b.is_dirty())
             };
             let Some(at) = dirty else { break };
@@ -7918,10 +8450,14 @@ impl EditorView {
             if !self.confirm_discard() {
                 return;
             }
-            self.ivars().state.borrow_mut().docs.close(at);
+            if let Some(mut state) = self.state_mut() {
+                state.docs.close(at);
+            }
         }
         {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             if state.panes.is_empty() {
                 return;
             }
@@ -7941,7 +8477,9 @@ impl EditorView {
     /// Handles a click in the sidebar: select, and toggle or open.
     fn sidebar_click(&self, y: f32, rect: Viewport) {
         let index = {
-            let state = self.ivars().state.borrow();
+            let Some(state) = self.state() else {
+                return;
+            };
             layout::sidebar_row_at(&state.tree, sidebar_field(&state), rect, y)
         };
         let Some(index) = index else {
@@ -7949,7 +8487,9 @@ impl EditorView {
         };
 
         let (path, is_dir, expanded, depth) = {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             let Some(entry) = state.tree.select(index) else {
                 return;
             };
@@ -7969,7 +8509,9 @@ impl EditorView {
         if is_dir {
             // Single click toggles a folder: a tree where you have to
             // double-click to see inside is needlessly slow to browse.
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             if expanded {
                 state.tree.toggle(index);
             } else if state.tree_children_pending.insert(path.clone()) {
@@ -8005,8 +8547,9 @@ impl EditorView {
         // real folders, and scripted keys meant for the editor would pick
         // one and index it.
         if self.ivars().testing {
-            self.ivars().state.borrow_mut().message =
-                Some(("would show the Open Folder panel".into(), Instant::now()));
+            if let Some(mut state) = self.state_mut() {
+                state.message = Some(("would show the Open Folder panel".into(), Instant::now()));
+            }
             return true;
         }
         let Some(path) = choose_path(MainThreadMarker::from(self), true, None) else {
@@ -8017,7 +8560,9 @@ impl EditorView {
     }
 
     fn load_folder_path(&self, path: &str) {
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         state.tree.set_root(path);
         let recent = std::mem::take(&mut state.recent_projects);
         state.recent_projects = with_recent(recent, state.tree.root());
@@ -8042,7 +8587,7 @@ impl EditorView {
     }
 
     fn poll_project_index(&self) {
-        let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
+        let Some(mut state) = self.state_mut() else {
             return;
         };
         let Some(rx) = &state.project_index_rx else {
@@ -8102,7 +8647,7 @@ impl EditorView {
 
     /// Takes Git's answer about ignored paths, if it is for this root.
     fn poll_ignored(&self) {
-        let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
+        let Some(mut state) = self.state_mut() else {
             return;
         };
         let Some(rx) = &state.ignored_rx else {
@@ -8125,7 +8670,7 @@ impl EditorView {
     }
 
     fn poll_tree_children(&self) {
-        let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
+        let Some(mut state) = self.state_mut() else {
             return;
         };
         let mut changed = false;
@@ -8151,7 +8696,9 @@ impl EditorView {
     /// Whether keys go to the terminal: it is open with the keyboard, and
     /// no field (palette, find, go to line) has taken it.
     fn terminal_has_keys(&self) -> bool {
-        let state = self.ivars().state.borrow();
+        let Some(state) = self.state() else {
+            return false;
+        };
         state.terminal.has_keys() && !field_has_keys(&state)
     }
 
@@ -8161,7 +8708,7 @@ impl EditorView {
 
     /// A session printed something, or its program exited.
     fn poll_terminal(&self) {
-        let Ok(state) = self.ivars().state.try_borrow() else {
+        let Some(state) = self.state() else {
             self.resume_display_link();
             return;
         };
@@ -8178,7 +8725,9 @@ impl EditorView {
         // A program that exits takes its tab with it, and the last tab
         // takes the panel, as in any terminal.
         if exited {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             while let Some(index) = state
                 .terminal
                 .tabs
@@ -8202,7 +8751,9 @@ impl EditorView {
     /// started if there is none.
     fn open_terminal(&self, claude: bool) {
         let existing = {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             state.terminal.open = true;
             state.terminal.focus = true;
             state.sidebar_keys = false;
@@ -8225,8 +8776,8 @@ impl EditorView {
     /// What a new session runs: the login shell, or `claude` through it so
     /// it finds what the shell profile puts on PATH. Claude Code is told
     /// this window's IDE port, so it connects without `/ide`.
-    fn terminal_launch(&self, claude: bool) -> crate::platform::terminal::Launch {
-        let state = self.ivars().state.borrow();
+    fn terminal_launch(&self, claude: bool) -> Option<crate::platform::terminal::Launch> {
+        let state = self.state()?;
         let shell = std::env::var("CRC_TERMINAL_SHELL")
             .or_else(|_| std::env::var("SHELL"))
             .unwrap_or_else(|_| "/bin/zsh".into());
@@ -8260,19 +8811,21 @@ impl EditorView {
             .filter_map(|(name, _)| name.into_string().ok())
             .filter(|name| name == "CLAUDECODE" || name.starts_with("CLAUDE_CODE_"))
             .collect();
-        crate::platform::terminal::Launch {
+        Some(crate::platform::terminal::Launch {
             program: shell.into(),
             args,
             cwd,
             env,
             unset,
-        }
+        })
     }
 
     /// The panel's grid, for the window as it is now.
     fn terminal_grid(&self) -> (usize, usize) {
         let chrome = self.chrome();
-        let state = self.ivars().state.borrow();
+        let Some(state) = self.state() else {
+            return (80, 24);
+        };
         chrome.terminal.map_or((80, 24), |rect| {
             let (_, screen) = crate::platform::terminal::split(rect);
             crate::platform::terminal::grid_size(&state.renderer.atlas, screen)
@@ -8281,11 +8834,15 @@ impl EditorView {
 
     fn spawn_terminal(&self, claude: bool) {
         {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             state.terminal.open = true;
             state.terminal.focus = true;
         }
-        let launch = self.terminal_launch(claude);
+        let Some(launch) = self.terminal_launch(claude) else {
+            return;
+        };
         let (cols, rows) = self.terminal_grid();
         let args: Vec<&str> = launch.args.iter().map(String::as_str).collect();
         let env: Vec<(&str, &str)> = launch
@@ -8304,7 +8861,9 @@ impl EditorView {
             rows,
             self.terminal_wake(),
         );
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         match spawned {
             Ok(session) => {
                 let title = if claude {
@@ -8347,7 +8906,7 @@ impl EditorView {
 
     /// Keeps every session's grid the size of the panel.
     fn terminal_after_frame(&self) {
-        let Ok(state) = self.ivars().state.try_borrow() else {
+        let Some(state) = self.state() else {
             return;
         };
         if !state.terminal.open || state.terminal.tabs.is_empty() {
@@ -8364,7 +8923,9 @@ impl EditorView {
     }
 
     fn terminal_write(&self, bytes: &[u8]) {
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         state.terminal.back = 0;
         state.terminal.selection = None;
         if let Some(tab) = state.terminal.active_tab_mut() {
@@ -8376,7 +8937,7 @@ impl EditorView {
     fn terminal_screen(&self) -> Option<(Viewport, usize, usize)> {
         let rect = self.chrome().terminal?;
         let (_, screen) = crate::platform::terminal::split(rect);
-        let state = self.ivars().state.borrow();
+        let state = self.state()?;
         let tab = state.terminal.active_tab()?;
         let term = tab.session.term.lock().unwrap_or_else(|e| e.into_inner());
         Some((screen, term.cols(), term.rows()))
@@ -8394,7 +8955,9 @@ impl EditorView {
             .contains(NSEventModifierFlags::Command);
         let clicks = event.clickCount();
         let target = {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             let (row, boundary, cell) =
                 crate::platform::terminal::point(&state.renderer.atlas, screen, x, y, cols, rows);
             let back = state.terminal.back;
@@ -8436,7 +8999,9 @@ impl EditorView {
             return;
         };
         {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             let (row, boundary, _) =
                 crate::platform::terminal::point(&state.renderer.atlas, screen, x, y, cols, rows);
             let back = state.terminal.back;
@@ -8456,7 +9021,7 @@ impl EditorView {
     }
 
     fn terminal_selected_text(&self) -> Option<String> {
-        let state = self.ivars().state.borrow();
+        let state = self.state()?;
         let (a, b) = state.terminal.selection?;
         let tab = state.terminal.active_tab()?;
         let text = tab
@@ -8482,8 +9047,9 @@ impl EditorView {
             .root()
             .map(Path::to_path_buf);
         let Some(root) = root else {
-            self.ivars().state.borrow_mut().message =
-                Some(("not a Git repository".into(), Instant::now()));
+            if let Some(mut state) = self.state_mut() {
+                state.message = Some(("not a Git repository".into(), Instant::now()));
+            }
             self.request_redraw();
             return;
         };
@@ -8493,13 +9059,15 @@ impl EditorView {
         std::thread::spawn(move || {
             let _ = tx.send(crate::project::git::branches(&root));
         });
-        self.ivars().state.borrow_mut().branch_rx = Some(rx);
+        if let Some(mut state) = self.state_mut() {
+            state.branch_rx = Some(rx);
+        }
         self.resume_display_link();
     }
 
     fn poll_branches(&self) {
         let reply = {
-            let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
+            let Some(mut state) = self.state_mut() else {
                 return;
             };
             let Some(rx) = &state.branch_rx else { return };
@@ -8514,10 +9082,14 @@ impl EditorView {
         match reply {
             Ok(branches) => {
                 self.open_palette_with("");
-                self.ivars().state.borrow_mut().branch_list = Some(branches);
+                if let Some(mut state) = self.state_mut() {
+                    state.branch_list = Some(branches);
+                }
             }
             Err(error) => {
-                self.ivars().state.borrow_mut().message = Some((error, Instant::now()));
+                if let Some(mut state) = self.state_mut() {
+                    state.message = Some((error, Instant::now()));
+                }
             }
         }
         self.request_redraw();
@@ -8525,7 +9097,9 @@ impl EditorView {
     }
 
     fn switch_branch(&self, name: String, create: bool) {
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         let current = state.git.branch();
         if !create && name == current {
             state.message = Some((format!("already on {name}"), Instant::now()));
@@ -8540,7 +9114,9 @@ impl EditorView {
     }
 
     fn git_remote(&self, what: crate::project::git::Remote) {
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         if state.git.root().is_none() {
             state.message = Some(("not a Git repository".into(), Instant::now()));
         } else {
@@ -8557,7 +9133,7 @@ impl EditorView {
     /// from the display link; the answer lands in `blame`.
     fn blame_refresh(&self) {
         const REST: Duration = Duration::from_millis(400);
-        let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
+        let Some(mut state) = self.state_mut() else {
             return;
         };
         if let Some(rx) = &state.blame_rx {
@@ -8635,7 +9211,9 @@ impl EditorView {
     /// Folds or opens the block `line` heads: a chevron click.
     fn toggle_fold(&self, line: Option<usize>) {
         let (rows, cols) = self.grid();
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         let buffer = state.docs.active_mut();
         let line = line.unwrap_or_else(|| buffer.cursor_position().0);
         if !buffer.unfold(line) {
@@ -8652,7 +9230,9 @@ impl EditorView {
     /// the block the caret is in.
     fn fold_command(&self, fold: Option<bool>) {
         let (rows, cols) = self.grid();
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         let buffer = state.docs.active_mut();
         let line = buffer.cursor_position().0;
         let done = match fold {
@@ -8694,7 +9274,9 @@ impl EditorView {
     /// View > Word Wrap: flips wrapping for the active document.
     fn toggle_word_wrap(&self) {
         let (rows, cols) = self.grid();
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         let setting = state.word_wrap;
         let buffer = state.docs.active_mut();
         let on = buffer.wrap.is_none();
@@ -8721,7 +9303,9 @@ impl EditorView {
         ask: impl FnOnce(&mut crate::lsp::client::Server, &Path, crate::lsp::Position),
     ) -> bool {
         self.lsp_flush_now();
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return false;
+        };
         let buffer = state.docs.active();
         let (Some(path), Some(language)) = (buffer.path.clone(), lsp_language(buffer)) else {
             state.message = Some(("no language server for this file".into(), Instant::now()));
@@ -8748,9 +9332,9 @@ impl EditorView {
     fn find_references(&self) {
         if self.ask_server(None, |server, path, at| {
             server.references(path, at);
-        }) {
-            self.ivars().state.borrow_mut().message =
-                Some(("finding references…".into(), Instant::now()));
+        }) && let Some(mut state) = self.state_mut()
+        {
+            state.message = Some(("finding references…".into(), Instant::now()));
         }
         self.request_redraw();
     }
@@ -8758,7 +9342,9 @@ impl EditorView {
     /// The references as project search results: the find bar in project
     /// mode, the name as its query, one row per place.
     fn show_references(&self, locations: Vec<crate::lsp::Location>) {
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         if locations.is_empty() {
             state.message = Some(("no references found".into(), Instant::now()));
             drop(state);
@@ -8857,7 +9443,9 @@ impl EditorView {
     /// F2: the rename field in the status line, holding the current name.
     fn start_rename(&self) {
         self.lsp_flush_now();
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         let buffer = state.docs.active();
         let (Some(path), Some(language)) = (buffer.path.clone(), lsp_language(buffer)) else {
             state.message = Some(("no language server for this file".into(), Instant::now()));
@@ -8898,9 +9486,15 @@ impl EditorView {
             code => code,
         };
         match code {
-            ESCAPE => self.ivars().state.borrow_mut().rename = None,
+            ESCAPE => {
+                if let Some(mut state) = self.state_mut() {
+                    state.rename = None;
+                }
+            }
             key::RETURN => {
-                let mut state = self.ivars().state.borrow_mut();
+                let Some(mut state) = self.state_mut() else {
+                    return false;
+                };
                 let Some(rename) = state.rename.take() else {
                     return true;
                 };
@@ -8923,7 +9517,9 @@ impl EditorView {
                 ));
             }
             key::DELETE => {
-                let mut state = self.ivars().state.borrow_mut();
+                let Some(mut state) = self.state_mut() else {
+                    return false;
+                };
                 if let Some(rename) = &mut state.rename {
                     rename.field.backspace();
                 }
@@ -8931,7 +9527,9 @@ impl EditorView {
             key::LEFT | key::RIGHT => {
                 let shift = event.modifierFlags().contains(NSEventModifierFlags::Shift);
                 let motion = if shift { Motion::Extend } else { Motion::Move };
-                let mut state = self.ivars().state.borrow_mut();
+                let Some(mut state) = self.state_mut() else {
+                    return false;
+                };
                 if let Some(rename) = &mut state.rename {
                     if code == key::LEFT {
                         rename.field.move_left(motion);
@@ -8952,14 +9550,16 @@ impl EditorView {
     /// through the same save path as everything else.
     fn apply_rename(&self, server: Language, files: Vec<crate::lsp::FileEdits>) {
         let outcome = self.apply_workspace_edit(server, &files);
-        self.ivars().state.borrow_mut().message = Some((
-            if files.is_empty() {
-                "the server had nothing to rename".into()
-            } else {
-                format!("renamed in {}", outcome.describe())
-            },
-            Instant::now(),
-        ));
+        if let Some(mut state) = self.state_mut() {
+            state.message = Some((
+                if files.is_empty() {
+                    "the server had nothing to rename".into()
+                } else {
+                    format!("renamed in {}", outcome.describe())
+                },
+                Instant::now(),
+            ));
+        }
         self.request_redraw();
         self.pump();
     }
@@ -8976,7 +9576,9 @@ impl EditorView {
         let (rows, cols) = self.grid();
         let mut outcome = EditOutcome::default();
         {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return outcome;
+            };
             let mut touched = Vec::new();
             let mut on_disk: Vec<&crate::lsp::FileEdits> = Vec::new();
             for file in files {
@@ -9051,7 +9653,7 @@ impl EditorView {
         invoked: bool,
     ) -> Option<(u64, Language, std::path::PathBuf, crate::text::rope::Rope)> {
         self.lsp_flush_now();
-        let mut state = self.ivars().state.borrow_mut();
+        let mut state = self.state_mut()?;
         let buffer = state.docs.active();
         let asked = match (buffer.path.clone(), lsp_language(buffer)) {
             (Some(path), Some(language)) => {
@@ -9107,7 +9709,9 @@ impl EditorView {
     /// when it has them for this caret; otherwise the server is asked.
     fn quick_fix(&self) {
         let ready = {
-            let state = self.ivars().state.borrow();
+            let Some(state) = self.state() else {
+                return;
+            };
             let buffer = state.docs.active();
             state
                 .bulb
@@ -9126,7 +9730,9 @@ impl EditorView {
             return;
         }
         if let Some((request, ..)) = self.request_code_actions(None, true) {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             state.quick_fix_request = Some(request);
             state.message = Some(("looking for code actions\u{2026}".into(), Instant::now()));
         }
@@ -9139,7 +9745,9 @@ impl EditorView {
     fn open_action_list(&self, server: Language, mut actions: Vec<crate::lsp::CodeAction>) {
         actions.sort_by_key(|a| (a.disabled.is_some(), !a.preferred));
         self.open_palette_with("");
-        self.ivars().state.borrow_mut().action_list = Some((server, actions));
+        if let Some(mut state) = self.state_mut() {
+            state.action_list = Some((server, actions));
+        }
         self.request_redraw();
         self.pump();
     }
@@ -9148,14 +9756,17 @@ impl EditorView {
     /// server holds its edit back.
     fn run_code_action(&self, server: Language, action: crate::lsp::CodeAction) {
         if let Some(reason) = &action.disabled {
-            self.ivars().state.borrow_mut().message =
-                Some((format!("{}: {reason}", action.title), Instant::now()));
+            if let Some(mut state) = self.state_mut() {
+                state.message = Some((format!("{}: {reason}", action.title), Instant::now()));
+            }
             self.request_redraw();
             return;
         }
         self.lsp_flush_now();
         let steps = {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             let steps = state
                 .lsp
                 .get_mut(&server)
@@ -9186,7 +9797,9 @@ impl EditorView {
         let outcome = self.apply_workspace_edit(server, &steps.edits);
         let changed = outcome.open + outcome.written > 0;
         {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             if let Some(command) = &steps.command
                 && let Some(server) = state.lsp.get_mut(&server).filter(|s| s.is_ready())
             {
@@ -9225,7 +9838,9 @@ impl EditorView {
         else {
             return false;
         };
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return false;
+        };
         state.organizing = Some(Organizing {
             request,
             path,
@@ -9244,7 +9859,7 @@ impl EditorView {
         if changed {
             self.save_formatted();
         }
-        if self.ivars().state.borrow().format_on_save {
+        if self.state().is_some_and(|state| state.format_on_save) {
             self.format_document(true);
         }
     }
@@ -9257,7 +9872,9 @@ impl EditorView {
         request: u64,
         actions: Vec<crate::lsp::CodeAction>,
     ) {
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         if state.quick_fix_request == Some(request) {
             state.quick_fix_request = None;
             if actions.is_empty() {
@@ -9348,7 +9965,9 @@ impl EditorView {
     /// or for the file itself, what is beside it, as a menu under it.
     fn breadcrumb_menu(&self, index: usize, event: &NSEvent) {
         let crumbs = {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             let rect = chrome_of(&state).breadcrumbs;
             let State {
                 docs,
@@ -9372,14 +9991,17 @@ impl EditorView {
         if self.ivars().testing {
             // A real popup runs its own event loop, which a script cannot
             // step past; the dump says which folder it would list.
-            self.ivars().state.borrow_mut().crumb_menu_requested =
-                Some(folder.display().to_string());
+            if let Some(mut state) = self.state_mut() {
+                state.crumb_menu_requested = Some(folder.display().to_string());
+            }
             return;
         }
         let mtm = MainThreadMarker::from(self);
         let mut paths = Vec::new();
         let menu = crumb_folder_menu(mtm, &folder, current.as_deref(), 1, &mut paths);
-        self.ivars().state.borrow_mut().crumb_paths = paths;
+        if let Some(mut state) = self.state_mut() {
+            state.crumb_paths = paths;
+        }
         let _ = event;
         let at = NSPoint::new(
             crumb.rect.x as f64,
@@ -9393,13 +10015,17 @@ impl EditorView {
     fn open_crumb_path(&self, path: &Path) {
         if path.is_dir() {
             let explorer = {
-                let state = self.ivars().state.borrow();
+                let Some(state) = self.state() else {
+                    return;
+                };
                 state.extensions.is_none() && !state.git_open
             };
             if !explorer {
                 self.activate(0);
             }
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             state.sidebar = true;
             state.tree.reveal(path);
             let rows = chrome_of(&state).sidebar.map_or(0, layout::sidebar_rows);
@@ -9409,7 +10035,9 @@ impl EditorView {
             self.load_path(&path.to_string_lossy());
             self.sync_title();
             self.reparse();
-            self.ivars().state.borrow_mut().tree.reveal(path);
+            if let Some(mut state) = self.state_mut() {
+                state.tree.reveal(path);
+            }
         }
         self.request_redraw();
         self.pump();
@@ -9417,7 +10045,9 @@ impl EditorView {
 
     fn activate(&self, index: usize) {
         let (showing, current) = {
-            let state = self.ivars().state.borrow();
+            let Some(state) = self.state() else {
+                return;
+            };
             let current = if state.extensions.is_some() {
                 2
             } else if state.git_open {
@@ -9428,7 +10058,9 @@ impl EditorView {
             (state.sidebar, current)
         };
         if index == current {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             state.sidebar = !showing;
             drop(state);
             self.request_redraw();
@@ -9440,7 +10072,9 @@ impl EditorView {
             1 => self.set_sidebar_view(true),
             _ => self.open_extensions(),
         }
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         if !state.sidebar {
             state.sidebar = true;
         }
@@ -9454,7 +10088,9 @@ impl EditorView {
     fn open_extensions(&self) {
         let installed = crate::ext::store::list();
         {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             let mut page = crate::platform::extensions::Page::new(installed);
             page.logs = state.ext_logs.clone();
             state.extensions = Some(page);
@@ -9473,7 +10109,9 @@ impl EditorView {
         std::thread::spawn(move || {
             let _ = tx.send(crate::ext::registry::fetch_index());
         });
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         state.ext_registry_rx = Some(rx);
         if let Some(page) = &mut state.extensions {
             page.registry = crate::platform::extensions::Registry::Loading;
@@ -9487,7 +10125,9 @@ impl EditorView {
     fn extensions_changed(&self) {
         let installed = crate::ext::store::list();
         {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             state.ext_generation += 1;
             if let Some(page) = &mut state.extensions {
                 if page.selected.as_ref().is_some_and(|id| {
@@ -9505,7 +10145,9 @@ impl EditorView {
         use crate::platform::extensions::{Action, Pending};
         match action {
             Action::Select(id) => {
-                let mut state = self.ivars().state.borrow_mut();
+                let Some(mut state) = self.state_mut() else {
+                    return;
+                };
                 if let Some(page) = &mut state.extensions {
                     if page.selected.as_ref() != Some(&id) {
                         page.readme_scroll = 0;
@@ -9516,7 +10158,9 @@ impl EditorView {
                 }
             }
             Action::Home => {
-                let mut state = self.ivars().state.borrow_mut();
+                let Some(mut state) = self.state_mut() else {
+                    return;
+                };
                 if let Some(page) = &mut state.extensions {
                     page.selected = None;
                     page.confirm = None;
@@ -9524,7 +10168,9 @@ impl EditorView {
                 }
             }
             Action::Install(id) => {
-                let mut state = self.ivars().state.borrow_mut();
+                let Some(mut state) = self.state_mut() else {
+                    return;
+                };
                 if let Some(page) = &mut state.extensions
                     && let Some(entry) = page.available(&id).cloned()
                 {
@@ -9533,14 +10179,18 @@ impl EditorView {
                 }
             }
             Action::Cancel => {
-                let mut state = self.ivars().state.borrow_mut();
+                let Some(mut state) = self.state_mut() else {
+                    return;
+                };
                 if let Some(page) = &mut state.extensions {
                     page.confirm = None;
                 }
             }
             Action::Confirm => {
                 let pending = {
-                    let mut state = self.ivars().state.borrow_mut();
+                    let Some(mut state) = self.state_mut() else {
+                        return;
+                    };
                     state.extensions.as_mut().and_then(|p| p.confirm.take())
                 };
                 match pending {
@@ -9550,7 +10200,9 @@ impl EditorView {
                         std::thread::spawn(move || {
                             let _ = tx.send(crate::ext::registry::download(&entry));
                         });
-                        let mut state = self.ivars().state.borrow_mut();
+                        let Some(mut state) = self.state_mut() else {
+                            return;
+                        };
                         state.ext_install_rx = Some(rx);
                         if let Some(page) = &mut state.extensions {
                             page.busy = Some(format!("Installing {name}\u{2026}"));
@@ -9576,7 +10228,9 @@ impl EditorView {
                         Err(e) => e,
                     };
                     self.extensions_changed();
-                    let mut state = self.ivars().state.borrow_mut();
+                    let Some(mut state) = self.state_mut() else {
+                        return;
+                    };
                     if let Some(page) = &mut state.extensions {
                         page.note = Some(note);
                     }
@@ -9601,7 +10255,9 @@ impl EditorView {
                         Err(e) => e,
                     };
                     self.extensions_changed();
-                    let mut state = self.ivars().state.borrow_mut();
+                    let Some(mut state) = self.state_mut() else {
+                        return;
+                    };
                     if let Some(page) = &mut state.extensions {
                         page.note = Some(note);
                     }
@@ -9611,7 +10267,9 @@ impl EditorView {
                 let folder = self.choose_extension_folder();
                 if let Some(folder) = folder {
                     let result = crate::ext::store::Package::from_folder(&folder);
-                    let mut state = self.ivars().state.borrow_mut();
+                    let Some(mut state) = self.state_mut() else {
+                        return;
+                    };
                     if let Some(page) = &mut state.extensions {
                         match result {
                             Ok(package) => {
@@ -9625,7 +10283,9 @@ impl EditorView {
             }
             Action::Refresh => self.refresh_registry(),
             Action::Close => {
-                let mut state = self.ivars().state.borrow_mut();
+                let Some(mut state) = self.state_mut() else {
+                    return;
+                };
                 if let Some(page) = &mut state.extensions {
                     page.details = false;
                     page.confirm = None;
@@ -9660,7 +10320,9 @@ impl EditorView {
                     if installed.signed { "" } else { ", unsigned" }
                 );
                 self.extensions_changed();
-                let mut state = self.ivars().state.borrow_mut();
+                let Some(mut state) = self.state_mut() else {
+                    return;
+                };
                 if let Some(page) = &mut state.extensions {
                     page.selected = Some(id);
                 }
@@ -9669,7 +10331,9 @@ impl EditorView {
             }
             Err(e) => format!("Not installed: {e}"),
         };
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         if let Some(page) = &mut state.extensions {
             page.busy = None;
             page.note = Some(note.clone());
@@ -9709,13 +10373,17 @@ impl EditorView {
                 menu.addItem(&item);
             }
         }
-        self.ivars().state.borrow_mut().ext_commands = commands;
+        if let Some(mut state) = self.state_mut() {
+            state.ext_commands = commands;
+        }
     }
 
     /// Runs extension command `tag` on the selection, or the whole document
     /// when nothing is selected, on the extension thread.
     fn run_extension(&self, tag: isize) {
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         let Some(command) = usize::try_from(tag)
             .ok()
             .and_then(|t| state.ext_commands.get(t))
@@ -9783,7 +10451,9 @@ impl EditorView {
     fn open_preview(&self, command: ExtCommand) {
         self.close_preview();
         {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             let buffer = state.docs.active();
             let preview = HtmlPreview {
                 buffer: buffer.id(),
@@ -9808,7 +10478,9 @@ impl EditorView {
     }
 
     fn close_preview(&self) {
-        let preview = self.ivars().state.borrow_mut().html_preview.take();
+        let Some(preview) = self.state_mut().map(|mut state| state.html_preview.take()) else {
+            return;
+        };
         // Out of the state first: the view leaving its superview can call
         // back into this one.
         if let Some(web) = preview.and_then(|p| p.web) {
@@ -9819,7 +10491,9 @@ impl EditorView {
 
     /// Asks the preview's extension for a page of the document as it is.
     fn run_preview(&self) {
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         let Some(command) = state.html_preview.as_ref().map(|p| p.command.clone()) else {
             return;
         };
@@ -9857,7 +10531,7 @@ impl EditorView {
     /// longer the active one, asks for a new page after edits, makes the
     /// web view once WebKit's rules are ready, and hands it each page.
     fn sync_html_preview(&self) {
-        let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
+        let Some(mut state) = self.state_mut() else {
             return;
         };
         let Some(preview) = &state.html_preview else {
@@ -9941,13 +10615,17 @@ impl EditorView {
                     Ok(true) => {}
                     Ok(false) => page = Some(next),
                     Err(why) => {
-                        self.ivars().state.borrow_mut().message = Some((why, Instant::now()));
+                        if let Some(mut state) = self.state_mut() {
+                            state.message = Some((why, Instant::now()));
+                        }
                     }
                 }
             }
             view.reveal_when_loaded(veiled);
         }
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         match state.html_preview.as_mut() {
             Some(preview) => {
                 preview.web = web;
@@ -9965,14 +10643,16 @@ impl EditorView {
     }
 
     fn preview_failed(&self, why: &str) {
-        self.ivars().state.borrow_mut().message = Some((why.to_string(), Instant::now()));
+        if let Some(mut state) = self.state_mut() {
+            state.message = Some((why.to_string(), Instant::now()));
+        }
         self.close_preview();
     }
 
     /// Everything extensions sent back: the registry, a download, command
     /// answers. Runs from the display link.
     fn ext_poll(&self) {
-        let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
+        let Some(mut state) = self.state_mut() else {
             return;
         };
         if let Some(rx) = &state.ext_registry_rx
@@ -10001,7 +10681,9 @@ impl EditorView {
         }
         drop(state);
         if let Some(result) = download {
-            self.ivars().state.borrow_mut().ext_install_rx = None;
+            if let Some(mut state) = self.state_mut() {
+                state.ext_install_rx = None;
+            }
             self.finish_install(result);
             self.ivars().needs_redraw.set(true);
         }
@@ -10014,7 +10696,9 @@ impl EditorView {
     /// not changed since the call.
     fn ext_answer(&self, done: crate::ext::run::Done) {
         let (rows, cols) = self.grid();
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         if !done.log.is_empty() {
             state.ext_logs.insert(done.id.clone(), done.log.clone());
             if let Some(page) = &mut state.extensions {
@@ -10055,7 +10739,9 @@ impl EditorView {
                     Err(e) => format!("{} keeps failing: {e}", installed.manifest.name),
                 };
                 self.extensions_changed();
-                self.ivars().state.borrow_mut().message = Some((note, Instant::now()));
+                if let Some(mut state) = self.state_mut() {
+                    state.message = Some((note, Instant::now()));
+                }
             }
             self.ivars().needs_redraw.set(true);
             return;
@@ -10116,7 +10802,9 @@ impl EditorView {
         result: Result<crate::ext::run::Response, String>,
         over_budget: bool,
     ) {
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         let Some(preview) = state
             .html_preview
             .as_mut()
@@ -10169,7 +10857,7 @@ impl EditorView {
     /// asked for again once it rests. Runs from the display link.
     fn bulb_refresh(&self) {
         const REST: Duration = Duration::from_millis(400);
-        let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
+        let Some(mut state) = self.state_mut() else {
             return;
         };
         let buffer = state.docs.active();
@@ -10211,8 +10899,10 @@ impl EditorView {
         if !offers {
             return;
         }
-        if let Some((request, ..)) = self.request_code_actions(None, false) {
-            self.ivars().state.borrow_mut().bulb_request = Some((request, id, caret));
+        if let Some((request, ..)) = self.request_code_actions(None, false)
+            && let Some(mut state) = self.state_mut()
+        {
+            state.bulb_request = Some((request, id, caret));
         }
     }
 
@@ -10220,14 +10910,18 @@ impl EditorView {
     /// asked, which saves again once the edits are in.
     fn format_document(&self, save: bool) {
         let (spaces, tab) = {
-            let state = self.ivars().state.borrow();
+            let Some(state) = self.state() else {
+                return;
+            };
             let buffer = state.docs.active();
             match buffer.indent_style {
                 Some(style) => (!style.tabs, style.width as u32),
                 None => indent_style(&buffer.rope),
             }
         };
-        let snapshot = self.ivars().state.borrow().docs.active().rope.clone();
+        let Some(snapshot) = self.state().map(|state| state.docs.active().rope.clone()) else {
+            return;
+        };
         let mut asked = None;
         let sent = self.ask_server(None, |server, path, _| {
             if server.formats() {
@@ -10235,7 +10929,9 @@ impl EditorView {
                 asked = Some(path.to_path_buf());
             }
         });
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         match asked {
             Some(path) => state.formatting = Some((path, snapshot)),
             None if sent && !save => {
@@ -10250,7 +10946,9 @@ impl EditorView {
 
     fn apply_format(&self, path: &Path, edits: &[crate::lsp::TextEdit], save: bool) {
         let (rows, cols) = self.grid();
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         let Some((asked, snapshot)) = state.formatting.take() else {
             return;
         };
@@ -10301,10 +10999,14 @@ impl EditorView {
         if let Some(path) = path {
             let cwd = path.parent().map(Path::to_path_buf).unwrap_or_default();
             self.open_reference(&path.to_string_lossy(), Some(line as usize + 1), None, &cwd);
-            self.ivars().state.borrow_mut().tree.reveal(&path);
+            if let Some(mut state) = self.state_mut() {
+                state.tree.reveal(&path);
+            }
         } else {
             let (rows, cols) = self.grid();
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             let buffer = state.docs.active_mut();
             buffer.goto_line(line as usize);
             buffer.scroll_to_cursor(rows, cols);
@@ -10333,8 +11035,9 @@ impl EditorView {
                 .collect()
         };
         let Some(found) = candidates.into_iter().find(|p| p.is_file()) else {
-            self.ivars().state.borrow_mut().message =
-                Some((format!("no file {path}"), Instant::now()));
+            if let Some(mut state) = self.state_mut() {
+                state.message = Some((format!("no file {path}"), Instant::now()));
+            }
             self.resume_display_link();
             return;
         };
@@ -10343,7 +11046,9 @@ impl EditorView {
         }
         if let Some(line) = line {
             let (rows, cols) = self.grid();
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             let buffer = state.docs.active_mut();
             buffer.goto_line(line - 1);
             if let Some(column) = column {
@@ -10362,7 +11067,9 @@ impl EditorView {
             buffer.scroll_to_cursor(rows, cols);
         }
         // The editor has the file now, so it has the keys too.
-        self.ivars().state.borrow_mut().terminal.focus = false;
+        if let Some(mut state) = self.state_mut() {
+            state.terminal.focus = false;
+        }
         self.sync_title();
         self.reparse();
     }
@@ -10424,7 +11131,7 @@ impl EditorView {
     /// comparison or two when nothing changed, which keeps it off the
     /// typing budget.
     fn claude_after_frame(&self) {
-        let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
+        let Some(mut state) = self.state_mut() else {
             return;
         };
         let root = state.tree.root().map(Path::to_path_buf);
@@ -10433,9 +11140,9 @@ impl EditorView {
             state.claude_tried = root;
             drop(state);
             self.claude_follow_root(&new_root);
-            state = match self.ivars().state.try_borrow_mut() {
-                Ok(state) => state,
-                Err(_) => return,
+            state = match self.state_mut() {
+                Some(state) => state,
+                None => return,
             };
         }
         let buffer = state.docs.active();
@@ -10463,7 +11170,9 @@ impl EditorView {
         if std::env::var_os("CRC_NO_CLAUDE").is_some() {
             return;
         }
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         let result = match state.claude.as_mut() {
             Some(bridge) if bridge.serves(root) => Ok(()),
             Some(bridge) => bridge.set_root(root),
@@ -10480,7 +11189,7 @@ impl EditorView {
     /// Sends the selection once it has been still for 100 ms, if it is not
     /// what Claude already has.
     fn claude_flush_selection(&self) {
-        let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
+        let Some(mut state) = self.state_mut() else {
             return;
         };
         let due = state
@@ -10510,7 +11219,7 @@ impl EditorView {
         use crate::ide::ws::Event;
         loop {
             let event = {
-                let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
+                let Some(mut state) = self.state_mut() else {
                     // Busy: the next wake or frame tries again.
                     self.resume_display_link();
                     return;
@@ -10550,7 +11259,9 @@ impl EditorView {
                     }
                     let reply = crate::ide::mcp::handle(&text, &mut ClaudeHost(self));
                     if let Some(reply) = reply {
-                        let state = self.ivars().state.borrow();
+                        let Some(state) = self.state() else {
+                            return;
+                        };
                         if let Some(bridge) = &state.claude {
                             bridge.send(&reply);
                         }
@@ -10565,14 +11276,18 @@ impl EditorView {
     /// On the way out: Claude hears no to anything still waiting, and the
     /// lock file goes with the bridge so `claude` stops offering this window.
     fn claude_shutdown(&self) {
-        let bridge = self.ivars().state.borrow_mut().claude.take();
+        let Some(bridge) = self.state_mut().map(|mut state| state.claude.take()) else {
+            return;
+        };
         if let Some(mut bridge) = bridge {
             bridge.reject_all();
         }
     }
 
     fn claude_note(&self, text: &str) {
-        self.ivars().state.borrow_mut().message = Some((text.to_owned(), Instant::now()));
+        if let Some(mut state) = self.state_mut() {
+            state.message = Some((text.to_owned(), Instant::now()));
+        }
         self.resume_display_link();
     }
 
@@ -10581,7 +11296,9 @@ impl EditorView {
     fn caret_to_line(&self, line: usize) {
         let (rows, _) = self.grid();
         {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             let buffer = state.docs.active_mut();
             let line = line.min(buffer.rope.len_lines().saturating_sub(1));
             let at = buffer.rope.line_to_byte(line);
@@ -10597,7 +11314,9 @@ impl EditorView {
     /// file. `from_top` goes to the first.
     fn step_conflict(&self, forward: bool, from_top: bool) {
         let target = {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             sync_conflicts(&mut state);
             let line = state.docs.active().cursor_position().0;
             active_conflicts(&state).and_then(|view| {
@@ -10614,8 +11333,9 @@ impl EditorView {
             })
         };
         let Some((index, count, line)) = target else {
-            self.ivars().state.borrow_mut().message =
-                Some(("no conflicts in this file".to_string(), Instant::now()));
+            if let Some(mut state) = self.state_mut() {
+                state.message = Some(("no conflicts in this file".to_string(), Instant::now()));
+            }
             self.request_redraw();
             self.pump();
             return;
@@ -10623,7 +11343,9 @@ impl EditorView {
         self.caret_to_line(line);
         let text = self.chrome().text;
         {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             let total = state.docs.active().rope.len_lines();
             if let Some(view) = active_conflicts_mut(&mut state) {
                 crate::platform::conflicts::show_in_side(view, total, index, text);
@@ -10638,7 +11360,9 @@ impl EditorView {
     /// one undo step, the file left unsaved.
     fn take_conflict(&self, index: usize, take: crate::project::conflict::Take) {
         {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             sync_conflicts(&mut state);
             let Some((conflict, count)) = active_conflicts(&state).and_then(|v| {
                 v.conflicts
@@ -10682,7 +11406,9 @@ impl EditorView {
     /// in, or else the next one.
     fn take_conflict_at_caret(&self, take: crate::project::conflict::Take) {
         let index = {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             sync_conflicts(&mut state);
             let line = state.docs.active().cursor_position().0;
             active_conflicts(&state).and_then(|view| {
@@ -10700,7 +11426,9 @@ impl EditorView {
     fn set_conflict_side(&self, side: bool) {
         let text = self.chrome().text;
         {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             state.conflict_side = side;
             let line = state.docs.active().cursor_position().0;
             let total = state.docs.active().rope.len_lines();
@@ -10724,7 +11452,9 @@ impl EditorView {
     /// since that would commit them.
     fn mark_conflict_resolved(&self) {
         let (path, ready, left, dirty) = {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             sync_conflicts(&mut state);
             let buffer = state.docs.active();
             let (path, dirty) = (buffer.path.clone(), buffer.is_dirty());
@@ -10734,14 +11464,16 @@ impl EditorView {
             }
         };
         let Some(path) = path.filter(|_| ready) else {
-            self.ivars().state.borrow_mut().message = Some((
-                match left {
-                    0 => "Git does not list this file as in conflict".to_string(),
-                    1 => "1 conflict left; resolve it first".to_string(),
-                    n => format!("{n} conflicts left; resolve them first"),
-                },
-                Instant::now(),
-            ));
+            if let Some(mut state) = self.state_mut() {
+                state.message = Some((
+                    match left {
+                        0 => "Git does not list this file as in conflict".to_string(),
+                        1 => "1 conflict left; resolve it first".to_string(),
+                        n => format!("{n} conflicts left; resolve them first"),
+                    },
+                    Instant::now(),
+                ));
+            }
             self.request_redraw();
             self.pump();
             return;
@@ -10749,7 +11481,9 @@ impl EditorView {
         if dirty && !self.save(false) {
             return;
         }
-        self.ivars().state.borrow_mut().git.mark_resolved(path);
+        if let Some(mut state) = self.state_mut() {
+            state.git.mark_resolved(path);
+        }
         self.resume_display_link();
         self.request_redraw();
         self.pump();
@@ -10779,7 +11513,7 @@ impl EditorView {
             _ => return Some(true),
         };
         {
-            let mut state = self.ivars().state.borrow_mut();
+            let mut state = self.state_mut()?;
             let total = state.docs.active().rope.len_lines();
             if let Some(view) = active_conflicts_mut(&mut state) {
                 view.scroll = view.scroll.saturating_add_signed(delta);
@@ -10794,7 +11528,9 @@ impl EditorView {
     /// Answers the review in the active tab.
     fn claude_decide(&self, accept: bool) {
         let answered = {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             let id = state.docs.active().id();
             state
                 .claude
@@ -10845,7 +11581,7 @@ impl EditorView {
             _ => return Some(true),
         };
         {
-            let mut state = self.ivars().state.borrow_mut();
+            let mut state = self.state_mut()?;
             let id = state.docs.active().id();
             if let Some(review) = state.claude.as_mut().and_then(|c| c.reviews.get_mut(&id)) {
                 review.scroll_by(delta, text);
@@ -10859,7 +11595,9 @@ impl EditorView {
     /// Closes the tab of the review `id`, wherever it is.
     fn claude_close_review(&self, id: u64) {
         let focused = {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             if let Some(bridge) = state.claude.as_mut() {
                 bridge.decide(id, false);
                 bridge.reviews.remove(&id);
@@ -10915,7 +11653,9 @@ impl EditorView {
         // Which languages are open, across panes.
         let mut wanted: Vec<(Language, std::path::PathBuf, u64)> = Vec::new();
         {
-            let state = self.ivars().state.borrow();
+            let Some(state) = self.state() else {
+                return;
+            };
             for docs in all_docs(&state) {
                 for buffer in docs.iter() {
                     if let Some(path) = &buffer.path
@@ -10929,7 +11669,9 @@ impl EditorView {
         for (language, _, _) in &wanted {
             let key = crate::lsp::servers::server_key(*language);
             let known = {
-                let state = self.ivars().state.borrow();
+                let Some(state) = self.state() else {
+                    return;
+                };
                 state.lsp.contains_key(&key) || state.lsp_unavailable.contains_key(&key)
             };
             if known {
@@ -10945,7 +11687,9 @@ impl EditorView {
                         &root,
                         self.lsp_wake(),
                     );
-                    let mut state = self.ivars().state.borrow_mut();
+                    let Some(mut state) = self.state_mut() else {
+                        return;
+                    };
                     match started {
                         Ok(server) => {
                             state.message =
@@ -10960,7 +11704,9 @@ impl EditorView {
                     }
                 }
                 Err(reason) => {
-                    let mut state = self.ivars().state.borrow_mut();
+                    let Some(mut state) = self.state_mut() else {
+                        return;
+                    };
                     // Said once per language, in the status line, and then
                     // the editor is simply an editor for that file.
                     state.message = Some((reason.clone(), Instant::now()));
@@ -10969,7 +11715,9 @@ impl EditorView {
             }
         }
         // Open documents in ready servers.
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         let State {
             lsp, docs, panes, ..
         } = &mut *state;
@@ -11000,7 +11748,7 @@ impl EditorView {
     /// edited since their marks were computed, once typing pauses.
     fn gutter_refresh(&self) {
         const PAUSE: Duration = Duration::from_millis(200);
-        let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
+        let Some(mut state) = self.state_mut() else {
             return;
         };
         // Marks worked out on a worker, for text that has not moved on.
@@ -11112,7 +11860,7 @@ impl EditorView {
 
     fn lsp_flush_changes(&self) {
         const PAUSE: Duration = Duration::from_millis(150);
-        let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
+        let Some(mut state) = self.state_mut() else {
             return;
         };
         if state.lsp_dirty.is_empty() {
@@ -11173,7 +11921,7 @@ impl EditorView {
 
     /// Main thread, whenever a server has something to say.
     fn poll_lsp(&self) {
-        let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
+        let Some(mut state) = self.state_mut() else {
             // Busy: the display link will try again.
             self.resume_display_link();
             return;
@@ -11190,7 +11938,9 @@ impl EditorView {
                 Event::Ready => sync = true,
                 Event::Diagnostics(path) => {
                     // New problems can mean new fixes.
-                    let mut state = self.ivars().state.borrow_mut();
+                    let Some(mut state) = self.state_mut() else {
+                        return;
+                    };
                     if state
                         .bulb
                         .as_ref()
@@ -11203,14 +11953,19 @@ impl EditorView {
                     request, actions, ..
                 } => self.code_actions_arrived(key, request, actions),
                 Event::Action(steps) => {
-                    let save = self.ivars().state.borrow_mut().resolving.take();
+                    let Some(save) = self.state_mut().map(|mut state| state.resolving.take())
+                    else {
+                        return;
+                    };
                     if let Some(save) = save {
                         self.run_steps(key, steps, save);
                     }
                 }
                 Event::ApplyEdit { id, edits } => {
                     let outcome = self.apply_workspace_edit(key, &edits);
-                    let mut state = self.ivars().state.borrow_mut();
+                    let Some(mut state) = self.state_mut() else {
+                        return;
+                    };
                     if let Some(server) = state.lsp.get_mut(&key) {
                         server.answer_apply_edit(&id, outcome.failed.is_empty());
                     }
@@ -11220,7 +11975,9 @@ impl EditorView {
                     }
                 }
                 Event::Completions { items, request, .. } => {
-                    let mut state = self.ivars().state.borrow_mut();
+                    let Some(mut state) = self.state_mut() else {
+                        return;
+                    };
                     let caret = state.docs.active().cursor();
                     let id = state.docs.active().id();
                     let prefix = state.completion.as_ref().and_then(|popup| {
@@ -11240,13 +11997,16 @@ impl EditorView {
                 }
                 Event::Definition(locations) => {
                     let Some(location) = locations.into_iter().next() else {
-                        self.ivars().state.borrow_mut().message =
-                            Some(("no definition found".into(), Instant::now()));
+                        if let Some(mut state) = self.state_mut() {
+                            state.message = Some(("no definition found".into(), Instant::now()));
+                        }
                         continue;
                     };
                     self.load_path(&location.path.to_string_lossy());
                     let (rows, cols) = self.grid();
-                    let mut state = self.ivars().state.borrow_mut();
+                    let Some(mut state) = self.state_mut() else {
+                        return;
+                    };
                     let buffer = state.docs.active_mut();
                     if buffer.path.as_deref() == Some(location.path.as_path()) {
                         let offset = crate::lsp::offset_of(&buffer.rope, location.start);
@@ -11259,13 +12019,17 @@ impl EditorView {
                 }
                 Event::Hover { text, .. } => {
                     let first: String = text.lines().take(2).collect::<Vec<_>>().join("  ");
-                    self.ivars().state.borrow_mut().message = Some((first, Instant::now()));
+                    if let Some(mut state) = self.state_mut() {
+                        state.message = Some((first, Instant::now()));
+                    }
                 }
                 Event::References(locations) => self.show_references(locations),
                 Event::Rename(files) => self.apply_rename(key, files),
                 Event::Formatting { path, edits, save } => self.apply_format(&path, &edits, save),
                 Event::Signature { path, signature } => {
-                    let mut state = self.ivars().state.borrow_mut();
+                    let Some(mut state) = self.state_mut() else {
+                        return;
+                    };
                     let buffer = state.docs.active();
                     let here = buffer.path.as_deref() == Some(path.as_path());
                     let (id, caret) = (buffer.id(), buffer.cursor());
@@ -11276,14 +12040,18 @@ impl EditorView {
                     });
                 }
                 Event::Refused(reason) => {
-                    self.ivars().state.borrow_mut().message = Some((reason, Instant::now()));
+                    if let Some(mut state) = self.state_mut() {
+                        state.message = Some((reason, Instant::now()));
+                    }
                 }
                 Event::Failed(reason) => {
                     // A server that died is dropped (its process with it),
                     // not kept as a dead entry: it gets another start, up to
                     // a few, and nothing more is written to its closed pipe
                     // nor read from its last diagnostics.
-                    let mut state = self.ivars().state.borrow_mut();
+                    let Some(mut state) = self.state_mut() else {
+                        return;
+                    };
                     let restarts = state.lsp_restarts.entry(key).or_insert(0);
                     *restarts += 1;
                     let restarts = *restarts;
@@ -11315,7 +12083,9 @@ impl EditorView {
     /// After any key reached the document: remember the edit for the
     /// server, and keep the completion list honest about the caret.
     fn lsp_after_key(&self, edited: bool) {
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         let id = state.docs.active().id();
         if let Some(tip) = &state.signature {
             let buffer = state.docs.active();
@@ -11349,7 +12119,9 @@ impl EditorView {
             return;
         };
         let (trigger, path, signature) = {
-            let state = self.ivars().state.borrow();
+            let Some(state) = self.state() else {
+                return;
+            };
             let buffer = state.docs.active();
             let server = lsp_server_for(&state, buffer);
             let trigger = server.is_some_and(|s| s.trigger_characters.iter().any(|t| t == text));
@@ -11359,13 +12131,17 @@ impl EditorView {
         };
         if signature {
             self.request_signature();
-        } else if ch == ')' {
-            self.ivars().state.borrow_mut().signature = None;
+        } else if ch == ')'
+            && let Some(mut state) = self.state_mut()
+        {
+            state.signature = None;
         }
         if crate::complete::is_word_char(ch) || trigger || path {
             self.request_completion(false);
         } else {
-            self.ivars().state.borrow_mut().completion = None;
+            if let Some(mut state) = self.state_mut() {
+                state.completion = None;
+            }
         }
     }
 
@@ -11376,7 +12152,9 @@ impl EditorView {
         // Whatever was typed goes to the server first, so it answers about
         // the text as it is now.
         self.lsp_flush_now();
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         let path = completion_path_query(&state);
         let buffer = state.docs.active();
         let caret = buffer.cursor();
@@ -11447,7 +12225,9 @@ impl EditorView {
     /// Sends the worker the current question for the open list.
     fn ask_worker(&self) {
         self.start_completer();
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         let path = completion_path_query(&state);
         let root = project_key(&state);
         let buffer = state.docs.active();
@@ -11483,7 +12263,7 @@ impl EditorView {
     }
 
     fn start_completer(&self) {
-        if self.ivars().state.borrow().completer.is_some() {
+        if self.state().is_some_and(|state| state.completer.is_some()) {
             return;
         }
         let wake: Box<dyn Fn() + Send> = self.wake(completion_wake_on_main);
@@ -11491,12 +12271,14 @@ impl EditorView {
             crate::complete::history::History::default_path(),
             wake,
         );
-        self.ivars().state.borrow_mut().completer = worker;
+        if let Some(mut state) = self.state_mut() {
+            state.completer = worker;
+        }
     }
 
     /// Main thread, when the worker has answered.
     fn poll_completion(&self) {
-        let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
+        let Some(mut state) = self.state_mut() else {
             self.resume_display_link();
             return;
         };
@@ -11536,7 +12318,9 @@ impl EditorView {
     /// that follows sees the current text.
     fn lsp_flush_now(&self) {
         {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             for at in state.lsp_dirty.values_mut() {
                 *at = Instant::now() - Duration::from_secs(1);
             }
@@ -11577,10 +12361,14 @@ impl EditorView {
         }
         match code {
             ESCAPE => {
-                self.ivars().state.borrow_mut().completion = None;
+                if let Some(mut state) = self.state_mut() {
+                    state.completion = None;
+                }
             }
             key::UP | key::DOWN if count > 0 => {
-                let mut state = self.ivars().state.borrow_mut();
+                let Some(mut state) = self.state_mut() else {
+                    return false;
+                };
                 if let Some(popup) = &mut state.completion {
                     popup.selected = if code == key::DOWN {
                         (popup.selected + 1) % count
@@ -11594,7 +12382,9 @@ impl EditorView {
             key::RETURN if count > 0 && chosen => self.accept_completion(None),
             key::RETURN => {
                 // Not chosen: a new line, as it would be with no list.
-                self.ivars().state.borrow_mut().completion = None;
+                if let Some(mut state) = self.state_mut() {
+                    state.completion = None;
+                }
                 return false;
             }
             _ => return false,
@@ -11609,7 +12399,9 @@ impl EditorView {
     /// folder that was just completed.
     fn accept_completion(&self, index: Option<usize>) {
         let (range, text, remember, into_folder) = {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             let Some(popup) = state.completion.take() else {
                 return;
             };
@@ -11641,15 +12433,20 @@ impl EditorView {
             )
         };
         {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             let buffer = state.docs.active_mut();
             buffer.select_range(range.start, range.end);
             buffer.insert(&text);
         }
         self.after_edit();
-        self.ivars().state.borrow_mut().completion = None;
+        if let Some(mut state) = self.state_mut() {
+            state.completion = None;
+        }
         if let Some((root, language, context, text)) = remember
-            && let Some(worker) = &self.ivars().state.borrow().completer
+            && let Some(state) = self.state()
+            && let Some(worker) = &state.completer
         {
             worker.accepted(root, language, context, text);
         }
@@ -11661,7 +12458,9 @@ impl EditorView {
     /// Edit > Forget Completion History: this project's remembered picks.
     fn forget_completion_history(&self) {
         self.start_completer();
-        let state = self.ivars().state.borrow();
+        let Some(state) = self.state() else {
+            return;
+        };
         if let (Some(root), Some(worker)) = (project_key(&state), &state.completer) {
             worker.forget(root);
         }
@@ -11691,7 +12490,9 @@ impl EditorView {
             .tree
             .root()
             .map(Path::to_path_buf);
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         state.watcher = None;
         let Some(root) = root else {
             state.indexer = None;
@@ -11718,7 +12519,7 @@ impl EditorView {
         {
             // A main-queue block also runs inside modal alerts, panels and
             // menu tracking, where the state may be borrowed.
-            let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
+            let Some(mut state) = self.state_mut() else {
                 let (tree, git) = self.ivars().deferred_change.get();
                 self.ivars().deferred_change.set(match change {
                     crate::project::watch::Change::Tree => (true, git),
@@ -11750,7 +12551,7 @@ impl EditorView {
     /// moment, and never while a rebuild is already running.
     fn refresh_after_watch(&self) {
         const SETTLE: Duration = Duration::from_millis(300);
-        let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
+        let Some(mut state) = self.state_mut() else {
             return;
         };
         // While Git is busy the change waits: it may be someone else's,
@@ -11788,7 +12589,9 @@ impl EditorView {
     }
 
     fn refresh_project_after_disk_change(&self) {
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         state.tree_version += 1;
         state.tree_children_pending.clear();
         state.project_index_rx = Some(spawn_project_refresh(
@@ -11808,7 +12611,10 @@ impl EditorView {
     /// New File: a name field in the tree when a project is open, the save
     /// panel when there is no tree to put one in.
     fn new_file(&self) -> bool {
-        if self.ivars().state.borrow().tree.root().is_some() {
+        if self
+            .state()
+            .is_some_and(|state| state.tree.root().is_some())
+        {
             self.start_sidebar_edit(SidebarEditKind::NewFile);
             return true;
         }
@@ -11816,7 +12622,10 @@ impl EditorView {
     }
 
     fn new_folder(&self) -> bool {
-        if self.ivars().state.borrow().tree.root().is_none() {
+        if self
+            .state()
+            .is_some_and(|state| state.tree.root().is_none())
+        {
             return false;
         }
         self.start_sidebar_edit(SidebarEditKind::NewFolder);
@@ -11827,10 +12636,12 @@ impl EditorView {
     /// item will appear.
     fn start_sidebar_edit(&self, kind: SidebarEditKind) {
         // Source control shares the column; the field belongs to the tree.
-        if self.ivars().state.borrow().git_open {
+        if self.state().is_some_and(|state| state.git_open) {
             self.set_sidebar_view(false);
         }
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         state.sidebar = true;
         close_fields(&mut state);
         let Some(root) = state.tree.root().map(Path::to_path_buf) else {
@@ -11919,7 +12730,9 @@ impl EditorView {
             key::RETURN => self.finish_sidebar_edit(true),
             key::TAB => return true,
             key::DELETE => {
-                let mut state = self.ivars().state.borrow_mut();
+                let Some(mut state) = self.state_mut() else {
+                    return false;
+                };
                 if let Some(edit) = &mut state.sidebar_edit {
                     if option {
                         edit.field.delete_word_backward();
@@ -11929,7 +12742,9 @@ impl EditorView {
                 }
             }
             key::LEFT | key::RIGHT | key::HOME | key::END => {
-                let mut state = self.ivars().state.borrow_mut();
+                let Some(mut state) = self.state_mut() else {
+                    return false;
+                };
                 if let Some(edit) = &mut state.sidebar_edit {
                     match code {
                         key::LEFT => edit.field.move_left(motion),
@@ -11949,7 +12764,10 @@ impl EditorView {
 
     /// Ends the inline field: creates, renames, or does nothing.
     fn finish_sidebar_edit(&self, commit: bool) {
-        let Some(edit) = self.ivars().state.borrow_mut().sidebar_edit.take() else {
+        let Some(edit) = self
+            .state_mut()
+            .and_then(|mut state| state.sidebar_edit.take())
+        else {
             return;
         };
         let name = edit.field.rope.to_string();
@@ -11969,8 +12787,9 @@ impl EditorView {
             SidebarEditKind::Rename(_) => single,
         };
         if !valid {
-            self.ivars().state.borrow_mut().message =
-                Some((format!("not a valid name: {name}"), Instant::now()));
+            if let Some(mut state) = self.state_mut() {
+                state.message = Some((format!("not a valid name: {name}"), Instant::now()));
+            }
             self.request_redraw();
             return;
         }
@@ -11978,8 +12797,9 @@ impl EditorView {
         match edit.kind {
             SidebarEditKind::NewFile => {
                 if target.exists() {
-                    self.ivars().state.borrow_mut().message =
-                        Some((format!("{name} already exists"), Instant::now()));
+                    if let Some(mut state) = self.state_mut() {
+                        state.message = Some((format!("{name} already exists"), Instant::now()));
+                    }
                 } else {
                     let created = target
                         .parent()
@@ -11990,12 +12810,16 @@ impl EditorView {
                     match created {
                         Ok(()) => self.open_created_file(&target),
                         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                            self.ivars().state.borrow_mut().message =
-                                Some((format!("{name} already exists"), Instant::now()));
+                            if let Some(mut state) = self.state_mut() {
+                                state.message =
+                                    Some((format!("{name} already exists"), Instant::now()));
+                            }
                         }
                         Err(error) => {
-                            self.ivars().state.borrow_mut().message =
-                                Some((format!("could not create: {error}"), Instant::now()));
+                            if let Some(mut state) = self.state_mut() {
+                                state.message =
+                                    Some((format!("could not create: {error}"), Instant::now()));
+                            }
                         }
                     }
                 }
@@ -12006,13 +12830,15 @@ impl EditorView {
                 } else {
                     std::fs::create_dir_all(&target)
                 };
-                self.ivars().state.borrow_mut().message = Some((
-                    match &result {
-                        Ok(()) => format!("created folder {name}"),
-                        Err(error) => format!("could not create folder: {error}"),
-                    },
-                    Instant::now(),
-                ));
+                if let Some(mut state) = self.state_mut() {
+                    state.message = Some((
+                        match &result {
+                            Ok(()) => format!("created folder {name}"),
+                            Err(error) => format!("could not create folder: {error}"),
+                        },
+                        Instant::now(),
+                    ));
+                }
                 if result.is_ok() {
                     self.refresh_project_after_disk_change();
                 }
@@ -12030,7 +12856,9 @@ impl EditorView {
     /// A file just written to disk gets a tab and the keyboard.
     fn open_created_file(&self, path: &Path) {
         {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             let message = match Buffer::open(path) {
                 // add, not push: the file may already be open.
                 Ok(buffer) => {
@@ -12056,7 +12884,9 @@ impl EditorView {
         match move_without_replace(path, destination) {
             Ok(()) => {
                 {
-                    let mut state = self.ivars().state.borrow_mut();
+                    let Some(mut state) = self.state_mut() else {
+                        return;
+                    };
                     for docs in all_docs_mut(&mut state) {
                         docs.rename_path(&source_key, destination);
                     }
@@ -12070,15 +12900,18 @@ impl EditorView {
                 self.reparse();
             }
             Err(error) => {
-                self.ivars().state.borrow_mut().message =
-                    Some((format!("rename failed: {error}"), Instant::now()));
+                if let Some(mut state) = self.state_mut() {
+                    state.message = Some((format!("rename failed: {error}"), Instant::now()));
+                }
             }
         }
     }
 
     fn new_file_with_panel(&self) -> bool {
         // No unsaved-changes prompt: the new file gets its own tab.
-        let start_dir = self.ivars().state.borrow().tree.target_dir();
+        let Some(start_dir) = self.state().map(|state| state.tree.target_dir()) else {
+            return false;
+        };
 
         let mtm = MainThreadMarker::from(self);
         let panel = NSSavePanel::savePanel(mtm);
@@ -12099,8 +12932,9 @@ impl EditorView {
         let path = std::path::PathBuf::from(path.to_string());
 
         if let Err(e) = std::fs::write(&path, "") {
-            self.ivars().state.borrow_mut().message =
-                Some((format!("could not create: {e}"), Instant::now()));
+            if let Some(mut state) = self.state_mut() {
+                state.message = Some((format!("could not create: {e}"), Instant::now()));
+            }
             return true;
         }
 
@@ -12117,9 +12951,13 @@ impl EditorView {
         // A review tab holds Claude's text, which is answered, not edited.
         // Menu edits land in a buffer nobody sees.
         let mut inert = Buffer::new();
-        let reviewing =
-            active_review(&self.ivars().state.borrow()).is_some() || self.terminal_has_keys();
-        let mut state = self.ivars().state.borrow_mut();
+        let reviewing = self
+            .state()
+            .is_some_and(|state| active_review(&state).is_some())
+            || self.terminal_has_keys();
+        let Some(mut state) = self.state_mut() else {
+            return (edit(&mut inert, Focus::Goto), Focus::Goto);
+        };
         let State {
             docs,
             find,
@@ -12165,7 +13003,9 @@ impl EditorView {
             Focus::Goto => {}
             Focus::Field => {
                 // A different palette query invalidates the selected row.
-                let mut state = self.ivars().state.borrow_mut();
+                let Some(mut state) = self.state_mut() else {
+                    return;
+                };
                 if let Some((_, selected)) = &mut state.palette {
                     *selected = 0;
                     state.palette_scroll = 0;
@@ -12180,7 +13020,9 @@ impl EditorView {
     fn after_edit(&self) {
         self.reparse();
         let (rows, cols) = self.grid();
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         let id = state.docs.active().id();
         if state.docs.active().path.is_some() {
             state.lsp_dirty.insert(id, Instant::now());
@@ -12199,7 +13041,9 @@ impl EditorView {
     /// if that point is past the top or bottom of the text. Returns whether
     /// it is, which is to say whether this needs calling again next frame.
     fn drag_select(&self) -> bool {
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return false;
+        };
         let (Some((unit, pressed)), Some((x, y))) = (state.selecting.clone(), state.drag_point)
         else {
             return false;
@@ -12266,7 +13110,9 @@ impl EditorView {
     fn offset_for_event(&self, event: &NSEvent) -> usize {
         let window_point = event.locationInWindow();
         let point = self.convertPoint_fromView(window_point, None);
-        let state = self.ivars().state.borrow();
+        let Some(state) = self.state() else {
+            return 0;
+        };
         // The hit test works in the text area's own coordinates. Handing it
         // window coordinates is what put every click two rows low and, with
         // the sidebar showing, a sidebar's width to the right.
@@ -12285,33 +13131,47 @@ impl EditorView {
         use crate::platform::settings::{MAX_FONT_SIZE, MIN_FONT_SIZE, Settings};
         let size = size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
         let font = {
-            let state = self.ivars().state.borrow();
+            let Some(state) = self.state() else {
+                return;
+            };
             if (state.font_size - size).abs() < 0.01 {
                 return;
             }
             state.font.clone()
         };
         self.apply_font(font.clone(), size);
+        let Some((theme, caret_blink, format_on_save, word_wrap)) = self.state().map(|state| {
+            (
+                state.theme_choice,
+                state.caret_blink,
+                state.format_on_save,
+                state.word_wrap,
+            )
+        }) else {
+            return;
+        };
         let saved = Settings {
             font,
             font_size: size,
-            theme: self.ivars().state.borrow().theme_choice,
-            caret_blink: self.ivars().state.borrow().caret_blink,
+            theme,
+            caret_blink,
             update_check: true,
-            format_on_save: self.ivars().state.borrow().format_on_save,
+            format_on_save,
             organize_imports_on_save: false,
-            word_wrap: self.ivars().state.borrow().word_wrap,
+            word_wrap,
             ssh_auth_sock: None,
             conflict_side_by_side: false,
         }
         .save();
-        self.ivars().state.borrow_mut().message = Some((
-            match saved {
-                Ok(()) => format!("font size {}", size as i32),
-                Err(e) => format!("font size {}, not saved: {e}", size as i32),
-            },
-            Instant::now(),
-        ));
+        if let Some(mut state) = self.state_mut() {
+            state.message = Some((
+                match saved {
+                    Ok(()) => format!("font size {}", size as i32),
+                    Err(e) => format!("font size {}, not saved: {e}", size as i32),
+                },
+                Instant::now(),
+            ));
+        }
     }
 
     /// crc > Settings: the settings file as a tab, created from the template
@@ -12320,14 +13180,17 @@ impl EditorView {
         let path = match crate::platform::settings::Settings::ensure_file() {
             Ok(path) => path,
             Err(e) => {
-                self.ivars().state.borrow_mut().message =
-                    Some((format!("settings: {e}"), Instant::now()));
+                if let Some(mut state) = self.state_mut() {
+                    state.message = Some((format!("settings: {e}"), Instant::now()));
+                }
                 return;
             }
         };
         // Straight into a tab, without adopting ~/.config/crc as the project
         // the way opening an ordinary file with no project would.
-        let mut state = self.ivars().state.borrow_mut();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
         match state.docs.open(&path) {
             Ok(()) => {
                 reveal_active_tab(&mut state);
@@ -12346,14 +13209,18 @@ impl EditorView {
     fn apply_settings_file(&self) {
         let settings = crate::platform::settings::Settings::load();
         let (font, size) = {
-            let state = self.ivars().state.borrow();
+            let Some(state) = self.state() else {
+                return;
+            };
             (state.font.clone(), state.font_size)
         };
         if settings.font != font || (settings.font_size - size).abs() > 0.01 {
             self.apply_font(settings.font.clone(), settings.font_size);
         }
         {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             state.theme_choice = settings.theme;
             state.caret_blink = settings.caret_blink;
             state.format_on_save = settings.format_on_save;
@@ -12363,8 +13230,9 @@ impl EditorView {
             state.conflict_side = settings.conflict_side_by_side;
         }
         self.apply_theme();
-        self.ivars().state.borrow_mut().message =
-            Some(("settings applied".to_string(), Instant::now()));
+        if let Some(mut state) = self.state_mut() {
+            state.message = Some(("settings applied".to_string(), Instant::now()));
+        }
     }
 
     /// Whether the view is being shown in the dark appearance.
@@ -12388,7 +13256,9 @@ impl EditorView {
         use objc2_app_kit::{
             NSAppearance, NSAppearanceCustomization, NSAppearanceNameAqua, NSAppearanceNameDarkAqua,
         };
-        let choice = self.ivars().state.borrow().theme_choice;
+        let Some(choice) = self.state().map(|state| state.theme_choice) else {
+            return;
+        };
         let dark = match choice {
             ThemeChoice::System => self.system_is_dark(),
             ThemeChoice::Dark => true,
@@ -12404,7 +13274,9 @@ impl EditorView {
             window.setAppearance(forced.as_deref());
         }
         {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             if state.theme.is_dark() == dark {
                 return;
             }
@@ -12421,7 +13293,9 @@ impl EditorView {
     fn apply_font(&self, font: String, size: f32) {
         let scale = self.window().map_or(2.0, |w| w.backingScaleFactor()) as f32;
         {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             let atlas = Atlas::build_with_ui(
                 &font,
                 size,
@@ -12435,7 +13309,9 @@ impl EditorView {
         // Fewer or more rows fit now; the scroll positions are re-clamped.
         let (rows, cols) = self.grid();
         {
-            let mut state = self.ivars().state.borrow_mut();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
             let setting = state.word_wrap;
             for docs in all_docs_mut(&mut state) {
                 apply_wrap(docs.active_mut(), setting, cols);
@@ -12451,7 +13327,7 @@ impl EditorView {
 
     fn resize(&self, size: NSSize) {
         let scale = self.window().map_or(2.0, |w| w.backingScaleFactor());
-        let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
+        let Some(mut state) = self.state_mut() else {
             self.ivars().deferred_size.set(Some(size));
             self.request_redraw();
             return;
@@ -12486,9 +13362,7 @@ impl EditorView {
         // resetCursorRects is called during tracking. If a borrow is already
         // live, the honest answer is to skip this frame and draw on the next
         // one, not to abort the process.
-        let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
-            return None;
-        };
+        let mut state = self.state_mut()?;
         sync_conflicts(&mut state);
         let side = side_by_side(&state);
         let chrome = chrome_of(&state);
@@ -13694,15 +14568,14 @@ define_class!(
             }
             // Written only once quitting is certain: recording a session for
             // a quit the user then cancelled would overwrite the real one.
-            let (session, ephemeral) = {
-                let mut state = view.ivars().state.borrow_mut();
+            // Busy: quit without the session rather than abort.
+            let (session, ephemeral) = view.state_mut().map_or((None, true), |mut state| {
                 (state.quit_session.take(), state.ephemeral_session)
-            };
+            });
             if !ephemeral && let Some(session) = session {
                 session.save();
             }
-            {
-                let mut state = view.ivars().state.borrow_mut();
+            if let Some(mut state) = view.state_mut() {
                 for server in state.lsp.values_mut() {
                     server.shutdown();
                 }
@@ -14180,7 +15053,9 @@ impl crate::ide::mcp::Host for ClaudeHost<'_> {
         &self,
         path: Option<&Path>,
     ) -> Vec<(std::path::PathBuf, Vec<crate::lsp::Diagnostic>)> {
-        let state = self.0.ivars().state.borrow();
+        let Some(state) = self.0.state() else {
+            return Vec::new();
+        };
         let mut out: Vec<_> = state
             .lsp
             .values()
@@ -14196,7 +15071,9 @@ impl crate::ide::mcp::Host for ClaudeHost<'_> {
     }
 
     fn open_editors(&self) -> Vec<crate::ide::mcp::Editor> {
-        let state = self.0.ivars().state.borrow();
+        let Some(state) = self.0.state() else {
+            return Vec::new();
+        };
         let active = state.docs.active().id();
         let reviews = state.claude.as_ref().map(|c| &c.reviews);
         all_docs(&state)
@@ -14216,7 +15093,9 @@ impl crate::ide::mcp::Host for ClaudeHost<'_> {
     }
 
     fn workspace_folders(&self) -> Vec<std::path::PathBuf> {
-        let state = self.0.ivars().state.borrow();
+        let Some(state) = self.0.state() else {
+            return Vec::new();
+        };
         state
             .claude
             .as_ref()
@@ -14225,11 +15104,11 @@ impl crate::ide::mcp::Host for ClaudeHost<'_> {
     }
 
     fn selection(&self) -> Option<crate::ide::mcp::Selection> {
-        claude_selection(&self.0.ivars().state.borrow())
+        self.0.state().and_then(|state| claude_selection(&state))
     }
 
     fn document_state(&self, path: &Path) -> Option<(bool, bool)> {
-        let state = self.0.ivars().state.borrow();
+        let state = self.0.state()?;
         let key = crate::platform::canonical(path);
         all_docs(&state)
             .flat_map(|docs| docs.iter())
@@ -14243,7 +15122,9 @@ impl crate::ide::mcp::Host for ClaudeHost<'_> {
 
     fn save(&mut self, path: &Path) -> Result<bool, String> {
         let saved = {
-            let mut state = self.0.ivars().state.borrow_mut();
+            let Some(mut state) = self.0.state_mut() else {
+                return Err("the editor is busy".into());
+            };
             let key = crate::platform::canonical(path);
             let result = all_docs_mut(&mut state)
                 .into_iter()
@@ -14265,8 +15146,10 @@ impl crate::ide::mcp::Host for ClaudeHost<'_> {
         };
         if let Some(path) = saved {
             self.0.lsp_flush_changes();
-            for server in self.0.ivars().state.borrow_mut().lsp.values_mut() {
-                server.did_save(&path);
+            if let Some(mut state) = self.0.state_mut() {
+                for server in state.lsp.values_mut() {
+                    server.did_save(&path);
+                }
             }
         }
         self.0.sync_title();
@@ -14286,7 +15169,9 @@ impl crate::ide::mcp::Host for ClaudeHost<'_> {
         }
         if let Some(start_text) = start_text.filter(|s| !s.is_empty()) {
             let (rows, cols) = self.0.grid();
-            let mut state = self.0.ivars().state.borrow_mut();
+            let Some(mut state) = self.0.state_mut() else {
+                return Err("the editor is busy".into());
+            };
             let buffer = state.docs.active_mut();
             let text = buffer.rope.to_string();
             if let Some(start) = text.find(start_text) {
@@ -14331,7 +15216,9 @@ impl crate::ide::mcp::Host for ClaudeHost<'_> {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| diff.tab_name.clone());
         {
-            let mut state = self.0.ivars().state.borrow_mut();
+            let Some(mut state) = self.0.state_mut() else {
+                return Err("the editor is busy".into());
+            };
             let Some(bridge) = state.claude.as_mut() else {
                 return Err("not connected".into());
             };

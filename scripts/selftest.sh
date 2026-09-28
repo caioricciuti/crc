@@ -626,6 +626,26 @@ CRC_SELFTEST="$T/conceal.script" "$BIN" "$T/conceal.md" 2> "$T/conceal.err"
 expect "$T/conceal-click.out" cursor "2:4"
 expect "$T/conceal-word.out" selection '"end"'
 
+# AppKit re-enters the view whenever it likes: menus, modal panels, cursor
+# rects, a redraw inside a call. With the state held as a caller up the
+# stack holds it, a key, clicks, a context menu, menu actions, an input
+# method query, a frame, close and quit must each skip, not abort, and
+# leave the document as it was.
+printf 'keep me\nsecond\n' > "$T/reenter.txt"
+cat > "$T/reenter.script" <<SCRIPT
+key 11 cmd b
+reenter
+dump $T/reenter.out
+text y
+dump $T/reenter-after.out
+quit
+SCRIPT
+CRC_SELFTEST="$T/reenter.script" "$BIN" "$T/reenter.txt" 2> "$T/reenter.err"
+expect "$T/reenter.out" message "reentered: drawn=false range=true close=false quit_cancelled=true"
+expect "$T/reenter.out" dirty "false"
+expect_line "$T/reenter.out" 1 "keep me"
+expect_line "$T/reenter-after.out" 1 "ykeep me"
+
 # Home is a page: typing there makes no Untitled document.
 cat > "$T/home-typing.script" <<SCRIPT
 wait 300
