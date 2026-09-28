@@ -168,16 +168,6 @@ fn too_broad_to_adopt(dir: &Path) -> bool {
             .any(|name| dir == home.join(name))
 }
 
-/// Starts `command` and reaps it from a thread, so a short-lived helper
-/// (`open -R`, `open <url>`) does not stay a zombie until quit.
-fn spawn_reaped(command: &mut std::process::Command) -> std::io::Result<()> {
-    let mut child = command.spawn()?;
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
-    Ok(())
-}
-
 /// A pasted string cut down to what a one-row field can hold: its first
 /// line, without control characters.
 fn single_line(text: &str) -> String {
@@ -4004,7 +3994,7 @@ impl EditorView {
         if reveal {
             command.arg("-R");
         }
-        spawn_reaped(command.arg(target))
+        crate::platform::spawn_reaped(command.arg(target))
     }
 
     /// A wake for a worker thread: it queues `work` with this view on the

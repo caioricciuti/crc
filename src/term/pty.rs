@@ -29,7 +29,6 @@ unsafe extern "C" {
     fn ioctl(fd: i32, request: u64, ...) -> i32;
     fn fcntl(fd: i32, command: i32, ...) -> i32;
     fn setsid() -> i32;
-    fn kill(pid: i32, signal: i32) -> i32;
 }
 
 const O_RDWR: i32 = 0x2;
@@ -254,7 +253,7 @@ impl Drop for Session {
         // once the program is gone, since its pid may have been reused. A
         // background job it left behind keeps the terminal until it closes.
         if !self.reaped.load(Ordering::Acquire) {
-            unsafe { kill(-self.pid, SIGHUP) };
+            crate::platform::send_signal(-self.pid, SIGHUP);
         }
     }
 }

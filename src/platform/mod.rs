@@ -64,19 +64,37 @@ fn home() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(std::path::PathBuf::from)
 }
 
+unsafe extern "C" {
+    fn kill(pid: i32, signal: i32) -> i32;
+}
+
+/// Sends `signal` to `pid`, or to the process group `-pid`. Whether it was
+/// delivered.
+pub fn send_signal(pid: i32, signal: i32) -> bool {
+    // SAFETY: kill(2) takes two integers and touches no memory of ours.
+    unsafe { kill(pid, signal) == 0 }
+}
+
+/// Starts `command` and reaps it from a thread, so a short-lived helper
+/// (`open -R`, `open <url>`) does not stay a zombie until quit.
+pub fn spawn_reaped(command: &mut std::process::Command) -> std::io::Result<()> {
+    let mut child = command.spawn()?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
 /// Whether a process exists. Signal 0 checks without sending anything;
 /// `EPERM` means it exists but belongs to someone else.
 pub fn process_alive(pid: u64) -> bool {
-    unsafe extern "C" {
-        fn kill(pid: i32, signal: i32) -> i32;
-    }
     let Ok(pid) = i32::try_from(pid) else {
         return false;
     };
     if pid <= 0 {
         return false;
     }
-    if unsafe { kill(pid, 0) } == 0 {
+    if send_signal(pid, 0) {
         return true;
     }
     std::io::Error::last_os_error().raw_os_error() == Some(1)
