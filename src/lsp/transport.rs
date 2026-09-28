@@ -23,7 +23,7 @@ pub enum Incoming {
 }
 
 /// Called after a message is queued, from the reader thread.
-pub type Wake = Box<dyn Fn() + Send + Sync>;
+pub use crate::platform::dispatch::Wake;
 
 pub struct Transport {
     /// `None` only while being dropped.

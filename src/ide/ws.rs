@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
 /// Called after an event is queued, from a server thread.
-pub type Wake = Box<dyn Fn() + Send + Sync>;
+pub use crate::platform::dispatch::Wake;
 
 /// What the server threads deliver. `u64` is the connection, so a close
 /// from a client that has since been replaced can be told apart.

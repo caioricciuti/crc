@@ -1287,13 +1287,7 @@ pub fn completion_range(
     let line = rope.byte_to_line(caret);
     let line_start = rope.line_to_byte(line);
     let before = rope.slice_to_string(line_start..caret);
-    let word_len = before
-        .chars()
-        .rev()
-        .take_while(|c| c.is_alphanumeric() || *c == '_')
-        .map(char::len_utf8)
-        .sum::<usize>();
-    caret - word_len..caret
+    caret - crate::complete::word_len(&before)..caret
 }
 
 /// What a completion inserts.

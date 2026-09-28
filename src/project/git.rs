@@ -454,10 +454,10 @@ pub fn head_text(root: &Path, path: &Path) -> Result<Option<String>, String> {
         .map_err(|e| e.to_string())?;
     if output.status.success() {
         // Line breaks as the buffer has them: CRLF and a lone CR are LF.
-        let text = String::from_utf8_lossy(&output.stdout)
-            .replace("\r\n", "\n")
-            .replace('\r', "\n");
-        return Ok(Some(text));
+        let text = String::from_utf8_lossy(&output.stdout);
+        return Ok(Some(
+            crate::text::buffer::normalize_newlines(&text).into_owned(),
+        ));
     }
     // Why it failed, from exit statuses rather than from git's wording,
     // which changes between versions and languages. No commit yet, or no

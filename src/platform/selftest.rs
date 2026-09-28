@@ -128,6 +128,24 @@ pub struct Mods {
     pub control: bool,
 }
 
+impl Mods {
+    /// `cmd,shift`, `opt` or `-` for none.
+    fn parse(spec: &str) -> Option<Mods> {
+        let mut mods = Mods::default();
+        for name in spec.split(',') {
+            match name {
+                "cmd" => mods.command = true,
+                "shift" => mods.shift = true,
+                "opt" => mods.option = true,
+                "ctrl" => mods.control = true,
+                "-" | "" => {}
+                _ => return None,
+            }
+        }
+        Some(mods)
+    }
+}
+
 /// Hardware key codes for the characters `text` knows how to type, on any
 /// ANSI layout. Letters, digits, space and a little punctuation: enough to
 /// write a test, not a keyboard driver.
@@ -178,17 +196,7 @@ pub fn parse(script: &str) -> Result<Vec<Step>, String> {
             "key" => {
                 let mut words = rest.split_whitespace();
                 let code = words.next().and_then(|w| w.parse().ok()).ok_or_else(bad)?;
-                let mut mods = Mods::default();
-                for name in words.next().unwrap_or("-").split(',') {
-                    match name {
-                        "cmd" => mods.command = true,
-                        "shift" => mods.shift = true,
-                        "opt" => mods.option = true,
-                        "ctrl" => mods.control = true,
-                        "-" | "" => {}
-                        _ => return Err(bad()),
-                    }
-                }
+                let mods = Mods::parse(words.next().unwrap_or("-")).ok_or_else(bad)?;
                 let chars = words.next().unwrap_or("").to_string();
                 steps.push(Step::Key { code, mods, chars });
             }
@@ -222,17 +230,7 @@ pub fn parse(script: &str) -> Result<Vec<Step>, String> {
                 let mut next = || words.next().and_then(|w| w.parse::<f64>().ok());
                 let (dx, dy) = (next().ok_or_else(bad)?, next().ok_or_else(bad)?);
                 let count = next().map_or(1, |c| c as isize);
-                let mut mods = Mods::default();
-                for name in words.next().unwrap_or("-").split(',') {
-                    match name {
-                        "cmd" => mods.command = true,
-                        "shift" => mods.shift = true,
-                        "opt" => mods.option = true,
-                        "ctrl" => mods.control = true,
-                        "-" | "" => {}
-                        _ => return Err(bad()),
-                    }
-                }
+                let mods = Mods::parse(words.next().unwrap_or("-")).ok_or_else(bad)?;
                 steps.push(Step::ClickIn {
                     name,
                     dx,

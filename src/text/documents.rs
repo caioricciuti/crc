@@ -89,7 +89,7 @@ impl Documents {
                 && buffer
                     .path
                     .as_deref()
-                    .is_some_and(|open| open == path || open.starts_with(path))
+                    .is_some_and(|open| open.starts_with(path))
         })
     }
 
@@ -104,7 +104,7 @@ impl Documents {
                     && buffer
                         .path
                         .as_deref()
-                        .is_some_and(|open| open == path || open.starts_with(path)))
+                        .is_some_and(|open| open.starts_with(path)))
                 .then_some(index)
             })
             .collect();

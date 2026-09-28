@@ -70,7 +70,7 @@ fn set_size(fd: i32, cols: usize, rows: usize) {
 }
 
 /// Called from the reader thread when there is something new to draw.
-pub type Wake = Box<dyn Fn() + Send + Sync>;
+pub use crate::platform::dispatch::Wake;
 
 /// A running program and its screen.
 pub struct Session {

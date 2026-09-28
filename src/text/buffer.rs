@@ -75,7 +75,7 @@ fn window(rope: &Rope, range: std::ops::Range<usize>) -> Vec<u8> {
 }
 
 /// `text` with CRLF and lone CR as LF, the only line break the rope holds.
-fn normalize_newlines(text: &str) -> std::borrow::Cow<'_, str> {
+pub(crate) fn normalize_newlines(text: &str) -> std::borrow::Cow<'_, str> {
     if text.contains('\r') {
         text.replace("\r\n", "\n").replace('\r', "\n").into()
     } else {
@@ -167,11 +167,16 @@ impl DiskStamp {
     }
 
     pub fn of(path: &std::path::Path) -> std::io::Result<Self> {
-        let meta = std::fs::metadata(path)?;
-        Ok(DiskStamp {
+        Ok(Self::from(&std::fs::metadata(path)?))
+    }
+}
+
+impl From<&std::fs::Metadata> for DiskStamp {
+    fn from(meta: &std::fs::Metadata) -> Self {
+        DiskStamp {
             len: meta.len(),
             modified: meta.modified().ok(),
-        })
+        }
     }
 }
 
@@ -248,7 +253,7 @@ enum CharClass {
 /// Underscores and digits count as word characters, so `foo_bar2` is one
 /// word rather than three. Identifiers are what people navigate in code.
 fn class_of(c: char) -> CharClass {
-    if c.is_alphanumeric() || c == '_' {
+    if crate::complete::is_word_char(c) {
         CharClass::Word
     } else if c.is_whitespace() {
         CharClass::Whitespace
@@ -593,10 +598,7 @@ impl Buffer {
         match std::fs::metadata(path) {
             Ok(meta) if !meta.is_file() => DiskState::Missing,
             Ok(meta) => {
-                let now = DiskStamp {
-                    len: meta.len(),
-                    modified: meta.modified().ok(),
-                };
+                let now = DiskStamp::from(&meta);
                 if now == stamp {
                     DiskState::Unchanged
                 } else {
@@ -1305,20 +1307,36 @@ impl Buffer {
     }
 
     pub fn undo(&mut self) -> bool {
+        self.step_history(true)
+    }
+
+    /// Undo or redo: the top of one stack becomes the text, and the text as
+    /// it was goes on the other.
+    fn step_history(&mut self, undo: bool) -> bool {
         if self.is_locked() {
             return false;
         }
-        let Some(snapshot) = self.undo_stack.pop() else {
+        let taken = if undo {
+            self.undo_stack.pop()
+        } else {
+            self.redo_stack.pop()
+        };
+        let Some(snapshot) = taken else {
             return false;
         };
-        self.redo_stack.push(self.snapshot());
+        let now = self.snapshot();
+        if undo {
+            self.redo_stack.push(now);
+        } else {
+            self.undo_stack.push(now);
+        }
         let before = self.rope.clone();
         self.restore(snapshot);
         // The whole rope was replaced; described as one edit over what
         // differs, the parser can still work incrementally.
         self.record_replacement(&before);
         // Break coalescing, so the next keystroke starts a fresh undo step
-        // instead of folding into the one we just reverted.
+        // instead of folding into the one just reverted.
         self.last_edit = None;
         self.goal_column = None;
         self.dirty = !self.matches_saved();
@@ -1336,20 +1354,7 @@ impl Buffer {
     }
 
     pub fn redo(&mut self) -> bool {
-        if self.is_locked() {
-            return false;
-        }
-        let Some(snapshot) = self.redo_stack.pop() else {
-            return false;
-        };
-        self.undo_stack.push(self.snapshot());
-        let before = self.rope.clone();
-        self.restore(snapshot);
-        self.record_replacement(&before);
-        self.last_edit = None;
-        self.goal_column = None;
-        self.dirty = !self.matches_saved();
-        true
+        self.step_history(false)
     }
 
     // ---- multiple cursors ------------------------------------------------
@@ -1609,7 +1614,7 @@ impl Buffer {
 
         let next_is_word = self
             .char_at(self.cursor)
-            .is_some_and(|c| c.is_alphanumeric() || c == '_');
+            .is_some_and(crate::complete::is_word_char);
         if next_is_word {
             self.insert(&ch.to_string());
             return;
@@ -1620,7 +1625,7 @@ impl Buffer {
         if matches!(ch, '"' | '\'' | '`')
             && self
                 .char_before(self.cursor)
-                .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                .is_some_and(crate::complete::is_word_char)
         {
             self.insert(&ch.to_string());
             return;

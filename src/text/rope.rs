@@ -561,11 +561,6 @@ impl Rope {
         (byte, column)
     }
 
-    /// Identity of immutable snapshots, without reading or hashing text.
-    pub fn same_snapshot(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.root, &other.root)
-    }
-
     /// Proven equal prefix/suffix byte counts, with no hashing or full scan.
     /// Shared subtrees are skipped by identity. Work is capped per edge; when
     /// unrelated snapshots exhaust the cap, the unexamined middle is treated
@@ -1348,8 +1343,8 @@ mod tests {
             }
             check(&rope.root);
         }
-        assert!(!rope.same_snapshot(&original));
-        assert!(original.same_snapshot(&original.clone()));
+        assert!(!rope.same_as(&original));
+        assert!(original.same_as(&original.clone()));
         assert_eq!(original.to_string(), "aé👩‍💻e\u{301}\r\n漢字".repeat(700));
     }
 

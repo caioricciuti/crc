@@ -2027,7 +2027,7 @@ define_class!(
             let chrome = chrome_of(&state);
             let add = |r: Viewport, cursor: &NSCursor| {
                 if r.width > 0.0 && r.height > 0.0 {
-                    self.addCursorRect_cursor(NSRect::new(NSPoint::new(r.x as f64, r.y as f64), NSSize::new(r.width as f64, r.height as f64)), cursor);
+                    self.addCursorRect_cursor(ns_rect(r), cursor);
                 }
             };
             add(state.viewport, &NSCursor::arrowCursor());
@@ -3035,20 +3035,12 @@ define_class!(
 
         #[unsafe(method(focusNextPane:))]
         fn action_focus_next_pane(&self, _sender: Option<&AnyObject>) {
-            let (focused, count) = {
-                let state = self.ivars().state.borrow();
-                (state.focused_pane, pane_count(&state))
-            };
-            self.focus_pane((focused + 1) % count);
+            self.cycle_pane(1);
         }
 
         #[unsafe(method(focusPreviousPane:))]
         fn action_focus_previous_pane(&self, _sender: Option<&AnyObject>) {
-            let (focused, count) = {
-                let state = self.ivars().state.borrow();
-                (state.focused_pane, pane_count(&state))
-            };
-            self.focus_pane((focused + count - 1) % count);
+            self.cycle_pane(-1);
         }
 
         #[unsafe(method(openClaude:))]
@@ -3480,12 +3472,9 @@ define_class!(
                         None => layout::caret_rect(state.docs.active(), &state.renderer.atlas, text)
                             .unwrap_or(Viewport { width: 0.0, height: 0.0, ..text }),
                     };
-                    NSRect::new(
-                        NSPoint::new(caret.x as f64, caret.y as f64),
-                        NSSize::new(caret.width as f64, caret.height as f64),
-                    )
+                    ns_rect(caret)
                 }
-                Err(_) => NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0)),
+                Err(_) => NSRect::ZERO,
             };
             let in_window = self.convertRect_toView(in_view, None);
             match self.window() {
@@ -3904,6 +3893,38 @@ impl EditorView {
         spawn_reaped(command.arg(target))
     }
 
+    /// A wake for a worker thread: it queues `work` with this view on the
+    /// main thread. The view lives as long as the process, which every
+    /// worker's thread is inside of; see `ViewPointer`.
+    fn wake(
+        &self,
+        work: unsafe extern "C" fn(*mut std::ffi::c_void),
+    ) -> crate::platform::dispatch::Wake {
+        let pointer = ViewPointer(self as *const EditorView);
+        Box::new(move || {
+            let pointer = &pointer;
+            unsafe { crate::platform::dispatch::on_main(pointer.0 as *mut std::ffi::c_void, work) };
+        })
+    }
+
+    /// Saves a document the formatter just changed, without formatting it
+    /// again on the way out.
+    fn save_formatted(&self) {
+        self.ivars().state.borrow_mut().saving_formatted = true;
+        self.save(false);
+        self.ivars().state.borrow_mut().saving_formatted = false;
+    }
+
+    /// Moves the keyboard `step` panes along, round from the last to the
+    /// first.
+    fn cycle_pane(&self, step: isize) {
+        let (focused, count) = {
+            let state = self.ivars().state.borrow();
+            (state.focused_pane, pane_count(&state))
+        };
+        self.focus_pane((focused as isize + step).rem_euclid(count as isize) as usize);
+    }
+
     fn pump(&self) {
         if self.ivars().handling_key.get() {
             self.request_redraw();
@@ -3938,10 +3959,7 @@ impl EditorView {
             .then(|| state.docs.active().path.clone())
             .flatten();
         let text = chrome_of(&state).text;
-        let frame = NSRect::new(
-            NSPoint::new(text.x as f64, text.y as f64),
-            NSSize::new(text.width as f64, text.height as f64),
-        );
+        let frame = ns_rect(text);
         if let Some(current) = &state.native_preview
             && path.as_deref() == Some(current.path.as_path())
         {
@@ -8172,17 +8190,7 @@ impl EditorView {
     }
 
     fn terminal_wake(&self) -> crate::term::pty::Wake {
-        let pointer = ViewPointer(self as *const EditorView);
-        Box::new(move || {
-            let pointer = &pointer;
-            // The view outlives every session; see `ViewPointer`.
-            unsafe {
-                crate::platform::dispatch::on_main(
-                    pointer.0 as *mut std::ffi::c_void,
-                    terminal_wake_on_main,
-                )
-            };
-        })
+        self.wake(terminal_wake_on_main)
     }
 
     /// A session printed something, or its program exited.
@@ -9268,9 +9276,7 @@ impl EditorView {
     /// format when that is on, which saves again.
     fn continue_save(&self, changed: bool) {
         if changed {
-            self.ivars().state.borrow_mut().saving_formatted = true;
-            self.save(false);
-            self.ivars().state.borrow_mut().saving_formatted = false;
+            self.save_formatted();
         }
         if self.ivars().state.borrow().format_on_save {
             self.format_document(true);
@@ -9902,12 +9908,7 @@ impl EditorView {
             self.close_preview();
             return;
         }
-        let frame = chrome_of(&state).preview.map(|r| {
-            NSRect::new(
-                NSPoint::new(r.x as f64, r.y as f64),
-                NSSize::new(r.width as f64, r.height as f64),
-            )
-        });
+        let frame = chrome_of(&state).preview.map(ns_rect);
         // Crc's own overlays are drawn under any native view; the page
         // steps aside while one is up.
         let veiled = frame.is_none()
@@ -10315,9 +10316,7 @@ impl EditorView {
         if changed {
             self.after_edit();
             if save {
-                self.ivars().state.borrow_mut().saving_formatted = true;
-                self.save(false);
-                self.ivars().state.borrow_mut().saving_formatted = false;
+                self.save_formatted();
             }
         }
         self.request_redraw();
@@ -10451,17 +10450,7 @@ impl EditorView {
 
     /// The wake-up the IDE server's threads use: a main-thread poll.
     fn claude_wake(&self) -> crate::ide::ws::Wake {
-        let pointer = ViewPointer(self as *const EditorView);
-        Box::new(move || {
-            let pointer = &pointer;
-            // The view outlives the server; see `ViewPointer`.
-            unsafe {
-                crate::platform::dispatch::on_main(
-                    pointer.0 as *mut std::ffi::c_void,
-                    claude_wake_on_main,
-                )
-            };
-        })
+        self.wake(claude_wake_on_main)
     }
 
     /// After every frame: the bridge follows the project root, and a moved
@@ -10940,17 +10929,7 @@ impl EditorView {
 
     /// The wake-up a server's reader thread uses: a main-thread poll.
     fn lsp_wake(&self) -> crate::lsp::transport::Wake {
-        let pointer = ViewPointer(self as *const EditorView);
-        Box::new(move || {
-            let pointer = &pointer;
-            // The view outlives every server; see `ViewPointer`.
-            unsafe {
-                crate::platform::dispatch::on_main(
-                    pointer.0 as *mut std::ffi::c_void,
-                    lsp_wake_on_main,
-                )
-            };
-        })
+        self.wake(lsp_wake_on_main)
     }
 
     /// Starts servers for the languages of open documents and tells each
@@ -11541,17 +11520,7 @@ impl EditorView {
         if self.ivars().state.borrow().completer.is_some() {
             return;
         }
-        let pointer = ViewPointer(self as *const EditorView);
-        let wake: Box<dyn Fn() + Send> = Box::new(move || {
-            let pointer = &pointer;
-            // The view outlives the worker; see `ViewPointer`.
-            unsafe {
-                crate::platform::dispatch::on_main(
-                    pointer.0 as *mut std::ffi::c_void,
-                    completion_wake_on_main,
-                )
-            };
-        });
+        let wake: Box<dyn Fn() + Send> = self.wake(completion_wake_on_main);
         let worker = crate::complete::worker::Worker::start(
             crate::complete::history::History::default_path(),
             wake,
@@ -14824,6 +14793,15 @@ fn frame_of(state: &mut State) -> Frame {
     frame
 }
 
+/// A layout rectangle as AppKit takes it. The view is flipped, so the two
+/// share an origin at the top left.
+fn ns_rect(r: Viewport) -> NSRect {
+    NSRect::new(
+        NSPoint::new(r.x as f64, r.y as f64),
+        NSSize::new(r.width as f64, r.height as f64),
+    )
+}
+
 /// Shared layout for rendering and interaction.
 fn chrome_of(state: &State) -> Chrome {
     // On a whole device pixel. The divider is dragged to wherever the pointer
@@ -15847,6 +15825,8 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default()),
     );
     let recent_projects = with_recent(session.recent.clone(), tree.root());
+    // Read once: each field below used to parse config.toml again.
+    let settings = crate::platform::settings::Settings::load();
     let state = State {
         docs,
         native_preview: None,
@@ -15923,17 +15903,17 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         rename: None,
         signature: None,
         formatting: None,
-        format_on_save: crate::platform::settings::Settings::load().format_on_save,
+        format_on_save: settings.format_on_save,
         saving_formatted: false,
-        word_wrap: crate::platform::settings::Settings::load().word_wrap,
-        ssh_auth_sock: crate::platform::settings::Settings::load().ssh_auth_sock,
+        word_wrap: settings.word_wrap,
+        ssh_auth_sock: settings.ssh_auth_sock.clone(),
         branch_list: None,
         branch_rx: None,
         action_list: None,
         quick_fix_request: None,
         organizing: None,
         resolving: None,
-        organize_on_save: crate::platform::settings::Settings::load().organize_imports_on_save,
+        organize_on_save: settings.organize_imports_on_save,
         extensions: None,
         ext_registry_rx: None,
         ext_install_rx: None,
@@ -15953,14 +15933,14 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         blame_rx: None,
         gutter: HashMap::new(),
         conflict_scans: HashMap::new(),
-        conflict_side: crate::platform::settings::Settings::load().conflict_side_by_side,
+        conflict_side: settings.conflict_side_by_side,
         conflict_cursor_key: None,
         pointer_targets: Vec::new(),
         bulb_rect: None,
         font: font.to_owned(),
         font_size: size_pt,
-        theme_choice: crate::platform::settings::Settings::load().theme,
-        caret_blink: crate::platform::settings::Settings::load().caret_blink,
+        theme_choice: settings.theme,
+        caret_blink: settings.caret_blink,
         caret_since: Instant::now(),
         unshaped_on_screen: false,
         completer: None,
@@ -16050,10 +16030,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         view.resume_display_link();
     }
 
-    if !testing
-        && crate::platform::settings::Settings::load().update_check
-        && crate::platform::update::launch_check_due()
-    {
+    if !testing && settings.update_check && crate::platform::update::launch_check_due() {
         view.start_update_check(false);
     }
 

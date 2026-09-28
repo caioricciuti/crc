@@ -184,16 +184,8 @@ impl Settings {
                         settings.theme = choice;
                     }
                 }
-                "caret_blink" => match value {
-                    "true" => settings.caret_blink = true,
-                    "false" => settings.caret_blink = false,
-                    _ => {}
-                },
-                "update_check" => match value {
-                    "true" => settings.update_check = true,
-                    "false" => settings.update_check = false,
-                    _ => {}
-                },
+                "caret_blink" => set_bool(value, &mut settings.caret_blink),
+                "update_check" => set_bool(value, &mut settings.update_check),
                 "word_wrap" => match unquote(value).as_deref().unwrap_or(value) {
                     "auto" => settings.word_wrap = WordWrap::Auto,
                     "on" | "true" => settings.word_wrap = WordWrap::On,
@@ -216,16 +208,10 @@ impl Settings {
                     "side-by-side" | "side" => settings.conflict_side_by_side = true,
                     _ => {}
                 },
-                "format_on_save" => match value {
-                    "true" => settings.format_on_save = true,
-                    "false" => settings.format_on_save = false,
-                    _ => {}
-                },
-                "organize_imports_on_save" => match value {
-                    "true" => settings.organize_imports_on_save = true,
-                    "false" => settings.organize_imports_on_save = false,
-                    _ => {}
-                },
+                "format_on_save" => set_bool(value, &mut settings.format_on_save),
+                "organize_imports_on_save" => {
+                    set_bool(value, &mut settings.organize_imports_on_save)
+                }
                 _ => {}
             }
         }
@@ -309,6 +295,15 @@ impl Settings {
             }
         }
         out
+    }
+}
+
+/// `true` or `false` into `field`; anything else leaves it as it was.
+fn set_bool(value: &str, field: &mut bool) {
+    match value {
+        "true" => *field = true,
+        "false" => *field = false,
+        _ => {}
     }
 }
 

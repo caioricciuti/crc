@@ -892,13 +892,13 @@ impl Atlas {
                 if self
                     .editor_snapshot
                     .as_ref()
-                    .is_some_and(|(id, snapshot)| *id == owner.0 && snapshot.same_snapshot(&rope))
+                    .is_some_and(|(id, snapshot)| *id == owner.0 && snapshot.same_as(&rope))
                 {
                     self.cache_editor_line(owner.1, shaped.map(Rc::new));
                 } else if let Some(parked) = self
                     .parked
                     .iter_mut()
-                    .find(|p| p.id == owner.0 && p.rope.same_snapshot(&rope))
+                    .find(|p| p.id == owner.0 && p.rope.same_as(&rope))
                 {
                     // Shaped for the other pane's document while this one
                     // was drawn: kept for when that one is.
@@ -1220,7 +1220,7 @@ impl Atlas {
         if !self
             .editor_snapshot
             .as_ref()
-            .is_some_and(|(id, old)| *id == owner.0 && old.same_snapshot(rope))
+            .is_some_and(|(id, old)| *id == owner.0 && old.same_as(rope))
         {
             let mut old = self.editor_snapshot.take();
             // Another document: park this one's lines and take that one's,
@@ -1301,7 +1301,7 @@ impl Atlas {
         if self
             .editor_snapshot
             .as_ref()
-            .is_some_and(|(id, old)| *id == owner.0 && old.same_snapshot(rope))
+            .is_some_and(|(id, old)| *id == owner.0 && old.same_as(rope))
         {
             return self.editor_lines.get(&owner.1)?.as_deref();
         }
@@ -1309,7 +1309,7 @@ impl Atlas {
         // there lands by its shaping too, not by monospace column math.
         self.parked
             .iter()
-            .find(|p| p.id == owner.0 && p.rope.same_snapshot(rope))?
+            .find(|p| p.id == owner.0 && p.rope.same_as(rope))?
             .lines
             .get(&owner.1)?
             .as_deref()

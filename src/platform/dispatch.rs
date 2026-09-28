@@ -7,6 +7,10 @@
 
 use std::ffi::c_void;
 
+/// How a worker thread says it has something: called on that thread, it
+/// queues the editor's poll on the main one.
+pub type Wake = Box<dyn Fn() + Send + Sync>;
+
 unsafe extern "C" {
     fn dispatch_async_f(
         queue: *mut c_void,

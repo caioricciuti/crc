@@ -131,7 +131,7 @@ impl Worker {
 
     pub fn request(&mut self, owner: Owner, rope: &Rope, range: Range<usize>) {
         if let Some(pending) = self.pending.get_mut(&owner)
-            && pending.rope.same_snapshot(rope)
+            && pending.rope.same_as(rope)
             && pending.range == range
         {
             pending.seen = true;
@@ -254,7 +254,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         };
         assert_eq!(ready[0].0, (1, 1));
-        assert!(ready[0].1.same_snapshot(&old));
+        assert!(ready[0].1.same_as(&old));
         assert_eq!(
             *ready[0].2.as_ref().unwrap().source_bytes.last().unwrap(),
             old.line(1).trim_end_matches(['\r', '\n']).len()
@@ -309,7 +309,7 @@ mod tests {
         let ready = worker.poll();
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].0, (1, 2));
-        assert!(ready[0].1.same_snapshot(&new));
+        assert!(ready[0].1.same_as(&new));
         assert!(!worker.is_pending());
     }
 
@@ -327,7 +327,7 @@ mod tests {
         assert_eq!(worker.pending.len(), 1);
         assert_ne!(a.load(Ordering::Relaxed), b.load(Ordering::Relaxed));
         let kept = &worker.pending[&(1, 0)];
-        assert!(kept.rope.same_snapshot(&new));
+        assert!(kept.rope.same_as(&new));
         assert!(!kept.cancelled.load(Ordering::Relaxed));
     }
 
@@ -352,7 +352,7 @@ mod tests {
         }
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].0, owner);
-        assert!(ready[0].1.same_snapshot(&latest));
+        assert!(ready[0].1.same_as(&latest));
         assert_eq!(ready[0].2.as_ref().unwrap().offsets.len(), 9);
     }
 
