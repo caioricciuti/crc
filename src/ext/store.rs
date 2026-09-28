@@ -37,6 +37,7 @@ pub fn list() -> Vec<Installed> {
 }
 
 pub fn list_in(root: &Path) -> Vec<Installed> {
+    recover(root);
     let mut out: Vec<Installed> = std::fs::read_dir(root)
         .into_iter()
         .flatten()
@@ -51,6 +52,43 @@ pub fn list_in(root: &Path) -> Vec<Installed> {
             .cmp(&b.manifest.name.to_lowercase())
     });
     out
+}
+
+/// Puts back what an install cut short left behind. An install writes
+/// `.staging-<id>-<pid>`, moves the installed folder aside to
+/// `.old-<id>-<pid>`, then renames the staging folder into place; a crash
+/// between the two renames leaves the extension only in `.old`, and it is
+/// moved back. Anything else left over is removed. Folders of a crc that is
+/// still running are its own business and left alone.
+fn recover(root: &Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let (old, rest) = if let Some(rest) = name.strip_prefix(".old-") {
+            (true, rest)
+        } else if let Some(rest) = name.strip_prefix(".staging-") {
+            (false, rest)
+        } else {
+            continue;
+        };
+        let Some((id, pid)) = rest.rsplit_once('-') else {
+            continue;
+        };
+        let Ok(pid) = pid.parse::<u64>() else {
+            continue;
+        };
+        if crate::platform::process_alive(pid) {
+            continue;
+        }
+        let target = root.join(id);
+        if old && !target.exists() {
+            let _ = std::fs::rename(entry.path(), &target);
+        } else {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 fn read(dir: &Path) -> Option<Installed> {
@@ -70,7 +108,7 @@ fn read(dir: &Path) -> Option<Installed> {
             .and_then(Value::as_bool)
             .unwrap_or(false),
         enabled: !dir.join("disabled").exists(),
-        readme: std::fs::read_to_string(dir.join("README.md")).unwrap_or_default(),
+        readme: read_readme(&dir.join("README.md")),
         dir: dir.to_path_buf(),
         manifest,
     })
@@ -90,6 +128,17 @@ pub struct Package {
 const MAX_MODULE_BYTES: usize = 16 << 20;
 /// A README past this is not shown.
 const MAX_README_BYTES: usize = 1 << 20;
+
+/// A README to show, or nothing when it is missing or over the limit: the
+/// size is checked before anything is read.
+fn read_readme(path: &Path) -> String {
+    if std::fs::metadata(path).map_or(true, |m| m.len() > MAX_README_BYTES as u64) {
+        return String::new();
+    }
+    std::fs::read(path)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default()
+}
 
 impl Package {
     /// A package from a folder holding manifest.json, README.md and the
@@ -111,11 +160,7 @@ impl Package {
         }
         let wasm =
             std::fs::read(&module).map_err(|_| format!("the folder has no {}", manifest.entry))?;
-        let readme = std::fs::read(folder.join("README.md"))
-            .ok()
-            .filter(|bytes| bytes.len() <= MAX_README_BYTES)
-            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-            .unwrap_or_default();
+        let readme = read_readme(&folder.join("README.md"));
         let package = Package {
             manifest_json,
             manifest,
@@ -229,6 +274,55 @@ mod tests {
 
     fn fixture() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/extensions/sort-lines")
+    }
+
+    #[test]
+    fn an_install_cut_short_is_put_back_or_cleaned_up() {
+        let root = std::env::temp_dir().join(format!("crc-ext-recover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let package = Package::from_folder(&fixture()).unwrap();
+        install_in(&root, &package).unwrap();
+        // A pid no process has: the install that left these is gone.
+        let dead = u32::MAX as u64 - 7;
+        assert!(!crate::platform::process_alive(dead));
+        // The crash came between the renames: only the old folder is left.
+        std::fs::rename(
+            root.join("crc.sort-lines"),
+            root.join(format!(".old-crc.sort-lines-{dead}")),
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join(format!(".staging-crc.sort-lines-{dead}"))).unwrap();
+        // One of this process's, which is alive: left alone.
+        let ours = root.join(format!(".staging-crc.other-{}", std::process::id()));
+        std::fs::create_dir_all(&ours).unwrap();
+        let listed = list_in(&root);
+        assert_eq!(listed.len(), 1, "the extension is back");
+        assert_eq!(listed[0].manifest.id, "crc.sort-lines");
+        let mut names: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                ours.file_name().unwrap().to_string_lossy().into_owned(),
+                "crc.sort-lines".into()
+            ]
+        );
+        // Both the old and the new present: the old one goes.
+        std::fs::create_dir_all(root.join(format!(".old-crc.sort-lines-{dead}"))).unwrap();
+        list_in(&root);
+        assert!(!root.join(format!(".old-crc.sort-lines-{dead}")).exists());
+        assert!(root.join("crc.sort-lines").is_dir());
+        // A README over the limit is not shown.
+        std::fs::write(
+            root.join("crc.sort-lines/README.md"),
+            "x".repeat(MAX_README_BYTES + 1),
+        )
+        .unwrap();
+        assert_eq!(list_in(&root)[0].readme, "");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

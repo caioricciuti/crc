@@ -779,19 +779,29 @@ fn apply_index_patch(root: &Path, patch: &[u8], reverse: bool, check: bool) -> R
     if check {
         cmd.arg("--check");
     }
+    run_with_stdin(&mut cmd, patch.to_vec()).map(|_| ())
+}
+
+/// Runs `cmd` with `input` on its standard input and answers its output, or
+/// Git's own error. The input is written from its own thread: a large one
+/// fills the pipe before Git starts answering, and both sides would wait
+/// for each other. A write cut short because Git exited is Git's error to
+/// report, not the pipe's.
+fn run_with_stdin(cmd: &mut Command, input: Vec<u8>) -> Result<Vec<u8>, String> {
     let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| e.to_string())?;
-    child
-        .stdin
-        .take()
-        .ok_or("Missing Git stdin")?
-        .write_all(patch)
-        .map_err(|e| e.to_string())?;
-    checked(child.wait_with_output().map_err(|e| e.to_string())?).map(|_| ())
+    let mut stdin = child.stdin.take().ok_or("Missing Git stdin")?;
+    let writer = std::thread::spawn(move || stdin.write_all(&input));
+    let output = checked(child.wait_with_output().map_err(|e| e.to_string())?)?;
+    match writer.join() {
+        Ok(Ok(())) => Ok(output),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err("the Git input thread stopped".into()),
+    }
 }
 
 /// Apply one exact, freshly validated hunk to the index. The worktree is never
@@ -857,20 +867,11 @@ pub fn commit(root: &Path, message: &str) -> Result<(), String> {
     if message.trim().is_empty() {
         return Err("Write a commit message first".into());
     }
-    let mut child = command(root)
-        .args(["commit", "--file=-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    child
-        .stdin
-        .take()
-        .ok_or("Missing Git stdin")?
-        .write_all(message.as_bytes())
-        .map_err(|e| e.to_string())?;
-    checked(child.wait_with_output().map_err(|e| e.to_string())?).map(|_| ())
+    run_with_stdin(
+        command(root).args(["commit", "--file=-"]),
+        message.as_bytes().to_vec(),
+    )
+    .map(|_| ())
 }
 
 /// A local branch.
@@ -1088,31 +1089,20 @@ pub struct Blame {
 /// the document's text, so unsaved edits count as not committed yet.
 pub fn blame_line(root: &Path, path: &Path, line: usize, contents: &str) -> Result<Blame, String> {
     let range = format!("{},{}", line + 1, line + 1);
-    let mut child = command(root)
-        .args([
-            "blame",
-            "--porcelain",
-            "--contents",
-            "-",
-            "-L",
-            &range,
-            "--",
-        ])
-        .arg(path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    let mut stdin = child.stdin.take().ok_or("Missing Git stdin")?;
-    let text = contents.to_owned();
-    // Written from its own thread: a large file fills the pipe before Git
-    // starts answering, and both sides would wait for each other.
-    let writer = std::thread::spawn(move || {
-        let _ = stdin.write_all(text.as_bytes());
-    });
-    let output = checked(child.wait_with_output().map_err(|e| e.to_string())?)?;
-    let _ = writer.join();
+    let output = run_with_stdin(
+        command(root)
+            .args([
+                "blame",
+                "--porcelain",
+                "--contents",
+                "-",
+                "-L",
+                &range,
+                "--",
+            ])
+            .arg(path),
+        contents.as_bytes().to_vec(),
+    )?;
     parse_blame(&String::from_utf8_lossy(&output)).ok_or_else(|| "no blame".into())
 }
 
@@ -1574,7 +1564,14 @@ mod tests {
 
         // A staged rename edited again stages its new edit.
         run(&root, &["add", "-A"]).unwrap();
-        commit(&root, "Everything").unwrap();
+        // A message several times a pipe's buffer goes in whole.
+        let body = "a long commit message line\n".repeat(12_000);
+        commit(&root, &format!("Everything\n\n{body}")).unwrap();
+        let logged = run(&root, &["log", "-1", "--format=%B"]).unwrap();
+        assert!(logged.len() > body.len(), "{} bytes", logged.len());
+        // Nothing staged: Git's own refusal, not a broken pipe.
+        let error = commit(&root, &body).unwrap_err();
+        assert!(!error.to_lowercase().contains("pipe"), "{error}");
         run(&root, &["mv", "a file.txt", "moved.txt"]).unwrap();
         std::fs::write(root.join("moved.txt"), "moved and edited\n").unwrap();
         let s = snapshot(&root).unwrap();

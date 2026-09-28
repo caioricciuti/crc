@@ -21,6 +21,24 @@ pub mod update;
 pub mod webview;
 pub mod window;
 
+/// Whether a process exists. Signal 0 checks without sending anything;
+/// `EPERM` means it exists but belongs to someone else.
+pub fn process_alive(pid: u64) -> bool {
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    if unsafe { kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(1)
+}
+
 /// Writes `bytes` to a temporary file beside `path` and renames it over, so
 /// a crash or a full disk leaves the old file rather than half of the new.
 pub fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {

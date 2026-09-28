@@ -150,23 +150,7 @@ pub fn remove_stale(dir: &Path) {
     }
 }
 
-/// Whether a process exists. Signal 0 checks without sending anything;
-/// `EPERM` means it exists but belongs to someone else.
-fn alive(pid: u64) -> bool {
-    unsafe extern "C" {
-        fn kill(pid: i32, signal: i32) -> i32;
-    }
-    let Ok(pid) = i32::try_from(pid) else {
-        return false;
-    };
-    if pid <= 0 {
-        return false;
-    }
-    if unsafe { kill(pid, 0) } == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() == Some(1)
-}
+use crate::platform::process_alive as alive;
 
 /// Reads a lock file back. For tests and the self-test.
 pub fn read(path: &Path) -> std::io::Result<Value> {
