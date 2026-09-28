@@ -71,13 +71,12 @@ jobs:
           cargo --version
 
       # The one step allowed to fetch. It can only fetch what Cargo.lock
-      # names, verified against the checksums recorded there.
+      # names, verified against the checksums recorded there; the gate runs
+      # again on what this job will build.
       - name: Vendor
         env:
           CARGO_NET_OFFLINE: false
-        run: |
-          mkdir -p .cargo
-          cargo vendor --locked --versioned-dirs > .cargo/config.toml
+        run: ./scripts/vendor.sh
 
       - name: Format
         run: cargo fmt --all -- --check

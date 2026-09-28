@@ -31,10 +31,14 @@ than `npm install --ignore-scripts` does.
    with `--locked`, which can only fetch what `Cargo.lock` names and verifies
    it against the checksums recorded there, and then builds with
    `CARGO_NET_OFFLINE=true`.
-3. **Every build script read.** There is exactly one in the whole tree, and
-   `scripts/check-build-scripts.sh` fails CI if that changes. The jobs that
-   compile wait for it, so a pull request that adds a build script is stopped
-   before `cargo test` would have run it.
+3. **Every build script read, every crate listed.** There is exactly one
+   dependency build script in the whole tree, and
+   `scripts/check-build-scripts.sh` fails CI if that changes. It also fails
+   on any crate or version not in its `ALLOWED_CRATES`, on a source other
+   than crates.io (git, another registry), on a path package outside this
+   workspace, and on a new build script or proc macro of our own. The jobs
+   that compile wait for it, so a pull request that changes any of these is
+   stopped before `cargo test` would have run anything.
 
    That check asks cargo, through `cargo metadata`, which build-script and
    proc-macro targets it would build. It went through two worse versions
@@ -120,7 +124,9 @@ a dependency.
 4. `find vendor -maxdepth 2 -name build.rs` and **read every new one**.
 5. `grep -l "proc-macro = true" vendor/*/Cargo.toml` — anything new here runs
    at compile time and needs the same scrutiny as a build script.
-6. Run `scripts/check-build-scripts.sh` and update its allowlist deliberately.
+6. Run `scripts/check-build-scripts.sh` and update its lists deliberately:
+   `ALLOWED_CRATES` (every crate and version), and the build-script and
+   proc-macro allowlists when the crate has either.
 7. Update this file.
 
 ## tree-sitter: vendored C, not the crate
@@ -141,8 +147,9 @@ a seven-day minimum release age, which npm can enforce and cargo cannot.
 
 `build.rs` in the project root is ours. It hands three C files to `cc` and
 emits a static library: no network, no code generation, no writes outside
-`OUT_DIR`. It is not covered by `scripts/check-build-scripts.sh`, which only
-inspects vendored crates, because it is in-repo and reviewable in a diff.
+`OUT_DIR`. It is reviewed in the diff, and `scripts/check-build-scripts.sh`
+lists it in `ALLOWED_WORKSPACE_BUILD`, so a second one of our own is caught
+too.
 
 What is vendored:
 
