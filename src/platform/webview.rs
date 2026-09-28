@@ -135,12 +135,7 @@ fn rule_list(folder_url: Option<&str>, page_url: &str) -> String {
 /// Where the preview of document `id` is written: crc's cache folder,
 /// named for this process so two copies of crc never share one.
 pub fn page_path(id: u64) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(
-        PathBuf::from(home)
-            .join("Library/Caches/crc")
-            .join(format!("preview-{}-{id}.html", std::process::id())),
-    )
+    Some(crate::platform::caches()?.join(format!("preview-{}-{id}.html", std::process::id())))
 }
 
 /// The deepest folder holding both `a` and `b`.
@@ -202,6 +197,11 @@ pub struct WebPreview {
     /// never flashes white before the page's own background.
     shown: bool,
     hidden: bool,
+    /// When the first page was handed over, and whether its load has been
+    /// seen running: WebKit starts loading on its own time, so right after
+    /// `loadFileURL` it is not loading yet, and that is not "finished".
+    load_started: Option<std::time::Instant>,
+    seen_loading: bool,
     /// The appearance last given, so the page's `prefers-color-scheme`
     /// follows crc's theme and not only the system's.
     dark: Option<bool>,
@@ -241,6 +241,8 @@ impl WebPreview {
                 loaded: false,
                 shown: false,
                 hidden: true,
+                load_started: None,
+                seen_loading: false,
                 dark: None,
             })
         }
@@ -302,6 +304,7 @@ impl WebPreview {
                     loadFileURL: &*url, allowingReadAccessToURL: &*access];
             }
             self.loaded = true;
+            self.load_started = Some(std::time::Instant::now());
             return Ok(true);
         }
         if self.loading() {
@@ -323,8 +326,17 @@ impl WebPreview {
     /// Shows the view once its first load has finished, unless `veiled`:
     /// something of crc's is drawn where it sits.
     pub fn reveal_when_loaded(&mut self, veiled: bool) {
-        if self.loaded && !self.shown && !self.loading() {
-            self.shown = true;
+        if self.loaded && !self.shown {
+            let loading = self.loading();
+            self.seen_loading |= loading;
+            // Finished once a load was seen and is over; or, for a load too
+            // quick for any frame to see, a moment after it was asked for.
+            let late = self
+                .load_started
+                .is_some_and(|t| t.elapsed() > std::time::Duration::from_millis(1500));
+            if !loading && (self.seen_loading || late) {
+                self.shown = true;
+            }
         }
         let hidden = !self.shown || veiled;
         if hidden != self.hidden {

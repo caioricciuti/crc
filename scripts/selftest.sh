@@ -1632,8 +1632,11 @@ expect "$T/ext-removed.out" extensions "open selected=crc.sort-lines installed= 
 # Markdown Preview, built in crc-extensions, installed from a folder. Cmd-E
 # splits the pane: the text keeps the left half, the page the right. What
 # the page may load is checked from inside it: the image beside the
-# document loads, a remote one and one outside the folder do not, and a
-# link goes nowhere. An edit re-renders without moving the page's scroll;
+# document loads, one outside the folder does not, a remote image the page
+# is made to load (Markdown Preview itself writes remote images as text) is
+# blocked by crc's rules, and a link goes nowhere. The remote image is one
+# that exists (it loads at 64 pixels without the rules), so a 0 is the
+# rules and not a missing file. An edit re-renders without moving the page's scroll;
 # the palette hides the page while it is up; Cmd-E again closes it and
 # deletes the file it was loaded from.
 X="$PWD/tests/fixtures/extensions/markdown-preview"
@@ -1667,6 +1670,11 @@ idle 2500
 webjs probe
 idle 300
 dump $T/pv-open.out
+webjs (function(){var i=new Image();i.id='remote';i.src='https://www.apple.com/favicon.ico';document.body.appendChild(i);return 'added'})()
+idle 1500
+webjs document.getElementById('remote').naturalWidth + ' ' + document.querySelector('.remote-image').textContent
+idle 300
+dump $T/pv-remote.out
 webjs (document.querySelector('a').click(), 'clicked')
 idle 600
 webjs location.href.indexOf('/Library/Caches/crc/preview-') > 0 ? 'stayed' : location.href
@@ -1692,14 +1700,15 @@ dump $T/pv-closed.out
 quit
 SCRIPT
 HOME="$T/pvhome" CRC_EXT_REGISTRY="file://$T/pvreg/" CRC_EXT_FOLDER="$T/pvfolder" CRC_SELFTEST="$T/pv.script" "$BIN" "$T/pvproj/doc.md" 2> "$T/pv.err"
-expect "$T/pv-open.out" preview "open ext=crc.markdown-preview view=shown probe=64/0/0 scroll=0 h1=Title text=6107"
+expect "$T/pv-open.out" preview "open ext=crc.markdown-preview view=shown probe=64/0 scroll=0 h1=Title text=6113"
+expect "$T/pv-remote.out" preview "open ext=crc.markdown-preview view=shown probe=0 remote"
 # 1100 wide, sidebar 240: the text's 816 points become 407, a gap, 408.
 grep -q '^layout: window 1100x760 sidebar Some(240.0) text 284,116 407x616 ' "$T/pv-open.out" \
     || { echo "FAIL preview: the text did not give the page its half: $(grep '^layout:' "$T/pv-open.out")"; fail=1; }
 expect "$T/pv-link.out" preview "open ext=crc.markdown-preview view=shown probe=stayed"
-expect "$T/pv-edited.out" preview "open ext=crc.markdown-preview view=shown probe=64/0/0 scroll=300 h1=- text=6110"
-expect "$T/pv-palette.out" preview "open ext=crc.markdown-preview view=veiled probe=64/0/0 scroll=300 h1=- text=6110"
-expect "$T/pv-back.out" preview "open ext=crc.markdown-preview view=shown probe=64/0/0 scroll=300 h1=- text=6110"
+expect "$T/pv-edited.out" preview "open ext=crc.markdown-preview view=shown probe=64/0 scroll=300 h1=- text=6116"
+expect "$T/pv-palette.out" preview "open ext=crc.markdown-preview view=veiled probe=64/0 scroll=300 h1=- text=6116"
+expect "$T/pv-back.out" preview "open ext=crc.markdown-preview view=shown probe=64/0 scroll=300 h1=- text=6116"
 expect "$T/pv-closed.out" preview "closed"
 [ -z "$(ls "$T/pvhome/Library/Caches/crc" 2>/dev/null | grep '^preview-')" ] \
     || { echo "FAIL preview: page files left behind: $(ls "$T/pvhome/Library/Caches/crc")"; fail=1; }

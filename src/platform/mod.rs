@@ -21,6 +21,26 @@ pub mod update;
 pub mod webview;
 pub mod window;
 
+/// crc's folder in Application Support: kept, and backed up, unlike
+/// Caches, and not something a person browses, unlike Documents.
+pub fn app_support() -> Option<std::path::PathBuf> {
+    Some(home()?.join("Library/Application Support/crc"))
+}
+
+/// `~/Library/Logs/crc`, where Console.app looks for an app's logs.
+pub fn logs() -> Option<std::path::PathBuf> {
+    Some(home()?.join("Library/Logs/crc"))
+}
+
+/// crc's cache folder: anything in it can be rebuilt, and may be deleted.
+pub fn caches() -> Option<std::path::PathBuf> {
+    Some(home()?.join("Library/Caches/crc"))
+}
+
+fn home() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(std::path::PathBuf::from)
+}
+
 /// Whether a process exists. Signal 0 checks without sending anything;
 /// `EPERM` means it exists but belongs to someone else.
 pub fn process_alive(pid: u64) -> bool {

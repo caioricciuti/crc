@@ -1,7 +1,7 @@
 {
   "id": "crc.markdown-preview",
   "name": "Markdown Preview",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A rendered preview of the Markdown document beside the editor, updated as you type.",
   "authors": [
     "crc"

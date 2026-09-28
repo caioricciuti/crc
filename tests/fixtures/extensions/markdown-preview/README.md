@@ -8,7 +8,8 @@ scroll position.
 - CommonMark, plus the GitHub additions: tables, task lists,
   strikethrough and footnotes.
 - Images with a relative path, like `![](img/diagram.png)`, load from the
-  document's folder.
+  document's folder. An image from the network shows as its description,
+  since the preview loads nothing from the network.
 - Light and dark follow crc's appearance.
 
 What it may do, and what it may not:
