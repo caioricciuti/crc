@@ -394,71 +394,61 @@ impl Rope {
         if line == 0 {
             return 0;
         }
-        let mut node = &self.root;
-        let mut remaining = line;
-        let mut offset = 0;
-
-        loop {
-            match &**node {
-                Node::Leaf { text, .. } => {
-                    // Walk to just past the `remaining`-th newline.
-                    let mut seen = 0;
-                    for (i, b) in text.as_bytes().iter().enumerate() {
-                        if *b == b'\n' {
-                            seen += 1;
-                            if seen == remaining {
-                                return offset + i + 1;
-                            }
-                        }
-                    }
-                    return offset + text.len();
+        // The leaf holding newline number `line - 1` (from zero); the line
+        // begins just past it.
+        let (leaf, newline, offset) = self.descend(line - 1, |s| s.lines, |s| s.bytes);
+        let Some(text) = leaf else { return offset };
+        let mut seen = 0;
+        for (i, b) in text.as_bytes().iter().enumerate() {
+            if *b == b'\n' {
+                if seen == newline {
+                    return offset + i + 1;
                 }
-                Node::Internal { children, .. } => {
-                    let mut next = None;
-                    for child in children {
-                        let s = child.summary();
-                        if remaining <= s.lines {
-                            next = Some(child);
-                            break;
-                        }
-                        remaining -= s.lines;
-                        offset += s.bytes;
-                    }
-                    match next {
-                        Some(c) => node = c,
-                        None => return offset,
-                    }
-                }
+                seen += 1;
             }
         }
+        offset + text.len()
     }
 
     /// Which line contains `byte`.
     pub fn byte_to_line(&self, byte: usize) -> usize {
         assert!(byte <= self.len_bytes(), "byte out of range");
-        let mut node = &self.root;
-        let mut remaining = byte;
-        let mut line = 0;
+        match self.descend(byte, |s| s.bytes, |s| s.lines) {
+            (Some(text), at, line) => line + count_newlines(&text.as_bytes()[..at]),
+            (None, _, line) => line,
+        }
+    }
 
+    /// Walks down to the leaf holding unit `at` of `measure` (the first
+    /// child whose measure exceeds what is left of `at`), adding up `carry`
+    /// over every subtree passed on the way. Returns that leaf, `at` within
+    /// it, and the carried sum; no leaf when `at` is at or past the end.
+    #[inline]
+    fn descend(
+        &self,
+        mut at: usize,
+        measure: fn(&Summary) -> usize,
+        carry: fn(&Summary) -> usize,
+    ) -> (Option<&str>, usize, usize) {
+        let mut node = &self.root;
+        let mut carried = 0;
         loop {
             match &**node {
-                Node::Leaf { text, .. } => {
-                    return line + count_newlines(&text.as_bytes()[..remaining]);
-                }
+                Node::Leaf { text, .. } => return (Some(text), at, carried),
                 Node::Internal { children, .. } => {
                     let mut next = None;
                     for child in children {
                         let s = child.summary();
-                        if remaining < s.bytes {
+                        if at < measure(&s) {
                             next = Some(child);
                             break;
                         }
-                        remaining -= s.bytes;
-                        line += s.lines;
+                        at -= measure(&s);
+                        carried += carry(&s);
                     }
                     match next {
-                        Some(c) => node = c,
-                        None => return line,
+                        Some(child) => node = child,
+                        None => return (None, at, carried),
                     }
                 }
             }
@@ -644,68 +634,24 @@ impl Rope {
     /// Scalar index at a byte offset. An interior UTF-8 byte snaps left.
     /// Reads at most one leaf after descending cached subtree counts.
     pub fn byte_to_char(&self, byte: usize) -> usize {
-        let mut node = &self.root;
-        let mut remaining = byte.min(self.len_bytes());
-        let mut chars = 0;
-        loop {
-            match &**node {
-                Node::Leaf { text, .. } => {
-                    while !text.is_char_boundary(remaining) {
-                        remaining -= 1;
-                    }
-                    return chars + text[..remaining].chars().count();
+        match self.descend(byte.min(self.len_bytes()), |s| s.bytes, |s| s.chars) {
+            (Some(text), mut at, chars) => {
+                while !text.is_char_boundary(at) {
+                    at -= 1;
                 }
-                Node::Internal { children, .. } => {
-                    let mut next = None;
-                    for child in children {
-                        let s = child.summary();
-                        if remaining < s.bytes {
-                            next = Some(child);
-                            break;
-                        }
-                        remaining -= s.bytes;
-                        chars += s.chars;
-                    }
-                    match next {
-                        Some(child) => node = child,
-                        None => return chars,
-                    }
-                }
+                chars + text[..at].chars().count()
             }
+            (None, _, chars) => chars,
         }
     }
 
     /// Byte offset of a Unicode scalar index, clamped to the rope end.
     pub fn char_to_byte(&self, index: usize) -> usize {
-        let mut node = &self.root;
-        let mut remaining = index;
-        let mut byte = 0;
-        loop {
-            match &**node {
-                Node::Leaf { text, .. } => {
-                    return byte
-                        + text
-                            .char_indices()
-                            .nth(remaining)
-                            .map_or(text.len(), |(i, _)| i);
-                }
-                Node::Internal { children, .. } => {
-                    let mut next = None;
-                    for child in children {
-                        let s = child.summary();
-                        if remaining < s.chars {
-                            next = Some(child);
-                            break;
-                        }
-                        remaining -= s.chars;
-                        byte += s.bytes;
-                    }
-                    match next {
-                        Some(child) => node = child,
-                        None => return byte,
-                    }
-                }
+        match self.descend(index, |s| s.chars, |s| s.bytes) {
+            (Some(text), at, byte) => {
+                byte + text.char_indices().nth(at).map_or(text.len(), |(i, _)| i)
             }
+            (None, _, byte) => byte,
         }
     }
 
@@ -715,71 +661,28 @@ impl Rope {
 
     /// UTF-16 index at a byte offset, snapping an interior byte left.
     pub fn byte_to_utf16(&self, byte: usize) -> usize {
-        let mut node = &self.root;
-        let mut remaining = byte.min(self.len_bytes());
-        let mut units = 0;
-        loop {
-            match &**node {
-                Node::Leaf { text, .. } => {
-                    while !text.is_char_boundary(remaining) {
-                        remaining -= 1;
-                    }
-                    return units + text[..remaining].encode_utf16().count();
+        match self.descend(byte.min(self.len_bytes()), |s| s.bytes, |s| s.utf16) {
+            (Some(text), mut at, units) => {
+                while !text.is_char_boundary(at) {
+                    at -= 1;
                 }
-                Node::Internal { children, .. } => {
-                    let mut next = None;
-                    for child in children {
-                        let s = child.summary();
-                        if remaining < s.bytes {
-                            next = Some(child);
-                            break;
-                        }
-                        remaining -= s.bytes;
-                        units += s.utf16;
-                    }
-                    match next {
-                        Some(child) => node = child,
-                        None => return units,
-                    }
-                }
+                units + text[..at].encode_utf16().count()
             }
+            (None, _, units) => units,
         }
     }
 
     /// Byte offset at a UTF-16 index. A low surrogate snaps to its scalar start.
     pub fn utf16_to_byte(&self, index: usize) -> usize {
-        let mut node = &self.root;
-        let mut remaining = index;
-        let mut byte = 0;
-        loop {
-            match &**node {
-                Node::Leaf { text, .. } => {
-                    for (at, ch) in text.char_indices() {
-                        if remaining < ch.len_utf16() {
-                            return byte + at;
-                        }
-                        remaining -= ch.len_utf16();
-                    }
-                    return byte + text.len();
-                }
-                Node::Internal { children, .. } => {
-                    let mut next = None;
-                    for child in children {
-                        let s = child.summary();
-                        if remaining < s.utf16 {
-                            next = Some(child);
-                            break;
-                        }
-                        remaining -= s.utf16;
-                        byte += s.bytes;
-                    }
-                    match next {
-                        Some(child) => node = child,
-                        None => return byte,
-                    }
-                }
+        let (leaf, mut at, byte) = self.descend(index, |s| s.utf16, |s| s.bytes);
+        let Some(text) = leaf else { return byte };
+        for (i, ch) in text.char_indices() {
+            if at < ch.len_utf16() {
+                return byte + i;
             }
+            at -= ch.len_utf16();
         }
+        byte + text.len()
     }
 
     /// Copy only a native string query's requested units, across leaf boundaries.
@@ -806,25 +709,8 @@ impl Rope {
         if idx >= self.len_bytes() {
             return None;
         }
-        let mut node = &self.root;
-        let mut remaining = idx;
-        loop {
-            match &**node {
-                Node::Leaf { text, .. } => return Some(text.as_bytes()[remaining]),
-                Node::Internal { children, .. } => {
-                    let mut next = None;
-                    for child in children {
-                        let bytes = child.summary().bytes;
-                        if remaining < bytes {
-                            next = Some(child);
-                            break;
-                        }
-                        remaining -= bytes;
-                    }
-                    node = next?;
-                }
-            }
-        }
+        let (leaf, at, _) = self.descend(idx, |s| s.bytes, |_| 0);
+        leaf.map(|text| text.as_bytes()[at])
     }
 
     /// Finds the next occurrence of `needle` at or after `from`.

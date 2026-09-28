@@ -19,7 +19,7 @@ use crate::text::documents::Documents;
 #[cfg(test)]
 use objc2_foundation::NSString;
 
-use crate::text::columns::{TAB_WIDTH, advance};
+use crate::text::columns::TAB_WIDTH;
 
 /// A rectangle of the window, in logical points, that something draws into.
 ///
@@ -1062,11 +1062,9 @@ pub fn build_text_appending(
         }
         let offset_at = |byte: usize| -> f32 {
             if let Some(shaped) = &shaped_line {
-                let bytes = &shaped.source_bytes;
-                let index = bytes.partition_point(|&b| b < byte.saturating_sub(line_start));
-                shaped.caret_offset(index.min(shaped.offsets.len() - 1))
+                shaped.x_of_byte(byte.saturating_sub(line_start))
             } else {
-                visual_column_between(buffer, line_start, byte) as f32 * m.advance
+                buffer.rope.visual_column(line_start..byte) as f32 * m.advance
             }
         };
         // A wrapped row is drawn as if the line began at the row's start.
@@ -1521,13 +1519,10 @@ pub fn build_text_appending(
         let x = if let Some((_, shaped, row_x0)) =
             shaped_carets.iter().find(|(index, ..)| *index == row_index)
         {
-            let index = shaped
-                .source_bytes
-                .partition_point(|&byte| byte < caret - line_start);
-            text_x + shaped.caret_offset(index.min(shaped.offsets.len() - 1)) - scroll_x - row_x0
+            text_x + shaped.x_of_byte(caret - line_start) - scroll_x - row_x0
         } else {
-            let column = visual_column_between(buffer, line_start, caret)
-                - visual_column_between(buffer, line_start, row.start);
+            let column = buffer.rope.visual_column(line_start..caret)
+                - buffer.rope.visual_column(line_start..row.start);
             text_x + column as f32 * m.advance - scroll_x
         };
         let y = row.y;
@@ -3749,9 +3744,9 @@ fn push_underline_on(
         {
             continue;
         }
-        let lead = visual_column_between(buffer, line_start, row.start);
-        let c0 = (visual_column_between(buffer, line_start, from.min(to)) - lead) as f32;
-        let c1 = (visual_column_between(buffer, line_start, to.max(from)) - lead) as f32;
+        let lead = buffer.rope.visual_column(line_start..row.start);
+        let c0 = (buffer.rope.visual_column(line_start..from.min(to)) - lead) as f32;
+        let c1 = (buffer.rope.visual_column(line_start..to.max(from)) - lead) as f32;
         let x0 = (text_x + c0 * m.advance - scroll_x).max(text_x);
         // An empty range still gets a mark one cell wide, or it is invisible.
         let x1 = (text_x + c1.max(c0 + 1.0) * m.advance - scroll_x).min(text.x + text.width);
@@ -4687,10 +4682,7 @@ pub fn offset_at_point(buffer: &Buffer, atlas: &Atlas, x: f32, y: f32) -> usize 
             .cached_editor_line((buffer.id(), row.line), &buffer.rope)
             .filter(|_| !split_rtl)
         {
-            let index = shaped
-                .source_bytes
-                .partition_point(|&b| b < row.start - line_start);
-            let x0 = shaped.caret_offset(index.min(shaped.offsets.len() - 1));
+            let x0 = shaped.x_of_byte(row.start - line_start);
             let at = line_start + shaped.byte_at_x(x - text_x + x0 + scrolled);
             return at.clamp(
                 row.start,
@@ -4735,7 +4727,12 @@ pub fn offset_at_point(buffer: &Buffer, atlas: &Atlas, x: f32, y: f32) -> usize 
     }
     let column = ((x - text_x) / m.advance).max(0.0) + buffer.scroll_column as f32;
 
-    byte_at_visual_column(buffer, line, column)
+    crate::text::wrap::byte_at_fraction(
+        &buffer.rope,
+        start,
+        crate::text::wrap::line_end(&buffer.rope, line),
+        column,
+    )
 }
 
 /// The line whose fold chevron is under a point in the text area's own
@@ -4780,13 +4777,7 @@ pub fn caret_rect(buffer: &Buffer, atlas: &Atlas, text: Viewport) -> Option<View
             .cached_editor_line((buffer.id(), line), &buffer.rope)
             .filter(|_| !split_rtl)
         {
-            let at = |byte: usize| {
-                let index = shaped
-                    .source_bytes
-                    .partition_point(|&b| b < byte - line_start);
-                shaped.caret_offset(index.min(shaped.offsets.len() - 1))
-            };
-            at(caret) - at(row.start)
+            shaped.x_of_byte(caret - line_start) - shaped.x_of_byte(row.start - line_start)
         } else {
             crate::text::wrap::column_in_row(&buffer.rope, row.start, caret) as f32 * m.advance
         };
@@ -4807,13 +4798,9 @@ pub fn caret_rect(buffer: &Buffer, atlas: &Atlas, text: Viewport) -> Option<View
     }
     let line_start = buffer.rope.line_to_byte(line);
     if let Some(shaped) = atlas.cached_editor_line((buffer.id(), line), &buffer.rope) {
-        let utf16 = shaped
-            .source_bytes
-            .partition_point(|&b| b < buffer.cursor() - line_start);
-        let x = text.x
-            + gutter_width(buffer, atlas)
-            + shaped.caret_offset(utf16.min(shaped.offsets.len() - 1))
-            - buffer.scroll_column as f32 * m.advance;
+        let x =
+            text.x + gutter_width(buffer, atlas) + shaped.x_of_byte(buffer.cursor() - line_start)
+                - buffer.scroll_column as f32 * m.advance;
         if x < text.x + gutter_width(buffer, atlas) {
             return None;
         }
@@ -4824,7 +4811,7 @@ pub fn caret_rect(buffer: &Buffer, atlas: &Atlas, text: Viewport) -> Option<View
             height: m.line_height,
         });
     }
-    let column = visual_column_between(buffer, line_start, buffer.cursor());
+    let column = buffer.rope.visual_column(line_start..buffer.cursor());
     let column = column.checked_sub(buffer.scroll_column)?;
     Some(Viewport {
         x: text.x + gutter_width(buffer, atlas) + column as f32 * m.advance,
@@ -4876,38 +4863,6 @@ pub fn push_marked_text(
         [(m.advance * 0.15).max(1.0), at.height],
         theme.cursor,
     );
-}
-
-/// Descends tab-aware rope summaries to `target` visual column, and
-/// returns the byte offset there. Clamps to the end of the line.
-fn byte_at_visual_column(buffer: &Buffer, line: usize, column: f32) -> usize {
-    let target = column.floor() as usize;
-    let start = buffer.rope.line_to_byte(line);
-    let end = if line + 1 < buffer.rope.len_lines() {
-        buffer.rope.line_to_byte(line + 1)
-    } else {
-        buffer.rope.len_bytes()
-    };
-
-    let (byte, column_at) = buffer.rope.visual_seek(start..end, target);
-    let Some(ch) = buffer
-        .rope
-        .chunks_in(byte..end)
-        .next()
-        .and_then(|s| s.chars().next())
-    else {
-        return byte;
-    };
-    if ch == '\r' || ch == '\n' {
-        return byte;
-    }
-    let (at, clicked) = (column_at, column);
-    let next = advance(at, ch);
-    if crate::text::wrap::after_middle(clicked, at, next) {
-        byte + ch.len_utf8()
-    } else {
-        byte
-    }
 }
 
 /// Appends a run of text at an arbitrary position. Used for chrome such as
@@ -5048,35 +5003,30 @@ pub fn screen_rows(buffer: &Buffer, viewport: Viewport, line_height: f32) -> Vec
 /// Cuts a quad to the rows between `top` and `bottom`, texture included,
 /// so a line half scrolled out of the text does not draw over the chrome.
 pub fn clip_vertical(quad: &mut GlyphInstance, top: f32, bottom: f32) {
-    let start = quad.pos[1];
-    let end = start + quad.size[1];
-    if start >= top && end <= bottom {
-        return;
-    }
-    let from = start.max(top).min(bottom);
-    let to = end.min(bottom).max(from);
-    if quad.size[1] > 0.0 {
-        let uv_height = quad.uv[3] - quad.uv[1];
-        quad.uv[1] += uv_height * (from - start) / quad.size[1];
-        quad.uv[3] = quad.uv[1] + uv_height * (to - from) / quad.size[1];
-    }
-    quad.pos[1] = from;
-    quad.size[1] = to - from;
+    clip_axis(quad, 1, top, bottom);
 }
 
-/// Crop textured geometry, including its UVs, rather than painting over it.
 fn clip_horizontal(quad: &mut GlyphInstance, left: f32, right: f32) {
-    let start = quad.pos[0];
-    let end = start + quad.size[0];
-    let from = start.max(left).min(right);
-    let to = end.min(right).max(from);
-    if quad.size[0] > 0.0 {
-        let uv_width = quad.uv[2] - quad.uv[0];
-        quad.uv[0] += uv_width * (from - start) / quad.size[0];
-        quad.uv[2] = quad.uv[0] + uv_width * (to - from) / quad.size[0];
+    clip_axis(quad, 0, left, right);
+}
+
+/// Crops textured geometry to `lo..hi` on `axis` (0 is x, 1 is y), UVs
+/// included, rather than painting over it.
+fn clip_axis(quad: &mut GlyphInstance, axis: usize, lo: f32, hi: f32) {
+    let start = quad.pos[axis];
+    let size = quad.size[axis];
+    if start >= lo && start + size <= hi {
+        return;
     }
-    quad.pos[0] = from;
-    quad.size[0] = to - from;
+    let from = start.max(lo).min(hi);
+    let to = (start + size).min(hi).max(from);
+    if size > 0.0 {
+        let uv = quad.uv[axis + 2] - quad.uv[axis];
+        quad.uv[axis] += uv * (from - start) / size;
+        quad.uv[axis + 2] = quad.uv[axis] + uv * (to - from) / size;
+    }
+    quad.pos[axis] = from;
+    quad.size[axis] = to - from;
 }
 
 /// Short proportional UI labels, shaped and cached independently from code.
@@ -5636,13 +5586,6 @@ pub fn push_rect(
         color,
         ..Default::default()
     });
-}
-
-/// Visual column from `from` to `to`, using tab-aware rope summaries.
-/// Shared by the cursor and the selection so they cannot disagree about
-/// where a column is.
-fn visual_column_between(buffer: &Buffer, from: usize, to: usize) -> usize {
-    buffer.rope.visual_column(from..to)
 }
 
 /// Leading whitespace of `line` in visual columns, or `None` when the line
@@ -6822,15 +6765,12 @@ mod tests {
         buffer.move_right(Motion::Move); // past the tab
         let line_start = buffer.rope.line_to_byte(0);
         assert_eq!(
-            visual_column_between(&buffer, line_start, buffer.cursor()),
+            buffer.rope.visual_column(line_start..buffer.cursor()),
             4,
             "cursor ignored tab expansion"
         );
         buffer.move_right(Motion::Move);
-        assert_eq!(
-            visual_column_between(&buffer, line_start, buffer.cursor()),
-            5
-        );
+        assert_eq!(buffer.rope.visual_column(line_start..buffer.cursor()), 5);
     }
 
     #[test]

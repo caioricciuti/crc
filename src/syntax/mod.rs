@@ -381,6 +381,84 @@ unsafe extern "C" fn read_rope(
     state.chunk.as_ptr() as *const c_char
 }
 
+/// A query running over a tree. Owns its cursor and frees it on drop, so
+/// no early exit can leak one.
+pub(crate) struct QueryMatches {
+    cursor: NonNull<ffi::TSQueryCursor>,
+    current: ffi::TSQueryMatch,
+}
+
+impl QueryMatches {
+    /// Starts `query` at `root`, limited to `bytes` when given. `None` when
+    /// the cursor cannot be allocated.
+    ///
+    /// # Safety
+    /// `query` and the tree `root` belongs to must outlive the value.
+    pub(crate) unsafe fn new(
+        query: *const ffi::TSQuery,
+        root: ffi::TSNode,
+        bytes: Option<std::ops::Range<usize>>,
+    ) -> Option<Self> {
+        let cursor = NonNull::new(unsafe { ffi::ts_query_cursor_new() })?;
+        unsafe {
+            if let Some(bytes) = bytes {
+                ffi::ts_query_cursor_set_byte_range(
+                    cursor.as_ptr(),
+                    bytes.start as u32,
+                    bytes.end as u32,
+                );
+            }
+            ffi::ts_query_cursor_exec(cursor.as_ptr(), query, root);
+        }
+        Some(Self {
+            cursor,
+            // SAFETY: a plain C struct; all zeroes is a valid empty match.
+            current: unsafe { std::mem::zeroed() },
+        })
+    }
+
+    /// The next match: its pattern index and captures, valid until the
+    /// next call.
+    pub(crate) fn next_match(&mut self) -> Option<(u16, &[ffi::TSQueryCapture])> {
+        // SAFETY: the cursor is live; the captures point into it and stay
+        // valid until it advances, which the borrow on `self` rules out.
+        unsafe {
+            if !ffi::ts_query_cursor_next_match(self.cursor.as_ptr(), &mut self.current) {
+                return None;
+            }
+            let captures = if self.current.captures.is_null() {
+                &[][..]
+            } else {
+                std::slice::from_raw_parts(
+                    self.current.captures,
+                    self.current.capture_count as usize,
+                )
+            };
+            Some((self.current.pattern_index, captures))
+        }
+    }
+}
+
+impl Drop for QueryMatches {
+    fn drop(&mut self) {
+        // SAFETY: allocated in `new`, freed once here.
+        unsafe { ffi::ts_query_cursor_delete(self.cursor.as_ptr()) }
+    }
+}
+
+/// The byte range a node covers.
+///
+/// # Safety
+/// `node` must belong to a live tree.
+pub(crate) unsafe fn node_bytes(node: ffi::TSNode) -> (usize, usize) {
+    unsafe {
+        (
+            ffi::ts_node_start_byte(node) as usize,
+            ffi::ts_node_end_byte(node) as usize,
+        )
+    }
+}
+
 /// An owned parse tree.
 pub struct Tree {
     raw: NonNull<ffi::TSTree>,
@@ -507,34 +585,32 @@ impl Highlighter {
     pub fn injection_ranges(&self, tree: &Tree) -> Vec<(Language, Vec<ffi::TSRange>)> {
         let mut out: Vec<(Language, Vec<ffi::TSRange>)> = Vec::new();
         for &(query, language) in &self.injections {
-            // SAFETY: the cursor is allocated and freed here; query and tree
-            // are live for the duration.
-            let Some(cursor) = NonNull::new(unsafe { ffi::ts_query_cursor_new() }) else {
+            // SAFETY: query and tree are live for the duration.
+            let Some(mut matches) = (unsafe {
+                QueryMatches::new(
+                    query.as_ptr(),
+                    ffi::ts_tree_root_node(tree.raw.as_ptr()),
+                    None,
+                )
+            }) else {
                 continue;
             };
             let mut ranges = Vec::new();
-            unsafe {
-                let root = ffi::ts_tree_root_node(tree.raw.as_ptr());
-                ffi::ts_query_cursor_exec(cursor.as_ptr(), query.as_ptr(), root);
-                let mut m = std::mem::zeroed::<ffi::TSQueryMatch>();
-                while ffi::ts_query_cursor_next_match(cursor.as_ptr(), &mut m) {
-                    if m.captures.is_null() {
-                        continue;
-                    }
-                    for capture in std::slice::from_raw_parts(m.captures, m.capture_count as usize)
-                    {
-                        let range = ffi::TSRange {
+            while let Some((_, captures)) = matches.next_match() {
+                for capture in captures {
+                    // SAFETY: capture nodes belong to the live tree.
+                    let range = unsafe {
+                        ffi::TSRange {
                             start_point: ffi::ts_node_start_point(capture.node),
                             end_point: ffi::ts_node_end_point(capture.node),
                             start_byte: ffi::ts_node_start_byte(capture.node),
                             end_byte: ffi::ts_node_end_byte(capture.node),
-                        };
-                        if range.end_byte > range.start_byte {
-                            ranges.push(range);
                         }
+                    };
+                    if range.end_byte > range.start_byte {
+                        ranges.push(range);
                     }
                 }
-                ffi::ts_query_cursor_delete(cursor.as_ptr());
             }
             if ranges.is_empty() {
                 continue;
@@ -652,70 +728,59 @@ impl Highlighter {
         range: std::ops::Range<usize>,
         source: impl Fn(std::ops::Range<usize>) -> String,
     ) -> Vec<Span> {
-        // SAFETY: cursor is allocated and freed in this function.
-        let Some(cursor) = NonNull::new(unsafe { ffi::ts_query_cursor_new() }) else {
+        // SAFETY: query and tree are live for the duration.
+        let Some(mut matches) = (unsafe {
+            QueryMatches::new(
+                self.query.as_ptr(),
+                ffi::ts_tree_root_node(tree.raw.as_ptr()),
+                Some(range),
+            )
+        }) else {
             return Vec::new();
         };
         let mut out: Vec<(u16, Span)> = Vec::new();
 
-        unsafe {
-            ffi::ts_query_cursor_set_byte_range(
-                cursor.as_ptr(),
-                range.start as u32,
-                range.end as u32,
-            );
-            let root = ffi::ts_tree_root_node(tree.raw.as_ptr());
-            ffi::ts_query_cursor_exec(cursor.as_ptr(), self.query.as_ptr(), root);
-
-            let mut m = std::mem::zeroed::<ffi::TSQueryMatch>();
-            while ffi::ts_query_cursor_next_match(cursor.as_ptr(), &mut m) {
-                if m.captures.is_null() {
+        while let Some((pattern, captures)) = matches.next_match() {
+            // Every predicate on this pattern has to hold for every
+            // capture in the match, or the match is not really a match.
+            let predicates = self
+                .pattern_predicates
+                .get(pattern as usize)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            if !predicates.is_empty() {
+                // Text only for the captures a predicate is about: most
+                // captures in a match are not, and copying each one's
+                // text per match per frame was most of the cost.
+                let satisfied = !predicates.iter().any(|p| p.capture().is_none())
+                    && captures.iter().all(|capture| {
+                        if !predicates
+                            .iter()
+                            .any(|p| p.capture() == Some(capture.index))
+                        {
+                            return true;
+                        }
+                        // SAFETY: capture nodes belong to the live tree.
+                        let (start, end) = unsafe { node_bytes(capture.node) };
+                        let text = source(start..end);
+                        predicates.iter().all(|p| p.accepts(capture.index, &text))
+                    });
+                if !satisfied {
                     continue;
                 }
-                let captures = std::slice::from_raw_parts(m.captures, m.capture_count as usize);
+            }
 
-                // Every predicate on this pattern has to hold for every
-                // capture in the match, or the match is not really a match.
-                let predicates = self
-                    .pattern_predicates
-                    .get(m.pattern_index as usize)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]);
-                if !predicates.is_empty() {
-                    // Text only for the captures a predicate is about: most
-                    // captures in a match are not, and copying each one's
-                    // text per match per frame was most of the cost.
-                    let satisfied = !predicates.iter().any(|p| p.capture().is_none())
-                        && captures.iter().all(|capture| {
-                            if !predicates
-                                .iter()
-                                .any(|p| p.capture() == Some(capture.index))
-                            {
-                                return true;
-                            }
-                            let start = ffi::ts_node_start_byte(capture.node) as usize;
-                            let end = ffi::ts_node_end_byte(capture.node) as usize;
-                            let text = source(start..end);
-                            predicates.iter().all(|p| p.accepts(capture.index, &text))
-                        });
-                    if !satisfied {
-                        continue;
-                    }
-                }
-
-                for capture in captures {
-                    let Some(Some(kind)) = self.capture_kinds.get(capture.index as usize).copied()
-                    else {
-                        continue;
-                    };
-                    let start = ffi::ts_node_start_byte(capture.node) as usize;
-                    let end = ffi::ts_node_end_byte(capture.node) as usize;
-                    if end > start {
-                        out.push((m.pattern_index, Span { start, end, kind }));
-                    }
+            for capture in captures {
+                let Some(Some(kind)) = self.capture_kinds.get(capture.index as usize).copied()
+                else {
+                    continue;
+                };
+                // SAFETY: as above.
+                let (start, end) = unsafe { node_bytes(capture.node) };
+                if end > start {
+                    out.push((pattern, Span { start, end, kind }));
                 }
             }
-            ffi::ts_query_cursor_delete(cursor.as_ptr());
         }
 
         // Order matters in three ways, and getting any of them wrong shows

@@ -9,7 +9,7 @@
 
 use std::ptr::NonNull;
 
-use super::{Language, ReadState, ffi};
+use super::{Language, QueryMatches, ReadState, ffi, node_bytes};
 use crate::text::rope::Rope;
 
 /// One definition.
@@ -175,24 +175,16 @@ unsafe fn collect(
                 KINDS.iter().copied().find(|k| *k == name)
             })
             .collect();
-        let Some(cursor) = NonNull::new(ffi::ts_query_cursor_new()) else {
+        let root = ffi::ts_tree_root_node(tree.as_ptr());
+        let Some(mut matches) = QueryMatches::new(query.as_ptr(), root, None) else {
             return;
         };
-        let root = ffi::ts_tree_root_node(tree.as_ptr());
-        ffi::ts_query_cursor_exec(cursor.as_ptr(), query.as_ptr(), root);
-        let mut m = std::mem::zeroed::<ffi::TSQueryMatch>();
-        while ffi::ts_query_cursor_next_match(cursor.as_ptr(), &mut m) {
-            if m.captures.is_null() {
-                continue;
-            }
-            for capture in std::slice::from_raw_parts(m.captures, m.capture_count as usize) {
+        while let Some((_, captures)) = matches.next_match() {
+            for capture in captures {
                 let Some(Some(kind)) = kinds.get(capture.index as usize).copied() else {
                     continue;
                 };
-                let (start, end) = (
-                    ffi::ts_node_start_byte(capture.node) as usize,
-                    ffi::ts_node_end_byte(capture.node) as usize,
-                );
+                let (start, end) = node_bytes(capture.node);
                 let Some(name) = text.get(start..end) else {
                     continue;
                 };
@@ -206,7 +198,6 @@ unsafe fn collect(
                 });
             }
         }
-        ffi::ts_query_cursor_delete(cursor.as_ptr());
     }
 }
 

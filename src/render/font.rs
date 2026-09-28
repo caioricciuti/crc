@@ -193,6 +193,12 @@ impl ShapedLine {
     pub fn caret_offset(&self, index: usize) -> f32 {
         self.primary_carets[index.min(self.primary_carets.len() - 1)]
     }
+
+    /// The caret x of `byte`, counted from the line start: the first UTF-16
+    /// unit at or after it, the line end past the last.
+    pub fn x_of_byte(&self, byte: usize) -> f32 {
+        self.caret_offset(self.source_bytes.partition_point(|&b| b < byte))
+    }
 }
 
 /// Shapes the paragraph at `range` of `rope`, without its line ending: the
@@ -958,17 +964,24 @@ impl Atlas {
         }
     }
 
+    /// What the atlas already knows about `ch`: `Some(Some(slot))` resident
+    /// (its page touched), `Some(None)` known to have no glyph, `None` not
+    /// looked at yet.
+    fn known(&mut self, ch: char) -> Option<Option<Slot>> {
+        if let Some(slot) = self.slots.get(&ch).copied() {
+            self.touch_page(slot.page);
+            return Some(Some(slot));
+        }
+        self.missing.contains(&ch).then_some(None)
+    }
+
     /// Looks a character up, rasterizing it on first sight.
     ///
     /// Returns `None` only when no font on the system has the character, or
     /// the atlas is full.
     pub fn slot_for(&mut self, ch: char) -> Option<Slot> {
-        if let Some(slot) = self.slots.get(&ch).copied() {
-            self.touch_page(slot.page);
-            return Some(slot);
-        }
-        if self.missing.contains(&ch) {
-            return None;
+        if let Some(known) = self.known(ch) {
+            return known;
         }
         match self.rasterize_new(ch) {
             Some(slot) => {
@@ -989,12 +1002,8 @@ impl Atlas {
     /// The resident question mark keeps pending text visible at its source
     /// column until the bitmap arrives. Offline/chrome callers keep slot_for.
     pub fn slot_for_fallback(&mut self, ch: char) -> Option<Slot> {
-        if let Some(slot) = self.slots.get(&ch).copied() {
-            self.touch_page(slot.page);
-            return Some(slot);
-        }
-        if self.missing.contains(&ch) {
-            return None;
+        if let Some(known) = self.known(ch) {
+            return known;
         }
         // Private-use icons retain their dedicated font and fitting behavior.
         if is_icon(ch) {

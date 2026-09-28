@@ -99,15 +99,10 @@ pub fn line_end(rope: &Rope, line: usize) -> usize {
     }
 }
 
-/// Columns from `from` to `to` on one line.
+/// Columns from `from` to `to` on one line, counting from column zero at
+/// `from`.
 pub fn columns_between(rope: &Rope, from: usize, to: usize) -> usize {
-    let mut column = 0;
-    for chunk in rope.chunks_in(from..to) {
-        for ch in chunk.chars() {
-            column = columns::advance(column, ch);
-        }
-    }
-    column
+    rope.visual_column(from..to)
 }
 
 /// Columns from the start of the row that begins at `row_start` to `byte`.
@@ -132,23 +127,25 @@ pub fn byte_at_fraction(rope: &Rope, row_start: usize, row_end: usize, column: f
     let line_start = rope.line_to_byte(rope.byte_to_line(row_start));
     let base = columns_between(rope, line_start, row_start);
     let column = column.max(0.0) + base as f32;
-    let mut at = base;
-    let mut byte = row_start;
-    for chunk in rope.chunks_in(row_start..row_end) {
-        for ch in chunk.chars() {
-            let next = columns::advance(at, ch);
-            if next as f32 > column {
-                return if after_middle(column, at, next) {
-                    byte + ch.len_utf8()
-                } else {
-                    byte
-                };
-            }
-            at = next;
-            byte += ch.len_utf8();
-        }
+    // The character that holds the column, found through the rope's
+    // summaries rather than by walking the row.
+    let (byte, at) = rope.visual_seek(line_start..row_end, column as usize);
+    let byte = byte.max(row_start);
+    let Some(ch) = rope
+        .chunks_in(byte..row_end)
+        .next()
+        .and_then(|s| s.chars().next())
+    else {
+        return row_end;
+    };
+    if ch == '\r' || ch == '\n' {
+        return byte;
     }
-    row_end
+    if after_middle(column, at, columns::advance(at, ch)) {
+        byte + ch.len_utf8()
+    } else {
+        byte
+    }
 }
 
 /// Whether `column` is at or past the middle of a character spanning the
@@ -269,6 +266,57 @@ mod tests {
         assert_eq!(byte_at_column(&rope, 0, 6, 2), 2);
         assert_eq!(byte_at_column(&rope, 0, 6, 99), 6);
         assert_eq!(columns_between(&rope, 0, 4), 4);
+    }
+
+    #[test]
+    fn byte_at_fraction_matches_a_walk_of_the_row() {
+        // The seek through rope summaries against the plain walk it
+        // replaced, over tabs, wide and zero-width characters, many leaves,
+        // and rows starting mid-line.
+        let alphabet = ['a', '\t', '世', ' ', 'é', '\u{301}', '😀'];
+        let mut seed = 0x2545_f491_u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as usize
+        };
+        let text: String = (0..6000)
+            .map(|_| alphabet[next() % alphabet.len()])
+            .collect();
+        let rope = Rope::from_text(&text);
+        let end = line_end(&rope, 0);
+        let walk = |row_start: usize, column: f32| {
+            let base = columns_between(&rope, 0, row_start);
+            let column = column + base as f32;
+            let mut at = base;
+            let mut byte = row_start;
+            for ch in text[row_start..end].chars() {
+                let next = columns::advance(at, ch);
+                if next as f32 > column {
+                    return if after_middle(column, at, next) {
+                        byte + ch.len_utf8()
+                    } else {
+                        byte
+                    };
+                }
+                at = next;
+                byte += ch.len_utf8();
+            }
+            end
+        };
+        for _ in 0..400 {
+            let mut row_start = next() % end;
+            while !text.is_char_boundary(row_start) {
+                row_start -= 1;
+            }
+            let column = (next() % 2000) as f32 / 4.0;
+            assert_eq!(
+                byte_at_fraction(&rope, row_start, end, column),
+                walk(row_start, column),
+                "row at {row_start}, column {column}"
+            );
+        }
     }
 
     #[test]
