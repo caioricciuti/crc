@@ -1192,6 +1192,9 @@ fn fill_find_cache<'a>(
     Ok(cache.as_ref().map_or(&[], |c| c.matches.as_slice()))
 }
 
+/// Project search results shown under the find bar at a time.
+const FIND_RESULT_ROWS: usize = 8;
+
 struct FindBar {
     query: Buffer,
     replacement: Buffer,
@@ -1203,6 +1206,25 @@ struct FindBar {
     selected: usize,
     result_scroll: usize,
     searching: bool,
+}
+
+impl FindBar {
+    /// No results, the first selected, scrolled to the top.
+    fn reset_results(&mut self) {
+        self.results.clear();
+        self.selected = 0;
+        self.result_scroll = 0;
+    }
+
+    /// Scrolls the result list so the selected row is in its window.
+    fn follow_selection(&mut self) {
+        if self.selected < self.result_scroll {
+            self.result_scroll = self.selected;
+        }
+        if self.selected >= self.result_scroll + FIND_RESULT_ROWS {
+            self.result_scroll = self.selected + 1 - FIND_RESULT_ROWS;
+        }
+    }
 }
 
 /// F2's field. The name goes to the server that knows `path`.
@@ -2709,26 +2731,12 @@ define_class!(
 
         #[unsafe(method(selectNextTab:))]
         fn action_next_tab(&self, _sender: Option<&AnyObject>) {
-            let mut state = self.ivars().state.borrow_mut();
-            state.docs.cycle(1);
-            reveal_active_tab(&mut state);
-            drop(state);
-            self.sync_title();
-            self.reparse();
-            self.request_redraw();
-            self.pump();
+            self.cycle_tab(1);
         }
 
         #[unsafe(method(selectPreviousTab:))]
         fn action_prev_tab(&self, _sender: Option<&AnyObject>) {
-            let mut state = self.ivars().state.borrow_mut();
-            state.docs.cycle(-1);
-            reveal_active_tab(&mut state);
-            drop(state);
-            self.sync_title();
-            self.reparse();
-            self.request_redraw();
-            self.pump();
+            self.cycle_tab(-1);
         }
 
         /// Cmd-W closes the tab while more than one is open, and only falls
@@ -2943,29 +2951,22 @@ define_class!(
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| path.display().to_string());
             if all_docs(&self.ivars().state.borrow()).any(|d| d.has_dirty_under(&source_key)) {
-                let mtm = MainThreadMarker::from(self);
-                let alert = NSAlert::new(mtm);
-                alert.setAlertStyle(NSAlertStyle::Warning);
-                alert.setMessageText(&NSString::from_str("Unsaved changes are open"));
-                alert.setInformativeText(&NSString::from_str(
+                ask(
+                    MainThreadMarker::from(self),
+                    "Unsaved changes are open",
                     "Save or close the affected tabs before moving this item to Trash.",
-                ));
-                alert.addButtonWithTitle(&NSString::from_str("OK"));
-                alert.runModal();
+                    &["OK"],
+                );
                 return;
             }
 
-            let mtm = MainThreadMarker::from(self);
-            let alert = NSAlert::new(mtm);
-            alert.setAlertStyle(NSAlertStyle::Warning);
-            alert.setMessageText(&NSString::from_str(&format!("Move “{name}” to Trash?")));
-            alert.setInformativeText(&NSString::from_str(
+            let answer = ask(
+                MainThreadMarker::from(self),
+                &format!("Move “{name}” to Trash?"),
                 "The item can be recovered from the Trash.",
-            ));
-            alert.addButtonWithTitle(&NSString::from_str("Move to Trash"));
-            alert.addButtonWithTitle(&NSString::from_str("Cancel"));
-            const FIRST: isize = 1000;
-            if alert.runModal() != FIRST {
+                &["Move to Trash", "Cancel"],
+            );
+            if answer != 0 {
                 return;
             }
 
@@ -3907,6 +3908,37 @@ impl EditorView {
         })
     }
 
+    /// Brings tab `index` of the focused pane to the front: shown in the tab
+    /// strip, named in the title, parsed. Whether it switched.
+    fn activate_tab(&self, index: usize) -> bool {
+        let switched = {
+            let mut state = self.ivars().state.borrow_mut();
+            let switched = state.docs.switch(index);
+            if switched {
+                reveal_active_tab(&mut state);
+            }
+            switched
+        };
+        if switched {
+            self.sync_title();
+            self.reparse();
+        }
+        switched
+    }
+
+    /// The tab `step` along, round from the last to the first.
+    fn cycle_tab(&self, step: isize) {
+        {
+            let mut state = self.ivars().state.borrow_mut();
+            state.docs.cycle(step);
+            reveal_active_tab(&mut state);
+        }
+        self.sync_title();
+        self.reparse();
+        self.request_redraw();
+        self.pump();
+    }
+
     /// Saves a document the formatter just changed, without formatting it
     /// again on the way out.
     fn save_formatted(&self) {
@@ -4575,19 +4607,7 @@ impl EditorView {
                 })
                 .filter(|d| (1..=9).contains(d))
             {
-                let switched = {
-                    let mut state = self.ivars().state.borrow_mut();
-                    let switched = state.docs.switch(digit as usize - 1);
-                    if switched {
-                        reveal_active_tab(&mut state);
-                    }
-                    switched
-                };
-                if switched {
-                    self.sync_title();
-                    self.reparse();
-                }
-                return switched;
+                return self.activate_tab(digit as usize - 1);
             }
             // Every other Command shortcut is a menu item, and AppKit matches
             // those before the event reaches here.
@@ -5322,12 +5342,7 @@ impl EditorView {
         };
         if let Some((pane, tab)) = elsewhere {
             self.focus_pane(pane);
-            let mut state = self.ivars().state.borrow_mut();
-            state.docs.switch(tab);
-            reveal_active_tab(&mut state);
-            drop(state);
-            self.sync_title();
-            self.reparse();
+            self.activate_tab(tab);
             return true;
         }
 
@@ -5355,13 +5370,12 @@ impl EditorView {
                 drop(state);
                 // A test instance cannot answer a modal; the status says it.
                 if !self.ivars().testing {
-                    let mtm = MainThreadMarker::from(self);
-                    let alert = NSAlert::new(mtm);
-                    alert.setAlertStyle(NSAlertStyle::Warning);
-                    alert.setMessageText(&NSString::from_str("File too large to open"));
-                    alert.setInformativeText(&NSString::from_str(&e.to_string()));
-                    alert.addButtonWithTitle(&NSString::from_str("OK"));
-                    alert.runModal();
+                    ask(
+                        MainThreadMarker::from(self),
+                        "File too large to open",
+                        &e.to_string(),
+                        &["OK"],
+                    );
                 }
                 return true;
             }
@@ -5458,9 +5472,7 @@ impl EditorView {
             // The alert names the active document and Save acts on it, so
             // bring the one in question to the front. It spins a nested run
             // loop, which is why nothing is borrowed across it.
-            self.ivars().state.borrow_mut().docs.switch(index);
-            self.sync_title();
-            self.reparse();
+            self.activate_tab(index);
             self.request_redraw();
             self.pump();
 
@@ -5468,15 +5480,13 @@ impl EditorView {
                 Discard::Cancel => {
                     self.ivars().state.borrow_mut().quit_session = None;
                     self.focus_pane(original_pane);
-                    {
-                        let mut state = self.ivars().state.borrow_mut();
-                        let at = state.docs.iter().position(|b| b.id() == original_doc);
-                        if let Some(at) = at {
-                            state.docs.switch(at);
-                        }
+                    let at = {
+                        let state = self.ivars().state.borrow();
+                        state.docs.iter().position(|b| b.id() == original_doc)
+                    };
+                    if let Some(at) = at {
+                        self.activate_tab(at);
                     }
-                    self.sync_title();
-                    self.reparse();
                     self.request_redraw();
                     self.pump();
                     return false;
@@ -5507,36 +5517,26 @@ impl EditorView {
     fn ask_about_conflict(&self, missing: bool) -> Conflict {
         let name = self.ivars().state.borrow().docs.active().display_name();
         let mtm = MainThreadMarker::from(self);
-        let alert = NSAlert::new(mtm);
-        alert.setAlertStyle(NSAlertStyle::Warning);
-        if missing {
-            alert.setMessageText(&NSString::from_str(&format!(
-                "\u{201c}{name}\u{201d} was deleted on disk."
-            )));
-            alert.setInformativeText(&NSString::from_str(
+        let answer = if missing {
+            ask(
+                mtm,
+                &format!("\u{201c}{name}\u{201d} was deleted on disk."),
                 "Saving will create the file again with the text in this tab.",
-            ));
-            alert.addButtonWithTitle(&NSString::from_str("Save Anyway"));
-            alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+                &["Save Anyway", "Cancel"],
+            )
         } else {
-            alert.setMessageText(&NSString::from_str(&format!(
-                "\u{201c}{name}\u{201d} has changed on disk since you opened it."
-            )));
-            alert.setInformativeText(&NSString::from_str(
+            ask(
+                mtm,
+                &format!("\u{201c}{name}\u{201d} has changed on disk since you opened it."),
                 "Overwrite keeps the text in this tab. Reload takes the version on \
                  disk and drops your changes; Undo brings them back.",
-            ));
-            alert.addButtonWithTitle(&NSString::from_str("Overwrite"));
-            alert.addButtonWithTitle(&NSString::from_str("Cancel"));
-            alert.addButtonWithTitle(&NSString::from_str("Reload"));
-        }
-        const FIRST: isize = 1000;
-        const SECOND: isize = 1001;
-        match alert.runModal() {
-            FIRST => Conflict::Overwrite,
-            SECOND => Conflict::Cancel,
-            _ if missing => Conflict::Cancel,
-            _ => Conflict::Reload,
+                &["Overwrite", "Cancel", "Reload"],
+            )
+        };
+        match answer {
+            0 => Conflict::Overwrite,
+            2 if !missing => Conflict::Reload,
+            _ => Conflict::Cancel,
         }
     }
 
@@ -5570,19 +5570,12 @@ impl EditorView {
 
     fn confirm_revert(&self) -> bool {
         let name = self.ivars().state.borrow().docs.active().display_name();
-        let mtm = MainThreadMarker::from(self);
-        let alert = NSAlert::new(mtm);
-        alert.setAlertStyle(NSAlertStyle::Warning);
-        alert.setMessageText(&NSString::from_str(&format!(
-            "Revert \u{201c}{name}\u{201d} to the saved version?"
-        )));
-        alert.setInformativeText(&NSString::from_str(
+        ask(
+            MainThreadMarker::from(self),
+            &format!("Revert \u{201c}{name}\u{201d} to the saved version?"),
             "Your unsaved changes will be replaced by the file on disk. Undo brings them back.",
-        ));
-        alert.addButtonWithTitle(&NSString::from_str("Revert"));
-        alert.addButtonWithTitle(&NSString::from_str("Cancel"));
-        const FIRST: isize = 1000;
-        alert.runModal() == FIRST
+            &["Revert", "Cancel"],
+        ) == 0
     }
 
     /// Looks at every open file and takes in what changed behind the editor.
@@ -5776,31 +5769,19 @@ impl EditorView {
             return Discard::Saved;
         }
 
-        let mtm = MainThreadMarker::from(self);
-        let alert = NSAlert::new(mtm);
-        {
-            alert.setAlertStyle(NSAlertStyle::Warning);
-            alert.setMessageText(&NSString::from_str(&format!(
-                "Do you want to save the changes to \u{201c}{name}\u{201d}?"
-            )));
-            alert.setInformativeText(&NSString::from_str(
-                "Your changes will be lost if you don't save them.",
-            ));
-            // Order matters: the first button is the default and maps to
-            // NSAlertFirstButtonReturn (1000).
-            alert.addButtonWithTitle(&NSString::from_str("Save"));
-            alert.addButtonWithTitle(&NSString::from_str("Cancel"));
-            alert.addButtonWithTitle(&NSString::from_str("Don't Save"));
-        }
-
-        const FIRST: isize = 1000;
-        const SECOND: isize = 1001;
-        match alert.runModal() {
+        // Save first: the first button is the default.
+        let answer = ask(
+            MainThreadMarker::from(self),
+            &format!("Do you want to save the changes to \u{201c}{name}\u{201d}?"),
+            "Your changes will be lost if you don't save them.",
+            &["Save", "Cancel", "Don't Save"],
+        );
+        match answer {
             // A save that was cancelled from its panel, or failed, is a
             // cancel: the work is still only in memory.
-            FIRST if self.save(false) => Discard::Saved,
-            FIRST | SECOND => Discard::Cancel,
-            _ => Discard::Dropped, // Don't Save
+            0 if self.save(false) => Discard::Saved,
+            2 => Discard::Dropped,
+            _ => Discard::Cancel,
         }
     }
 
@@ -6017,12 +5998,7 @@ impl EditorView {
             } else {
                 bar.selected.saturating_sub(1)
             };
-            if bar.selected < bar.result_scroll {
-                bar.result_scroll = bar.selected;
-            }
-            if bar.selected >= bar.result_scroll + 8 {
-                bar.result_scroll = bar.selected - 7;
-            }
+            bar.follow_selection();
             drop(state);
             self.request_redraw();
             self.pump();
@@ -6252,7 +6228,7 @@ impl EditorView {
             if let Some(bar) = &mut state.find
                 && bar.project
             {
-                bar.results.clear();
+                bar.reset_results();
                 bar.searching = false;
                 return;
             }
@@ -7147,9 +7123,7 @@ impl EditorView {
         state.project_search_rx = Some(rx);
         state.project_search_references = false;
         if let Some(bar) = &mut state.find {
-            bar.results.clear();
-            bar.selected = 0;
-            bar.result_scroll = 0;
+            bar.reset_results();
             bar.searching = true;
         }
         drop(state);
@@ -7387,7 +7361,7 @@ impl EditorView {
                         2 => bar.options.regex = !bar.options.regex,
                         _ => bar.project = !bar.project,
                     }
-                    bar.results.clear();
+                    bar.reset_results();
                 }
             }
             self.refresh_find();
@@ -7410,12 +7384,7 @@ impl EditorView {
                     } else {
                         bar.selected.saturating_sub(1)
                     };
-                    if bar.selected < bar.result_scroll {
-                        bar.result_scroll = bar.selected;
-                    }
-                    if bar.selected >= bar.result_scroll + 8 {
-                        bar.result_scroll = bar.selected - 7;
-                    }
+                    bar.follow_selection();
                 }
             } else {
                 self.find_step(forward);
@@ -7546,23 +7515,20 @@ impl EditorView {
             return say("over 500 matches: narrow the search before replacing".into());
         }
         if !self.ivars().testing {
-            let mtm = MainThreadMarker::from(self);
-            let alert = NSAlert::new(mtm);
-            alert.setAlertStyle(NSAlertStyle::Warning);
-            alert.setMessageText(&NSString::from_str(&format!(
+            let question = format!(
                 "Replace {matches} match{} in {} file{}?",
                 if matches == 1 { "" } else { "es" },
                 files.len(),
                 if files.len() == 1 { "" } else { "s" }
-            )));
-            alert.setInformativeText(&NSString::from_str(
+            );
+            let answer = ask(
+                MainThreadMarker::from(self),
+                &question,
                 "Open files are changed in their tabs and can be undone there. \
                  Files that are not open are saved to disk.",
-            ));
-            alert.addButtonWithTitle(&NSString::from_str("Replace"));
-            alert.addButtonWithTitle(&NSString::from_str("Cancel"));
-            const FIRST: isize = 1000;
-            if alert.runModal() != FIRST {
+                &["Replace", "Cancel"],
+            );
+            if answer != 0 {
                 return;
             }
         }
@@ -7646,9 +7612,7 @@ impl EditorView {
         {
             let mut state = self.ivars().state.borrow_mut();
             if let Some(bar) = &mut state.find {
-                bar.results.clear();
-                bar.selected = 0;
-                bar.result_scroll = 0;
+                bar.reset_results();
             }
         }
         self.reparse();
@@ -7780,11 +7744,7 @@ impl EditorView {
         if on_cross {
             self.close_tab(hit.index);
         } else {
-            let mut state = self.ivars().state.borrow_mut();
-            state.docs.switch(hit.index);
-            drop(state);
-            self.sync_title();
-            self.reparse();
+            self.activate_tab(hit.index);
         }
         self.request_redraw();
         self.pump();
@@ -7836,8 +7796,7 @@ impl EditorView {
             // switching to it first so the alert names the right file. The
             // alert spins a nested run loop, so nothing may be borrowed
             // across it.
-            self.ivars().state.borrow_mut().docs.switch(index);
-            self.sync_title();
+            self.activate_tab(index);
             if !self.confirm_discard() {
                 return;
             }
@@ -7947,8 +7906,7 @@ impl EditorView {
                 state.docs.iter().position(|b| b.is_dirty())
             };
             let Some(at) = dirty else { break };
-            self.ivars().state.borrow_mut().docs.switch(at);
-            self.sync_title();
+            self.activate_tab(at);
             if !self.confirm_discard() {
                 return;
             }
@@ -13232,7 +13190,7 @@ impl EditorView {
                     .results
                     .iter()
                     .skip(bar.result_scroll)
-                    .take(8)
+                    .take(FIND_RESULT_ROWS)
                     .enumerate()
                 {
                     let y = g.results.y + layout::FIND_ROW_HEIGHT * row as f32;
@@ -14818,7 +14776,7 @@ fn chrome_of(state: &State) -> Chrome {
     // spanning the window with four small toggles and nothing else on it.
     let find_rows = state.find.as_ref().map_or(0, |bar| {
         2 + if bar.project {
-            bar.results.len().min(8)
+            bar.results.len().min(FIND_RESULT_ROWS)
         } else {
             0
         }
@@ -14891,14 +14849,27 @@ fn ask_to_restore(mtm: MainThreadMarker, documents: &[recovery::Recovered]) -> b
         eprintln!("crc: restore prompt: {text}");
         return std::env::var("CRC_RESTORE_ANSWER").map_or(true, |a| a != "discard");
     }
+    ask(
+        mtm,
+        "crc quit unexpectedly.",
+        &text,
+        &["Restore", "Discard"],
+    ) == 0
+}
+
+/// A warning with `message`, `detail` and `buttons`, the first the
+/// default. Answers which button was clicked, from 0.
+fn ask(mtm: MainThreadMarker, message: &str, detail: &str, buttons: &[&str]) -> usize {
+    // NSAlertFirstButtonReturn; the ones after it count up.
+    const FIRST: isize = 1000;
     let alert = NSAlert::new(mtm);
     alert.setAlertStyle(NSAlertStyle::Warning);
-    alert.setMessageText(&NSString::from_str("crc quit unexpectedly."));
-    alert.setInformativeText(&NSString::from_str(&text));
-    alert.addButtonWithTitle(&NSString::from_str("Restore"));
-    alert.addButtonWithTitle(&NSString::from_str("Discard"));
-    const FIRST: isize = 1000;
-    alert.runModal() == FIRST
+    alert.setMessageText(&NSString::from_str(message));
+    alert.setInformativeText(&NSString::from_str(detail));
+    for button in buttons {
+        alert.addButtonWithTitle(&NSString::from_str(button));
+    }
+    (alert.runModal() - FIRST).max(0) as usize
 }
 
 /// The restore prompt's text: which documents came back, by name and

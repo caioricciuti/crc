@@ -10,6 +10,7 @@
 
 use std::ops::Range;
 
+use super::{fence_open, heading_level, is_rule, is_table_delimiter, list_marker};
 use crate::syntax::{Kind, Language, Span};
 
 /// A fenced block's code, and the language its info string names.
@@ -211,13 +212,6 @@ fn push_code(out: &mut Styled, source: &str, content: Range<usize>, language: Op
 }
 
 /// `(character, length)` of an opening code fence.
-fn fence_open(body: &str) -> Option<(char, usize)> {
-    let c = body.chars().next().filter(|c| *c == '`' || *c == '~')?;
-    let len = body.chars().take_while(|x| *x == c).count();
-    // A backtick fence's info string cannot hold a backtick.
-    (len >= 3 && !(c == '`' && body[len..].contains('`'))).then_some((c, len))
-}
-
 /// The grammar for a fence's info string.
 pub fn fence_language(info: &str) -> Option<Language> {
     let lower = info.to_ascii_lowercase();
@@ -233,43 +227,6 @@ pub fn fence_language(info: &str) -> Option<Language> {
         other => other,
     };
     Language::from_extension(extension)
-}
-
-fn heading_level(body: &str) -> Option<u8> {
-    let hashes = body.chars().take_while(|c| *c == '#').count();
-    let after = body[hashes..].chars().next();
-    ((1..=6).contains(&hashes) && after.is_none_or(|c| c == ' ' || c == '\t'))
-        .then_some(hashes as u8)
-}
-
-fn is_rule(body: &str) -> bool {
-    let t = body.trim_end();
-    let Some(c) = t.chars().next().filter(|c| matches!(c, '-' | '*' | '_')) else {
-        return false;
-    };
-    t.chars().filter(|x| *x == c).count() >= 3 && t.chars().all(|x| x == c || x == ' ')
-}
-
-/// The length of a list item's marker and the space after it.
-fn list_marker(body: &str) -> Option<usize> {
-    let bytes = body.as_bytes();
-    if matches!(bytes.first(), Some(b'-' | b'*' | b'+'))
-        && matches!(bytes.get(1), Some(b' ' | b'\t'))
-    {
-        return Some(2);
-    }
-    let digits = bytes.iter().take_while(|b| b.is_ascii_digit()).count();
-    ((1..=9).contains(&digits)
-        && matches!(bytes.get(digits), Some(b'.' | b')'))
-        && matches!(bytes.get(digits + 1), Some(b' ' | b'\t')))
-    .then_some(digits + 2)
-}
-
-fn is_table_delimiter(line: &str) -> bool {
-    let t = line.trim();
-    t.contains('-')
-        && t.contains('|')
-        && t.chars().all(|c| matches!(c, '|' | '-' | ':' | ' ' | '\t'))
 }
 
 /// A table row: the pipes faint, the cells as prose, the header's bold.

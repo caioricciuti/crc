@@ -282,21 +282,7 @@ impl Reader {
     /// Definitions whose name starts with `prefix`, shortest names first.
     pub fn symbols(&self, prefix: &str, limit: usize) -> Result<Vec<Symbol>> {
         let like = format!("{}%", crate::index::db::escape_like(prefix));
-        let mut statement = self.db.prepare(
-            "SELECT name, kind, path, line FROM symbols JOIN files ON files.id = symbols.file
-             WHERE name LIKE ?1 ESCAPE '\\' ORDER BY length(name), name LIMIT ?2",
-        )?;
-        statement.bind(&[Value::Text(&like), Value::Int(limit as i64)])?;
-        let mut out = Vec::new();
-        while statement.step()? {
-            out.push(Symbol {
-                name: statement.text(0),
-                kind: statement.text(1),
-                path: statement.text(2),
-                line: statement.int(3) as u32,
-            });
-        }
-        Ok(out)
+        self.symbols_like(&like, limit)
     }
 
     /// Definitions whose name holds the characters of `needle` in order, for
@@ -308,11 +294,17 @@ impl Reader {
             like.push_str(&crate::index::db::escape_like(&c.to_string()));
             like.push('%');
         }
+        self.symbols_like(&like, limit)
+    }
+
+    /// Definitions whose name matches the LIKE pattern `like`, shortest
+    /// first.
+    fn symbols_like(&self, like: &str, limit: usize) -> Result<Vec<Symbol>> {
         let mut statement = self.db.prepare(
             "SELECT name, kind, path, line FROM symbols JOIN files ON files.id = symbols.file
              WHERE name LIKE ?1 ESCAPE '\\' ORDER BY length(name), name LIMIT ?2",
         )?;
-        statement.bind(&[Value::Text(&like), Value::Int(limit as i64)])?;
+        statement.bind(&[Value::Text(like), Value::Int(limit as i64)])?;
         let mut out = Vec::new();
         while statement.step()? {
             out.push(Symbol {

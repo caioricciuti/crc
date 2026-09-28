@@ -388,56 +388,62 @@ fn gather_continuation(lines: &[&str], i: &mut usize, text: &mut String) {
     }
 }
 
+// The block rules both readers of Markdown use, the renderer below and the
+// styled source in `source`, so they cannot come to disagree. Each takes a
+// line with its indent already removed.
+
 /// The fence that opens a code block, if this line does.
 fn fence_of(line: &str) -> Option<String> {
-    for marker in ['`', '~'] {
-        let count = line.chars().take_while(|c| *c == marker).count();
-        if count >= 3 {
-            return Some(std::iter::repeat_n(marker, count).collect());
-        }
-    }
-    None
+    fence_open(line).map(|(c, len)| std::iter::repeat_n(c, len).collect())
 }
 
+/// A fence's character and length: three or more backticks or tildes. A
+/// backtick fence's info string cannot hold a backtick.
+fn fence_open(line: &str) -> Option<(char, usize)> {
+    let c = line.chars().next().filter(|c| *c == '`' || *c == '~')?;
+    let len = line.chars().take_while(|x| *x == c).count();
+    (len >= 3 && !(c == '`' && line[len..].contains('`'))).then_some((c, len))
+}
+
+/// `#` to `######` followed by a space, a tab or nothing: `#text` is not a
+/// heading, `#` alone is.
 fn heading_level(line: &str) -> Option<u8> {
     let hashes = line.chars().take_while(|c| *c == '#').count();
-    // `#text` without a space is not a heading; `#` alone is.
-    let valid = (1..=6).contains(&hashes) && line[hashes..].chars().next().is_none_or(|c| c == ' ');
-    valid.then_some(hashes as u8)
+    let after = line[hashes..].chars().next();
+    ((1..=6).contains(&hashes) && after.is_none_or(|c| c == ' ' || c == '\t'))
+        .then_some(hashes as u8)
 }
 
+/// Three or more of one of `-`, `*`, `_`, with spaces or tabs between.
 fn is_rule(line: &str) -> bool {
-    for marker in ['-', '*', '_'] {
-        let stripped: String = line.chars().filter(|c| !c.is_whitespace()).collect();
-        if stripped.len() >= 3 && stripped.chars().all(|c| c == marker) {
-            return true;
-        }
+    let t = line.trim_end();
+    let Some(c) = t.chars().next().filter(|c| matches!(c, '-' | '*' | '_')) else {
+        return false;
+    };
+    t.chars().filter(|x| *x == c).count() >= 3 && t.chars().all(|x| x == c || x == ' ' || x == '\t')
+}
+
+/// The length of a list item's marker and the space after it: `-`, `*` or
+/// `+`, or one to nine digits and `.` or `)`, then a space or a tab.
+fn list_marker(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    if matches!(bytes.first(), Some(b'-' | b'*' | b'+'))
+        && matches!(bytes.get(1), Some(b' ' | b'\t'))
+    {
+        return Some(2);
     }
-    false
+    let digits = bytes.iter().take_while(|b| b.is_ascii_digit()).count();
+    ((1..=9).contains(&digits)
+        && matches!(bytes.get(digits), Some(b'.' | b')'))
+        && matches!(bytes.get(digits + 1), Some(b' ' | b'\t')))
+    .then_some(digits + 2)
 }
 
 /// Splits a list marker from its content.
 fn list_item(line: &str) -> Option<(Option<u64>, Option<bool>, &str)> {
-    let mut number = None;
-    let rest = if let Some(rest) = line
-        .strip_prefix("- ")
-        .or_else(|| line.strip_prefix("* "))
-        .or_else(|| line.strip_prefix("+ "))
-    {
-        rest
-    } else {
-        // Ordered: digits then `.` or `)`.
-        let digits = line.chars().take_while(char::is_ascii_digit).count();
-        if digits == 0 || digits > 9 {
-            return None;
-        }
-        let after = &line[digits..];
-        let rest = after
-            .strip_prefix(". ")
-            .or_else(|| after.strip_prefix(") "))?;
-        number = line[..digits].parse::<u64>().ok();
-        rest
-    };
+    let marker = list_marker(line)?;
+    let number = line[..marker - 2].parse::<u64>().ok();
+    let rest = &line[marker..];
 
     // Task list markers, which are the one list extension worth having.
     let (task, content) = if let Some(c) = rest.strip_prefix("[ ] ") {
@@ -454,12 +460,17 @@ fn list_item(line: &str) -> Option<(Option<u64>, Option<bool>, &str)> {
     Some((number, task, content))
 }
 
+/// A table's delimiter row: cells of `-` with an optional `:` at either
+/// end, between pipes, at least one pipe.
 fn is_table_delimiter(line: &str) -> bool {
-    let body = line.trim_matches('|');
-    !body.is_empty()
+    let t = line.trim();
+    let body = t.trim_start_matches('|').trim_end_matches('|');
+    t.contains('|')
+        && !body.is_empty()
         && body.split('|').all(|cell| {
             let c = cell.trim();
-            !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':')
+            let dashes = c.trim_start_matches(':').trim_end_matches(':');
+            !dashes.is_empty() && dashes.chars().all(|ch| ch == '-') && c.len() - dashes.len() <= 2
         })
 }
 
@@ -726,6 +737,35 @@ fn find_from(chars: &[char], from: usize, needle: char) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The block rules the renderer and the styled source share, at the
+    /// cases the two used to answer differently.
+    #[test]
+    fn block_rules_follow_commonmark() {
+        assert_eq!(heading_level("#\tTabbed"), Some(1));
+        assert_eq!(heading_level("#nospace"), None);
+        assert_eq!(heading_level("######"), Some(6));
+        assert_eq!(heading_level("####### seven"), None);
+        assert!(is_rule("- -\t-"));
+        assert!(!is_rule("--"));
+        assert!(!is_rule("-*-"));
+        assert_eq!(fence_open("```rust"), Some(('`', 3)));
+        assert_eq!(
+            fence_open("``` a`b"),
+            None,
+            "a backtick in a backtick fence's info"
+        );
+        assert_eq!(fence_open("~~~~ a`b"), Some(('~', 4)));
+        assert_eq!(list_marker("-\titem"), Some(2));
+        assert_eq!(list_marker("12) item"), Some(4));
+        assert_eq!(list_marker("1234567890. item"), None);
+        assert!(is_table_delimiter("|:--|--:|:-:|"));
+        assert!(is_table_delimiter("--- | ---"));
+        assert!(!is_table_delimiter("| | --- |"), "an empty cell");
+        assert!(!is_table_delimiter("|:|---|"), "a colon without dashes");
+        assert!(!is_table_delimiter("---"), "no pipe: a rule");
+    }
+
     use super::*;
 
     #[test]
