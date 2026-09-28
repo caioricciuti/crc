@@ -1482,6 +1482,61 @@ mod tests {
         assert!(!tree.has_error());
     }
 
+    /// Multi-cursor edits are recorded one per cursor, back to front, and
+    /// replay to the same tree a full parse gives.
+    #[test]
+    fn multi_cursor_edits_parse_incrementally() {
+        use crate::text::buffer::{Buffer, Motion};
+
+        let mut h = rust();
+        let source = "fn a() { f(1); }\nfn b() { f(2); }\nfn c() { f(3); }\n";
+        let mut buffer = Buffer::from_text(source);
+        let mut tree = h.parse(&buffer.rope).expect("initial parse");
+        buffer.drain_edits();
+        let calls: Vec<usize> = source.match_indices("f(").map(|(at, _)| at + 2).collect();
+        let mut step = |buffer: &mut Buffer, edit: &dyn Fn(&mut Buffer)| {
+            edit(buffer);
+            let edits = buffer.drain_edits().expect("edits should be replayable");
+            let incremental = h
+                .parse_incremental(&buffer.rope, &tree, &edits)
+                .expect("incremental parse");
+            let full = h.parse(&buffer.rope).expect("full parse");
+            let range = 0..buffer.rope.len_bytes();
+            assert_eq!(
+                h.spans(&incremental, range.clone()),
+                h.spans(&full, range),
+                "incremental and full parses disagreed after {:?}",
+                buffer.rope.to_string()
+            );
+            tree = incremental;
+        };
+        // Typing at three carets, a backspace at each, a selection at each
+        // replaced, and an empty pair deleted around each.
+        step(&mut buffer, &|b| {
+            b.place_cursor(calls[0], Motion::Move);
+            b.add_cursor(calls[1], calls[1]);
+            b.add_cursor(calls[2], calls[2]);
+            b.insert("x + ");
+        });
+        step(&mut buffer, &|b| b.backspace());
+        step(&mut buffer, &|b| {
+            let text = b.rope.to_string();
+            let at: Vec<usize> = text.match_indices("x +").map(|(at, _)| at).collect();
+            b.select_range(at[0], at[0] + 3);
+            b.add_cursor(at[1], at[1] + 3);
+            b.add_cursor(at[2], at[2] + 3);
+            b.insert("\"()\"");
+        });
+        step(&mut buffer, &|b| {
+            let text = b.rope.to_string();
+            let at: Vec<usize> = text.match_indices("()").map(|(at, _)| at + 1).collect();
+            b.place_cursor(at[1], Motion::Move);
+            b.add_cursor(at[2], at[2]);
+            b.add_cursor(at[3], at[3]);
+            b.backspace_paired();
+        });
+    }
+
     // ---- the vendored grammars --------------------------------------------
 
     /// A query that does not fit its grammar makes `Highlighter::new` return

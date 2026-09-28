@@ -306,6 +306,13 @@ struct Snapshot {
     extra: Vec<(usize, usize)>,
 }
 
+/// Where a position exactly at an insertion ends up.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AtInsert {
+    Before,
+    After,
+}
+
 /// What a bare cursor consumes around itself in a multi-cursor edit. A cursor
 /// with a selection always consumes exactly its selection.
 #[derive(Clone, Copy)]
@@ -1198,9 +1205,6 @@ impl Buffer {
         let text = &*normalize_newlines(text);
         if !self.extra.is_empty() {
             self.checkpoint_keeping_cursors(EditKind::Insert);
-            // Multi-cursor edits are not describable as a single tree-sitter
-            // edit, so the syntax layer re-parses in full.
-            self.invalidate_edits();
             self.edit_at_all_cursors(text, Reach::Nothing);
             return;
         }
@@ -1229,7 +1233,6 @@ impl Buffer {
         }
         if !self.extra.is_empty() {
             self.checkpoint_keeping_cursors(EditKind::Delete);
-            self.invalidate_edits();
             // One character back at each bare cursor; a selection consumes
             // itself instead.
             self.edit_at_all_cursors("", Reach::Back);
@@ -1483,54 +1486,92 @@ impl Buffer {
         }
     }
 
-    /// Replaces every selection with `replacement`, back to front.
-    ///
-    /// Back to front so that an earlier edit cannot invalidate a later
-    /// offset. Positions are then recomputed front to back, accumulating the
-    /// net length change as it goes.
+    /// Replaces every selection with `replacement`; every cursor lands at
+    /// the end of its replacement.
     fn edit_at_all_cursors(&mut self, replacement: &str, reach: Reach) {
         // Every range is measured here, against the text as it is, before any
         // of them is applied. How far a caret reaches depends on the
         // character next to *that* caret: one width for all of them deleted
         // half of an accent under one cursor because another sat after an
         // ASCII letter.
-        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
         for (start, end) in self.all_selections() {
             let range = match reach {
-                _ if end > start => (start, end),
-                Reach::Nothing => (start, end),
-                Reach::Back => (self.prev_boundary(start), end),
-                Reach::Both => (self.prev_boundary(start), self.next_boundary(end)),
+                _ if end > start => start..end,
+                Reach::Nothing => start..end,
+                Reach::Back => self.prev_boundary(start)..end,
+                Reach::Both => self.prev_boundary(start)..self.next_boundary(end),
             };
             // Reaching can run into the neighbour, and two edits over the
             // same bytes would delete past what the first one left.
             match ranges.last_mut() {
-                Some(last) if range.0 < last.1 => last.1 = last.1.max(range.1),
+                Some(last) if range.start < last.end => last.end = last.end.max(range.end),
                 _ => ranges.push(range),
             }
         }
-
-        for &(from, end) in ranges.iter().rev() {
-            if end > from {
-                self.rope.delete(from..end);
-            }
-            if !replacement.is_empty() {
-                self.rope.insert(from, replacement);
-            }
+        // Each cursor as a caret at its selection's end, which the edits
+        // carry to the end of its replacement.
+        let end = |(a, b): (usize, usize)| (a.max(b), a.max(b));
+        (self.anchor, self.cursor) = end((self.anchor, self.cursor));
+        for cursor in &mut self.extra {
+            *cursor = end(*cursor);
         }
+        let edits: Vec<_> = ranges.into_iter().map(|r| (r, replacement)).collect();
+        self.apply_edits(&edits, AtInsert::After);
+        // Cursors whose ranges merged now share a place; keep one there.
+        let mut seen = std::collections::HashSet::from([self.cursor]);
+        self.extra.retain(|&(_, at)| seen.insert(at));
+    }
 
-        // Recompute every cursor's landing position.
-        let mut delta: isize = 0;
-        let mut positions = Vec::with_capacity(ranges.len());
-        for &(from, end) in &ranges {
-            let landing = (from as isize + delta) as usize + replacement.len();
-            positions.push(landing);
-            delta += replacement.len() as isize - (end as isize - from as isize);
+    /// Applies `edits` within the current undo step. They are in order, do
+    /// not overlap, and are measured against the text as it is. Each goes
+    /// in back to front and is recorded for the parser, so the tree updates
+    /// incrementally, and every caret and anchor moves with the text around
+    /// it: before an edit it stays, after one it shifts by the change,
+    /// inside a replaced range it lands at the end of the replacement, and
+    /// exactly at an insertion it goes to `at_insert`'s side.
+    fn apply_edits(&mut self, edits: &[(std::ops::Range<usize>, &str)], at_insert: AtInsert) {
+        for (range, text) in edits.iter().rev() {
+            let old_end_point = self.point_of(range.end);
+            if !range.is_empty() {
+                self.rope.delete(range.clone());
+            }
+            if !text.is_empty() {
+                self.rope.insert(range.start, text);
+            }
+            self.record_edit(
+                range.start,
+                range.end,
+                old_end_point,
+                range.start + text.len(),
+            );
         }
-
-        self.cursor = *positions.first().expect("at least one cursor");
-        self.anchor = self.cursor;
-        self.extra = positions[1..].iter().map(|&p| (p, p)).collect();
+        // shifts[i]: how far the edits before `i` move what follows them.
+        let mut shifts = Vec::with_capacity(edits.len() + 1);
+        let mut shift = 0isize;
+        shifts.push(0);
+        for (range, text) in edits {
+            shift += text.len() as isize - range.len() as isize;
+            shifts.push(shift);
+        }
+        let map = |pos: usize| -> usize {
+            let passed = edits.partition_point(|(range, _)| {
+                pos > range.end
+                    || (pos == range.end && (!range.is_empty() || at_insert == AtInsert::After))
+            });
+            let moved = match edits.get(passed) {
+                Some((range, text)) if range.start < pos => {
+                    range.start as isize + shifts[passed] + text.len() as isize
+                }
+                _ => pos as isize + shifts[passed],
+            };
+            moved.max(0) as usize
+        };
+        self.cursor = map(self.cursor);
+        self.anchor = map(self.anchor);
+        for cursor in &mut self.extra {
+            *cursor = (map(cursor.0), map(cursor.1));
+        }
         self.clamp_positions();
     }
 
@@ -1656,7 +1697,6 @@ impl Buffer {
             let in_empty_pair = |b: &Self, at: usize| matches!((b.char_before(at), b.char_at(at)), (Some(o), Some(c)) if PAIRS.contains(&(o, c)));
             if self.every_caret(in_empty_pair) {
                 self.checkpoint_keeping_cursors(EditKind::Delete);
-                self.invalidate_edits();
                 self.edit_at_all_cursors("", Reach::Both);
             } else {
                 self.backspace();
@@ -1725,29 +1765,13 @@ impl Buffer {
             return 0;
         }
         let text = &*normalize_newlines(text);
-        // The caret keeps its place in the text around the replacements.
-        let mut caret = self.cursor;
-        for &offset in offsets.iter().rev() {
-            if offset + needle.len() <= self.cursor {
-                caret = caret + text.len() - needle.len();
-            } else if offset < self.cursor {
-                caret = offset + text.len();
-            }
-        }
-
+        let edits: Vec<_> = offsets
+            .iter()
+            .map(|&offset| (offset..offset + needle.len(), text))
+            .collect();
         self.checkpoint(EditKind::Insert);
-        // Back to front, so earlier replacements do not shift later offsets.
-        for &offset in offsets.iter().rev() {
-            let end = offset + needle.len();
-            let old_end_point = self.point_of(end);
-            self.rope.delete(offset..end);
-            self.rope.insert(offset, text);
-            self.record_edit(offset, end, old_end_point, offset + text.len());
-        }
-
-        self.cursor = caret.min(self.rope.len_bytes());
+        self.apply_edits(&edits, AtInsert::After);
         self.anchor = self.cursor;
-        self.clamp_positions();
         offsets.len()
     }
 
@@ -1784,29 +1808,13 @@ impl Buffer {
             }
             previous_end = range.end;
         }
-        let mut caret = self.cursor as isize;
-        for (range, replacement) in replacements {
-            if range.end <= self.cursor {
-                caret += replacement.len() as isize - range.len() as isize;
-            } else if range.start < self.cursor {
-                caret = caret - (self.cursor - range.start) as isize + replacement.len() as isize;
-            }
-        }
+        let edits: Vec<_> = replacements
+            .iter()
+            .map(|(range, text)| (range.clone(), text.as_str()))
+            .collect();
         self.checkpoint(EditKind::Insert);
-        for (range, replacement) in replacements.iter().rev() {
-            let old_end_point = self.point_of(range.end);
-            self.rope.delete(range.clone());
-            self.rope.insert(range.start, replacement);
-            self.record_edit(
-                range.start,
-                range.end,
-                old_end_point,
-                range.start + replacement.len(),
-            );
-        }
-        self.cursor = (caret.max(0) as usize).min(self.rope.len_bytes());
+        self.apply_edits(&edits, AtInsert::After);
         self.anchor = self.cursor;
-        self.clamp_positions();
         replacements.len()
     }
 
@@ -1925,27 +1933,14 @@ impl Buffer {
         let unit = self.indent_unit(*lines.start());
         self.checkpoint(EditKind::Insert);
 
-        // Back to front, so earlier insertions do not shift later offsets.
-        // Cursor and anchor each move by the indents inserted *before* them,
-        // which is not the same number for both when only part of a line is
-        // selected.
-        let mut before_cursor = 0usize;
-        let mut before_anchor = 0usize;
-        for line in lines.rev() {
-            let at = self.rope.line_to_byte(line);
-            let old_end_point = self.point_of(at);
-            self.rope.insert(at, &unit);
-            self.record_edit(at, at, old_end_point, at + unit.len());
-            if at <= self.cursor {
-                before_cursor += unit.len();
-            }
-            if at <= self.anchor {
-                before_anchor += unit.len();
-            }
-        }
-        self.cursor += before_cursor;
-        self.anchor += before_anchor;
-        self.clamp_positions();
+        // A caret at a line's start moves with the line's text.
+        let edits: Vec<_> = lines
+            .map(|line| {
+                let at = self.rope.line_to_byte(line);
+                (at..at, unit.as_str())
+            })
+            .collect();
+        self.apply_edits(&edits, AtInsert::After);
     }
 
     /// Removes one indent level from every selected line that has one.
@@ -1956,34 +1951,25 @@ impl Buffer {
         let lines = self.selected_lines();
         self.checkpoint(EditKind::Delete);
 
-        let mut removed_before_cursor = 0usize;
-        let mut removed_before_anchor = 0usize;
-        for line in lines.rev() {
+        let level = self.indent_style.map_or(4, |s| s.width.max(1));
+        let mut edits = Vec::new();
+        for line in lines {
             let at = self.rope.line_to_byte(line);
             let indent = self.indent_of(line);
             // Take a tab, or up to one level of spaces: a line indented by
             // three spaces should still outdent rather than refusing.
-            let level = self.indent_style.map_or(4, |s| s.width.max(1));
             let take = if indent.starts_with('\t') {
                 1
             } else {
                 indent.chars().take_while(|c| *c == ' ').count().min(level)
             };
-            if take == 0 {
-                continue;
+            if take > 0 {
+                edits.push((at..at + take, ""));
             }
-            let old_end_point = self.point_of(at + take);
-            self.rope.delete(at..at + take);
-            self.record_edit(at, at + take, old_end_point, at);
-            // Only what was removed before a position moves it: a caret
-            // inside the indentation stops at the line's new start rather
-            // than being pulled back onto the line above.
-            removed_before_cursor += self.cursor.saturating_sub(at).min(take);
-            removed_before_anchor += self.anchor.saturating_sub(at).min(take);
         }
-        self.cursor = self.cursor.saturating_sub(removed_before_cursor);
-        self.anchor = self.anchor.saturating_sub(removed_before_anchor);
-        self.clamp_positions();
+        // A caret inside the removed indentation stops at the line's new
+        // start rather than being pulled back onto the line above.
+        self.apply_edits(&edits, AtInsert::After);
     }
 
     /// Comments or uncomments the selected lines with `token`.
@@ -2023,50 +2009,29 @@ impl Buffer {
             EditKind::Insert
         });
 
-        // Caret and anchor follow the text around them. Lines are edited
-        // bottom up, so each edit is at a position in the original text.
-        let (mut cursor, mut anchor) = (self.cursor as isize, self.anchor as isize);
-        let (original_cursor, original_anchor) = (self.cursor, self.anchor);
-        let shift = |pos: usize, at: usize, removed: usize, inserted: usize| -> isize {
-            if removed > 0 {
-                -(pos.saturating_sub(at).min(removed) as isize)
-            } else if pos > at {
-                inserted as isize
-            } else {
-                0
-            }
-        };
-        for &line in non_empty.iter().rev() {
-            let start = self.rope.line_to_byte(line);
-            let end = self.line_end(line);
-            let text = self.rope.slice_to_string(start..end);
-            let indent_len = text.len() - text.trim_start().len();
-            let at = start + indent_len;
-
-            if all_commented {
-                // Remove the token and one following space if it is there.
-                let rest = &text[indent_len..];
-                let mut take = token.len();
-                if rest[take..].starts_with(' ') {
-                    take += 1;
+        let insert = format!("{token} ");
+        let edits: Vec<_> = non_empty
+            .iter()
+            .map(|&line| {
+                let start = self.rope.line_to_byte(line);
+                let text = self.rope.slice_to_string(start..self.line_end(line));
+                let indent_len = text.len() - text.trim_start().len();
+                let at = start + indent_len;
+                if all_commented {
+                    // The token and one following space if it is there.
+                    let rest = &text[indent_len + token.len()..];
+                    (
+                        at..at + token.len() + usize::from(rest.starts_with(' ')),
+                        "",
+                    )
+                } else {
+                    (at..at, insert.as_str())
                 }
-                let old_end_point = self.point_of(at + take);
-                self.rope.delete(at..at + take);
-                self.record_edit(at, at + take, old_end_point, at);
-                cursor += shift(original_cursor, at, take, 0);
-                anchor += shift(original_anchor, at, take, 0);
-            } else {
-                let insert = format!("{token} ");
-                let old_end_point = self.point_of(at);
-                self.rope.insert(at, &insert);
-                self.record_edit(at, at, old_end_point, at + insert.len());
-                cursor += shift(original_cursor, at, 0, insert.len());
-                anchor += shift(original_anchor, at, 0, insert.len());
-            }
-        }
-        self.cursor = cursor.max(0) as usize;
-        self.anchor = anchor.max(0) as usize;
-        self.clamp_positions();
+            })
+            .collect();
+        // A selection that starts where the token goes takes it in, so a
+        // second toggle restores exactly what was there.
+        self.apply_edits(&edits, AtInsert::Before);
     }
 
     /// Duplicates the selected lines below themselves.
@@ -3796,14 +3761,20 @@ mod tests {
     }
 
     #[test]
-    fn multi_cursor_edits_force_a_full_reparse() {
-        let mut b = Buffer::from_text("a\na\n");
-        b.add_cursor(2, 2);
+    fn multi_cursor_edits_are_recorded_and_keep_folds() {
+        let mut b = Buffer::from_text("fn a() {\n    1\n}\nb\nb\n");
+        assert!(b.fold(0));
+        b.drain_edits();
+        let first_b = "fn a() {\n    1\n}\n".len();
+        b.place_cursor(first_b, Move);
+        b.add_cursor(first_b + 2, first_b + 2);
         b.insert("x");
-        assert!(
-            b.drain_edits().is_none(),
-            "a multi-cursor edit is not one tree-sitter edit"
-        );
+        let edits = b.drain_edits().expect("one edit per cursor, replayable");
+        assert_eq!(edits.len(), 2);
+        assert_eq!(b.rope.to_string(), "fn a() {\n    1\n}\nxb\nxb\n");
+        assert_eq!(b.folds, [(1, 1)], "an edit below a fold leaves it alone");
+        assert_eq!(b.cursor(), first_b + 1, "the primary cursor stays primary");
+        assert_eq!(b.cursor_count(), 2);
     }
 
     #[test]
