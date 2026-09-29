@@ -18,6 +18,7 @@
 //! ASCII uses direct character lookup; other text is shaped as a CTLine.
 
 use crate::text::columns::TAB_WIDTH;
+pub use crate::text::columns::display_width;
 use crate::text::rope::Rope;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
@@ -25,10 +26,16 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+mod editor_cache;
+mod load;
+mod pages;
 mod raster;
 mod reuse;
 mod selection;
 mod worker;
+use editor_cache::*;
+use load::*;
+pub use pages::*;
 
 use objc2_core_foundation::{
     CFAttributedString, CFData, CFDictionary, CFRange, CFRetained, CFString, CGFloat, CGPoint,
@@ -448,59 +455,6 @@ const MAX_EDITOR_MARKERS: usize = 16 * 1024;
 /// Documents whose shaped lines are kept while another is drawn.
 const MAX_PARKED: usize = 3;
 
-/// Shaped text by key, bounded by what was drawn lately: when full, what
-/// was not used this frame or the last goes. Clearing it all at the limit
-/// meant a page with more distinct words than that shaped every word again,
-/// every frame.
-struct RecentCache<K> {
-    limit: usize,
-    lines: HashMap<K, (Rc<ShapedLine>, u64)>,
-}
-
-impl<K: std::hash::Hash + Eq> RecentCache<K> {
-    fn new(limit: usize) -> Self {
-        RecentCache {
-            limit,
-            lines: HashMap::new(),
-        }
-    }
-
-    fn get<Q>(&mut self, key: &Q, frame: u64) -> Option<Rc<ShapedLine>>
-    where
-        K: std::borrow::Borrow<Q>,
-        Q: std::hash::Hash + Eq + ?Sized,
-    {
-        let (line, used) = self.lines.get_mut(key)?;
-        *used = frame;
-        Some(line.clone())
-    }
-
-    fn insert(&mut self, key: K, line: Rc<ShapedLine>, frame: u64) {
-        if self.lines.len() >= self.limit {
-            self.lines.retain(|_, (_, used)| *used + 1 >= frame);
-            // Everything is in use: a page with more than the limit on it.
-            if self.lines.len() >= self.limit {
-                self.lines.clear();
-            }
-        }
-        self.lines.insert(key, (line, frame));
-    }
-}
-
-/// A document's shaped lines, kept while another document is drawn.
-struct Parked {
-    id: u64,
-    rope: Rope,
-    lines: HashMap<usize, Option<Rc<ShapedLine>>>,
-}
-
-impl Parked {
-    /// What its lines count against the cache's budget.
-    fn utf16(&self) -> usize {
-        self.lines.values().flatten().map(|l| l.offsets.len()).sum()
-    }
-}
-
 /// Transparent gutter around each cell, so sampling at a cell edge cannot
 /// bleed a neighbouring glyph in.
 const PAD: usize = 2;
@@ -637,70 +591,6 @@ pub use crate::text::columns::is_icon;
 /// machine can see it, and there is no file to find at run time.
 static ICON_FONT: &[u8] =
     include_bytes!("../../third_party/nerd-fonts-symbols/SymbolsNerdFont-Regular.ttf");
-
-fn load_icon_font(size_px: f32) -> Option<CFRetained<CTFont>> {
-    let data = CFData::from_static_bytes(ICON_FONT);
-    let provider = CGDataProvider::with_cf_data(Some(&data))?;
-    let graphics_font = CGFont::with_data_provider(&provider)?;
-    // SAFETY: a live CGFont, a null matrix meaning identity, no descriptor.
-    Some(unsafe {
-        CTFont::with_graphics_font(&graphics_font, size_px as CGFloat, std::ptr::null(), None)
-    })
-}
-
-pub use crate::text::columns::display_width;
-
-/// Where a character lives in the atlas and how it should be drawn.
-#[derive(Clone, Copy, Debug)]
-pub struct Slot {
-    /// Atlas rect: u0, v0, u1, v1.
-    pub uv: [f32; 4],
-    /// Width in character cells. 2 for CJK and emoji, 1 for everything else.
-    pub cells: u8,
-    /// Whether the glyph carries its own colour and must not be tinted.
-    pub color: bool,
-    pub page: u32,
-    /// Where the quad starts relative to the glyph's pen position, in
-    /// points: negative when ink reaches left of it (an italic `f`), which
-    /// the cell was shifted to hold.
-    pub dx: f32,
-}
-
-impl Slot {
-    pub fn flags(self) -> u32 {
-        u32::from(self.color) | (self.page << 1)
-    }
-}
-
-struct Page {
-    pixels: Vec<u8>,
-    next_cell: usize,
-    last_used: u64,
-    dirty: Dirty,
-}
-
-/// What of a page has to reach its texture.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Dirty {
-    #[default]
-    Clean,
-    /// Glyphs were added in these rows of pixels, into cells no frame has
-    /// used: they can be copied into the texture in place.
-    Rows(usize, usize),
-    /// New, or evicted and refilled: a new texture, so frames still in
-    /// flight keep the old pixels.
-    Whole,
-}
-
-impl Dirty {
-    fn add_rows(&mut self, from: usize, to: usize) {
-        *self = match *self {
-            Dirty::Clean => Dirty::Rows(from, to),
-            Dirty::Rows(a, b) => Dirty::Rows(a.min(from), b.max(to)),
-            Dirty::Whole => Dirty::Whole,
-        };
-    }
-}
 
 pub struct Atlas {
     pub width: u32,
@@ -906,40 +796,6 @@ impl Atlas {
                     self.cached_utf16 += units;
                 }
             }
-        }
-    }
-
-    pub fn page_count(&self) -> usize {
-        1 + self.pages.len()
-    }
-
-    pub fn page_pixels(&self, page: usize) -> &[u8] {
-        if page == 0 {
-            &self.pixels
-        } else {
-            &self.pages[page - 1].pixels
-        }
-    }
-
-    pub fn page_dirty(&self, page: usize) -> Dirty {
-        if page == 0 {
-            self.primary_dirty
-        } else {
-            self.pages[page - 1].dirty
-        }
-    }
-
-    pub fn mark_uploaded(&mut self) {
-        self.dirty = false;
-        self.primary_dirty = Dirty::Clean;
-        for page in &mut self.pages {
-            page.dirty = Dirty::Clean;
-        }
-    }
-
-    fn touch_page(&mut self, page: u32) {
-        if page != 0 {
-            self.pages[page as usize - 1].last_used = self.frame;
         }
     }
 
@@ -1203,204 +1059,6 @@ impl Atlas {
         Some(line)
     }
 
-    /// Makes `rope` of document `doc` the text the shaped editor lines belong
-    /// to: another document's lines are parked and this one's taken back,
-    /// and lines that survived the edit move to their new numbers.
-    fn adopt_snapshot(&mut self, doc: u64, rope: &Rope) {
-        let mut old = self.editor_snapshot.take();
-        // Another document: park this one's lines and take that one's,
-        // if they were kept.
-        if old.as_ref().is_some_and(|(id, _)| *id != doc) {
-            if let Some((id, rope)) = old.take() {
-                let lines = std::mem::take(&mut self.editor_lines);
-                self.parked.push(Parked { id, rope, lines });
-            }
-            if let Some(at) = self.parked.iter().position(|p| p.id == doc) {
-                let parked = self.parked.remove(at);
-                self.editor_lines = parked.lines;
-                old = Some((parked.id, parked.rope));
-            }
-            while self.parked.len() > MAX_PARKED {
-                let dropped = self.parked.remove(0);
-                self.cached_utf16 -= dropped.utf16();
-            }
-        }
-        let mapping = old
-            .as_ref()
-            .filter(|(id, _)| *id == doc)
-            .map(|(_, old)| reuse::LineReuse::new(old, rope));
-        let mut retained = HashMap::new();
-        for (line, shaped) in self.editor_lines.drain() {
-            if let Some((line, _)) = mapping.as_ref().and_then(|m| m.map(line)) {
-                // Deleting duplicate text can map two old paragraphs to
-                // one new line via overlapping prefix/suffix proofs.
-                if let Some(Some(displaced)) = retained.insert(line, shaped) {
-                    self.cached_utf16 -= displaced.offsets.len();
-                }
-            } else if let Some(shaped) = shaped {
-                self.cached_utf16 -= shaped.offsets.len();
-            }
-        }
-        self.editor_lines = retained;
-        if let Some(worker) = &mut self.worker {
-            worker.rebase(doc, mapping.as_ref());
-        }
-        self.editor_snapshot = Some((doc, rope.clone()));
-    }
-
-    /// Cache by immutable rope identity, remapping proven unchanged complete
-    /// lines on edits. Long source extraction and mapping stay on the worker.
-    pub fn shape_editor_line(
-        &mut self,
-        owner: (u64, usize),
-        rope: &Rope,
-        range: std::ops::Range<usize>,
-    ) -> Option<Rc<ShapedLine>> {
-        if !self.editor_snapshot_is(owner.0, rope) {
-            self.adopt_snapshot(owner.0, rope);
-        }
-        if let Some(shaped) = self.editor_lines.get(&owner.1) {
-            if let Some(worker) = &mut self.worker {
-                worker.cancel(owner);
-            }
-            return shaped.clone();
-        }
-        if range.len() > MAX_SHAPED_LINE_BYTES
-            || rope.byte_to_char(range.end) - rope.byte_to_char(range.start) == range.len()
-        {
-            self.cache_editor_line(owner.1, None);
-            return None;
-        }
-        if range.len().saturating_mul(4) <= SYNC_SHAPED_BYTES {
-            let shaped = shape_paragraph(
-                &self.font,
-                rope,
-                range,
-                self.metrics.scale,
-                &AtomicBool::new(false),
-            )
-            .map(Rc::new);
-            self.cache_editor_line(owner.1, shaped.clone());
-            return shaped;
-        }
-        let worker = self.worker.get_or_insert_with(|| {
-            worker::Worker::new(
-                self.font_name.clone(),
-                unsafe { self.font.size() } as f32,
-                self.metrics.scale,
-            )
-        });
-        worker.request(owner, rope, range);
-        None
-    }
-
-    /// Whether the shaped editor lines belong to document `id` as `rope` has it.
-    fn editor_snapshot_is(&self, id: u64, rope: &Rope) -> bool {
-        self.editor_snapshot
-            .as_ref()
-            .is_some_and(|(owner, old)| *owner == id && old.same_as(rope))
-    }
-
-    pub fn cached_editor_line(&self, owner: (u64, usize), rope: &Rope) -> Option<&ShapedLine> {
-        if self.editor_snapshot_is(owner.0, rope) {
-            return self.editor_lines.get(&owner.1)?.as_deref();
-        }
-        // The other pane's document, while this one was drawn last: a click
-        // there lands by its shaping too, not by monospace column math.
-        self.parked
-            .iter()
-            .find(|p| p.id == owner.0 && p.rope.same_as(rope))?
-            .lines
-            .get(&owner.1)?
-            .as_deref()
-    }
-
-    fn make_cache_room(&mut self, units: usize) {
-        // Shaped lines count against the limit; the marker that an ASCII
-        // line needs no shaping costs nothing and does not, or a tall
-        // window evicted every frame what it had just shaped.
-        let shaped_editor = self.editor_lines.values().filter(|l| l.is_some()).count();
-        let mut over = self.shaped_lines.len() + shaped_editor >= MAX_SHAPED_ENTRIES;
-        while over || self.cached_utf16 + units > MAX_CACHED_UTF16 {
-            if !self.parked.is_empty() {
-                let dropped = self.parked.remove(0);
-                self.cached_utf16 -= dropped.utf16();
-                continue;
-            }
-            over = false;
-            if let Some(key) = self.shaped_lines.keys().next().cloned() {
-                self.cached_utf16 -= self.shaped_lines.remove(&key).unwrap().offsets.len();
-            } else if let Some(key) = self
-                .editor_lines
-                .iter()
-                .find(|(_, l)| l.is_some())
-                .map(|(k, _)| *k)
-            {
-                if let Some(shaped) = self.editor_lines.remove(&key).flatten() {
-                    self.cached_utf16 -= shaped.offsets.len();
-                }
-            } else {
-                break;
-            }
-        }
-        // The markers are bounded on their own.
-        if self.editor_lines.len() > MAX_EDITOR_MARKERS {
-            self.editor_lines.retain(|_, l| l.is_some());
-        }
-    }
-
-    fn cache_editor_line(&mut self, line: usize, shaped: Option<Rc<ShapedLine>>) {
-        let units = shaped.as_ref().map_or(0, |s| s.offsets.len());
-        self.make_cache_room(units);
-        if let Some(old) = self.editor_lines.insert(line, shaped).flatten() {
-            self.cached_utf16 -= old.offsets.len();
-        }
-        self.cached_utf16 += units;
-    }
-
-    pub fn finish_shaping_frame(&mut self) {
-        if let Some(worker) = &mut self.worker {
-            worker.finish_frame();
-        }
-    }
-
-    /// Waits for the shaping and rasterising workers, calling `rebuild`
-    /// every 2 ms the way the display link would, and panics past `limit`.
-    /// For benchmarks, dumps and tests that want the settled frame.
-    pub fn settle_shaping(
-        &mut self,
-        limit: std::time::Duration,
-        mut rebuild: impl FnMut(&mut Self),
-    ) {
-        let started = std::time::Instant::now();
-        while self.has_pending_shaping() {
-            assert!(
-                started.elapsed() < limit,
-                "shaping did not finish in {limit:?}"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(2));
-            rebuild(self);
-        }
-    }
-
-    pub fn has_pending_shaping(&self) -> bool {
-        self.worker.as_ref().is_some_and(worker::Worker::is_pending)
-            || self
-                .raster_worker
-                .as_ref()
-                .is_some_and(raster::Worker::is_pending)
-    }
-
-    fn cache_shaped(&mut self, text: String, shaped: ShapedLine) -> Rc<ShapedLine> {
-        self.make_cache_room(shaped.offsets.len());
-        let shaped = Rc::new(shaped);
-        if let Some(old) = self.shaped_lines.insert(text, shaped.clone()) {
-            self.cached_utf16 -= old.offsets.len();
-        }
-        self.cached_utf16 += shaped.offsets.len();
-        shaped
-    }
-
     /// Rasterize only glyphs the layout actually emits. Shaping a long line
     /// must not fill the atlas with thousands of offscreen glyphs.
     pub fn slot_for_shaped(&mut self, shaped: &ShapedLine, glyph: &ShapedGlyph) -> Option<Slot> {
@@ -1459,107 +1117,6 @@ impl Atlas {
     }
 
     // ---- internals -------------------------------------------------------
-
-    /// Reserves consecutive cells without crossing a row or overwriting a
-    /// page referenced by this frame. At the memory cap, evict the oldest
-    /// unused page, leaving ASCII and all currently emitted quads intact.
-    fn alloc(&mut self, cells: usize) -> Option<usize> {
-        fn reserve(next: &mut usize, cells: usize) -> Option<usize> {
-            let mut start = *next;
-            if start / COLS != (start + cells - 1) / COLS {
-                start = (start / COLS + 1) * COLS;
-            }
-            if start + cells > CELLS {
-                return None;
-            }
-            *next = start + cells;
-            Some(start)
-        }
-        if let Some(cell) = reserve(&mut self.next_cell, cells) {
-            return Some(cell);
-        }
-        for (index, page) in self.pages.iter_mut().enumerate() {
-            if let Some(cell) = reserve(&mut page.next_cell, cells) {
-                page.last_used = self.frame;
-                return Some((index + 1) * CELLS + cell);
-            }
-        }
-        if self.page_count() < self.max_pages {
-            self.pages.push(Page {
-                pixels: vec![0; self.pixels.len()],
-                next_cell: cells,
-                last_used: self.frame,
-                dirty: Dirty::Whole,
-            });
-            self.dirty = true;
-            return Some(self.pages.len() * CELLS);
-        }
-        let victim = self
-            .pages
-            .iter()
-            .enumerate()
-            .filter(|(_, page)| page.last_used != self.frame)
-            .min_by_key(|(_, page)| page.last_used)
-            .map(|(index, _)| index);
-        if let Some(index) = victim {
-            let number = (index + 1) as u32;
-            self.slots.retain(|_, slot| slot.page != number);
-            self.face_slots.retain(|_, slot| slot.page != number);
-            for glyphs in self.shaped_slots.values_mut() {
-                glyphs.retain(|_, slot| slot.page != number);
-            }
-            let page = &mut self.pages[index];
-            page.pixels.fill(0);
-            page.next_cell = cells;
-            page.last_used = self.frame;
-            page.dirty = Dirty::Whole;
-            self.dirty = true;
-            return Some((index + 1) * CELLS);
-        }
-        self.exhausted = true;
-        None
-    }
-
-    fn cell_origin(&self, cell: usize) -> (usize, usize) {
-        let (cw, ch) = self.cell_px;
-        let cell = cell % CELLS;
-        ((cell % COLS) * cw, (cell / COLS) * ch)
-    }
-
-    /// The slot for a glyph drawn at `cell`, `cells` wide, with no shift.
-    fn slot_at(&self, cell: usize, cells: usize, color: bool) -> Slot {
-        Slot {
-            dx: 0.0,
-            uv: self.cell_uv(cell, cells),
-            page: (cell / CELLS) as u32,
-            cells: cells as u8,
-            color,
-        }
-    }
-
-    fn cell_uv(&self, cell: usize, cells: usize) -> [f32; 4] {
-        let (cw, ch) = self.cell_px;
-        let (x, y) = self.cell_origin(cell);
-        [
-            x as f32 / self.width as f32,
-            y as f32 / self.height as f32,
-            (x + cw * cells) as f32 / self.width as f32,
-            (y + ch) as f32 / self.height as f32,
-        ]
-    }
-
-    fn cell_uv_inset(&self, cell: usize, inset: f32) -> [f32; 4] {
-        let (cw, ch) = self.cell_px;
-        let (x, y) = self.cell_origin(cell);
-        let cx = x as f32 + cw as f32 * 0.5;
-        let cy = y as f32 + ch as f32 * 0.5;
-        [
-            (cx - inset) / self.width as f32,
-            (cy - inset) / self.height as f32,
-            (cx + inset) / self.width as f32,
-            (cy + inset) / self.height as f32,
-        ]
-    }
 
     fn fill_cell_opaque(&mut self, cell: usize) {
         let (cw, ch) = self.cell_px;
@@ -1829,99 +1386,6 @@ fn resolve_glyph(primary: &CTFont, text: &[u16]) -> Option<(Option<CFRetained<CT
     let fallback = unsafe { CTFont::for_string(primary, &cf, range) };
     let glyph = glyph_in(&fallback, text)?;
     Some((Some(fallback), glyph))
-}
-
-/// A font that has been confirmed usable, with its ASCII glyphs resolved.
-struct Loaded {
-    font: CFRetained<CTFont>,
-    /// Glyph ids for [`FIRST_ASCII`]..=[`LAST_ASCII`], in order.
-    glyphs: Vec<u16>,
-    /// The uniform advance width, in device pixels.
-    advance_px: f32,
-    /// The candidate name that actually resolved to this font.
-    resolved_name: String,
-}
-
-/// Finds a genuinely monospace font, in device pixels at `size_px`.
-///
-/// `CTFont::with_name` never fails: handed a name it cannot resolve it
-/// substitutes a default, which on this system is proportional. So the name
-/// is only a request, and the returned font has to be *measured* to know what
-/// it is. Candidates are tried in order and the first one whose ASCII
-/// advances are all equal wins.
-///
-/// Names here are PostScript names, which is what `with_name` matches on.
-/// "SF Mono" is a display name and does not resolve; "SFMono-Regular" does,
-/// when Xcode or Terminal has installed it.
-fn load_monospace(preferred: &str, size_px: f32) -> Loaded {
-    let fallbacks = ["SFMono-Regular", "Menlo-Regular", "Monaco", "Courier"];
-    let mut tried = Vec::with_capacity(fallbacks.len() + 1);
-
-    for candidate in std::iter::once(preferred).chain(fallbacks) {
-        tried.push(candidate);
-        let cf = CFString::from_str(candidate);
-        let font = unsafe { CTFont::with_name(&cf, size_px as CGFloat, std::ptr::null()) };
-        if let Some(loaded) = measure_if_monospace(font, candidate) {
-            return loaded;
-        }
-    }
-
-    panic!("no monospace font among {tried:?}; all resolved to proportional or incomplete fonts");
-}
-
-/// Resolves ASCII glyphs and returns the font only if every advance matches.
-fn measure_if_monospace(font: CFRetained<CTFont>, name: &str) -> Option<Loaded> {
-    let count = (LAST_ASCII - FIRST_ASCII + 1) as usize;
-    let chars: Vec<u16> = (FIRST_ASCII..=LAST_ASCII).map(|c| c as u16).collect();
-    let mut glyphs = vec![0u16; count];
-
-    // Returns false if *any* character has no glyph in this font.
-    let complete = unsafe {
-        font.glyphs_for_characters(
-            NonNull::new(chars.as_ptr() as *mut u16).expect("non-empty"),
-            NonNull::new(glyphs.as_mut_ptr()).expect("non-empty"),
-            count as isize,
-        )
-    };
-    if !complete {
-        return None;
-    }
-
-    let mut advances = vec![
-        CGSize {
-            width: 0.0,
-            height: 0.0
-        };
-        count
-    ];
-    unsafe {
-        font.advances_for_glyphs(
-            CTFontOrientation::Default,
-            NonNull::new(glyphs.as_mut_ptr()).expect("non-empty"),
-            advances.as_mut_ptr(),
-            count as isize,
-        );
-    }
-
-    let first = advances[0].width as f32;
-    if first <= 0.0 {
-        return None;
-    }
-    // A real monospace font reports identical advances; allow a hair of
-    // floating-point slack but nothing that would visibly misalign a column.
-    let uniform = advances
-        .iter()
-        .all(|a| ((a.width as f32) - first).abs() < 0.01);
-    if !uniform {
-        return None;
-    }
-
-    Some(Loaded {
-        font,
-        glyphs,
-        advance_px: first,
-        resolved_name: name.to_string(),
-    })
 }
 
 #[cfg(test)]

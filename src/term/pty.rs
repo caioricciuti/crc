@@ -80,15 +80,30 @@ pub struct Session {
     /// The master, for the window-size ioctl.
     control: File,
     pid: i32,
+    /// What the reader and wait threads have seen.
+    status: Arc<Status>,
+}
+
+/// Set by the reader thread and the wait thread, read by the session.
+#[derive(Default)]
+struct Status {
     /// Set when the program's side closed, or the program itself exited:
     /// a background job it left holding the terminal keeps the first from
     /// ever happening.
-    exited: Arc<AtomicBool>,
+    exited: AtomicBool,
     /// The program has been waited for; its pid may belong to another
     /// process by now.
-    reaped: Arc<AtomicBool>,
+    reaped: AtomicBool,
     /// A wake-up is queued and not yet taken by [`Session::drain_wake`].
-    woken: Arc<AtomicBool>,
+    woken: AtomicBool,
+}
+
+impl Status {
+    /// Queues a wake-up. True when none was queued, so the caller wakes
+    /// the window; one queued is enough.
+    fn queue_wake(&self) -> bool {
+        !self.woken.swap(true, Ordering::AcqRel)
+    }
 }
 
 impl Session {
@@ -155,19 +170,16 @@ impl Session {
         let child = command.spawn()?;
         let pid = child.id() as i32;
         let wake: Arc<dyn Fn() + Send + Sync> = Arc::from(wake);
-        let exited = Arc::new(AtomicBool::new(false));
-        let woken = Arc::new(AtomicBool::new(false));
-        let reaped = Arc::new(AtomicBool::new(false));
+        let status = Arc::new(Status::default());
         // Reaped on a thread of its own, so it never lingers as a zombie.
         {
-            let (exited, woken, reaped, wake) =
-                (exited.clone(), woken.clone(), reaped.clone(), wake.clone());
+            let (status, wake) = (status.clone(), wake.clone());
             std::thread::spawn(move || {
                 let mut child = child;
                 let _ = child.wait();
-                reaped.store(true, Ordering::Release);
-                exited.store(true, Ordering::Release);
-                if !woken.swap(true, Ordering::AcqRel) {
+                status.reaped.store(true, Ordering::Release);
+                status.exited.store(true, Ordering::Release);
+                if status.queue_wake() {
                     wake();
                 }
             });
@@ -186,7 +198,7 @@ impl Session {
                 }
             }
         });
-        let (shared, done, pending) = (term.clone(), exited.clone(), woken.clone());
+        let (shared, seen) = (term.clone(), status.clone());
         std::thread::spawn(move || {
             let mut reader = master;
             let mut buffer = vec![0u8; 64 * 1024];
@@ -204,12 +216,12 @@ impl Session {
                 if !reply.is_empty() {
                     let _ = replies.write_all(&reply);
                 }
-                if !pending.swap(true, Ordering::AcqRel) {
+                if seen.queue_wake() {
                     wake();
                 }
             }
-            done.store(true, Ordering::Release);
-            pending.store(true, Ordering::Release);
+            seen.exited.store(true, Ordering::Release);
+            seen.woken.store(true, Ordering::Release);
             wake();
         });
         Ok(Session {
@@ -217,9 +229,7 @@ impl Session {
             input,
             control,
             pid,
-            exited,
-            reaped,
-            woken,
+            status,
         })
     }
 
@@ -238,12 +248,12 @@ impl Session {
     }
 
     pub fn has_exited(&self) -> bool {
-        self.exited.load(Ordering::Acquire)
+        self.status.exited.load(Ordering::Acquire)
     }
 
     /// Whether the reader asked for a redraw since the last call.
     pub fn drain_wake(&self) -> bool {
-        self.woken.swap(false, Ordering::AcqRel)
+        self.status.woken.swap(false, Ordering::AcqRel)
     }
 }
 
@@ -252,7 +262,7 @@ impl Drop for Session {
         // The whole process group, as closing a terminal window does; not
         // once the program is gone, since its pid may have been reused. A
         // background job it left behind keeps the terminal until it closes.
-        if !self.reaped.load(Ordering::Acquire) {
+        if !self.status.reaped.load(Ordering::Acquire) {
             crate::platform::send_signal(-self.pid, SIGHUP);
         }
     }

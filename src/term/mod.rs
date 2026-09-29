@@ -13,7 +13,10 @@
 //! resize; programs redraw on SIGWINCH.
 
 pub mod keys;
+mod parser;
 pub mod pty;
+mod text;
+pub use text::*;
 
 use std::collections::VecDeque;
 
@@ -259,20 +262,6 @@ impl Term {
         std::mem::take(&mut self.replies)
     }
 
-    /// The screen as text, trailing blanks trimmed. For tests and dumps.
-    pub fn screen_text(&self) -> String {
-        let lines: Vec<String> = self
-            .screen
-            .iter()
-            .map(|row| cells_text(row).trim_end().to_owned())
-            .collect();
-        let end = lines
-            .iter()
-            .rposition(|l| !l.is_empty())
-            .map_or(0, |i| i + 1);
-        lines[..end].join("\n")
-    }
-
     /// The number of screen row 0, counting from the first line kept.
     fn screen_base(&self) -> u64 {
         self.dropped + self.scrollback.len() as u64
@@ -290,70 +279,6 @@ impl Term {
             None => self.scrollback.get(index).map(Vec::as_slice),
             Some(row) => self.screen.get(row).map(Vec::as_slice),
         }
-    }
-
-    /// The text from `start` to `end`, each a line number and a column
-    /// boundary, in either order. Lines the terminal wrapped are joined;
-    /// others end in a newline, without their trailing blanks.
-    pub fn text_between(&self, start: (u64, usize), end: (u64, usize)) -> String {
-        let (start, end) = if start <= end {
-            (start, end)
-        } else {
-            (end, start)
-        };
-        let mut out = String::new();
-        for number in start.0..=end.0 {
-            let Some(cells) = self.line(number) else {
-                continue;
-            };
-            let from = if number == start.0 { start.1 } else { 0 };
-            let to = if number == end.0 { end.1 } else { cells.len() };
-            let piece = cells_text(&cells[from.min(cells.len())..to.min(cells.len())]);
-            let wrapped = to >= cells.len() && cells.last().is_some_and(|c| c.flags & WRAPPED != 0);
-            if number == end.0 || wrapped {
-                out.push_str(if number == end.0 {
-                    piece.trim_end()
-                } else {
-                    &piece
-                });
-            } else {
-                out.push_str(piece.trim_end());
-                out.push('\n');
-            }
-        }
-        out
-    }
-
-    /// The columns `[from, to)` of the word or path under column `col`, for
-    /// a double click: letters, digits and the characters paths and
-    /// addresses are made of. Any other character is a word of one.
-    pub fn word_at(&self, line: u64, col: usize) -> Option<(usize, usize)> {
-        let cells = self.line(line)?;
-        let col = col.min(cells.len().checked_sub(1)?);
-        let col = if cells[col].flags & WIDE_TAIL != 0 {
-            col.saturating_sub(1)
-        } else {
-            col
-        };
-        let wordy = |c: &Cell| c.flags & WIDE_TAIL != 0 || is_word_char(c.ch);
-        if !wordy(&cells[col]) {
-            return Some((col, col + 1));
-        }
-        Some(span_while(cells.len(), col, |i| wordy(&cells[i])))
-    }
-
-    /// Line `line` as text, with the column each character starts at.
-    pub fn line_chars(&self, line: u64) -> Vec<(usize, char)> {
-        self.line(line)
-            .map(|cells| {
-                cells
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, c)| c.flags & WIDE_TAIL == 0)
-                    .map(|(i, c)| (i, c.ch))
-                    .collect()
-            })
-            .unwrap_or_default()
     }
 
     /// Changes the size. The cursor's line stays on screen: when rows are
@@ -408,212 +333,6 @@ impl Term {
         self.pending_wrap = false;
         self.reset_tabs();
         self.generation += 1;
-    }
-
-    /// Feeds the program's output.
-    pub fn advance(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            self.byte(byte);
-        }
-        self.generation += 1;
-    }
-
-    fn byte(&mut self, byte: u8) {
-        // Strings end at ST (ESC \) or BEL and take everything else.
-        if matches!(self.state, State::Osc | State::Ignore) {
-            if self.string_escape {
-                self.string_escape = false;
-                if byte == b'\\' {
-                    self.end_string();
-                    return;
-                }
-                // ESC ESC inside a device-control string is tmux passing an
-                // escape through to the outer terminal: part of the string.
-                if byte == 0x1B && self.state == State::Ignore {
-                    return;
-                }
-                // ESC and anything but a backslash: the string was cut.
-                self.end_string();
-                self.state = State::Escape;
-                self.escape(byte);
-                return;
-            }
-            match byte {
-                0x07 => self.end_string(),
-                0x1B => self.string_escape = true,
-                0x18 | 0x1A => self.state = State::Ground,
-                _ if self.state == State::Osc && self.osc.len() < MAX_OSC => self.osc.push(byte),
-                _ => {}
-            }
-            return;
-        }
-        // C0 controls act anywhere, even inside a sequence.
-        match byte {
-            0x1B => {
-                self.utf8.clear();
-                self.state = State::Escape;
-                return;
-            }
-            0x18 | 0x1A => {
-                self.state = State::Ground;
-                return;
-            }
-            0x00..=0x1F => {
-                self.control(byte);
-                return;
-            }
-            _ => {}
-        }
-        match self.state.clone() {
-            State::Ground => self.ground(byte),
-            State::Escape => self.escape(byte),
-            State::EscapeIntermediate(i) => {
-                self.escape_intermediate(i, byte);
-                self.state = State::Ground;
-            }
-            State::Csi => self.csi_byte(byte),
-            State::Osc | State::Ignore => unreachable!("handled above"),
-        }
-    }
-
-    fn ground(&mut self, byte: u8) {
-        if byte < 0x80 {
-            self.utf8.clear();
-            if byte != 0x7F {
-                self.print(byte as char);
-            }
-            return;
-        }
-        // UTF-8: collect the bytes of one character.
-        if byte & 0xC0 != 0x80 {
-            self.utf8.clear();
-        }
-        self.utf8.push(byte);
-        let expected = match self.utf8[0] {
-            0xC0..=0xDF => 2,
-            0xE0..=0xEF => 3,
-            0xF0..=0xF7 => 4,
-            _ => {
-                self.utf8.clear();
-                self.print(char::REPLACEMENT_CHARACTER);
-                return;
-            }
-        };
-        if self.utf8.len() < expected {
-            return;
-        }
-        let ch = std::str::from_utf8(&self.utf8)
-            .ok()
-            .and_then(|s| s.chars().next())
-            .unwrap_or(char::REPLACEMENT_CHARACTER);
-        self.utf8.clear();
-        self.print(ch);
-    }
-
-    fn control(&mut self, byte: u8) {
-        match byte {
-            0x08 => {
-                self.col = self.col.saturating_sub(1);
-                self.pending_wrap = false;
-            }
-            0x09 => self.tab_forward(1),
-            0x0A..=0x0C => self.linefeed(),
-            0x0D => {
-                self.col = 0;
-                self.pending_wrap = false;
-            }
-            // SO and SI shift to G1 and back; G1 is never line drawing here.
-            0x0E | 0x0F => {}
-            _ => {}
-        }
-    }
-
-    fn escape(&mut self, byte: u8) {
-        self.state = State::Ground;
-        match byte {
-            b'[' => {
-                self.params.clear();
-                self.params.push(Vec::new());
-                self.private = None;
-                self.intermediate = None;
-                self.state = State::Csi;
-            }
-            b']' => {
-                self.osc.clear();
-                self.state = State::Osc;
-            }
-            b'P' | b'X' | b'^' | b'_' => self.state = State::Ignore,
-            b'(' | b')' | b'*' | b'+' | b'#' | b' ' | b'%' => {
-                self.state = State::EscapeIntermediate(byte)
-            }
-            b'7' => self.save_cursor(),
-            b'8' => self.restore_cursor(),
-            b'D' => self.linefeed(),
-            b'E' => {
-                self.col = 0;
-                self.linefeed();
-            }
-            b'M' => self.reverse_index(),
-            b'H' => {
-                if let Some(stop) = self.tabs.get_mut(self.col) {
-                    *stop = true;
-                }
-            }
-            b'c' => self.reset(),
-            // Keypad application and numeric modes: keys are sent the same.
-            b'=' | b'>' => {}
-            _ => {}
-        }
-    }
-
-    fn escape_intermediate(&mut self, intermediate: u8, byte: u8) {
-        if intermediate == b'(' {
-            self.line_drawing = byte == b'0';
-        }
-    }
-
-    fn csi_byte(&mut self, byte: u8) {
-        match byte {
-            b'0'..=b'9' => {
-                let params = self.params.last_mut().expect("a CSI starts with one");
-                if params.is_empty() {
-                    params.push(0);
-                }
-                let last = params.last_mut().expect("just pushed");
-                *last = last.saturating_mul(10).saturating_add((byte - b'0') as u16);
-            }
-            b';' => {
-                if self.params.len() < MAX_PARAMS {
-                    self.params.push(Vec::new());
-                }
-            }
-            b':' => {
-                let params = self.params.last_mut().expect("a CSI starts with one");
-                if params.is_empty() {
-                    params.push(0);
-                }
-                // Bounded like `;`: `cat` of a binary could send megabytes
-                // of colons.
-                if params.len() < MAX_PARAMS {
-                    params.push(0);
-                }
-            }
-            b'<' | b'=' | b'>' | b'?' => self.private = Some(byte),
-            0x20..=0x2F => self.intermediate = Some(byte),
-            0x40..=0x7E => {
-                self.state = State::Ground;
-                self.csi(byte);
-            }
-            _ => self.state = State::Ground,
-        }
-    }
-
-    /// Parameter `i`, or `default` when absent or zero.
-    fn param(&self, i: usize, default: usize) -> usize {
-        match self.params.get(i).and_then(|p| p.first()) {
-            Some(&0) | None => default,
-            Some(&n) => n as usize,
-        }
     }
 
     fn csi(&mut self, command: u8) {
@@ -1106,32 +825,6 @@ impl Term {
         self.apply(saved);
     }
 
-    fn end_string(&mut self) {
-        if self.state == State::Osc {
-            let text = String::from_utf8_lossy(&self.osc).into_owned();
-            if let Some((kind, value)) = text.split_once(';') {
-                match (kind, value) {
-                    ("0" | "2", _) => self.title = value.to_owned(),
-                    // A query: answered, or the program waits out its timeout.
-                    ("10" | "11", "?") => {
-                        let [r, g, b] = if kind == "10" {
-                            self.colors.0
-                        } else {
-                            self.colors.1
-                        };
-                        let reply = format!(
-                            "\x1b]{kind};rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}\x1b\\"
-                        );
-                        self.replies.extend_from_slice(reply.as_bytes());
-                    }
-                    _ => {}
-                }
-            }
-        }
-        self.osc.clear();
-        self.state = State::Ground;
-    }
-
     fn reset(&mut self) {
         let mut fresh = Term::new(self.cols, self.rows);
         std::mem::swap(&mut fresh.scrollback, &mut self.scrollback);
@@ -1139,15 +832,6 @@ impl Term {
         fresh.generation = self.generation;
         *self = fresh;
     }
-}
-
-/// The characters of `cells`, a wide character once.
-fn cells_text(cells: &[Cell]) -> String {
-    cells
-        .iter()
-        .filter(|c| c.flags & WIDE_TAIL == 0)
-        .map(|c| c.ch)
-        .collect()
 }
 
 /// Adds a line to history, counting in `dropped` the oldest line when it
@@ -1208,69 +892,6 @@ fn line_drawing(ch: char) -> char {
         '|' => '≠',
         '}' => '£',
         _ => ch,
-    }
-}
-
-fn is_word_char(ch: char) -> bool {
-    ch.is_alphanumeric() || "/._-~:@+#%=?&$".contains(ch)
-}
-
-/// A file reference under character `index` of `text`: a path, optionally
-/// followed by `:line` and `:column`, as compilers and `claude` print them.
-/// Quotes, brackets and trailing punctuation around it are not part of it.
-/// The run `[from, to)` around `at`, within `0..len`, of indexes that
-/// `keep` accepts. `at` itself is always inside.
-fn span_while(len: usize, at: usize, keep: impl Fn(usize) -> bool) -> (usize, usize) {
-    let from = (0..at).rev().take_while(|&i| keep(i)).last().unwrap_or(at);
-    let to = (at..len).take_while(|&i| keep(i)).last().unwrap_or(at) + 1;
-    (from, to)
-}
-
-pub fn path_at(text: &[char], index: usize) -> Option<(String, Option<usize>, Option<usize>)> {
-    let stop = |c: &char| c.is_whitespace() || "\"'`()[]{}<>,;|".contains(*c);
-    if index >= text.len() || stop(&text[index]) {
-        return None;
-    }
-    let (from, to) = span_while(text.len(), index, |i| !stop(&text[i]));
-    let token: String = text[from..to].iter().collect();
-    let token = token.trim_end_matches(['.', ':', '!', '?']);
-    let token = token.strip_prefix("file://").unwrap_or(token);
-    let mut parts = token.split(':');
-    let path = parts.next().filter(|p| !p.is_empty())?;
-    if !path.contains('/') && !path.contains('.') {
-        return None;
-    }
-    let line = parts
-        .next()
-        .and_then(|p| p.parse().ok())
-        .filter(|&n: &usize| n > 0);
-    let column = line
-        .and_then(|_| parts.next())
-        .and_then(|p| p.parse().ok())
-        .filter(|&n: &usize| n > 0);
-    Some((path.to_owned(), line, column))
-}
-
-/// The colour of a palette entry, 0 to 255, for the 16 named colours given
-/// by the theme and the rest computed as xterm does.
-pub fn palette(index: u8, named: &[[f32; 4]; 16]) -> [f32; 4] {
-    match index {
-        0..=15 => named[index as usize],
-        16..=231 => {
-            let i = index - 16;
-            let level = |v: u8| {
-                if v == 0 {
-                    0.0
-                } else {
-                    (55.0 + 40.0 * v as f32) / 255.0
-                }
-            };
-            [level(i / 36), level((i / 6) % 6), level(i % 6), 1.0]
-        }
-        232..=255 => {
-            let v = (8.0 + 10.0 * (index - 232) as f32) / 255.0;
-            [v, v, v, 1.0]
-        }
     }
 }
 
