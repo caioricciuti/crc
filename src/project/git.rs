@@ -238,18 +238,7 @@ impl Diff {
                 continue;
             }
             // Headers that name the command's arguments, not the change.
-            if line.starts_with("diff --git ")
-                || line.starts_with("index ")
-                || line.starts_with("--- ")
-                || line.starts_with("+++ ")
-                || line.starts_with("new file mode")
-                || line.starts_with("deleted file mode")
-                || line.starts_with("old mode")
-                || line.starts_with("new mode")
-                || line.starts_with("similarity index")
-                || line.starts_with("rename from")
-                || line.starts_with("rename to")
-            {
+            if COMMAND_HEADERS.iter().any(|h| line.starts_with(h)) {
                 active_hunk = None;
                 continue;
             }
@@ -415,6 +404,9 @@ pub fn ignored(directory: &Path) -> Result<std::collections::HashSet<PathBuf>, S
 pub fn toplevel(directory: &Path) -> Result<PathBuf, String> {
     let root = run(directory, &["rev-parse", "--show-toplevel"])?;
     let root = root.strip_suffix(b"\n").unwrap_or(&root);
+    if root.is_empty() {
+        return Err("Git returned no path".into());
+    }
     Ok(path_from_bytes(root))
 }
 
@@ -544,8 +536,7 @@ pub fn marks(diff: &Diff) -> Vec<Mark> {
 }
 
 pub fn snapshot(directory: &Path) -> Result<Snapshot, String> {
-    // One process for both: the top level, and the Git directory, which is
-    // not `<root>/.git` in a linked worktree.
+    // The Git directory, which is not `<root>/.git` in a linked worktree.
     // One question per call: a path may itself contain a newline, so two
     // answers on two lines cannot be told apart.
     let answer = |args: &[&str]| -> Result<PathBuf, String> {
@@ -558,7 +549,7 @@ pub fn snapshot(directory: &Path) -> Result<Snapshot, String> {
         }
         Ok(path_from_bytes(bytes))
     };
-    let root = answer(&["rev-parse", "--show-toplevel"])?;
+    let root = toplevel(directory)?;
     let in_progress = answer(&["rev-parse", "--absolute-git-dir"])
         .ok()
         .and_then(|dir| InProgress::read(&dir));
@@ -623,6 +614,21 @@ fn parse_status(root: PathBuf, bytes: &[u8]) -> Result<Snapshot, String> {
         in_progress: None,
     })
 }
+
+/// Lines of a diff that name the command's arguments, not the change.
+const COMMAND_HEADERS: [&str; 11] = [
+    "diff --git ",
+    "index ",
+    "--- ",
+    "+++ ",
+    "new file mode",
+    "deleted file mode",
+    "old mode",
+    "new mode",
+    "similarity index",
+    "rename from",
+    "rename to",
+];
 
 pub fn diff(root: &Path, change: &Change) -> Result<String, String> {
     if change.index == b'?' {

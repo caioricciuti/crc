@@ -674,10 +674,6 @@ fn delimiter_at(chars: &[char], i: usize, run_end: usize) -> Option<(usize, Styl
     Some((len, style))
 }
 
-/// Finds the closing delimiter of a run, or `None` if it is unterminated.
-///
-/// The closer has to be *right-flanking*: preceded by something that is not
-/// whitespace. `_` additionally may not close inside a word.
 /// Whether `line` starts a list item, a quote or a table row rather than
 /// a paragraph.
 fn opens_container(line: &str) -> bool {
@@ -738,6 +734,10 @@ impl Misses {
     }
 }
 
+/// Finds the closing delimiter of a run, or `None` if it is unterminated.
+///
+/// The closer has to be *right-flanking*: preceded by something that is not
+/// whitespace. `_` additionally may not close inside a word.
 fn find_run(chars: &[char], from: usize, marker: &char, len: usize) -> Option<usize> {
     let mut i = from;
     while i + len <= chars.len() {

@@ -2208,13 +2208,6 @@ impl Buffer {
         });
     }
 
-    /// Hands over the edits since the last drain.
-    ///
-    /// Returns `None` when the text changed in a way edits cannot describe
-    /// (undo, redo, a reload), meaning the caller must re-parse in full.
-    /// Whether the text changed since the last [`Buffer::drain_edits`].
-    /// The text changed in a way edits cannot describe. Folds cannot follow
-    /// such a change either, so they open.
     /// Records the change from `before` to the current text as one edit:
     /// from where they first differ to where they last do. Queued edits
     /// stay valid, since this one follows them.
@@ -2250,6 +2243,7 @@ impl Buffer {
 
     /// After the whole rope was replaced: queued edits no longer lead from
     /// the old text to the new, so they go and the parser starts over.
+    /// Folds cannot follow such a change either, so they open.
     fn invalidate_edits(&mut self) {
         self.edits_invalidated = true;
         self.folds.clear();
@@ -2257,10 +2251,15 @@ impl Buffer {
         self.last_edit = None;
     }
 
+    /// Whether the text changed since the last [`Buffer::drain_edits`].
     pub fn has_pending_edits(&self) -> bool {
         self.edits_invalidated || !self.pending_edits.is_empty()
     }
 
+    /// Hands over the edits since the last drain.
+    ///
+    /// Returns `None` when the text changed in a way edits cannot describe
+    /// (undo, redo, a reload), meaning the caller must re-parse in full.
     pub fn drain_edits(&mut self) -> Option<Vec<Edit>> {
         if self.edits_invalidated {
             self.edits_invalidated = false;
@@ -2793,8 +2792,6 @@ impl Buffer {
         (line, row)
     }
 
-    /// The furthest scroll position, with the last row at the bottom of a
-    /// view `rows` tall.
     /// Whether a view `rows` tall starting at `line` could reach past the
     /// end, which is when [`Buffer::max_scroll_row`] is worth its cost:
     /// every visible line has at least one row, so only the last `rows`
@@ -2803,6 +2800,8 @@ impl Buffer {
         !self.folds.is_empty() || line + rows.max(1) >= self.rope.len_lines()
     }
 
+    /// The furthest scroll position, with the last row at the bottom of a
+    /// view `rows` tall.
     fn max_scroll_row(&self, rows: usize) -> (usize, usize) {
         let last = self.rope.len_lines().saturating_sub(1);
         let end = (last, self.row_starts(last).len().saturating_sub(1));

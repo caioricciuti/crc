@@ -59,9 +59,9 @@ pub struct Panel {
     announcement: Option<String>,
     /// Whether the operation in flight is one that announces.
     announces: bool,
-    /// A path to mark resolved once the worker is free: Mark Resolved saves
-    /// first, and the save starts a refresh of its own.
-    /// Files marked resolved while Git was busy, added in order after.
+    /// Files marked resolved while Git was busy, added in order once it is
+    /// free: Mark Resolved saves first, and the save starts a refresh of
+    /// its own.
     resolve_queued: std::collections::VecDeque<PathBuf>,
     /// A change clicked while Git was busy, shown once it is done.
     select_queued: Option<PathBuf>,
@@ -577,29 +577,28 @@ impl Panel {
         self.note = "Working…".into();
         std::thread::spawn(move || {
             let result = (|| {
-                let initial = git::snapshot(&directory)?;
+                // The root alone: a whole status here was thrown away.
+                let root = git::toplevel(&directory)?;
                 let mut selected_path = previous;
                 let mut committed = false;
                 let mut done = None;
                 let error = match operation {
-                    Operation::Switch(name) => match git::switch(&initial.root, &name) {
+                    Operation::Switch(name) => match git::switch(&root, &name) {
                         Ok(()) => {
                             done = Some(format!("switched to {name}"));
                             None
                         }
                         Err(error) => Some(error),
                     },
-                    Operation::CreateBranch(name) => {
-                        match git::create_branch(&initial.root, &name) {
-                            Ok(()) => {
-                                done = Some(format!("created and switched to {name}"));
-                                None
-                            }
-                            Err(error) => Some(error),
+                    Operation::CreateBranch(name) => match git::create_branch(&root, &name) {
+                        Ok(()) => {
+                            done = Some(format!("created and switched to {name}"));
+                            None
                         }
-                    }
+                        Err(error) => Some(error),
+                    },
                     Operation::Remote(what, sock) => {
-                        match git::remote(&initial.root, what, sock.as_deref()) {
+                        match git::remote(&root, what, sock.as_deref()) {
                             Ok(said) => {
                                 let verb = match what {
                                     git::Remote::Fetch => "fetched",
@@ -622,10 +621,8 @@ impl Panel {
                         selected_path = Some(path);
                         None
                     }
-                    Operation::Stage(change, stage) => {
-                        git::stage(&initial.root, &change, stage).err()
-                    }
-                    Operation::Resolve(change) => match git::stage(&initial.root, &change, true) {
+                    Operation::Stage(change, stage) => git::stage(&root, &change, stage).err(),
+                    Operation::Resolve(change) => match git::stage(&root, &change, true) {
                         Ok(()) => {
                             done = Some(format!("marked {} resolved", change.label()));
                             None
@@ -633,9 +630,9 @@ impl Panel {
                         Err(error) => Some(error),
                     },
                     Operation::StageHunk(change, hunk) => {
-                        git::stage_hunk(&initial.root, &change, &hunk).err()
+                        git::stage_hunk(&root, &change, &hunk).err()
                     }
-                    Operation::Commit(message) => match git::commit(&initial.root, &message) {
+                    Operation::Commit(message) => match git::commit(&root, &message) {
                         Ok(()) => {
                             committed = true;
                             None
@@ -643,7 +640,7 @@ impl Panel {
                         Err(error) => Some(error),
                     },
                 };
-                let snapshot = git::snapshot(&initial.root)?;
+                let snapshot = git::snapshot(&root)?;
                 let selected = selected_path
                     .and_then(|p| snapshot.changes.iter().position(|c| c.path == p))
                     .unwrap_or(0);

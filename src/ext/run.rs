@@ -213,9 +213,12 @@ impl Loaded {
         ]));
         self.instance.fuel = self.fuel;
         self.instance.deadline = Some(Instant::now() + self.deadline);
-        let trap = |t: Trap| match t.0.as_str() {
-            "out of fuel" | "took too long" => format!("{name} {OVER_BUDGET}"),
-            other => format!("{name} failed: {other}"),
+        let trap = |t: Trap| {
+            if t.over_budget() {
+                format!("{name} {OVER_BUDGET}")
+            } else {
+                format!("{name} failed: {}", t.0)
+            }
         };
         let len = input.len() as u64;
         let first = |values: Vec<u64>| {

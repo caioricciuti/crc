@@ -357,12 +357,14 @@ pub fn draw(
     for (row, (cells, line)) in visible.iter().enumerate() {
         let line = *line;
         let y = screen.y + row as f32 * row_h;
+        // What of the row the screen has room for.
+        let room = cols.min(cells.len());
         // Backgrounds, merged into runs of one colour.
         let mut col = 0;
-        while col < cols.min(cells.len()) {
+        while col < room {
             let (_, bg) = colours(&cells[col], theme, background);
             let start = col;
-            while col < cols.min(cells.len()) && colours(&cells[col], theme, background).1 == bg {
+            while col < room && colours(&cells[col], theme, background).1 == bg {
                 col += 1;
             }
             if bg != background {
@@ -394,13 +396,13 @@ pub fn draw(
         }
         // Text in runs of one colour and decoration.
         let mut col = 0;
-        while col < cols.min(cells.len()) {
+        while col < room {
             let first = cells[col];
             let (fg, _) = colours(&first, theme, background);
             let decoration = first.flags & (UNDERLINE | STRIKE);
             let start = col;
             run.clear();
-            while col < cols.min(cells.len()) {
+            while col < room {
                 let cell = cells[col];
                 if cell.flags & WIDE_TAIL == 0 {
                     if colours(&cell, theme, background).0 != fg

@@ -946,13 +946,13 @@ fn build_predicate(run: &[(u32, u32)], string_at: &dyn Fn(u32) -> String) -> Opt
     })
 }
 
-/// Row/column pair to tree-sitter's point type.
 /// The row and byte column of `byte` in `rope`.
 fn point_at(rope: &Rope, byte: usize) -> ffi::TSPoint {
     let row = rope.byte_to_line(byte);
     point((row, byte - rope.line_to_byte(row)))
 }
 
+/// A row/column pair as tree-sitter's point type.
 fn point((row, column): (usize, usize)) -> ffi::TSPoint {
     ffi::TSPoint {
         row: row as u32,

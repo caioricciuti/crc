@@ -30,6 +30,17 @@ use std::time::Instant;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Trap(pub String);
 
+/// A trap for spending the budget: the fuel, or the time.
+pub const OUT_OF_FUEL: &str = "out of fuel";
+pub const TOOK_TOO_LONG: &str = "took too long";
+
+impl Trap {
+    /// Whether the guest was stopped for its budget, not for an error.
+    pub fn over_budget(&self) -> bool {
+        self.0 == OUT_OF_FUEL || self.0 == TOOK_TOO_LONG
+    }
+}
+
 impl fmt::Display for Trap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
@@ -801,9 +812,12 @@ impl Instance {
             let started = instance.call(start, &[]);
             instance.fuel = u64::MAX;
             instance.deadline = None;
-            started.map_err(|t| match t.0.as_str() {
-                "out of fuel" | "took too long" => Trap("its start function took too long".into()),
-                _ => t,
+            started.map_err(|t| {
+                if t.over_budget() {
+                    Trap("its start function took too long".into())
+                } else {
+                    t
+                }
             })?;
         }
         Ok(instance)
@@ -859,11 +873,11 @@ impl Instance {
             };
             frame.pc = pc + 1;
             if self.fuel == 0 {
-                return trap("out of fuel");
+                return trap(OUT_OF_FUEL);
             }
             self.fuel -= 1;
             if self.fuel & 0xffff == 0 && self.deadline.is_some_and(|d| Instant::now() >= d) {
-                return trap("took too long");
+                return trap(TOOK_TOO_LONG);
             }
             let jump = |frames: &mut Vec<Frame>, to: usize| {
                 if let Some(f) = frames.last_mut() {
@@ -1059,11 +1073,11 @@ impl Instance {
         }
         if self.fuel < units {
             self.fuel = 0;
-            return trap("out of fuel");
+            return trap(OUT_OF_FUEL);
         }
         self.fuel -= units;
         if self.deadline.is_some_and(|d| Instant::now() >= d) {
-            return trap("took too long");
+            return trap(TOOK_TOO_LONG);
         }
         Ok(())
     }
