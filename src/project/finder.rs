@@ -11,9 +11,11 @@
 
 use std::path::{Path, PathBuf};
 
-/// Directories never worth indexing. Same list the sidebar hides, for the
-/// same reason: they are enormous and nobody opens files in them by name.
-const SKIP_DIRS: &[&str] = &["target", "node_modules", "vendor", "third_party", ".git"];
+/// Directories never worth indexing: the ones the sidebar hides, and
+/// vendored sources, which the sidebar shows but nobody opens by name.
+fn skip_dir(name: &str) -> bool {
+    super::SKIP_DIRS.contains(&name) || name == "third_party"
+}
 
 /// How deep to walk. A guard against a pathological tree rather than a real
 /// limit; symlink loops are caught by the folders already walked.
@@ -295,7 +297,7 @@ fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<Entry>, state: &mut
         }
 
         if kind.is_dir() {
-            if SKIP_DIRS.contains(&name.as_str()) {
+            if skip_dir(&name) {
                 continue;
             }
             walk(root, &path, depth + 1, out, state);

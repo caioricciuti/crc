@@ -313,7 +313,7 @@ pub struct Done {
 
 /// The thread every extension runs on. Instances stay loaded between calls,
 /// keyed by id and version; `wake` is called after each answer.
-pub fn spawn(wake: Box<dyn Fn() + Send>) -> (mpsc::Sender<Job>, mpsc::Receiver<Done>) {
+pub fn spawn(wake: crate::platform::dispatch::Wake) -> (mpsc::Sender<Job>, mpsc::Receiver<Done>) {
     let (jobs, inbox) = mpsc::channel::<Job>();
     let (outbox, done) = mpsc::channel();
     std::thread::Builder::new()

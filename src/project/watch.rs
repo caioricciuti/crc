@@ -297,8 +297,7 @@ pub fn classify(root: &Path, git_dirs: &[PathBuf], path: &Path) -> Option<Change
     if first == ".git" {
         return bookkeeping(components.map(|c| c.into_owned()).collect());
     }
-    let noisy = ["target", "node_modules", "vendor", ".DS_Store"];
-    if noisy.contains(&first.as_ref()) {
+    if super::SKIP_DIRS.contains(&first.as_ref()) || first == ".DS_Store" {
         return None;
     }
     let name = relative

@@ -178,8 +178,8 @@ pub fn parse(raw: &[u8]) -> Result<Response, String> {
         response.status = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
         response.reason = parts.next().unwrap_or_default().trim().to_owned();
         response.headers = lines
-            .filter_map(|l| l.split_once(':'))
-            .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
+            .filter_map(super::header_line)
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
             .collect();
         rest = body;
         // `100 Continue` and friends precede the real reply.

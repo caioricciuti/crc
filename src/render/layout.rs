@@ -1554,8 +1554,7 @@ pub fn build_text_appending(
             let column = map.column(&buffer.rope, caret) - map.column(&buffer.rope, row.start);
             text_x + column * m.advance - scroll_x
         } else {
-            let column = buffer.rope.visual_column(line_start..caret)
-                - buffer.rope.visual_column(line_start..row.start);
+            let column = crate::text::wrap::column_in_row(&buffer.rope, row.start, caret);
             text_x + column as f32 * m.advance - scroll_x
         };
         let y = row.y;

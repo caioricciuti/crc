@@ -217,10 +217,8 @@ fn read_message<R: BufRead>(reader: &mut R) -> std::io::Result<Option<Result<Val
             }
             continue;
         }
-        if let Some(value) = trimmed
-            .split_once(':')
+        if let Some((_, value)) = crate::http::header_line(trimmed)
             .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-            .map(|(_, value)| value.trim())
         {
             length = value.parse().ok();
         }

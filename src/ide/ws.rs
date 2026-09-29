@@ -311,8 +311,8 @@ fn read_request<R: BufRead>(reader: &mut R) -> std::io::Result<Request> {
         if trimmed.is_empty() {
             break;
         }
-        if let Some((name, value)) = trimmed.split_once(':') {
-            headers.push((name.trim().to_ascii_lowercase(), value.trim().to_owned()));
+        if let Some((name, value)) = crate::http::header_line(trimmed) {
+            headers.push((name.to_ascii_lowercase(), value.to_owned()));
         }
     }
     Ok(Request { method, headers })

@@ -59,7 +59,10 @@ pub struct Worker {
 impl Worker {
     /// Starts the thread. `wake` is called after each answer, from the
     /// worker, to get the main thread to look.
-    pub fn start(history: Option<PathBuf>, wake: Box<dyn Fn() + Send>) -> Option<Worker> {
+    pub fn start(
+        history: Option<PathBuf>,
+        wake: crate::platform::dispatch::Wake,
+    ) -> Option<Worker> {
         let (tx, jobs) = mpsc::channel::<Job>();
         let (answers, rx) = mpsc::channel::<Answer>();
         let (forgot, forgotten) = mpsc::channel::<i32>();

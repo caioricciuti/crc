@@ -82,11 +82,6 @@ pub enum Ignored {
     Preview,
 }
 
-/// Directories that are never worth showing in an editor sidebar. Hidden
-/// entries are filtered separately, so this is only for the noisy ones that
-/// do not start with a dot.
-const SKIP_DIRS: &[&str] = &["target", "node_modules", "vendor", ".git"];
-
 impl Tree {
     pub fn new() -> Self {
         Tree::default()
@@ -394,7 +389,7 @@ fn read_dir(path: &Path, depth: usize) -> Vec<Entry> {
                 t.is_dir()
                     || (t.is_symlink() && std::fs::metadata(entry.path()).is_ok_and(|m| m.is_dir()))
             });
-            if is_dir && SKIP_DIRS.contains(&name.as_str()) {
+            if is_dir && super::SKIP_DIRS.contains(&name.as_str()) {
                 return None;
             }
             Some(Entry {

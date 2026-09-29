@@ -497,6 +497,14 @@ pub fn load_named_environment(
     }
 }
 
+/// A `Name: value` header line as its trimmed name and value; `None` for a
+/// line without a colon. HTTP, the language-server framing and the
+/// WebSocket handshake all write headers this way.
+pub fn header_line(line: &str) -> Option<(&str, &str)> {
+    line.split_once(':')
+        .map(|(name, value)| (name.trim(), value.trim()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

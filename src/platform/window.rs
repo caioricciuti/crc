@@ -410,24 +410,18 @@ struct ViewPointer(*const EditorView);
 unsafe impl Send for ViewPointer {}
 unsafe impl Sync for ViewPointer {}
 
-unsafe extern "C" fn lsp_wake_on_main(context: *mut std::ffi::c_void) {
-    let view = unsafe { &*(context as *const EditorView) };
-    view.poll_lsp();
+/// One wake in flight: the poll to run on the main thread, with its view.
+struct QueuedPoll {
+    view: *const EditorView,
+    poll: fn(&EditorView),
 }
 
-unsafe extern "C" fn terminal_wake_on_main(context: *mut std::ffi::c_void) {
-    let view = unsafe { &*(context as *const EditorView) };
-    view.poll_terminal();
-}
-
-unsafe extern "C" fn completion_wake_on_main(context: *mut std::ffi::c_void) {
-    let view = unsafe { &*(context as *const EditorView) };
-    view.poll_completion();
-}
-
-unsafe extern "C" fn claude_wake_on_main(context: *mut std::ffi::c_void) {
-    let view = unsafe { &*(context as *const EditorView) };
-    view.poll_claude();
+/// Runs a queued poll on the main thread and frees what `wake` queued.
+unsafe extern "C" fn poll_on_main(context: *mut std::ffi::c_void) {
+    // SAFETY: `wake` queued exactly this box, and it runs once.
+    let queued = unsafe { Box::from_raw(context as *mut QueuedPoll) };
+    // SAFETY: the view lives for the process; see `ViewPointer`.
+    (queued.poll)(unsafe { &*queued.view });
 }
 
 /// The per-pane state of a pane that does not have the keyboard.
@@ -4021,14 +4015,21 @@ impl EditorView {
     /// A wake for a worker thread: it queues `work` with this view on the
     /// main thread. The view lives as long as the process, which every
     /// worker's thread is inside of; see `ViewPointer`.
-    fn wake(
-        &self,
-        work: unsafe extern "C" fn(*mut std::ffi::c_void),
-    ) -> crate::platform::dispatch::Wake {
+    fn wake(&self, poll: fn(&EditorView)) -> crate::platform::dispatch::Wake {
         let pointer = ViewPointer(self as *const EditorView);
         Box::new(move || {
             let pointer = &pointer;
-            unsafe { crate::platform::dispatch::on_main(pointer.0 as *mut std::ffi::c_void, work) };
+            let queued = Box::new(QueuedPoll {
+                view: pointer.0,
+                poll,
+            });
+            // SAFETY: `poll_on_main` takes the box back and frees it.
+            unsafe {
+                crate::platform::dispatch::on_main(
+                    Box::into_raw(queued) as *mut std::ffi::c_void,
+                    poll_on_main,
+                )
+            };
         })
     }
 
@@ -7938,7 +7939,7 @@ impl EditorView {
     }
 
     fn terminal_wake(&self) -> crate::term::pty::Wake {
-        self.wake(terminal_wake_on_main)
+        self.wake(EditorView::poll_terminal)
     }
 
     /// A session printed something, or its program exited.
@@ -9588,7 +9589,7 @@ impl EditorView {
 
     /// The wake-up the IDE server's threads use: a main-thread poll.
     fn claude_wake(&self) -> crate::ide::ws::Wake {
-        self.wake(claude_wake_on_main)
+        self.wake(EditorView::poll_claude)
     }
 
     /// After every frame: the bridge follows the project root, and a moved
@@ -10098,7 +10099,7 @@ impl EditorView {
 
     /// The wake-up a server's reader thread uses: a main-thread poll.
     fn lsp_wake(&self) -> crate::lsp::transport::Wake {
-        self.wake(lsp_wake_on_main)
+        self.wake(EditorView::poll_lsp)
     }
 
     /// Starts servers for the languages of open documents and tells each
@@ -10721,7 +10722,7 @@ impl EditorView {
         if self.state().is_some_and(|state| state.completer.is_some()) {
             return;
         }
-        let wake: Box<dyn Fn() + Send> = self.wake(completion_wake_on_main);
+        let wake = self.wake(EditorView::poll_completion);
         let worker = crate::complete::worker::Worker::start(
             crate::complete::history::History::default_path(),
             wake,
