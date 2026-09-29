@@ -366,9 +366,10 @@ fn band_of(conflict: &Conflict, line: usize) -> Option<(Take, bool)> {
 
 /// Washes behind each conflict's rows, to go under the text: markers
 /// stronger than the sections they bound.
+/// `rows` are the frame's screen rows of `buffer` in `text`.
 pub fn bands(
     view: &View,
-    buffer: &Buffer,
+    rows: &[layout::ScreenRow],
     atlas: &Atlas,
     text: Viewport,
     theme: &Theme,
@@ -378,7 +379,7 @@ pub fn bands(
     if view.conflicts.is_empty() {
         return out;
     }
-    for row in layout::screen_rows(buffer, text, m.line_height) {
+    for row in rows {
         let Some(index) = conflict::at_line(&view.conflicts, row.line) else {
             continue;
         };
@@ -428,6 +429,7 @@ fn inline_label(take: Take) -> &'static str {
 pub fn inline_hits(
     view: &View,
     buffer: &Buffer,
+    rows: &[layout::ScreenRow],
     atlas: &mut Atlas,
     text: Viewport,
 ) -> Vec<(Hit, Viewport)> {
@@ -438,7 +440,7 @@ pub fn inline_hits(
     }
     let text_x = text.x + layout::gutter_width(buffer, atlas);
     let right = text.x + text.width - 8.0;
-    for row in layout::screen_rows(buffer, text, m.line_height) {
+    for row in rows {
         if !row.first || row.y < text.y || row.y + m.line_height > text.y + text.height {
             continue;
         }

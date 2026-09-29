@@ -5596,13 +5596,13 @@ pub fn response_segments(atlas: &mut Atlas, strip: Viewport, labels: [&str; 3]) 
 
 /// Status, facts and the segment switch above a response body.
 pub fn build_response_strip(
-    view: &crate::http::curl::View,
+    view: &crate::http::view::View,
     atlas: &mut Atlas,
     strip: Viewport,
     theme: &Theme,
     out: &mut Vec<GlyphInstance>,
 ) {
-    use crate::http::curl::{Segment, Verdict};
+    use crate::http::view::{Segment, Verdict};
     let tone = match view.verdict() {
         Verdict::Pending => theme.status_text,
         Verdict::Success => theme.diff_added,

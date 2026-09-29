@@ -32,6 +32,7 @@
 //! timeout, and its stderr shown verbatim when it fails.
 
 pub mod curl;
+pub mod view;
 pub use crate::json;
 
 use std::ops::Range;

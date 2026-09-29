@@ -1451,10 +1451,6 @@ impl Atlas {
         Some(slot)
     }
 
-    pub fn cached_shaping(&self, text: &str) -> Option<&ShapedLine> {
-        self.shaped_lines.get(text).map(Rc::as_ref)
-    }
-
     // ---- internals -------------------------------------------------------
 
     /// Reserves consecutive cells without crossing a row or overwriting a

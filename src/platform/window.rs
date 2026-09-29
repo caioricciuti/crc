@@ -388,7 +388,7 @@ impl EditOutcome {
     fn describe(&self) -> String {
         let files = self.open + self.written;
         let mut text = format!("{files} file{}", if files == 1 { "" } else { "s" });
-        if self.open > 0 && self.failed.is_empty() {
+        if self.open > 0 {
             text.push_str(&format!(", {} open and unsaved", self.open));
         }
         if !self.failed.is_empty() {
@@ -463,6 +463,18 @@ fn restore_panes(state: &mut State, mut all: Vec<PaneStore>, focus: usize) {
 /// Every pane's documents, focused first.
 fn all_docs(state: &State) -> impl Iterator<Item = &Documents> {
     std::iter::once(&state.docs).chain(state.panes.iter().map(|p| &p.docs))
+}
+
+/// The pane and tab where `path` is open in a pane without the keyboard,
+/// as `focus_pane` numbers panes (the focused one keeps its place).
+fn pane_holding(state: &State, path: &Path) -> Option<(usize, usize)> {
+    let key = crate::platform::canonical(path);
+    state
+        .panes
+        .iter()
+        .enumerate()
+        .find_map(|(slot, pane)| pane.docs.index_of(&key).map(|tab| (slot, tab)))
+        .map(|(slot, tab)| (slot + usize::from(slot >= state.focused_pane), tab))
 }
 
 /// The document `id` in whichever pane has it. Takes the fields, not the
@@ -855,7 +867,7 @@ struct State {
     )>,
     /// Response tabs, by buffer id. The buffer holds the text of the chosen
     /// segment; this holds the request and the reply it came from.
-    responses: HashMap<u64, crate::http::curl::View>,
+    responses: HashMap<u64, crate::http::view::View>,
     /// Whether the project tree has the keyboard: after a click on a folder
     /// row or a right-click on any row, until a click elsewhere or typing
     /// in the document. Only then does Cmd-Delete trash the tree's
@@ -1055,7 +1067,7 @@ fn is_markdown(buffer: &Buffer) -> bool {
 
 /// Opens `view` in the response tab titled `title`, reusing the tab that
 /// already has that title. Returns the id of the tab's buffer.
-fn show_response(state: &mut State, title: &str, view: crate::http::curl::View) -> u64 {
+fn show_response(state: &mut State, title: &str, view: crate::http::view::View) -> u64 {
     let (text, ext) = view.text(view.segment);
     match state.docs.index_of_label(title) {
         Some(index) => {
@@ -4930,13 +4942,7 @@ impl EditorView {
             let Some(state) = self.state() else {
                 return false;
             };
-            let key = crate::platform::canonical(std::path::Path::new(path));
-            state
-                .panes
-                .iter()
-                .enumerate()
-                .find_map(|(slot, pane)| pane.docs.index_of(&key).map(|tab| (slot, tab)))
-                .map(|(slot, tab)| (slot + usize::from(slot >= state.focused_pane), tab))
+            pane_holding(&state, std::path::Path::new(path))
         };
         if let Some((pane, tab)) = elsewhere {
             self.focus_pane(pane);
@@ -6908,7 +6914,7 @@ impl EditorView {
         let id = show_response(
             &mut state,
             &title,
-            crate::http::curl::View::pending(prepared.clone()),
+            crate::http::view::View::pending(prepared.clone()),
         );
         state.http = Some((id, crate::http::curl::spawn(prepared)));
         state.message = Some((format!("sending {title}"), Instant::now()));
@@ -6975,10 +6981,10 @@ impl EditorView {
         let Some(view) = responses.get_mut(&id) else {
             return;
         };
-        let Some(hit) = Some(index).filter(|i| *i < crate::http::curl::Segment::ALL.len()) else {
+        let Some(hit) = Some(index).filter(|i| *i < crate::http::view::Segment::ALL.len()) else {
             return;
         };
-        let segment = crate::http::curl::Segment::ALL[hit];
+        let segment = crate::http::view::Segment::ALL[hit];
         if segment == view.segment {
             return;
         }
@@ -7278,8 +7284,8 @@ impl EditorView {
                 return;
             }
         }
-        let (mut replaced, mut open, mut written) = (0, 0, 0);
-        let mut failed = Vec::new();
+        let mut replaced = 0;
+        let mut outcome = EditOutcome::default();
         {
             let Some(mut state) = self.state_mut() else {
                 return;
@@ -7314,10 +7320,10 @@ impl EditorView {
                     Some(0) => {}
                     Some(n) => {
                         replaced += n;
-                        open += 1;
+                        outcome.open += 1;
                         touched.push(buffer.id());
                     }
-                    None => failed.push(path.clone()),
+                    None => outcome.failed.push(path.clone()),
                 }
             }
             for (path, done) in on_disk.iter().zip(edit_on_disk(&on_disk, edit)) {
@@ -7325,36 +7331,18 @@ impl EditorView {
                     Some(0) => {}
                     Some(n) => {
                         replaced += n;
-                        written += 1;
+                        outcome.written += 1;
                     }
-                    None => failed.push(path.clone()),
+                    None => outcome.failed.push(path.clone()),
                 }
             }
             note_documents_edited(&mut state, touched);
-            if written > 0 {
+            if outcome.written > 0 {
                 note_files_written(&mut state);
             }
         }
         self.lsp_flush_changes();
-        let mut note = format!(
-            "replaced {replaced} in {} file{}",
-            open + written,
-            if open + written == 1 { "" } else { "s" }
-        );
-        if open > 0 {
-            note.push_str(&format!(", {open} open and unsaved"));
-        }
-        if !failed.is_empty() {
-            note.push_str(&format!(
-                "; could not edit {}",
-                failed
-                    .iter()
-                    .filter_map(|p| p.file_name())
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
+        let note = format!("replaced {replaced} in {}", outcome.describe());
         // The list described text that is gone. Not searched again: project
         // search reads the disk, and the open files' changes are not saved.
         {
@@ -12017,7 +12005,7 @@ impl EditorView {
             {
                 let bands = crate::platform::conflicts::bands(
                     view,
-                    buffer,
+                    &rows,
                     &renderer.atlas,
                     editor_rect,
                     theme,
@@ -12026,6 +12014,7 @@ impl EditorView {
                 let hits = crate::platform::conflicts::inline_hits(
                     view,
                     buffer,
+                    &rows,
                     &mut renderer.atlas,
                     editor_rect,
                 );
@@ -13742,7 +13731,7 @@ fn draw_other_pane(
     rects: &layout::PaneChrome,
     tree: &Tree,
     syntax: &mut SyntaxStore,
-    responses: &HashMap<u64, crate::http::curl::View>,
+    responses: &HashMap<u64, crate::http::view::View>,
     marks: &HashMap<u64, GutterState>,
     renderer: &mut Renderer,
     theme: &Theme,
@@ -13888,9 +13877,12 @@ fn frame_of(state: &mut State) -> Frame {
                         text_rect,
                     ));
                 } else {
+                    let rows =
+                        layout::screen_rows(buffer, text_rect, renderer.atlas.metrics.line_height);
                     hits.extend(crate::platform::conflicts::inline_hits(
                         view,
                         buffer,
+                        &rows,
                         &mut renderer.atlas,
                         text_rect,
                     ));
