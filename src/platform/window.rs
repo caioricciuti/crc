@@ -65,9 +65,11 @@ mod project;
 mod render;
 mod selftest_play;
 mod sidebar;
+mod state;
 mod tabs;
 mod terminal;
 use extensions::{ext_details, preview_command, preview_displaced};
+use state::{Blame, Ext, Gutter, Lsp, Watch};
 
 struct ProjectIndexResult {
     root: std::path::PathBuf,
@@ -120,17 +122,17 @@ fn set_project_root(state: &mut State, dir: &Path) {
     state.tree.set_root(dir);
     state.git = crate::platform::git_panel::Panel::new(dir.to_path_buf());
     state.tree_version = 0;
-    state.tree_children_pending.clear();
+    state.watch.children_pending.clear();
     state.finder = Finder::new();
-    state.project_index_rx = Some(spawn_project_index(dir.to_path_buf()));
+    state.watch.index_rx = Some(spawn_project_index(dir.to_path_buf()));
 }
 
 /// Rereads the sidebar and the finder after the project changed on disk.
 /// A scan already running is outdated by the version bump.
 fn start_project_refresh(state: &mut State) {
     state.tree_version += 1;
-    state.tree_children_pending.clear();
-    state.project_index_rx = Some(spawn_project_refresh(
+    state.watch.children_pending.clear();
+    state.watch.index_rx = Some(spawn_project_refresh(
         state.tree.clone(),
         state.tree_version,
     ));
@@ -602,6 +604,16 @@ const SIDEBAR_MAX: f32 = 600.0;
 const DIVIDER_GRAB: f32 = 5.0;
 
 struct State {
+    /// Git marks per open document, and the work that keeps them current.
+    gutter: Gutter,
+    /// Who last changed the caret's line, for the status line.
+    blame: Blame,
+    /// Language servers, and what is asked of them.
+    lsp: Lsp,
+    /// Installed extensions: their threads, commands and calls in flight.
+    ext: Ext,
+    /// What keeps the project tree and index current.
+    watch: Watch,
     git: crate::platform::git_panel::Panel,
     git_open: bool,
     /// The tab a Source Control diff is shown in, by buffer id. The diff
@@ -614,27 +626,8 @@ struct State {
     /// crosses on every tab is a wall of targets; one under the pointer is
     /// the affordance without the clutter.
     hovered_tab: Option<usize>,
-    /// A sidebar row being dragged onto a folder.
-    tree_drag: Option<TreeDrag>,
-    /// FSEvents on the project root. Dropped and remade when the root moves.
-    watcher: Option<crate::project::watch::Watcher>,
-    /// Language servers by their shared language key, for the current root.
-    lsp: HashMap<Language, crate::lsp::client::Server>,
-    /// Languages whose server could not be started, and why. Said once.
-    lsp_unavailable: HashMap<Language, String>,
-    /// How often each language's server has stopped this session: it is
-    /// started again a few times, then left alone.
-    lsp_restarts: HashMap<Language, u32>,
-    /// Buffers edited since their server last heard, and when. Changes are
-    /// sent once typing pauses.
-    lsp_dirty: HashMap<u64, Instant>,
     /// F2's field: the new name, and where the rename was asked.
     rename: Option<RenameField>,
-    /// The signature of the call the caret is in, while the server has one.
-    signature: Option<SignatureTip>,
-    /// A format in flight: the file and its text when asked, so a reply
-    /// that no longer fits the text is dropped rather than applied.
-    formatting: Option<(std::path::PathBuf, crate::text::rope::Rope)>,
     /// `format_on_save` from the settings.
     format_on_save: bool,
     /// Set while saving what a format-on-save produced, so that save does
@@ -649,56 +642,10 @@ struct State {
     branch_list: Option<Vec<crate::project::git::Branch>>,
     /// The branch picker's list, being read by a worker.
     branch_rx: Option<mpsc::Receiver<Result<Vec<crate::project::git::Branch>, String>>>,
-    /// The palette is picking a code action: the server that offered them
-    /// and the actions. `None` in every other mode.
-    action_list: Option<(Language, Vec<crate::lsp::CodeAction>)>,
-    /// The Quick Fix request the palette waits on.
-    quick_fix_request: Option<u64>,
-    /// Organize Imports in flight.
-    organizing: Option<Organizing>,
-    /// A code action being resolved before it runs; `true` when a save ran
-    /// it, and goes on once it has.
-    resolving: Option<bool>,
     /// `organize_imports_on_save` from the settings.
     organize_on_save: bool,
     /// The Extensions page, when it has the editor column.
     extensions: Option<crate::platform::extensions::Page>,
-    /// The registry list being fetched, and a download being installed.
-    ext_registry_rx: Option<mpsc::Receiver<Result<crate::ext::registry::Index, String>>>,
-    ext_install_rx: Option<mpsc::Receiver<Result<crate::ext::store::Package, String>>>,
-    /// The extension thread, started on the first command.
-    ext_worker: Option<ExtWorker>,
-    /// Previews run on their own thread: a slow page must not hold up a
-    /// command someone asked for.
-    ext_preview_worker: Option<ExtWorker>,
-    /// Failures in a row by extension id. Three turn it off.
-    ext_failures: HashMap<String, u32>,
-    /// Extension commands by menu tag.
-    ext_commands: Vec<ExtCommand>,
-    /// Calls in flight, by job tag.
-    ext_pending: HashMap<u64, ExtCall>,
-    ext_next_job: u64,
-    /// Bumped whenever what is installed changes, so the extension thread
-    /// drops instances of what was replaced.
-    ext_generation: u64,
-    /// Recent log lines per extension.
-    ext_logs: HashMap<String, Vec<String>>,
-    /// The code actions at the caret, asked for when it rested there.
-    bulb: Option<Bulb>,
-    /// The caret's document and offset, and since when, so the bulb is
-    /// asked for once the caret rests.
-    bulb_want: Option<(u64, usize, Instant)>,
-    /// The bulb request in flight: request, document and caret.
-    bulb_request: Option<(u64, u64, usize)>,
-    /// Who last changed the caret's line: document, line, and what the
-    /// status line says.
-    blame: Option<(u64, usize, String)>,
-    /// The caret's document and line, and since when, so blame is asked
-    /// once the caret rests.
-    blame_want: Option<(u64, usize, Instant)>,
-    blame_rx: Option<mpsc::Receiver<(u64, usize, String)>>,
-    /// Git marks per open buffer, keyed by buffer id.
-    gutter: HashMap<u64, GutterState>,
     /// Merge conflicts found in open documents, keyed by buffer id.
     conflict_scans: HashMap<u64, crate::platform::conflicts::Scan>,
     /// Conflicts are shown as columns rather than in the text.
@@ -708,8 +655,6 @@ struct State {
     /// The Extensions page's targets and the bulb, as last drawn, so their
     /// pointing-hand cursor rects are rebuilt when they move.
     pointer_targets: Vec<Viewport>,
-    /// Where the bulb was last drawn.
-    bulb_rect: Option<Viewport>,
     /// The code font as asked for, and its size in points. The atlas holds
     /// the resolved face; this is what a rebuild at a new size starts from.
     font: String,
@@ -725,43 +670,18 @@ struct State {
     completion_generation: u64,
     /// Where the suggestion chips were drawn, for clicks.
     completion_chips: Vec<(layout::Viewport, usize)>,
-    /// Keeps the project index current; one per open project.
-    indexer: Option<crate::index::store::Indexer>,
-    /// Git's ignored paths being read for this root.
-    ignored_rx: Option<
-        mpsc::Receiver<(
-            std::path::PathBuf,
-            std::collections::HashSet<std::path::PathBuf>,
-        )>,
-    >,
     /// An update check in flight, and whether someone asked for it (which
     /// changes what an answer says and does).
     update: Option<(bool, mpsc::Receiver<crate::platform::update::Outcome>)>,
     /// The last key or click. The caret is solid for a blink phase after
     /// it, so it never vanishes under your typing.
     caret_since: Instant,
-    /// Buffers whose marks are stale, and since when. Recomputed after a
-    /// pause, like the language server sync.
-    gutter_dirty: HashMap<u64, Instant>,
-    /// Buffers whose HEAD text is being fetched on a worker.
-    gutter_pending: HashSet<u64>,
-    gutter_channel: (mpsc::Sender<HeadText>, mpsc::Receiver<HeadText>),
     /// Large files changed on disk, being read by a worker for a reload,
     /// by buffer id.
     reload_channel: (mpsc::Sender<ReloadRead>, mpsc::Receiver<ReloadRead>),
     reloading: HashSet<u64>,
-    /// Gutter marks computed on a worker: document, the text they are for,
-    /// the marks.
-    marks_channel: (mpsc::Sender<GutterMarks>, mpsc::Receiver<GutterMarks>),
-    gutter_diffing: HashSet<u64>,
     /// The completion list, while one is open.
     completion: Option<CompletionPopup>,
-    /// When the watcher last reported a tree change that has not been
-    /// acted on. Refreshes are debounced against it, and a change that
-    /// arrives while a refresh is running is kept for the next one.
-    project_changed_at: Option<Instant>,
-    /// The same for `.git` bookkeeping.
-    git_changed_at: Option<Instant>,
     /// A name being typed into the tree, for a file or folder about to be
     /// created or an item being renamed. The way VS Code does it: no panel.
     sidebar_edit: Option<SidebarEdit>,
@@ -781,9 +701,6 @@ struct State {
     /// The project tree behind the sidebar.
     tree: Tree,
     tree_version: u64,
-    tree_children_tx: mpsc::Sender<(std::path::PathBuf, std::path::PathBuf, Vec<TreeEntry>)>,
-    tree_children_rx: mpsc::Receiver<(std::path::PathBuf, std::path::PathBuf, Vec<TreeEntry>)>,
-    tree_children_pending: HashSet<std::path::PathBuf>,
     /// The find bar. Both fields are `Buffer`s, which means editing them
     /// gets the cursor, selection and boundary behaviour that already exists
     /// rather than two more, worse, text inputs.
@@ -795,21 +712,8 @@ struct State {
     sidebar: bool,
     /// Sidebar width in logical points, draggable.
     sidebar_width: f32,
-    /// Set while the divider is being dragged.
-    dragging_divider: bool,
-    /// Set while the terminal panel's top edge is being dragged.
-    dragging_terminal: bool,
-    /// Set while the editor's scrollbar thumb is held: where on the thumb
-    /// the press landed, so the thumb does not jump under the pointer.
-    scrollbar_drag: Option<f32>,
-    /// Set while a press that began in the text is held, which is the only
-    /// kind of drag that selects: the unit it selects in, and what the press
-    /// itself selected, which a drag never shrinks below.
-    selecting: Option<(SelectUnit, std::ops::Range<usize>)>,
-    /// Where the pointer last was during that drag. Kept because a pointer
-    /// held still past the edge sends no events, and the view still has to
-    /// keep scrolling under it.
-    drag_point: Option<(f32, f32)>,
+    /// What the held press is dragging, if anything.
+    drag: Option<Drag>,
     /// Lines of autoscroll owed but not yet amounting to a whole one.
     autoscroll_carry: f32,
     /// Text an input method is still composing: the accent waiting for its
@@ -855,8 +759,6 @@ struct State {
     /// First tab shown when the strip is narrower than all open tabs.
     tab_scroll: usize,
     tab_scroll_carry: f64,
-    /// Tab being dragged across the strip.
-    tab_drag: Option<usize>,
     /// The home screen's rows, as of the last frame that drew it.
     home_hits: Vec<layout::HomeHit>,
     /// Project folders opened before, most recent first.
@@ -871,7 +773,6 @@ struct State {
     spans: Vec<Span>,
     /// Indexed project files for the Cmd-P palette.
     finder: Finder,
-    project_index_rx: Option<mpsc::Receiver<ProjectIndexResult>>,
     project_search_rx: Option<mpsc::Receiver<Result<Vec<ProjectHit>, String>>>,
     /// The search running is Find References, not a text search.
     project_search_references: bool,
@@ -1029,7 +930,7 @@ fn follow_completion(state: &mut State) -> bool {
 /// index look again.
 fn note_files_written(state: &mut State) {
     state.git.refresh();
-    if let Some(indexer) = &state.indexer {
+    if let Some(indexer) = &state.watch.indexer {
         indexer.poke();
     }
 }
@@ -1054,8 +955,8 @@ fn overdue() -> Instant {
 /// pause, and the gutter's change marks are worked out again.
 fn note_documents_edited(state: &mut State, ids: impl IntoIterator<Item = u64>) {
     for id in ids {
-        state.lsp_dirty.insert(id, overdue());
-        state.gutter_dirty.insert(id, Instant::now());
+        state.lsp.dirty.insert(id, overdue());
+        state.gutter.dirty.insert(id, Instant::now());
     }
 }
 
@@ -1247,6 +1148,33 @@ struct TreeDrag {
     valid: bool,
 }
 
+/// What a held press is dragging. One at a time: `mouseDown:` clears it
+/// before deciding what the press started, `mouseUp:` clears it again.
+enum Drag {
+    /// The sidebar's divider.
+    Divider,
+    /// The terminal panel's top edge.
+    Terminal,
+    /// The editor's scrollbar thumb: where on the thumb the press landed,
+    /// so the thumb does not jump under the pointer.
+    Scrollbar(f32),
+    /// A tab across the strip, by its current index.
+    Tab(usize),
+    /// A sidebar row onto a folder.
+    Tree(TreeDrag),
+    /// A press that began in the text, the only kind of drag that selects.
+    Select {
+        /// What it selects in.
+        unit: SelectUnit,
+        /// What the press itself selected, which a drag never shrinks below.
+        pressed: std::ops::Range<usize>,
+        /// Where the pointer last was. Kept because a pointer held still
+        /// past the edge sends no events, and the view still has to keep
+        /// scrolling under it.
+        point: Option<(f32, f32)>,
+    },
+}
+
 struct ProjectHit {
     path: std::path::PathBuf,
     range: std::ops::Range<usize>,
@@ -1411,7 +1339,7 @@ define_class!(
             let chrome = self.chrome();
             // A press only starts a text selection if it lands in the text.
             if let Some(mut state) = self.state_mut() {
-                state.selecting = None;
+                state.drag = None;
             }
 
             // The Extensions page owns the editor column while it is open.
@@ -1463,7 +1391,7 @@ define_class!(
                         state.docs.active_mut().scroll_to(line, rows);
                         thumb.height / 2.0
                     };
-                    state.scrollbar_drag = Some(grab);
+                    state.drag = Some(Drag::Scrollbar(grab));
                     drop(state);
                     self.request_redraw();
                     self.pump();
@@ -1549,7 +1477,7 @@ define_class!(
                 // Grabbing the divider starts a resize rather than anything else.
                 Some(Hit::SidebarDivider) => {
                     if let Some(mut state) = self.state_mut() {
-                        state.dragging_divider = true;
+                        state.drag = Some(Drag::Divider);
                     }
                     return;
                 }
@@ -1580,7 +1508,7 @@ define_class!(
                 }
                 Some(Hit::TerminalDivider) => {
                     if let Some(mut state) = self.state_mut() {
-                        state.dragging_terminal = true;
+                        state.drag = Some(Drag::Terminal);
                     }
                     return;
                 }
@@ -1667,14 +1595,14 @@ define_class!(
                         if let Some(page) = &mut state.extensions {
                             page.details = false;
                         }
-                        state.tab_drag = Some(index);
+                        state.drag = Some(Drag::Tab(index));
                     }
                     self.tab_click(x);
                     return;
                 }
                 Some(Hit::TabClose(_)) => {
                     if let Some(mut state) = self.state_mut() {
-                        state.tab_drag = None;
+                        state.drag = None;
                     }
                     self.tab_click(x);
                     return;
@@ -1714,7 +1642,7 @@ define_class!(
                         };
                         let (tx, ty) = chrome_of(&state).to_text(x, y);
                         let buffer = state.docs.active();
-                        state.bulb.as_ref().is_some_and(|b| {
+                        state.lsp.bulb.as_ref().is_some_and(|b| {
                             (b.buffer, b.caret) == (buffer.id(), buffer.cursor()) && b.shows()
                         }) && layout::bulb_at(buffer, &state.renderer.atlas, tx, ty)
                     };
@@ -1761,15 +1689,15 @@ define_class!(
                         return;
                     };
                     let row = layout::sidebar_row_at(&state.tree, sidebar_field(&state), rect, y);
-                    state.tree_drag = row
+                    state.drag = row
                         .and_then(|index| state.tree.rows().get(index))
-                        .map(|entry| TreeDrag {
+                        .map(|entry| Drag::Tree(TreeDrag {
                             path: entry.path.clone(),
                             origin: (x, y),
                             active: false,
                             over: None,
                             valid: false,
-                        });
+                        }));
                 }
                 self.sidebar_click(y, rect);
                 return;
@@ -1838,11 +1766,11 @@ define_class!(
                 let Some(mut state) = self.state_mut() else {
                     return;
                 };
-                if let Some(from) = state.tab_drag {
+                if let Some(Drag::Tab(from)) = state.drag {
                     let x = point.x as f32;
                     let to = state.tab_hits.iter().find(|h| x >= h.x0 && x < h.x1).map(|h| h.index);
                     if let Some(to) = to && state.docs.move_tab(from, to) {
-                        state.tab_drag = Some(to);
+                        state.drag = Some(Drag::Tab(to));
                         true
                     } else { false }
                 } else { false }
@@ -1852,9 +1780,12 @@ define_class!(
                 self.pump();
                 return;
             }
-            if self.state().is_some_and(|state| state.tab_drag.is_some()) { return; }
+            if self.state().is_some_and(|state| matches!(state.drag, Some(Drag::Tab(_)))) { return; }
 
-            let Some(grab) = self.state().map(|state| state.scrollbar_drag) else {
+            let Some(grab) = self.state().map(|state| match state.drag {
+                Some(Drag::Scrollbar(grab)) => Some(grab),
+                _ => None,
+            }) else {
                 return;
             };
             if let Some(grab) = grab {
@@ -1878,7 +1809,7 @@ define_class!(
                 return;
             }
 
-            if self.state().is_some_and(|state| state.tree_drag.is_some()) {
+            if self.state().is_some_and(|state| matches!(state.drag, Some(Drag::Tree(_)))) {
                 self.tree_drag_moved(point.x as f32, point.y as f32);
                 return;
             }
@@ -1888,7 +1819,7 @@ define_class!(
                 return;
             }
 
-            if self.state().is_some_and(|state| state.dragging_terminal) {
+            if self.state().is_some_and(|state| matches!(state.drag, Some(Drag::Terminal))) {
                 let chrome = self.chrome();
                 {
                     let Some(mut state) = self.state_mut() else {
@@ -1906,7 +1837,7 @@ define_class!(
                 return;
             }
 
-            if self.state().is_some_and(|state| state.dragging_divider) {
+            if self.state().is_some_and(|state| matches!(state.drag, Some(Drag::Divider))) {
                 {
                     let Some(mut state) = self.state_mut() else {
                         return;
@@ -1922,11 +1853,11 @@ define_class!(
             // Only a drag that began in the text selects. One that began on a
             // tab or a sidebar row and wandered over the editor used to select
             // from the old caret to the pointer, in whatever had just opened.
-            if self.state().is_some_and(|state| state.selecting.is_none()) {
-                return;
-            }
             if let Some(mut state) = self.state_mut() {
-                state.drag_point = Some((point.x as f32, point.y as f32));
+                let Some(Drag::Select { point: at, .. }) = &mut state.drag else {
+                    return;
+                };
+                *at = Some((point.x as f32, point.y as f32));
             }
             self.drag_select();
             self.request_redraw();
@@ -1951,20 +1882,17 @@ define_class!(
                 let Some(mut state) = self.state_mut() else {
                     return;
                 };
-                state.dragging_divider = false;
-                state.dragging_terminal = false;
-                state.scrollbar_drag = None;
                 // A press that never moved selects nothing.
                 if std::mem::take(&mut state.terminal.selecting)
                     && state.terminal.selection.is_some_and(|(a, b)| a == b)
                 {
                     state.terminal.selection = None;
                 }
-                state.tab_drag = None;
-                state.selecting = None;
-                state.drag_point = None;
                 state.autoscroll_carry = 0.0;
-                state.tree_drag.take().filter(|drag| drag.active && drag.valid)
+                match state.drag.take() {
+                    Some(Drag::Tree(drag)) if drag.active && drag.valid => Some(drag),
+                    _ => None,
+                }
             };
             if let Some(drag) = drop {
                 self.drop_tree_item(drag);
@@ -2284,7 +2212,7 @@ define_class!(
                     state.message = None;
                     self.ivars().needs_redraw.set(true);
                 }
-                if !self.ivars().needs_redraw.get() && state.message.is_none() && !state.git.busy() && state.drag_point.is_none() && state.project_search_rx.is_none() && state.project_index_rx.is_none() && state.http.is_none() && state.project_changed_at.is_none() && state.git_changed_at.is_none() && state.lsp_dirty.is_empty() && state.gutter_dirty.is_empty() && state.gutter_pending.is_empty() && state.tree_children_pending.is_empty() && state.claude.as_ref().is_none_or(|c| c.selection_changed_at.is_none()) && state.update.is_none() && state.ignored_rx.is_none() && state.blame_rx.is_none() && state.blame_want.is_none() && state.bulb_want.is_none() && state.ext_registry_rx.is_none() && state.ext_install_rx.is_none() && state.ext_pending.is_empty() && state.html_preview.as_ref().is_none_or(|p| !p.busy()) && state.branch_rx.is_none() && state.reloading.is_empty() && state.gutter_diffing.is_empty() && !state.symbols.pending() {
+                if !self.ivars().needs_redraw.get() && state.idle() {
                     link.setPaused(true);
                     return;
                 }
@@ -3624,7 +3552,7 @@ impl EditorView {
                 Some(project_menu(mtm))
             }
         } else {
-            let commands = self.state().map(|state| state.ext_commands.clone())?;
+            let commands = self.state().map(|state| state.ext.commands.clone())?;
             Some(editor_context_menu(mtm, &commands))
         }
     }
@@ -3979,7 +3907,7 @@ impl EditorView {
                     .chain(page.list_hits.iter())
                     .map(|(r, _)| *r)
             })
-            .chain(state.bulb_rect)
+            .chain(state.lsp.bulb_rect)
             .collect();
         if state.pointer_targets != pointer_targets {
             state.pointer_targets = pointer_targets;
@@ -4325,12 +4253,12 @@ define_class!(
                 session.save();
             }
             if let Some(mut state) = view.state_mut() {
-                for server in state.lsp.values_mut() {
+                for server in state.lsp.servers.values_mut() {
                     server.shutdown();
                 }
                 // A moment, shared by all of them, to answer and exit.
                 let until = Instant::now() + Duration::from_millis(300);
-                for server in state.lsp.values_mut() {
+                for server in state.lsp.servers.values_mut() {
                     server.finish_shutdown(until);
                 }
             }
@@ -4558,6 +4486,7 @@ fn lsp_server_for<'a>(state: &'a State, buffer: &Buffer) -> Option<&'a crate::ls
     let language = lsp_language(buffer)?;
     state
         .lsp
+        .servers
         .get(&crate::lsp::servers::server_key(language))
         .filter(|s| s.is_ready())
 }
@@ -4669,10 +4598,10 @@ fn forget_document(state: &mut State, id: u64) {
     if all_docs(state).any(|d| d.iter().any(|b| b.id() == id)) {
         return;
     }
-    state.gutter.remove(&id);
-    state.gutter_dirty.remove(&id);
-    state.gutter_pending.remove(&id);
-    state.lsp_dirty.remove(&id);
+    state.gutter.docs.remove(&id);
+    state.gutter.dirty.remove(&id);
+    state.gutter.pending.remove(&id);
+    state.lsp.dirty.remove(&id);
     state.conflict_scans.remove(&id);
 }
 
@@ -4806,6 +4735,7 @@ impl crate::ide::mcp::Host for ClaudeHost<'_> {
         };
         let mut out: Vec<_> = state
             .lsp
+            .servers
             .values()
             .flat_map(|server| server.diagnostics.iter())
             .filter(|(file, list)| match path {
@@ -4895,7 +4825,7 @@ impl crate::ide::mcp::Host for ClaudeHost<'_> {
         if let Some(path) = saved {
             self.0.lsp_flush_changes();
             if let Some(mut state) = self.0.state_mut() {
-                for server in state.lsp.values_mut() {
+                for server in state.lsp.servers.values_mut() {
                     server.did_save(&path);
                 }
             }
@@ -5747,7 +5677,7 @@ fn palette_sources(state: &State) -> PaletteSources<'_> {
         symbols: &state.symbols,
         root: state.tree.root(),
         branches: state.branch_list.as_deref(),
-        actions: state.action_list.as_ref(),
+        actions: state.lsp.action_list.as_ref(),
     }
 }
 
@@ -6524,21 +6454,13 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         diff_tab: None,
         git_focus: false,
         hovered_tab: None,
-        tree_drag: None,
         tree,
         tree_version: 0,
-        tree_children_tx,
-        tree_children_rx,
-        tree_children_pending: HashSet::new(),
         find: None,
         find_cache: None,
         sidebar,
         sidebar_width: session.sidebar_width,
-        dragging_divider: false,
-        dragging_terminal: false,
-        scrollbar_drag: None,
-        selecting: None,
-        drag_point: None,
+        drag: None,
         autoscroll_carry: 0.0,
         marked: None,
         marked_caret: 0,
@@ -6562,7 +6484,6 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         tab_hits: Vec::new(),
         tab_scroll: 0,
         tab_scroll_carry: 0.0,
-        tab_drag: None,
         context_tab: None,
         ephemeral_session: launched_with_file,
         discard_confirmed: false,
@@ -6572,7 +6493,6 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         syntax: SyntaxStore::new(),
         spans: Vec::new(),
         finder,
-        project_index_rx,
         project_search_rx: None,
         project_search_references: false,
         project_search_cancel: None,
@@ -6583,48 +6503,19 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         sidebar_keys: false,
         terminal: crate::platform::terminal::Panel::default(),
         sidebar_edit: None,
-        watcher: None,
-        lsp: HashMap::new(),
-        lsp_unavailable: HashMap::new(),
-        lsp_restarts: HashMap::new(),
-        lsp_dirty: HashMap::new(),
         rename: None,
-        signature: None,
-        formatting: None,
         format_on_save: settings.format_on_save,
         saving_formatted: false,
         word_wrap: settings.word_wrap,
         ssh_auth_sock: settings.ssh_auth_sock.clone(),
         branch_list: None,
         branch_rx: None,
-        action_list: None,
-        quick_fix_request: None,
-        organizing: None,
-        resolving: None,
         organize_on_save: settings.organize_imports_on_save,
         extensions: None,
-        ext_registry_rx: None,
-        ext_install_rx: None,
-        ext_worker: None,
-        ext_preview_worker: None,
-        ext_failures: HashMap::new(),
-        ext_commands: Vec::new(),
-        ext_pending: HashMap::new(),
-        ext_next_job: 1,
-        ext_generation: 0,
-        ext_logs: HashMap::new(),
-        bulb: None,
-        bulb_want: None,
-        bulb_request: None,
-        blame: None,
-        blame_want: None,
-        blame_rx: None,
-        gutter: HashMap::new(),
         conflict_scans: HashMap::new(),
         conflict_side: settings.conflict_side_by_side,
         conflict_cursor_key: None,
         pointer_targets: Vec::new(),
-        bulb_rect: None,
         font: font.to_owned(),
         font_size: size_pt,
         theme_choice: settings.theme,
@@ -6634,19 +6525,10 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         completer: None,
         completion_generation: 0,
         completion_chips: Vec::new(),
-        indexer: None,
         update: None,
-        ignored_rx: None,
-        gutter_dirty: HashMap::new(),
-        gutter_pending: HashSet::new(),
-        gutter_channel: mpsc::channel(),
         reload_channel: mpsc::channel(),
         reloading: HashSet::new(),
-        marks_channel: mpsc::channel(),
-        gutter_diffing: HashSet::new(),
         completion: None,
-        project_changed_at: None,
-        git_changed_at: None,
         panes: Vec::new(),
         focused_pane: 0,
         palette: None,
@@ -6660,6 +6542,58 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         pending_input: None,
         title_sync_pending: false,
         frame_interval: Duration::from_secs_f64(1.0 / 120.0),
+        gutter: Gutter {
+            docs: HashMap::new(),
+            dirty: HashMap::new(),
+            pending: HashSet::new(),
+            heads: mpsc::channel(),
+            computed: mpsc::channel(),
+            diffing: HashSet::new(),
+        },
+        blame: Blame {
+            shown: None,
+            want: None,
+            rx: None,
+        },
+        lsp: Lsp {
+            servers: HashMap::new(),
+            unavailable: HashMap::new(),
+            restarts: HashMap::new(),
+            dirty: HashMap::new(),
+            signature: None,
+            formatting: None,
+            action_list: None,
+            quick_fix_request: None,
+            organizing: None,
+            resolving: None,
+            bulb: None,
+            bulb_want: None,
+            bulb_request: None,
+            bulb_rect: None,
+        },
+        ext: Ext {
+            registry_rx: None,
+            install_rx: None,
+            worker: None,
+            preview_worker: None,
+            failures: HashMap::new(),
+            commands: Vec::new(),
+            pending: HashMap::new(),
+            next_job: 1,
+            generation: 0,
+            logs: HashMap::new(),
+        },
+        watch: Watch {
+            watcher: None,
+            indexer: None,
+            tree_changed_at: None,
+            git_changed_at: None,
+            ignored_rx: None,
+            index_rx: project_index_rx,
+            children_tx: tree_children_tx,
+            children_rx: tree_children_rx,
+            children_pending: HashSet::new(),
+        },
     };
 
     let content = NSRect::new(NSPoint::new(0.0, 0.0), frame.size);
@@ -6726,7 +6660,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
     } else {
         window.makeKeyAndOrderFront(None);
     }
-    if view.ivars().state.borrow().project_index_rx.is_some()
+    if view.ivars().state.borrow().watch.index_rx.is_some()
         || view.ivars().state.borrow().git.busy()
     {
         view.resume_display_link();

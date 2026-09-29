@@ -323,8 +323,8 @@ impl EditorView {
             }
         }
         for id in lsp_dirty {
-            state.lsp_dirty.insert(id, Instant::now());
-            state.gutter_dirty.insert(id, Instant::now());
+            state.lsp.dirty.insert(id, Instant::now());
+            state.gutter.dirty.insert(id, Instant::now());
         }
         for (id, path) in background {
             if !state.reloading.insert(id) {
@@ -391,8 +391,8 @@ impl EditorView {
             }
             active_changed |= id == active_id;
             drop(all);
-            state.lsp_dirty.insert(id, Instant::now());
-            state.gutter_dirty.insert(id, Instant::now());
+            state.lsp.dirty.insert(id, Instant::now());
+            state.gutter.dirty.insert(id, Instant::now());
         }
         if names.is_empty() {
             return;
@@ -424,8 +424,8 @@ impl EditorView {
             let active = state.docs.active();
             let id = active.id();
             if active.path.is_some() {
-                state.lsp_dirty.insert(id, Instant::now());
-                state.gutter_dirty.insert(id, Instant::now());
+                state.lsp.dirty.insert(id, Instant::now());
+                state.gutter.dirty.insert(id, Instant::now());
             }
             state.completion = None;
             if announce {}
@@ -506,7 +506,7 @@ impl EditorView {
                 return;
             };
             if let Some(root) = state.tree.root().map(Path::to_path_buf) {
-                state.ignored_rx = Some(spawn_ignored(root));
+                state.watch.ignored_rx = Some(spawn_ignored(root));
             }
         }
         if ok {
@@ -518,7 +518,7 @@ impl EditorView {
             let Some(mut state) = self.state_mut() else {
                 return;
             };
-            for server in state.lsp.values_mut() {
+            for server in state.lsp.servers.values_mut() {
                 server.did_save(&path);
             }
             // Saved first, formatted after: a server that never answers

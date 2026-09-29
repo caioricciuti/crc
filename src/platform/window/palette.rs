@@ -118,7 +118,7 @@ impl EditorView {
             let root = state.tree.root().map(Path::to_path_buf);
             state.symbols.reset(document, root);
             state.branch_list = None;
-            state.action_list = None;
+            state.lsp.action_list = None;
             let mut query = Buffer::new();
             if !prefix.is_empty() {
                 query.insert(prefix);
@@ -262,7 +262,7 @@ impl EditorView {
             };
             state.palette = None;
             state.branch_list = None;
-            state.action_list = None;
+            state.lsp.action_list = None;
         }
         self.request_redraw();
         self.pump();

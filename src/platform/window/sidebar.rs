@@ -21,8 +21,7 @@ impl EditorView {
                 Some(entry) => entry.path.parent().map(Path::to_path_buf),
                 None => state.tree.root().map(Path::to_path_buf),
             };
-            let State { tree_drag, .. } = &mut *state;
-            let Some(drag) = tree_drag else {
+            let Some(Drag::Tree(drag)) = &mut state.drag else {
                 break 'drag (false, false);
             };
             if !drag.active {
@@ -267,7 +266,7 @@ impl EditorView {
                     return false;
                 };
                 if !state.git_focus
-                    && (state.docs.active().cursor_count() > 1 || state.signature.is_some())
+                    && (state.docs.active().cursor_count() > 1 || state.lsp.signature.is_some())
                 {
                     return false;
                 }
@@ -353,9 +352,9 @@ impl EditorView {
             };
             if expanded {
                 state.tree.toggle(index);
-            } else if state.tree_children_pending.insert(path.clone()) {
+            } else if state.watch.children_pending.insert(path.clone()) {
                 let root = state.tree.root().map(Path::to_path_buf);
-                let tx = state.tree_children_tx.clone();
+                let tx = state.watch.children_tx.clone();
                 std::thread::spawn(move || {
                     if let Some(root) = root {
                         let children = Tree::children(&path, depth + 1);
@@ -364,7 +363,7 @@ impl EditorView {
                 });
             } else {
                 // A second click before the worker finishes cancels expansion.
-                state.tree_children_pending.remove(&path);
+                state.watch.children_pending.remove(&path);
             }
             drop(state);
             self.resume_display_link();
@@ -409,8 +408,8 @@ impl EditorView {
         // A project is open now, which is worth coming back to.
         state.ephemeral_session = false;
         state.message = Some(("Folder opened".to_string(), Instant::now()));
-        state.lsp.clear();
-        state.lsp_unavailable.clear();
+        state.lsp.servers.clear();
+        state.lsp.unavailable.clear();
         state.completion = None;
         drop(state);
         self.watch_project();
@@ -424,18 +423,18 @@ impl EditorView {
         let Some(mut state) = self.state_mut() else {
             return;
         };
-        let Some(rx) = &state.project_index_rx else {
+        let Some(rx) = &state.watch.index_rx else {
             return;
         };
         let result = match rx.try_recv() {
             Ok(result) => result,
             Err(mpsc::TryRecvError::Empty) => return,
             Err(mpsc::TryRecvError::Disconnected) => {
-                state.project_index_rx = None;
+                state.watch.index_rx = None;
                 return;
             }
         };
-        state.project_index_rx = None;
+        state.watch.index_rx = None;
         let ProjectIndexResult {
             root,
             mut tree,
@@ -447,7 +446,7 @@ impl EditorView {
         }
         if state.tree_version != tree_version {
             state.finder = finder;
-            state.project_index_rx = Some(spawn_project_refresh(
+            state.watch.index_rx = Some(spawn_project_refresh(
                 state.tree.clone(),
                 state.tree_version,
             ));
@@ -473,7 +472,7 @@ impl EditorView {
         }
         state.finder = finder;
         state.tree_version += 1;
-        state.ignored_rx = Some(spawn_ignored(root));
+        state.watch.ignored_rx = Some(spawn_ignored(root));
         drop(state);
         self.request_redraw();
         self.resume_display_link();
@@ -484,18 +483,18 @@ impl EditorView {
         let Some(mut state) = self.state_mut() else {
             return;
         };
-        let Some(rx) = &state.ignored_rx else {
+        let Some(rx) = &state.watch.ignored_rx else {
             return;
         };
         let (root, ignored) = match rx.try_recv() {
             Ok(answer) => answer,
             Err(mpsc::TryRecvError::Empty) => return,
             Err(mpsc::TryRecvError::Disconnected) => {
-                state.ignored_rx = None;
+                state.watch.ignored_rx = None;
                 return;
             }
         };
-        state.ignored_rx = None;
+        state.watch.ignored_rx = None;
         if state.tree.root() == Some(root.as_path()) {
             state.tree.set_ignored(std::sync::Arc::new(ignored));
             drop(state);
@@ -508,9 +507,9 @@ impl EditorView {
             return;
         };
         let mut changed = false;
-        while let Ok((root, path, children)) = state.tree_children_rx.try_recv() {
+        while let Ok((root, path, children)) = state.watch.children_rx.try_recv() {
             if state.tree.root() != Some(root.as_path())
-                || !state.tree_children_pending.remove(&path)
+                || !state.watch.children_pending.remove(&path)
             {
                 continue;
             }

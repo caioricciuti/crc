@@ -230,13 +230,21 @@ impl EditorView {
             };
             if unit != SelectUnit::Character && !option && !shift {
                 buffer.select_range(pressed.start, pressed.end);
-                state.selecting = Some((unit, pressed));
+                state.drag = Some(Drag::Select {
+                    unit,
+                    pressed,
+                    point: None,
+                });
                 drop(state);
                 self.note_input(started);
                 self.pump();
                 return;
             }
-            state.selecting = Some((unit, pressed));
+            state.drag = Some(Drag::Select {
+                unit,
+                pressed,
+                point: None,
+            });
         }
         {
             let Some(mut state) = self.state_mut() else {
@@ -458,11 +466,11 @@ impl EditorView {
                 && state.find.is_none()
                 && state.goto.is_none()
                 && state.rename.is_none();
-            let tip = state.signature.is_some();
+            let tip = state.lsp.signature.is_some();
             drop(state);
             if idle && tip {
                 if let Some(mut state) = self.state_mut() {
-                    state.signature = None;
+                    state.lsp.signature = None;
                 }
                 self.request_redraw();
                 return true;
@@ -889,8 +897,8 @@ impl EditorView {
         };
         let id = state.docs.active().id();
         if state.docs.active().path.is_some() {
-            state.lsp_dirty.insert(id, Instant::now());
-            state.gutter_dirty.insert(id, Instant::now());
+            state.lsp.dirty.insert(id, Instant::now());
+            state.gutter.dirty.insert(id, Instant::now());
         }
         follow_completion(&mut state);
         state.docs.active_mut().scroll_to_cursor(rows, cols);
@@ -908,10 +916,15 @@ impl EditorView {
         let Some(mut state) = self.state_mut() else {
             return false;
         };
-        let (Some((unit, pressed)), Some((x, y))) = (state.selecting.clone(), state.drag_point)
+        let Some(Drag::Select {
+            unit,
+            pressed,
+            point: Some((x, y)),
+        }) = &state.drag
         else {
             return false;
         };
+        let (unit, pressed, x, y) = (*unit, pressed.clone(), *x, *y);
         let chrome = chrome_of(&state);
         let text = chrome.text;
         let m = state.renderer.atlas.metrics;

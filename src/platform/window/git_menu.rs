@@ -107,44 +107,46 @@ impl EditorView {
         let Some(mut state) = self.state_mut() else {
             return;
         };
-        if let Some(rx) = &state.blame_rx {
+        if let Some(rx) = &state.blame.rx {
             match rx.try_recv() {
                 Ok((id, line, text)) => {
-                    state.blame_rx = None;
-                    state.blame = Some((id, line, text));
+                    state.blame.rx = None;
+                    state.blame.shown = Some((id, line, text));
                     self.ivars().needs_redraw.set(true);
                 }
                 Err(mpsc::TryRecvError::Empty) => return,
-                Err(mpsc::TryRecvError::Disconnected) => state.blame_rx = None,
+                Err(mpsc::TryRecvError::Disconnected) => state.blame.rx = None,
             }
         }
         let buffer = state.docs.active();
         let (id, line) = (buffer.id(), buffer.cursor_position().0);
         if state
             .blame
+            .shown
             .as_ref()
             .is_some_and(|(i, l, _)| (*i, *l) == (id, line))
         {
             return;
         }
-        match state.blame_want {
+        match state.blame.want {
             Some((i, l, at)) if (i, l) == (id, line) => {
                 if at.elapsed() < REST {
                     return;
                 }
             }
             _ => {
-                state.blame_want = Some((id, line, Instant::now()));
-                if state.blame.take().is_some() {
+                state.blame.want = Some((id, line, Instant::now()));
+                if state.blame.shown.take().is_some() {
                     self.ivars().needs_redraw.set(true);
                 }
                 return;
             }
         }
-        state.blame_want = None;
+        state.blame.want = None;
         // Only files Git knows: their HEAD text was found for the gutter.
         let tracked = state
             .gutter
+            .docs
             .get(&id)
             .is_some_and(|g| g.head.as_ref().is_some_and(|h| !h.is_empty()));
         let buffer = state.docs.active();
@@ -158,7 +160,7 @@ impl EditorView {
         }
         let text = buffer.rope.to_string();
         let (tx, rx) = mpsc::channel();
-        state.blame_rx = Some(rx);
+        state.blame.rx = Some(rx);
         std::thread::spawn(move || {
             let relative = path.strip_prefix(&root).unwrap_or(&path).to_path_buf();
             let note = match crate::project::git::blame_line(&root, &relative, line, &text) {

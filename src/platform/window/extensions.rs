@@ -14,7 +14,7 @@ impl EditorView {
                 return;
             };
             let mut page = crate::platform::extensions::Page::new(installed);
-            page.logs = state.ext_logs.clone();
+            page.logs = state.ext.logs.clone();
             state.extensions = Some(page);
             state.palette = None;
             state.completion = None;
@@ -34,7 +34,7 @@ impl EditorView {
         let Some(mut state) = self.state_mut() else {
             return;
         };
-        state.ext_registry_rx = Some(rx);
+        state.ext.registry_rx = Some(rx);
         if let Some(page) = &mut state.extensions {
             page.registry = crate::platform::extensions::Registry::Loading;
         }
@@ -50,7 +50,7 @@ impl EditorView {
             let Some(mut state) = self.state_mut() else {
                 return;
             };
-            state.ext_generation += 1;
+            state.ext.generation += 1;
             if let Some(page) = &mut state.extensions {
                 if page.selected.as_ref().is_some_and(|id| {
                     !installed.iter().any(|i| &i.manifest.id == id) && page.available(id).is_none()
@@ -125,7 +125,7 @@ impl EditorView {
                         let Some(mut state) = self.state_mut() else {
                             return;
                         };
-                        state.ext_install_rx = Some(rx);
+                        state.ext.install_rx = Some(rx);
                         if let Some(page) = &mut state.extensions {
                             page.busy = Some(format!("Installing {name}\u{2026}"));
                         }
@@ -296,7 +296,7 @@ impl EditorView {
             }
         }
         if let Some(mut state) = self.state_mut() {
-            state.ext_commands = commands;
+            state.ext.commands = commands;
         }
     }
 
@@ -308,7 +308,7 @@ impl EditorView {
         };
         let Some(command) = usize::try_from(tag)
             .ok()
-            .and_then(|t| state.ext_commands.get(t))
+            .and_then(|t| state.ext.commands.get(t))
             .cloned()
         else {
             return;
@@ -461,7 +461,7 @@ impl EditorView {
         };
         let active = state.docs.active();
         let gone = active.id() != preview.buffer
-            || !state.ext_commands.iter().any(|c| {
+            || !state.ext.commands.iter().any(|c| {
                 c.installed.manifest.id == preview.command.installed.manifest.id
                     && c.command == preview.command.command
             });
@@ -477,7 +477,7 @@ impl EditorView {
             || state.palette.is_some()
             || state.goto.is_some()
             || state.branch_list.is_some()
-            || state.action_list.is_some();
+            || state.lsp.action_list.is_some();
         let rope = active.rope.clone();
         let dark = state.theme.is_dark();
         let Some(preview) = state.html_preview.as_mut() else {
@@ -577,10 +577,10 @@ impl EditorView {
         let Some(mut state) = self.state_mut() else {
             return;
         };
-        if let Some(rx) = &state.ext_registry_rx
+        if let Some(rx) = &state.ext.registry_rx
             && let Ok(result) = rx.try_recv()
         {
-            state.ext_registry_rx = None;
+            state.ext.registry_rx = None;
             if let Some(page) = &mut state.extensions {
                 page.registry = match result {
                     Ok((entries, skipped)) => {
@@ -592,11 +592,12 @@ impl EditorView {
             self.ivars().needs_redraw.set(true);
         }
         let download = state
-            .ext_install_rx
+            .ext
+            .install_rx
             .as_ref()
             .and_then(|rx| rx.try_recv().ok());
         let mut done = Vec::new();
-        for (_, rx) in state.ext_worker.iter().chain(&state.ext_preview_worker) {
+        for (_, rx) in state.ext.worker.iter().chain(&state.ext.preview_worker) {
             while let Ok(answer) = rx.try_recv() {
                 done.push(answer);
             }
@@ -604,7 +605,7 @@ impl EditorView {
         drop(state);
         if let Some(result) = download {
             if let Some(mut state) = self.state_mut() {
-                state.ext_install_rx = None;
+                state.ext.install_rx = None;
             }
             self.finish_install(result);
             self.ivars().needs_redraw.set(true);
@@ -622,32 +623,33 @@ impl EditorView {
             return;
         };
         if !done.log.is_empty() {
-            state.ext_logs.insert(done.id.clone(), done.log.clone());
+            state.ext.logs.insert(done.id.clone(), done.log.clone());
             if let Some(page) = &mut state.extensions {
                 page.logs.insert(done.id.clone(), done.log);
             }
         }
-        let Some(call) = state.ext_pending.remove(&done.tag) else {
+        let Some(call) = state.ext.pending.remove(&done.tag) else {
             return;
         };
         // Three failures in a row, not counting time or instruction limits,
         // turn an extension off until someone turns it back on.
         let broken = match &done.result {
             Err(_) if !done.over_budget => {
-                let count = state.ext_failures.entry(done.id.clone()).or_insert(0);
+                let count = state.ext.failures.entry(done.id.clone()).or_insert(0);
                 *count += 1;
                 *count >= EXT_FAILURES_TO_DISABLE
             }
             Err(_) => false,
             Ok(_) => {
-                state.ext_failures.remove(&done.id);
+                state.ext.failures.remove(&done.id);
                 false
             }
         };
         if broken {
-            state.ext_failures.remove(&done.id);
+            state.ext.failures.remove(&done.id);
             let installed = state
-                .ext_commands
+                .ext
+                .commands
                 .iter()
                 .find(|c| c.installed.manifest.id == done.id)
                 .map(|c| c.installed.clone());
@@ -702,8 +704,8 @@ impl EditorView {
             }
         }
         if changed {
-            state.lsp_dirty.insert(call.buffer, Instant::now());
-            state.gutter_dirty.insert(call.buffer, Instant::now());
+            state.lsp.dirty.insert(call.buffer, Instant::now());
+            state.gutter.dirty.insert(call.buffer, Instant::now());
         }
         state.message = Some((note.unwrap_or_else(|| call.title.clone()), Instant::now()));
         let active = state.docs.active().id() == call.buffer;
@@ -799,19 +801,19 @@ pub(super) fn send_ext_job(
 ) -> bool {
     let preview = call.preview;
     let slot = if preview {
-        &mut state.ext_preview_worker
+        &mut state.ext.preview_worker
     } else {
-        &mut state.ext_worker
+        &mut state.ext.worker
     };
     if slot.is_none() {
         *slot = Some(crate::ext::run::spawn(Box::new(|| {})));
     }
-    let job = state.ext_next_job;
-    state.ext_next_job += 1;
+    let job = state.ext.next_job;
+    state.ext.next_job += 1;
     let worker = if preview {
-        &state.ext_preview_worker
+        &state.ext.preview_worker
     } else {
-        &state.ext_worker
+        &state.ext.worker
     };
     let sent = worker.as_ref().is_some_and(|(tx, _)| {
         tx.send(crate::ext::run::Job {
@@ -819,18 +821,18 @@ pub(super) fn send_ext_job(
             manifest: command.installed.manifest.clone(),
             wasm: command.installed.wasm(),
             sha256: command.installed.sha256.clone(),
-            generation: state.ext_generation,
+            generation: state.ext.generation,
             request,
         })
         .is_ok()
     });
     if sent {
-        state.ext_pending.insert(job, call);
+        state.ext.pending.insert(job, call);
     } else {
         if preview {
-            state.ext_preview_worker = None;
+            state.ext.preview_worker = None;
         } else {
-            state.ext_worker = None;
+            state.ext.worker = None;
         }
         state.message = Some(("the extension thread stopped".into(), Instant::now()));
     }
@@ -855,7 +857,8 @@ pub(super) fn preview_displaced(state: &State) -> bool {
 /// preview.
 pub(super) fn preview_command(state: &State) -> Option<ExtCommand> {
     state
-        .ext_commands
+        .ext
+        .commands
         .iter()
         .find(|c| {
             c.installed.manifest.may_preview() && c.command == crate::ext::manifest::PREVIEW_COMMAND

@@ -25,7 +25,7 @@ impl EditorView {
         };
         let at = crate::lsp::position_of(&buffer.rope, offset.unwrap_or(buffer.cursor()));
         let key = crate::lsp::servers::server_key(language);
-        match ready_server(&mut state.lsp, key).filter(|s| s.knows(&path)) {
+        match ready_server(&mut state.lsp.servers, key).filter(|s| s.knows(&path)) {
             Some(server) => {
                 ask(server, &path, at);
                 true
@@ -205,7 +205,7 @@ impl EditorView {
                 let name = rename.field.rope.to_string().trim().to_owned();
                 let key = crate::lsp::servers::server_key(rename.language);
                 let sent = !name.is_empty()
-                    && ready_server(&mut state.lsp, key)
+                    && ready_server(&mut state.lsp.servers, key)
                         .map(|server| server.rename(&rename.path, rename.at, &name))
                         .is_some();
                 state.message = Some((
@@ -285,9 +285,9 @@ impl EditorView {
                 if let Some((id, own_path)) = open {
                     let sent = own_path
                         .as_deref()
-                        .and_then(|p| state.lsp.get(&server).and_then(|s| s.version_of(p)));
+                        .and_then(|p| state.lsp.servers.get(&server).and_then(|s| s.version_of(p)));
                     let moved = file.version.is_some() && sent.is_some() && file.version != sent;
-                    if moved || state.lsp_dirty.contains_key(&id) {
+                    if moved || state.lsp.dirty.contains_key(&id) {
                         outcome.failed.push(path.clone());
                         continue;
                     }
@@ -364,7 +364,7 @@ impl EditorView {
             return None;
         };
         let key = crate::lsp::servers::server_key(language);
-        let server = ready_server(&mut state.lsp, key).filter(|s| s.knows(&path));
+        let server = ready_server(&mut state.lsp.servers, key).filter(|s| s.knows(&path));
         let (sent, why) = match server {
             Some(server) if server.offers_code_actions() => {
                 let diagnostics: Vec<crate::lsp::Diagnostic> = server
@@ -398,6 +398,7 @@ impl EditorView {
             };
             let buffer = state.docs.active();
             state
+                .lsp
                 .bulb
                 .as_ref()
                 .filter(|b| {
@@ -405,7 +406,7 @@ impl EditorView {
                         && b.caret == buffer.cursor()
                         && buffer.selection().is_none()
                         && b.shows()
-                        && !state.lsp_dirty.contains_key(&b.buffer)
+                        && !state.lsp.dirty.contains_key(&b.buffer)
                 })
                 .map(|b| (b.server, b.actions.clone()))
         };
@@ -417,7 +418,7 @@ impl EditorView {
             let Some(mut state) = self.state_mut() else {
                 return;
             };
-            state.quick_fix_request = Some(request);
+            state.lsp.quick_fix_request = Some(request);
             state.message = Some(("looking for code actions\u{2026}".into(), Instant::now()));
         }
         self.request_redraw();
@@ -434,7 +435,7 @@ impl EditorView {
         actions.sort_by_key(|a| (a.disabled.is_some(), !a.preferred));
         self.open_palette_with("");
         if let Some(mut state) = self.state_mut() {
-            state.action_list = Some((server, actions));
+            state.lsp.action_list = Some((server, actions));
         }
         self.request_redraw();
         self.pump();
@@ -455,13 +456,14 @@ impl EditorView {
             let Some(mut state) = self.state_mut() else {
                 return;
             };
-            let steps = ready_server(&mut state.lsp, server).map(|s| s.action_steps(&action));
+            let steps =
+                ready_server(&mut state.lsp.servers, server).map(|s| s.action_steps(&action));
             match &steps {
                 None => {
                     state.message = Some(("the language server stopped".into(), Instant::now()))
                 }
                 Some(None) => {
-                    state.resolving = Some(false);
+                    state.lsp.resolving = Some(false);
                     state.message = Some((format!("{}\u{2026}", action.title), Instant::now()));
                 }
                 Some(Some(_)) => {}
@@ -490,7 +492,7 @@ impl EditorView {
                 return;
             };
             if let Some(command) = &steps.command
-                && let Some(server) = ready_server(&mut state.lsp, server)
+                && let Some(server) = ready_server(&mut state.lsp.servers, server)
             {
                 server.execute_command(command);
             }
@@ -530,7 +532,7 @@ impl EditorView {
         let Some(mut state) = self.state_mut() else {
             return false;
         };
-        state.organizing = Some(Organizing {
+        state.lsp.organizing = Some(Organizing {
             request,
             path,
             snapshot,
@@ -564,8 +566,8 @@ impl EditorView {
         let Some(mut state) = self.state_mut() else {
             return;
         };
-        if state.quick_fix_request == Some(request) {
-            state.quick_fix_request = None;
+        if state.lsp.quick_fix_request == Some(request) {
+            state.lsp.quick_fix_request = None;
             if actions.is_empty() {
                 state.message = Some(("no code actions here".into(), Instant::now()));
                 return;
@@ -576,11 +578,12 @@ impl EditorView {
             return;
         }
         if state
+            .lsp
             .organizing
             .as_ref()
             .is_some_and(|o| o.request == request)
         {
-            let Some(asked) = state.organizing.take() else {
+            let Some(asked) = state.lsp.organizing.take() else {
                 return;
             };
             let key = crate::platform::canonical(&asked.path);
@@ -597,7 +600,7 @@ impl EditorView {
                 .find(|a| a.disabled.is_none() && a.kind.starts_with("source.organizeImports"));
             let steps = match (&action, unchanged) {
                 (Some(action), true) => {
-                    ready_server(&mut state.lsp, server).map(|s| s.action_steps(action))
+                    ready_server(&mut state.lsp.servers, server).map(|s| s.action_steps(action))
                 }
                 _ => None,
             };
@@ -606,7 +609,7 @@ impl EditorView {
                 (Some(_), false, _) => Some("organize imports skipped: the text changed"),
                 (Some(_), true, None) => Some("the language server stopped"),
                 (Some(_), true, Some(None)) => {
-                    state.resolving = Some(asked.save);
+                    state.lsp.resolving = Some(asked.save);
                     None
                 }
                 (Some(_), true, Some(Some(_))) => None,
@@ -625,16 +628,16 @@ impl EditorView {
             }
             return;
         }
-        if let Some((asked, buffer, caret)) = state.bulb_request
+        if let Some((asked, buffer, caret)) = state.lsp.bulb_request
             && asked == request
         {
-            state.bulb_request = None;
+            state.lsp.bulb_request = None;
             let path = all_docs(&state)
                 .flat_map(|d| d.iter())
                 .find(|b| b.id() == buffer)
                 .and_then(|b| b.path.clone());
             if let Some(path) = path {
-                state.bulb = Some(Bulb {
+                state.lsp.bulb = Some(Bulb {
                     buffer,
                     path,
                     caret,
@@ -780,35 +783,36 @@ impl EditorView {
         let buffer = state.docs.active();
         let (id, caret) = (buffer.id(), buffer.cursor());
         let selecting = buffer.selection().is_some();
-        let dirty = state.lsp_dirty.contains_key(&id);
+        let dirty = state.lsp.dirty.contains_key(&id);
         let here = |b: &Bulb| (b.buffer, b.caret) == (id, caret);
-        if state.bulb.as_ref().is_some_and(|b| !here(b) || dirty) {
-            state.bulb = None;
+        if state.lsp.bulb.as_ref().is_some_and(|b| !here(b) || dirty) {
+            state.lsp.bulb = None;
             self.ivars().needs_redraw.set(true);
         }
-        if state.bulb.is_some()
+        if state.lsp.bulb.is_some()
             || selecting
             || dirty
             || state.palette.is_some()
             || state
+                .lsp
                 .bulb_request
                 .is_some_and(|(_, b, c)| (b, c) == (id, caret))
         {
-            state.bulb_want = None;
+            state.lsp.bulb_want = None;
             return;
         }
-        match state.bulb_want {
+        match state.lsp.bulb_want {
             Some((b, c, at)) if (b, c) == (id, caret) => {
                 if at.elapsed() < REST {
                     return;
                 }
             }
             _ => {
-                state.bulb_want = Some((id, caret, Instant::now()));
+                state.lsp.bulb_want = Some((id, caret, Instant::now()));
                 return;
             }
         }
-        state.bulb_want = None;
+        state.lsp.bulb_want = None;
         // Only where a server offers them; asking costs nothing then.
         let offers =
             lsp_server_for(&state, state.docs.active()).is_some_and(|s| s.offers_code_actions());
@@ -819,7 +823,7 @@ impl EditorView {
         if let Some((request, ..)) = self.request_code_actions(None, false)
             && let Some(mut state) = self.state_mut()
         {
-            state.bulb_request = Some((request, id, caret));
+            state.lsp.bulb_request = Some((request, id, caret));
         }
     }
 
@@ -850,7 +854,7 @@ impl EditorView {
             return;
         };
         match asked {
-            Some(path) => state.formatting = Some((path, snapshot)),
+            Some(path) => state.lsp.formatting = Some((path, snapshot)),
             None if sent && !save => {
                 state.message = Some((
                     "this language server does not format".into(),
@@ -866,7 +870,7 @@ impl EditorView {
         let Some(mut state) = self.state_mut() else {
             return;
         };
-        let Some((asked, snapshot)) = state.formatting.take() else {
+        let Some((asked, snapshot)) = state.lsp.formatting.take() else {
             return;
         };
         let buffer = state.docs.active_mut();
@@ -882,7 +886,7 @@ impl EditorView {
         buffer.scroll_to_cursor(rows, cols);
         let id = buffer.id();
         if changed {
-            state.lsp_dirty.insert(id, Instant::now());
+            state.lsp.dirty.insert(id, Instant::now());
         }
         state.message = Some((
             if changed {

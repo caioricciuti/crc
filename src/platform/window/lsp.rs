@@ -45,7 +45,7 @@ impl EditorView {
                 let Some(state) = self.state() else {
                     return;
                 };
-                state.lsp.contains_key(&key) || state.lsp_unavailable.contains_key(&key)
+                state.lsp.servers.contains_key(&key) || state.lsp.unavailable.contains_key(&key)
             };
             if known {
                 continue;
@@ -67,12 +67,12 @@ impl EditorView {
                         Ok(server) => {
                             state.message =
                                 Some((format!("{} starting", launch.name), Instant::now()));
-                            state.lsp.insert(key, server);
+                            state.lsp.servers.insert(key, server);
                         }
                         Err(error) => {
                             let reason = format!("{} failed to start: {error}", launch.name);
                             state.message = Some((reason.clone(), Instant::now()));
-                            state.lsp_unavailable.insert(key, reason);
+                            state.lsp.unavailable.insert(key, reason);
                         }
                     }
                 }
@@ -83,7 +83,7 @@ impl EditorView {
                     // Said once per language, in the status line, and then
                     // the editor is simply an editor for that file.
                     state.message = Some((reason.clone(), Instant::now()));
-                    state.lsp_unavailable.insert(key, reason);
+                    state.lsp.unavailable.insert(key, reason);
                 }
             }
         }
@@ -92,7 +92,10 @@ impl EditorView {
             return;
         };
         let State {
-            lsp, docs, panes, ..
+            lsp: Lsp { servers: lsp, .. },
+            docs,
+            panes,
+            ..
         } = &mut *state;
         for (language, path, id) in wanted {
             let key = crate::lsp::servers::server_key(language);
@@ -121,22 +124,22 @@ impl EditorView {
             return;
         };
         // Marks worked out on a worker, for text that has not moved on.
-        while let Ok((id, text, marks)) = state.marks_channel.1.try_recv() {
-            state.gutter_diffing.remove(&id);
+        while let Ok((id, text, marks)) = state.gutter.computed.1.try_recv() {
+            state.gutter.diffing.remove(&id);
             let current = all_docs(&state)
                 .flat_map(|d| d.iter())
                 .find(|b| b.id() == id)
                 .is_some_and(|b| b.rope.same_as(&text));
-            if current && let Some(entry) = state.gutter.get_mut(&id) {
+            if current && let Some(entry) = state.gutter.docs.get_mut(&id) {
                 entry.marks = marks;
                 self.ivars().needs_redraw.set(true);
             }
         }
         // Fetched HEAD texts landing.
-        while let Ok((id, head)) = state.gutter_channel.1.try_recv() {
-            state.gutter_pending.remove(&id);
+        while let Ok((id, head)) = state.gutter.heads.1.try_recv() {
+            state.gutter.pending.remove(&id);
             let has_head = head.is_some();
-            state.gutter.insert(
+            state.gutter.docs.insert(
                 id,
                 GutterState {
                     head: head.map(std::sync::Arc::new),
@@ -144,7 +147,7 @@ impl EditorView {
                 },
             );
             if has_head {
-                state.gutter_dirty.insert(id, overdue());
+                state.gutter.dirty.insert(id, overdue());
             }
             self.ivars().needs_redraw.set(true);
         }
@@ -155,11 +158,11 @@ impl EditorView {
             if let Some(path) = active.path.clone()
                 && !active.is_preview_file()
                 && active.rope.len_bytes() <= GUTTER_MAX_BYTES
-                && !state.gutter.contains_key(&id)
-                && !state.gutter_pending.contains(&id)
+                && !state.gutter.docs.contains_key(&id)
+                && !state.gutter.pending.contains(&id)
             {
-                state.gutter_pending.insert(id);
-                let tx = state.gutter_channel.0.clone();
+                state.gutter.pending.insert(id);
+                let tx = state.gutter.heads.0.clone();
                 std::thread::spawn(move || {
                     let head = path
                         .parent()
@@ -173,15 +176,19 @@ impl EditorView {
             }
         }
         // Files edited a moment ago.
-        let due = due(&state.gutter_dirty, PAUSE);
+        let due = due(&state.gutter.dirty, PAUSE);
         if due.is_empty() {
             return;
         }
         let State {
-            gutter,
-            gutter_dirty,
-            gutter_diffing,
-            marks_channel,
+            gutter:
+                Gutter {
+                    docs: gutter,
+                    dirty: gutter_dirty,
+                    diffing: gutter_diffing,
+                    computed: marks_channel,
+                    ..
+                },
             docs,
             panes,
             ..
@@ -224,16 +231,20 @@ impl EditorView {
         let Some(mut state) = self.state_mut() else {
             return;
         };
-        if state.lsp_dirty.is_empty() {
+        if state.lsp.dirty.is_empty() {
             return;
         }
-        let due = due(&state.lsp_dirty, PAUSE);
+        let due = due(&state.lsp.dirty, PAUSE);
         if due.is_empty() {
             return;
         }
         let State {
-            lsp,
-            lsp_dirty,
+            lsp:
+                Lsp {
+                    servers: lsp,
+                    dirty: lsp_dirty,
+                    ..
+                },
             docs,
             panes,
             ..
@@ -280,7 +291,7 @@ impl EditorView {
             return;
         };
         let mut events = Vec::new();
-        for (key, server) in state.lsp.iter_mut() {
+        for (key, server) in state.lsp.servers.iter_mut() {
             events.extend(server.poll().into_iter().map(|event| (*key, event)));
         }
         drop(state);
@@ -295,18 +306,19 @@ impl EditorView {
                         return;
                     };
                     if state
+                        .lsp
                         .bulb
                         .as_ref()
                         .is_some_and(|b| same_file(&b.path, &path))
                     {
-                        state.bulb = None;
+                        state.lsp.bulb = None;
                     }
                 }
                 Event::CodeActions {
                     request, actions, ..
                 } => self.code_actions_arrived(key, request, actions),
                 Event::Action(steps) => {
-                    let Some(save) = self.state_mut().map(|mut state| state.resolving.take())
+                    let Some(save) = self.state_mut().map(|mut state| state.lsp.resolving.take())
                     else {
                         return;
                     };
@@ -319,7 +331,7 @@ impl EditorView {
                     let Some(mut state) = self.state_mut() else {
                         return;
                     };
-                    if let Some(server) = state.lsp.get_mut(&key) {
+                    if let Some(server) = state.lsp.servers.get_mut(&key) {
                         server.answer_apply_edit(&id, outcome.failed.is_empty());
                     }
                     if outcome.open + outcome.written > 0 || !outcome.failed.is_empty() {
@@ -379,11 +391,12 @@ impl EditorView {
                     let buffer = state.docs.active();
                     let here = buffer.path.as_deref() == Some(path.as_path());
                     let (id, caret) = (buffer.id(), buffer.cursor());
-                    state.signature = signature.filter(|_| here).map(|signature| SignatureTip {
-                        buffer: id,
-                        anchor: caret,
-                        signature,
-                    });
+                    state.lsp.signature =
+                        signature.filter(|_| here).map(|signature| SignatureTip {
+                            buffer: id,
+                            anchor: caret,
+                            signature,
+                        });
                 }
                 Event::Refused(reason) => {
                     if let Some(mut state) = self.state_mut() {
@@ -398,7 +411,7 @@ impl EditorView {
                     let Some(mut state) = self.state_mut() else {
                         return;
                     };
-                    let restarts = state.lsp_restarts.entry(key).or_insert(0);
+                    let restarts = state.lsp.restarts.entry(key).or_insert(0);
                     *restarts += 1;
                     let restarts = *restarts;
                     // Dropping it kills a process that is still there (one
@@ -406,11 +419,13 @@ impl EditorView {
                     // after starting will only die again: not restarted.
                     let short_lived = state
                         .lsp
+                        .servers
                         .remove(&key)
                         .is_some_and(|server| server.uptime() < LSP_RESTART_AFTER);
                     if short_lived || restarts >= LSP_MAX_RESTARTS {
                         state
-                            .lsp_unavailable
+                            .lsp
+                            .unavailable
                             .insert(key, format!("{reason}; not started again"));
                     } else {
                         sync = true;
@@ -433,16 +448,16 @@ impl EditorView {
             return;
         };
         let id = state.docs.active().id();
-        if let Some(tip) = &state.signature {
+        if let Some(tip) = &state.lsp.signature {
             let buffer = state.docs.active();
             let caret = buffer.cursor();
             let line = |at: usize| buffer.rope.byte_to_line(at.min(buffer.rope.len_bytes()));
             if tip.buffer != id || caret < tip.anchor || line(caret) != line(tip.anchor) {
-                state.signature = None;
+                state.lsp.signature = None;
             }
         }
         if edited && state.docs.active().path.is_some() {
-            state.lsp_dirty.insert(id, Instant::now());
+            state.lsp.dirty.insert(id, Instant::now());
         }
         let still = follow_completion(&mut state);
         drop(state);
@@ -480,7 +495,7 @@ impl EditorView {
         } else if ch == ')'
             && let Some(mut state) = self.state_mut()
         {
-            state.signature = None;
+            state.lsp.signature = None;
         }
         if crate::complete::is_word_char(ch) || trigger || path {
             self.request_completion(false);
@@ -498,7 +513,7 @@ impl EditorView {
             let Some(mut state) = self.state_mut() else {
                 return;
             };
-            for at in state.lsp_dirty.values_mut() {
+            for at in state.lsp.dirty.values_mut() {
                 *at = overdue();
             }
         }

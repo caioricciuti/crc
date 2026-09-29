@@ -384,6 +384,7 @@ impl EditorView {
                     state.focused_pane,
                     state
                         .lsp
+                        .servers
                         .values()
                         .map(|s| format!("{} {:?}", s.name, s.phase))
                         .collect::<Vec<_>>()
@@ -538,12 +539,12 @@ impl EditorView {
                         )
                     }),
                     state
-                        .ext_commands
+                        .ext.commands
                         .iter()
                         .map(|c| c.title.as_str())
                         .collect::<Vec<_>>()
                         .join("|"),
-                    state.bulb.as_ref().map_or("none".to_string(), |b| format!(
+                    state.lsp.bulb.as_ref().map_or("none".to_string(), |b| format!(
                         "{} at {}",
                         b.actions.iter().filter(|a| a.disabled.is_none()).count(),
                         b.caret
@@ -551,7 +552,7 @@ impl EditorView {
                     state
                         .palette
                         .as_ref()
-                        .filter(|_| state.action_list.is_some())
+                        .filter(|_| state.lsp.action_list.is_some())
                         .map(|(query, _)| palette_rows(
                             &palette_sources(&state),
                             &query.rope.to_string()
@@ -572,7 +573,7 @@ impl EditorView {
                     )),
                     state.git.conflict_count(),
                     state
-                        .blame
+                        .blame.shown
                         .as_ref()
                         .map_or("", |(_, _, text)| text.as_str()),
                     state
@@ -596,7 +597,7 @@ impl EditorView {
                         })
                         .unwrap_or_default(),
                     state
-                        .signature
+                        .lsp.signature
                         .as_ref()
                         .map(|t| {
                             let label = &t.signature.label;

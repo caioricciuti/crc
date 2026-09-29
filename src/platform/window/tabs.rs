@@ -142,7 +142,7 @@ impl EditorView {
             };
             let closed = state.docs.close(index);
             if let Some(path) = closed.as_ref().and_then(|b| b.path.clone()) {
-                for server in state.lsp.values_mut() {
+                for server in state.lsp.servers.values_mut() {
                     server.did_close(&path);
                 }
             }
@@ -186,7 +186,9 @@ impl EditorView {
             restore_panes(&mut state, all, index);
             state.find = None;
             state.goto = None;
-            state.selecting = None;
+            if matches!(state.drag, Some(Drag::Select { .. })) {
+                state.drag = None;
+            }
         }
         self.sync_title();
         self.reparse();

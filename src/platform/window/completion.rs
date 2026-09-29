@@ -38,7 +38,9 @@ impl EditorView {
         {
             let at = crate::lsp::position_of(&buffer.rope, caret);
             let key = crate::lsp::servers::server_key(lang);
-            if let Some(server) = ready_server(&mut state.lsp, key).filter(|s| s.knows(&file)) {
+            if let Some(server) =
+                ready_server(&mut state.lsp.servers, key).filter(|s| s.knows(&file))
+            {
                 request = server.completion(&file, at);
             }
         }

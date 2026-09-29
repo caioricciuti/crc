@@ -56,7 +56,7 @@ impl EditorView {
             tab_hits,
             tab_scroll,
             hovered_tab,
-            tree_drag,
+            drag,
             syntax,
             spans,
             finder,
@@ -67,14 +67,10 @@ impl EditorView {
             palette_count,
             goto,
             rename,
-            signature,
             word_wrap,
             branch_list,
-            action_list,
-            bulb,
-            bulb_rect,
             extensions,
-            blame,
+            blame: Blame { shown: blame, .. },
             renderer,
             glyphs,
             theme,
@@ -90,11 +86,19 @@ impl EditorView {
             sidebar_edit,
             panes,
             focused_pane,
-            lsp,
+            lsp:
+                Lsp {
+                    servers: lsp,
+                    signature,
+                    action_list,
+                    bulb,
+                    bulb_rect,
+                    ..
+                },
             completion,
             claude,
             terminal: terminal_panel,
-            gutter,
+            gutter: Gutter { docs: gutter, .. },
             home_hits,
             recent_projects,
             unshaped_on_screen,
@@ -903,7 +907,10 @@ impl EditorView {
             );
             if *git_open {
                 git.draw_sidebar(&mut renderer.atlas, rect, theme, glyphs);
-            } else if let Some(drag) = tree_drag.as_ref().filter(|d| d.active && d.valid) {
+            } else if let Some(Drag::Tree(drag)) = drag
+                && drag.active
+                && drag.valid
+            {
                 // Where it would land. A drag with no target drawn is a drag
                 // you have to guess at.
                 let band = match drag.over {

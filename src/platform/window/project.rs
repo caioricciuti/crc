@@ -16,18 +16,18 @@ impl EditorView {
         let Some(mut state) = self.state_mut() else {
             return;
         };
-        state.watcher = None;
+        state.watch.watcher = None;
         let Some(root) = root else {
-            state.indexer = None;
+            state.watch.indexer = None;
             return;
         };
-        if state.indexer.as_ref().is_none_or(|i| i.root != root) {
-            state.indexer = crate::index::store::Indexer::start(root.clone());
+        if state.watch.indexer.as_ref().is_none_or(|i| i.root != root) {
+            state.watch.indexer = crate::index::store::Indexer::start(root.clone());
         }
         // The view lives for the process; the display link holds it the
         // same way. The handler only ever runs on the main thread.
         let view = self as *const EditorView;
-        state.watcher = crate::project::watch::Watcher::new(
+        state.watch.watcher = crate::project::watch::Watcher::new(
             &root,
             Box::new(move |change| {
                 let view = unsafe { &*view };
@@ -53,7 +53,7 @@ impl EditorView {
             };
             match change {
                 crate::project::watch::Change::Tree => {
-                    state.project_changed_at = Some(Instant::now());
+                    state.watch.tree_changed_at = Some(Instant::now());
                 }
                 crate::project::watch::Change::Git => {
                     // Read with the panel closed as well: a merge in the
@@ -63,7 +63,7 @@ impl EditorView {
                     // after them costs one status, which writes nothing
                     // under .git (optional locks are off), so it cannot
                     // come back round.
-                    state.git_changed_at = Some(Instant::now());
+                    state.watch.git_changed_at = Some(Instant::now());
                 }
             }
         }
@@ -79,22 +79,22 @@ impl EditorView {
         };
         // While Git is busy the change waits: it may be someone else's,
         // arriving during the panel's own operation.
-        if let Some(at) = state.git_changed_at
+        if let Some(at) = state.watch.git_changed_at
             && at.elapsed() >= SETTLE
             && !state.git.busy()
         {
-            state.git_changed_at = None;
-            state.gutter.clear();
+            state.watch.git_changed_at = None;
+            state.gutter.docs.clear();
             state.git.refresh();
         }
-        let Some(at) = state.project_changed_at else {
+        let Some(at) = state.watch.tree_changed_at else {
             return;
         };
-        if at.elapsed() < SETTLE || state.project_index_rx.is_some() {
+        if at.elapsed() < SETTLE || state.watch.index_rx.is_some() {
             return;
         }
-        state.project_changed_at = None;
-        if let Some(indexer) = &state.indexer {
+        state.watch.tree_changed_at = None;
+        if let Some(indexer) = &state.watch.indexer {
             indexer.poke();
         }
         start_project_refresh(&mut state);
