@@ -417,12 +417,7 @@ impl EditorView {
                 return false;
             };
             // A field opened over it (the palette, find) keeps its keys.
-            state.git_open
-                && (state.git_focus
-                    || (state.rename.is_none()
-                        && state.goto.is_none()
-                        && state.palette.is_none()
-                        && state.find.is_none()))
+            state.git_open && matches!(keys(&state), Keys::GitMessage | Keys::Document)
         };
         if git_turn && self.handle_git_key(event) {
             return true;
@@ -830,39 +825,37 @@ impl EditorView {
         let Some(mut state) = self.state_mut() else {
             return (edit(&mut inert, Focus::Goto), Focus::Goto);
         };
+        let owner = keys(&state);
         let State {
             docs,
             find,
             palette,
             goto,
             git,
-            git_open,
-            git_focus,
             sidebar_edit,
             rename,
             ..
         } = &mut *state;
-        // The commit message only once it has been clicked, as for typing.
-        let (buffer, focus) = if let Some(edit) = sidebar_edit {
-            (&mut edit.field, Focus::Field)
-        } else if let Some(rename) = rename {
-            (&mut rename.field, Focus::Field)
-        } else if *git_open && *git_focus {
-            (&mut git.message, Focus::Field)
-        } else if let Some(field) = goto {
-            (field, Focus::Goto)
-        } else if let Some((query, _)) = palette {
-            (query, Focus::Field)
-        } else if let Some(bar) = find {
-            if bar.replacing {
-                (&mut bar.replacement, Focus::Field)
-            } else {
-                (&mut bar.query, Focus::FindQuery)
-            }
-        } else if reviewing {
-            (&mut inert, Focus::Goto)
-        } else {
-            (docs.active_mut(), Focus::Document)
+        let field = match owner {
+            Keys::SidebarEdit => sidebar_edit
+                .as_mut()
+                .map(|edit| (&mut edit.field, Focus::Field)),
+            Keys::Rename => rename
+                .as_mut()
+                .map(|rename| (&mut rename.field, Focus::Field)),
+            Keys::GitMessage => Some((&mut git.message, Focus::Field)),
+            Keys::Goto => goto.as_mut().map(|field| (field, Focus::Goto)),
+            Keys::Palette => palette.as_mut().map(|(query, _)| (query, Focus::Field)),
+            Keys::FindQuery => find.as_mut().map(|bar| (&mut bar.query, Focus::FindQuery)),
+            Keys::FindReplace => find
+                .as_mut()
+                .map(|bar| (&mut bar.replacement, Focus::Field)),
+            Keys::Document => None,
+        };
+        let (buffer, focus) = match field {
+            Some(field) => field,
+            None if reviewing => (&mut inert, Focus::Goto),
+            None => (docs.active_mut(), Focus::Document),
         };
         (edit(buffer, focus), focus)
     }

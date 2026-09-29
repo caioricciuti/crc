@@ -846,11 +846,7 @@ pub(super) fn ext_details(state: &State) -> bool {
 
 /// Something else has the editor column, and the preview gives way.
 pub(super) fn preview_displaced(state: &State) -> bool {
-    ext_details(state)
-        || diffing(state)
-        || active_review(state).is_some()
-        || side_by_side(state)
-        || state.native_preview.is_some()
+    !matches!(column_of(state), Column::Home | Column::Text) || state.native_preview.is_some()
 }
 
 /// The command Cmd-E runs: the first installed one that may show a

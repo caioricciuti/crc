@@ -43,7 +43,7 @@ impl EditorView {
         // one, not to abort the process.
         let mut state = self.state_mut()?;
         sync_conflicts(&mut state);
-        let side = side_by_side(&state);
+        let column = column_of(&state);
         let chrome = chrome_of(&state);
         let carets_on = !self.caret_blinks(&state) || caret_phase(state.caret_since.elapsed()).0;
         let State {
@@ -105,7 +105,6 @@ impl EditorView {
             completion_chips,
             conflict_scans,
             conflict_side,
-            diff_tab,
             ..
         } = &mut *state;
         *unshaped_on_screen = false;
@@ -170,16 +169,19 @@ impl EditorView {
         // Nothing open: the home screen, drawn by the same renderer. There is
         // no home "mode" to get stuck in. Typing lands in the untouched buffer
         // underneath, which stops being untouched, and the editor is back.
-        let home = docs.is_home();
+        let home = column == Column::Home;
 
         // A change picked in Source Control has a tab of its own, and takes
         // the editor column while that tab is active, the way a diff editor
         // does. The list highlights the change only then.
-        let diffing = *diff_tab == Some(docs.active().id());
+        let diffing = column == Column::GitDiff;
         git.showing_diff = diffing;
-        let reviewing = claude.as_ref().and_then(|c| c.reviews.get(&buffer.id()));
+        let reviewing = claude
+            .as_ref()
+            .and_then(|c| c.reviews.get(&buffer.id()))
+            .filter(|_| column == Column::Review);
 
-        if let Some(page) = extensions.as_mut().filter(|p| p.details) {
+        if let Some(page) = extensions.as_mut().filter(|_| column == Column::Extensions) {
             glyphs.clear();
             crate::platform::extensions::draw_details(
                 page,
@@ -198,7 +200,7 @@ impl EditorView {
                 theme.tab_active,
             );
             git.draw_diff(&mut renderer.atlas, editor_rect, theme, glyphs);
-        } else if side
+        } else if column == Column::ConflictColumns
             && let Some(view) = conflict_scans
                 .get_mut(&buffer.id())
                 .and_then(|s| s.view.as_mut())
@@ -493,7 +495,7 @@ impl EditorView {
             tab_hits,
         );
 
-        if extensions.as_ref().is_some_and(|p| p.details) {
+        if column == Column::Extensions {
             // The Extensions details cover this row; a document's path here
             // would label them as something they are not.
         } else if diffing {
@@ -583,274 +585,14 @@ impl EditorView {
             }
         }
 
-        if let Some(rect) = find_rect {
-            layout::push_rect(
-                glyphs,
-                &renderer.atlas,
-                [rect.x, rect.y],
-                [rect.width, rect.height],
-                theme.find_background,
-            );
-            let bar = find.as_ref().expect("find_rect implies a bar");
-            let g = layout::FindGeometry::new(rect);
-
-            // A field that looks like a field. There was no box at all: a
-            // "Find" label sat at the far left and the text began eleven
-            // monospace columns later, with nothing to say where you could
-            // type or how far the field reached.
-            let field = |glyphs: &mut Vec<GlyphInstance>,
-                         atlas: &mut Atlas,
-                         box_rect: Viewport,
-                         placeholder: &str,
-                         buffer: &Buffer,
-                         focused: bool,
-                         trailing: Option<&str>| {
-                if focused {
-                    layout::push_focus_ring(glyphs, box_rect, 6.0, 1.5);
-                }
-                layout::push_rounded_rect(glyphs, box_rect, 6.0, theme.tab_active);
-                let text = buffer.rope.to_string();
-                let inner = Viewport {
-                    x: box_rect.x + FIND_FIELD_PAD,
-                    width: (box_rect.width - FIND_FIELD_PAD * 2.0).max(0.0),
-                    ..box_rect
-                };
-                // The match count first, so the text knows how much room is
-                // left and never runs underneath it.
-                let mut room = inner.width;
-                if let Some(trailing) = trailing {
-                    layout::push_ui_text_right(glyphs, atlas, inner, trailing, theme.status_text);
-                    room = (room - layout::ui_text_width(atlas, trailing) - 12.0).max(0.0);
-                }
-                layout::push_ui_field(
-                    glyphs,
-                    atlas,
-                    Viewport {
-                        width: room,
-                        ..inner
-                    },
-                    (5.0, box_rect.height - 10.0),
-                    &layout::UiField {
-                        text: &text,
-                        cursor: buffer.cursor(),
-                        selection: buffer.selection(),
-                        placeholder,
-                        focused,
-                    },
-                    theme,
-                );
-            };
-
-            // "3 of 17" in the field it belongs to, which the bar never
-            // reported at all: there was no way to tell a search that found
-            // nothing from one that found everything.
-            let count = if bar.project {
-                (!bar.results.is_empty()).then(|| format!("{} found", bar.results.len()))
-            } else {
-                search_matches.as_ref().map(|found| {
-                    if found.is_empty() {
-                        "No matches".to_string()
-                    } else {
-                        // From the selection's start: a found match is
-                        // selected with the caret at its end.
-                        let from = buffer.selection().map_or(buffer.cursor(), |r| r.start);
-                        let at = found
-                            .iter()
-                            .position(|m| m.range.start >= from)
-                            .unwrap_or(0);
-                        format!("{} of {}", at + 1, found.len())
-                    }
-                })
-            };
-            field(
-                glyphs,
-                &mut renderer.atlas,
-                g.find_field,
-                if bar.project {
-                    "Search the project"
-                } else {
-                    "Find"
-                },
-                &bar.query,
-                !bar.replacing,
-                count.as_deref(),
-            );
-            field(
-                glyphs,
-                &mut renderer.atlas,
-                g.replace_field,
-                if bar.project {
-                    "Replace in every file listed"
-                } else {
-                    "Replace with"
-                },
-                &bar.replacement,
-                bar.replacing,
-                None,
-            );
-
-            // Buttons with their text centred, in the UI font the rest of the
-            // window uses, rather than monospace pushed in by one advance.
-            let button = |glyphs: &mut Vec<GlyphInstance>,
-                          atlas: &mut Atlas,
-                          r: Viewport,
-                          label: &str,
-                          enabled: bool| {
-                layout::push_rounded_rect(glyphs, r, 5.0, theme.tab_hover);
-                layout::push_ui_text_centered(
-                    glyphs,
-                    atlas,
-                    r,
-                    label,
-                    if enabled {
-                        theme.tab_text
-                    } else {
-                        theme.gutter_text
-                    },
-                );
-            };
-            let has_matches = if bar.project {
-                !bar.results.is_empty()
-            } else {
-                search_matches.as_ref().is_some_and(|f| !f.is_empty())
-            };
-            button(
-                glyphs,
-                &mut renderer.atlas,
-                g.previous,
-                "\u{2039}",
-                has_matches,
-            );
-            button(glyphs, &mut renderer.atlas, g.next, "\u{203a}", has_matches);
-            button(glyphs, &mut renderer.atlas, g.close, "\u{2715}", true);
-            if !bar.project {
-                button(
-                    glyphs,
-                    &mut renderer.atlas,
-                    g.replace_one,
-                    "Replace",
-                    has_matches,
-                );
-                button(
-                    glyphs,
-                    &mut renderer.atlas,
-                    g.replace_all,
-                    "All",
-                    has_matches,
-                );
-            } else {
-                button(glyphs, &mut renderer.atlas, g.replace_one, "Search", true);
-                // Rows open with a click or Return; this button replaces
-                // in every file the results list.
-                button(
-                    glyphs,
-                    &mut renderer.atlas,
-                    g.replace_all,
-                    "Replace All",
-                    has_matches,
-                );
-            }
-
-            // Toggles that show their state: filled and accented when on,
-            // quiet when off. They were the same flat rectangle either way.
-            for (slot, (label, on)) in [
-                ("Aa", bar.options.case_sensitive),
-                ("Word", bar.options.whole_word),
-                (".*", bar.options.regex),
-                ("Project", bar.project),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let r = g.options[slot];
-                layout::push_rounded_rect(
-                    glyphs,
-                    r,
-                    5.0,
-                    if on {
-                        theme.palette_selected
-                    } else {
-                        theme.tab_hover
-                    },
-                );
-                layout::push_ui_text_centered(
-                    glyphs,
-                    &mut renderer.atlas,
-                    r,
-                    label,
-                    if on { theme.accent } else { theme.status_text },
-                );
-            }
-            if bar.project {
-                for (row, hit) in bar
-                    .results
-                    .iter()
-                    .skip(bar.result_scroll)
-                    .take(FIND_RESULT_ROWS)
-                    .enumerate()
-                {
-                    let y = g.results.y + layout::FIND_ROW_HEIGHT * row as f32;
-                    let row_rect = Viewport {
-                        x: g.results.x + 8.0,
-                        y,
-                        width: (g.results.width - 16.0).max(0.0),
-                        height: layout::FIND_ROW_HEIGHT,
-                    };
-                    if bar.selected == bar.result_scroll + row {
-                        layout::push_rounded_rect(
-                            glyphs,
-                            Viewport {
-                                y: y + 1.0,
-                                height: layout::FIND_ROW_HEIGHT - 2.0,
-                                ..row_rect
-                            },
-                            5.0,
-                            theme.palette_selected,
-                        );
-                    }
-                    let path = tree
-                        .root()
-                        .and_then(|root| hit.path.strip_prefix(root).ok())
-                        .unwrap_or(&hit.path);
-                    // Where it is, then what it says, told apart by colour
-                    // rather than run together into one monospace string.
-                    let where_it_is = format!("{}:{}", path.display(), hit.line + 1);
-                    let width = layout::ui_text_width(&mut renderer.atlas, &where_it_is);
-                    layout::push_ui_text(
-                        glyphs,
-                        &mut renderer.atlas,
-                        Viewport {
-                            x: row_rect.x + 8.0,
-                            ..row_rect
-                        },
-                        &where_it_is,
-                        theme.accent,
-                    );
-                    layout::push_ui_text(
-                        glyphs,
-                        &mut renderer.atlas,
-                        Viewport {
-                            x: row_rect.x + 20.0 + width,
-                            width: (row_rect.width - 28.0 - width).max(0.0),
-                            ..row_rect
-                        },
-                        hit.snippet.trim(),
-                        theme.sidebar_text,
-                    );
-                }
-                if bar.searching {
-                    layout::push_ui_text(
-                        glyphs,
-                        &mut renderer.atlas,
-                        Viewport {
-                            x: g.results.x + 16.0,
-                            ..g.results
-                        },
-                        "Searching project\u{2026}",
-                        theme.status_text,
-                    );
-                }
-            }
+        if let Some(rect) = find_rect
+            && let Some(bar) = find.as_ref()
+        {
+            // From the selection's start: a found match is selected with
+            // the caret at its end.
+            let from = buffer.selection().map_or(buffer.cursor(), |r| r.start);
+            let found = search_matches.map(|found| (found, from));
+            draw_find_bar(glyphs, renderer, theme, rect, bar, found, tree);
         }
 
         layout::push_activity(
@@ -1077,8 +819,6 @@ impl EditorView {
             &detail,
             theme.status_text,
         );
-        let advance = renderer.atlas.metrics.advance;
-
         // Go-to-line takes over the status line: it is a line number, and
         // that is where line numbers already live.
         let prompt = goto
@@ -1086,50 +826,12 @@ impl EditorView {
             .map(|field| ("Go to line: ", field))
             .or_else(|| rename.as_ref().map(|r| ("Rename to: ", &r.field)));
         if let Some((label, field)) = prompt {
-            let text = field.rope.to_string();
-            layout::push_rect(
-                glyphs,
-                &renderer.atlas,
-                [0.0, y],
-                [viewport.width, status_height],
-                theme.find_background,
-            );
-            layout::push_text(
-                glyphs,
-                &mut renderer.atlas,
-                advance,
-                y,
-                label,
-                theme.gutter_text,
-            );
-            let x = advance * (label.len() as f32 + 1.0);
-            // The field's own caret and selection: Left, Right and Shift
-            // move them. By the cells the text takes, as push_text lays it
-            // out: a wide character is two.
-            let column = |at: usize| {
-                let cells: usize = text[..at.min(text.len())]
-                    .chars()
-                    .map(crate::text::columns::display_width)
-                    .sum();
-                cells as f32 * advance
+            let row = Viewport {
+                x: 0.0,
+                width: viewport.width,
+                ..status_rect
             };
-            if let Some(range) = field.selection() {
-                layout::push_rect(
-                    glyphs,
-                    &renderer.atlas,
-                    [x + column(range.start), y],
-                    [column(range.end) - column(range.start), status_height],
-                    theme.selection,
-                );
-            }
-            layout::push_text(glyphs, &mut renderer.atlas, x, y, &text, theme.text);
-            layout::push_rect(
-                glyphs,
-                &renderer.atlas,
-                [x + column(field.cursor()), y],
-                [(advance * 0.15).max(1.0), status_height],
-                theme.cursor,
-            );
+            draw_prompt(glyphs, &mut renderer.atlas, theme, row, label, field);
         }
 
         // The palette floats over everything, so it is drawn last.
@@ -1196,4 +898,332 @@ impl EditorView {
         }
         timing
     }
+}
+
+/// The find bar: its two fields, the buttons and options beside them and,
+/// for a project search, the results under them. `found` is the active
+/// document's matches and the offset the "n of m" count starts from.
+fn draw_find_bar(
+    glyphs: &mut Vec<GlyphInstance>,
+    renderer: &mut Renderer,
+    theme: &Theme,
+    rect: Viewport,
+    bar: &FindBar,
+    found: Option<(&[search::Match], usize)>,
+    tree: &Tree,
+) {
+    layout::push_rect(
+        glyphs,
+        &renderer.atlas,
+        [rect.x, rect.y],
+        [rect.width, rect.height],
+        theme.find_background,
+    );
+    let g = layout::FindGeometry::new(rect);
+
+    // A field that looks like a field. There was no box at all: a
+    // "Find" label sat at the far left and the text began eleven
+    // monospace columns later, with nothing to say where you could
+    // type or how far the field reached.
+    let field = |glyphs: &mut Vec<GlyphInstance>,
+                 atlas: &mut Atlas,
+                 box_rect: Viewport,
+                 placeholder: &str,
+                 buffer: &Buffer,
+                 focused: bool,
+                 trailing: Option<&str>| {
+        if focused {
+            layout::push_focus_ring(glyphs, box_rect, 6.0, 1.5);
+        }
+        layout::push_rounded_rect(glyphs, box_rect, 6.0, theme.tab_active);
+        let text = buffer.rope.to_string();
+        let inner = Viewport {
+            x: box_rect.x + FIND_FIELD_PAD,
+            width: (box_rect.width - FIND_FIELD_PAD * 2.0).max(0.0),
+            ..box_rect
+        };
+        // The match count first, so the text knows how much room is
+        // left and never runs underneath it.
+        let mut room = inner.width;
+        if let Some(trailing) = trailing {
+            layout::push_ui_text_right(glyphs, atlas, inner, trailing, theme.status_text);
+            room = (room - layout::ui_text_width(atlas, trailing) - 12.0).max(0.0);
+        }
+        layout::push_ui_field(
+            glyphs,
+            atlas,
+            Viewport {
+                width: room,
+                ..inner
+            },
+            (5.0, box_rect.height - 10.0),
+            &layout::UiField {
+                text: &text,
+                cursor: buffer.cursor(),
+                selection: buffer.selection(),
+                placeholder,
+                focused,
+            },
+            theme,
+        );
+    };
+
+    // "3 of 17" in the field it belongs to, which the bar never
+    // reported at all: there was no way to tell a search that found
+    // nothing from one that found everything.
+    let count = if bar.project {
+        (!bar.results.is_empty()).then(|| format!("{} found", bar.results.len()))
+    } else {
+        found.map(|(found, from)| {
+            if found.is_empty() {
+                "No matches".to_string()
+            } else {
+                let at = found
+                    .iter()
+                    .position(|m| m.range.start >= from)
+                    .unwrap_or(0);
+                format!("{} of {}", at + 1, found.len())
+            }
+        })
+    };
+    field(
+        glyphs,
+        &mut renderer.atlas,
+        g.find_field,
+        if bar.project {
+            "Search the project"
+        } else {
+            "Find"
+        },
+        &bar.query,
+        !bar.replacing,
+        count.as_deref(),
+    );
+    field(
+        glyphs,
+        &mut renderer.atlas,
+        g.replace_field,
+        if bar.project {
+            "Replace in every file listed"
+        } else {
+            "Replace with"
+        },
+        &bar.replacement,
+        bar.replacing,
+        None,
+    );
+
+    // Buttons with their text centred, in the UI font the rest of the
+    // window uses, rather than monospace pushed in by one advance.
+    let button = |glyphs: &mut Vec<GlyphInstance>,
+                  atlas: &mut Atlas,
+                  r: Viewport,
+                  label: &str,
+                  enabled: bool| {
+        layout::push_rounded_rect(glyphs, r, 5.0, theme.tab_hover);
+        layout::push_ui_text_centered(
+            glyphs,
+            atlas,
+            r,
+            label,
+            if enabled {
+                theme.tab_text
+            } else {
+                theme.gutter_text
+            },
+        );
+    };
+    let has_matches = if bar.project {
+        !bar.results.is_empty()
+    } else {
+        found.is_some_and(|(f, _)| !f.is_empty())
+    };
+    button(
+        glyphs,
+        &mut renderer.atlas,
+        g.previous,
+        "\u{2039}",
+        has_matches,
+    );
+    button(glyphs, &mut renderer.atlas, g.next, "\u{203a}", has_matches);
+    button(glyphs, &mut renderer.atlas, g.close, "\u{2715}", true);
+    if !bar.project {
+        button(
+            glyphs,
+            &mut renderer.atlas,
+            g.replace_one,
+            "Replace",
+            has_matches,
+        );
+        button(
+            glyphs,
+            &mut renderer.atlas,
+            g.replace_all,
+            "All",
+            has_matches,
+        );
+    } else {
+        button(glyphs, &mut renderer.atlas, g.replace_one, "Search", true);
+        // Rows open with a click or Return; this button replaces
+        // in every file the results list.
+        button(
+            glyphs,
+            &mut renderer.atlas,
+            g.replace_all,
+            "Replace All",
+            has_matches,
+        );
+    }
+
+    // Toggles that show their state: filled and accented when on,
+    // quiet when off. They were the same flat rectangle either way.
+    for (slot, (label, on)) in [
+        ("Aa", bar.options.case_sensitive),
+        ("Word", bar.options.whole_word),
+        (".*", bar.options.regex),
+        ("Project", bar.project),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let r = g.options[slot];
+        layout::push_rounded_rect(
+            glyphs,
+            r,
+            5.0,
+            if on {
+                theme.palette_selected
+            } else {
+                theme.tab_hover
+            },
+        );
+        layout::push_ui_text_centered(
+            glyphs,
+            &mut renderer.atlas,
+            r,
+            label,
+            if on { theme.accent } else { theme.status_text },
+        );
+    }
+    if bar.project {
+        for (row, hit) in bar
+            .results
+            .iter()
+            .skip(bar.result_scroll)
+            .take(FIND_RESULT_ROWS)
+            .enumerate()
+        {
+            let y = g.results.y + layout::FIND_ROW_HEIGHT * row as f32;
+            let row_rect = Viewport {
+                x: g.results.x + 8.0,
+                y,
+                width: (g.results.width - 16.0).max(0.0),
+                height: layout::FIND_ROW_HEIGHT,
+            };
+            if bar.selected == bar.result_scroll + row {
+                layout::push_rounded_rect(
+                    glyphs,
+                    Viewport {
+                        y: y + 1.0,
+                        height: layout::FIND_ROW_HEIGHT - 2.0,
+                        ..row_rect
+                    },
+                    5.0,
+                    theme.palette_selected,
+                );
+            }
+            let path = tree
+                .root()
+                .and_then(|root| hit.path.strip_prefix(root).ok())
+                .unwrap_or(&hit.path);
+            // Where it is, then what it says, told apart by colour
+            // rather than run together into one monospace string.
+            let where_it_is = format!("{}:{}", path.display(), hit.line + 1);
+            let width = layout::ui_text_width(&mut renderer.atlas, &where_it_is);
+            layout::push_ui_text(
+                glyphs,
+                &mut renderer.atlas,
+                Viewport {
+                    x: row_rect.x + 8.0,
+                    ..row_rect
+                },
+                &where_it_is,
+                theme.accent,
+            );
+            layout::push_ui_text(
+                glyphs,
+                &mut renderer.atlas,
+                Viewport {
+                    x: row_rect.x + 20.0 + width,
+                    width: (row_rect.width - 28.0 - width).max(0.0),
+                    ..row_rect
+                },
+                hit.snippet.trim(),
+                theme.sidebar_text,
+            );
+        }
+        if bar.searching {
+            layout::push_ui_text(
+                glyphs,
+                &mut renderer.atlas,
+                Viewport {
+                    x: g.results.x + 16.0,
+                    ..g.results
+                },
+                "Searching project\u{2026}",
+                theme.status_text,
+            );
+        }
+    }
+}
+
+/// A one-line prompt over the status row: its label, then the field with
+/// its own caret and selection.
+fn draw_prompt(
+    glyphs: &mut Vec<GlyphInstance>,
+    atlas: &mut Atlas,
+    theme: &Theme,
+    row: Viewport,
+    label: &str,
+    field: &Buffer,
+) {
+    let (y, status_height) = (row.y, row.height);
+    let advance = atlas.metrics.advance;
+    let text = field.rope.to_string();
+    layout::push_rect(
+        glyphs,
+        atlas,
+        [row.x, y],
+        [row.width, status_height],
+        theme.find_background,
+    );
+    layout::push_text(glyphs, atlas, advance, y, label, theme.gutter_text);
+    let x = advance * (label.len() as f32 + 1.0);
+    // The field's own caret and selection: Left, Right and Shift
+    // move them. By the cells the text takes, as push_text lays it
+    // out: a wide character is two.
+    let column = |at: usize| {
+        let cells: usize = text[..at.min(text.len())]
+            .chars()
+            .map(crate::text::columns::display_width)
+            .sum();
+        cells as f32 * advance
+    };
+    if let Some(range) = field.selection() {
+        layout::push_rect(
+            glyphs,
+            atlas,
+            [x + column(range.start), y],
+            [column(range.end) - column(range.start), status_height],
+            theme.selection,
+        );
+    }
+    layout::push_text(glyphs, atlas, x, y, &text, theme.text);
+    layout::push_rect(
+        glyphs,
+        atlas,
+        [x + column(field.cursor()), y],
+        [(advance * 0.15).max(1.0), status_height],
+        theme.cursor,
+    );
 }

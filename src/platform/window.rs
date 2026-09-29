@@ -1956,7 +1956,7 @@ define_class!(
             for target in &state.pointer_targets {
                 add(*target, &NSCursor::pointingHandCursor());
             }
-            if !ext_details(&state) && state.native_preview.is_none() && !diffing(&state) && active_review(&state).is_none() && !side_by_side(&state) {
+            if matches!(column_of(&state), Column::Home | Column::Text) && state.native_preview.is_none() {
                 let gutter = layout::gutter_width(state.docs.active(), &state.renderer.atlas);
                 add(chrome.text.inset_left(gutter), &NSCursor::IBeamCursor());
             }
@@ -4605,6 +4605,41 @@ fn forget_document(state: &mut State, id: u64) {
     state.conflict_scans.remove(&id);
 }
 
+/// What has the editor column.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Column {
+    /// The Extensions page's details.
+    Extensions,
+    /// A Source Control change, in its tab.
+    GitDiff,
+    /// A document's merge conflicts as columns.
+    ConflictColumns,
+    /// Claude's proposed change, in its tab.
+    Review,
+    /// Nothing open.
+    Home,
+    /// The active document, with a preview beside it when one is open.
+    Text,
+}
+
+/// Which mode draws the editor column. Drawing, hit testing, cursor rects
+/// and the preview all ask this, in this one order.
+fn column_of(state: &State) -> Column {
+    if ext_details(state) {
+        Column::Extensions
+    } else if diffing(state) {
+        Column::GitDiff
+    } else if side_by_side(state) {
+        Column::ConflictColumns
+    } else if active_review(state).is_some() {
+        Column::Review
+    } else if state.docs.is_home() {
+        Column::Home
+    } else {
+        Column::Text
+    }
+}
+
 /// Whether the Source Control diff has the editor column: its tab is the
 /// active one.
 fn diffing(state: &State) -> bool {
@@ -4976,8 +5011,6 @@ impl crate::ide::mcp::Host for ClaudeHost<'_> {
     }
 }
 
-/// Whether typing goes to a field (palette, find, go to line, a sidebar
-/// name, the commit message) rather than to the document.
 /// Closes every one-line field that takes the keyboard ahead of the
 /// document, so the one about to open is the one that gets the keys: the
 /// order they are checked in is not the order they were opened in. The find
@@ -5051,36 +5084,66 @@ fn place_field_caret(atlas: &mut crate::render::font::Atlas, field: &mut Buffer,
     }
 }
 
+/// What has the keyboard. Typing, the Edit menu, the key handlers and
+/// the menu's enabled state all ask [`keys`], so they cannot disagree.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Keys {
+    SidebarEdit,
+    Rename,
+    /// The commit message, once it has been clicked.
+    GitMessage,
+    Goto,
+    Palette,
+    FindQuery,
+    FindReplace,
+    Document,
+}
+
+/// Which field has the keyboard, in the one order they are offered it.
+/// Opening a field closes the others ahead of the find bar
+/// ([`close_fields`]), so normally at most one of them and the find bar
+/// are open, and this order only settles that pair.
+fn keys(state: &State) -> Keys {
+    if state.sidebar_edit.is_some() {
+        Keys::SidebarEdit
+    } else if state.rename.is_some() {
+        Keys::Rename
+    } else if state.git_open && state.git_focus {
+        Keys::GitMessage
+    } else if state.goto.is_some() {
+        Keys::Goto
+    } else if state.palette.is_some() {
+        Keys::Palette
+    } else if let Some(bar) = &state.find {
+        if bar.replacing {
+            Keys::FindReplace
+        } else {
+            Keys::FindQuery
+        }
+    } else {
+        Keys::Document
+    }
+}
+
+/// Whether typing goes to a field (palette, find, go to line, a sidebar
+/// name, the commit message) rather than to the document.
 fn field_has_keys(state: &State) -> bool {
-    state.sidebar_edit.is_some()
-        || state.rename.is_some()
-        || state.palette.is_some()
-        || state.find.is_some()
-        || state.goto.is_some()
-        || (state.git_open && state.git_focus)
+    keys(state) != Keys::Document
 }
 
 /// The field that receives text input and editing menu commands.
 fn focused_buffer(state: &State) -> &Buffer {
-    if let Some(edit) = &state.sidebar_edit {
-        &edit.field
-    } else if let Some(rename) = &state.rename {
-        &rename.field
-    } else if state.git_open && state.git_focus {
-        &state.git.message
-    } else if let Some(field) = &state.goto {
-        field
-    } else if let Some((query, _)) = &state.palette {
-        query
-    } else if let Some(bar) = &state.find {
-        if bar.replacing {
-            &bar.replacement
-        } else {
-            &bar.query
-        }
-    } else {
-        state.docs.active()
-    }
+    let field = match keys(state) {
+        Keys::SidebarEdit => state.sidebar_edit.as_ref().map(|edit| &edit.field),
+        Keys::Rename => state.rename.as_ref().map(|rename| &rename.field),
+        Keys::GitMessage => Some(&state.git.message),
+        Keys::Goto => state.goto.as_ref(),
+        Keys::Palette => state.palette.as_ref().map(|(query, _)| query),
+        Keys::FindQuery => state.find.as_ref().map(|bar| &bar.query),
+        Keys::FindReplace => state.find.as_ref().map(|bar| &bar.replacement),
+        Keys::Document => None,
+    };
+    field.unwrap_or_else(|| state.docs.active())
 }
 
 /// Draws a pane that does not have the keyboard: its tab bar, breadcrumbs
@@ -5206,23 +5269,25 @@ fn draw_other_pane(
 fn frame_of(state: &mut State) -> Frame {
     sync_conflicts(state);
     let chrome = chrome_of(state);
-    let side = side_by_side(state);
+    let column = column_of(state);
+    let side = column == Column::ConflictColumns;
     let conflict_hits = {
         let text_rect = chrome.text;
         let State {
             docs,
             renderer,
             conflict_scans,
-            diff_tab,
             ..
         } = &mut *state;
-        let diffing = *diff_tab == Some(docs.active().id());
+        // Not under a diff, a review or the Extensions page, which draw
+        // over the text the controls belong to.
+        let shown = matches!(column, Column::ConflictColumns | Column::Text);
         let buffer = docs.active();
         match conflict_scans
             .get_mut(&buffer.id())
             .and_then(|s| s.view.as_mut())
         {
-            Some(view) if !diffing => {
+            Some(view) if shown => {
                 let mut hits = match chrome.response {
                     Some(strip) => {
                         crate::platform::conflicts::strip_hits(view, &mut renderer.atlas, strip)
