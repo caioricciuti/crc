@@ -131,7 +131,7 @@ impl Store {
             }
         }
         let mut synced = Synced::default();
-        let mut pending: Vec<(String, i64, i64, Option<i64>, String)> = Vec::new();
+        let mut pending: Vec<FileRow> = Vec::new();
         for file in files.iter().take(MAX_FILES) {
             let Ok(relative) = file.strip_prefix(root) else {
                 continue;
@@ -160,7 +160,13 @@ impl Store {
                 .ok()
                 .and_then(|bytes| String::from_utf8(bytes).ok())
                 .unwrap_or_default();
-            pending.push((relative, mtime, size, old.map(|(id, _, _)| id), text));
+            pending.push(FileRow {
+                relative,
+                mtime,
+                size,
+                old: old.map(|(id, _, _)| id),
+                text,
+            });
             if pending.len() >= BATCH {
                 synced.read += pending.len();
                 self.write(std::mem::take(&mut pending))?;
@@ -171,63 +177,63 @@ impl Store {
         let gone: Vec<i64> = known.into_values().map(|(id, _, _)| id).collect();
         synced.removed = gone.len();
         self.db.transaction(|| {
+            let mut forget = Forget::prepare(&self.db)?;
+            let mut delete = self.db.prepare("DELETE FROM files WHERE id = ?1")?;
             for id in &gone {
-                self.forget_file(*id)?;
-                let mut statement = self.db.prepare("DELETE FROM files WHERE id = ?1")?;
-                statement.run(&[Value::Int(*id)])?;
+                forget.file(*id)?;
+                delete.run(&[Value::Int(*id)])?;
             }
             Ok(())
         })?;
         Ok(synced)
     }
 
-    fn forget_file(&self, id: i64) -> Result<()> {
-        for sql in [
-            "DELETE FROM symbols WHERE file = ?1",
-            "DELETE FROM words WHERE file = ?1",
-        ] {
-            let mut statement = self.db.prepare(sql)?;
-            statement.run(&[Value::Int(id)])?;
-        }
-        Ok(())
-    }
-
-    fn write(&self, batch: Vec<(String, i64, i64, Option<i64>, String)>) -> Result<()> {
+    fn write(&self, batch: Vec<FileRow>) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
         }
         self.db.transaction(|| {
-            for (relative, mtime, size, old, text) in &batch {
-                let id = match old {
+            // Prepared once for the batch, not once per file.
+            let mut forget = Forget::prepare(&self.db)?;
+            let mut update = self
+                .db
+                .prepare("UPDATE files SET mtime = ?2, size = ?3 WHERE id = ?1")?;
+            let mut insert = self
+                .db
+                .prepare("INSERT INTO files (path, mtime, size) VALUES (?1, ?2, ?3)")?;
+            let mut symbol = self
+                .db
+                .prepare("INSERT INTO symbols (file, name, kind, line) VALUES (?1, ?2, ?3, ?4)")?;
+            let mut word = self
+                .db
+                .prepare("INSERT INTO words (file, word, count) VALUES (?1, ?2, ?3)")?;
+            for row in &batch {
+                let id = match row.old {
                     Some(id) => {
-                        self.forget_file(*id)?;
-                        let mut statement = self
-                            .db
-                            .prepare("UPDATE files SET mtime = ?2, size = ?3 WHERE id = ?1")?;
-                        statement.run(&[Value::Int(*id), Value::Int(*mtime), Value::Int(*size)])?;
-                        *id
+                        forget.file(id)?;
+                        update.run(&[
+                            Value::Int(id),
+                            Value::Int(row.mtime),
+                            Value::Int(row.size),
+                        ])?;
+                        id
                     }
                     None => {
-                        let mut statement = self
-                            .db
-                            .prepare("INSERT INTO files (path, mtime, size) VALUES (?1, ?2, ?3)")?;
-                        statement.run(&[
-                            Value::Text(relative),
-                            Value::Int(*mtime),
-                            Value::Int(*size),
+                        insert.run(&[
+                            Value::Text(&row.relative),
+                            Value::Int(row.mtime),
+                            Value::Int(row.size),
                         ])?;
                         self.db.last_insert_rowid()
                     }
                 };
-                if text.is_empty() {
+                if row.text.is_empty() {
                     continue;
                 }
-                if let Some(language) = crate::syntax::Language::from_path(Path::new(relative)) {
-                    let mut statement = self.db.prepare(
-                        "INSERT INTO symbols (file, name, kind, line) VALUES (?1, ?2, ?3, ?4)",
-                    )?;
-                    for definition in crate::syntax::defs::definitions(language, text) {
-                        statement.run(&[
+                if let Some(language) = crate::syntax::Language::from_path(Path::new(&row.relative))
+                {
+                    for definition in crate::syntax::defs::definitions(language, &row.text) {
+                        symbol.run(&[
                             Value::Int(id),
                             Value::Text(&definition.name),
                             Value::Text(definition.kind),
@@ -235,22 +241,45 @@ impl Store {
                         ])?;
                     }
                 }
-                let mut statement = self
-                    .db
-                    .prepare("INSERT INTO words (file, word, count) VALUES (?1, ?2, ?3)")?;
-                for (word, count) in crate::complete::words(text, "", None)
+                for (text, count) in crate::complete::words(&row.text, "", None)
                     .into_iter()
                     .take(WORDS_PER_FILE)
                 {
-                    statement.run(&[
-                        Value::Int(id),
-                        Value::Text(&word),
-                        Value::Int(count as i64),
-                    ])?;
+                    word.run(&[Value::Int(id), Value::Text(&text), Value::Int(count as i64)])?;
                 }
             }
             Ok(())
         })
+    }
+}
+
+/// A file read for the index: where, its stamp, its row when it was
+/// indexed before, and its text (empty when it is not text).
+struct FileRow {
+    relative: String,
+    mtime: i64,
+    size: i64,
+    old: Option<i64>,
+    text: String,
+}
+
+/// What forgets a file's symbols and words, prepared once per transaction.
+struct Forget<'db> {
+    symbols: crate::index::db::Statement<'db>,
+    words: crate::index::db::Statement<'db>,
+}
+
+impl<'db> Forget<'db> {
+    fn prepare(db: &'db crate::index::db::Db) -> Result<Forget<'db>> {
+        Ok(Forget {
+            symbols: db.prepare("DELETE FROM symbols WHERE file = ?1")?,
+            words: db.prepare("DELETE FROM words WHERE file = ?1")?,
+        })
+    }
+
+    fn file(&mut self, id: i64) -> Result<()> {
+        self.symbols.run(&[Value::Int(id)])?;
+        self.words.run(&[Value::Int(id)])
     }
 }
 

@@ -1809,84 +1809,7 @@ define_class!(
                 }
             }
 
-            let offset = self.offset_for_event(event);
-            let flags = event.modifierFlags();
-            let shift = flags.contains(NSEventModifierFlags::Shift);
-            let option = flags.contains(NSEventModifierFlags::Option);
-            if flags.contains(NSEventModifierFlags::Command) && !shift && !option {
-                // Cmd-click: go to the definition of what is under the pointer.
-                if let Some(mut state) = self.state_mut() {
-                    state.docs.active_mut().place_cursor(offset, Motion::Move);
-                }
-                self.goto_definition(Some(offset));
-                self.note_input(started);
-                self.pump();
-                return;
-            }
-            let chip = {
-                let Some(state) = self.state() else {
-                    return;
-                };
-                let point = self.convertPoint_fromView(event.locationInWindow(), None);
-                state
-                    .completion_chips
-                    .iter()
-                    .find(|(rect, _)| rect.contains(point.x as f32, point.y as f32))
-                    .map(|(_, index)| *index)
-            };
-            if let Some(index) = chip {
-                self.accept_completion(Some(index));
-                self.note_input(started);
-                self.pump();
-                return;
-            }
-            if let Some(mut state) = self.state_mut() {
-                state.completion = None;
-            }
-            {
-                let Some(mut state) = self.state_mut() else {
-                    return;
-                };
-                let buffer = state.docs.active_mut();
-                // One click places the caret, two take a word, three a line,
-                // and a drag that follows keeps selecting in the same unit.
-                let pressed = match event.clickCount() {
-                    2 => buffer.word_range_at(offset),
-                    n if n >= 3 => buffer.line_range_at(offset),
-                    _ => offset..offset,
-                };
-                let unit = match event.clickCount() {
-                    2 => SelectUnit::Word,
-                    n if n >= 3 => SelectUnit::Line,
-                    _ => SelectUnit::Character,
-                };
-                if unit != SelectUnit::Character && !option && !shift {
-                    buffer.select_range(pressed.start, pressed.end);
-                    state.selecting = Some((unit, pressed));
-                    drop(state);
-                    self.note_input(started);
-                    self.pump();
-                    return;
-                }
-                state.selecting = Some((unit, pressed));
-            }
-            {
-                let Some(mut state) = self.state_mut() else {
-                    return;
-                };
-                if option {
-                    // Option-click drops an extra cursor instead of moving
-                    // the one you have.
-                    state.docs.active_mut().add_cursor(offset, offset);
-                } else {
-                    // Shift-click extends an existing selection rather than
-                    // starting a new one, matching every other editor.
-                    let motion = if shift { Motion::Extend } else { Motion::Move };
-                    state.docs.active_mut().place_cursor(offset, motion);
-                }
-            }
-            self.note_input(started);
-            self.pump();
+            self.text_press(event, started);
         }
 
         #[unsafe(method(mouseDragged:))]
@@ -4064,6 +3987,90 @@ impl EditorView {
                 )
             };
         })
+    }
+
+    /// A press in the text: Cmd-click goes to a definition, a click on a
+    /// completion chip takes it, and otherwise the caret or selection starts
+    /// there, by character, word or line as the click count says.
+    fn text_press(&self, event: &NSEvent, started: Instant) {
+        let offset = self.offset_for_event(event);
+        let flags = event.modifierFlags();
+        let shift = flags.contains(NSEventModifierFlags::Shift);
+        let option = flags.contains(NSEventModifierFlags::Option);
+        if flags.contains(NSEventModifierFlags::Command) && !shift && !option {
+            // Cmd-click: go to the definition of what is under the pointer.
+            if let Some(mut state) = self.state_mut() {
+                state.docs.active_mut().place_cursor(offset, Motion::Move);
+            }
+            self.goto_definition(Some(offset));
+            self.note_input(started);
+            self.pump();
+            return;
+        }
+        let chip = {
+            let Some(state) = self.state() else {
+                return;
+            };
+            let point = self.convertPoint_fromView(event.locationInWindow(), None);
+            state
+                .completion_chips
+                .iter()
+                .find(|(rect, _)| rect.contains(point.x as f32, point.y as f32))
+                .map(|(_, index)| *index)
+        };
+        if let Some(index) = chip {
+            self.accept_completion(Some(index));
+            self.note_input(started);
+            self.pump();
+            return;
+        }
+        if let Some(mut state) = self.state_mut() {
+            state.completion = None;
+        }
+        {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            let buffer = state.docs.active_mut();
+            // One click places the caret, two take a word, three a line,
+            // and a drag that follows keeps selecting in the same unit.
+            let pressed = match event.clickCount() {
+                2 => buffer.word_range_at(offset),
+                n if n >= 3 => buffer.line_range_at(offset),
+                _ => offset..offset,
+            };
+            let unit = match event.clickCount() {
+                2 => SelectUnit::Word,
+                n if n >= 3 => SelectUnit::Line,
+                _ => SelectUnit::Character,
+            };
+            if unit != SelectUnit::Character && !option && !shift {
+                buffer.select_range(pressed.start, pressed.end);
+                state.selecting = Some((unit, pressed));
+                drop(state);
+                self.note_input(started);
+                self.pump();
+                return;
+            }
+            state.selecting = Some((unit, pressed));
+        }
+        {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            if option {
+                // Option-click drops an extra cursor instead of moving
+                // the one you have.
+                state.docs.active_mut().add_cursor(offset, offset);
+            } else {
+                // Shift-click extends an existing selection rather than
+                // starting a new one, matching every other editor.
+                let motion = if shift { Motion::Extend } else { Motion::Move };
+                state.docs.active_mut().place_cursor(offset, motion);
+            }
+        }
+        self.note_input(started);
+        self.pump();
     }
 
     /// Brings tab `index` of the focused pane to the front: shown in the tab
