@@ -14521,13 +14521,23 @@ fn tab_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
 }
 
 fn menu_item(mtm: MainThreadMarker, title: &str, action: Sel) -> Retained<NSMenuItem> {
+    keyed_menu_item(mtm, title, action, "")
+}
+
+/// A menu item whose Command-`key` shortcut sends `action`.
+fn keyed_menu_item(
+    mtm: MainThreadMarker,
+    title: &str,
+    action: Sel,
+    key: &str,
+) -> Retained<NSMenuItem> {
     let item = NSMenuItem::alloc(mtm);
     unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             item,
             &NSString::from_str(title),
             Some(action),
-            &NSString::from_str(""),
+            &NSString::from_str(key),
         )
     }
 }
@@ -14714,15 +14724,7 @@ fn install_menu(mtm: MainThreadMarker, app: &NSApplication) {
     // the first responder, which is the editor view. That is how a native app
     // wires menus, and it is what lets validateMenuItem: grey things out.
     let item = |title: &str, action: objc2::runtime::Sel, key: &str, shift: bool| {
-        let item = NSMenuItem::alloc(mtm);
-        let item = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                item,
-                &NSString::from_str(title),
-                Some(action),
-                &NSString::from_str(key),
-            )
-        };
+        let item = keyed_menu_item(mtm, title, action, key);
         if shift {
             item.setKeyEquivalentModifierMask(
                 NSEventModifierFlags::Command | NSEventModifierFlags::Shift,

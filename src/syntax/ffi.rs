@@ -230,3 +230,34 @@ unsafe extern "C" {
     pub fn tree_sitter_yaml() -> *const TSLanguage;
     pub fn tree_sitter_bash() -> *const TSLanguage;
 }
+
+/// Bytes tree-sitter hands back as a pointer and a length into a query's
+/// own storage; empty for a null pointer.
+///
+/// # Safety
+/// `ptr` and `len` come from tree-sitter for a query that outlives `'a`.
+pub unsafe fn query_bytes<'a>(ptr: *const c_char, len: u32) -> &'a [u8] {
+    if ptr.is_null() {
+        &[]
+    } else {
+        // SAFETY: the caller's contract.
+        unsafe { std::slice::from_raw_parts(ptr as *const u8, len as usize) }
+    }
+}
+
+/// Every capture name of `query`, by index: "" where tree-sitter has none
+/// or it is not UTF-8.
+///
+/// # Safety
+/// `query` is live and outlives `'a`.
+pub unsafe fn capture_names<'a>(query: *const TSQuery) -> Vec<&'a str> {
+    // SAFETY: the caller's contract; indexes are bounded by the count.
+    let count = unsafe { ts_query_capture_count(query) };
+    (0..count)
+        .map(|i| {
+            let mut len = 0u32;
+            let ptr = unsafe { ts_query_capture_name_for_id(query, i, &mut len) };
+            std::str::from_utf8(unsafe { query_bytes(ptr, len) }).unwrap_or("")
+        })
+        .collect()
+}

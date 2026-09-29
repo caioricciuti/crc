@@ -162,18 +162,9 @@ unsafe fn collect(
     out: &mut Vec<Definition>,
 ) {
     unsafe {
-        let count = ffi::ts_query_capture_count(query.as_ptr());
-        let kinds: Vec<Option<&'static str>> = (0..count)
-            .map(|i| {
-                let mut len = 0u32;
-                let ptr = ffi::ts_query_capture_name_for_id(query.as_ptr(), i, &mut len);
-                if ptr.is_null() {
-                    return None;
-                }
-                let bytes = std::slice::from_raw_parts(ptr as *const u8, len as usize);
-                let name = std::str::from_utf8(bytes).ok()?;
-                KINDS.iter().copied().find(|k| *k == name)
-            })
+        let kinds: Vec<Option<&'static str>> = ffi::capture_names(query.as_ptr())
+            .into_iter()
+            .map(|name| KINDS.iter().copied().find(|k| *k == name))
             .collect();
         let root = ffi::ts_tree_root_node(tree.as_ptr());
         let Some(mut matches) = QueryMatches::new(query.as_ptr(), root, None) else {

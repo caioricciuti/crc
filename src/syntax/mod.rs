@@ -540,22 +540,11 @@ impl Highlighter {
 
         // Resolve capture names once. A query has a fixed capture list, and
         // doing this per match would mean a string comparison per token.
-        // SAFETY: query is live and index is bounded by the reported count.
-        let count = unsafe { ffi::ts_query_capture_count(query.as_ptr()) };
-        let mut capture_kinds = Vec::with_capacity(count as usize);
-        for i in 0..count {
-            let mut len = 0u32;
-            let ptr = unsafe { ffi::ts_query_capture_name_for_id(query.as_ptr(), i, &mut len) };
-            let name = if ptr.is_null() {
-                ""
-            } else {
-                // SAFETY: tree-sitter returns a pointer plus a length into
-                // the query's own storage, which outlives this borrow.
-                let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len as usize) };
-                std::str::from_utf8(bytes).unwrap_or("")
-            };
-            capture_kinds.push(Kind::from_capture(name));
-        }
+        // SAFETY: query is live for this whole function.
+        let capture_kinds: Vec<Option<Kind>> = unsafe { ffi::capture_names(query.as_ptr()) }
+            .into_iter()
+            .map(Kind::from_capture)
+            .collect();
 
         let pattern_predicates = load_predicates(query.as_ptr());
 
@@ -854,11 +843,8 @@ fn load_predicates(query: *const ffi::TSQuery) -> Vec<Vec<Predicate>> {
         let string_at = |id: u32| -> String {
             let mut len = 0u32;
             let ptr = unsafe { ffi::ts_query_string_value_for_id(query, id, &mut len) };
-            if ptr.is_null() {
-                return String::new();
-            }
-            let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len as usize) };
-            String::from_utf8_lossy(bytes).into_owned()
+            // SAFETY: a pointer and length from the live query.
+            String::from_utf8_lossy(unsafe { ffi::query_bytes(ptr, len) }).into_owned()
         };
 
         // Steps come as a flat list of runs terminated by `Done`. Each run is

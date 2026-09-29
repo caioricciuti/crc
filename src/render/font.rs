@@ -907,11 +907,7 @@ impl Atlas {
             let completed = worker.poll();
             worker.begin_frame();
             for (owner, rope, shaped) in completed {
-                if self
-                    .editor_snapshot
-                    .as_ref()
-                    .is_some_and(|(id, snapshot)| *id == owner.0 && snapshot.same_as(&rope))
-                {
+                if self.editor_snapshot_is(owner.0, &rope) {
                     self.cache_editor_line(owner.1, shaped.map(Rc::new));
                 } else if let Some(parked) = self
                     .parked
@@ -1238,11 +1234,7 @@ impl Atlas {
         rope: &Rope,
         range: std::ops::Range<usize>,
     ) -> Option<Rc<ShapedLine>> {
-        if !self
-            .editor_snapshot
-            .as_ref()
-            .is_some_and(|(id, old)| *id == owner.0 && old.same_as(rope))
-        {
+        if !self.editor_snapshot_is(owner.0, rope) {
             let mut old = self.editor_snapshot.take();
             // Another document: park this one's lines and take that one's,
             // if they were kept.
@@ -1318,12 +1310,15 @@ impl Atlas {
         None
     }
 
-    pub fn cached_editor_line(&self, owner: (u64, usize), rope: &Rope) -> Option<&ShapedLine> {
-        if self
-            .editor_snapshot
+    /// Whether the shaped editor lines belong to document `id` as `rope` has it.
+    fn editor_snapshot_is(&self, id: u64, rope: &Rope) -> bool {
+        self.editor_snapshot
             .as_ref()
-            .is_some_and(|(id, old)| *id == owner.0 && old.same_as(rope))
-        {
+            .is_some_and(|(owner, old)| *owner == id && old.same_as(rope))
+    }
+
+    pub fn cached_editor_line(&self, owner: (u64, usize), rope: &Rope) -> Option<&ShapedLine> {
+        if self.editor_snapshot_is(owner.0, rope) {
             return self.editor_lines.get(&owner.1)?.as_deref();
         }
         // The other pane's document, while this one was drawn last: a click
