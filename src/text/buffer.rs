@@ -1073,13 +1073,8 @@ impl Buffer {
     pub fn input_selection(&self) -> (usize, usize) {
         let range = self.selection().unwrap_or(self.cursor..self.cursor);
         let line_start = self.rope.line_to_byte(self.rope.byte_to_line(range.start));
-        let units = |from: usize, to: usize| -> usize {
-            self.rope
-                .chunks_in(from..to)
-                .flat_map(str::chars)
-                .map(char::len_utf16)
-                .sum()
-        };
+        let units =
+            |from: usize, to: usize| self.rope.byte_to_utf16(to) - self.rope.byte_to_utf16(from);
         (
             units(line_start, range.start),
             units(range.start, range.end),
@@ -1093,22 +1088,15 @@ impl Buffer {
         let line = self.rope.byte_to_line(self.cursor);
         let line_start = self.rope.line_to_byte(line);
         let line_end = self.line_end(line);
-        let text = self.rope.slice_to_string(line_start..line_end);
-
-        let mut units = 0;
-        let (mut start, mut end) = (None, None);
-        for (byte, ch) in text.char_indices() {
-            if units >= location && start.is_none() {
-                start = Some(byte);
-            }
-            if units >= location + length && end.is_none() {
-                end = Some(byte);
-            }
-            units += ch.len_utf16();
-        }
-        let start = start.unwrap_or(text.len());
-        let end = end.unwrap_or(text.len()).max(start);
-        self.select_range(line_start + start, line_start + end);
+        let base = self.rope.byte_to_utf16(line_start);
+        let at = |units: usize| {
+            self.rope
+                .utf16_to_byte(base + units)
+                .clamp(line_start, line_end)
+        };
+        let start = at(location);
+        let end = at(location + length).max(start);
+        self.select_range(start, end);
     }
 
     /// The run of like characters around `at`: a word, a run of punctuation,
@@ -2564,8 +2552,7 @@ impl Buffer {
         for chunk in self.rope.chunks_in(start..end) {
             for ch in chunk.chars() {
                 match ch {
-                    ' ' => column += 1,
-                    '\t' => column = column / 4 * 4 + 4,
+                    ' ' | '\t' => column = crate::text::columns::advance(column, ch),
                     '\r' => {}
                     _ => return Some(column),
                 }

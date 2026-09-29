@@ -334,15 +334,9 @@ pub fn parse_spanned(source: &str) -> Vec<SpannedBlock> {
 /// Leading indentation in columns, with tabs advancing to the next multiple
 /// of four.
 fn indent_columns(line: &str) -> usize {
-    let mut columns = 0;
-    for ch in line.chars() {
-        match ch {
-            ' ' => columns += 1,
-            '\t' => columns = (columns / 4 + 1) * 4,
-            _ => break,
-        }
-    }
-    columns
+    line.chars()
+        .take_while(|c| matches!(c, ' ' | '\t'))
+        .fold(0, crate::text::columns::advance)
 }
 
 /// Drops `want` columns of leading indentation, tabs included, and returns
@@ -355,8 +349,7 @@ fn strip_columns(line: &str, want: usize) -> String {
             return line[at..].to_string();
         }
         match ch {
-            ' ' => columns += 1,
-            '\t' => columns = (columns / 4 + 1) * 4,
+            ' ' | '\t' => columns = crate::text::columns::advance(columns, ch),
             _ => return line[at..].to_string(),
         }
     }

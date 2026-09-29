@@ -41,7 +41,7 @@ pub fn position_of(rope: &Rope, byte: usize) -> Position {
     let byte = byte.min(rope.len_bytes());
     let line = rope.byte_to_line(byte);
     let start = rope.line_to_byte(line);
-    let character = rope.slice_to_string(start..byte).encode_utf16().count();
+    let character = rope.byte_to_utf16(byte) - rope.byte_to_utf16(start);
     Position {
         line: line as u32,
         character: character as u32,
@@ -58,16 +58,9 @@ pub fn offset_of(rope: &Rope, position: Position) -> usize {
     }
     let line = (position.line as usize).min(lines - 1);
     let start = rope.line_to_byte(line);
-    let text = rope.line(line);
-    let content = text.trim_end_matches('\n').trim_end_matches('\r');
-    let mut units = 0u32;
-    for (index, ch) in content.char_indices() {
-        if units >= position.character {
-            return start + index;
-        }
-        units += ch.len_utf16() as u32;
-    }
-    start + content.len()
+    let end = crate::text::wrap::line_end(rope, line);
+    let at = rope.utf16_to_byte(rope.byte_to_utf16(start) + position.character as usize);
+    at.clamp(start, end)
 }
 
 /// A `file://` URI for `path`, percent-encoding what a URI cannot carry.
