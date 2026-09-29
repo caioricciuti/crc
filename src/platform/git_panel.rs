@@ -201,9 +201,16 @@ impl Sidebar {
 
 impl Panel {
     pub fn new(directory: PathBuf) -> Self {
-        let mut panel = Self {
+        let mut panel = Self::idle(directory, None);
+        panel.refresh();
+        panel
+    }
+
+    /// A panel that has asked the repository nothing yet: no worker runs.
+    fn idle(directory: PathBuf, snapshot: Option<Snapshot>) -> Self {
+        Self {
             directory,
-            snapshot: None,
+            snapshot,
             selected: 0,
             list_scroll: 0,
             diff_scroll: 0,
@@ -220,9 +227,7 @@ impl Panel {
             select_queued: None,
             queued: None,
             generation: 0,
-        };
-        panel.refresh();
-        panel
+        }
     }
     /// How many times the worker has answered.
     pub fn generation(&self) -> u64 {
@@ -1261,31 +1266,15 @@ mod tests {
 
     /// Built without touching a repository: `Panel::new` starts a worker.
     fn panel(changes: Vec<Change>) -> Panel {
-        Panel {
-            directory: PathBuf::from("/tmp"),
-            snapshot: Some(Snapshot {
-                root: PathBuf::from("/tmp"),
-                branch: "main".into(),
-                changes,
-                in_progress: None,
-            }),
-            selected: 0,
-            list_scroll: 0,
-            diff_scroll: 0,
-            message: Buffer::new(),
-            note: String::new(),
-            showing_diff: false,
-            diff: git::Diff::default(),
-            rx: None,
-            submitted: None,
-            finished_at: None,
-            announcement: None,
-            announces: false,
-            resolve_queued: Default::default(),
-            select_queued: None,
-            queued: None,
-            generation: 0,
-        }
+        let snapshot = Snapshot {
+            root: PathBuf::from("/tmp"),
+            branch: "main".into(),
+            changes,
+            in_progress: None,
+        };
+        let mut panel = Panel::idle(PathBuf::from("/tmp"), Some(snapshot));
+        panel.note = String::new();
+        panel
     }
 
     #[test]

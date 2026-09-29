@@ -66,6 +66,12 @@ impl Text {
     }
 }
 
+/// The bytes of module memory a pointer and a length name. An overflowing
+/// end stays past the memory, so `get` refuses it rather than wrapping.
+fn memory_span(ptr: usize, len: usize) -> std::ops::Range<usize> {
+    ptr..ptr.saturating_add(len)
+}
+
 impl From<&str> for Text {
     fn from(text: &str) -> Text {
         let rope = crate::text::rope::Rope::from_text(text);
@@ -125,7 +131,7 @@ pub fn load(manifest: Manifest, wasm: &[u8]) -> Result<Loaded, String> {
                     };
                     let (ptr, len) = (*ptr as u32 as usize, *len as u32 as usize);
                     let bytes = memory
-                        .get(ptr..ptr.saturating_add(len))
+                        .get(memory_span(ptr, len))
                         .ok_or_else(|| Trap("log outside memory".into()))?;
                     let line: String = String::from_utf8_lossy(bytes).chars().take(1000).collect();
                     let mut log = sink.lock().unwrap_or_else(|e| e.into_inner());
@@ -221,7 +227,7 @@ impl Loaded {
         let ptr = first(self.instance.call(self.alloc, &[len]).map_err(trap)?)? as usize;
         self.instance
             .memory
-            .get_mut(ptr..ptr.saturating_add(input.len()))
+            .get_mut(memory_span(ptr, input.len()))
             .ok_or_else(|| format!("{name} gave memory it does not have"))?
             .copy_from_slice(input.as_bytes());
         let packed = first(self.instance.call(func, &[ptr as u64, len]).map_err(trap)?)?;
@@ -229,7 +235,7 @@ impl Loaded {
         let bytes = self
             .instance
             .memory
-            .get(out..out.saturating_add(out_len))
+            .get(memory_span(out, out_len))
             .ok_or_else(|| format!("{name} answered outside its memory"))?
             .to_vec();
         // Its buffer is its own to free, on a budget of its own rather than

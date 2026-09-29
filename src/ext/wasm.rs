@@ -272,12 +272,20 @@ fn block_type(r: &mut Reader, types: &[FuncType]) -> Result<(u16, u16), Trap> {
 }
 
 /// A constant expression: one const or global.get, then end.
-fn const_expr(r: &mut Reader, globals: &[(bool, u64)]) -> Result<u64, Trap> {
-    let value = match r.byte()? {
+/// The immediate of `i32.const` (0x41), `i64.const`, `f32.const` or
+/// `f64.const` (0x44), as the stack holds it.
+fn const_immediate(r: &mut Reader, op: u8) -> Result<u64, Trap> {
+    Ok(match op {
         0x41 => r.signed(32)? as i32 as u32 as u64,
         0x42 => r.signed(64)? as u64,
         0x43 => u32::from_le_bytes(r.take(4)?.try_into().unwrap_or([0; 4])) as u64,
-        0x44 => u64::from_le_bytes(r.take(8)?.try_into().unwrap_or([0; 8])),
+        _ => u64::from_le_bytes(r.take(8)?.try_into().unwrap_or([0; 8])),
+    })
+}
+
+fn const_expr(r: &mut Reader, globals: &[(bool, u64)]) -> Result<u64, Trap> {
+    let value = match r.byte()? {
+        op @ 0x41..=0x44 => const_immediate(r, op)?,
         0x23 => {
             let i = r.u32()? as usize;
             globals
@@ -458,10 +466,7 @@ fn decode_body(body: &[u8], types: &[FuncType], ty: FuncType) -> Result<Func, Tr
                 memory_zero(&mut r)?;
                 Op::MemoryGrow
             }
-            0x41 => Op::Const(r.signed(32)? as i32 as u32 as u64),
-            0x42 => Op::Const(r.signed(64)? as u64),
-            0x43 => Op::Const(u32::from_le_bytes(r.take(4)?.try_into().unwrap_or([0; 4])) as u64),
-            0x44 => Op::Const(u64::from_le_bytes(r.take(8)?.try_into().unwrap_or([0; 8]))),
+            op @ 0x41..=0x44 => Op::Const(const_immediate(&mut r, op)?),
             0x45..=0xc4 => Op::Num(op),
             0xfc => match r.u32()? {
                 n @ 0..=7 => Op::Sat(n as u8),

@@ -5373,6 +5373,33 @@ pub fn ui_text_width(atlas: &mut Atlas, text: &str) -> f32 {
     ui_caret_x(atlas, &bounded, bounded.len())
 }
 
+/// `text` broken into lines that fit `width`, at spaces.
+pub fn wrap_words(atlas: &mut Atlas, text: &str, width: f32) -> Vec<String> {
+    // Measured a word at a time: the UI width of a whole line stops
+    // counting at 120 characters, so a long one never seemed to overflow.
+    let space = ui_text_width(atlas, " ");
+    let mut lines = Vec::new();
+    for paragraph in text.lines() {
+        let mut line = String::new();
+        let mut line_w = 0.0;
+        for word in paragraph.split_whitespace() {
+            let word_w = ui_text_width(atlas, word);
+            if !line.is_empty() && line_w + space + word_w > width {
+                lines.push(std::mem::take(&mut line));
+                line_w = 0.0;
+            }
+            if !line.is_empty() {
+                line.push(' ');
+                line_w += space;
+            }
+            line.push_str(word);
+            line_w += word_w;
+        }
+        lines.push(line);
+    }
+    lines
+}
+
 /// A UI label centred horizontally in `rect`.
 ///
 /// Controls used to centre their text by hand, with a fixed left inset chosen

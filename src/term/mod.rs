@@ -350,17 +350,7 @@ impl Term {
         if !wordy(&cells[col]) {
             return Some((col, col + 1));
         }
-        let from = (0..col)
-            .rev()
-            .take_while(|&i| wordy(&cells[i]))
-            .last()
-            .unwrap_or(col);
-        let to = (col..cells.len())
-            .take_while(|&i| wordy(&cells[i]))
-            .last()
-            .unwrap_or(col)
-            + 1;
-        Some((from, to))
+        Some(span_while(cells.len(), col, |i| wordy(&cells[i])))
     }
 
     /// Line `line` as text, with the column each character starts at.
@@ -1229,21 +1219,20 @@ fn is_word_char(ch: char) -> bool {
 /// A file reference under character `index` of `text`: a path, optionally
 /// followed by `:line` and `:column`, as compilers and `claude` print them.
 /// Quotes, brackets and trailing punctuation around it are not part of it.
+/// The run `[from, to)` around `at`, within `0..len`, of indexes that
+/// `keep` accepts. `at` itself is always inside.
+fn span_while(len: usize, at: usize, keep: impl Fn(usize) -> bool) -> (usize, usize) {
+    let from = (0..at).rev().take_while(|&i| keep(i)).last().unwrap_or(at);
+    let to = (at..len).take_while(|&i| keep(i)).last().unwrap_or(at) + 1;
+    (from, to)
+}
+
 pub fn path_at(text: &[char], index: usize) -> Option<(String, Option<usize>, Option<usize>)> {
     let stop = |c: &char| c.is_whitespace() || "\"'`()[]{}<>,;|".contains(*c);
     if index >= text.len() || stop(&text[index]) {
         return None;
     }
-    let from = (0..index)
-        .rev()
-        .take_while(|&i| !stop(&text[i]))
-        .last()
-        .unwrap_or(index);
-    let to = (index..text.len())
-        .take_while(|&i| !stop(&text[i]))
-        .last()
-        .unwrap_or(index)
-        + 1;
+    let (from, to) = span_while(text.len(), index, |i| !stop(&text[i]));
     let token: String = text[from..to].iter().collect();
     let token = token.trim_end_matches(['.', ':', '!', '?']);
     let token = token.strip_prefix("file://").unwrap_or(token);

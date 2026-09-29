@@ -205,33 +205,6 @@ fn button(
     rect
 }
 
-/// `text` broken into lines that fit `width`, at spaces.
-fn wrap(atlas: &mut Atlas, text: &str, width: f32) -> Vec<String> {
-    // Measured a word at a time: the UI width of a whole line stops
-    // counting at 120 characters, so a long one never seemed to overflow.
-    let space = layout::ui_text_width(atlas, " ");
-    let mut lines = Vec::new();
-    for paragraph in text.lines() {
-        let mut line = String::new();
-        let mut line_w = 0.0;
-        for word in paragraph.split_whitespace() {
-            let word_w = layout::ui_text_width(atlas, word);
-            if !line.is_empty() && line_w + space + word_w > width {
-                lines.push(std::mem::take(&mut line));
-                line_w = 0.0;
-            }
-            if !line.is_empty() {
-                line.push(' ');
-                line_w += space;
-            }
-            line.push_str(word);
-            line_w += word_w;
-        }
-        lines.push(line);
-    }
-    lines
-}
-
 fn text(
     out: &mut Vec<GlyphInstance>,
     atlas: &mut Atlas,
@@ -361,7 +334,7 @@ pub fn draw_details(
         );
         y += 30.0;
         if !pending.signed() {
-            for line in wrap(
+            for line in layout::wrap_words(
                 atlas,
                 "Unsigned: this did not come from the signed registry, so nobody has checked it. Install it only if you trust where it came from.",
                 detail_w,
@@ -403,7 +376,7 @@ pub fn draw_details(
         return;
     }
     let Some(id) = page.selected.clone() else {
-        for line in wrap(
+        for line in layout::wrap_words(
             atlas,
             "Extensions add commands to crc. Pick one in the list to see what it does and what it may touch. Installed ones run from the Extensions menu, from the editor's right-click menu, and from the palette.",
             detail_w,
@@ -477,7 +450,7 @@ pub fn draw_details(
     }
     y += BUTTON_H + 20.0;
 
-    for line in wrap(atlas, &manifest.description, detail_w) {
+    for line in layout::wrap_words(atlas, &manifest.description, detail_w) {
         text(out, atlas, dx, y, detail_w, &line, theme.text);
         y += 20.0;
     }
