@@ -160,46 +160,26 @@ const MODES: [&str; 2] = ["Inline", "Side by side"];
 /// Every control in the strip, where it is: mode segments, Previous, Next,
 /// and Mark Resolved when Git has the file unmerged.
 pub fn strip_hits(view: &View, atlas: &mut Atlas, strip: Viewport) -> Vec<(Hit, Viewport)> {
-    let y = strip.y + 38.0;
     let mut x = strip.x + 16.0;
     let mut hits = Vec::new();
     for (index, label) in MODES.iter().enumerate() {
-        let width = layout::ui_text_width(atlas, label) + 24.0;
-        hits.push((
-            Hit::ConflictMode(index == 1),
-            Viewport {
-                x,
-                y,
-                width,
-                height: 26.0,
-            },
-        ));
-        x += width;
+        let rect = layout::strip_button(atlas, strip, x, label, 24.0);
+        hits.push((Hit::ConflictMode(index == 1), rect));
+        x += rect.width;
     }
     x += 14.0;
     if !view.conflicts.is_empty() {
         for (forward, label) in [(false, "Previous"), (true, "Next")] {
-            let width = layout::ui_text_width(atlas, label) + 24.0;
-            hits.push((
-                Hit::ConflictStep(forward),
-                Viewport {
-                    x,
-                    y,
-                    width,
-                    height: 26.0,
-                },
-            ));
-            x += width + 6.0;
+            let rect = layout::strip_button(atlas, strip, x, label, 24.0);
+            hits.push((Hit::ConflictStep(forward), rect));
+            x += rect.width + 6.0;
         }
     }
     if view.unmerged {
-        let label = "Mark Resolved";
-        let width = layout::ui_text_width(atlas, label) + 28.0;
+        let button = layout::strip_button(atlas, strip, x, "Mark Resolved", 28.0);
         let right = Viewport {
-            x: (strip.x + strip.width - 16.0 - width).max(x),
-            y,
-            width,
-            height: 26.0,
+            x: (strip.x + strip.width - 16.0 - button.width).max(x),
+            ..button
         };
         // Only where it fits: pushed right of the other buttons in a narrow
         // strip, it drew past the strip and took clicks meant for the text.
@@ -232,14 +212,7 @@ pub fn draw_strip(
     } else {
         "Conflicts"
     };
-    let pill = Viewport {
-        x: strip.x + 16.0,
-        y: strip.y + 6.0,
-        width: layout::ui_text_width(atlas, pill_label) + 20.0,
-        height: 26.0,
-    };
-    layout::push_rounded_rect(out, pill, 6.0, [tone[0], tone[1], tone[2], 0.18]);
-    layout::push_ui_text_centered(out, atlas, pill, pill_label, tone);
+    let pill = layout::strip_pill(out, atlas, strip, pill_label, tone);
     let left = view.conflicts.len();
     let facts = match (left, view.unmerged) {
         (0, true) => format!(
@@ -266,18 +239,7 @@ pub fn draw_strip(
             facts
         }
     };
-    layout::push_ui_text(
-        out,
-        atlas,
-        Viewport {
-            x: pill.x + pill.width + 12.0,
-            y: pill.y,
-            width: (strip.x + strip.width - pill.x - pill.width - 28.0).max(0.0),
-            height: pill.height,
-        },
-        &facts,
-        theme.status_text,
-    );
+    layout::strip_facts(out, atlas, strip, pill, &facts, theme);
     let hits = strip_hits(view, atlas, strip);
     // The two modes read as one control: a track, and the chosen half lit.
     let modes: Vec<Viewport> = hits
@@ -359,13 +321,7 @@ pub fn draw_strip(
             _ => {}
         }
     }
-    layout::push_rect(
-        out,
-        atlas,
-        [strip.x, strip.y + strip.height - 1.0],
-        [strip.width, 1.0],
-        theme.hairline,
-    );
+    layout::strip_hairline(out, atlas, strip, theme);
 }
 
 fn or_unnamed(label: &str) -> &str {

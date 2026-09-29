@@ -2952,11 +2952,7 @@ define_class!(
                 let Some(state) = self.state() else {
                     return;
                 };
-                state
-                    .tree
-                    .selected
-                    .and_then(|index| state.tree.rows().get(index))
-                    .map(|entry| entry.path.clone())
+                state.tree.selected_path()
             };
             let Some(path) = path else { return };
             self.start_sidebar_edit(SidebarEditKind::Rename(path));
@@ -11049,22 +11045,13 @@ impl EditorView {
         let Some(root) = state.tree.root().map(Path::to_path_buf) else {
             return;
         };
-        let (parent, row, depth, mut field) = match &kind {
+        let (parent, row, depth, field) = match &kind {
             SidebarEditKind::Rename(path) => {
                 let Some(index) = state.tree.rows().iter().position(|e| &e.path == path) else {
                     return;
                 };
                 let entry = &state.tree.rows()[index];
-                let name = entry.name.clone();
-                let mut field = Buffer::from_text(&name);
-                // The stem is selected, as in Finder: typing replaces the
-                // name and keeps the extension.
-                let stem = if entry.is_dir {
-                    name.len()
-                } else {
-                    Path::new(&name).file_stem().map_or(name.len(), |s| s.len())
-                };
-                field.select_input_range(0, stem);
+                let field = rename_field(&entry.name, entry.is_dir);
                 let parent = path.parent().map_or(root.clone(), Path::to_path_buf);
                 (parent, index, entry.depth, field)
             }
@@ -11082,11 +11069,6 @@ impl EditorView {
                 (parent, row, depth, Buffer::new())
             }
         };
-        field.select_input_range(field.cursor(), 0);
-        if let SidebarEditKind::Rename(_) = &kind {
-            let stem_end = field.selection().map_or(field.cursor(), |r| r.end);
-            field.select_input_range(0, stem_end);
-        }
         // Scroll the row into view.
         let chrome = chrome_of(&state);
         if let Some(rect) = chrome.sidebar {
@@ -13705,6 +13687,19 @@ fn close_fields(state: &mut State) {
     state.git_focus = false;
 }
 
+/// The sidebar's rename field for `name`, its stem selected as Finder does:
+/// typing replaces the name and keeps the extension. A folder's whole name.
+fn rename_field(name: &str, is_dir: bool) -> Buffer {
+    let mut field = Buffer::from_text(name);
+    let stem = if is_dir {
+        name.len()
+    } else {
+        Path::new(name).file_stem().map_or(name.len(), |s| s.len())
+    };
+    field.select_range(0, stem);
+    field
+}
+
 /// The file of the tab the tab-strip context menu was opened on.
 fn context_tab_path(state: &State) -> Option<std::path::PathBuf> {
     state
@@ -15348,10 +15343,20 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
 #[cfg(test)]
 mod tests {
     use super::{
-        caret_phase, inserted_text, single_line, spawn_project_index, spawn_project_refresh,
-        typed_text,
+        caret_phase, inserted_text, rename_field, single_line, spawn_project_index,
+        spawn_project_refresh, typed_text,
     };
     use std::time::Duration;
+
+    #[test]
+    fn rename_selects_the_stem_in_bytes() {
+        let field = rename_field("caf\u{e9}.txt", false);
+        assert_eq!(field.selected_text().as_deref(), Some("caf\u{e9}"));
+        let field = rename_field("notes.d", true);
+        assert_eq!(field.selected_text().as_deref(), Some("notes.d"));
+        let field = rename_field(".profile", false);
+        assert_eq!(field.selected_text().as_deref(), Some(".profile"));
+    }
 
     #[test]
     fn the_restore_prompt_names_what_came_back() {

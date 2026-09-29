@@ -5232,6 +5232,75 @@ pub struct UiField<'a> {
     pub focused: bool,
 }
 
+// ---- status strips --------------------------------------------------------
+// The strip above a merge conflict and above a Claude review: a tinted pill
+// naming the state, the facts beside it, a row of buttons below, and a
+// hairline under it all.
+
+/// Draws the pill at the strip's top left, tinted `tone`; its rectangle.
+pub fn strip_pill(
+    out: &mut Vec<GlyphInstance>,
+    atlas: &mut Atlas,
+    strip: Viewport,
+    label: &str,
+    tone: [f32; 4],
+) -> Viewport {
+    let pill = Viewport {
+        x: strip.x + 16.0,
+        y: strip.y + 6.0,
+        width: ui_text_width(atlas, label) + 20.0,
+        height: 26.0,
+    };
+    push_rounded_rect(out, pill, 6.0, [tone[0], tone[1], tone[2], 0.18]);
+    push_ui_text_centered(out, atlas, pill, label, tone);
+    pill
+}
+
+/// The strip's facts, right of its `pill`.
+pub fn strip_facts(
+    out: &mut Vec<GlyphInstance>,
+    atlas: &mut Atlas,
+    strip: Viewport,
+    pill: Viewport,
+    facts: &str,
+    theme: &Theme,
+) {
+    push_ui_text(
+        out,
+        atlas,
+        Viewport {
+            x: pill.x + pill.width + 12.0,
+            y: pill.y,
+            width: (strip.x + strip.width - pill.x - pill.width - 28.0).max(0.0),
+            height: pill.height,
+        },
+        facts,
+        theme.status_text,
+    );
+}
+
+/// A button on the strip's second row, starting at `x`, `pad` wider than
+/// its label.
+pub fn strip_button(atlas: &mut Atlas, strip: Viewport, x: f32, label: &str, pad: f32) -> Viewport {
+    Viewport {
+        x,
+        y: strip.y + 38.0,
+        width: ui_text_width(atlas, label) + pad,
+        height: 26.0,
+    }
+}
+
+/// The hairline along the strip's bottom edge.
+pub fn strip_hairline(out: &mut Vec<GlyphInstance>, atlas: &Atlas, strip: Viewport, theme: &Theme) {
+    push_rect(
+        out,
+        atlas,
+        [strip.x, strip.y + strip.height - 1.0],
+        [strip.width, 1.0],
+        theme.hairline,
+    );
+}
+
 /// The palette query's text inset from the palette's left edge.
 pub const PALETTE_INPUT_PAD: f32 = 18.0;
 

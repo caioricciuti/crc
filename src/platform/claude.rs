@@ -186,17 +186,10 @@ impl Bridge {
 /// The Accept and Reject buttons in the strip above a review.
 pub fn review_buttons(atlas: &mut Atlas, strip: Viewport) -> [Viewport; 2] {
     let mut x = strip.x + 16.0;
-    let y = strip.y + 38.0;
     let mut rects = [strip; 2];
     for (rect, label) in rects.iter_mut().zip(BUTTONS) {
-        let width = layout::ui_text_width(atlas, label) + 24.0;
-        *rect = Viewport {
-            x,
-            y,
-            width,
-            height: 26.0,
-        };
-        x += width + 6.0;
+        *rect = layout::strip_button(atlas, strip, x, label, 24.0);
+        x += rect.width + 6.0;
     }
     rects
 }
@@ -212,15 +205,8 @@ pub fn draw_review_strip(
     theme: &Theme,
     out: &mut Vec<GlyphInstance>,
 ) {
-    let pill = Viewport {
-        x: strip.x + 16.0,
-        y: strip.y + 6.0,
-        width: layout::ui_text_width(atlas, "Claude") + 20.0,
-        height: 26.0,
-    };
     let tone = theme.accent;
-    layout::push_rounded_rect(out, pill, 6.0, [tone[0], tone[1], tone[2], 0.18]);
-    layout::push_ui_text_centered(out, atlas, pill, "Claude", tone);
+    let pill = layout::strip_pill(out, atlas, strip, "Claude", tone);
     let shown = root
         .and_then(|root| review.path.strip_prefix(root).ok())
         .unwrap_or(&review.path);
@@ -234,18 +220,7 @@ pub fn draw_review_strip(
         Some(true) => format!("Accepted. Claude writes {} next.", shown.display()),
         Some(false) => format!("Rejected. {} is unchanged.", shown.display()),
     };
-    layout::push_ui_text(
-        out,
-        atlas,
-        Viewport {
-            x: pill.x + pill.width + 12.0,
-            y: pill.y,
-            width: (strip.x + strip.width - pill.x - pill.width - 28.0).max(0.0),
-            height: pill.height,
-        },
-        &facts,
-        theme.status_text,
-    );
+    layout::strip_facts(out, atlas, strip, pill, &facts, theme);
     if review.decided.is_none() {
         let [accept, reject] = review_buttons(atlas, strip);
         layout::push_rounded_rect(out, accept, 6.0, [tone[0], tone[1], tone[2], 0.22]);
@@ -253,13 +228,7 @@ pub fn draw_review_strip(
         layout::push_rounded_rect(out, reject, 6.0, theme.tab_hover);
         layout::push_ui_text_centered(out, atlas, reject, BUTTONS[1], theme.status_text);
     }
-    layout::push_rect(
-        out,
-        atlas,
-        [strip.x, strip.y + strip.height - 1.0],
-        [strip.width, 1.0],
-        theme.hairline,
-    );
+    layout::strip_hairline(out, atlas, strip, theme);
 }
 
 /// The proposal as a diff against the file.
