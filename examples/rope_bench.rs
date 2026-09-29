@@ -8,27 +8,10 @@
 //! Run with: cargo run --release --offline --example rope_bench
 
 use crc::text::rope::Rope;
-use std::time::Instant;
 
-fn synth(target_bytes: usize) -> String {
-    // Roughly source-code shaped: ~50 byte lines, mixed content, some
-    // multi-byte characters so the chunker has to work for its living.
-    let mut s = String::with_capacity(target_bytes + 128);
-    let mut i = 0usize;
-    while s.len() < target_bytes {
-        match i % 7 {
-            0 => s.push_str("fn handle_event(&mut self, ev: &Event) -> Result<()> {\n"),
-            1 => s.push_str("    let span = self.tree.node_at(ev.offset)?;\n"),
-            2 => s.push_str("    // café, naïve, 🌍 — multi-byte lives here too\n"),
-            3 => s.push_str("    match span.kind() { Kind::Ident => self.bump(), _ => {} }\n"),
-            4 => s.push('\n'),
-            5 => s.push_str("    self.dirty.insert(span.range());\n"),
-            _ => s.push_str("}\n"),
-        }
-        i += 1;
-    }
-    s
-}
+#[path = "common/synth.rs"]
+mod synth;
+use std::time::Instant;
 
 fn ms(d: std::time::Duration) -> f64 {
     d.as_secs_f64() * 1000.0
@@ -41,7 +24,11 @@ fn main() {
         "building {} MiB of synthetic source...",
         TARGET / 1024 / 1024
     );
-    let src = synth(TARGET);
+    // Multi-byte characters, so the chunker has to work for its living.
+    let src = synth::synth(
+        TARGET,
+        "    // café, naïve, 🌍 — multi-byte lives here too\n",
+    );
     println!(
         "  {} bytes, {} lines\n",
         src.len(),

@@ -22,6 +22,9 @@ use crc::text::documents::Documents;
 use objc2_metal::MTLCreateSystemDefaultDevice;
 use std::time::{Duration, Instant};
 
+#[path = "common/synth.rs"]
+mod synth;
+
 /// One 120Hz frame.
 const BUDGET_MS: f64 = 1000.0 / 120.0;
 
@@ -95,24 +98,6 @@ impl ChromeFrame {
     }
 }
 
-fn synth(target_bytes: usize) -> String {
-    let mut s = String::with_capacity(target_bytes + 128);
-    let mut i = 0usize;
-    while s.len() < target_bytes {
-        match i % 7 {
-            0 => s.push_str("fn handle_event(&mut self, ev: &Event) -> Result<()> {\n"),
-            1 => s.push_str("    let span = self.tree.node_at(ev.offset)?;\n"),
-            2 => s.push_str("    // a comment line that runs on a bit longer than the others\n"),
-            3 => s.push_str("    match span.kind() { Kind::Ident => self.bump(), _ => {} }\n"),
-            4 => s.push('\n'),
-            5 => s.push_str("    self.dirty.insert(span.range());\n"),
-            _ => s.push_str("}\n"),
-        }
-        i += 1;
-    }
-    s
-}
-
 fn percentile(sorted: &[f64], p: f64) -> f64 {
     crc::platform::latency::nearest_rank(sorted, p)
 }
@@ -145,7 +130,10 @@ fn main() {
     let mut renderer = Renderer::new(device, atlas);
 
     const MB: usize = 100 * 1024 * 1024;
-    let src = synth(MB);
+    let src = synth::synth(
+        MB,
+        "    // a comment line that runs on a bit longer than the others\n",
+    );
     let t = Instant::now();
     let mut buffer = Buffer::from_text(&src);
     buffer.path = Some("src/main.rs".into());

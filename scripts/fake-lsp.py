@@ -73,32 +73,29 @@ def publish(uri):
     notify("textDocument/publishDiagnostics", {"uri": uri, "diagnostics": diagnostics})
 
 
-def word_before(uri, position):
+def word_span(uri, position, whole):
+    """The identifier characters before `position`, and after it too when
+    `whole`, with the column it starts at."""
     text = documents.get(uri, "")
     lines = text.split("\n")
     if position["line"] >= len(lines):
         return "", position["character"]
     line = lines[position["line"]]
-    end = min(position["character"], len(line))
-    start = end
-    while start > 0 and (line[start - 1].isalnum() or line[start - 1] == "_"):
-        start -= 1
-    return line[start:end], start
-
-
-def word_at(uri, position):
-    text = documents.get(uri, "")
-    lines = text.split("\n")
-    if position["line"] >= len(lines):
-        return ""
-    line = lines[position["line"]]
     start = end = min(position["character"], len(line))
     ident = lambda c: c.isalnum() or c == "_"
     while start > 0 and ident(line[start - 1]):
         start -= 1
-    while end < len(line) and ident(line[end]):
+    while whole and end < len(line) and ident(line[end]):
         end += 1
-    return line[start:end]
+    return line[start:end], start
+
+
+def word_before(uri, position):
+    return word_span(uri, position, False)
+
+
+def word_at(uri, position):
+    return word_span(uri, position, True)[0]
 
 
 def on_disk():

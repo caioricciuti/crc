@@ -1380,6 +1380,25 @@ impl Atlas {
         }
     }
 
+    /// Waits for the shaping and rasterising workers, calling `rebuild`
+    /// every 2 ms the way the display link would, and panics past `limit`.
+    /// For benchmarks, dumps and tests that want the settled frame.
+    pub fn settle_shaping(
+        &mut self,
+        limit: std::time::Duration,
+        mut rebuild: impl FnMut(&mut Self),
+    ) {
+        let started = std::time::Instant::now();
+        while self.has_pending_shaping() {
+            assert!(
+                started.elapsed() < limit,
+                "shaping did not finish in {limit:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            rebuild(self);
+        }
+    }
+
     pub fn has_pending_shaping(&self) -> bool {
         self.worker.as_ref().is_some_and(worker::Worker::is_pending)
             || self
@@ -2127,12 +2146,7 @@ mod tests {
             let expected = synchronous.slot_for(ch).unwrap();
             assert!(asynchronous.slot_for_fallback(ch).is_some());
             assert!(asynchronous.peek(ch).is_none());
-            let started = std::time::Instant::now();
-            while asynchronous.has_pending_shaping() {
-                assert!(started.elapsed().as_secs() < 10);
-                std::thread::sleep(std::time::Duration::from_millis(2));
-                asynchronous.begin_frame();
-            }
+            asynchronous.settle_shaping(std::time::Duration::from_secs(10), Atlas::begin_frame);
             let actual = asynchronous.peek(ch).unwrap();
             assert_eq!(actual.cells, expected.cells);
             assert_eq!(actual.color, expected.color);

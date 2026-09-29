@@ -5,7 +5,7 @@ use crc::render::font::Atlas;
 use crc::render::layout::{self, Theme, Viewport};
 use crc::text::buffer::{Buffer, Motion};
 use std::hint::black_box;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 fn p99(samples: &mut [f64]) -> f64 {
     samples.sort_by(f64::total_cmp);
@@ -77,19 +77,11 @@ fn measure(label: &str, source: &str, cursor: usize, scroll: usize) {
             );
             let started = Instant::now();
             let mut max_poll_ms = 0.0_f64;
-            while atlas.has_pending_shaping() {
-                assert!(started.elapsed().as_secs() < 30, "shaping did not finish");
-                std::thread::sleep(std::time::Duration::from_millis(2));
+            atlas.settle_shaping(Duration::from_secs(30), |atlas| {
                 let frame = Instant::now();
-                layout::build(
-                    &buffer,
-                    &mut atlas,
-                    viewport,
-                    &Theme::default(),
-                    &mut glyphs,
-                );
+                layout::build(&buffer, atlas, viewport, &Theme::default(), &mut glyphs);
                 max_poll_ms = max_poll_ms.max(frame.elapsed().as_secs_f64() * 1000.0);
-            }
+            });
             assert!(
                 max_poll_ms < 1000.0 / 120.0,
                 "shaping installation exceeds frame budget"
@@ -199,18 +191,9 @@ fn measure_selection(source: &str) {
         &Theme::default(),
         &mut glyphs,
     );
-    let deadline = Instant::now();
-    while atlas.has_pending_shaping() {
-        assert!(deadline.elapsed().as_secs() < 30);
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        layout::build(
-            &buffer,
-            &mut atlas,
-            viewport,
-            &Theme::default(),
-            &mut glyphs,
-        );
-    }
+    atlas.settle_shaping(Duration::from_secs(30), |atlas| {
+        layout::build(&buffer, atlas, viewport, &Theme::default(), &mut glyphs);
+    });
     let mut samples = Vec::new();
     for _ in 0..200 {
         let start = Instant::now();
@@ -238,12 +221,9 @@ fn measure_unchanged_paragraph_edits(source: &str) {
     let mut glyphs = Vec::new();
     let theme = Theme::default();
     layout::build(&buffer, &mut atlas, viewport, &theme, &mut glyphs);
-    let deadline = Instant::now();
-    while atlas.has_pending_shaping() {
-        assert!(deadline.elapsed().as_secs() < 30);
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        layout::build(&buffer, &mut atlas, viewport, &theme, &mut glyphs);
-    }
+    atlas.settle_shaping(Duration::from_secs(30), |atlas| {
+        layout::build(&buffer, atlas, viewport, &theme, &mut glyphs);
+    });
     let original = atlas
         .shape_editor_line(
             (buffer.id(), 1),

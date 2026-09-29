@@ -18,7 +18,8 @@ use crc::syntax::SyntaxStore;
 use crc::text::buffer::{Buffer, Motion};
 use crc::text::documents::Documents;
 use objc2_metal::MTLCreateSystemDefaultDevice;
-use std::io::Write;
+#[path = "common/bmp.rs"]
+mod bmp;
 
 const SAMPLE: &str = "\
 // Unicode check: everything below used to be silently dropped.
@@ -47,41 +48,12 @@ fn main() {
 }
 ";
 
-/// BGRA8 from Metal to a 24-bit BMP (bottom-up rows, 4-byte padded).
-fn write_bmp(path: &str, w: usize, h: usize, bgra: &[u8]) -> std::io::Result<()> {
-    let row_padded = (w * 3).div_ceil(4) * 4;
-    let pixel_bytes = row_padded * h;
-    let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
-
-    f.write_all(b"BM")?;
-    f.write_all(&((54 + pixel_bytes) as u32).to_le_bytes())?;
-    f.write_all(&0u32.to_le_bytes())?;
-    f.write_all(&54u32.to_le_bytes())?;
-    f.write_all(&40u32.to_le_bytes())?;
-    f.write_all(&(w as i32).to_le_bytes())?;
-    f.write_all(&(h as i32).to_le_bytes())?;
-    f.write_all(&1u16.to_le_bytes())?;
-    f.write_all(&24u16.to_le_bytes())?;
-    f.write_all(&0u32.to_le_bytes())?;
-    f.write_all(&(pixel_bytes as u32).to_le_bytes())?;
-    f.write_all(&2835i32.to_le_bytes())?;
-    f.write_all(&2835i32.to_le_bytes())?;
-    f.write_all(&0u32.to_le_bytes())?;
-    f.write_all(&0u32.to_le_bytes())?;
-
-    let mut row = vec![0u8; row_padded];
-    for y in (0..h).rev() {
-        for x in 0..w {
-            let src = (y * w + x) * 4;
-            let dst = x * 3;
-            // Metal gives BGRA; BMP wants BGR in that same order.
-            row[dst] = bgra[src];
-            row[dst + 1] = bgra[src + 1];
-            row[dst + 2] = bgra[src + 2];
-        }
-        f.write_all(&row)?;
-    }
-    f.flush()
+/// BGRA8 from Metal as a BMP, which wants BGR in that same order.
+fn write_bgra(path: &str, w: usize, h: usize, bgra: &[u8]) -> std::io::Result<()> {
+    bmp::write_bmp(path, w, h, |x, y| {
+        let at = (y * w + x) * 4;
+        [bgra[at], bgra[at + 1], bgra[at + 2]]
+    })
 }
 
 fn main() -> std::io::Result<()> {
@@ -245,23 +217,19 @@ fn main() -> std::io::Result<()> {
     );
     // The live display link polls pending shaping without waiting for input.
     // Export the settled shaped view, not the temporary character fallback.
-    let shaping_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while renderer.atlas.has_pending_shaping() {
-        assert!(
-            std::time::Instant::now() < shaping_deadline,
-            "shaping worker timed out"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        stats = layout::build_full(
-            docs.active(),
-            &mut renderer.atlas,
-            viewport,
-            &theme,
-            "",
-            &spans,
-            &mut glyphs,
-        );
-    }
+    renderer
+        .atlas
+        .settle_shaping(std::time::Duration::from_secs(30), |atlas| {
+            stats = layout::build_full(
+                docs.active(),
+                atlas,
+                viewport,
+                &theme,
+                "",
+                &spans,
+                &mut glyphs,
+            );
+        });
     // Export the first frame after an unrelated newline edit, proving that
     // the native paragraph survives a row shift without a fallback frame.
     if std::env::args().any(|arg| arg == "--reuse-edit") {
@@ -393,7 +361,7 @@ fn main() -> std::io::Result<()> {
             (logical_w, logical_h),
             theme.background,
         );
-        write_bmp(&out, px_w, px_h, &bgra)?;
+        write_bgra(&out, px_w, px_h, &bgra)?;
         println!("wrote       {out}");
         return Ok(());
     }
@@ -701,7 +669,7 @@ fn main() -> std::io::Result<()> {
         "the frame is entirely background: nothing drew"
     );
 
-    write_bmp(&out, px_w, px_h, &bgra)?;
+    write_bgra(&out, px_w, px_h, &bgra)?;
     println!("wrote       {out}");
     Ok(())
 }
