@@ -2571,7 +2571,7 @@ impl Buffer {
     }
 
     /// Leading whitespace of `line` in columns, or `None` for a blank line.
-    fn indent_columns(&self, line: usize) -> Option<usize> {
+    pub fn indent_columns(&self, line: usize) -> Option<usize> {
         let start = self.rope.line_to_byte(line);
         let end = self.line_end(line).min(start + 1024);
         let mut column = 0;

@@ -1016,7 +1016,7 @@ pub fn build_text_appending(
     shown_lines.dedup();
     let indents: Vec<Option<usize>> = shown_lines
         .iter()
-        .map(|&l| indent_columns(buffer, l))
+        .map(|&l| buffer.indent_columns(l))
         .collect();
     let unit = indent_unit(&indents);
     // Which visible lines could fold, from the indents already read: the
@@ -1699,16 +1699,7 @@ pub fn bulb_at(buffer: &Buffer, atlas: &Atlas, x: f32, y: f32) -> bool {
         return false;
     }
     let line = buffer.rope.byte_to_line(buffer.cursor());
-    let rows = screen_rows(
-        buffer,
-        Viewport {
-            x: 0.0,
-            y: 0.0,
-            width: f32::MAX,
-            height: y.max(0.0) + m.line_height,
-        },
-        m.line_height,
-    );
+    let rows = rows_down_to(buffer, y, m.line_height);
     rows.iter()
         .any(|r| r.line == line && r.first && r.y <= y && y < r.y + m.line_height)
 }
@@ -3385,7 +3376,7 @@ pub fn build_sidebar_with_edit(
     let mut drawn = 0;
 
     for visible in first..last {
-        let y = viewport.y + SIDEBAR_HEADER_HEIGHT + (visible - first) as f32 * SIDEBAR_ROW_HEIGHT;
+        let y = sidebar_row_rect(viewport, visible - first).y;
         if let Some(edit) = edit.as_ref().filter(|e| e.row == visible) {
             push_sidebar_edit_row(edit, atlas, viewport, y, theme, out);
             drawn += 1;
@@ -4094,6 +4085,16 @@ pub fn build_completion_ribbon(
 }
 
 /// Which sidebar row is at `y`, or `None` past the last row.
+/// The rectangle of the sidebar row `on_screen` rows below the first one
+/// shown. [`sidebar_row_at`] is the inverse.
+pub fn sidebar_row_rect(viewport: Viewport, on_screen: usize) -> Viewport {
+    Viewport {
+        y: viewport.y + SIDEBAR_HEADER_HEIGHT + on_screen as f32 * SIDEBAR_ROW_HEIGHT,
+        height: SIDEBAR_ROW_HEIGHT,
+        ..viewport
+    }
+}
+
 pub fn sidebar_row_at(
     tree: &Tree,
     field: Option<SidebarField>,
@@ -4694,16 +4695,7 @@ pub fn offset_at_point(
         // Horizontal scroll only exists without wrapping.
         let scrolled = buffer.scroll_column as f32 * m.advance;
         // Rows from the top of the text; y is measured from there too.
-        let rows = screen_rows(
-            buffer,
-            Viewport {
-                x: 0.0,
-                y: 0.0,
-                width: f32::MAX,
-                height: y.max(0.0) + m.line_height,
-            },
-            m.line_height,
-        );
+        let rows = rows_down_to(buffer, y, m.line_height);
         let Some(row) = rows
             .iter()
             .rev()
@@ -4784,6 +4776,21 @@ pub fn offset_at_point(
     )
 }
 
+/// The screen rows from the top of the text down to the one under `y`, for
+/// hit tests measured from the top of the text rather than a viewport.
+fn rows_down_to(buffer: &Buffer, y: f32, line_height: f32) -> Vec<ScreenRow> {
+    screen_rows(
+        buffer,
+        Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: f32::MAX,
+            height: y.max(0.0) + line_height,
+        },
+        line_height,
+    )
+}
+
 /// The line whose fold chevron is under a point in the text area's own
 /// coordinates (as [`offset_at_point`] takes them), when there is one: the
 /// cell after the line number, on a line's first row, of a line that is
@@ -4794,16 +4801,7 @@ pub fn fold_chevron_at(buffer: &Buffer, atlas: &Atlas, x: f32, y: f32) -> Option
     if x < gutter - m.advance * 1.2 || x >= gutter {
         return None;
     }
-    let rows = screen_rows(
-        buffer,
-        Viewport {
-            x: 0.0,
-            y: 0.0,
-            width: f32::MAX,
-            height: y.max(0.0) + m.line_height,
-        },
-        m.line_height,
-    );
+    let rows = rows_down_to(buffer, y, m.line_height);
     let row = rows.iter().find(|r| r.y <= y && y < r.y + m.line_height)?;
     (row.first && (buffer.is_folded_at(row.line) || buffer.can_fold(row.line))).then_some(row.line)
 }
@@ -5831,30 +5829,6 @@ pub fn push_rect(
     });
 }
 
-/// Leading whitespace of `line` in visual columns, or `None` when the line
-/// is blank (whitespace only), which has no indent of its own.
-fn indent_columns(buffer: &Buffer, line: usize) -> Option<usize> {
-    let rope = &buffer.rope;
-    let start = rope.line_to_byte(line);
-    let end = if line + 1 < rope.len_lines() {
-        rope.line_to_byte(line + 1)
-    } else {
-        rope.len_bytes()
-    };
-    let mut columns = 0;
-    for chunk in rope.bytes_in(start..end) {
-        for &byte in chunk {
-            match byte {
-                b' ' => columns += 1,
-                b'\t' => columns += TAB_WIDTH - columns % TAB_WIDTH,
-                b'\n' | b'\r' => return None,
-                _ => return Some(columns),
-            }
-        }
-    }
-    None
-}
-
 /// The indent step the guides are drawn at: the greatest common divisor of
 /// the indents on screen, so two-space and four-space files both get one
 /// guide per level. Nothing to go on means the tab width.
@@ -5887,7 +5861,7 @@ fn blank_line_indent(
     let at = |l: usize| -> Option<usize> {
         match lines.binary_search(&l) {
             Ok(i) => indents[i],
-            Err(_) => indent_columns(buffer, l),
+            Err(_) => buffer.indent_columns(l),
         }
     };
     let above = (line.saturating_sub(REACH)..line).rev().find_map(at);
@@ -5976,11 +5950,11 @@ mod guide_tests {
     #[test]
     fn indent_is_counted_in_columns_and_blank_lines_have_none() {
         let b = Buffer::from_text("fn a() {\n    x;\n\t\ty;\n  \n}\n");
-        assert_eq!(indent_columns(&b, 0), Some(0));
-        assert_eq!(indent_columns(&b, 1), Some(4));
-        assert_eq!(indent_columns(&b, 2), Some(8), "two tabs");
-        assert_eq!(indent_columns(&b, 3), None, "spaces only");
-        assert_eq!(indent_columns(&b, 5), None, "the empty last line");
+        assert_eq!(b.indent_columns(0), Some(0));
+        assert_eq!(b.indent_columns(1), Some(4));
+        assert_eq!(b.indent_columns(2), Some(8), "two tabs");
+        assert_eq!(b.indent_columns(3), None, "spaces only");
+        assert_eq!(b.indent_columns(5), None, "the empty last line");
     }
 
     #[test]
@@ -5999,7 +5973,7 @@ mod guide_tests {
     fn a_blank_line_keeps_the_guides_of_its_block() {
         let b = Buffer::from_text("{\n    a\n\n    b\n}\n");
         let lines: Vec<usize> = (0..5).collect();
-        let indents: Vec<_> = lines.iter().map(|&l| indent_columns(&b, l)).collect();
+        let indents: Vec<_> = lines.iter().map(|&l| b.indent_columns(l)).collect();
         assert_eq!(blank_line_indent(&b, 2, &lines, &indents), 4);
         // Looking past the visible range reads the buffer.
         assert_eq!(blank_line_indent(&b, 2, &lines[3..], &indents[3..]), 4);

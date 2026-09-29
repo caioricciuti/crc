@@ -140,13 +140,10 @@ impl Documents {
         true
     }
 
-    /// Moves `delta` tabs, wrapping at both ends.
-    pub fn cycle(&mut self, delta: isize) {
-        if self.buffers.is_empty() {
-            return;
-        }
+    /// The tab `delta` along from the active one, wrapping at both ends.
+    pub fn cycled(&self, delta: isize) -> Option<usize> {
         let len = self.buffers.len() as isize;
-        self.active = ((self.active as isize + delta).rem_euclid(len)) as usize;
+        (len > 0).then(|| (self.active as isize + delta).rem_euclid(len) as usize)
     }
 
     /// Moves a tab while keeping the same document active.
@@ -427,10 +424,9 @@ mod tests {
         assert_eq!(d.len(), 3);
         assert_eq!(d.active_index(), 2);
 
-        d.cycle(1);
-        assert_eq!(d.active_index(), 0, "should wrap past the end");
-        d.cycle(-1);
-        assert_eq!(d.active_index(), 2, "should wrap past the start");
+        assert_eq!(d.cycled(1), Some(0), "should wrap past the end");
+        assert!(d.switch(0));
+        assert_eq!(d.cycled(-1), Some(2), "should wrap past the start");
 
         assert!(d.switch(1));
         assert_eq!(d.active_index(), 1);

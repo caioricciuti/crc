@@ -97,6 +97,17 @@ fn spawn_project_scan(
     rx
 }
 
+/// Makes `dir` the project: the sidebar, Source Control and the finder
+/// start over there, read on workers.
+fn set_project_root(state: &mut State, dir: &Path) {
+    state.tree.set_root(dir);
+    state.git = crate::platform::git_panel::Panel::new(dir.to_path_buf());
+    state.tree_version = 0;
+    state.tree_children_pending.clear();
+    state.finder = Finder::new();
+    state.project_index_rx = Some(spawn_project_index(dir.to_path_buf()));
+}
+
 /// Rereads the sidebar and the finder after the project changed on disk.
 /// A scan already running is outdated by the version bump.
 fn start_project_refresh(state: &mut State) {
@@ -4043,15 +4054,10 @@ impl EditorView {
 
     /// The tab `step` along, round from the last to the first.
     fn cycle_tab(&self, step: isize) {
-        {
-            let Some(mut state) = self.state_mut() else {
-                return;
-            };
-            state.docs.cycle(step);
-            reveal_active_tab(&mut state);
-        }
-        self.sync_title();
-        self.reparse();
+        let Some(index) = self.state().and_then(|state| state.docs.cycled(step)) else {
+            return;
+        };
+        self.activate_tab(index);
         self.request_redraw();
         self.pump();
     }
@@ -4887,9 +4893,7 @@ impl EditorView {
                 && dir.is_dir()
                 && !too_broad_to_adopt(dir)
             {
-                state.tree.set_root(dir);
-                state.git = crate::platform::git_panel::Panel::new(dir.to_path_buf());
-                state.project_index_rx = Some(spawn_project_index(dir.to_path_buf()));
+                set_project_root(&mut state, dir);
                 adopted_folder = true;
             }
         }
@@ -7799,14 +7803,9 @@ impl EditorView {
         let Some(mut state) = self.state_mut() else {
             return;
         };
-        state.tree.set_root(path);
+        set_project_root(&mut state, Path::new(path));
         let recent = std::mem::take(&mut state.recent_projects);
         state.recent_projects = with_recent(recent, state.tree.root());
-        state.git = crate::platform::git_panel::Panel::new(path.into());
-        state.tree_version = 0;
-        state.tree_children_pending.clear();
-        state.finder = Finder::new();
-        state.project_index_rx = Some(spawn_project_index(path.into()));
         state.sidebar = true;
         // A project is open now, which is worth coming back to.
         state.ephemeral_session = false;
@@ -12679,12 +12678,8 @@ impl EditorView {
                 let band = match drag.over {
                     Some(index) => Viewport {
                         x: rect.x + 4.0,
-                        y: rect.y
-                            + layout::SIDEBAR_HEADER_HEIGHT
-                            + (index.saturating_sub(tree.scroll)) as f32
-                                * layout::SIDEBAR_ROW_HEIGHT,
                         width: (rect.width - 8.0).max(0.0),
-                        height: layout::SIDEBAR_ROW_HEIGHT,
+                        ..layout::sidebar_row_rect(rect, index.saturating_sub(tree.scroll))
                     },
                     // The project root: the whole column below the tree.
                     None => Viewport {
@@ -14026,14 +14021,7 @@ fn frame_of(state: &mut State) -> Frame {
                 };
                 frame.push(
                     Hit::SidebarRow(index),
-                    Viewport {
-                        x: rect.x,
-                        y: rect.y
-                            + layout::SIDEBAR_HEADER_HEIGHT
-                            + (visible - first) as f32 * layout::SIDEBAR_ROW_HEIGHT,
-                        width: rect.width,
-                        height: layout::SIDEBAR_ROW_HEIGHT,
-                    },
+                    layout::sidebar_row_rect(rect, visible - first),
                 );
             }
         }
