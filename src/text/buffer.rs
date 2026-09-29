@@ -800,12 +800,15 @@ impl Buffer {
         }
 
         file_format::validate(&self.rope, &self.format)?;
-        self.follow_mixed_endings();
+        // The format this text is written with. It replaces `self.format`
+        // only once the write landed: until then the endings stay numbered
+        // by the saved text's lines, which a rollback and the next save need.
+        let format = self.format_for_save();
         let in_place = existing.as_ref().is_some_and(|m| m.nlink() > 1);
         let atomic = if in_place {
             None
         } else {
-            Some(self.write_replacing(&target, existing.is_some()))
+            Some(self.write_replacing(&target, existing.is_some(), &format))
         };
         match atomic {
             Some(Ok(())) => {}
@@ -814,13 +817,14 @@ impl Buffer {
             Some(Err(e))
                 if e.kind() == std::io::ErrorKind::PermissionDenied && existing.is_some() =>
             {
-                self.write_in_place(&target)?;
+                self.write_in_place(&target, &format)?;
             }
             Some(Err(e)) => return Err(e),
             // Rename would silently detach the other names from this file.
             // Writing the same inode preserves its links, ACLs and xattrs.
-            None => self.write_in_place(&target)?,
+            None => self.write_in_place(&target, &format)?,
         }
+        self.format = format;
         self.stamp = DiskStamp::of(&target).ok();
         self.conflict_noticed = false;
         self.path = Some(crate::platform::canonical(&target));
@@ -829,18 +833,21 @@ impl Buffer {
         Ok(())
     }
 
-    /// A file with mixed line endings keeps one per newline, by position.
-    /// Lines added or removed since the last save shift those positions, so
-    /// before writing, each line that is still there takes the ending it
-    /// had, and each new one the file's usual ending.
-    fn follow_mixed_endings(&mut self) {
+    /// The format to write the text with. A file with mixed line endings
+    /// keeps one per newline, by position. Lines added or removed since the
+    /// last save shift those positions, so each line that is still there
+    /// takes the ending it had, and each new one the file's usual ending.
+    fn format_for_save(&self) -> DiskFormat {
+        let mut format = self.format.clone();
         let preferred = self.format.preferred;
         if self.format.endings.iter().all(|e| *e == preferred) {
-            return;
+            return format;
         }
-        let Some(saved) = &self.saved else { return };
+        let Some(saved) = &self.saved else {
+            return format;
+        };
         if saved.same_as(&self.rope) {
-            return;
+            return format;
         }
         let (old, new) = (saved.to_string(), self.rope.to_string());
         let mut endings = vec![preferred; new.bytes().filter(|b| *b == b'\n').count()];
@@ -850,16 +857,17 @@ impl Buffer {
                 *slot = *ending;
             }
         }
-        self.format.endings = endings;
+        format.endings = endings;
+        format
     }
 
     /// Writes over the file's own bytes. Nothing is truncated before the new
     /// text is all written, and a write that fails half-way puts the old
     /// text back, when it is known.
-    fn write_in_place(&self, target: &std::path::Path) -> std::io::Result<()> {
+    fn write_in_place(&self, target: &std::path::Path, format: &DiskFormat) -> std::io::Result<()> {
         use std::os::unix::fs::FileExt;
         let mut new = Vec::new();
-        file_format::write(&mut new, &self.rope, &self.format)?;
+        file_format::write(&mut new, &self.rope, format)?;
         let mut old = None;
         if let Some(saved) = &self.saved
             && self.path.as_deref() == Some(target)
@@ -883,7 +891,12 @@ impl Buffer {
     }
 
     /// Writes a temporary file next to `target` and renames it over.
-    fn write_replacing(&self, target: &std::path::Path, existing: bool) -> std::io::Result<()> {
+    fn write_replacing(
+        &self,
+        target: &std::path::Path,
+        existing: bool,
+        format: &DiskFormat,
+    ) -> std::io::Result<()> {
         {
             let parent = target.parent().ok_or_else(|| {
                 std::io::Error::new(
@@ -918,7 +931,7 @@ impl Buffer {
                 )
             })?;
             let result: std::io::Result<()> = (|| {
-                file_format::write(&mut file, &self.rope, &self.format)?;
+                file_format::write(&mut file, &self.rope, format)?;
                 if existing {
                     copy_metadata(target, &file)?;
                     // COPYFILE_STAT also copies the old modification time.
@@ -4260,6 +4273,30 @@ mod tests {
         // Each old line keeps its ending; the new one takes the usual one
         // (a tie here, so LF).
         assert_eq!(std::fs::read(&path).unwrap(), b"a\r\nX\nb\nc\r\nd\n");
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn a_failed_save_leaves_the_mixed_endings_where_they_were() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("mixed-failed");
+        let path = dir.join("mixed.txt");
+        std::fs::write(&path, "a\r\nb\r\nc\n").expect("write");
+        let mut b = Buffer::open(&path).expect("open");
+        b.place_cursor(0, Move);
+        b.insert("x\n");
+        // Neither a replacement beside it nor a write in place can land.
+        let mode = |p: &std::path::Path, m: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).expect("chmod")
+        };
+        mode(&path, 0o444);
+        mode(&dir, 0o555);
+        assert!(b.save(None).is_err(), "the save should fail");
+        assert_eq!(std::fs::read(&path).unwrap(), b"a\r\nb\r\nc\n", "untouched");
+        mode(&dir, 0o755);
+        mode(&path, 0o644);
+        b.save(None).expect("save");
+        assert_eq!(std::fs::read(&path).unwrap(), b"x\r\na\r\nb\r\nc\n");
         std::fs::remove_dir_all(dir).expect("cleanup");
     }
 
