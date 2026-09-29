@@ -26,6 +26,15 @@ scripts/check-third-party.sh
 scripts/check-build-scripts.sh
 ```
 
+The suite is the scenarios in `scripts/selftest/`, run in order. While
+working on one feature, name the scenarios to run only those (a word in
+the file name, such as `terminal` or `30-merge`); run the whole suite
+before sending the change:
+
+```sh
+scripts/selftest.sh terminal merge
+```
+
 For changes that send Objective-C messages (`msg_send!`, blocks, a new
 AppKit or WebKit call), run the suite once against a debug build too.
 Release builds skip objc2's type checks, so a wrong argument or return
