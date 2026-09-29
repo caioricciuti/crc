@@ -5426,21 +5426,16 @@ impl EditorView {
         }
     }
 
-    /// Saves, falling back to a Save As panel when there is no path yet.
-    /// Returns whether the file actually reached disk.
-    fn save(&self, force_panel: bool) -> bool {
-        let Some(untitled) = self.state().map(|state| state.docs.active().path.is_none()) else {
-            return false;
-        };
-        let needs_panel = force_panel || untitled;
-
-        let chosen = if needs_panel {
+    /// Where a save goes: `Some(None)` to the document's own file,
+    /// `Some(Some(path))` where the save panel said, `None` when it was
+    /// cancelled. The panel shows for Save As and for an untitled document.
+    fn choose_save_path(&self, force_panel: bool) -> Option<Option<std::path::PathBuf>> {
+        let untitled = self.state()?.docs.active().path.is_none();
+        if force_panel || untitled {
             let mtm = MainThreadMarker::from(self);
             let panel = NSSavePanel::savePanel(mtm);
             let suggested = {
-                let Some(state) = self.state() else {
-                    return false;
-                };
+                let state = self.state()?;
                 state
                     .docs
                     .active()
@@ -5452,17 +5447,60 @@ impl EditorView {
             };
             panel.setNameFieldStringValue(&NSString::from_str(&suggested));
             if panel.runModal() != MODAL_RESPONSE_OK {
-                return false;
+                return None;
             }
-            let Some(url) = panel.URL() else {
-                return false;
-            };
-            let Some(path) = url.path() else {
-                return false;
-            };
-            Some(std::path::PathBuf::from(path.to_string()))
+            let path = panel.URL()?.path()?;
+            Some(Some(std::path::PathBuf::from(path.to_string())))
         } else {
-            None
+            Some(None)
+        }
+    }
+
+    /// What follows a save: settings and ignore rules re-read when the file
+    /// was one of those, the servers told, and format or organize on save.
+    fn after_saved(&self, saved_path: Option<std::path::PathBuf>, ok: bool) {
+        if saved_path.is_some() && saved_path == crate::platform::settings::Settings::path() {
+            self.apply_settings_file();
+        }
+        // The watcher ignores this process's own writes, so a .gitignore
+        // saved here would otherwise leave the Explorer showing the old rules.
+        if saved_path.as_deref().is_some_and(changes_ignore_rules) {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            if let Some(root) = state.tree.root().map(Path::to_path_buf) {
+                state.ignored_rx = Some(spawn_ignored(root));
+            }
+        }
+        if ok {
+            self.resume_display_link();
+        }
+        if let Some(path) = saved_path {
+            self.lsp_flush_changes();
+            self.lsp_sync_open();
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            for server in state.lsp.values_mut() {
+                server.did_save(&path);
+            }
+            // Saved first, formatted after: a server that never answers
+            // cannot hold a save hostage. The formatted text is saved again.
+            let format = state.format_on_save && !state.saving_formatted;
+            let organize = state.organize_on_save && !state.saving_formatted;
+            drop(state);
+            // Organize first; it goes on to format once its edits are in.
+            if !(organize && self.organize_imports(true)) && format {
+                self.format_document(true);
+            }
+        }
+    }
+
+    /// Saves, falling back to a Save As panel when there is no path yet.
+    /// Returns whether the file actually reached disk.
+    fn save(&self, force_panel: bool) -> bool {
+        let Some(chosen) = self.choose_save_path(force_panel) else {
+            return false;
         };
 
         let Some(mut state) = self.state_mut() else {
@@ -5542,41 +5580,7 @@ impl EditorView {
         }
         let saved_path = ok.then(|| state.docs.active().path.clone()).flatten();
         drop(state);
-        if saved_path.is_some() && saved_path == crate::platform::settings::Settings::path() {
-            self.apply_settings_file();
-        }
-        // The watcher ignores this process's own writes, so a .gitignore
-        // saved here would otherwise leave the Explorer showing the old rules.
-        if saved_path.as_deref().is_some_and(changes_ignore_rules) {
-            let Some(mut state) = self.state_mut() else {
-                return false;
-            };
-            if let Some(root) = state.tree.root().map(Path::to_path_buf) {
-                state.ignored_rx = Some(spawn_ignored(root));
-            }
-        }
-        if ok {
-            self.resume_display_link();
-        }
-        if let Some(path) = saved_path {
-            self.lsp_flush_changes();
-            self.lsp_sync_open();
-            let Some(mut state) = self.state_mut() else {
-                return false;
-            };
-            for server in state.lsp.values_mut() {
-                server.did_save(&path);
-            }
-            // Saved first, formatted after: a server that never answers
-            // cannot hold a save hostage. The formatted text is saved again.
-            let format = state.format_on_save && !state.saving_formatted;
-            let organize = state.organize_on_save && !state.saving_formatted;
-            drop(state);
-            // Organize first; it goes on to format once its edits are in.
-            if !(organize && self.organize_imports(true)) && format {
-                self.format_document(true);
-            }
-        }
+        self.after_saved(saved_path, ok);
         self.sync_title();
         ok
     }
@@ -5815,37 +5819,10 @@ impl EditorView {
                 &mut bar.query
             };
             match code {
-                key::LEFT => {
-                    if flags.contains(NSEventModifierFlags::Option) {
-                        field.move_word_left(motion)
-                    } else {
-                        field.move_left(motion)
-                    }
-                }
-                key::RIGHT => {
-                    if flags.contains(NSEventModifierFlags::Option) {
-                        field.move_word_right(motion)
-                    } else {
-                        field.move_right(motion)
-                    }
-                }
-                key::HOME | key::UP => field.move_line_start(motion),
-                key::END | key::DOWN => field.move_line_end(motion),
-                key::DELETE => {
-                    if flags.contains(NSEventModifierFlags::Option) {
-                        field.delete_word_backward()
-                    } else {
-                        field.backspace()
-                    }
-                }
-                key::FORWARD_DELETE => {
-                    if flags.contains(NSEventModifierFlags::Option) {
-                        field.delete_word_forward()
-                    } else {
-                        field.delete_forward()
-                    }
-                }
-                _ => as_text = true,
+                // One line: Up and Down go to its ends.
+                key::UP => field.move_line_start(motion),
+                key::DOWN => field.move_line_end(motion),
+                _ => as_text = !field_key(field, code, flags),
             }
             if as_text {
                 // The borrow has to end before the input system is asked,
@@ -6000,12 +5977,12 @@ impl EditorView {
                     .active_mut()
                     .scroll_to_cursor(rows, cols);
             }
-            key::DELETE => {
+            key::DELETE | key::FORWARD_DELETE | key::LEFT | key::RIGHT | key::HOME | key::END => {
                 let Some(mut state) = self.state_mut() else {
                     return false;
                 };
                 if let Some(b) = &mut state.goto {
-                    b.backspace();
+                    field_key(b, code, event.modifierFlags());
                 }
             }
             // Text, through the input system like everywhere else.
@@ -6351,24 +6328,9 @@ impl EditorView {
         let Some(mut state) = self.state_mut() else {
             return false;
         };
-        let motion = if flags.contains(NSEventModifierFlags::Shift) {
-            Motion::Extend
-        } else {
-            Motion::Move
-        };
-        let option = flags.contains(NSEventModifierFlags::Option);
         match event.keyCode() {
-            key::DELETE => {
-                if option && state.git.message.selection().is_none() {
-                    state.git.message.move_word_left(Motion::Extend);
-                }
-                state.git.message.backspace();
-            }
-            key::LEFT if option => state.git.message.move_word_left(motion),
-            key::RIGHT if option => state.git.message.move_word_right(motion),
-            key::LEFT => state.git.message.move_left(motion),
-            key::RIGHT => state.git.message.move_right(motion),
             key::RETURN | key::TAB => return true,
+            code if field_key(&mut state.git.message, code, flags) => {}
             _ => {
                 drop(state);
                 return self.interpret(event);
@@ -6659,28 +6621,15 @@ impl EditorView {
             // did the same. A query field is a text field; the standard
             // editing combinations have to reach it.
             let option = flags.contains(NSEventModifierFlags::Option);
-            let motion = if flags.contains(NSEventModifierFlags::Shift) {
-                Motion::Extend
-            } else {
-                Motion::Move
-            };
             match code {
-                key::DELETE => {
+                key::DELETE if flags.contains(NSEventModifierFlags::Control) && !option => {
                     if query.selection().is_none() {
-                        if option {
-                            query.move_word_left(Motion::Extend);
-                        } else if flags.contains(NSEventModifierFlags::Control) {
-                            query.select_all();
-                        }
+                        query.select_all();
                     }
                     query.backspace();
                 }
-                key::LEFT if option => query.move_word_left(motion),
-                key::RIGHT if option => query.move_word_right(motion),
-                key::LEFT => query.move_left(motion),
-                key::RIGHT => query.move_right(motion),
                 key::TAB => return true,
-                _ => as_text = true,
+                _ => as_text = !field_key(query, code, flags),
             }
             if as_text {
                 drop(state);
@@ -8724,26 +8673,12 @@ impl EditorView {
                     Instant::now(),
                 ));
             }
-            key::DELETE => {
+            key::DELETE | key::FORWARD_DELETE | key::LEFT | key::RIGHT | key::HOME | key::END => {
                 let Some(mut state) = self.state_mut() else {
                     return false;
                 };
                 if let Some(rename) = &mut state.rename {
-                    rename.field.backspace();
-                }
-            }
-            key::LEFT | key::RIGHT => {
-                let shift = event.modifierFlags().contains(NSEventModifierFlags::Shift);
-                let motion = if shift { Motion::Extend } else { Motion::Move };
-                let Some(mut state) = self.state_mut() else {
-                    return false;
-                };
-                if let Some(rename) = &mut state.rename {
-                    if code == key::LEFT {
-                        rename.field.move_left(motion);
-                    } else {
-                        rename.field.move_right(motion);
-                    }
+                    field_key(&mut rename.field, code, event.modifierFlags());
                 }
             }
             _ => return self.interpret(event),
@@ -13678,6 +13613,33 @@ fn context_tab_path(state: &State) -> Option<std::path::PathBuf> {
         .and_then(|b| b.path.clone())
 }
 
+/// The editing keys every one-line field takes, as a text field does:
+/// Left and Right (by word with Option), Home and End, Delete and Forward
+/// Delete (by word with Option), Shift extending the selection. Whether
+/// `code` was one of them.
+fn field_key(field: &mut Buffer, code: u16, flags: NSEventModifierFlags) -> bool {
+    let option = flags.contains(NSEventModifierFlags::Option);
+    let motion = if flags.contains(NSEventModifierFlags::Shift) {
+        Motion::Extend
+    } else {
+        Motion::Move
+    };
+    match code {
+        key::LEFT if option => field.move_word_left(motion),
+        key::RIGHT if option => field.move_word_right(motion),
+        key::LEFT => field.move_left(motion),
+        key::RIGHT => field.move_right(motion),
+        key::HOME => field.move_line_start(motion),
+        key::END => field.move_line_end(motion),
+        key::DELETE if option => field.delete_word_backward(),
+        key::DELETE => field.backspace(),
+        key::FORWARD_DELETE if option => field.delete_word_forward(),
+        key::FORWARD_DELETE => field.delete_forward(),
+        _ => return false,
+    }
+    true
+}
+
 /// The find and replace fields' text inset inside their boxes.
 const FIND_FIELD_PAD: f32 = 10.0;
 
@@ -15320,6 +15282,26 @@ mod tests {
         spawn_project_refresh, typed_text,
     };
     use std::time::Duration;
+
+    #[test]
+    fn one_line_fields_share_the_editing_keys() {
+        use super::{field_key, key};
+        use crate::text::buffer::Buffer;
+        use objc2_app_kit::NSEventModifierFlags as F;
+        let mut field = Buffer::from_text("alpha beta gamma");
+        assert!(field_key(&mut field, key::END, F::empty()));
+        assert_eq!(field.cursor(), 16);
+        assert!(field_key(&mut field, key::LEFT, F::Option));
+        assert_eq!(field.cursor(), 11, "a word back");
+        assert!(field_key(&mut field, key::FORWARD_DELETE, F::Option));
+        assert_eq!(field.rope.to_string(), "alpha beta ");
+        assert!(field_key(&mut field, key::HOME, F::Shift));
+        assert_eq!(field.selected_text().as_deref(), Some("alpha beta "));
+        assert!(
+            !field_key(&mut field, key::RETURN, F::empty()),
+            "not an editing key"
+        );
+    }
 
     #[test]
     fn rename_selects_the_stem_in_bytes() {
