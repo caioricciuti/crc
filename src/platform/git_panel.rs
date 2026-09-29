@@ -745,16 +745,16 @@ impl Panel {
     pub fn scroll(&mut self, delta: isize, over_list: bool, g: Sidebar, diff: Viewport) {
         if over_list {
             let visible = self.rows(g).len();
-            self.list_scroll = self
-                .list_scroll
-                .saturating_add_signed(delta)
-                .min(self.entries().len().saturating_sub(visible.max(1)));
+            self.list_scroll = layout::scroll_clamped(
+                self.list_scroll,
+                delta,
+                self.entries().len(),
+                visible.max(1),
+            );
         } else {
             let visible = (diff.height / DIFF_LINE).max(1.0) as usize;
-            self.diff_scroll = self
-                .diff_scroll
-                .saturating_add_signed(delta)
-                .min(self.diff.lines.len().saturating_sub(visible));
+            self.diff_scroll =
+                layout::scroll_clamped(self.diff_scroll, delta, self.diff.lines.len(), visible);
         }
     }
 
@@ -1214,15 +1214,7 @@ pub fn draw_diff_lines(
             colour,
         );
         // Code stays monospace, so a diff lines up the way the file does.
-        let mut width = 0;
-        let shown: String = line
-            .text
-            .chars()
-            .take_while(|ch| {
-                width += crate::render::font::display_width(*ch);
-                width <= columns
-            })
-            .collect();
+        let shown = crate::text::columns::fit_columns(line.text.chars(), columns);
         layout::push_text(
             out,
             atlas,

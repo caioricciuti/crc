@@ -15,6 +15,17 @@ pub fn is_icon(ch: char) -> bool {
     matches!(ch as u32, 0xE000..=0xF8FF | 0xF_0000..=0xF_FFFD)
 }
 
+/// The leading characters of `chars` that fit in `columns` cells.
+pub fn fit_columns(chars: impl Iterator<Item = char>, columns: usize) -> String {
+    let mut width = 0;
+    chars
+        .take_while(|&ch| {
+            width += display_width(ch);
+            width <= columns
+        })
+        .collect()
+}
+
 /// Fallback cell width; intentionally preserves the character renderer policy.
 pub fn display_width(ch: char) -> usize {
     let c = ch as u32;

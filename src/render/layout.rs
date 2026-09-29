@@ -2232,6 +2232,14 @@ pub fn palette_visible_rows(rect: Viewport) -> usize {
     ((rect.height - PALETTE_HEADER - PALETTE_FOOTER).max(0.0) / PALETTE_ROW) as usize
 }
 
+/// `scroll` moved by `delta` rows, kept where the last of `len` rows can
+/// still fill `visible` of them.
+pub fn scroll_clamped(scroll: usize, delta: isize, len: usize, visible: usize) -> usize {
+    scroll
+        .saturating_add_signed(delta)
+        .min(len.saturating_sub(visible))
+}
+
 /// The last first row that still fills the list.
 pub fn palette_max_scroll(count: usize, visible: usize) -> usize {
     count.saturating_sub(visible)

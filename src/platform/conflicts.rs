@@ -893,17 +893,13 @@ pub fn draw_side(
                 );
             }
             let columns_fit = ((column.width - SIDE_GUTTER - 8.0).max(0.0) / cell_w) as usize;
-            let mut width = 0;
-            let text: String = rope
-                .line(cell.line)
-                .trim_end_matches(['\n', '\r'])
-                .chars()
-                .flat_map(|ch| if ch == '\t' { vec![' '; 4] } else { vec![ch] })
-                .take_while(|ch| {
-                    width += crate::render::font::display_width(*ch);
-                    width <= columns_fit
-                })
-                .collect();
+            let text = crate::text::columns::fit_columns(
+                rope.line(cell.line)
+                    .trim_end_matches(['\n', '\r'])
+                    .chars()
+                    .flat_map(|ch| if ch == '\t' { vec![' '; 4] } else { vec![ch] }),
+                columns_fit,
+            );
             layout::push_text(
                 out,
                 atlas,

@@ -42,8 +42,7 @@ impl Review {
     /// Scrolls by `delta` lines, keeping the last line reachable.
     pub fn scroll_by(&mut self, delta: isize, rect: Viewport) {
         let visible = (rect.height / DIFF_LINE).max(1.0) as usize;
-        let last = self.diff.lines.len().saturating_sub(visible);
-        self.scroll = self.scroll.saturating_add_signed(delta).min(last);
+        self.scroll = layout::scroll_clamped(self.scroll, delta, self.diff.lines.len(), visible);
     }
 }
 

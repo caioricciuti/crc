@@ -3724,10 +3724,8 @@ impl EditorView {
             let tabs = state.tab_scroll_carry.trunc() as isize;
             state.tab_scroll_carry -= tabs as f64;
             if tabs != 0 {
-                state.tab_scroll = state
-                    .tab_scroll
-                    .saturating_add_signed(tabs)
-                    .min(state.docs.len().saturating_sub(1));
+                state.tab_scroll =
+                    layout::scroll_clamped(state.tab_scroll, tabs, state.docs.len(), 1);
                 drop(state);
                 self.request_redraw();
                 self.pump();
@@ -6513,11 +6511,7 @@ impl EditorView {
         let rows = state.palette_scroll_carry.trunc() as isize;
         state.palette_scroll_carry -= rows as f64;
         let max = layout::palette_max_scroll(count, visible);
-        let scroll = state
-            .palette_scroll
-            .min(max)
-            .saturating_add_signed(rows)
-            .min(max);
+        let scroll = layout::scroll_clamped(state.palette_scroll.min(max), rows, count, visible);
         if scroll != state.palette_scroll {
             state.palette_scroll = scroll;
             drop(state);
