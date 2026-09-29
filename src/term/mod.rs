@@ -114,6 +114,25 @@ pub struct Modes {
     pub sync: bool,
 }
 
+impl Modes {
+    /// The flag private mode `n` switches. The alternate screen (47, 1047,
+    /// 1049) is not a flag here: switching it moves the screens.
+    fn flag(&mut self, n: usize) -> Option<&mut bool> {
+        Some(match n {
+            1 => &mut self.app_cursor,
+            6 => &mut self.origin,
+            7 => &mut self.autowrap,
+            25 => &mut self.cursor_visible,
+            1000 | 1002 | 1003 => &mut self.mouse,
+            1004 => &mut self.focus_events,
+            1006 => &mut self.sgr_mouse,
+            2004 => &mut self.bracketed_paste,
+            2026 => &mut self.sync,
+            _ => return None,
+        })
+    }
+}
+
 pub struct Term {
     cols: usize,
     rows: usize,
@@ -760,39 +779,28 @@ impl Term {
     }
 
     fn private_mode(&self, mode: usize) -> Option<bool> {
-        Some(match mode {
-            1 => self.modes.app_cursor,
-            6 => self.modes.origin,
-            7 => self.modes.autowrap,
-            25 => self.modes.cursor_visible,
-            47 | 1047 | 1049 => self.alternate,
-            1000 | 1002 | 1003 => self.modes.mouse,
-            1004 => self.modes.focus_events,
-            1006 => self.modes.sgr_mouse,
-            2004 => self.modes.bracketed_paste,
-            2026 => self.modes.sync,
-            _ => return None,
-        })
+        match mode {
+            47 | 1047 | 1049 => Some(self.alternate),
+            _ => {
+                let mut modes = self.modes;
+                modes.flag(mode).copied()
+            }
+        }
     }
 
     fn set_private_modes(&mut self, on: bool) {
         for i in 0..self.params.len() {
             match self.param(i, 0) {
-                1 => self.modes.app_cursor = on,
-                6 => {
-                    self.modes.origin = on;
-                    self.goto(0, 0);
-                }
-                7 => self.modes.autowrap = on,
-                25 => self.modes.cursor_visible = on,
                 47 | 1047 => self.switch_screen(on, false),
                 1049 => self.switch_screen(on, true),
-                1000 | 1002 | 1003 => self.modes.mouse = on,
-                1004 => self.modes.focus_events = on,
-                1006 => self.modes.sgr_mouse = on,
-                2004 => self.modes.bracketed_paste = on,
-                2026 => self.modes.sync = on,
-                _ => {}
+                n => {
+                    if let Some(flag) = self.modes.flag(n) {
+                        *flag = on;
+                    }
+                    if n == 6 {
+                        self.goto(0, 0);
+                    }
+                }
             }
         }
     }
@@ -1402,6 +1410,22 @@ mod tests {
         );
         assert!(t.take_replies().is_empty());
         assert!(t.modes.bracketed_paste);
+    }
+
+    #[test]
+    fn every_private_mode_reports_what_was_set() {
+        for mode in [
+            1, 6, 7, 25, 47, 1047, 1049, 1000, 1002, 1003, 1004, 1006, 2004, 2026,
+        ] {
+            let mut t = term(&format!(
+                "\x1b[?{mode}h\x1b[?{mode}$p\x1b[?{mode}l\x1b[?{mode}$p"
+            ));
+            assert_eq!(
+                String::from_utf8(t.take_replies()).unwrap(),
+                format!("\x1b[?{mode};1$y\x1b[?{mode};2$y"),
+                "mode {mode}"
+            );
+        }
     }
 
     #[test]

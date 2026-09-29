@@ -380,12 +380,23 @@ pub fn compact(value: &Value) -> String {
     out
 }
 
-fn write_compact(value: &Value, out: &mut String) {
+/// Writes `value` when it is not a container, the same in either layout.
+fn write_scalar(value: &Value, out: &mut String) -> bool {
     match value {
         Value::Null => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         Value::Number(n) => out.push_str(n),
         Value::String(s) => write_string(s, out),
+        Value::Array(_) | Value::Object(_) => return false,
+    }
+    true
+}
+
+fn write_compact(value: &Value, out: &mut String) {
+    if write_scalar(value, out) {
+        return;
+    }
+    match value {
         Value::Array(items) => {
             out.push('[');
             for (i, item) in items.iter().enumerate() {
@@ -408,6 +419,7 @@ fn write_compact(value: &Value, out: &mut String) {
             }
             out.push('}');
         }
+        _ => {}
     }
 }
 
@@ -425,11 +437,10 @@ fn write_pretty(value: &Value, depth: usize, out: &mut String) {
             out.push_str("  ");
         }
     };
+    if write_scalar(value, out) {
+        return;
+    }
     match value {
-        Value::Null => out.push_str("null"),
-        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        Value::Number(n) => out.push_str(n),
-        Value::String(s) => write_string(s, out),
         Value::Array(items) if items.is_empty() => out.push_str("[]"),
         Value::Array(items) => {
             out.push_str("[\n");
@@ -454,6 +465,7 @@ fn write_pretty(value: &Value, depth: usize, out: &mut String) {
             indent(out, depth);
             out.push('}');
         }
+        _ => {}
     }
 }
 
