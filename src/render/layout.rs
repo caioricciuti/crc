@@ -1181,6 +1181,36 @@ pub fn build_text_appending(
             }
         }
 
+        // One band over `from..to` of this row, clipped to the text area:
+        // `extend` more at its end (half a cell marks a selected newline).
+        let right_edge = viewport.x + viewport.width;
+        let band = |out: &mut Vec<GlyphInstance>, from: usize, to: usize, extend: f32, color| {
+            let intervals = if let Some(shaped) = &shaped_line {
+                shaped.selection_intervals(
+                    from - line_start,
+                    to - line_start,
+                    scroll_x..scroll_x + right_edge - text_x,
+                    extend,
+                )
+            } else {
+                vec![(offset_at(from), offset_at(to) + extend)]
+            };
+            for (left, right) in intervals {
+                let x0 = text_x + left.min(right) - scroll_x;
+                let clipped = x0.max(text_x);
+                let width = (right - left).abs() - (clipped - x0);
+                if width > 0.0 && clipped < right_edge {
+                    out.push(GlyphInstance {
+                        pos: [clipped, y],
+                        size: [width.min(right_edge - clipped), m.line_height],
+                        uv: solid,
+                        color,
+                        ..Default::default()
+                    });
+                }
+            }
+        };
+
         // Selection bands for this row, also behind the text.
         // The last row of a line ends past its newline; the newline is the
         // byte before `line_end`, and the last line of the file has none.
@@ -1207,43 +1237,12 @@ pub fn build_text_appending(
                 }
             }
             if from < to {
-                let intervals = if let Some(shaped) = &shaped_line {
-                    let extend = if newline_selected {
-                        m.advance * 0.5
-                    } else {
-                        0.0
-                    };
-                    shaped.selection_intervals(
-                        from - line_start,
-                        to - line_start,
-                        scroll_x..scroll_x + viewport.x + viewport.width - text_x,
-                        extend,
-                    )
+                let extend = if newline_selected {
+                    m.advance * 0.5
                 } else {
-                    vec![(offset_at(from), offset_at(to))]
+                    0.0
                 };
-                let interval_count = intervals.len();
-                for (index, (left, right)) in intervals.into_iter().enumerate() {
-                    let x0 = text_x + left.min(right) - scroll_x;
-                    let mut width = (right - left).abs();
-                    if shaped_line.is_none() && newline_selected && index + 1 == interval_count {
-                        width += m.advance * 0.5;
-                    }
-                    let clipped = x0.max(text_x);
-                    let width = width - (clipped - x0);
-                    if width > 0.0 && clipped < viewport.x + viewport.width {
-                        out.push(GlyphInstance {
-                            pos: [clipped, y],
-                            size: [
-                                width.min(viewport.x + viewport.width - clipped),
-                                m.line_height,
-                            ],
-                            uv: solid,
-                            color: theme.selection,
-                            ..Default::default()
-                        });
-                    }
-                }
+                band(out, from, to, extend, theme.selection);
             }
         }
 
@@ -1254,36 +1253,13 @@ pub fn build_text_appending(
                 if end <= row_start || at >= row_end {
                     continue;
                 }
-                let from = at.max(row_start);
-                let to = end.min(row_end);
-                let intervals = if let Some(shaped) = &shaped_line {
-                    shaped.selection_intervals(
-                        from - line_start,
-                        to - line_start,
-                        scroll_x..scroll_x + viewport.x + viewport.width - text_x,
-                        0.0,
-                    )
-                } else {
-                    vec![(offset_at(from), offset_at(to))]
-                };
-                for (left, right) in intervals {
-                    let x0 = text_x + left.min(right) - scroll_x;
-                    let width = (right - left).abs();
-                    let clipped = x0.max(text_x);
-                    let width = width - (clipped - x0);
-                    if width > 0.0 && clipped < viewport.x + viewport.width {
-                        out.push(GlyphInstance {
-                            pos: [clipped, y],
-                            size: [
-                                width.min(viewport.x + viewport.width - clipped),
-                                m.line_height,
-                            ],
-                            uv: solid,
-                            color: theme.find_match,
-                            ..Default::default()
-                        });
-                    }
-                }
+                band(
+                    out,
+                    at.max(row_start),
+                    end.min(row_end),
+                    0.0,
+                    theme.find_match,
+                );
             }
         }
 

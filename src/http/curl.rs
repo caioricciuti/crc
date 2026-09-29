@@ -20,6 +20,27 @@ use std::time::Duration;
 /// first on PATH would be a surprise anyway.
 pub const CURL: &str = "/usr/bin/curl";
 
+/// curl set up for crc's own downloads (the update check, the extension
+/// registry): https only, redirects too, failing on an HTTP error, at most
+/// `max_bytes` and `seconds`. file:// only in tests and self-test runs.
+/// The caller adds headers and the URL.
+pub fn strict_get(max_bytes: u64, seconds: u32) -> Command {
+    let protocols = if cfg!(test) || std::env::var_os("CRC_SELFTEST").is_some() {
+        "=https,file"
+    } else {
+        "=https"
+    };
+    let mut command = Command::new(CURL);
+    command
+        .args(["--silent", "--show-error", "--fail", "--location"])
+        .args(["--max-time", &seconds.to_string()])
+        .args(["--max-filesize", &max_bytes.to_string()])
+        .args(["--proto", protocols, "--proto-redir", "=https"])
+        .arg("--user-agent")
+        .arg(format!("crc/{}", env!("CARGO_PKG_VERSION")));
+    command
+}
+
 /// How long a request may take end to end.
 pub const TIMEOUT: Duration = Duration::from_secs(30);
 

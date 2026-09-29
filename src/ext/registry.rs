@@ -34,18 +34,7 @@ fn base() -> String {
 }
 
 fn fetch(url: &str, max: u64) -> Result<Vec<u8>, String> {
-    // file:// only in a self-test run; everything real is https.
-    let protocols = if std::env::var_os("CRC_SELFTEST").is_some() {
-        "=https,file"
-    } else {
-        "=https"
-    };
-    let output = std::process::Command::new("/usr/bin/curl")
-        .args(["--silent", "--show-error", "--fail", "--location"])
-        .args(["--max-time", "30", "--max-filesize", &max.to_string()])
-        .args(["--proto", protocols, "--proto-redir", "=https"])
-        .arg("--user-agent")
-        .arg(format!("crc/{}", env!("CARGO_PKG_VERSION")))
+    let output = crate::http::curl::strict_get(max, 30)
         .arg(url)
         .output()
         .map_err(|e| format!("could not run curl: {e}"))?;

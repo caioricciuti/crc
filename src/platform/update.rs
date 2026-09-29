@@ -152,33 +152,10 @@ pub fn spawn() -> mpsc::Receiver<Outcome> {
 }
 
 fn fetch(url: &str) -> Outcome {
-    let output = std::process::Command::new("/usr/bin/curl")
-        .args([
-            "--silent",
-            "--show-error",
-            "--fail",
-            "--location",
-            "--max-time",
-            "10",
-        ])
-        // file:// only for tests and self-test runs; a release listing is
-        // https, and so is anywhere it redirects. It is a small JSON file.
-        .args([
-            "--proto",
-            if cfg!(test) || std::env::var_os("CRC_SELFTEST").is_some() {
-                "=https,file"
-            } else {
-                "=https"
-            },
-            "--proto-redir",
-            "=https",
-            "--max-filesize",
-            "4194304",
-        ])
+    // A release listing is a small JSON file.
+    let output = crate::http::curl::strict_get(4 << 20, 10)
         .arg("--header")
         .arg("Accept: application/vnd.github+json")
-        .arg("--user-agent")
-        .arg(format!("crc/{}", env!("CARGO_PKG_VERSION")))
         .arg(url)
         .output()
         .map_err(|e| format!("could not run curl: {e}"))?;

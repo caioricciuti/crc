@@ -111,6 +111,17 @@ pub fn process_alive(pid: u64) -> bool {
 /// a crash or a full disk leaves the old file rather than half of the new.
 pub fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
+    write_atomically_with(path, 0o666, |file| file.write_all(bytes))
+}
+
+/// [`write_atomically`], with the file created as `mode` (before the umask)
+/// and its contents written by `write`.
+pub fn write_atomically_with(
+    path: &std::path::Path,
+    mode: u32,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
     let name = path
         .file_name()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no file name"))?;
@@ -119,8 +130,13 @@ pub fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result
     tmp_name.push(format!(".{}.tmp", std::process::id()));
     let tmp = path.with_file_name(tmp_name);
     let result = (|| {
-        let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(bytes)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(mode)
+            .open(&tmp)?;
+        write(&mut file)?;
         file.sync_all()?;
         std::fs::rename(&tmp, path)
     })();

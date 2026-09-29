@@ -8,9 +8,9 @@
 //! by the user alone, written whole to a temporary name and renamed into
 //! place so a reader never sees half of it.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
 use crate::json::{self, Value};
@@ -53,24 +53,9 @@ impl Lock {
     /// Rewrites the folder list, as when another project is opened.
     pub fn update(&self, folders: &[PathBuf]) -> std::io::Result<()> {
         let body = json::compact(&contents(std::process::id(), folders, &self.token));
-        let temp = self
-            .path
-            .with_extension(format!("lock.{}.tmp", std::process::id()));
-        let _ = std::fs::remove_file(&temp);
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temp)?;
-        let written = file
-            .write_all(body.as_bytes())
-            .and_then(|()| file.sync_all());
-        drop(file);
-        if let Err(e) = written.and_then(|()| std::fs::rename(&temp, &self.path)) {
-            let _ = std::fs::remove_file(&temp);
-            return Err(e);
-        }
-        Ok(())
+        crate::platform::write_atomically_with(&self.path, 0o600, |file| {
+            file.write_all(body.as_bytes())
+        })
     }
 
     pub fn path(&self) -> &Path {
