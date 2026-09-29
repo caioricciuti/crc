@@ -139,7 +139,7 @@ pub fn rank(
     boosts: &[Boost],
     limit: usize,
 ) -> Vec<Candidate> {
-    let mut scored: Vec<(f32, Candidate)> = Vec::new();
+    let mut scored: Vec<(f32, Option<String>, Candidate)> = Vec::new();
     // Where each label already is in `scored`, and the boosts by text:
     // thousands of server items after a `.` made both lookups quadratic.
     let mut by_label: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -151,7 +151,7 @@ pub fn rank(
             .or_default()
             .push(boost);
     }
-    for mut candidate in candidates {
+    for candidate in candidates {
         if candidate.label == prefix || candidate.insert == prefix {
             continue;
         }
@@ -173,59 +173,60 @@ pub fn rank(
                     .cmp(&b.same_context)
                     .then(a.count.cmp(&b.count))
             });
+        // Why your history lifted it, put before the reason at the end.
+        let mut picked = None;
         if let Some(boost) = best {
             let recency = 0.5f32.powf(boost.age_days / 30.0);
             let lift = 0.25 * (1.0 + boost.count as f32).ln() * recency;
             score += if boost.same_context { lift * 2.0 } else { lift };
-            let picked = if boost.same_context && !boost.context.is_empty() {
+            picked = Some(if boost.same_context && !boost.context.is_empty() {
                 format!("you picked this {}× after `{}`", boost.count, boost.context)
             } else {
                 format!("you picked this {}× here", boost.count)
-            };
-            candidate.why = if candidate.why.is_empty() {
-                picked
-            } else {
-                format!("{picked} · {}", candidate.why)
-            };
+            });
         }
         match by_label
             .get(&candidate.label)
             .copied()
             .and_then(|at| scored.get_mut(at))
         {
-            Some((best, existing)) => {
+            Some((best, existing_picked, existing)) => {
                 // The most specific source speaks for the name: the server
                 // (which carries the edit), then a definition, then your
                 // history, then a plain word. Its icon and reason win; the
                 // score is the best either had.
                 if candidate.source < existing.source {
-                    if existing.why.starts_with("you picked")
-                        && !candidate.why.starts_with("you picked")
-                    {
-                        let picked = existing.why.split(" · ").next().unwrap_or("").to_owned();
-                        candidate.why = if candidate.why.is_empty() {
-                            picked
-                        } else {
-                            format!("{picked} · {}", candidate.why)
-                        };
-                    }
+                    *existing_picked = picked.or(existing_picked.take());
                     *existing = candidate;
                 }
                 *best = best.max(score);
             }
             None => {
                 by_label.insert(candidate.label.clone(), scored.len());
-                scored.push((score, candidate));
+                scored.push((score, picked, candidate));
             }
         }
     }
-    scored.sort_by(|(a, x), (b, y)| {
+    scored.sort_by(|(a, _, x), (b, _, y)| {
         b.total_cmp(a)
             .then(x.source.cmp(&y.source))
             .then(x.label.len().cmp(&y.label.len()))
             .then(x.label.cmp(&y.label))
     });
-    scored.into_iter().take(limit).map(|(_, c)| c).collect()
+    scored
+        .into_iter()
+        .take(limit)
+        .map(|(_, picked, mut c)| {
+            if let Some(picked) = picked {
+                c.why = if c.why.is_empty() {
+                    picked
+                } else {
+                    format!("{picked} · {}", c.why)
+                };
+            }
+            c
+        })
+        .collect()
 }
 
 /// Words of three characters or more in `text` that match `prefix`, with

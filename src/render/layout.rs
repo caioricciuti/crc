@@ -2798,6 +2798,34 @@ pub fn build_tab_bar(
     );
 }
 
+/// The first tab the strip shows: `requested`, unless the active tab would
+/// not fit from there (or is that tab), in which case as many tabs before
+/// the active one as fit in `width`.
+pub fn tab_strip_start(docs: &Documents, requested: usize, width: f32, advance: f32) -> usize {
+    let requested = requested.min(docs.len().saturating_sub(1));
+    let active = docs.active_index();
+    let fits_from = |start: usize, target: usize| {
+        let used: f32 = (start..=target)
+            .map(|index| tab_width(docs, index, advance))
+            .sum();
+        used <= width
+    };
+    if active >= requested && fits_from(requested, active) && requested != active {
+        return requested;
+    }
+    let mut start = active;
+    let mut used = tab_width(docs, active, advance);
+    while start > 0 {
+        let previous = tab_width(docs, start - 1, advance);
+        if used + previous > width {
+            break;
+        }
+        start -= 1;
+        used += previous;
+    }
+    start
+}
+
 /// [`build_tab_bar`] for a pane that may not have the keyboard: without it,
 /// the active tab shows no close cross, since Cmd-W would not close it.
 #[allow(clippy::too_many_arguments)]
@@ -2831,27 +2859,7 @@ pub fn build_tab_bar_in(
         ..Default::default()
     });
 
-    let requested = first.min(docs.len().saturating_sub(1));
-    let active = docs.active_index();
-    let fits_from = |start: usize, target: usize| {
-        let width: f32 = (start..=target)
-            .map(|index| tab_width(docs, index, m.advance))
-            .sum();
-        width <= viewport.width
-    };
-    let mut start = requested;
-    if active < start || !fits_from(start, active) || start == active {
-        start = active;
-        let mut used = tab_width(docs, active, m.advance);
-        while start > 0 {
-            let previous = tab_width(docs, start - 1, m.advance);
-            if used + previous > viewport.width {
-                break;
-            }
-            start -= 1;
-            used += previous;
-        }
-    }
+    let start = tab_strip_start(docs, first, viewport.width, m.advance);
 
     let mut x = viewport.x;
     let mut active_span: Option<(f32, f32)> = None;
@@ -6428,6 +6436,35 @@ mod tests {
         );
         assert!(hits.len() > 1, "overflow must not collapse to one tab");
         assert!(hits.iter().any(|hit| hit.index == active));
+    }
+
+    #[test]
+    fn the_strip_keeps_its_start_while_the_active_tab_shows() {
+        let tab = |index: usize| {
+            let mut buffer = Buffer::from_text("");
+            buffer.path = Some(format!("/tmp/caio-strip-{index}.md").into());
+            buffer
+        };
+        let mut docs = Documents::new(tab(0));
+        for index in 1..10 {
+            docs.add(tab(index));
+        }
+        assert_eq!(docs.len(), 10);
+        let advance = 8.0;
+        let one = tab_width(&docs, 0, advance);
+        docs.switch(4);
+        assert_eq!(
+            tab_strip_start(&docs, 2, one * 10.0, advance),
+            2,
+            "4 shows from 2"
+        );
+        assert_eq!(
+            tab_strip_start(&docs, 6, one * 10.0, advance),
+            0,
+            "4 is before 6"
+        );
+        // Room for three: the active tab and the two before it.
+        assert_eq!(tab_strip_start(&docs, 0, one * 3.0, advance), 2);
     }
 
     /// A tab that is not the active one still has to be closable, which means

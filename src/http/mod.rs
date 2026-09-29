@@ -131,10 +131,7 @@ fn parse_block(
         if trimmed.is_empty() {
             continue;
         }
-        if let Some(comment) = trimmed
-            .strip_prefix('#')
-            .or_else(|| trimmed.strip_prefix("//"))
-        {
+        if let Some(comment) = comment(trimmed) {
             let comment = comment.trim();
             if let Some(n) = comment.strip_prefix("@name") {
                 let n = n.trim().trim_start_matches('=').trim();
@@ -204,7 +201,7 @@ fn parse_block(
             break;
         }
         let trimmed = line.trim();
-        if trimmed.starts_with('#') || trimmed.starts_with("//") {
+        if comment(trimmed).is_some() {
             continue;
         }
         if let Some((k, v)) = trimmed.split_once(':') {
@@ -495,6 +492,13 @@ pub fn load_named_environment(
         )),
         _ => Ok(vars),
     }
+}
+
+/// The text of a `#` or `//` comment line, after the marker.
+fn comment(trimmed: &str) -> Option<&str> {
+    trimmed
+        .strip_prefix('#')
+        .or_else(|| trimmed.strip_prefix("//"))
 }
 
 /// A `Name: value` header line as its trimmed name and value; `None` for a

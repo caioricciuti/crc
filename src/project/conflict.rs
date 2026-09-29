@@ -147,19 +147,31 @@ fn marker(line: &str) -> Option<(Marker, &str)> {
 ///
 /// Cheap when there are none: one search for the opening marker, no copy of
 /// the text. Only the lines of a conflict are read one by one.
+/// A marker line: its number and its bytes, the line ending included.
+#[derive(Clone, Copy)]
+struct MarkerLine {
+    line: usize,
+    start: usize,
+    end: usize,
+}
+
 pub fn parse(rope: &Rope) -> Vec<Conflict> {
     let len = rope.len_bytes();
     let total = rope.len_lines();
     let mut out = Vec::new();
     let mut resume_line = 0;
-    let text_of = |line: usize| -> (String, usize, usize) {
-        let start = rope.line_to_byte(line);
-        let end = rope.line_range(line).end;
-        let mut text = rope.slice_to_string(start..end);
+    let text_of = |line: usize| -> (String, MarkerLine) {
+        let range = rope.line_range(line);
+        let mut text = rope.slice_to_string(range.clone());
         while text.ends_with('\n') || text.ends_with('\r') {
             text.pop();
         }
-        (text, start, end)
+        let at = MarkerLine {
+            line,
+            start: range.start,
+            end: range.end,
+        };
+        (text, at)
     };
     for at in rope.find_in("<<<<<<<", 0..len) {
         if out.len() >= MAX_CONFLICTS {
@@ -169,7 +181,7 @@ pub fn parse(rope: &Rope) -> Vec<Conflict> {
         if rope.line_to_byte(line) != at || line < resume_line {
             continue;
         }
-        let (first, start, first_end) = text_of(line);
+        let (first, opening) = text_of(line);
         let Some((Marker::Start, current_label)) = marker(&first) else {
             continue;
         };
@@ -183,7 +195,7 @@ pub fn parse(rope: &Rope) -> Vec<Conflict> {
         // for each marker is far cheaper than reading every line of it,
         // which an opening marker that never closes made a hundred
         // thousand allocations per keystroke.
-        let region = first_end..if last < total {
+        let region = opening.end..if last < total {
             rope.line_to_byte(last)
         } else {
             len
@@ -197,45 +209,43 @@ pub fn parse(rope: &Rope) -> Vec<Conflict> {
         candidates.sort_unstable();
         candidates.dedup();
         for n in candidates {
-            let (text, line_start, line_end) = text_of(n);
+            let (text, at) = text_of(n);
             match marker(&text) {
                 // Another opening before this one closed: this one is not a
                 // conflict, and the next candidate is that line.
                 Some((Marker::Start, _)) => break,
                 Some((Marker::Base, label)) if base_line.is_none() && separator_line.is_none() => {
-                    base_line = Some((n, line_start, line_end));
+                    base_line = Some(at);
                     base_label = Some(label.to_owned());
                 }
                 Some((Marker::Separator, _)) if separator_line.is_none() => {
-                    separator_line = Some((n, line_start, line_end));
+                    separator_line = Some(at);
                 }
                 Some((Marker::End, label)) if separator_line.is_some() => {
-                    found = Some((n, line_start, line_end, label.to_owned()));
+                    found = Some((at, label.to_owned()));
                     break;
                 }
                 _ => {}
             }
         }
-        let (Some((sep, sep_start, sep_end)), Some((end_line, end_start, end_end, incoming_label))) =
-            (separator_line, found)
-        else {
+        let (Some(separator), Some((end, incoming_label))) = (separator_line, found) else {
             continue;
         };
-        let current_end = base_line.map_or(sep_start, |(_, s, _)| s);
+        let current_end = base_line.map_or(separator.start, |b| b.start);
         out.push(Conflict {
-            range: start..end_end,
-            current: first_end..current_end,
-            base: base_line.map(|(_, _, e)| e..sep_start),
-            incoming: sep_end..end_start,
+            range: opening.start..end.end,
+            current: opening.end..current_end,
+            base: base_line.map(|b| b.end..separator.start),
+            incoming: separator.end..end.start,
             start_line: line,
-            base_line: base_line.map(|(n, _, _)| n),
-            separator_line: sep,
-            end_line,
+            base_line: base_line.map(|b| b.line),
+            separator_line: separator.line,
+            end_line: end.line,
             current_label,
             base_label,
             incoming_label,
         });
-        resume_line = end_line + 1;
+        resume_line = end.line + 1;
     }
     out
 }

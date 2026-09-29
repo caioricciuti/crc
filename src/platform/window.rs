@@ -11524,29 +11524,10 @@ impl EditorView {
             state.font.clone()
         };
         self.apply_font(font.clone(), size);
-        let Some((theme, caret_blink, format_on_save, word_wrap)) = self.state().map(|state| {
-            (
-                state.theme_choice,
-                state.caret_blink,
-                state.format_on_save,
-                state.word_wrap,
-            )
-        }) else {
+        let Some(theme) = self.state().map(|state| state.theme_choice) else {
             return;
         };
-        let saved = Settings {
-            font,
-            font_size: size,
-            theme,
-            caret_blink,
-            update_check: true,
-            format_on_save,
-            organize_imports_on_save: false,
-            word_wrap,
-            ssh_auth_sock: None,
-            conflict_side_by_side: false,
-        }
-        .save();
+        let saved = Settings::save_font(&font, size, theme);
         if let Some(mut state) = self.state_mut() {
             state.message = Some((
                 match saved {

@@ -234,6 +234,18 @@ impl Settings {
 
     /// Writes the settings, keeping every line of the existing file that is
     /// not one of ours.
+    /// Saves the font, its size and the theme, the fields `save` writes;
+    /// every other line of the file stays as it is.
+    pub fn save_font(font: &str, font_size: f32, theme: ThemeChoice) -> std::io::Result<()> {
+        Settings {
+            font: font.to_owned(),
+            font_size,
+            theme,
+            ..Settings::parse("")
+        }
+        .save()
+    }
+
     pub fn save(&self) -> std::io::Result<()> {
         let Some(path) = Settings::path() else {
             return Err(std::io::Error::other("no home directory"));

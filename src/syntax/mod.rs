@@ -854,7 +854,7 @@ fn load_predicates(query: *const ffi::TSQuery) -> Vec<Vec<Predicate>> {
         for step in steps {
             if step.kind == ffi::TSQueryPredicateStep::DONE {
                 if !run.is_empty() {
-                    predicates.push(build_predicate(&run, &string_at));
+                    predicates.extend(build_predicate(&run, &string_at));
                     run.clear();
                 }
                 continue;
@@ -862,7 +862,7 @@ fn load_predicates(query: *const ffi::TSQuery) -> Vec<Vec<Predicate>> {
             run.push((step.kind, step.value_id));
         }
         if !run.is_empty() {
-            predicates.push(build_predicate(&run, &string_at));
+            predicates.extend(build_predicate(&run, &string_at));
         }
         out.push(predicates);
     }
@@ -882,30 +882,30 @@ fn literal_alternatives(pattern: &str) -> Option<Vec<String>> {
 }
 
 /// Turns one predicate run into a [`Predicate`].
-fn build_predicate(run: &[(u32, u32)], string_at: &dyn Fn(u32) -> String) -> Predicate {
+fn build_predicate(run: &[(u32, u32)], string_at: &dyn Fn(u32) -> String) -> Option<Predicate> {
     const CAPTURE: u32 = ffi::TSQueryPredicateStep::CAPTURE;
     const STRING: u32 = ffi::TSQueryPredicateStep::STRING;
 
     let Some(&(kind, name_id)) = run.first() else {
-        return Predicate::Unsupported;
+        return Some(Predicate::Unsupported);
     };
     if kind != STRING {
-        return Predicate::Unsupported;
+        return Some(Predicate::Unsupported);
     }
     let name = string_at(name_id);
     let args = &run[1..];
 
-    match name.as_str() {
+    Some(match name.as_str() {
         "match?" | "not-match?" => {
             let [(CAPTURE, capture), (STRING, pattern_id)] = args[..] else {
-                return Predicate::Unsupported;
+                return Some(Predicate::Unsupported);
             };
             let source = string_at(pattern_id);
             // `^(a|b|c)$` is how queries spell "one of these words", and it
             // is the one use of alternation in the grammars vendored here.
             // It needs no regex engine: it is `any-of?` with more typing.
             if let Some(values) = literal_alternatives(&source).filter(|_| name == "match?") {
-                return Predicate::AnyOf { capture, values };
+                return Some(Predicate::AnyOf { capture, values });
             }
             match Pattern::compile(&source) {
                 Some(pattern) => Predicate::Match {
@@ -920,7 +920,7 @@ fn build_predicate(run: &[(u32, u32)], string_at: &dyn Fn(u32) -> String) -> Pre
             let [(CAPTURE, capture), (STRING, value_id)] = args[..] else {
                 // Capture-to-capture equality needs both texts at once, which
                 // this pass does not carry.
-                return Predicate::Unsupported;
+                return Some(Predicate::Unsupported);
             };
             Predicate::EqString {
                 capture,
@@ -930,7 +930,7 @@ fn build_predicate(run: &[(u32, u32)], string_at: &dyn Fn(u32) -> String) -> Pre
         }
         "any-of?" => {
             let Some(&(CAPTURE, capture)) = args.first() else {
-                return Predicate::Unsupported;
+                return Some(Predicate::Unsupported);
             };
             let values = args[1..]
                 .iter()
@@ -940,13 +940,10 @@ fn build_predicate(run: &[(u32, u32)], string_at: &dyn Fn(u32) -> String) -> Pre
             Predicate::AnyOf { capture, values }
         }
         // `set!`, `is?` and friends are directives rather than filters; they
-        // do not constrain a match.
-        "set!" | "is?" | "is-not?" => Predicate::AnyOf {
-            capture: u32::MAX,
-            values: Vec::new(),
-        },
+        // do not constrain a match, so they are no predicate at all.
+        "set!" | "is?" | "is-not?" => return None,
         _ => Predicate::Unsupported,
-    }
+    })
 }
 
 /// Row/column pair to tree-sitter's point type.
