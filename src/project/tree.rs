@@ -441,28 +441,23 @@ mod tests {
 
     use super::*;
 
-    /// Builds a throwaway directory tree and removes it on drop, so a failing
-    /// test cannot leave litter in /tmp.
-    struct Fixture(PathBuf);
+    /// A small project: `src` with a nested folder, `target` and `.git`
+    /// (which the tree hides), and a README.
+    struct Fixture;
 
     impl Fixture {
-        fn new(name: &str) -> Self {
-            let root = std::env::temp_dir().join(format!("caio-tree-{name}"));
-            let _ = std::fs::remove_dir_all(&root);
-            std::fs::create_dir_all(root.join("src")).expect("mkdir src");
-            std::fs::create_dir_all(root.join("src/nested")).expect("mkdir nested");
-            std::fs::create_dir_all(root.join("target")).expect("mkdir target");
-            std::fs::create_dir_all(root.join(".git")).expect("mkdir .git");
-            std::fs::write(root.join("README.md"), "hi").expect("write");
-            std::fs::write(root.join("src/main.rs"), "fn main() {}").expect("write");
-            std::fs::write(root.join("src/nested/deep.rs"), "//").expect("write");
-            Fixture(root)
-        }
-    }
-
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+        #[allow(clippy::new_ret_no_self)]
+        fn new(name: &str) -> crate::project::TempTree {
+            crate::project::TempTree::new(
+                &format!("tree-{name}"),
+                &[
+                    ("target/", ""),
+                    (".git/", ""),
+                    ("README.md", "hi"),
+                    ("src/main.rs", "fn main() {}"),
+                    ("src/nested/deep.rs", "//"),
+                ],
+            )
         }
     }
 

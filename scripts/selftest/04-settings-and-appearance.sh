@@ -15,16 +15,13 @@ quit
 SCRIPT
 HOME="$T/settingshome" CRC_SELFTEST="$T/settings.script" "$BIN" "$T/settings.txt" 2> "$T/settings.err"
 if ! grep -q '^tabs: .*config.toml' "$T/settings-open.out"; then
-    echo "FAIL settings-open.out: $(grep -m1 '^tabs' "$T/settings-open.out"), expected a config.toml tab"
-    fail=1
+    failed "settings-open.out: $(grep -m1 '^tabs' "$T/settings-open.out"), expected a config.toml tab"
 fi
 if ! grep -q '^font_size = 13$' "$T/settings-open.out"; then
-    echo "FAIL settings-open.out: the template should be in the tab"
-    fail=1
+    failed "settings-open.out: the template should be in the tab"
 fi
 if ! grep -q '^# crc settings' "$T/settingshome/.config/crc/config.toml"; then
-    echo "FAIL settings: file not created from the template"
-    fail=1
+    failed "settings: file not created from the template"
 fi
 expect "$T/settings-saved.out" dirty "false"
 
@@ -38,7 +35,6 @@ for choice in light dark; do
     printf 'dump %s/theme-%s.out\nquit\n' "$T" "$choice" > "$T/theme-$choice.script"
     HOME="$T/theme-$choice" CRC_SELFTEST="$T/theme-$choice.script" "$BIN" "$T/settings.txt" 2> "$T/theme-$choice.err"
     if ! grep -q "^layout: .* theme $choice\$" "$T/theme-$choice.out"; then
-        echo "FAIL theme-$choice.out: $(grep -m1 '^layout' "$T/theme-$choice.out"), expected theme $choice"
-        fail=1
+        failed "theme-$choice.out: $(grep -m1 '^layout' "$T/theme-$choice.out"), expected theme $choice"
     fi
 done

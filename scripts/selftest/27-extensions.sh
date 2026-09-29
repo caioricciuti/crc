@@ -112,4 +112,4 @@ expect "$T/ext-folder.out" extensions "open selected=crc.sort-lines installed=cr
 expect "$T/ext-unsigned.out" extensions "open selected=crc.sort-lines installed=crc.sort-lines:0.1.0:off:unsigned registry=ready:crc.sort-lines confirm=- busy=- note=Installed Sort Lines 0.1.0, unsigned"
 expect "$T/ext-removed.out" extensions "open selected=crc.sort-lines installed= registry=ready:crc.sort-lines confirm=- busy=- note=Removed Sort Lines"
 [ -z "$(ls -A "$T/exthome/Library/Application Support/crc/extensions" 2>/dev/null)" ] \
-    || { echo "FAIL ext: files left after uninstall: $(ls -A "$T/exthome/Library/Application Support/crc/extensions")"; fail=1; }
+    || failed "ext: files left after uninstall: $(ls -A "$T/exthome/Library/Application Support/crc/extensions")"

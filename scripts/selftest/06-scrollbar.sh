@@ -22,13 +22,11 @@ CRC_SELFTEST="$T/scroll.script" "$BIN" "$T/scroll.txt" 2> "$T/scroll.err"
 expect "$T/scroll-track.out" cursor "1:1"
 track=$(grep -m1 '^scroll: ' "$T/scroll-track.out" | sed 's/scroll: //')
 if [ "${track:-0}" -lt 150 ] || [ "${track:-0}" -gt 190 ]; then
-    echo "FAIL scroll-track.out: scroll is [$track], expected about 170"
-    fail=1
+    failed "scroll-track.out: scroll is [$track], expected about 170"
 fi
 drag=$(grep -m1 '^scroll: ' "$T/scroll-drag.out" | sed 's/scroll: //')
 if [ "${drag:-0}" -lt 185 ] || [ "${drag:-0}" -gt 210 ]; then
-    echo "FAIL scroll-drag.out: scroll is [$drag], expected about 198"
-    fail=1
+    failed "scroll-drag.out: scroll is [$drag], expected about 198"
 fi
 expect "$T/scroll-drag.out" cursor "1:1"
 

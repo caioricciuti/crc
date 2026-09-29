@@ -9,7 +9,7 @@ mkdir -p "$T/actproj" "$T/acthome"
 git init -q -b main "$T/actproj"
 printf 'one\n' > "$T/actproj/a.txt"
 git -C "$T/actproj" add a.txt
-git -C "$T/actproj" -c user.name=Tester -c user.email=t@example.com -c commit.gpgsign=false commit -q -m first
+testgit "$T/actproj" commit -q -m first
 printf 'two\n' >> "$T/actproj/a.txt"
 cat > "$T/act.script" <<SCRIPT
 wait 500
@@ -41,7 +41,7 @@ expect "$T/act-scm.out" git_open true
 expect "$T/act-hidden.out" activity "source-control sidebar=off"
 expect "$T/act-back.out" activity "source-control sidebar=on"
 expect "$T/act-ext.out" activity "extensions sidebar=on"
-grep -q '^extensions: open ' "$T/act-ext.out" || { echo "FAIL act-ext: the details did not open"; fail=1; }
-grep -q '^extensions: list ' "$T/act-ext-list.out" || { echo "FAIL act-ext-list: Close did not keep the list"; fail=1; }
+grep -q '^extensions: open ' "$T/act-ext.out" || failed "act-ext: the details did not open"
+grep -q '^extensions: list ' "$T/act-ext-list.out" || failed "act-ext-list: Close did not keep the list"
 expect "$T/act-explorer.out" activity "explorer sidebar=on"
 expect "$T/act-explorer.out" extensions "closed"

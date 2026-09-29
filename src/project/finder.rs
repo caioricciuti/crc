@@ -334,16 +334,12 @@ fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<Entry>, state: &mut
 mod tests {
     use super::*;
 
-    struct Fixture(PathBuf);
+    struct Fixture;
 
     impl Fixture {
-        fn new(name: &str) -> Self {
-            let root = std::env::temp_dir().join(format!("caio-finder-{name}"));
-            let _ = std::fs::remove_dir_all(&root);
-            for dir in ["src/render", "src/text", "target/debug", ".git"] {
-                std::fs::create_dir_all(root.join(dir)).expect("mkdir");
-            }
-            for file in [
+        #[allow(clippy::new_ret_no_self)]
+        fn new(name: &str) -> crate::project::TempTree {
+            let files = [
                 "README.md",
                 "Cargo.toml",
                 "src/main.rs",
@@ -352,20 +348,13 @@ mod tests {
                 "src/text/rope.rs",
                 "target/debug/junk.o",
                 ".git/config",
-            ] {
-                std::fs::write(root.join(file), "x").expect("write");
-            }
-            Fixture(root)
+            ];
+            let entries: Vec<(&str, &str)> = files.iter().map(|f| (*f, "x")).collect();
+            crate::project::TempTree::new(&format!("finder-{name}"), &entries)
         }
     }
 
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn finder(f: &Fixture) -> Finder {
+    fn finder(f: &crate::project::TempTree) -> Finder {
         let mut finder = Finder::new();
         finder.scan(&f.0);
         finder

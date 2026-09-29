@@ -59,17 +59,17 @@ expect "$T/merge-open.out" branch "main · MERGING"
 expect "$T/merge-next.out" cursor "2:1"
 expect "$T/merge-next.out" message "conflict 1 of 2"
 grep -q '^conflicts: 1 side=false unmerged=true resolvable=false ' "$T/merge-took.out" \
-    || { echo "FAIL merge-took.out: $(grep '^conflicts:' "$T/merge-took.out")"; fail=1; }
+    || failed "merge-took.out: $(grep '^conflicts:' "$T/merge-took.out")"
 expect_line "$T/merge-took.out" 2 "water: evening"
 expect_line "$T/merge-took.out" 7 "<<<<<<< HEAD"
 grep -q '^conflicts: 1 side=true ' "$T/merge-side.out" \
-    || { echo "FAIL merge-side.out: $(grep '^conflicts:' "$T/merge-side.out")"; fail=1; }
+    || failed "merge-side.out: $(grep '^conflicts:' "$T/merge-side.out")"
 grep -q '^conflicts: 0 side=false unmerged=true resolvable=true ' "$T/merge-both.out" \
-    || { echo "FAIL merge-both.out: $(grep '^conflicts:' "$T/merge-both.out")"; fail=1; }
+    || failed "merge-both.out: $(grep '^conflicts:' "$T/merge-both.out")"
 expect_line "$T/merge-both.out" 7 "beds: 5"
 expect_line "$T/merge-both.out" 8 "beds: 4"
 grep -q '^conflicts: 1 side=true ' "$T/merge-undo.out" \
-    || { echo "FAIL merge-undo.out: $(grep '^conflicts:' "$T/merge-undo.out")"; fail=1; }
+    || failed "merge-undo.out: $(grep '^conflicts:' "$T/merge-undo.out")"
 expect_line "$T/merge-undo.out" 2 "water: evening"
 expect_line "$T/merge-base.out" 7 "beds: 3"
 expect_line "$T/merge-base.out" 8 "end"
@@ -77,7 +77,7 @@ expect "$T/merge-resolved.out" conflicts "none"
 expect "$T/merge-resolved.out" git_conflicts "0"
 expect "$T/merge-resolved.out" message "marked plan.txt resolved"
 [ "$(cat "$T/mergeproj/plan.txt")" = "$(printf 'garden plan\nwater: evening\nshade: none\nsoil: loam\npath: gravel\nfence: wood\nbeds: 3\nend')" ] \
-    || { echo "FAIL merge: plan.txt on disk is"; cat "$T/mergeproj/plan.txt"; fail=1; }
-[ -z "$(mgit ls-files -u)" ] || { echo "FAIL merge: plan.txt is still unmerged"; fail=1; }
+    || failed "merge: plan.txt on disk is"; cat "$T/mergeproj/plan.txt"
+[ -z "$(mgit ls-files -u)" ] || failed "merge: plan.txt is still unmerged"
 [ "$(mgit diff --cached --name-only)" = "plan.txt" ] \
-    || { echo "FAIL merge: plan.txt is not staged"; fail=1; }
+    || failed "merge: plan.txt is not staged"

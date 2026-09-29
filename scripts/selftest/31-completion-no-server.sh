@@ -49,9 +49,9 @@ expect "$T/comp-symbol.out" completion "harvest_total"
 expect "$T/comp-symbol.out" completion_why "function in src/lib.rs:1"
 # waterfall was picked twice; now it leads what `wat` offers.
 grep -q '^completion: waterfall|' "$T/comp-history.out" \
-    || { echo "FAIL comp-history.out: $(grep '^completion:' "$T/comp-history.out")"; fail=1; }
+    || failed "comp-history.out: $(grep '^completion:' "$T/comp-history.out")"
 grep -q '^completion_why: you picked this 2× here' "$T/comp-history.out" \
-    || { echo "FAIL comp-history.out: $(grep '^completion_why:' "$T/comp-history.out")"; fail=1; }
+    || failed "comp-history.out: $(grep '^completion_why:' "$T/comp-history.out")"
 
 cat > "$T/comp-path.script" <<SCRIPT
 wait 800

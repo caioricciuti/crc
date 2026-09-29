@@ -70,5 +70,5 @@ quit
 SCRIPT
 HOME="$T/lsp4home" CRC_LSP_FAKE="$PWD/scripts/fake-lsp.py" CRC_SELFTEST="$T/lsp4.script" "$BIN" "$T/lsp4proj/main.py" 2> "$T/lsp4.err"
 [ "$(cat "$T/lsp4proj/main.py")" = "$(printf 'import a\nimport b\nx = 1\ny = 2')" ] \
-    || { echo "FAIL lsp4: main.py is: $(cat "$T/lsp4proj/main.py")"; fail=1; }
+    || failed "lsp4: main.py is: $(cat "$T/lsp4proj/main.py")"
 expect "$T/lsp4-saved.out" dirty false

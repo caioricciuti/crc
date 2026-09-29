@@ -24,7 +24,6 @@ expect "$T/http.out" dirty false
 # The body segment shows curl's own error when nothing came back; the
 # Request segment shows what was sent.
 if ! sed -n '/^text:$/,$p' "$T/http.out" | sed -n 2p | grep -q '^curl: (7)'; then
-    echo "FAIL http.out: expected curl's connection error as the response body"
-    fail=1
+    failed "http.out: expected curl's connection error as the response body"
 fi
 expect_line "$T/http-request.out" 1 "GET http://127.0.0.1:1/"

@@ -19,22 +19,22 @@ quit
 SCRIPT
 CRC_SELFTEST="$T/crash.script" "$BIN" "$T/crashproj/notes.rs" 2> "$T/crash.log" || true
 [ -n "$(ls -A "$recovery" 2>/dev/null)" ] \
-    || { echo "FAIL crash: nothing written to $recovery"; fail=1; }
+    || failed "crash: nothing written to $recovery"
 CRC_SELFTEST="$T/restored.script" "$BIN" 2> "$T/restored.log"
 grep -q 'restore prompt: Unsaved changes to 1 document were written to disk as the app went down: notes.rs (in crashproj)\.' "$T/restored.log" \
-    || { echo "FAIL restored.log: $(grep 'restore prompt' "$T/restored.log")"; fail=1; }
+    || failed "restored.log: $(grep 'restore prompt' "$T/restored.log")"
 expect "$T/restored.out" tabs "notes.rs"
 expect "$T/restored.out" dirty "true"
 expect_line "$T/restored.out" 1 "// keptfn main() {}"
 [ -z "$(ls -A "$recovery" 2>/dev/null)" ] \
-    || { echo "FAIL restored: recovery copies left in $recovery"; fail=1; }
+    || failed "restored: recovery copies left in $recovery"
 [ "$(cat "$T/crashproj/notes.rs")" = "fn main() {}" ] \
-    || { echo "FAIL restored: the file on disk changed"; fail=1; }
+    || failed "restored: the file on disk changed"
 
 # The crash left a log, and Help > Report a Problem (run from the palette)
 # builds an issue from it. A test instance says what it would open.
 grep -q '^panic: selftest: forced panic$' "$HOME/Library/Logs/crc/"crash-*.log \
-    || { echo "FAIL crash: no crash log in $HOME/Library/Logs/crc"; fail=1; }
+    || failed "crash: no crash log in $HOME/Library/Logs/crc"
 cat > "$T/report.script" <<SCRIPT
 key 35 cmd p
 text >report a problem
@@ -44,9 +44,9 @@ quit
 SCRIPT
 CRC_SELFTEST="$T/report.script" "$BIN" "$T/crashproj/notes.rs" 2> "$T/report.err"
 grep -q '^message: would open https://github.com/caioricciuti/crc/issues/new?body=What%20did%20you%20do%3F' "$T/report.out" \
-    || { echo "FAIL report.out: $(grep '^message:' "$T/report.out" | cut -c1-160)"; fail=1; }
+    || failed "report.out: $(grep '^message:' "$T/report.out" | cut -c1-160)"
 grep -q 'Last%20crash%3A%20panic%3A%20selftest%3A%20forced%20panic' "$T/report.out" \
-    || { echo "FAIL report.out: the crash is not in the issue"; fail=1; }
+    || failed "report.out: the crash is not in the issue"
 
 # ---- update check -------------------------------------------------------------
 # Help > Check for Updates, from the palette, against local listings: a newer
@@ -68,7 +68,7 @@ expect "$T/update.out" message "crc 999.0.0 is out; would open https://github.co
 CRC_UPDATE_URL="file://$T/releases-none.json" CRC_SELFTEST="$T/update.script" "$BIN" "$T/crashproj/notes.rs" 2> "$T/update-none.err"
 mv "$T/update.out" "$T/update-none.out"
 grep -q '^message: crc .* is the latest release$' "$T/update-none.out" \
-    || { echo "FAIL update-none.out: $(grep '^message:' "$T/update-none.out")"; fail=1; }
+    || failed "update-none.out: $(grep '^message:' "$T/update-none.out")"
 
 CRC_SELFTEST="$T/crash.script" "$BIN" "$T/crashproj/notes.rs" 2> "$T/crash2.log" || true
 CRC_RESTORE_ANSWER=discard CRC_SELFTEST="$T/restored.script" "$BIN" "$T/crashproj/notes.rs" 2> "$T/discarded.log"
@@ -83,4 +83,4 @@ if cat "$T/restored.log" "$T/discarded.log" | grep -v '^crc: restore prompt: ' |
     fail=1
 fi
 [ -z "$(ls -A "$recovery" 2>/dev/null)" ] \
-    || { echo "FAIL discarded: recovery copies left in $recovery"; fail=1; }
+    || failed "discarded: recovery copies left in $recovery"

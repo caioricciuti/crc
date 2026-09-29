@@ -74,13 +74,25 @@ expect_line() {
     fi
 }
 
+# failed <message>: a check that did not hold.
+failed() {
+    echo "FAIL $1"
+    fail=1
+}
+# testgit <dir> <args>: git in a fixture, with a test identity and no
+# signing, so no one's own git settings reach a commit made here.
+testgit() {
+    local dir=$1
+    shift
+    git -C "$dir" -c user.name=Tester -c user.email=t@example.com -c commit.gpgsign=false "$@"
+}
+
 # Geometry the scripts rely on, with the sidebar hidden: a one-digit gutter is
 # 3 cells of 8pt, the text starts 116pt down (toolbar 48 + tabs 30 + breadcrumbs 30 + 8 of air), and a
 # line is 19pt. So line n is centred at y = 116 + 19 * (n - 1) + 9.
 
 mgit() {
-    git -C "$T/mergeproj" -c user.name=Tester -c user.email=t@example.com \
-        -c commit.gpgsign=false -c merge.conflictStyle=zdiff3 -c rerere.enabled=false "$@"
+    testgit "$T/mergeproj" -c merge.conflictStyle=zdiff3 -c rerere.enabled=false "$@"
 }
 
 # expect_claude <python expression over the log `j`> <description>

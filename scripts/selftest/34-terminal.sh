@@ -53,8 +53,7 @@ expect "$T/term-shell.out" dirty false
 expect_terminal "$T/term-resized.out" "height=420 "
 expect_terminal "$T/term-claude.out" "tabs=sh|✻ Claude "
 if ! grep -m1 '^terminal: ' "$T/term-claude.out" | grep -qE 'port=[0-9]+ ide=true'; then
-    echo "FAIL term-claude.out: the Claude session was not given the IDE port: $(grep -m1 '^terminal: ' "$T/term-claude.out")"
-    fail=1
+    failed "term-claude.out: the Claude session was not given the IDE port: $(grep -m1 '^terminal: ' "$T/term-claude.out")"
 fi
 expect_terminal "$T/term-closed.out" "tabs=sh "
 expect_terminal "$T/term-exit.out" "open=false focus=false height=420 tabs= "

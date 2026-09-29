@@ -18,7 +18,7 @@ expect_line "$T/big.out" 1 "first"
 expect_line "$T/big.out" 2 "second"
 # The limit in force, which this run lowered to 8 bytes.
 grep -q '^message: opened .*big.txt read-only: it is over 8 bytes$' "$T/big.out" \
-    || { echo "FAIL big.out: no read-only note: $(grep '^message:' "$T/big.out")"; fail=1; }
+    || failed "big.out: no read-only note: $(grep '^message:' "$T/big.out")"
 
 # Past the hard cap (sparse, so nothing is written) it is refused from its
 # size alone, from inside the app; a test instance gets the status line
@@ -35,7 +35,7 @@ quit
 SCRIPT
 CRC_SELFTEST="$T/huge.script" "$BIN" "$T/hugeproj" 2> "$T/huge.err"
 grep -q '^message: not opened: huge.txt is 3.0 GB; crc opens files up to 2.0 GB$' "$T/huge.out" \
-    || { echo "FAIL huge.out: $(grep '^message:' "$T/huge.out")"; fail=1; }
+    || failed "huge.out: $(grep '^message:' "$T/huge.out")"
 rm -rf "$T/hugeproj"
 
 # A non-ASCII line past the shaping limit stays editable, and the status

@@ -24,8 +24,7 @@ expect "$T/behind-clean.out" dirty "false"
 expect_line "$T/behind-dirty.out" 1 "localsecond"
 expect "$T/behind-dirty.out" dirty "true"
 if [ "$(sed -n 1p "$T/behind.txt")" != "third" ]; then
-    echo "FAIL behind: the external write was replaced by [$(sed -n 1p "$T/behind.txt")]"
-    fail=1
+    failed "behind: the external write was replaced by [$(sed -n 1p "$T/behind.txt")]"
 fi
 # Two undos: the typed word, then the reload itself.
 expect_line "$T/behind-undone.out" 1 "first"

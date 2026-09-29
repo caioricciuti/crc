@@ -49,12 +49,10 @@ expect_line "$T/opened.out" 1 "second file"
 expect "$T/kept.out" active "0"
 expect "$T/kept.out" dirty "true"
 if ! grep -q "unsaved" "$T/kept.out" 2>/dev/null; then
-    echo "FAIL kept.out: the text typed before opening another file is gone"
-    fail=1
+    failed "kept.out: the text typed before opening another file is gone"
 fi
 if [ ! -s "$T/cursors.out" ]; then
-    echo "FAIL cursors.out: no dump, the app did not survive undo with extra cursors"
-    fail=1
+    failed "cursors.out: no dump, the app did not survive undo with extra cursors"
 fi
 
 # Markdown opens as styled text: the heading's marker and text have kinds
@@ -212,11 +210,11 @@ expect_line "$T/project-replace.out" 2 "thread two"
 expect "$T/project-replace.out" dirty true
 expect "$T/project-replace.out" find_results ""
 [ "$(cat "$T/replproj/b.txt")" = "a thread in b" ] \
-    || { echo "FAIL project replace: b.txt is $(cat "$T/replproj/b.txt")"; fail=1; }
+    || failed "project replace: b.txt is $(cat "$T/replproj/b.txt")"
 [ "$(cat "$T/replproj/a.txt")" = "$(printf 'needle one\nneedle two')" ] \
-    || { echo "FAIL project replace: the open a.txt was written"; fail=1; }
+    || failed "project replace: the open a.txt was written"
 [ "$(cat "$T/replproj/c.txt")" = "nothing here" ] \
-    || { echo "FAIL project replace: c.txt changed"; fail=1; }
+    || failed "project replace: c.txt changed"
 
 # A directory argument opens that directory as the project, including its
 # Cmd-P index, instead of restoring an unrelated session.
@@ -293,7 +291,7 @@ expect "$T/title-opened.out" tabs after.txt
 expect "$T/title-opened.out" key_handler_draws 0
 # The breadcrumb's file part lists the folder it is in.
 grep -q '^crumb_menu: .*/personal-project-with-a-long-folder-name$' "$T/title-crumb.out" \
-    || { echo "FAIL title-crumb: the breadcrumb did not offer its folder"; fail=1; }
+    || failed "title-crumb: the breadcrumb did not offer its folder"
 expect "$T/title-menu.out" crumb_menu none
 expect "$T/title-opened.out" window_title after.txt
 

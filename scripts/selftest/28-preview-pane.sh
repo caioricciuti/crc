@@ -77,11 +77,11 @@ expect "$T/pv-open.out" preview "open ext=crc.markdown-preview view=shown probe=
 expect "$T/pv-remote.out" preview "open ext=crc.markdown-preview view=shown probe=0 remote"
 # 1100 wide, sidebar 240: the text's 816 points become 407, a gap, 408.
 grep -q '^layout: window 1100x760 sidebar Some(240.0) text 284,116 407x616 ' "$T/pv-open.out" \
-    || { echo "FAIL preview: the text did not give the page its half: $(grep '^layout:' "$T/pv-open.out")"; fail=1; }
+    || failed "preview: the text did not give the page its half: $(grep '^layout:' "$T/pv-open.out")"
 expect "$T/pv-link.out" preview "open ext=crc.markdown-preview view=shown probe=stayed"
 expect "$T/pv-edited.out" preview "open ext=crc.markdown-preview view=shown probe=64/0 scroll=300 h1=- text=6116"
 expect "$T/pv-palette.out" preview "open ext=crc.markdown-preview view=veiled probe=64/0 scroll=300 h1=- text=6116"
 expect "$T/pv-back.out" preview "open ext=crc.markdown-preview view=shown probe=64/0 scroll=300 h1=- text=6116"
 expect "$T/pv-closed.out" preview "closed"
 [ -z "$(ls "$T/pvhome/Library/Caches/crc" 2>/dev/null | grep '^preview-')" ] \
-    || { echo "FAIL preview: page files left behind: $(ls "$T/pvhome/Library/Caches/crc")"; fail=1; }
+    || failed "preview: page files left behind: $(ls "$T/pvhome/Library/Caches/crc")"

@@ -60,9 +60,9 @@ expect "$T/lsp2-renamed.out" dirty true
 expect "$T/lsp2-renamed.out" message "renamed in 2 files, 1 open and unsaved"
 # other.rs was not open: renamed on disk. main.rs is open: not written.
 [ "$(cat "$T/lsp2proj/other.rs")" = "fn other() { tally(); }" ] \
-    || { echo "FAIL lsp2: other.rs is: $(cat "$T/lsp2proj/other.rs")"; fail=1; }
+    || failed "lsp2: other.rs is: $(cat "$T/lsp2proj/other.rs")"
 grep -q 'let count = 1;' "$T/lsp2proj/main.rs" \
-    || { echo "FAIL lsp2: the open main.rs was written to disk"; fail=1; }
+    || failed "lsp2: the open main.rs was written to disk"
 expect_line "$T/lsp2-formatted.out" 1 "fn total() {"
 expect "$T/lsp2-formatted.out" message "formatted"
 expect "$T/lsp2-signature.out" signature "fn alpha(first: i32, second: i32) [second: i32]"

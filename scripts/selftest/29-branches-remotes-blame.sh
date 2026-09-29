@@ -10,7 +10,7 @@ git init -q -b main "$T/branchproj"
 git init -q --bare "$T/branchorigin.git"
 printf 'one\ntwo\n' > "$T/branchproj/notes.txt"
 git -C "$T/branchproj" add notes.txt
-git -C "$T/branchproj" -c user.name=Tester -c user.email=t@example.com -c commit.gpgsign=false commit -q -m "first notes"
+testgit "$T/branchproj" commit -q -m "first notes"
 git -C "$T/branchproj" remote add origin "$T/branchorigin.git"
 cat > "$T/branch.script" <<SCRIPT
 wait 800
@@ -47,13 +47,13 @@ SCRIPT
 CRC_SELFTEST="$T/branch.script" "$BIN" "$T/branchproj/notes.txt" 2> "$T/branch.err"
 expect "$T/branch-blame.out" branch "main"
 grep -q '^blame: Tester, .*: first notes$' "$T/branch-blame.out" \
-    || { echo "FAIL branch-blame.out: $(grep '^blame:' "$T/branch-blame.out")"; fail=1; }
+    || failed "branch-blame.out: $(grep '^blame:' "$T/branch-blame.out")"
 expect "$T/branch-picker.out" palette_first "Create branch “feature”"
 expect "$T/branch-created.out" branch "feature"
 expect "$T/branch-created.out" message "created and switched to feature"
 expect "$T/branch-pull.out" message "this branch has no upstream to pull from"
 expect "$T/branch-push.out" branch "feature"
 grep -q '^message: pushed' "$T/branch-push.out" \
-    || { echo "FAIL branch-push.out: $(grep '^message:' "$T/branch-push.out")"; fail=1; }
+    || failed "branch-push.out: $(grep '^message:' "$T/branch-push.out")"
 git -C "$T/branchorigin.git" rev-parse --verify -q refs/heads/feature > /dev/null \
-    || { echo "FAIL branch push: origin has no feature branch"; fail=1; }
+    || failed "branch push: origin has no feature branch"
