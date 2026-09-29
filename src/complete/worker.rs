@@ -194,11 +194,7 @@ pub fn answer(query: &Query, reader: Option<&Reader>, history: Option<&History>)
         .rope
         .line_to_byte(query.rope.byte_to_line(query.anchor.saturating_sub(WINDOW)));
     let to_line = query.rope.byte_to_line((query.caret + WINDOW).min(total));
-    let to = if to_line + 1 < query.rope.len_lines() {
-        query.rope.line_to_byte(to_line + 1)
-    } else {
-        total
-    };
+    let to = query.rope.line_range(to_line).end;
     // Whole lines, but not a whole minified file on one line: no further
     // than twice the window either side of the caret. A word cut at an end
     // is at worst one candidate less.

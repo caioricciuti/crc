@@ -1142,13 +1142,7 @@ impl Buffer {
     /// its text.
     pub fn line_range_at(&self, at: usize) -> std::ops::Range<usize> {
         let line = self.rope.byte_to_line(at.min(self.rope.len_bytes()));
-        let start = self.rope.line_to_byte(line);
-        let end = if line + 1 < self.rope.len_lines() {
-            self.rope.line_to_byte(line + 1)
-        } else {
-            self.rope.len_bytes()
-        };
-        start..end
+        self.rope.line_range(line)
     }
 
     // ---- editing ---------------------------------------------------------
@@ -2042,11 +2036,7 @@ impl Buffer {
         let lines = self.selected_lines();
         let start = self.rope.line_to_byte(*lines.start());
         let last = *lines.end();
-        let end = if last + 1 < self.rope.len_lines() {
-            self.rope.line_to_byte(last + 1)
-        } else {
-            self.rope.len_bytes()
-        };
+        let end = self.rope.line_range(last).end;
 
         // On a last line with no trailing newline the separator has to go
         // *before* the copy, or the two lines run together.
@@ -2101,11 +2091,7 @@ impl Buffer {
             (first - 1, last)
         };
         let start = self.rope.line_to_byte(span_first);
-        let end = if span_last + 1 < total {
-            self.rope.line_to_byte(span_last + 1)
-        } else {
-            self.rope.len_bytes()
-        };
+        let end = self.rope.line_range(span_last).end;
         let split = self.rope.line_to_byte(if down { last + 1 } else { first });
 
         let head = self.rope.slice_to_string(start..split);
@@ -3059,12 +3045,7 @@ impl Buffer {
 
     /// Byte offset of the end of `line`, excluding its newline.
     fn line_end(&self, line: usize) -> usize {
-        if line + 1 < self.rope.len_lines() {
-            // line_to_byte points past the newline, so step back over it.
-            self.rope.line_to_byte(line + 1) - 1
-        } else {
-            self.rope.len_bytes()
-        }
+        wrap::line_end(&self.rope, line)
     }
 
     /// Previous user-perceived character boundary, preserving native grapheme rules.

@@ -987,11 +987,7 @@ pub fn build_text_appending(
             .into_iter()
             .flat_map(|l| {
                 let start = buffer.rope.line_to_byte(l);
-                let end = if l + 1 < total_lines {
-                    buffer.rope.line_to_byte(l + 1)
-                } else {
-                    buffer.rope.len_bytes()
-                };
+                let end = buffer.rope.line_range(l).end;
                 buffer.rope.find_in(query, start..end)
             })
             .map(|at| at..at + query.len())
@@ -1041,11 +1037,7 @@ pub fn build_text_appending(
         let y = row.y;
 
         let line_start = buffer.rope.line_to_byte(line);
-        let line_end = if line + 1 < total_lines {
-            buffer.rope.line_to_byte(line + 1)
-        } else {
-            buffer.rope.len_bytes()
-        };
+        let line_end = buffer.rope.line_range(line).end;
 
         // Shape bounded non-ASCII lines. The cached CoreText offsets are
         // shared by text, selection, search bands, and the caret.
@@ -5180,11 +5172,7 @@ pub fn screen_rows(buffer: &Buffer, viewport: Viewport, line_height: f32) -> Vec
         0
     };
     while line < total && y < bottom {
-        let next = if line + 1 < total {
-            buffer.rope.line_to_byte(line + 1)
-        } else {
-            buffer.rope.len_bytes()
-        };
+        let next = buffer.rope.line_range(line).end;
         let starts = buffer.row_starts(line);
         let count = starts.len();
         if count == 0 {

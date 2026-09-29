@@ -154,11 +154,7 @@ pub fn parse(rope: &Rope) -> Vec<Conflict> {
     let mut resume_line = 0;
     let text_of = |line: usize| -> (String, usize, usize) {
         let start = rope.line_to_byte(line);
-        let end = if line + 1 < total {
-            rope.line_to_byte(line + 1)
-        } else {
-            len
-        };
+        let end = rope.line_range(line).end;
         let mut text = rope.slice_to_string(start..end);
         while text.ends_with('\n') || text.ends_with('\r') {
             text.pop();

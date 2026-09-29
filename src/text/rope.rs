@@ -848,13 +848,16 @@ impl Rope {
 
     /// Text of a single line, including its trailing newline if present.
     pub fn line(&self, line: usize) -> String {
-        let start = self.line_to_byte(line);
-        let end = if line + 1 < self.len_lines() {
-            self.line_to_byte(line + 1)
-        } else {
-            self.len_bytes()
-        };
-        self.slice_to_string(start..end)
+        self.slice_to_string(self.line_range(line))
+    }
+
+    /// The bytes of `line` with its line ending; an empty range at the end
+    /// for a line past the last.
+    pub fn line_range(&self, line: usize) -> std::ops::Range<usize> {
+        if line >= self.len_lines() {
+            return self.len_bytes()..self.len_bytes();
+        }
+        self.line_to_byte(line)..self.line_to_byte(line + 1)
     }
 }
 
@@ -987,6 +990,17 @@ impl<'a> Iterator for ByteChunks<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn line_range_keeps_the_ending_and_stops_at_the_end() {
+        let rope = Rope::from_text("ab\ncd\nef");
+        assert_eq!(rope.line_range(0), 0..3);
+        assert_eq!(rope.line_range(1), 3..6);
+        assert_eq!(rope.line_range(2), 6..8, "no newline after the last line");
+        assert_eq!(rope.line_range(3), 8..8, "past the last line");
+        let ended = Rope::from_text("ab\n");
+        assert_eq!(ended.line_range(1), 3..3, "the empty line after a newline");
+    }
 
     #[test]
     fn same_text_compares_content_across_different_chunking() {

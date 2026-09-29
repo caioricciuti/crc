@@ -8543,11 +8543,7 @@ impl EditorView {
         };
         let at = crate::lsp::position_of(&buffer.rope, offset.unwrap_or(buffer.cursor()));
         let key = crate::lsp::servers::server_key(language);
-        match state
-            .lsp
-            .get_mut(&key)
-            .filter(|s| s.is_ready() && s.knows(&path))
-        {
+        match ready_server(&mut state.lsp, key).filter(|s| s.knows(&path)) {
             Some(server) => {
                 ask(server, &path, at);
                 true
@@ -8616,11 +8612,7 @@ impl EditorView {
                 let end = crate::lsp::offset_of(rope, location.end).max(start);
                 let line = rope.byte_to_line(start);
                 let line_start = rope.line_to_byte(line);
-                let line_end = if line + 1 < rope.len_lines() {
-                    rope.line_to_byte(line + 1)
-                } else {
-                    rope.len_bytes()
-                };
+                let line_end = rope.line_range(line).end;
                 results.push(ProjectHit {
                     path: location.path.clone(),
                     range: start..end,
@@ -8731,10 +8723,7 @@ impl EditorView {
                 let name = rename.field.rope.to_string().trim().to_owned();
                 let key = crate::lsp::servers::server_key(rename.language);
                 let sent = !name.is_empty()
-                    && state
-                        .lsp
-                        .get_mut(&key)
-                        .filter(|s| s.is_ready())
+                    && ready_server(&mut state.lsp, key)
                         .map(|server| server.rename(&rename.path, rename.at, &name))
                         .is_some();
                 state.message = Some((
@@ -8907,10 +8896,7 @@ impl EditorView {
             return None;
         };
         let key = crate::lsp::servers::server_key(language);
-        let server = state
-            .lsp
-            .get_mut(&key)
-            .filter(|s| s.is_ready() && s.knows(&path));
+        let server = ready_server(&mut state.lsp, key).filter(|s| s.knows(&path));
         let (sent, why) = match server {
             Some(server) if server.offers_code_actions() => {
                 let diagnostics: Vec<crate::lsp::Diagnostic> = server
@@ -8997,11 +8983,7 @@ impl EditorView {
             let Some(mut state) = self.state_mut() else {
                 return;
             };
-            let steps = state
-                .lsp
-                .get_mut(&server)
-                .filter(|s| s.is_ready())
-                .map(|s| s.action_steps(&action));
+            let steps = ready_server(&mut state.lsp, server).map(|s| s.action_steps(&action));
             match &steps {
                 None => {
                     state.message = Some(("the language server stopped".into(), Instant::now()))
@@ -9031,7 +9013,7 @@ impl EditorView {
                 return;
             };
             if let Some(command) = &steps.command
-                && let Some(server) = state.lsp.get_mut(&server).filter(|s| s.is_ready())
+                && let Some(server) = ready_server(&mut state.lsp, server)
             {
                 server.execute_command(command);
             }
@@ -9137,11 +9119,9 @@ impl EditorView {
                 .into_iter()
                 .find(|a| a.disabled.is_none() && a.kind.starts_with("source.organizeImports"));
             let steps = match (&action, unchanged) {
-                (Some(action), true) => state
-                    .lsp
-                    .get_mut(&server)
-                    .filter(|s| s.is_ready())
-                    .map(|s| s.action_steps(action)),
+                (Some(action), true) => {
+                    ready_server(&mut state.lsp, server).map(|s| s.action_steps(action))
+                }
                 _ => None,
             };
             let note = match (&action, unchanged, &steps) {
@@ -10629,11 +10609,7 @@ impl EditorView {
         {
             let at = crate::lsp::position_of(&buffer.rope, caret);
             let key = crate::lsp::servers::server_key(lang);
-            if let Some(server) = state
-                .lsp
-                .get_mut(&key)
-                .filter(|s| s.is_ready() && s.knows(&file))
-            {
+            if let Some(server) = ready_server(&mut state.lsp, key).filter(|s| s.knows(&file)) {
                 request = server.completion(&file, at);
             }
         }
@@ -12172,11 +12148,7 @@ impl EditorView {
                     .rope
                     .slice_to_string(popup.anchor.min(cursor)..cursor);
                 let line = buffer.rope.byte_to_line(cursor);
-                let line_end = if line + 1 < buffer.rope.len_lines() {
-                    buffer.rope.line_to_byte(line + 1)
-                } else {
-                    buffer.rope.len_bytes()
-                };
+                let line_end = buffer.rope.line_range(line).end;
                 let rest = buffer.rope.slice_to_string(cursor..line_end);
                 let picked = &popup.shown[popup.selected.min(popup.shown.len() - 1)];
                 // Only at the end of a line: drawn over text that follows the
@@ -13247,6 +13219,14 @@ fn lsp_server_for<'a>(state: &'a State, buffer: &Buffer) -> Option<&'a crate::ls
         .lsp
         .get(&crate::lsp::servers::server_key(language))
         .filter(|s| s.is_ready())
+}
+
+/// The server for `key` (a `server_key`), when it has finished starting.
+fn ready_server(
+    lsp: &mut HashMap<Language, crate::lsp::client::Server>,
+    key: Language,
+) -> Option<&mut crate::lsp::client::Server> {
+    lsp.get_mut(&key).filter(|s| s.is_ready())
 }
 
 /// Brings the active document's merge conflicts up to date with its text
