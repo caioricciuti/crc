@@ -271,7 +271,7 @@ impl Tree {
         self.reselect(selected, index);
     }
 
-    fn selected_path(&self) -> Option<PathBuf> {
+    pub fn selected_path(&self) -> Option<PathBuf> {
         self.selected
             .and_then(|i| self.rows.get(i))
             .map(|e| e.path.clone())

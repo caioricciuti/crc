@@ -60,29 +60,31 @@ struct ProjectIndexResult {
 }
 
 fn spawn_project_index(root: std::path::PathBuf) -> mpsc::Receiver<ProjectIndexResult> {
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
+    spawn_project_scan(move || {
         let mut tree = Tree::new();
         tree.open(&root);
-        let mut finder = Finder::new();
-        finder.scan(&root);
-        let _ = tx.send(ProjectIndexResult {
-            root,
-            tree,
-            finder,
-            tree_version: 0,
-        });
-    });
-    rx
+        Some((root, tree, 0))
+    })
 }
 
 fn spawn_project_refresh(mut tree: Tree, tree_version: u64) -> mpsc::Receiver<ProjectIndexResult> {
+    spawn_project_scan(move || {
+        let root = tree.root()?.to_path_buf();
+        tree.refresh();
+        Some((root, tree, tree_version))
+    })
+}
+
+/// On a worker: `read_tree` reads the sidebar, then the finder scans the
+/// same root. Nothing is sent when there is no root.
+fn spawn_project_scan(
+    read_tree: impl FnOnce() -> Option<(std::path::PathBuf, Tree, u64)> + Send + 'static,
+) -> mpsc::Receiver<ProjectIndexResult> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let Some(root) = tree.root().map(Path::to_path_buf) else {
+        let Some((root, tree, tree_version)) = read_tree() else {
             return;
         };
-        tree.refresh();
         let mut finder = Finder::new();
         finder.scan(&root);
         let _ = tx.send(ProjectIndexResult {
@@ -93,6 +95,17 @@ fn spawn_project_refresh(mut tree: Tree, tree_version: u64) -> mpsc::Receiver<Pr
         });
     });
     rx
+}
+
+/// Rereads the sidebar and the finder after the project changed on disk.
+/// A scan already running is outdated by the version bump.
+fn start_project_refresh(state: &mut State) {
+    state.tree_version += 1;
+    state.tree_children_pending.clear();
+    state.project_index_rx = Some(spawn_project_refresh(
+        state.tree.clone(),
+        state.tree_version,
+    ));
 }
 
 /// macOS virtual key codes. These are physical positions and do not shift
@@ -962,14 +975,27 @@ fn note_files_written(state: &mut State) {
     }
 }
 
+/// The documents in a debounce map (`lsp_dirty`, `gutter_dirty`) whose
+/// last edit is at least `pause` old.
+fn due(dirty: &HashMap<u64, Instant>, pause: Duration) -> Vec<u64> {
+    dirty
+        .iter()
+        .filter(|(_, at)| at.elapsed() >= pause)
+        .map(|(id, _)| *id)
+        .collect()
+}
+
+/// A debounce stamp past any pause: the next flush takes the document.
+fn overdue() -> Instant {
+    Instant::now() - Duration::from_secs(1)
+}
+
 /// After documents were edited in place by something other than typing:
 /// the server gets the text on its next flush, without waiting out the
 /// pause, and the gutter's change marks are worked out again.
 fn note_documents_edited(state: &mut State, ids: impl IntoIterator<Item = u64>) {
     for id in ids {
-        state
-            .lsp_dirty
-            .insert(id, Instant::now() - Duration::from_secs(1));
+        state.lsp_dirty.insert(id, overdue());
         state.gutter_dirty.insert(id, Instant::now());
     }
 }
@@ -2794,14 +2820,8 @@ define_class!(
 
         #[unsafe(method(copyContextTabPath:))]
         fn action_copy_context_path(&self, _sender: Option<&AnyObject>) {
-            let path = {
-                let Some(state) = self.state() else {
-                    return;
-                };
-                state
-                    .context_tab
-                    .and_then(|i| state.docs.iter().nth(i))
-                    .and_then(|b| b.path.clone())
+            let Some(path) = self.state().map(|state| context_tab_path(&state)) else {
+                return;
             };
             if let Some(path) = path {
                 clipboard::write_text(&path.to_string_lossy());
@@ -2816,14 +2836,8 @@ define_class!(
 
         #[unsafe(method(revealContextTab:))]
         fn action_reveal_context_tab(&self, _sender: Option<&AnyObject>) {
-            let path = {
-                let Some(state) = self.state() else {
-                    return;
-                };
-                state
-                    .context_tab
-                    .and_then(|i| state.docs.iter().nth(i))
-                    .and_then(|b| b.path.clone())
+            let Some(path) = self.state().map(|state| context_tab_path(&state)) else {
+                return;
             };
             if let Some(path) = path {
                 let _ = self.open(true, path.as_os_str());
@@ -2838,9 +2852,7 @@ define_class!(
                 };
                 state
                     .tree
-                    .selected
-                    .and_then(|i| state.tree.rows().get(i))
-                    .map(|e| e.path.clone())
+                    .selected_path()
                     .or_else(|| state.docs.active().path.clone())
             };
             let Some(path) = path else {
@@ -10229,7 +10241,7 @@ impl EditorView {
                 },
             );
             if has_head {
-                state.gutter_dirty.insert(id, Instant::now() - PAUSE);
+                state.gutter_dirty.insert(id, overdue());
             }
             self.ivars().needs_redraw.set(true);
         }
@@ -10258,12 +10270,7 @@ impl EditorView {
             }
         }
         // Files edited a moment ago.
-        let due: Vec<u64> = state
-            .gutter_dirty
-            .iter()
-            .filter(|(_, at)| at.elapsed() >= PAUSE)
-            .map(|(id, _)| *id)
-            .collect();
+        let due = due(&state.gutter_dirty, PAUSE);
         if due.is_empty() {
             return;
         }
@@ -10320,12 +10327,7 @@ impl EditorView {
         if state.lsp_dirty.is_empty() {
             return;
         }
-        let due: Vec<u64> = state
-            .lsp_dirty
-            .iter()
-            .filter(|(_, at)| at.elapsed() >= PAUSE)
-            .map(|(id, _)| *id)
-            .collect();
+        let due = due(&state.lsp_dirty, PAUSE);
         if due.is_empty() {
             return;
         }
@@ -10776,7 +10778,7 @@ impl EditorView {
                 return;
             };
             for at in state.lsp_dirty.values_mut() {
-                *at = Instant::now() - Duration::from_secs(1);
+                *at = overdue();
             }
         }
         self.lsp_flush_changes();
@@ -11028,12 +11030,7 @@ impl EditorView {
         if let Some(indexer) = &state.indexer {
             indexer.poke();
         }
-        state.tree_version += 1;
-        state.tree_children_pending.clear();
-        state.project_index_rx = Some(spawn_project_refresh(
-            state.tree.clone(),
-            state.tree_version,
-        ));
+        start_project_refresh(&mut state);
         if state.git_open {
             state.git.refresh();
         }
@@ -11046,12 +11043,7 @@ impl EditorView {
         let Some(mut state) = self.state_mut() else {
             return;
         };
-        state.tree_version += 1;
-        state.tree_children_pending.clear();
-        state.project_index_rx = Some(spawn_project_refresh(
-            state.tree.clone(),
-            state.tree_version,
-        ));
+        start_project_refresh(&mut state);
         state.git.refresh();
         drop(state);
         self.resume_display_link();
@@ -13486,11 +13478,7 @@ fn is_open_path(open: &Path, path: &Path, key: &Path) -> bool {
 /// Whether `a` and `b` name the same file, by path or by what it resolves
 /// to. Two lookups: for paths that are not both open documents.
 fn same_file(a: &Path, b: &Path) -> bool {
-    a == b
-        || std::fs::canonicalize(a)
-            .ok()
-            .zip(std::fs::canonicalize(b).ok())
-            .is_some_and(|(a, b)| a == b)
+    a == b || crate::platform::canonical(a) == crate::platform::canonical(b)
 }
 
 /// The window, as the tools Claude calls see it. Every method borrows the
@@ -13759,6 +13747,14 @@ fn close_fields(state: &mut State) {
     state.palette = None;
     state.goto = None;
     state.git_focus = false;
+}
+
+/// The file of the tab the tab-strip context menu was opened on.
+fn context_tab_path(state: &State) -> Option<std::path::PathBuf> {
+    state
+        .context_tab
+        .and_then(|i| state.docs.iter().nth(i))
+        .and_then(|b| b.path.clone())
 }
 
 fn field_has_keys(state: &State) -> bool {

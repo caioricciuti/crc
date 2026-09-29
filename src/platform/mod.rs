@@ -45,7 +45,6 @@ pub fn canonical(path: &std::path::Path) -> std::path::PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// Seconds since 1970, 0 on a clock set before it.
 /// A path from the raw bytes Git, the crash journal and the session store
 /// keep. A `Vec` moves in without a copy.
 pub fn path_from_bytes(bytes: impl Into<Vec<u8>>) -> std::path::PathBuf {
@@ -53,6 +52,7 @@ pub fn path_from_bytes(bytes: impl Into<Vec<u8>>) -> std::path::PathBuf {
     std::ffi::OsString::from_vec(bytes.into()).into()
 }
 
+/// Seconds since 1970, 0 on a clock set before it.
 pub fn unix_seconds() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

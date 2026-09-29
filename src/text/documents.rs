@@ -173,11 +173,10 @@ impl Documents {
     /// a raw path from a panel or the sidebar never equals the stored one and
     /// every reopen would make a fresh tab onto the same file.
     pub fn index_of(&self, path: &Path) -> Option<usize> {
-        let canonical = std::fs::canonicalize(path);
-        let key = canonical.as_deref().unwrap_or(path);
+        let key = crate::platform::canonical(path);
         self.buffers
             .iter()
-            .position(|b| b.path.as_deref() == Some(key))
+            .position(|b| b.path.as_deref() == Some(key.as_path()))
     }
 
     /// Opens a file, or switches to it when it is already open.
