@@ -237,6 +237,25 @@ pub fn draw_details(
     theme: &Theme,
     out: &mut Vec<GlyphInstance>,
 ) {
+    let start = out.len();
+    draw_page(page, atlas, rect, theme, out);
+    // A long description, many commands or a long log run past a short
+    // window: what does not fit is cut at the page's edge, not drawn over
+    // what is below it, and cannot be clicked there.
+    let bottom = rect.y + rect.height;
+    for quad in &mut out[start..] {
+        layout::clip_vertical(quad, rect.y, bottom);
+    }
+    page.hits.retain(|(r, _)| r.y + r.height <= bottom);
+}
+
+fn draw_page(
+    page: &mut Page,
+    atlas: &mut Atlas,
+    rect: Viewport,
+    theme: &Theme,
+    out: &mut Vec<GlyphInstance>,
+) {
     let mut hits = Vec::new();
     layout::push_rect(
         out,
@@ -315,11 +334,8 @@ pub fn draw_details(
     // Prose keeps a readable measure rather than the width of a wide window.
     let detail_x = x;
     let detail_w = (right - x).min(680.0);
-    let top = y;
-    let _ = bottom;
 
     // Details of the selected one, or the install confirmation.
-    let mut y = top;
     let dx = detail_x;
     if let Some(pending) = &page.confirm {
         let m = pending.manifest();

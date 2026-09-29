@@ -1160,6 +1160,37 @@ pub fn ago(time: i64, now: i64) -> String {
 mod tests {
     use super::*;
 
+    /// A repository in a temporary folder, with a test identity and no
+    /// signing, removed when dropped (a failed test included).
+    struct TempRepo(PathBuf);
+
+    impl TempRepo {
+        fn new(name: &str) -> TempRepo {
+            let dir = std::env::temp_dir().join(format!("crc-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            run(&dir, &["init", "--quiet"]).unwrap();
+            for (key, value) in [
+                ("user.name", "caio test"),
+                ("user.email", "test@example.invalid"),
+                ("commit.gpgsign", "false"),
+            ] {
+                run(&dir, &["config", key, value]).unwrap();
+            }
+            TempRepo(std::fs::canonicalize(&dir).unwrap())
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempRepo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn blame_porcelain_parses_and_uncommitted_has_no_author() {
         let committed = "a1b2c3 4 4 1\nauthor Caio\nauthor-mail <x>\nauthor-time 1700000000\nsummary feat: beds\nfilename f\n\tline\n";
@@ -1403,23 +1434,16 @@ mod tests {
 
     #[test]
     fn head_text_of_a_repository_without_commits_is_a_new_file() {
-        let root = std::env::temp_dir().join(format!("caio-unborn-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        run(&root, &["init", "--quiet"]).unwrap();
-        let root = std::fs::canonicalize(&root).unwrap();
+        let repo = TempRepo::new("unborn");
+        let root = repo.path().to_path_buf();
         std::fs::write(root.join("a.txt"), "one\n").unwrap();
         assert_eq!(head_text(&root, &root.join("a.txt")), Ok(None));
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn unstaging_before_the_first_commit_keeps_the_edited_file() {
-        let root = std::env::temp_dir().join(format!("caio-unborn-unstage-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        run(&root, &["init", "--quiet"]).unwrap();
-        let root = std::fs::canonicalize(&root).unwrap();
+        let repo = TempRepo::new("unborn-unstage");
+        let root = repo.path().to_path_buf();
         std::fs::write(root.join("a.txt"), "one\n").unwrap();
         run(&root, &["add", "a.txt"]).unwrap();
         std::fs::write(root.join("a.txt"), "two\n").unwrap();
@@ -1436,7 +1460,6 @@ mod tests {
             std::fs::read_to_string(root.join("a.txt")).unwrap(),
             "two\n"
         );
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1548,12 +1571,8 @@ mod tests {
 
     #[test]
     fn local_staging_diff_and_commit_round_trip() {
-        let root = std::env::temp_dir().join(format!("caio-git-test-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        run(&root, &["init", "--quiet"]).unwrap();
-        run(&root, &["config", "user.name", "caio test"]).unwrap();
-        run(&root, &["config", "user.email", "test@example.invalid"]).unwrap();
-        run(&root, &["config", "commit.gpgsign", "false"]).unwrap();
+        let repo = TempRepo::new("git-test");
+        let root = repo.path().to_path_buf();
         run(&root, &["config", "core.hooksPath", ".git/hooks"]).unwrap();
         std::fs::write(root.join("a file.txt"), "hello\n").unwrap();
         let s = snapshot(&root).unwrap();
@@ -1624,17 +1643,12 @@ mod tests {
         );
         let staged = run(&root, &["diff", "--cached", "--", "moved.txt"]).unwrap();
         assert!(String::from_utf8_lossy(&staged).contains("+moved and edited"));
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn stages_and_unstages_one_hunk_without_touching_other_edits() {
-        let root = std::env::temp_dir().join(format!("caio-hunk-test-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        run(&root, &["init", "--quiet"]).unwrap();
-        run(&root, &["config", "user.name", "caio test"]).unwrap();
-        run(&root, &["config", "user.email", "test@example.invalid"]).unwrap();
-        run(&root, &["config", "commit.gpgsign", "false"]).unwrap();
+        let repo = TempRepo::new("hunk-test");
+        let root = repo.path().to_path_buf();
         let path = root.join("personal notes.txt");
         let original: Vec<String> = (1..=24).map(|n| format!("line {n}\n")).collect();
         std::fs::write(&path, original.concat()).unwrap();
@@ -1686,18 +1700,13 @@ mod tests {
         std::fs::write(&path, edited.concat()).unwrap();
         assert!(stage_hunk(&root, &change, &stale).is_err());
         assert!(run(&root, &["diff", "--cached"]).unwrap().is_empty());
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn hunk_patch_keeps_crlf_bytes() {
-        let root = std::env::temp_dir().join(format!("caio-crlf-hunk-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        run(&root, &["init", "--quiet"]).unwrap();
+        let repo = TempRepo::new("crlf-hunk");
+        let root = repo.path().to_path_buf();
         run(&root, &["config", "core.autocrlf", "false"]).unwrap();
-        run(&root, &["config", "user.name", "caio test"]).unwrap();
-        run(&root, &["config", "user.email", "test@example.invalid"]).unwrap();
-        run(&root, &["config", "commit.gpgsign", "false"]).unwrap();
         let path = root.join("crlf notes.txt");
         let mut lines: Vec<String> = (1..=20).map(|n| format!("line {n}\r\n")).collect();
         std::fs::write(&path, lines.concat()).unwrap();
@@ -1723,17 +1732,12 @@ mod tests {
                 .any(|w| w == b"+second edit\r\n")
         );
         assert_eq!(std::fs::read(&path).unwrap(), lines.concat().as_bytes());
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn hunk_patch_keeps_missing_final_newline() {
-        let root = std::env::temp_dir().join(format!("caio-eof-hunk-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        run(&root, &["init", "--quiet"]).unwrap();
-        run(&root, &["config", "user.name", "caio test"]).unwrap();
-        run(&root, &["config", "user.email", "test@example.invalid"]).unwrap();
-        run(&root, &["config", "commit.gpgsign", "false"]).unwrap();
+        let repo = TempRepo::new("eof-hunk");
+        let root = repo.path().to_path_buf();
         let path = root.join("no-final-newline.txt");
         std::fs::write(&path, "alpha\nbeta").unwrap();
         run(&root, &["add", "--", "no-final-newline.txt"]).unwrap();
@@ -1749,6 +1753,5 @@ mod tests {
         stage_hunk(&root, &change, &preview.hunks[0]).unwrap();
         assert!(run(&root, &["diff"]).unwrap().is_empty());
         assert_eq!(std::fs::read(&path).unwrap(), b"alpha\nchanged");
-        std::fs::remove_dir_all(root).unwrap();
     }
 }

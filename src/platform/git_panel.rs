@@ -36,6 +36,15 @@ struct Reply {
 /// The commit message's text inset inside its box, for drawing and clicks.
 pub const MESSAGE_PAD: f32 = 9.0;
 
+/// An operation on the worker.
+struct InFlight {
+    rx: Receiver<Result<Reply, String>>,
+    /// The message, when it is a commit.
+    submitted: Option<String>,
+    /// Whether its outcome is said in the status line.
+    announces: bool,
+}
+
 pub struct Panel {
     directory: PathBuf,
     pub snapshot: Option<Snapshot>,
@@ -48,8 +57,8 @@ pub struct Panel {
     /// the active document.
     pub showing_diff: bool,
     diff: git::Diff,
-    rx: Option<Receiver<Result<Reply, String>>>,
-    submitted: Option<String>,
+    /// The operation the worker is running, if any.
+    in_flight: Option<InFlight>,
     /// When the worker last answered. The project watcher reports the
     /// repository changes the panel's own operations make; those are
     /// already reflected, so a refresh right after one is skipped.
@@ -57,8 +66,6 @@ pub struct Panel {
     /// A branch or remote command's outcome, success or failure, waiting
     /// for the window to show it in the status line.
     announcement: Option<String>,
-    /// Whether the operation in flight is one that announces.
-    announces: bool,
     /// Files marked resolved while Git was busy, added in order once it is
     /// free: Mark Resolved saves first, and the save starts a refresh of
     /// its own.
@@ -221,11 +228,9 @@ impl Panel {
             note: "Reading repository…".into(),
             showing_diff: false,
             diff: git::Diff::default(),
-            rx: None,
-            submitted: None,
+            in_flight: None,
             finished_at: None,
             announcement: None,
-            announces: false,
             resolve_queued: Default::default(),
             select_queued: None,
             queued: None,
@@ -238,7 +243,7 @@ impl Panel {
     }
 
     pub fn busy(&self) -> bool {
-        self.rx.is_some()
+        self.in_flight.is_some()
     }
     pub fn branch(&self) -> String {
         self.snapshot
@@ -544,7 +549,11 @@ impl Panel {
     pub fn commit(&mut self) {
         let message = self.message.rope.to_string();
         // A second click while the first commit runs is the same commit.
-        if self.busy() && self.submitted.as_deref() == Some(message.as_str()) {
+        if self
+            .in_flight
+            .as_ref()
+            .is_some_and(|f| f.submitted.as_deref() == Some(message.as_str()))
+        {
             return;
         }
         if self.can_commit() {
@@ -558,12 +567,12 @@ impl Panel {
             }
             return;
         }
-        self.submitted = if let Operation::Commit(message) = &operation {
+        let submitted = if let Operation::Commit(message) = &operation {
             Some(message.clone())
         } else {
             None
         };
-        self.announces = matches!(
+        let announces = matches!(
             operation,
             Operation::Switch(_)
                 | Operation::CreateBranch(_)
@@ -573,7 +582,11 @@ impl Panel {
         let directory = self.directory.clone();
         let previous = self.selected_change().map(|c| c.path.clone());
         let (tx, rx) = mpsc::channel();
-        self.rx = Some(rx);
+        self.in_flight = Some(InFlight {
+            rx,
+            submitted,
+            announces,
+        });
         self.note = "Working…".into();
         std::thread::spawn(move || {
             let result = (|| {
@@ -663,22 +676,24 @@ impl Panel {
         });
     }
     pub fn poll(&mut self) -> bool {
-        let Some(rx) = &self.rx else {
+        let Some(flight) = &self.in_flight else {
             return false;
         };
-        let reply = match rx.try_recv() {
+        let reply = match flight.rx.try_recv() {
             Ok(reply) => reply,
             Err(mpsc::TryRecvError::Empty) => return false,
             Err(mpsc::TryRecvError::Disconnected) => Err("Git worker stopped".into()),
         };
-        self.rx = None;
+        let Some(flight) = self.in_flight.take() else {
+            return false;
+        };
         self.generation += 1;
         self.finished_at = Some(std::time::Instant::now());
         match reply {
             Ok(reply) => {
                 // Branch and remote commands announce, failures included:
                 // they run from the menu, with the panel usually closed.
-                if self.announces {
+                if flight.announces {
                     self.announcement = reply.done.clone().or_else(|| {
                         reply.error.as_ref().map(|e| {
                             // Git's own reason, not its closing "Aborting".
@@ -698,7 +713,7 @@ impl Panel {
                 // scrolled past its end, it drew as "No changes".
                 self.list_scroll = self.list_scroll.min(self.entries().len().saturating_sub(1));
                 if reply.committed
-                    && self.submitted.as_deref() == Some(self.message.rope.to_string().as_str())
+                    && flight.submitted.as_deref() == Some(self.message.rope.to_string().as_str())
                 {
                     self.message = Buffer::new();
                 }
@@ -730,7 +745,7 @@ impl Panel {
                 // A menu-driven Fetch or Switch that failed before its
                 // command ran is said in the status line too, where it can
                 // be seen with the panel closed.
-                if self.announces {
+                if flight.announces {
                     self.announcement = Some(error.clone());
                 }
                 self.note = error;
