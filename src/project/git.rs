@@ -1,8 +1,8 @@
 //! Local Git plumbing. Paths remain OS strings; display labels may be lossy.
 //! Call on workers, never on the event/render thread. No network operations.
+use crate::platform::path_from_bytes;
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -415,7 +415,7 @@ pub fn ignored(directory: &Path) -> Result<std::collections::HashSet<PathBuf>, S
 pub fn toplevel(directory: &Path) -> Result<PathBuf, String> {
     let root = run(directory, &["rev-parse", "--show-toplevel"])?;
     let root = root.strip_suffix(b"\n").unwrap_or(&root);
-    Ok(PathBuf::from(std::ffi::OsString::from_vec(root.to_vec())))
+    Ok(path_from_bytes(root))
 }
 
 /// The text of `path` as of HEAD, or `None` when HEAD has no such file:
@@ -434,7 +434,7 @@ pub fn git_dirs(directory: &Path) -> Vec<PathBuf> {
             if bytes.last() == Some(&b'\n') {
                 bytes.pop();
             }
-            let dir = PathBuf::from(std::ffi::OsString::from_vec(bytes));
+            let dir = path_from_bytes(bytes);
             if !dir.as_os_str().is_empty() && !dirs.contains(&dir) {
                 dirs.push(dir);
             }
@@ -556,7 +556,7 @@ pub fn snapshot(directory: &Path) -> Result<Snapshot, String> {
         if bytes.is_empty() {
             return Err("Git returned no path".into());
         }
-        Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+        Ok(path_from_bytes(bytes))
     };
     let root = answer(&["rev-parse", "--show-toplevel"])?;
     let in_progress = answer(&["rev-parse", "--absolute-git-dir"])
@@ -596,11 +596,11 @@ fn parse_status(root: PathBuf, bytes: &[u8]) -> Result<Snapshot, String> {
         }
         let index = field[0];
         let worktree = field[1];
-        let path = PathBuf::from(std::ffi::OsString::from_vec(field[3..].to_vec()));
+        let path = path_from_bytes(&field[3..]);
         let original = if [index, worktree].iter().any(|c| matches!(c, b'R' | b'C')) {
-            Some(PathBuf::from(std::ffi::OsString::from_vec(
-                fields.next().ok_or("Missing rename source")?.to_vec(),
-            )))
+            Some(path_from_bytes(
+                fields.next().ok_or("Missing rename source")?,
+            ))
         } else {
             None
         };

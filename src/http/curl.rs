@@ -9,6 +9,7 @@
 
 use super::Prepared;
 use super::json;
+use crate::text::buffer::human_size;
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -329,7 +330,7 @@ impl View {
         if let Some(t) = r.time_total {
             facts.push(millis(t));
         }
-        facts.push(human_bytes(r.body.len()));
+        facts.push(human_size(r.body.len() as u64));
         if !r.version.is_empty() {
             facts.push(r.version.clone());
         }
@@ -427,7 +428,7 @@ pub fn body_text(response: &Response) -> (String, Option<&'static str>) {
         Err(_) => (
             format!(
                 "Binary body, {}{}.",
-                human_bytes(response.body.len()),
+                human_size(response.body.len() as u64),
                 if content_type.is_empty() {
                     String::new()
                 } else {
@@ -443,7 +444,7 @@ pub fn body_text(response: &Response) -> (String, Option<&'static str>) {
         }
         text.push_str(&format!(
             "\n[body cut at {}; the rest was not kept]\n",
-            human_bytes(BODY_LIMIT)
+            human_size(BODY_LIMIT as u64)
         ));
     }
     (text, ext)
@@ -472,7 +473,7 @@ pub fn request_text(request: &Prepared) -> String {
         out.push('\n');
         match std::str::from_utf8(body) {
             Ok(text) => out.push_str(text),
-            Err(_) => out.push_str(&format!("[binary body, {}]", human_bytes(body.len()))),
+            Err(_) => out.push_str(&format!("[binary body, {}]", human_size(body.len() as u64))),
         }
         if !out.ends_with('\n') {
             out.push('\n');
@@ -495,18 +496,6 @@ fn millis(seconds: f64) -> String {
         format!("{ms:.0} ms")
     } else {
         format!("{ms:.1} ms")
-    }
-}
-
-fn human_bytes(n: usize) -> String {
-    const KIB: f64 = 1024.0;
-    let n = n as f64;
-    if n < KIB {
-        format!("{n} B")
-    } else if n < KIB * KIB {
-        format!("{:.1} KiB", n / KIB)
-    } else {
-        format!("{:.1} MiB", n / (KIB * KIB))
     }
 }
 
@@ -631,7 +620,7 @@ mod tests {
             "HTTP/2 carries no reason phrase; one is supplied"
         );
         assert_eq!(view.verdict(), Verdict::Success);
-        assert_eq!(view.facts(), "42 ms · 11 B · HTTP/2 · 1.2.3.4");
+        assert_eq!(view.facts(), "42 ms · 11 bytes · HTTP/2 · 1.2.3.4");
         assert_eq!(view.header_count(), 1);
         assert_eq!(
             view.text(Segment::Body),
@@ -685,7 +674,7 @@ mod tests {
             truncated: true,
             ..Response::default()
         };
-        assert!(body_text(&cut).0.contains("[body cut at 4.0 MiB"));
+        assert!(body_text(&cut).0.contains("[body cut at 4 MB"));
         let binary = Response {
             status: 200,
             headers: vec![("Content-Type".into(), "image/png".into())],
@@ -694,7 +683,7 @@ mod tests {
         };
         assert_eq!(
             body_text(&binary),
-            ("Binary body, 3 B, image/png.".to_owned(), None)
+            ("Binary body, 3 bytes, image/png.".to_owned(), None)
         );
     }
 

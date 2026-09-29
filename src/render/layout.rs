@@ -2278,22 +2278,21 @@ fn project_label(atlas: &mut Atlas, name: &str, width: f32) -> String {
         let keep = (low + high).div_ceil(2);
         let head = keep.div_ceil(2);
         let tail = keep / 2;
-        let candidate: String = chars[..head]
-            .iter()
-            .chain(std::iter::once(&'…'))
-            .chain(chars[chars.len() - tail..].iter())
-            .collect();
+        let candidate = middle_ellipsis(&chars, head, tail);
         if ui_text_width(atlas, &candidate) <= width {
             low = keep;
         } else {
             high = keep - 1;
         }
     }
-    let head = low.div_ceil(2);
-    let tail = low / 2;
+    middle_ellipsis(&chars, low.div_ceil(2), low / 2)
+}
+
+/// The first `head` and last `tail` characters joined by an ellipsis.
+fn middle_ellipsis(chars: &[char], head: usize, tail: usize) -> String {
     chars[..head]
         .iter()
-        .chain(std::iter::once(&'…'))
+        .chain(std::iter::once(&'\u{2026}'))
         .chain(chars[chars.len() - tail..].iter())
         .collect()
 }
@@ -2989,11 +2988,7 @@ pub fn build_tab_bar_in(
             let chars: Vec<char> = title.chars().collect();
             let head = fit_cells(chars.iter(), head_cells);
             let tail = fit_cells(chars[head..].iter().rev(), tail_cells);
-            chars[..head]
-                .iter()
-                .chain(std::iter::once(&'\u{2026}'))
-                .chain(chars[chars.len() - tail..].iter())
-                .collect()
+            middle_ellipsis(&chars, head, tail)
         } else {
             title
         };

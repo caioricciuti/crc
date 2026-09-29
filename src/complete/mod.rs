@@ -397,7 +397,7 @@ pub fn path_candidates(query: &PathQuery, limit: usize) -> Vec<Candidate> {
             "folder".to_owned()
         } else {
             let size = entry.metadata().map_or(0, |m| m.len());
-            format!("file · {}", human_bytes(size))
+            format!("file · {}", crate::text::buffer::human_size(size))
         };
         out.push((
             is_dir,
@@ -416,14 +416,6 @@ pub fn path_candidates(query: &PathQuery, limit: usize) -> Vec<Candidate> {
             .then(x.label.to_lowercase().cmp(&y.label.to_lowercase()))
     });
     out.into_iter().take(limit).map(|(_, c)| c).collect()
-}
-
-fn human_bytes(n: u64) -> String {
-    match n {
-        0..1024 => format!("{n} B"),
-        1024..1_048_576 => format!("{:.1} KB", n as f64 / 1024.0),
-        _ => format!("{:.1} MB", n as f64 / 1_048_576.0),
-    }
 }
 
 #[cfg(test)]

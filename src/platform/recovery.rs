@@ -278,11 +278,10 @@ pub fn pending(dir: &Path) -> Pending {
                 readable = false;
                 continue;
             };
-            use std::os::unix::ffi::OsStringExt;
             let path = std::fs::read(crash.join(format!("{n}.path")))
                 .ok()
                 .filter(|p| !p.is_empty())
-                .map(|p| PathBuf::from(std::ffi::OsString::from_vec(p)));
+                .map(crate::platform::path_from_bytes);
             let stamp = std::fs::read_to_string(crash.join(format!("{n}.stamp")))
                 .ok()
                 .and_then(|s| DiskStamp::decode(&s));

@@ -46,6 +46,13 @@ pub fn canonical(path: &std::path::Path) -> std::path::PathBuf {
 }
 
 /// Seconds since 1970, 0 on a clock set before it.
+/// A path from the raw bytes Git, the crash journal and the session store
+/// keep. A `Vec` moves in without a copy.
+pub fn path_from_bytes(bytes: impl Into<Vec<u8>>) -> std::path::PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    std::ffi::OsString::from_vec(bytes.into()).into()
+}
+
 pub fn unix_seconds() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
