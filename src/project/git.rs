@@ -652,12 +652,7 @@ pub fn diff(root: &Path, change: &Change) -> Result<String, String> {
     }
     let mut text = String::new();
     for (staged, title) in [(true, "STAGED"), (false, "WORKING TREE")] {
-        let mut cmd = command(root);
-        cmd.args(["diff", "--no-ext-diff", "--no-textconv"]);
-        if staged {
-            cmd.arg("--cached");
-        }
-        cmd.arg("--").arg(&change.path);
+        let mut cmd = diff_command(root, &change.path, staged);
         if let Some(old) = &change.original {
             cmd.arg(old);
         }
@@ -670,6 +665,18 @@ pub fn diff(root: &Path, change: &Change) -> Result<String, String> {
         text.push_str("No textual diff. This may be a binary file, submodule, or metadata change.");
     }
     Ok(text)
+}
+
+/// `git diff` of one path, of the index against HEAD when `staged`, else of
+/// the worktree against the index. More paths may follow.
+fn diff_command(root: &Path, path: &Path, staged: bool) -> Command {
+    let mut cmd = command(root);
+    cmd.args(["diff", "--no-ext-diff", "--no-textconv"]);
+    if staged {
+        cmd.arg("--cached");
+    }
+    cmd.arg("--").arg(path);
+    cmd
 }
 
 fn diff_output(mut cmd: Command, differences_exit: bool) -> Result<String, String> {
@@ -810,12 +817,7 @@ pub fn stage_hunk(root: &Path, change: &Change, hunk: &Hunk) -> Result<(), Strin
     if !can_stage_hunk(change, hunk.staged) {
         return Err("Hunk action supports tracked text modifications only".into());
     }
-    let mut cmd = command(root);
-    cmd.args(["diff", "--no-ext-diff", "--no-textconv"]);
-    if hunk.staged {
-        cmd.arg("--cached");
-    }
-    cmd.arg("--").arg(&change.path);
+    let mut cmd = diff_command(root, &change.path, hunk.staged);
     let (bytes, truncated) = diff_output_bytes(&mut cmd, false)?;
     if truncated {
         return Err("Diff is too large for a safe hunk action".into());

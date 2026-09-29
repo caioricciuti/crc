@@ -128,16 +128,18 @@ pub fn selection_changed(selection: &Selection) -> String {
             ("text", json::string(&selection.text)),
             ("filePath", json::string(&selection.path.to_string_lossy())),
             ("fileUrl", json::string(&lsp::uri_for(&selection.path))),
-            (
-                "selection",
-                json::object([
-                    ("start", selection.start.to_json()),
-                    ("end", selection.end.to_json()),
-                    ("isEmpty", Value::Bool(selection.start == selection.end)),
-                ]),
-            ),
+            ("selection", selection_range(selection)),
         ]),
     )
+}
+
+/// The `selection` member both the notification and the tool reply carry.
+fn selection_range(selection: &Selection) -> Value {
+    json::object([
+        ("start", selection.start.to_json()),
+        ("end", selection.end.to_json()),
+        ("isEmpty", Value::Bool(selection.start == selection.end)),
+    ])
 }
 
 /// `at_mentioned`: puts a file, or lines of it, into Claude's prompt.
@@ -355,14 +357,7 @@ fn call(id: &Value, params: &Value, host: &mut impl Host) -> Result<Option<Value
                 ("success", Value::Bool(true)),
                 ("text", json::string(&selection.text)),
                 ("filePath", json::string(&selection.path.to_string_lossy())),
-                (
-                    "selection",
-                    json::object([
-                        ("start", selection.start.to_json()),
-                        ("end", selection.end.to_json()),
-                        ("isEmpty", Value::Bool(selection.start == selection.end)),
-                    ]),
-                ),
+                ("selection", selection_range(&selection)),
             ]),
             None => json::object([
                 ("success", Value::Bool(false)),
