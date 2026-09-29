@@ -20,19 +20,22 @@ use crate::text::file_format::{self, DiskFormat};
 use crate::text::rope::Rope;
 use crate::text::wrap;
 
+mod cursors;
+mod disk;
+mod lines;
+mod view;
+pub use disk::*;
+
 /// Fold All reads every line; past this many it is refused.
 pub const FOLD_ALL_MAX_LINES: usize = 100_000;
-
 /// Consecutive edits closer together than this fold into one undo step, so
 /// undo steps back over a word rather than a character.
 const COALESCE_WINDOW: Duration = Duration::from_millis(600);
-
 /// True for a UTF-8 continuation byte, the trailing bytes of a multi-byte
 /// character.
 fn is_continuation(b: u8) -> bool {
     b & 0xC0 == 0x80
 }
-
 /// Bytes `a` and `b` share at the start, up to `limit`, compared a window
 /// at a time.
 fn common_prefix(a: &Rope, b: &Rope, limit: usize) -> usize {
@@ -48,7 +51,6 @@ fn common_prefix(a: &Rope, b: &Rope, limit: usize) -> usize {
     }
     limit
 }
-
 /// Bytes `a` and `b` share at the end, up to `limit`.
 fn common_suffix(a: &Rope, b: &Rope, limit: usize) -> usize {
     const WINDOW: usize = 64 * 1024;
@@ -65,7 +67,6 @@ fn common_suffix(a: &Rope, b: &Rope, limit: usize) -> usize {
     }
     limit
 }
-
 fn window(rope: &Rope, range: std::ops::Range<usize>) -> Vec<u8> {
     let mut out = Vec::with_capacity(range.len());
     for chunk in rope.bytes_in(range) {
@@ -73,163 +74,6 @@ fn window(rope: &Rope, range: std::ops::Range<usize>) -> Vec<u8> {
     }
     out
 }
-
-/// `text` with CRLF and lone CR as LF, the only line break the rope holds.
-pub(crate) fn normalize_newlines(text: &str) -> std::borrow::Cow<'_, str> {
-    if text.contains('\r') {
-        text.replace("\r\n", "\n").replace('\r', "\n").into()
-    } else {
-        text.into()
-    }
-}
-
-/// Copies mode, owner, ACLs and extended attributes onto a replacement file.
-fn copy_metadata(source: &std::path::Path, destination: &std::fs::File) -> std::io::Result<()> {
-    unsafe extern "C" {
-        fn fcopyfile(
-            from: std::os::raw::c_int,
-            to: std::os::raw::c_int,
-            state: *mut std::ffi::c_void,
-            flags: u32,
-        ) -> std::os::raw::c_int;
-    }
-    let original = std::fs::File::open(source)?;
-    // COPYFILE_METADATA = COPYFILE_STAT | COPYFILE_ACL | COPYFILE_XATTR.
-    let rc = unsafe {
-        fcopyfile(
-            original.as_raw_fd(),
-            destination.as_raw_fd(),
-            std::ptr::null_mut(),
-            0b111,
-        )
-    };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-fn matches_disk(
-    path: &std::path::Path,
-    expected: &Rope,
-    format: &DiskFormat,
-) -> std::io::Result<bool> {
-    let mut file = std::fs::File::open(path)?;
-    let mut encoded = Vec::new();
-    file_format::write(&mut encoded, expected, format)?;
-    let mut bytes = Vec::new();
-    for chunk in encoded.chunks(64 * 1024) {
-        bytes.resize(chunk.len(), 0);
-        match file.read_exact(&mut bytes) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
-            Err(e) => return Err(e),
-        }
-        if bytes != chunk {
-            return Ok(false);
-        }
-    }
-    Ok(file.read(&mut [0u8; 1])? == 0)
-}
-
-/// What `stat` said about the file the last time the buffer read or wrote it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DiskStamp {
-    len: u64,
-    modified: Option<std::time::SystemTime>,
-}
-
-impl DiskStamp {
-    /// `len secs nanos`, or `len -` without a modification time: how a
-    /// recovery file keeps it.
-    pub fn encode(&self) -> String {
-        match self
-            .modified
-            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
-        {
-            Some(d) => format!("{} {} {}", self.len, d.as_secs(), d.subsec_nanos()),
-            None => format!("{} -", self.len),
-        }
-    }
-
-    pub fn decode(text: &str) -> Option<Self> {
-        let mut parts = text.split_whitespace();
-        let len = parts.next()?.parse().ok()?;
-        let modified = match parts.next()? {
-            "-" => None,
-            secs => Some(
-                std::time::UNIX_EPOCH
-                    + std::time::Duration::new(secs.parse().ok()?, parts.next()?.parse().ok()?),
-            ),
-        };
-        Some(DiskStamp { len, modified })
-    }
-
-    pub fn of(path: &std::path::Path) -> std::io::Result<Self> {
-        Ok(Self::from(&std::fs::metadata(path)?))
-    }
-}
-
-impl From<&std::fs::Metadata> for DiskStamp {
-    fn from(meta: &std::fs::Metadata) -> Self {
-        DiskStamp {
-            len: meta.len(),
-            modified: meta.modified().ok(),
-        }
-    }
-}
-
-/// A file read for a reload, not yet taken by the buffer.
-pub struct DiskRead {
-    rope: Rope,
-    format: DiskFormat,
-    stamp: Option<DiskStamp>,
-}
-
-impl DiskRead {
-    /// What `stat` said when it was read: still the file's, or it changed
-    /// again while the read was on its way.
-    pub fn stamp(&self) -> Option<DiskStamp> {
-        self.stamp
-    }
-}
-
-/// Files past this open read-only, with the status line saying why.
-pub const READ_ONLY_BYTES: u64 = 512 * 1024 * 1024;
-/// Files past this are not opened at all.
-pub const MAX_OPEN_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-
-/// `512 MB`, `2.0 GB`: sizes as the status line and alerts say them.
-pub fn human_size(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * KB;
-    if bytes >= 1024 * MB {
-        format!("{:.1} GB", bytes as f64 / (1024 * MB) as f64)
-    } else if bytes >= MB {
-        format!("{} MB", bytes.div_ceil(MB))
-    } else if bytes >= KB {
-        format!("{} KB", bytes.div_ceil(KB))
-    } else if bytes == 1 {
-        "1 byte".to_string()
-    } else {
-        format!("{bytes} bytes")
-    }
-}
-
-/// The size past which a file opens read-only: [`READ_ONLY_BYTES`], or less
-/// when `CRC_READ_ONLY_BYTES` says so (the GUI self-test, which cannot write
-/// half a gigabyte per run). What the messages say is this, not the constant.
-pub fn read_only_limit() -> u64 {
-    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *LIMIT.get_or_init(|| {
-        std::env::var("CRC_READ_ONLY_BYTES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(READ_ONLY_BYTES)
-    })
-}
-
 /// The file behind a buffer, compared with what the buffer last saw of it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DiskState {
@@ -241,7 +85,6 @@ pub enum DiskState {
     /// The file is gone, or is no longer a regular file.
     Missing,
 }
-
 /// How a character counts for word motions.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CharClass {
@@ -249,7 +92,6 @@ enum CharClass {
     Punctuation,
     Whitespace,
 }
-
 /// Underscores and digits count as word characters, so `foo_bar2` is one
 /// word rather than three. Identifiers are what people navigate in code.
 fn class_of(c: char) -> CharClass {
@@ -261,7 +103,6 @@ fn class_of(c: char) -> CharClass {
         CharClass::Punctuation
     }
 }
-
 /// Whether a movement collapses the selection or extends it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Motion {
@@ -270,14 +111,12 @@ pub enum Motion {
     /// Shift-movement: the anchor stays put and the selection grows.
     Extend,
 }
-
 /// What produced the most recent edit, for undo coalescing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EditKind {
     Insert,
     Delete,
 }
-
 /// A single change to the text, in the shape an incremental parser needs.
 ///
 /// Byte offsets alone are not enough: tree-sitter also wants row/column for
@@ -294,7 +133,6 @@ pub struct Edit {
     pub old_end_point: (usize, usize),
     pub new_end_point: (usize, usize),
 }
-
 /// A restorable point in the buffer's history.
 #[derive(Clone)]
 struct Snapshot {
@@ -305,14 +143,12 @@ struct Snapshot {
     /// rope without them leaves offsets that point past the end of it.
     extra: Vec<(usize, usize)>,
 }
-
 /// Where a position exactly at an insertion ends up.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AtInsert {
     Before,
     After,
 }
-
 /// What a bare cursor consumes around itself in a multi-cursor edit. A cursor
 /// with a selection always consumes exactly its selection.
 #[derive(Clone, Copy)]
@@ -323,7 +159,6 @@ enum Reach {
     /// The characters either side of it: backspace inside an empty pair.
     Both,
 }
-
 /// How the syntax layer catches up with the text: by the edits since it
 /// last drained them, so a re-parse is incremental, or from scratch when
 /// the text was replaced wholesale (undo, redo, reload), where no edits
@@ -332,7 +167,6 @@ enum SyntaxSync {
     Edits(Vec<Edit>),
     Invalidated,
 }
-
 pub struct Buffer {
     pub rope: Rope,
     /// The moving end of the selection, and where text is inserted.
@@ -413,64 +247,16 @@ pub struct Buffer {
     /// on Save As and is absent for an untitled buffer.
     id: u64,
 }
-
 /// Source of [`Buffer::id`]. Never reused within a run.
 static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-/// Formats macOS Quick Look can display without treating their bytes as text.
-fn is_preview_path(path: &std::path::Path) -> bool {
-    let Some(extension) = path.extension().and_then(|e| e.to_str()) else {
-        return false;
-    };
-    matches!(
-        extension.to_ascii_lowercase().as_str(),
-        "pdf"
-            | "svgz"
-            | "png"
-            | "jpg"
-            | "jpeg"
-            | "gif"
-            | "webp"
-            | "heic"
-            | "heif"
-            | "tif"
-            | "tiff"
-            | "bmp"
-            | "ico"
-            | "icns"
-            | "avif"
-            | "psd"
-            | "mp3"
-            | "m4a"
-            | "wav"
-            | "aiff"
-            | "flac"
-            | "mp4"
-            | "m4v"
-            | "mov"
-            | "avi"
-            | "webm"
-            | "doc"
-            | "docx"
-            | "pages"
-            | "xls"
-            | "xlsx"
-            | "numbers"
-            | "ppt"
-            | "pptx"
-            | "key"
-    )
-}
 
 impl Buffer {
     pub fn new() -> Self {
         Buffer::from_rope(Rope::new())
     }
-
     pub fn from_text(text: &str) -> Self {
         Buffer::from_rope(Rope::from_text(text))
     }
-
     /// A document that exists only in the editor: generated text under a
     /// title, treated as `ext` for highlighting. Clean until it is typed
     /// in, so closing it never asks about unsaved changes.
@@ -480,7 +266,6 @@ impl Buffer {
         buffer.display_ext = Some(ext);
         buffer
     }
-
     /// Replaces the whole text of a generated document with a new version,
     /// keeping the tab, its identity and the caret near where it was.
     pub fn regenerate(&mut self, text: &str) {
@@ -494,7 +279,6 @@ impl Buffer {
         self.redo_stack.clear();
         self.dirty = false;
     }
-
     /// The lowercase file extension, from the path or the display hint.
     pub fn extension(&self) -> Option<String> {
         self.path
@@ -504,501 +288,12 @@ impl Buffer {
             .map(str::to_ascii_lowercase)
             .or_else(|| self.display_ext.map(str::to_owned))
     }
-
-    /// Loads a file, remembering the path so it can be saved back.
-    ///
-    /// Past [`READ_ONLY_BYTES`] it opens read-only; past [`MAX_OPEN_BYTES`]
-    /// it is refused with `FileTooLarge` before a byte is read. The file is
-    /// held about three times over while it loads (bytes, decoded text,
-    /// rope), so the cap is what keeps a stray disk image from taking the
-    /// machine's memory. `CRC_READ_ONLY_BYTES` lowers the first limit for
-    /// the GUI self-test, which cannot write half a gigabyte per run.
-    pub fn open(path: impl Into<std::path::PathBuf>) -> std::io::Result<Self> {
-        Self::open_with_limits(path.into(), read_only_limit(), MAX_OPEN_BYTES)
-    }
-
-    fn open_with_limits(
-        path: std::path::PathBuf,
-        read_only_at: u64,
-        max: u64,
-    ) -> std::io::Result<Self> {
-        if is_preview_path(&path) {
-            std::fs::metadata(&path)?;
-            return Ok(Self::preview_file(path));
-        }
-        let len = std::fs::metadata(&path)?.len();
-        if len > max {
-            let name = path.file_name().map_or_else(
-                || path.display().to_string(),
-                |n| n.to_string_lossy().into_owned(),
-            );
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::FileTooLarge,
-                format!(
-                    "{name} is {}; crc opens files up to {}",
-                    human_size(len),
-                    human_size(max)
-                ),
-            ));
-        }
-        let raw = std::fs::read(&path)?;
-        let (text, format) = match file_format::decode(&raw) {
-            Ok(decoded) => decoded,
-            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
-                return Ok(Self::preview_file(path));
-            }
-            Err(error) => return Err(error),
-        };
-        let mut buffer = Buffer::from_text(&text);
-        buffer.format = format;
-        // Canonicalise, so the same file reached by two different routes is
-        // the same document. Without it a symlink, a `..`, or a path from
-        // the sidebar versus one from Cmd-P are different keys and open a
-        // second tab onto identical text, which can then diverge.
-        buffer.stamp = DiskStamp::of(&path).ok();
-        buffer.path = Some(crate::platform::canonical(&path));
-        buffer.saved = Some(buffer.rope.clone());
-        buffer.read_only = len > read_only_at;
-        if let Some(path) = &buffer.path {
-            buffer.indent_style = crate::text::indent::for_file(path, &buffer.rope);
-        }
-        Ok(buffer)
-    }
-
-    /// What `stat` said the last time this buffer read or wrote its file.
-    pub fn disk_stamp(&self) -> Option<DiskStamp> {
-        self.stamp
-    }
-
-    /// Opened past [`READ_ONLY_BYTES`], so it cannot be edited.
-    pub fn is_read_only(&self) -> bool {
-        self.read_only
-    }
-
-    /// Whether edits are refused: a preview has no text to edit, and a
-    /// read-only file is too big to.
-    fn is_locked(&self) -> bool {
-        self.preview_file || self.read_only || self.home_page || self.view_only
-    }
-
-    pub fn set_view_only(&mut self, view_only: bool) {
-        self.view_only = view_only;
-    }
-
-    /// A tab with no text of its own: no caret, encoding or save state.
-    pub fn is_view_only(&self) -> bool {
-        self.view_only
-    }
-
-    /// Marks this as the document behind the Home page, which refuses edits.
-    pub fn set_home_page(&mut self, home: bool) {
-        self.home_page = home;
-    }
-
-    /// Whether the file behind this buffer still matches the last read or
-    /// write. One `stat`, so it is cheap enough to ask on every watcher batch
-    /// and every time the window comes to the front.
-    pub fn disk_state(&self) -> DiskState {
-        let (Some(path), Some(stamp)) = (&self.path, self.stamp) else {
-            return DiskState::Unchanged;
-        };
-        if self.preview_file {
-            return DiskState::Unchanged;
-        }
-        match std::fs::metadata(path) {
-            Ok(meta) if !meta.is_file() => DiskState::Missing,
-            Ok(meta) => {
-                let now = DiskStamp::from(&meta);
-                if now == stamp {
-                    DiskState::Unchanged
-                } else {
-                    DiskState::Changed
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => DiskState::Missing,
-            Err(_) => DiskState::Unchanged,
-        }
-    }
-
-    /// Re-reads the file behind the buffer, replacing the text.
-    ///
-    /// The previous text goes on the undo stack, so a reload that took
-    /// something away is one Cmd-Z from coming back (as an unsaved change).
-    /// The caret and scroll stay where they were, clamped to the new text.
-    pub fn reload(&mut self) -> std::io::Result<()> {
-        let Some(path) = self.path.clone() else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "buffer has no path to reload from",
-            ));
-        };
-        if self.preview_file {
-            return Ok(());
-        }
-        let read = Buffer::read_disk(&path)?;
-        self.apply_disk(read);
-        Ok(())
-    }
-
-    /// The file at `path` as a reload would take it. Touches nothing of a
-    /// buffer, so a large file can be read on another thread.
-    pub fn read_disk(path: &std::path::Path) -> std::io::Result<DiskRead> {
-        let raw = std::fs::read(path)?;
-        let (text, format) = file_format::decode(&raw)?;
-        Ok(DiskRead {
-            rope: Rope::from_text(&text),
-            format,
-            stamp: DiskStamp::of(path).ok(),
-        })
-    }
-
-    /// Takes the text [`Buffer::read_disk`] read, keeping the old text under
-    /// undo.
-    pub fn apply_disk(&mut self, read: DiskRead) {
-        let DiskRead {
-            rope,
-            format,
-            stamp,
-        } = read;
-        let before = self.snapshot();
-        self.rope = rope;
-        self.format = format;
-        self.extra.clear();
-        self.clamp_positions();
-        self.undo_stack.push(before);
-        self.redo_stack.clear();
-        self.invalidate_edits();
-        self.goal_column = None;
-        self.saved = Some(self.rope.clone());
-        self.stamp = stamp;
-        self.conflict_noticed = false;
-        self.dirty = false;
-    }
-
-    /// The file behind the buffer was deleted by something else. The text
-    /// is now the only copy, which is what "unsaved" means: the tab gets its
-    /// dot and closing asks first.
-    pub fn note_missing_on_disk(&mut self) {
-        if self.path.is_some() && !self.preview_file {
-            self.dirty = true;
-        }
-    }
-
-    fn preview_file(path: std::path::PathBuf) -> Self {
-        let mut buffer = Buffer::new();
-        buffer.path = Some(crate::platform::canonical(&path));
-        buffer.preview_file = true;
-        buffer.saved = Some(buffer.rope.clone());
-        buffer
-    }
-
-    pub fn is_preview_file(&self) -> bool {
-        self.preview_file
-    }
-
-    /// Rebuilds a document from text that outlived a crash.
-    ///
-    /// Dirty from the start, and the file at `path` is not read: what is on
-    /// disk is the last save, and this is what came after it.
-    ///
-    /// `stamp` is what the crashed instance knew of the file. When the file
-    /// has changed since, the disk text is not what the edits were made
-    /// against: the first save asks, as for any change on disk.
-    pub fn recovered(
-        path: Option<std::path::PathBuf>,
-        text: &str,
-        stamp: Option<DiskStamp>,
-    ) -> Self {
-        let path = path.map(|p| crate::platform::canonical(&p));
-        let mut buffer = Buffer::from_text(text);
-        if let Some((saved, format)) = path
-            .as_deref()
-            .and_then(|p| std::fs::read(p).ok())
-            .and_then(|raw| file_format::decode(&raw).ok())
-        {
-            buffer.saved = Some(Rope::from_text(&saved));
-            buffer.format = format;
-        }
-        let now = path.as_deref().and_then(|p| DiskStamp::of(p).ok());
-        buffer.stamp = stamp.or(now);
-        if stamp.is_some() && stamp != now {
-            buffer.saved = None;
-        }
-        buffer.path = path;
-        buffer.dirty = true;
-        buffer
-    }
-
-    /// Writes back to `path`, or to the path it was opened from.
-    pub fn save(&mut self, path: Option<&std::path::Path>) -> std::io::Result<()> {
-        self.save_with(path, false)
-    }
-
-    /// Saves over whatever is on disk, for a user who has seen the conflict
-    /// and chosen their copy. Everything else about the write is the same.
-    pub fn save_overwriting(&mut self, path: Option<&std::path::Path>) -> std::io::Result<()> {
-        self.save_with(path, true)
-    }
-
-    fn save_with(&mut self, path: Option<&std::path::Path>, force: bool) -> std::io::Result<()> {
-        if self.preview_file {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "preview files are read-only",
-            ));
-        }
-        let target = match (path, &self.path) {
-            (Some(p), _) => p.to_path_buf(),
-            (None, Some(p)) => p.clone(),
-            (None, None) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "buffer has no path; save-as is required",
-                ));
-            }
-        };
-        // Resolve Save As symlinks too: replacing the link would leave its
-        // destination untouched and turn this tab into a different file.
-        let target = match std::fs::canonicalize(&target) {
-            Ok(path) => path,
-            Err(e)
-                if std::fs::symlink_metadata(&target).is_ok_and(|m| m.file_type().is_symlink()) =>
-            {
-                return Err(e);
-            }
-            Err(_) => target,
-        };
-        let existing = match std::fs::metadata(&target) {
-            Ok(meta) => Some(meta),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e),
-        };
-        if let Some(meta) = &existing {
-            if !meta.is_file() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "target is not a regular file",
-                ));
-            }
-            if !force && self.path.as_deref() == Some(target.as_path()) {
-                let expected = self.saved.as_ref().ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::AlreadyExists,
-                        "cannot verify the previous disk contents",
-                    )
-                })?;
-                // Our own stamp still on the file means nobody wrote it since;
-                // only a changed stamp costs reading the whole file.
-                let unchanged = self.stamp.is_some() && DiskStamp::of(&target).ok() == self.stamp;
-                if !unchanged && !matches_disk(&target, expected, &self.format)? {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::AlreadyExists,
-                        "file changed on disk since it was opened",
-                    ));
-                }
-            }
-        } else if !force && self.saved.is_some() && self.path.as_deref() == Some(target.as_path()) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "file was removed from disk",
-            ));
-        }
-
-        file_format::validate(&self.rope, &self.format)?;
-        // The format this text is written with. It replaces `self.format`
-        // only once the write landed: until then the endings stay numbered
-        // by the saved text's lines, which a rollback and the next save need.
-        let format = self.format_for_save();
-        let in_place = existing.as_ref().is_some_and(|m| m.nlink() > 1);
-        let atomic = if in_place {
-            None
-        } else {
-            Some(self.write_replacing(&target, existing.is_some(), &format))
-        };
-        match atomic {
-            Some(Ok(())) => {}
-            // A writable file in a directory we may not create in: write
-            // the file itself, as for a hard link.
-            Some(Err(e))
-                if e.kind() == std::io::ErrorKind::PermissionDenied && existing.is_some() =>
-            {
-                self.write_in_place(&target, &format)?;
-            }
-            Some(Err(e)) => return Err(e),
-            // Rename would silently detach the other names from this file.
-            // Writing the same inode preserves its links, ACLs and xattrs.
-            None => self.write_in_place(&target, &format)?,
-        }
-        self.format = format;
-        self.stamp = DiskStamp::of(&target).ok();
-        self.conflict_noticed = false;
-        self.path = Some(crate::platform::canonical(&target));
-        self.saved = Some(self.rope.clone());
-        self.dirty = false;
-        Ok(())
-    }
-
-    /// The format to write the text with. A file with mixed line endings
-    /// keeps one per newline, by position. Lines added or removed since the
-    /// last save shift those positions, so each line that is still there
-    /// takes the ending it had, and each new one the file's usual ending.
-    fn format_for_save(&self) -> DiskFormat {
-        let mut format = self.format.clone();
-        let preferred = self.format.preferred;
-        if self.format.endings.iter().all(|e| *e == preferred) {
-            return format;
-        }
-        let Some(saved) = &self.saved else {
-            return format;
-        };
-        if saved.same_as(&self.rope) {
-            return format;
-        }
-        let (old, new) = (saved.to_string(), self.rope.to_string());
-        let mut endings = vec![preferred; new.bytes().filter(|b| *b == b'\n').count()];
-        for (was, is) in crate::ide::diff::unchanged_lines(&old, &new) {
-            if let (Some(slot), Some(ending)) = (endings.get_mut(is), self.format.endings.get(was))
-            {
-                *slot = *ending;
-            }
-        }
-        format.endings = endings;
-        format
-    }
-
-    /// Writes over the file's own bytes. Nothing is truncated before the new
-    /// text is all written, and a write that fails half-way puts the old
-    /// text back, when it is known.
-    fn write_in_place(&self, target: &std::path::Path, format: &DiskFormat) -> std::io::Result<()> {
-        use std::os::unix::fs::FileExt;
-        let mut new = Vec::new();
-        file_format::write(&mut new, &self.rope, format)?;
-        let mut old = None;
-        if let Some(saved) = &self.saved
-            && self.path.as_deref() == Some(target)
-        {
-            let mut bytes = Vec::new();
-            file_format::write(&mut bytes, saved, &self.format)?;
-            old = Some(bytes);
-        }
-        let file = std::fs::OpenOptions::new().write(true).open(target)?;
-        let result = file
-            .write_all_at(&new, 0)
-            .and_then(|()| file.set_len(new.len() as u64))
-            .and_then(|()| file.sync_all());
-        if let (Err(_), Some(old)) = (&result, old) {
-            let _ = file
-                .write_all_at(&old, 0)
-                .and_then(|()| file.set_len(old.len() as u64))
-                .and_then(|()| file.sync_all());
-        }
-        result
-    }
-
-    /// Writes a temporary file next to `target` and renames it over.
-    fn write_replacing(
-        &self,
-        target: &std::path::Path,
-        existing: bool,
-        format: &DiskFormat,
-    ) -> std::io::Result<()> {
-        {
-            let parent = target.parent().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "target has no parent directory",
-                )
-            })?;
-            let mut tmp = None;
-            for nonce in 0..1000 {
-                let candidate = parent.join(format!(
-                    ".crc-{}-{}-{nonce}.tmp",
-                    std::process::id(),
-                    self.id
-                ));
-                match std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&candidate)
-                {
-                    Ok(file) => {
-                        tmp = Some((candidate, file));
-                        break;
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                    Err(e) => return Err(e),
-                }
-            }
-            let (temp_path, mut file) = tmp.ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    "could not create a unique temporary file",
-                )
-            })?;
-            let result: std::io::Result<()> = (|| {
-                file_format::write(&mut file, &self.rope, format)?;
-                if existing {
-                    copy_metadata(target, &file)?;
-                    // COPYFILE_STAT also copies the old modification time.
-                    file.set_times(
-                        std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()),
-                    )?;
-                }
-                file.sync_all()?;
-                std::fs::rename(&temp_path, target)?;
-                std::fs::File::open(parent)?.sync_all()?;
-                Ok(())
-            })();
-            if result.is_err() {
-                let _ = std::fs::remove_file(&temp_path);
-            }
-            result
-        }
-    }
-
-    fn from_rope(rope: Rope) -> Self {
-        Buffer {
-            rope,
-            cursor: 0,
-            anchor: 0,
-            extra: Vec::new(),
-            read_only: false,
-            home_page: false,
-            view_only: false,
-            scroll_line: 0,
-            scroll_fraction: 0.0,
-            scroll_column: 0,
-            wrap: None,
-            scroll_row: 0,
-            wrap_choice: None,
-            folds: Vec::new(),
-            indent_style: None,
-            goal_column: None,
-            undo_stack: Vec::new(),
-            redo_stack: Vec::new(),
-            last_edit: None,
-            syntax_sync: SyntaxSync::Edits(Vec::new()),
-            path: None,
-            label: None,
-            display_ext: None,
-            preview_file: false,
-            dirty: false,
-            saved: None,
-            stamp: None,
-            conflict_noticed: false,
-            format: DiskFormat::default(),
-            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        }
-    }
-
     pub fn id(&self) -> u64 {
         self.id
     }
-
     pub fn cursor(&self) -> usize {
         self.cursor
     }
-
     /// What the document is called: its file name, else its label (a
     /// response tab), else "Untitled".
     pub fn display_name(&self) -> String {
@@ -1009,15 +304,12 @@ impl Buffer {
             .or_else(|| self.label.clone())
             .unwrap_or_else(|| "Untitled".to_string())
     }
-
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
-
     pub fn disk_format(&self) -> &DiskFormat {
         &self.format
     }
-
     /// The selected byte range, or `None` when the selection is empty.
     pub fn selection(&self) -> Option<std::ops::Range<usize>> {
         if self.anchor == self.cursor {
@@ -1026,36 +318,30 @@ impl Buffer {
             Some(self.anchor.min(self.cursor)..self.anchor.max(self.cursor))
         }
     }
-
     pub fn selected_text(&self) -> Option<String> {
         self.selection().map(|r| self.rope.slice_to_string(r))
     }
-
     pub fn select_all(&mut self) {
         self.anchor = 0;
         self.cursor = self.rope.len_bytes();
         self.goal_column = None;
     }
-
     /// Cursor position as (line, column in characters).
     pub fn cursor_position(&self) -> (usize, usize) {
         self.position_of(self.cursor)
     }
-
     pub fn position_of(&self, byte: usize) -> (usize, usize) {
         let line = self.rope.byte_to_line(byte);
         let line_start = self.rope.line_to_byte(line);
         let column = self.rope.byte_to_char(byte) - self.rope.byte_to_char(line_start);
         (line, column)
     }
-
     /// Byte offset for a (line, column) pair, clamped into the buffer. Used
     /// by mouse hit-testing.
     pub fn offset_at(&self, line: usize, column: usize) -> usize {
         let line = line.min(self.rope.len_lines().saturating_sub(1));
         self.byte_at(line, column)
     }
-
     /// Moves the cursor, optionally dragging the selection with it.
     pub fn place_cursor(&mut self, byte: usize, motion: Motion) {
         self.cursor = self.char_floor(byte);
@@ -1064,7 +350,6 @@ impl Buffer {
         // of the current undo run.
         self.after_move(motion);
     }
-
     /// Sets the selection outright, as one cursor. For the mouse, which
     /// knows both ends at once.
     pub fn select_range(&mut self, anchor: usize, cursor: usize) {
@@ -1075,7 +360,6 @@ impl Buffer {
         self.after_move(Motion::Extend);
         self.extra.clear();
     }
-
     /// The selection as the system's text input machinery wants it: UTF-16
     /// units, as (location, length).
     ///
@@ -1093,7 +377,6 @@ impl Buffer {
             units(range.start, range.end),
         )
     }
-
     /// Selects a range given in the coordinates of [`Buffer::input_selection`],
     /// clamped to the caret's line. This is how the press-and-hold accent
     /// menu says "replace the `e` you just typed".
@@ -1111,7 +394,6 @@ impl Buffer {
         let end = at(location + length).max(start);
         self.select_range(start, end);
     }
-
     /// The run of like characters around `at`: a word, a run of punctuation,
     /// or a run of spaces, whichever `at` is in. This is what a double click
     /// selects. It never crosses a line end.
@@ -1137,7 +419,6 @@ impl Buffer {
         }
         start..end
     }
-
     /// The whole line containing `at`, with its line ending, which is what a
     /// triple click selects: deleting it then takes the line away, not just
     /// its text.
@@ -1147,7 +428,6 @@ impl Buffer {
     }
 
     // ---- editing ---------------------------------------------------------
-
     fn snapshot(&self) -> Snapshot {
         Snapshot {
             rope: self.rope.clone(),
@@ -1156,7 +436,6 @@ impl Buffer {
             extra: self.extra.clone(),
         }
     }
-
     fn restore(&mut self, snapshot: Snapshot) {
         self.folds.clear();
         self.rope = snapshot.rope;
@@ -1164,7 +443,6 @@ impl Buffer {
         self.anchor = snapshot.anchor;
         self.extra = snapshot.extra;
     }
-
     /// Checkpoint for an edit made at the primary cursor only, which is every
     /// edit except plain typing and backspace.
     ///
@@ -1176,7 +454,6 @@ impl Buffer {
         self.checkpoint_keeping_cursors(kind);
         self.extra.clear();
     }
-
     /// Captures a snapshot unless this edit should fold into the previous
     /// one. Must be called before mutating the rope.
     fn checkpoint_keeping_cursors(&mut self, kind: EditKind) {
@@ -1192,7 +469,6 @@ impl Buffer {
         self.redo_stack.clear();
         self.dirty = true;
     }
-
     pub fn insert(&mut self, text: &str) {
         if self.is_locked() {
             return;
@@ -1219,7 +495,6 @@ impl Buffer {
 
         self.record_edit(start, old_end, old_end_point, self.cursor);
     }
-
     /// Deletes the selection if there is one, otherwise the character before
     /// the cursor.
     pub fn backspace(&mut self) {
@@ -1251,7 +526,6 @@ impl Buffer {
         self.goal_column = None;
         self.record_edit(prev, old_end, old_end_point, prev);
     }
-
     /// Deletes the selection if there is one, otherwise the character at the
     /// cursor.
     pub fn delete_forward(&mut self) {
@@ -1274,7 +548,6 @@ impl Buffer {
         self.goal_column = None;
         self.record_edit(self.cursor, next, old_end_point, self.cursor);
     }
-
     /// Removes the selected range. Assumes a checkpoint has been taken.
     fn delete_selection_inner(&mut self) {
         if let Some(range) = self.selection() {
@@ -1283,7 +556,6 @@ impl Buffer {
             self.anchor = range.start;
         }
     }
-
     /// Deletes `range`, recording the edit. Used by the word and line
     /// deletions, which all have the same shape.
     fn delete_range_recorded(&mut self, range: std::ops::Range<usize>) {
@@ -1295,19 +567,15 @@ impl Buffer {
         self.goal_column = None;
         self.record_edit(start, old_end, old_end_point, start);
     }
-
     pub fn can_undo(&self) -> bool {
         !self.undo_stack.is_empty()
     }
-
     pub fn can_redo(&self) -> bool {
         !self.redo_stack.is_empty()
     }
-
     pub fn undo(&mut self) -> bool {
         self.step_history(true)
     }
-
     /// Undo or redo: the top of one stack becomes the text, and the text as
     /// it was goes on the other.
     fn step_history(&mut self, undo: bool) -> bool {
@@ -1340,7 +608,6 @@ impl Buffer {
         self.dirty = !self.matches_saved();
         true
     }
-
     /// Whether the text is the one last read or written: back there by
     /// undo or redo, a document has nothing unsaved.
     fn matches_saved(&self) -> bool {
@@ -1350,794 +617,11 @@ impl Buffer {
                     && common_prefix(saved, &self.rope, saved.len_bytes()) == saved.len_bytes())
         })
     }
-
     pub fn redo(&mut self) -> bool {
         self.step_history(false)
     }
 
     // ---- multiple cursors ------------------------------------------------
-
-    /// How many cursors are active, including the primary.
-    pub fn cursor_count(&self) -> usize {
-        self.extra.len() + 1
-    }
-
-    /// Every selection as a normalised `(start, end)`, ascending, with
-    /// overlaps merged.
-    ///
-    /// Merging matters: two cursors that have grown into each other must
-    /// become one, or an edit would be applied twice to the same text.
-    /// Selections that merely touch stay apart, since `ab` selected twice in
-    /// `abab` is two selections, but a bare caret on the edge of a selection
-    /// has nothing of its own to edit and folds into it.
-    fn all_selections(&self) -> Vec<(usize, usize)> {
-        let mut out: Vec<(usize, usize)> = std::iter::once((self.anchor, self.cursor))
-            .chain(self.extra.iter().copied())
-            .map(|(a, h)| (a.min(h), a.max(h)))
-            .collect();
-        out.sort_by_key(|r| r.0);
-
-        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(out.len());
-        for range in out {
-            match merged.last_mut() {
-                Some(last)
-                    if range.0 < last.1
-                        || (range.0 == last.1 && (range.0 == range.1 || last.0 == last.1)) =>
-                {
-                    last.1 = last.1.max(range.1)
-                }
-                _ => merged.push(range),
-            }
-        }
-        merged
-    }
-
-    /// Every selection as `(start, end)`, ascending and merged. Public so
-    /// the renderer can draw all of them.
-    pub fn selections(&self) -> Vec<(usize, usize)> {
-        self.all_selections()
-    }
-
-    /// Every caret position, ascending. Empty selections included.
-    pub fn caret_positions(&self) -> Vec<usize> {
-        let mut out: Vec<usize> = std::iter::once(self.cursor)
-            .chain(self.extra.iter().map(|&(_, h)| h))
-            .collect();
-        out.sort_unstable();
-        out.dedup();
-        out
-    }
-
-    /// Adds a cursor, ignoring one that duplicates an existing position.
-    pub fn add_cursor(&mut self, anchor: usize, head: usize) {
-        let (anchor, head) = (self.char_floor(anchor), self.char_floor(head));
-        if (self.anchor, self.cursor) == (anchor, head) || self.extra.contains(&(anchor, head)) {
-            return;
-        }
-        self.extra.push((anchor, head));
-    }
-
-    /// Drops every cursor but the primary.
-    pub fn collapse_cursors(&mut self) -> bool {
-        if self.extra.is_empty() {
-            return false;
-        }
-        self.extra.clear();
-        true
-    }
-
-    /// Cmd-D: selects the word at the cursor, or adds the next occurrence of
-    /// the current selection as another cursor.
-    pub fn select_next_occurrence(&mut self) -> bool {
-        let Some(range) = self.selection() else {
-            // Nothing selected yet: select the word under the caret, which is
-            // what makes the first press useful. A caret at the end of a
-            // word still means that word, not the delimiter after it.
-            let is_word = |c: Option<char>| c.is_some_and(|c| class_of(c) == CharClass::Word);
-            let start =
-                if !is_word(self.char_at(self.cursor)) && is_word(self.char_before(self.cursor)) {
-                    self.prev_word_boundary(self.cursor)
-                } else {
-                    self.prev_word_boundary(self.next_boundary(self.cursor))
-                };
-            let end = self.next_word_boundary(start);
-            if end <= start {
-                return false;
-            }
-            self.anchor = start;
-            self.cursor = end;
-            return true;
-        };
-
-        let needle = self.rope.slice_to_string(range.clone());
-        if needle.is_empty() {
-            return false;
-        }
-
-        // Search forward from the furthest selection, wrapping once, and
-        // skipping occurrences that already have a cursor: after the wrap the
-        // first hit is usually one of those, and stopping at it would leave
-        // everything between it and the starting point unreachable.
-        let selected = self.all_selections();
-        let from = selected.last().map_or(range.end, |r| r.1);
-        let mut at = from;
-        let mut wrapped = false;
-        loop {
-            match self.rope.find_from(&needle, at) {
-                Some(found) if wrapped && found >= from => return false,
-                Some(found) if selected.iter().any(|r| r.0 == found) => {
-                    at = found + needle.len();
-                }
-                Some(found) => {
-                    self.add_cursor(found, found + needle.len());
-                    return true;
-                }
-                None if wrapped => return false,
-                None => {
-                    wrapped = true;
-                    at = 0;
-                }
-            }
-        }
-    }
-
-    /// Replaces every selection with `replacement`; every cursor lands at
-    /// the end of its replacement.
-    fn edit_at_all_cursors(&mut self, replacement: &str, reach: Reach) {
-        // Every range is measured here, against the text as it is, before any
-        // of them is applied. How far a caret reaches depends on the
-        // character next to *that* caret: one width for all of them deleted
-        // half of an accent under one cursor because another sat after an
-        // ASCII letter.
-        let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
-        for (start, end) in self.all_selections() {
-            let range = match reach {
-                _ if end > start => start..end,
-                Reach::Nothing => start..end,
-                Reach::Back => self.prev_boundary(start)..end,
-                Reach::Both => self.prev_boundary(start)..self.next_boundary(end),
-            };
-            // Reaching can run into the neighbour, and two edits over the
-            // same bytes would delete past what the first one left.
-            match ranges.last_mut() {
-                Some(last) if range.start < last.end => last.end = last.end.max(range.end),
-                _ => ranges.push(range),
-            }
-        }
-        // Each cursor as a caret at its selection's end, which the edits
-        // carry to the end of its replacement.
-        let end = |(a, b): (usize, usize)| (a.max(b), a.max(b));
-        (self.anchor, self.cursor) = end((self.anchor, self.cursor));
-        for cursor in &mut self.extra {
-            *cursor = end(*cursor);
-        }
-        let edits: Vec<_> = ranges.into_iter().map(|r| (r, replacement)).collect();
-        self.apply_edits(&edits, AtInsert::After);
-        // Cursors whose ranges merged now share a place; keep one there.
-        let mut seen = std::collections::HashSet::from([self.cursor]);
-        self.extra.retain(|&(_, at)| seen.insert(at));
-    }
-
-    /// Applies `edits` within the current undo step. They are in order, do
-    /// not overlap, and are measured against the text as it is. Each goes
-    /// in back to front and is recorded for the parser, so the tree updates
-    /// incrementally, and every caret and anchor moves with the text around
-    /// it: before an edit it stays, after one it shifts by the change,
-    /// inside a replaced range it lands at the end of the replacement, and
-    /// exactly at an insertion it goes to `at_insert`'s side.
-    fn apply_edits(&mut self, edits: &[(std::ops::Range<usize>, &str)], at_insert: AtInsert) {
-        for (range, text) in edits.iter().rev() {
-            let old_end_point = self.point_of(range.end);
-            if !range.is_empty() {
-                self.rope.delete(range.clone());
-            }
-            if !text.is_empty() {
-                self.rope.insert(range.start, text);
-            }
-            self.record_edit(
-                range.start,
-                range.end,
-                old_end_point,
-                range.start + text.len(),
-            );
-        }
-        // shifts[i]: how far the edits before `i` move what follows them.
-        let mut shifts = Vec::with_capacity(edits.len() + 1);
-        let mut shift = 0isize;
-        shifts.push(0);
-        for (range, text) in edits {
-            shift += text.len() as isize - range.len() as isize;
-            shifts.push(shift);
-        }
-        let map = |pos: usize| -> usize {
-            let passed = edits.partition_point(|(range, _)| {
-                pos > range.end
-                    || (pos == range.end && (!range.is_empty() || at_insert == AtInsert::After))
-            });
-            let moved = match edits.get(passed) {
-                Some((range, text)) if range.start < pos => {
-                    range.start as isize + shifts[passed] + text.len() as isize
-                }
-                _ => pos as isize + shifts[passed],
-            };
-            moved.max(0) as usize
-        };
-        self.cursor = map(self.cursor);
-        self.anchor = map(self.anchor);
-        for cursor in &mut self.extra {
-            *cursor = (map(cursor.0), map(cursor.1));
-        }
-        self.clamp_positions();
-    }
-
-    /// Whether every cursor is a bare caret for which `test` holds.
-    fn every_caret(&self, test: impl Fn(&Self, usize) -> bool) -> bool {
-        self.all_selections()
-            .iter()
-            .all(|&(start, end)| start == end && test(self, start))
-    }
-
-    /// Moves every caret by `by` bytes, collapsing each to a bare caret.
-    fn shift_carets(&mut self, by: isize) {
-        let shift = |p: usize| (p as isize + by).max(0) as usize;
-        self.cursor = shift(self.cursor);
-        self.anchor = self.cursor;
-        for cursor in &mut self.extra {
-            cursor.1 = shift(cursor.1);
-            cursor.0 = cursor.1;
-        }
-        self.clamp_positions();
-    }
-
-    // ---- bracket pairing -------------------------------------------------
-
-    /// Types `ch`, auto-closing brackets and quotes where it helps.
-    ///
-    /// Three behaviours, all of which exist because their absence is
-    /// immediately irritating:
-    ///   - typing an opener inserts the pair and sits between them
-    ///   - typing a closer that is already there steps over it instead of
-    ///     inserting a second one
-    ///   - with text selected, an opener wraps the selection
-    ///
-    /// Auto-close is suppressed when the next character is a letter or digit,
-    /// because typing `(` before an existing word almost always means calling
-    /// it, not wrapping it.
-    pub fn insert_char_paired(&mut self, ch: char) {
-        if self.is_locked() {
-            return;
-        }
-        let closer = match ch {
-            '(' => Some(')'),
-            '[' => Some(']'),
-            '{' => Some('}'),
-            '"' => Some('"'),
-            '\'' => Some('\''),
-            '`' => Some('`'),
-            _ => None,
-        };
-
-        // Wrap a selection rather than replacing it.
-        if let (Some(closer), Some(range)) = (closer, self.selection()) {
-            // The wrapped text is the primary selection's. Other cursors may
-            // hold something else, or nothing, so this is a one-cursor edit.
-            self.extra.clear();
-            let text = self.rope.slice_to_string(range.clone());
-            self.insert(&format!("{ch}{text}{closer}"));
-            // Leave the wrapped text selected, which is what makes wrapping
-            // twice work.
-            self.anchor = range.start + ch.len_utf8();
-            self.cursor = self.anchor + text.len();
-            return;
-        }
-
-        // Step over a closer that is already there.
-        if matches!(ch, ')' | ']' | '}' | '"' | '\'' | '`')
-            && self.every_caret(|b, at| b.char_at(at) == Some(ch))
-        {
-            // At every caret or at none: stepping over at some and typing at
-            // others would leave the cursors disagreeing about what happened.
-            self.shift_carets(ch.len_utf8() as isize);
-            self.last_edit = None;
-            self.goal_column = None;
-            return;
-        }
-
-        let Some(closer) = closer else {
-            self.insert(&ch.to_string());
-            return;
-        };
-
-        let next_is_word = self
-            .char_at(self.cursor)
-            .is_some_and(crate::complete::is_word_char);
-        if next_is_word {
-            self.insert(&ch.to_string());
-            return;
-        }
-
-        // A quote immediately after a word is a closing quote or an
-        // apostrophe, not the start of a new string.
-        if matches!(ch, '"' | '\'' | '`')
-            && self
-                .char_before(self.cursor)
-                .is_some_and(crate::complete::is_word_char)
-        {
-            self.insert(&ch.to_string());
-            return;
-        }
-
-        let mut pair = String::with_capacity(2);
-        pair.push(ch);
-        pair.push(closer);
-        self.insert(&pair);
-        // Every cursor typed the pair, so every cursor sits inside its own.
-        self.shift_carets(-(closer.len_utf8() as isize));
-    }
-
-    /// Backspace that removes both halves of an empty pair.
-    pub fn backspace_paired(&mut self) {
-        if self.is_locked() {
-            return;
-        }
-        const PAIRS: [(char, char); 6] = [
-            ('(', ')'),
-            ('[', ']'),
-            ('{', '}'),
-            ('"', '"'),
-            ('\'', '\''),
-            ('`', '`'),
-        ];
-        if !self.extra.is_empty() {
-            let in_empty_pair = |b: &Self, at: usize| matches!((b.char_before(at), b.char_at(at)), (Some(o), Some(c)) if PAIRS.contains(&(o, c)));
-            if self.every_caret(in_empty_pair) {
-                self.checkpoint_keeping_cursors(EditKind::Delete);
-                self.edit_at_all_cursors("", Reach::Both);
-            } else {
-                self.backspace();
-            }
-            return;
-        }
-        if self.selection().is_none() {
-            let before = self.char_before(self.cursor);
-            let after = self.char_at(self.cursor);
-            let empty_pair = matches!(
-                (before, after),
-                (Some('('), Some(')'))
-                    | (Some('['), Some(']'))
-                    | (Some('{'), Some('}'))
-                    | (Some('"'), Some('"'))
-                    | (Some('\''), Some('\''))
-                    | (Some('`'), Some('`'))
-            );
-            if empty_pair {
-                let start = self.prev_boundary(self.cursor);
-                let end = self.next_boundary(self.cursor);
-                self.checkpoint(EditKind::Delete);
-                self.delete_range_recorded(start..end);
-                return;
-            }
-        }
-        self.backspace();
-    }
-
-    // ---- search and replace ----------------------------------------------
-
-    /// Replaces the selection with `text` if it matches `needle`, then finds
-    /// the next occurrence. Returns whether anything was replaced.
-    pub fn replace_current(&mut self, needle: &str, text: &str) -> bool {
-        if self.is_locked() {
-            return false;
-        }
-        let Some(range) = self.selection() else {
-            return false;
-        };
-        if self.rope.slice_to_string(range.clone()) != needle {
-            return false;
-        }
-        self.insert(text);
-        true
-    }
-
-    /// Replaces every occurrence of `needle`, returning how many.
-    ///
-    /// One undo step for the whole operation, which is the only thing that
-    /// makes a mistaken replace-all recoverable.
-    pub fn replace_all(&mut self, needle: &str, text: &str) -> usize {
-        if self.is_locked() {
-            return 0;
-        }
-        if needle.is_empty() {
-            return 0;
-        }
-        let mut offsets = Vec::new();
-        let mut at = 0;
-        while let Some(found) = self.rope.find_from(needle, at) {
-            offsets.push(found);
-            at = found + needle.len();
-        }
-        if offsets.is_empty() {
-            return 0;
-        }
-        let text = &*normalize_newlines(text);
-        let edits: Vec<_> = offsets
-            .iter()
-            .map(|&offset| (offset..offset + needle.len(), text))
-            .collect();
-        self.checkpoint(EditKind::Insert);
-        self.apply_edits(&edits, AtInsert::After);
-        self.anchor = self.cursor;
-        offsets.len()
-    }
-
-    /// Applies already-resolved ranges as one undoable edit: regex captures,
-    /// case-insensitive matches, a language server's edits. Ranges are in
-    /// order and do not overlap; an empty one is an insertion. The caret
-    /// keeps its place in the text around the edits.
-    pub fn replace_ranges(&mut self, replacements: &[(std::ops::Range<usize>, String)]) -> usize {
-        if self.is_locked() {
-            return 0;
-        }
-        if replacements.is_empty() {
-            return 0;
-        }
-        // A formatter on a CRLF file answers in CRLF; the rope holds LF
-        // only and the file's own endings are restored on save.
-        let normalized: Vec<(std::ops::Range<usize>, String)>;
-        let replacements = if replacements.iter().any(|(_, t)| t.contains('\r')) {
-            normalized = replacements
-                .iter()
-                .map(|(r, t)| (r.clone(), normalize_newlines(t).into_owned()))
-                .collect();
-            &normalized[..]
-        } else {
-            replacements
-        };
-        let mut previous_end = 0;
-        for (range, _) in replacements {
-            if range.start < previous_end
-                || range.start > range.end
-                || range.end > self.rope.len_bytes()
-            {
-                return 0;
-            }
-            previous_end = range.end;
-        }
-        let edits: Vec<_> = replacements
-            .iter()
-            .map(|(range, text)| (range.clone(), text.as_str()))
-            .collect();
-        self.checkpoint(EditKind::Insert);
-        self.apply_edits(&edits, AtInsert::After);
-        self.anchor = self.cursor;
-        replacements.len()
-    }
-
-    // ---- line and block operations ---------------------------------------
-
-    /// The leading whitespace of `line`, as a string.
-    fn indent_of(&self, line: usize) -> String {
-        let start = self.rope.line_to_byte(line);
-        let end = self.line_end(line);
-        let text = self.rope.slice_to_string(start..end);
-        text.chars()
-            .take_while(|c| *c == ' ' || *c == '\t')
-            .collect()
-    }
-
-    /// One indent level, matching whatever the surrounding line already uses.
-    ///
-    /// Guessing from context rather than from a setting: a file that is
-    /// indented with tabs should stay indented with tabs, and there is no
-    /// preferences system yet to say otherwise.
-    fn indent_unit(&self, line: usize) -> String {
-        if let Some(style) = self.indent_style {
-            return style.unit();
-        }
-        let indent = self.indent_of(line);
-        if indent.contains('\t') {
-            "\t".to_string()
-        } else {
-            "    ".to_string()
-        }
-    }
-
-    /// Tab with nothing selected: a tab character, or spaces to the next
-    /// stop when the document indents with spaces.
-    pub fn insert_tab(&mut self) {
-        match self.indent_style {
-            Some(style) if !style.tabs => {
-                let (_, column) = self.cursor_position();
-                let width = style.width.max(1);
-                self.insert(&" ".repeat(width - column % width));
-            }
-            _ => self.insert("\t"),
-        }
-    }
-
-    /// Inserts a newline, carrying the current indentation, and adding a
-    /// level when the line being left ends in an opening bracket.
-    pub fn insert_newline_indented(&mut self) {
-        if self.is_locked() {
-            return;
-        }
-        let (line, _) = self.cursor_position();
-        let indent = self.indent_of(line);
-
-        // Look at the text before the cursor, not the whole line: pressing
-        // Enter in the middle of `{ foo }` should not indent.
-        let line_start = self.rope.line_to_byte(line);
-        let before = self.rope.slice_to_string(line_start..self.cursor);
-        let opens = before.trim_end().ends_with(['{', '[', '(']);
-
-        // And whether a closing bracket sits immediately after, in which case
-        // it gets a line of its own at the outer level.
-        let after_is_close = self
-            .char_at(self.cursor)
-            .is_some_and(|c| matches!(c, '}' | ']' | ')'));
-
-        let unit = self.indent_unit(line);
-        let mut text = String::with_capacity(indent.len() + unit.len() + 2);
-        text.push('\n');
-        text.push_str(&indent);
-        if opens {
-            text.push_str(&unit);
-        }
-        self.insert(&text);
-
-        if opens && after_is_close {
-            // Put the closer on its own line, then step back onto the blank
-            // line between them.
-            let landing = self.cursor;
-            let mut tail = String::with_capacity(indent.len() + 1);
-            tail.push('\n');
-            tail.push_str(&indent);
-            self.insert(&tail);
-            self.cursor = landing;
-            self.anchor = landing;
-        }
-    }
-
-    /// Lines touched by the selection, or the cursor's line.
-    fn selected_lines(&self) -> std::ops::RangeInclusive<usize> {
-        match self.selection() {
-            Some(range) => {
-                let first = self.rope.byte_to_line(range.start);
-                // A selection ending exactly at a line start does not include
-                // that line; otherwise selecting a whole line by dragging to
-                // the next one would indent two.
-                let mut last = self.rope.byte_to_line(range.end);
-                if last > first && range.end == self.rope.line_to_byte(last) {
-                    last -= 1;
-                }
-                first..=last
-            }
-            None => {
-                let (line, _) = self.cursor_position();
-                line..=line
-            }
-        }
-    }
-
-    /// Adds one indent level to every selected line.
-    pub fn indent(&mut self) {
-        if self.is_locked() {
-            return;
-        }
-        let lines = self.selected_lines();
-        let unit = self.indent_unit(*lines.start());
-        self.checkpoint(EditKind::Insert);
-
-        // A caret at a line's start moves with the line's text.
-        let edits: Vec<_> = lines
-            .map(|line| {
-                let at = self.rope.line_to_byte(line);
-                (at..at, unit.as_str())
-            })
-            .collect();
-        self.apply_edits(&edits, AtInsert::After);
-    }
-
-    /// Removes one indent level from every selected line that has one.
-    pub fn outdent(&mut self) {
-        if self.is_locked() {
-            return;
-        }
-        let lines = self.selected_lines();
-        self.checkpoint(EditKind::Delete);
-
-        let level = self.indent_style.map_or(4, |s| s.width.max(1));
-        let mut edits = Vec::new();
-        for line in lines {
-            let at = self.rope.line_to_byte(line);
-            let indent = self.indent_of(line);
-            // Take a tab, or up to one level of spaces: a line indented by
-            // three spaces should still outdent rather than refusing.
-            let take = if indent.starts_with('\t') {
-                1
-            } else {
-                indent.chars().take_while(|c| *c == ' ').count().min(level)
-            };
-            if take > 0 {
-                edits.push((at..at + take, ""));
-            }
-        }
-        // A caret inside the removed indentation stops at the line's new
-        // start rather than being pulled back onto the line above.
-        self.apply_edits(&edits, AtInsert::After);
-    }
-
-    /// Comments or uncomments the selected lines with `token`.
-    ///
-    /// Toggling on the whole block rather than per line: if any selected line
-    /// is uncommented, the whole block gets commented, which is what makes a
-    /// second press restore exactly what you started with.
-    pub fn toggle_comment(&mut self, token: &str) {
-        if self.is_locked() {
-            return;
-        }
-        let lines = self.selected_lines();
-        let non_empty: Vec<usize> = lines
-            .clone()
-            .filter(|&l| {
-                let start = self.rope.line_to_byte(l);
-                let end = self.line_end(l);
-                !self.rope.slice_to_string(start..end).trim().is_empty()
-            })
-            .collect();
-        if non_empty.is_empty() {
-            return;
-        }
-
-        let all_commented = non_empty.iter().all(|&l| {
-            let start = self.rope.line_to_byte(l);
-            let end = self.line_end(l);
-            self.rope
-                .slice_to_string(start..end)
-                .trim_start()
-                .starts_with(token)
-        });
-
-        self.checkpoint(if all_commented {
-            EditKind::Delete
-        } else {
-            EditKind::Insert
-        });
-
-        let insert = format!("{token} ");
-        let edits: Vec<_> = non_empty
-            .iter()
-            .map(|&line| {
-                let start = self.rope.line_to_byte(line);
-                let text = self.rope.slice_to_string(start..self.line_end(line));
-                let indent_len = text.len() - text.trim_start().len();
-                let at = start + indent_len;
-                if all_commented {
-                    // The token and one following space if it is there.
-                    let rest = &text[indent_len + token.len()..];
-                    (
-                        at..at + token.len() + usize::from(rest.starts_with(' ')),
-                        "",
-                    )
-                } else {
-                    (at..at, insert.as_str())
-                }
-            })
-            .collect();
-        // A selection that starts where the token goes takes it in, so a
-        // second toggle restores exactly what was there.
-        self.apply_edits(&edits, AtInsert::Before);
-    }
-
-    /// Duplicates the selected lines below themselves.
-    pub fn duplicate_lines(&mut self) {
-        if self.is_locked() {
-            return;
-        }
-        let lines = self.selected_lines();
-        let start = self.rope.line_to_byte(*lines.start());
-        let last = *lines.end();
-        let end = self.rope.line_range(last).end;
-
-        // On a last line with no trailing newline the separator has to go
-        // *before* the copy, or the two lines run together.
-        let source = self.rope.slice_to_string(start..end);
-        let text = if source.ends_with('\n') {
-            source
-        } else {
-            format!("\n{source}")
-        };
-
-        self.checkpoint(EditKind::Insert);
-        let old_end_point = self.point_of(end);
-        self.rope.insert(end, &text);
-        self.record_edit(end, end, old_end_point, end + text.len());
-
-        // Move onto the copy, which is what makes repeated presses stack.
-        self.cursor += text.len();
-        self.anchor += text.len();
-        self.clamp_positions();
-    }
-
-    /// Moves the selected lines up or down by one.
-    ///
-    /// Implemented as a swap of two adjacent spans rather than a delete and
-    /// a re-insert elsewhere, so it stays one edit for undo and for the
-    /// incremental parser.
-    pub fn move_lines(&mut self, down: bool) {
-        if self.is_locked() {
-            return;
-        }
-        let lines = self.selected_lines();
-        let (first, last) = (*lines.start(), *lines.end());
-        let total = self.rope.len_lines();
-        // The empty "line" after a final newline is not one to swap with:
-        // doing so moved the newline instead and grew the file a line per
-        // press.
-        let last_text = if total > 1 && self.rope.byte_at(self.rope.len_bytes() - 1) == Some(b'\n')
-        {
-            total - 2
-        } else {
-            total - 1
-        };
-        if (down && last + 1 > last_text) || (!down && (first == 0 || first > last_text)) {
-            return;
-        }
-
-        // The span covering the block plus the line it swaps with, and the
-        // offset where one ends and the other begins.
-        let (span_first, span_last) = if down {
-            (first, last + 1)
-        } else {
-            (first - 1, last)
-        };
-        let start = self.rope.line_to_byte(span_first);
-        let end = self.rope.line_range(span_last).end;
-        let split = self.rope.line_to_byte(if down { last + 1 } else { first });
-
-        let head = self.rope.slice_to_string(start..split);
-        let tail = self.rope.slice_to_string(split..end);
-
-        // After the swap `tail` comes first and must end in a newline, while
-        // `head` comes last and must only keep one if the span originally did.
-        // The last line of a file with no trailing newline is what makes this
-        // fiddly rather than a plain concatenation.
-        let mut leading = tail;
-        if !leading.ends_with('\n') {
-            leading.push('\n');
-        }
-        let mut trailing = head;
-        if !self.rope.slice_to_string(start..end).ends_with('\n') {
-            trailing = trailing.strip_suffix('\n').unwrap_or(&trailing).to_string();
-        }
-        let swapped = format!("{leading}{trailing}");
-
-        self.checkpoint(EditKind::Insert);
-        let old_end_point = self.point_of(end);
-        self.rope.delete(start..end);
-        self.rope.insert(start, &swapped);
-        self.record_edit(start, end, old_end_point, start + swapped.len());
-
-        // Follow the block: moving down it now begins after `leading`,
-        // moving up it begins where the span does.
-        let delta = if down {
-            leading.len() as isize
-        } else {
-            start as isize - split as isize
-        };
-        self.cursor = (self.cursor as isize + delta).max(0) as usize;
-        self.anchor = (self.anchor as isize + delta).max(0) as usize;
-        self.clamp_positions();
-    }
-
-    /// Places the cursor at the start of `line`, 0-based and clamped.
-    pub fn goto_line(&mut self, line: usize) {
-        let line = line.min(self.rope.len_lines().saturating_sub(1));
-        self.cursor = self.rope.line_to_byte(line);
-        self.goal_column = None;
-        self.after_move(Motion::Move);
-    }
-
     /// `at` clamped into the buffer and back onto a char boundary.
     fn char_floor(&self, at: usize) -> usize {
         let mut at = at.min(self.rope.len_bytes());
@@ -2146,7 +630,6 @@ impl Buffer {
         }
         at
     }
-
     /// Clamps cursor and anchor into the buffer and onto char boundaries.
     fn clamp_positions(&mut self) {
         self.cursor = self.char_floor(self.cursor);
@@ -2163,14 +646,12 @@ impl Buffer {
     }
 
     // ---- change tracking -------------------------------------------------
-
     /// tree-sitter's point for a byte offset: row, plus the byte column
     /// within that row.
     fn point_of(&self, byte: usize) -> (usize, usize) {
         let row = self.rope.byte_to_line(byte);
         (row, byte - self.rope.line_to_byte(row))
     }
-
     /// Records a replacement of `start..old_end` by `new_len` bytes.
     ///
     /// Must be called with `old_end_point` captured before the rope changed
@@ -2213,7 +694,6 @@ impl Buffer {
             });
         }
     }
-
     /// Records the change from `before` to the current text as one edit:
     /// from where they first differ to where they last do. Queued edits
     /// stay valid, since this one follows them.
@@ -2246,7 +726,6 @@ impl Buffer {
         let old_end_point = (old_row, old_end - before.line_to_byte(old_row));
         self.record_edit(prefix, old_end, old_end_point, new_end);
     }
-
     /// After the whole rope was replaced: queued edits no longer lead from
     /// the old text to the new, so they go and the parser starts over.
     /// Folds cannot follow such a change either, so they open.
@@ -2255,12 +734,10 @@ impl Buffer {
         self.folds.clear();
         self.last_edit = None;
     }
-
     /// Whether the text changed since the last [`Buffer::drain_edits`].
     pub fn has_pending_edits(&self) -> bool {
         !matches!(&self.syntax_sync, SyntaxSync::Edits(edits) if edits.is_empty())
     }
-
     /// Hands over the edits since the last drain.
     ///
     /// Returns `None` when the text changed in a way edits cannot describe
@@ -2273,7 +750,6 @@ impl Buffer {
     }
 
     // ---- words -----------------------------------------------------------
-
     /// The character immediately before `at`, if any.
     fn char_before(&self, at: usize) -> Option<char> {
         if at == 0 {
@@ -2282,7 +758,6 @@ impl Buffer {
         let start = self.prev_boundary(at);
         self.rope.slice_to_string(start..at).chars().next()
     }
-
     /// The character starting at `at`, if any.
     fn char_at(&self, at: usize) -> Option<char> {
         if at >= self.rope.len_bytes() {
@@ -2291,7 +766,6 @@ impl Buffer {
         let end = self.next_boundary(at);
         self.rope.slice_to_string(at..end).chars().next()
     }
-
     /// Start of the word before `at`.
     ///
     /// Follows the macOS convention: skip any whitespace first, then consume
@@ -2323,7 +797,6 @@ impl Buffer {
         }
         i
     }
-
     /// End of the word after `at`.
     pub fn next_word_boundary(&self, at: usize) -> usize {
         let len = self.rope.len_bytes();
@@ -2349,19 +822,16 @@ impl Buffer {
         }
         i
     }
-
     pub fn move_word_left(&mut self, motion: Motion) {
         self.cursor = self.prev_word_boundary(self.cursor);
         self.goal_column = None;
         self.after_move(motion);
     }
-
     pub fn move_word_right(&mut self, motion: Motion) {
         self.cursor = self.next_word_boundary(self.cursor);
         self.goal_column = None;
         self.after_move(motion);
     }
-
     /// Option-Backspace: delete the word before the cursor.
     pub fn delete_word_backward(&mut self) {
         if self.is_locked() {
@@ -2378,7 +848,6 @@ impl Buffer {
         self.checkpoint(EditKind::Delete);
         self.delete_range_recorded(to..self.cursor);
     }
-
     /// Option-Delete: delete the word after the cursor.
     pub fn delete_word_forward(&mut self) {
         if self.is_locked() {
@@ -2395,7 +864,6 @@ impl Buffer {
         self.checkpoint(EditKind::Delete);
         self.delete_range_recorded(self.cursor..to);
     }
-
     /// Cmd-Backspace: delete from the cursor back to the start of the line.
     pub fn delete_to_line_start(&mut self) {
         if self.is_locked() {
@@ -2413,7 +881,6 @@ impl Buffer {
         self.checkpoint(EditKind::Delete);
         self.delete_range_recorded(start..self.cursor);
     }
-
     /// Cmd-Delete: delete from the cursor to the end of the line.
     pub fn delete_to_line_end(&mut self) {
         if self.is_locked() {
@@ -2433,608 +900,6 @@ impl Buffer {
     }
 
     // ---- movement --------------------------------------------------------
-
-    fn after_move(&mut self, motion: Motion) {
-        if motion == Motion::Move {
-            self.anchor = self.cursor;
-            // Plain movement is how you get back to one cursor.
-            self.extra.clear();
-        }
-        // Any movement ends an edit run for undo purposes.
-        self.last_edit = None;
-        self.reveal_cursors();
-    }
-
-    /// Opens every fold that hides a cursor. Go to line, find, go to
-    /// definition and a click can all land inside a fold, and a caret on a
-    /// hidden line has no screen row to move from.
-    fn reveal_cursors(&mut self) {
-        if self.folds.is_empty() {
-            return;
-        }
-        let lines: Vec<usize> = std::iter::once(self.cursor)
-            .chain(self.extra.iter().map(|(_, head)| *head))
-            .map(|at| self.rope.byte_to_line(at))
-            .collect();
-        for line in lines {
-            if self.is_hidden(line) {
-                self.unfold(line);
-            }
-        }
-    }
-
-    pub fn move_left(&mut self, motion: Motion) {
-        // Plain left with a selection collapses to its start, which is what
-        // every other editor does.
-        if motion == Motion::Move
-            && let Some(range) = self.selection()
-        {
-            self.cursor = range.start;
-            self.goal_column = None;
-            self.after_move(motion);
-            return;
-        }
-        self.cursor = self.prev_boundary(self.cursor);
-        self.goal_column = None;
-        self.after_move(motion);
-    }
-
-    pub fn move_right(&mut self, motion: Motion) {
-        if motion == Motion::Move
-            && let Some(range) = self.selection()
-        {
-            self.cursor = range.end;
-            self.goal_column = None;
-            self.after_move(motion);
-            return;
-        }
-        self.cursor = self.next_boundary(self.cursor);
-        self.goal_column = None;
-        self.after_move(motion);
-    }
-
-    pub fn move_up(&mut self, motion: Motion) {
-        if self.row_mode() {
-            return self.move_row(-1, motion);
-        }
-        let (line, column) = self.visual_position();
-        if line == 0 {
-            self.cursor = 0;
-        } else {
-            let goal = self.goal_column.unwrap_or(column);
-            self.cursor = self.byte_at_visual(line - 1, goal);
-            self.goal_column = Some(goal);
-        }
-        self.after_move(motion);
-    }
-
-    /// The caret's line and its column on screen: tabs to their stops,
-    /// wide characters as two. The goal column of Up and Down is kept in
-    /// these, as it is while wrapping, so the caret does not zig-zag past
-    /// tabs and CJK and does the same with wrapping on or off.
-    fn visual_position(&self) -> (usize, usize) {
-        let line = self.rope.byte_to_line(self.cursor);
-        let start = self.rope.line_to_byte(line);
-        (line, wrap::column_in_row(&self.rope, start, self.cursor))
-    }
-
-    fn byte_at_visual(&self, line: usize, column: usize) -> usize {
-        let start = self.rope.line_to_byte(line);
-        let end = wrap::line_end(&self.rope, line);
-        wrap::byte_at_column(&self.rope, start, end, column)
-    }
-
-    pub fn move_down(&mut self, motion: Motion) {
-        if self.row_mode() {
-            return self.move_row(1, motion);
-        }
-        let (line, column) = self.visual_position();
-        if line + 1 >= self.rope.len_lines() {
-            self.cursor = self.rope.len_bytes();
-        } else {
-            let goal = self.goal_column.unwrap_or(column);
-            self.cursor = self.byte_at_visual(line + 1, goal);
-            self.goal_column = Some(goal);
-        }
-        self.after_move(motion);
-    }
-
-    /// Whether screen rows differ from lines: wrapping, or lines folded away.
-    pub fn row_mode(&self) -> bool {
-        self.wrap.is_some() || !self.folds.is_empty()
-    }
-
-    /// Whether `line` is folded away.
-    pub fn is_hidden(&self, line: usize) -> bool {
-        let at = self.folds.partition_point(|(_, b)| *b < line);
-        self.folds.get(at).is_some_and(|(a, _)| *a <= line)
-    }
-
-    /// The last line of the fold hiding `line`, if one does.
-    pub fn hidden_until(&self, line: usize) -> Option<usize> {
-        let at = self.folds.partition_point(|(_, b)| *b < line);
-        self.folds
-            .get(at)
-            .filter(|(a, _)| *a <= line)
-            .map(|(_, b)| *b)
-    }
-
-    /// Leading whitespace of `line` in columns, or `None` for a blank line.
-    pub fn indent_columns(&self, line: usize) -> Option<usize> {
-        let start = self.rope.line_to_byte(line);
-        let end = self.line_end(line).min(start + 1024);
-        let mut column = 0;
-        for chunk in self.rope.chunks_in(start..end) {
-            for ch in chunk.chars() {
-                match ch {
-                    ' ' | '\t' => column = crate::text::columns::advance(column, ch),
-                    '\r' => {}
-                    _ => return Some(column),
-                }
-            }
-        }
-        None
-    }
-
-    /// Whether the next non-blank line after `line` is indented deeper:
-    /// the cheap test for a fold, run for every visible line.
-    pub fn can_fold(&self, line: usize) -> bool {
-        let Some(base) = self.indent_columns(line) else {
-            return false;
-        };
-        let total = self.rope.len_lines();
-        (line + 1..total.min(line + 64))
-            .find_map(|l| self.indent_columns(l))
-            .is_some_and(|next| next > base)
-    }
-
-    /// The lines folding `line` hides: everything below it indented deeper,
-    /// down to the last such non-blank line. A closing bracket at the
-    /// block's own indent stays visible, as do blank lines after the block.
-    pub fn fold_range(&self, line: usize) -> Option<(usize, usize)> {
-        if !self.can_fold(line) {
-            return None;
-        }
-        let base = self.indent_columns(line)?;
-        let mut last = line;
-        // A block longer than this (a whole generated JSON under its first
-        // brace) is not worth the scan on the main thread to fold.
-        let limit = self.rope.len_lines().min(line + 1 + FOLD_ALL_MAX_LINES);
-        for l in line + 1..limit {
-            if l + 1 == limit && limit < self.rope.len_lines() {
-                return None;
-            }
-            match self.indent_columns(l) {
-                Some(indent) if indent <= base => break,
-                Some(_) => last = l,
-                None => {}
-            }
-        }
-        (last > line).then_some((line + 1, last))
-    }
-
-    /// Folds the block that starts at `line`. The caret, if it was inside,
-    /// moves to the end of `line`.
-    pub fn fold(&mut self, line: usize) -> bool {
-        let Some((a, b)) = self.fold_range(line) else {
-            return false;
-        };
-        // A fold swallows any inside it.
-        self.folds.retain(|(x, y)| !(*x >= a && *y <= b));
-        let at = self.folds.partition_point(|(x, _)| *x < a);
-        self.folds.insert(at, (a, b));
-        let caret = self.rope.byte_to_line(self.cursor);
-        if (a..=b).contains(&caret) {
-            self.cursor = self.line_end(line);
-            self.anchor = self.cursor;
-            self.extra.clear();
-        }
-        true
-    }
-
-    /// Opens the fold that `line` heads, or the one hiding `line`.
-    pub fn unfold(&mut self, line: usize) -> bool {
-        let before = self.folds.len();
-        self.folds
-            .retain(|(a, b)| *a != line + 1 && !(*a <= line && line <= *b));
-        before != self.folds.len()
-    }
-
-    /// Whether `line` heads a fold that is closed.
-    pub fn is_folded_at(&self, line: usize) -> bool {
-        self.folds
-            .binary_search_by_key(&(line + 1), |(a, _)| *a)
-            .is_ok()
-    }
-
-    /// Folds every top-level block whose lines are indented deeper. Refused
-    /// past [`FOLD_ALL_MAX_LINES`]: reading every line's indent on the main
-    /// thread would stall the window for seconds.
-    pub fn fold_all(&mut self) -> bool {
-        if self.rope.len_lines() > FOLD_ALL_MAX_LINES {
-            return false;
-        }
-        let caret = self.rope.byte_to_line(self.cursor);
-        let mut line = 0;
-        let total = self.rope.len_lines();
-        let mut folds = Vec::new();
-        while line < total {
-            match self.fold_range(line) {
-                Some((a, b)) => {
-                    folds.push((a, b));
-                    line = b + 1;
-                }
-                None => line += 1,
-            }
-        }
-        self.folds = folds;
-        if self.is_hidden(caret) {
-            let at = self.folds.partition_point(|(_, b)| *b < caret);
-            let head = self.folds[at].0 - 1;
-            self.cursor = self.line_end(head);
-            self.anchor = self.cursor;
-        }
-        true
-    }
-
-    /// Where each screen row of `line` starts: one row unless wrapping,
-    /// none when the line is folded away.
-    pub fn row_starts(&self, line: usize) -> Vec<usize> {
-        if !self.folds.is_empty() && self.is_hidden(line) {
-            return Vec::new();
-        }
-        match self.wrap {
-            Some(columns) => wrap::row_starts(&self.rope, line, columns),
-            None => vec![self.rope.line_to_byte(line)],
-        }
-    }
-
-    /// The caret's line and its row within that line.
-    pub fn cursor_row(&self) -> (usize, usize) {
-        let line = self.rope.byte_to_line(self.cursor);
-        (line, wrap::row_of(&self.row_starts(line), self.cursor))
-    }
-
-    /// Up or down one screen row while wrapping, keeping the goal column
-    /// measured from the start of the row.
-    fn move_row(&mut self, delta: isize, motion: Motion) {
-        let line = self.rope.byte_to_line(self.cursor);
-        if self.is_hidden(line) {
-            self.unfold(line);
-        }
-        let starts = self.row_starts(line);
-        let row = wrap::row_of(&starts, self.cursor);
-        let column = wrap::column_in_row(&self.rope, starts[row], self.cursor);
-        let goal = self.goal_column.unwrap_or(column);
-        let (target_line, target_row) = self.step_rows((line, row), delta);
-        if (target_line, target_row) == (line, row) {
-            self.cursor = if delta < 0 { 0 } else { self.rope.len_bytes() };
-        } else {
-            let starts = if target_line == line {
-                starts
-            } else {
-                self.row_starts(target_line)
-            };
-            let start = starts[target_row];
-            let end = starts
-                .get(target_row + 1)
-                .copied()
-                .unwrap_or_else(|| wrap::line_end(&self.rope, target_line));
-            let mut at = wrap::byte_at_column(&self.rope, start, end, goal);
-            // The end of a row that continues is the next row's start:
-            // stop before it, or the caret would jump down a row.
-            if target_row + 1 < starts.len() && at == end {
-                at = self.prev_boundary(end).max(start);
-            }
-            self.cursor = at;
-            self.goal_column = Some(goal);
-        }
-        self.after_move(motion);
-    }
-
-    /// `delta` screen rows from `(line, row)`, stopping at either end of the
-    /// document.
-    pub fn step_rows(
-        &self,
-        (mut line, mut row): (usize, usize),
-        mut delta: isize,
-    ) -> (usize, usize) {
-        let total = self.rope.len_lines();
-        if !self.row_mode() {
-            let line = (line as isize + delta).clamp(0, total.saturating_sub(1) as isize);
-            return (line as usize, 0);
-        }
-        // The next line with rows, from `line` in `step` direction.
-        let shown = |mut l: isize, step: isize| -> Option<(usize, usize)> {
-            while l >= 0 && (l as usize) < total {
-                let count = self.row_starts(l as usize).len();
-                if count > 0 {
-                    return Some((l as usize, count));
-                }
-                l += step;
-            }
-            None
-        };
-        let Some((start, count)) = shown(line as isize, -1).or_else(|| shown(line as isize, 1))
-        else {
-            return (0, 0);
-        };
-        if start != line {
-            (line, row) = (start, count - 1);
-        }
-        while delta > 0 {
-            let count = self.row_starts(line).len().max(1);
-            let left = (count - 1 - row.min(count - 1)) as isize;
-            if delta <= left {
-                row += delta as usize;
-                delta = 0;
-            } else if let Some((next, _)) = shown(line as isize + 1, 1) {
-                delta -= left + 1;
-                line = next;
-                row = 0;
-            } else {
-                row = count - 1;
-                delta = 0;
-            }
-        }
-        while delta < 0 {
-            if (-delta) as usize <= row {
-                row -= (-delta) as usize;
-                delta = 0;
-            } else if let Some((previous, count)) =
-                shown(line as isize - 1, -1).filter(|_| line > 0)
-            {
-                delta += row as isize + 1;
-                line = previous;
-                row = count - 1;
-            } else {
-                row = 0;
-                delta = 0;
-            }
-        }
-        (line, row)
-    }
-
-    /// Whether a view `rows` tall starting at `line` could reach past the
-    /// end, which is when [`Buffer::max_scroll_row`] is worth its cost:
-    /// every visible line has at least one row, so only the last `rows`
-    /// lines can. Folded lines have none, so with folds it always could.
-    fn near_end(&self, line: usize, rows: usize) -> bool {
-        !self.folds.is_empty() || line + rows.max(1) >= self.rope.len_lines()
-    }
-
-    /// The furthest scroll position, with the last row at the bottom of a
-    /// view `rows` tall.
-    fn max_scroll_row(&self, rows: usize) -> (usize, usize) {
-        let last = self.rope.len_lines().saturating_sub(1);
-        let end = (last, self.row_starts(last).len().saturating_sub(1));
-        // step_rows first finds the last line with rows, if `last` has none.
-        let end = self.step_rows(end, 0);
-        self.step_rows(end, -(rows.max(1) as isize - 1))
-    }
-
-    pub fn move_line_start(&mut self, motion: Motion) {
-        let (line, _) = self.cursor_position();
-        self.cursor = self.rope.line_to_byte(line);
-        self.goal_column = None;
-        self.after_move(motion);
-    }
-
-    pub fn move_line_end(&mut self, motion: Motion) {
-        let (line, _) = self.cursor_position();
-        self.cursor = self.line_end(line);
-        self.goal_column = None;
-        self.after_move(motion);
-    }
-
-    pub fn move_buffer_start(&mut self, motion: Motion) {
-        self.cursor = 0;
-        self.goal_column = None;
-        self.after_move(motion);
-    }
-
-    pub fn move_buffer_end(&mut self, motion: Motion) {
-        self.cursor = self.rope.len_bytes();
-        self.goal_column = None;
-        self.after_move(motion);
-    }
-
-    // ---- scrolling -------------------------------------------------------
-
-    /// Scrolls so the cursor is visible, given a viewport of `rows` lines and
-    /// `cols` columns.
-    ///
-    /// `cols` of zero means "do not track horizontally", which is what the
-    /// callers that only know the row count pass.
-    pub fn scroll_to_cursor(&mut self, rows: usize, cols: usize) {
-        if self.row_mode() {
-            if self.wrap.is_some() {
-                self.scroll_column = 0;
-            }
-            let caret = self.cursor_row();
-            let top = (self.scroll_line, self.scroll_row);
-            if caret < top || (caret == top && self.scroll_fraction > 0.0) {
-                (self.scroll_line, self.scroll_row) = caret;
-                self.scroll_fraction = 0.0;
-            } else if rows > 0 && self.step_rows(top, rows as isize - 1) < caret {
-                (self.scroll_line, self.scroll_row) = self.step_rows(caret, -(rows as isize - 1));
-                self.scroll_fraction = 0.0;
-            }
-            return;
-        }
-        let (line, column) = self.cursor_position();
-        // The top line is only partly in view while a fraction is scrolled
-        // off, so a caret on it counts as above the view.
-        if line < self.scroll_line || (line == self.scroll_line && self.scroll_fraction > 0.0) {
-            self.scroll_line = line;
-            self.scroll_fraction = 0.0;
-        } else if rows > 0 && line >= self.scroll_line + rows {
-            self.scroll_line = line + 1 - rows;
-            self.scroll_fraction = 0.0;
-        }
-
-        if cols == 0 {
-            return;
-        }
-        // A few columns of lead, so the caret is not pinned to the very edge
-        // while you type toward it.
-        const MARGIN: usize = 4;
-        if column < self.scroll_column + MARGIN {
-            self.scroll_column = column.saturating_sub(MARGIN);
-        } else if column >= self.scroll_column + cols {
-            self.scroll_column = column + 1 + MARGIN - cols;
-        }
-    }
-
-    /// Scrolls horizontally, clamped at the left edge.
-    /// Scrolls horizontally, clamped so you cannot drift off into empty
-    /// space to the right of the longest visible line.
-    ///
-    /// The bound is the longest line *in view*, not in the document: finding
-    /// the longest line of a 100MB file is a full scan, and the answer would
-    /// only be used to stop a gesture.
-    pub fn scroll_columns_by(&mut self, columns: isize, rows: usize) {
-        if columns == 0 {
-            return;
-        }
-        let longest = self.longest_visible_line(rows);
-        let next = self.scroll_column as isize + columns;
-        self.scroll_column = next.clamp(0, longest as isize) as usize;
-    }
-
-    /// Pulls the scroll position back inside what there is to show.
-    ///
-    /// Scrolling clamps itself, but the limits move without any scrolling:
-    /// the view gets taller, lines are deleted, a vertical scroll leaves the
-    /// long line that a horizontal one was measured against. Called every
-    /// frame with that frame's size.
-    pub fn clamp_scroll(&mut self, rows: usize, cols: usize) {
-        if self.row_mode() {
-            if self.wrap.is_some() {
-                self.scroll_column = 0;
-            }
-            // A top line folded away: the view starts at the fold's head.
-            let mut top = self
-                .scroll_line
-                .min(self.rope.len_lines().saturating_sub(1));
-            while top > 0 && self.row_starts(top).is_empty() {
-                top -= 1;
-                self.scroll_row = usize::MAX;
-            }
-            self.scroll_line = top;
-            let count = self.row_starts(top).len().max(1);
-            self.scroll_row = self.scroll_row.min(count - 1);
-            self.scroll_by(0, rows);
-            return;
-        }
-        self.scroll_row = 0;
-        self.scroll_by(0, rows);
-        if self.scroll_column == 0 {
-            return;
-        }
-        // Keep the end of the longest visible line reachable, and no more:
-        // further right than this the whole view is blank.
-        let longest = self.longest_visible_line(rows);
-        let reach = longest.saturating_sub(cols.saturating_sub(1).min(longest));
-        // The caret is allowed to hold the view out there, since typing past
-        // the right edge is how it got there.
-        let caret = self.cursor_position().1;
-        self.scroll_column = self
-            .scroll_column
-            .min(reach.max(caret.saturating_sub(cols.saturating_sub(1))));
-    }
-
-    /// Characters in the longest line of the current viewport.
-    fn longest_visible_line(&self, rows: usize) -> usize {
-        let total = self.rope.len_lines();
-        let first = self.scroll_line.min(total.saturating_sub(1));
-        let last = (first + rows.max(1)).min(total);
-        (first..last)
-            .map(|line| {
-                let start = self.rope.line_to_byte(line);
-                let end = self.line_end(line);
-                self.rope.byte_to_char(end) - self.rope.byte_to_char(start)
-            })
-            .max()
-            .unwrap_or(0)
-    }
-
-    /// Scrolls by whole lines. A fraction left by a trackpad stays put, so a
-    /// Page Down in the middle of a gesture does not snap the view; at the
-    /// last position there is none, since nothing is below to reveal.
-    pub fn scroll_by(&mut self, lines: isize, rows: usize) {
-        if self.row_mode() {
-            let mut at = self.step_rows((self.scroll_line, self.scroll_row), lines);
-            if self.near_end(at.0, rows) {
-                let max = self.max_scroll_row(rows);
-                at = at.min(max);
-                if at >= max {
-                    self.scroll_fraction = 0.0;
-                }
-            }
-            (self.scroll_line, self.scroll_row) = at;
-            return;
-        }
-        let max = self.rope.len_lines().saturating_sub(rows.max(1));
-        let next = self.scroll_line as isize + lines;
-        self.scroll_line = next.clamp(0, max as isize) as usize;
-        if self.scroll_line >= max {
-            self.scroll_fraction = 0.0;
-        }
-    }
-
-    /// Scrolls by a part of a line, for a trackpad: `lines` is the gesture's
-    /// points over the line height. Clamped to the same range as
-    /// [`Buffer::scroll_by`].
-    pub fn scroll_smooth_by(&mut self, lines: f32, rows: usize) {
-        if !lines.is_finite() {
-            return;
-        }
-        if self.row_mode() {
-            // Rows here, not lines: a wrapped paragraph scrolls row by row.
-            let total = self.scroll_fraction as f64 + lines as f64;
-            let whole = total.floor();
-            let from = (self.scroll_line, self.scroll_row);
-            let mut to = self.step_rows(from, whole as isize);
-            let max = if self.near_end(to.0, rows) {
-                self.max_scroll_row(rows)
-            } else {
-                (usize::MAX, usize::MAX)
-            };
-            to = to.min(max);
-            (self.scroll_line, self.scroll_row) = to;
-            self.scroll_fraction = (total - whole) as f32;
-            // Stopped short at either end: nothing more to reveal.
-            let short_of_top =
-                whole < 0.0 && to == (0, 0) && self.step_rows(to, -whole as isize) != from;
-            if to >= max || short_of_top {
-                self.scroll_fraction = 0.0;
-            }
-            return;
-        }
-        let max = self.rope.len_lines().saturating_sub(rows.max(1)) as f64;
-        let at =
-            (self.scroll_line as f64 + self.scroll_fraction as f64 + lines as f64).clamp(0.0, max);
-        self.scroll_line = at.floor() as usize;
-        self.scroll_fraction = (at - at.floor()) as f32;
-    }
-
-    /// Puts `line` at the top of a view `rows` tall, as far as the text allows.
-    pub fn scroll_to(&mut self, line: usize, rows: usize) {
-        self.scroll_row = 0;
-        if self.row_mode() {
-            let max = self.max_scroll_row(rows);
-            (self.scroll_line, self.scroll_row) = (line, 0).min(max);
-            self.scroll_fraction = 0.0;
-            return;
-        }
-        let max = self.rope.len_lines().saturating_sub(rows.max(1));
-        self.scroll_line = line.min(max);
-        self.scroll_fraction = 0.0;
-    }
-
-    // ---- internals -------------------------------------------------------
-
     /// Byte offset of `column` characters into `line`, clamped to the line's
     /// end so a short line cannot push the cursor onto the next one.
     fn byte_at(&self, line: usize, column: usize) -> usize {
@@ -3044,12 +909,10 @@ impl Buffer {
             .char_to_byte(self.rope.byte_to_char(start).saturating_add(column))
             .min(end)
     }
-
     /// Byte offset of the end of `line`, excluding its newline.
     fn line_end(&self, line: usize) -> usize {
         wrap::line_end(&self.rope, line)
     }
-
     /// Previous user-perceived character boundary, preserving native grapheme rules.
     fn prev_boundary(&self, at: usize) -> usize {
         if at == 0 {
@@ -3071,7 +934,6 @@ impl Buffer {
         let range = super::grapheme::range(&self.rope, units - 1);
         self.rope.utf16_to_byte(range.start)
     }
-
     fn next_boundary(&self, at: usize) -> usize {
         let len = self.rope.len_bytes();
         if at >= len {

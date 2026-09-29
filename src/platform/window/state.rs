@@ -118,6 +118,21 @@ pub(super) struct Watch {
         mpsc::Receiver<(std::path::PathBuf, std::path::PathBuf, Vec<TreeEntry>)>,
     pub(super) children_pending: HashSet<std::path::PathBuf>,
 }
+/// Large files changed on disk, read on a worker before they reload.
+pub(super) struct Reloads {
+    pub(super) channel: (mpsc::Sender<ReloadRead>, mpsc::Receiver<ReloadRead>),
+    /// The documents being read, by buffer id.
+    pub(super) pending: HashSet<u64>,
+}
+
+/// A project search or Find References running on a worker.
+pub(super) struct ProjectSearch {
+    pub(super) rx: Option<mpsc::Receiver<Result<Vec<ProjectHit>, String>>>,
+    /// The search running is Find References, not a text search.
+    pub(super) references: bool,
+    pub(super) cancel: Option<Arc<AtomicBool>>,
+}
+
 impl Gutter {
     /// No document waits for a pause, a HEAD read or a diff.
     pub(super) fn idle(&self) -> bool {
@@ -166,11 +181,11 @@ impl State {
             && self.message.is_none()
             && !self.git.busy()
             && !matches!(self.drag, Some(Drag::Select { point: Some(_), .. }))
-            && self.project_search_rx.is_none()
+            && self.project_search.rx.is_none()
             && self.http.is_none()
             && self.update.is_none()
             && self.branch_rx.is_none()
-            && self.reloading.is_empty()
+            && self.reloads.pending.is_empty()
             && !self.symbols.pending()
             && self
                 .claude

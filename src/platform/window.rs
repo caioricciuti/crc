@@ -69,7 +69,7 @@ mod state;
 mod tabs;
 mod terminal;
 use extensions::{ext_details, preview_command, preview_displaced};
-use state::{Blame, Ext, Gutter, Lsp, Watch};
+use state::{Blame, Ext, Gutter, Lsp, ProjectSearch, Reloads, Watch};
 
 struct ProjectIndexResult {
     root: std::path::PathBuf,
@@ -676,10 +676,8 @@ struct State {
     /// The last key or click. The caret is solid for a blink phase after
     /// it, so it never vanishes under your typing.
     caret_since: Instant,
-    /// Large files changed on disk, being read by a worker for a reload,
-    /// by buffer id.
-    reload_channel: (mpsc::Sender<ReloadRead>, mpsc::Receiver<ReloadRead>),
-    reloading: HashSet<u64>,
+    /// Large files changed on disk, being read by a worker for a reload.
+    reloads: Reloads,
     /// The completion list, while one is open.
     completion: Option<CompletionPopup>,
     /// A name being typed into the tree, for a file or folder about to be
@@ -773,10 +771,8 @@ struct State {
     spans: Vec<Span>,
     /// Indexed project files for the Cmd-P palette.
     finder: Finder,
-    project_search_rx: Option<mpsc::Receiver<Result<Vec<ProjectHit>, String>>>,
-    /// The search running is Find References, not a text search.
-    project_search_references: bool,
-    project_search_cancel: Option<Arc<AtomicBool>>,
+    /// A project search or Find References in flight.
+    project_search: ProjectSearch,
     /// A request in flight: the id of its response tab's buffer, and where
     /// the reply arrives.
     http: Option<(
@@ -6558,9 +6554,11 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         syntax: SyntaxStore::new(),
         spans: Vec::new(),
         finder,
-        project_search_rx: None,
-        project_search_references: false,
-        project_search_cancel: None,
+        project_search: ProjectSearch {
+            rx: None,
+            references: false,
+            cancel: None,
+        },
         http: None,
         responses: HashMap::new(),
         claude: None,
@@ -6591,8 +6589,10 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         completion_generation: 0,
         completion_chips: Vec::new(),
         update: None,
-        reload_channel: mpsc::channel(),
-        reloading: HashSet::new(),
+        reloads: Reloads {
+            channel: mpsc::channel(),
+            pending: HashSet::new(),
+        },
         completion: None,
         panes: Vec::new(),
         focused_pane: 0,

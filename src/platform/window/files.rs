@@ -327,10 +327,10 @@ impl EditorView {
             state.gutter.dirty.insert(id, Instant::now());
         }
         for (id, path) in background {
-            if !state.reloading.insert(id) {
+            if !state.reloads.pending.insert(id) {
                 continue;
             }
-            let tx = state.reload_channel.0.clone();
+            let tx = state.reloads.channel.0.clone();
             std::thread::spawn(move || {
                 let _ = tx.send((id, Buffer::read_disk(&path)));
             });
@@ -367,8 +367,8 @@ impl EditorView {
         let mut names = Vec::new();
         let mut active_changed = false;
         let active_id = state.docs.active().id();
-        while let Ok((id, read)) = state.reload_channel.1.try_recv() {
-            state.reloading.remove(&id);
+        while let Ok((id, read)) = state.reloads.channel.1.try_recv() {
+            state.reloads.pending.remove(&id);
             let Ok(read) = read else { continue };
             let mut all = all_docs_mut(&mut state);
             let Some(buffer) = all

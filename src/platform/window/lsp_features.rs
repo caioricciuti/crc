@@ -112,11 +112,11 @@ impl EditorView {
         });
         // One search at a time: a project search still running would
         // otherwise land over the references.
-        if let Some(old) = state.project_search_cancel.replace(cancel) {
+        if let Some(old) = state.project_search.cancel.replace(cancel) {
             old.store(true, Ordering::Relaxed);
         }
-        state.project_search_rx = Some(rx);
-        state.project_search_references = true;
+        state.project_search.rx = Some(rx);
+        state.project_search.references = true;
         let buffer = state.docs.active();
         let name = buffer
             .rope

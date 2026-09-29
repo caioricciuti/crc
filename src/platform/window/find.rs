@@ -244,10 +244,10 @@ impl EditorView {
             let Some(mut state) = self.state_mut() else {
                 return;
             };
-            if let Some(cancel) = state.project_search_cancel.take() {
+            if let Some(cancel) = state.project_search.cancel.take() {
                 cancel.store(true, Ordering::Relaxed);
             }
-            state.project_search_rx = None;
+            state.project_search.rx = None;
             if let Some(bar) = &mut state.find
                 && bar.project
             {
@@ -324,10 +324,10 @@ impl EditorView {
         let Some(mut state) = self.state_mut() else {
             return;
         };
-        if let Some(cancel) = state.project_search_cancel.take() {
+        if let Some(cancel) = state.project_search.cancel.take() {
             cancel.store(true, Ordering::Relaxed);
         }
-        state.project_search_rx = None;
+        state.project_search.rx = None;
         state.find = None;
         drop(state);
         self.request_redraw();
@@ -440,11 +440,11 @@ impl EditorView {
         let Some(mut state) = self.state_mut() else {
             return;
         };
-        if let Some(old) = state.project_search_cancel.replace(cancel) {
+        if let Some(old) = state.project_search.cancel.replace(cancel) {
             old.store(true, Ordering::Relaxed);
         }
-        state.project_search_rx = Some(rx);
-        state.project_search_references = false;
+        state.project_search.rx = Some(rx);
+        state.project_search.references = false;
         if let Some(bar) = &mut state.find {
             bar.reset_results();
             bar.searching = true;
@@ -458,7 +458,7 @@ impl EditorView {
         let Some(mut state) = self.state_mut() else {
             return;
         };
-        let Some(rx) = &state.project_search_rx else {
+        let Some(rx) = &state.project_search.rx else {
             return;
         };
         let result = match rx.try_recv() {
@@ -466,8 +466,8 @@ impl EditorView {
             Err(mpsc::TryRecvError::Empty) => return,
             Err(mpsc::TryRecvError::Disconnected) => Err("project search stopped".into()),
         };
-        state.project_search_rx = None;
-        state.project_search_cancel = None;
+        state.project_search.rx = None;
+        state.project_search.cancel = None;
         if let Some(bar) = &mut state.find {
             bar.searching = false;
             match result {
@@ -476,7 +476,7 @@ impl EditorView {
                     bar.results = results;
                     bar.selected = 0;
                     bar.result_scroll = 0;
-                    let text = if state.project_search_references {
+                    let text = if state.project_search.references {
                         format!("{count} reference{}", if count == 1 { "" } else { "s" })
                     } else {
                         format!(

@@ -692,8 +692,6 @@ impl EditorView {
             [status_rect.width, status_height],
             theme.status_background,
         );
-        let (line, column) = buffer.cursor_position();
-
         // A transient note (save result, open error) takes over the status
         // line briefly, then yields back to the steady-state readout.
         let note = match message {
@@ -703,98 +701,32 @@ impl EditorView {
                 None
             }
         };
-
-        let name = buffer.display_name();
-        // The diagnostic under the caret, or the file's counts.
-        let (diag_note, diag_counts) = {
-            let list =
-                buffer
-                    .path
-                    .as_ref()
-                    .zip(lsp_language(buffer))
-                    .and_then(|(path, language)| {
-                        lsp.get(&crate::lsp::servers::server_key(language))
-                            .and_then(|s| s.diagnostics.get(path))
-                    });
-            match list {
-                Some(list) if !list.is_empty() => {
-                    let (line, _) = buffer.cursor_position();
-                    let here = list
-                        .iter()
-                        .find(|d| (d.start.line as usize..=d.end.line as usize).contains(&line))
-                        .map(|d| d.message.lines().next().unwrap_or("").to_owned());
-                    let errors = list
-                        .iter()
-                        .filter(|d| d.severity == crate::lsp::Severity::Error)
-                        .count();
-                    let warnings = list.len() - errors;
-                    (here, format!("✕ {errors}  ⚠ {warnings}     "))
-                }
-                _ => (None, String::new()),
-            }
-        };
-        let blamed = blame
-            .as_ref()
-            .filter(|(id, l, text)| *id == buffer.id() && *l == line && !text.is_empty())
-            .map(|(_, _, text)| format!("   ·   {text}"))
-            .unwrap_or_default();
-        let status = note.or(diag_note).unwrap_or_else(|| {
-            if buffer.is_view_only() {
-                return name.to_string();
-            }
-            format!(
-                "{}   {}{}{}",
-                name,
-                if buffer.is_read_only() {
-                    format!(
-                        "Read-only: over {}",
-                        crate::text::buffer::human_size(crate::text::buffer::read_only_limit())
-                    )
-                } else if buffer.is_dirty() {
-                    "Unsaved changes".to_string()
-                } else {
-                    "All changes saved".to_string()
-                },
-                // Known only from drawing: finding such a line up front
-                // would mean scanning the whole file.
-                if *unshaped_on_screen {
-                    "   Long lines drawn without shaping"
-                } else {
-                    ""
-                },
-                blamed
-            )
+        let diagnostics =
+            buffer
+                .path
+                .as_ref()
+                .zip(lsp_language(buffer))
+                .and_then(|(path, language)| {
+                    lsp.get(&crate::lsp::servers::server_key(language))
+                        .and_then(|s| s.diagnostics.get(path))
+                });
+        let (line, _) = buffer.cursor_position();
+        let (status, detail) = status_texts(&StatusParts {
+            buffer,
+            note,
+            diagnostics: diagnostics.map(Vec::as_slice),
+            blame: blame
+                .as_ref()
+                .filter(|(id, l, _)| *id == buffer.id() && *l == line)
+                .map(|(_, _, text)| text.as_str()),
+            unshaped: *unshaped_on_screen,
+            branch: git.branch_status(),
+            claude: claude.as_ref().is_some_and(|c| c.is_connected()),
         });
         let detail = if std::env::var_os("CRC_SHOW_LATENCY").is_some() {
             format!("{}  {:?}", latency.summary(), worst)
         } else {
-            let branch = git.branch_status();
-            let position = if buffer.is_view_only() {
-                String::new()
-            } else {
-                format!(
-                    "Ln {}, Col {}     {}     {}",
-                    line + 1,
-                    column + 1,
-                    buffer.disk_format().label(),
-                    buffer.disk_format().line_ending_label()
-                )
-            };
-            format!(
-                "{}{}{}{}",
-                if claude.as_ref().is_some_and(|c| c.is_connected()) {
-                    "✻ Claude     "
-                } else {
-                    ""
-                },
-                if branch.is_empty() {
-                    String::new()
-                } else {
-                    format!("{branch}     ")
-                },
-                diag_counts,
-                position
-            )
+            detail
         };
         let right_width = 320.0f32.min(status_rect.width * 0.55);
         layout::push_ui_text(
@@ -1226,4 +1158,176 @@ fn draw_prompt(
         [(advance * 0.15).max(1.0), status_height],
         theme.cursor,
     );
+}
+
+/// What the status line says, gathered by `render`.
+struct StatusParts<'a> {
+    buffer: &'a Buffer,
+    /// A transient note: a save result, an open error.
+    note: Option<String>,
+    /// The document's diagnostics, from its language server.
+    diagnostics: Option<&'a [crate::lsp::Diagnostic]>,
+    /// Who last changed the caret's line.
+    blame: Option<&'a str>,
+    /// The frame drew a line too long to shape.
+    unshaped: bool,
+    branch: String,
+    /// Claude Code is connected.
+    claude: bool,
+}
+
+/// The status line's left and right text. The left is a note, else the
+/// diagnostic under the caret, else the file's name and save state; the
+/// right is Claude, the branch, the diagnostic counts and the position.
+fn status_texts(parts: &StatusParts<'_>) -> (String, String) {
+    let buffer = parts.buffer;
+    let (line, column) = buffer.cursor_position();
+    let (here, counts) = match parts.diagnostics {
+        Some(list) if !list.is_empty() => {
+            let here = list
+                .iter()
+                .find(|d| (d.start.line as usize..=d.end.line as usize).contains(&line))
+                .map(|d| d.message.lines().next().unwrap_or("").to_owned());
+            let errors = list
+                .iter()
+                .filter(|d| d.severity == crate::lsp::Severity::Error)
+                .count();
+            let warnings = list.len() - errors;
+            (here, format!("✕ {errors}  ⚠ {warnings}     "))
+        }
+        _ => (None, String::new()),
+    };
+    let name = buffer.display_name();
+    let left = parts.note.clone().or(here).unwrap_or_else(|| {
+        if buffer.is_view_only() {
+            return name;
+        }
+        let saved = if buffer.is_read_only() {
+            format!(
+                "Read-only: over {}",
+                crate::text::buffer::human_size(crate::text::buffer::read_only_limit())
+            )
+        } else if buffer.is_dirty() {
+            "Unsaved changes".to_string()
+        } else {
+            "All changes saved".to_string()
+        };
+        // Known only from drawing: finding such a line up front would mean
+        // scanning the whole file.
+        let unshaped = if parts.unshaped {
+            "   Long lines drawn without shaping"
+        } else {
+            ""
+        };
+        let blamed = parts
+            .blame
+            .filter(|text| !text.is_empty())
+            .map(|text| format!("   ·   {text}"))
+            .unwrap_or_default();
+        format!("{name}   {saved}{unshaped}{blamed}")
+    });
+    let position = if buffer.is_view_only() {
+        String::new()
+    } else {
+        format!(
+            "Ln {}, Col {}     {}     {}",
+            line + 1,
+            column + 1,
+            buffer.disk_format().label(),
+            buffer.disk_format().line_ending_label()
+        )
+    };
+    let right = format!(
+        "{}{}{counts}{position}",
+        if parts.claude { "✻ Claude     " } else { "" },
+        if parts.branch.is_empty() {
+            String::new()
+        } else {
+            format!("{}     ", parts.branch)
+        },
+    );
+    (left, right)
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::{StatusParts, status_texts};
+    use crate::lsp::{Diagnostic, Position, Severity};
+    use crate::text::buffer::Buffer;
+
+    fn parts(buffer: &Buffer) -> StatusParts<'_> {
+        StatusParts {
+            buffer,
+            note: None,
+            diagnostics: None,
+            blame: None,
+            unshaped: false,
+            branch: String::new(),
+            claude: false,
+        }
+    }
+
+    fn diagnostic(line: u32, severity: Severity, message: &str) -> Diagnostic {
+        Diagnostic {
+            start: Position { line, character: 0 },
+            end: Position { line, character: 1 },
+            severity,
+            message: message.to_owned(),
+            source: None,
+            raw: String::new(),
+        }
+    }
+
+    #[test]
+    fn the_left_side_is_the_note_then_the_diagnostic_here_then_the_file() {
+        let buffer = Buffer::new();
+        let (left, right) = status_texts(&parts(&buffer));
+        assert_eq!(left, "Untitled   All changes saved");
+        assert!(right.starts_with("Ln 1, Col 1"), "{right}");
+
+        let list = [
+            diagnostic(0, Severity::Error, "expected `;`\nmore"),
+            diagnostic(4, Severity::Warning, "unused"),
+        ];
+        let with_list = StatusParts {
+            diagnostics: Some(&list),
+            blame: Some("Ada, 2 days ago"),
+            ..parts(&buffer)
+        };
+        let (left, right) = status_texts(&with_list);
+        assert_eq!(
+            left, "expected `;`",
+            "the first line of the one under the caret"
+        );
+        assert!(right.starts_with("✕ 1  ⚠ 1"), "{right}");
+
+        let noted = StatusParts {
+            note: Some("Saved".into()),
+            ..with_list
+        };
+        assert_eq!(status_texts(&noted).0, "Saved");
+    }
+
+    #[test]
+    fn blame_long_lines_claude_and_the_branch_are_added_when_known() {
+        let buffer = Buffer::new();
+        let all = StatusParts {
+            blame: Some("Ada, 2 days ago"),
+            unshaped: true,
+            branch: "main".into(),
+            claude: true,
+            ..parts(&buffer)
+        };
+        let (left, right) = status_texts(&all);
+        assert_eq!(
+            left,
+            "Untitled   All changes saved   Long lines drawn without shaping   ·   Ada, 2 days ago"
+        );
+        assert!(right.starts_with("✻ Claude     main     Ln 1"), "{right}");
+        let empty_blame = StatusParts {
+            blame: Some(""),
+            ..parts(&buffer)
+        };
+        assert_eq!(status_texts(&empty_blame).0, "Untitled   All changes saved");
+    }
 }
