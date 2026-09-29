@@ -485,8 +485,6 @@ impl Buffer {
         // The whole rope was replaced: queued edits no longer describe the
         // way from the old text to the new, so the parser starts over.
         self.invalidate_edits();
-        self.pending_edits.clear();
-        self.last_edit = None;
         self.undo_stack.clear();
         self.redo_stack.clear();
         self.dirty = false;
@@ -665,8 +663,6 @@ impl Buffer {
         self.undo_stack.push(before);
         self.redo_stack.clear();
         self.invalidate_edits();
-        self.pending_edits.clear();
-        self.last_edit = None;
         self.goal_column = None;
         self.saved = Some(self.rope.clone());
         self.stamp = stamp;
@@ -2239,9 +2235,13 @@ impl Buffer {
         self.record_edit(prefix, old_end, old_end_point, new_end);
     }
 
+    /// After the whole rope was replaced: queued edits no longer lead from
+    /// the old text to the new, so they go and the parser starts over.
     fn invalidate_edits(&mut self) {
         self.edits_invalidated = true;
         self.folds.clear();
+        self.pending_edits.clear();
+        self.last_edit = None;
     }
 
     pub fn has_pending_edits(&self) -> bool {

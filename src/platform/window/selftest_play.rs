@@ -31,6 +31,22 @@ impl EditorView {
         let mouse = |kind: NSEventType, x: f64, y: f64, count: isize| {
             mouse_with(kind, x, y, count, NSEventModifierFlags::empty())
         };
+        // A left-button event, sent to the view as AppKit would send it.
+        let press = |kind: NSEventType, x: f64, y: f64, count: isize, flags| {
+            let Some(event) = mouse_with(kind, x, y, count, flags) else {
+                return;
+            };
+            if kind == NSEventType::LeftMouseDown {
+                let _: () = unsafe { msg_send![self, mouseDown: &*event] };
+            } else if kind == NSEventType::LeftMouseUp {
+                let _: () = unsafe { msg_send![self, mouseUp: &*event] };
+            } else {
+                let _: () = unsafe { msg_send![self, mouseDragged: &*event] };
+            }
+        };
+        let send = |kind: NSEventType, x: f64, y: f64, count: isize| {
+            press(kind, x, y, count, NSEventModifierFlags::empty())
+        };
         match step {
             Step::ClickIn {
                 name,
@@ -50,36 +66,12 @@ impl EditorView {
                     return;
                 };
                 let (x, y) = (f64::from(rect.x) + dx, f64::from(rect.y) + dy);
-                let mut flags = NSEventModifierFlags::empty();
-                for (on, flag) in [
-                    (mods.command, NSEventModifierFlags::Command),
-                    (mods.shift, NSEventModifierFlags::Shift),
-                    (mods.option, NSEventModifierFlags::Option),
-                    (mods.control, NSEventModifierFlags::Control),
-                ] {
-                    if on {
-                        flags |= flag;
-                    }
-                }
-                if let Some(event) = mouse_with(NSEventType::LeftMouseDown, x, y, *count, flags) {
-                    let _: () = unsafe { msg_send![self, mouseDown: &*event] };
-                }
-                if let Some(event) = mouse_with(NSEventType::LeftMouseUp, x, y, *count, flags) {
-                    let _: () = unsafe { msg_send![self, mouseUp: &*event] };
-                }
+                let flags = modifier_flags(mods);
+                press(NSEventType::LeftMouseDown, x, y, *count, flags);
+                press(NSEventType::LeftMouseUp, x, y, *count, flags);
             }
             Step::Key { code, mods, chars } => {
-                let mut flags = NSEventModifierFlags::empty();
-                for (on, flag) in [
-                    (mods.command, NSEventModifierFlags::Command),
-                    (mods.shift, NSEventModifierFlags::Shift),
-                    (mods.option, NSEventModifierFlags::Option),
-                    (mods.control, NSEventModifierFlags::Control),
-                ] {
-                    if on {
-                        flags |= flag;
-                    }
-                }
+                let flags = modifier_flags(mods);
                 let characters = NSString::from_str(chars);
                 let plain = NSString::from_str(&chars.to_lowercase());
                 let event = NSEvent::keyEventWithType_location_modifierFlags_timestamp_windowNumber_context_characters_charactersIgnoringModifiers_isARepeat_keyCode(
@@ -127,12 +119,8 @@ impl EditorView {
             // test; which window is in front is not.
             Step::Click { x, y, count } => {
                 let started = Instant::now();
-                if let Some(event) = mouse(NSEventType::LeftMouseDown, *x, *y, *count) {
-                    let _: () = unsafe { msg_send![self, mouseDown: &*event] };
-                }
-                if let Some(event) = mouse(NSEventType::LeftMouseUp, *x, *y, *count) {
-                    let _: () = unsafe { msg_send![self, mouseUp: &*event] };
-                }
+                send(NSEventType::LeftMouseDown, *x, *y, *count);
+                send(NSEventType::LeftMouseUp, *x, *y, *count);
                 if let Some(mut state) = self.state_mut() {
                     state.last_selftest_click_ms = started.elapsed().as_secs_f64() * 1000.0;
                 }
@@ -155,12 +143,8 @@ impl EditorView {
                     f64::from(rect.x + rect.width / 2.0),
                     f64::from(rect.y + rect.height / 2.0),
                 );
-                if let Some(event) = mouse(NSEventType::LeftMouseDown, x, y, *count) {
-                    let _: () = unsafe { msg_send![self, mouseDown: &*event] };
-                }
-                if let Some(event) = mouse(NSEventType::LeftMouseUp, x, y, *count) {
-                    let _: () = unsafe { msg_send![self, mouseUp: &*event] };
-                }
+                send(NSEventType::LeftMouseDown, x, y, *count);
+                send(NSEventType::LeftMouseUp, x, y, *count);
             }
             Step::DownNamed { name } => {
                 let target = {
@@ -180,43 +164,31 @@ impl EditorView {
                 if let Some(mut state) = self.state_mut() {
                     state.selftest_pointer = (x, y);
                 }
-                if let Some(event) = mouse(NSEventType::LeftMouseDown, x, y, 1) {
-                    let _: () = unsafe { msg_send![self, mouseDown: &*event] };
-                }
+                send(NSEventType::LeftMouseDown, x, y, 1);
             }
             Step::DragBy { dx, dy } => {
                 let Some((x, y)) = self.state().map(|state| state.selftest_pointer) else {
                     return;
                 };
-                if let Some(event) = mouse(NSEventType::LeftMouseDragged, x + dx, y + dy, 1) {
-                    let _: () = unsafe { msg_send![self, mouseDragged: &*event] };
-                }
+                send(NSEventType::LeftMouseDragged, x + dx, y + dy, 1);
             }
             Step::UpBy { dx, dy } => {
                 let Some((x, y)) = self.state().map(|state| state.selftest_pointer) else {
                     return;
                 };
-                if let Some(event) = mouse(NSEventType::LeftMouseUp, x + dx, y + dy, 1) {
-                    let _: () = unsafe { msg_send![self, mouseUp: &*event] };
-                }
+                send(NSEventType::LeftMouseUp, x + dx, y + dy, 1);
             }
             Step::Down { x, y, count } => {
                 if let Some(mut state) = self.state_mut() {
                     state.selftest_pointer = (*x, *y);
                 }
-                if let Some(event) = mouse(NSEventType::LeftMouseDown, *x, *y, *count) {
-                    let _: () = unsafe { msg_send![self, mouseDown: &*event] };
-                }
+                send(NSEventType::LeftMouseDown, *x, *y, *count);
             }
             Step::Drag { x, y } => {
-                if let Some(event) = mouse(NSEventType::LeftMouseDragged, *x, *y, 1) {
-                    let _: () = unsafe { msg_send![self, mouseDragged: &*event] };
-                }
+                send(NSEventType::LeftMouseDragged, *x, *y, 1);
             }
             Step::Up { x, y } => {
-                if let Some(event) = mouse(NSEventType::LeftMouseUp, *x, *y, 1) {
-                    let _: () = unsafe { msg_send![self, mouseUp: &*event] };
-                }
+                send(NSEventType::LeftMouseUp, *x, *y, 1);
             }
             Step::Resize { width, height } => {
                 window.setContentSize(NSSize::new(*width, *height));
@@ -273,12 +245,8 @@ impl EditorView {
                     let _: Option<Retained<NSMenu>> =
                         unsafe { msg_send![self, menuForEvent: &*event] };
                 }
-                if let Some(event) = mouse(NSEventType::LeftMouseDragged, x + 40.0, y, 1) {
-                    let _: () = unsafe { msg_send![self, mouseDragged: &*event] };
-                }
-                if let Some(event) = mouse(NSEventType::LeftMouseUp, x + 40.0, y, 1) {
-                    let _: () = unsafe { msg_send![self, mouseUp: &*event] };
-                }
+                send(NSEventType::LeftMouseDragged, x + 40.0, y, 1);
+                send(NSEventType::LeftMouseUp, x + 40.0, y, 1);
                 let _: () = unsafe { msg_send![self, resetCursorRects] };
                 let app = NSApplication::sharedApplication(mtm);
                 let target: &AnyObject = self;
@@ -708,4 +676,20 @@ fn menu_action_for(menu: &NSMenu, chars: &str, flags: NSEventModifierFlags) -> O
         }
     }
     None
+}
+
+/// A script's modifier keys as AppKit's flags.
+fn modifier_flags(mods: &crate::platform::selftest::Mods) -> NSEventModifierFlags {
+    let mut flags = NSEventModifierFlags::empty();
+    for (on, flag) in [
+        (mods.command, NSEventModifierFlags::Command),
+        (mods.shift, NSEventModifierFlags::Shift),
+        (mods.option, NSEventModifierFlags::Option),
+        (mods.control, NSEventModifierFlags::Control),
+    ] {
+        if on {
+            flags |= flag;
+        }
+    }
+    flags
 }

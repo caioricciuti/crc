@@ -465,6 +465,26 @@ fn all_docs(state: &State) -> impl Iterator<Item = &Documents> {
     std::iter::once(&state.docs).chain(state.panes.iter().map(|p| &p.docs))
 }
 
+/// The document `id` in whichever pane has it. Takes the fields, not the
+/// state, for callers that hold other fields of it at the same time.
+fn buffer_by_id<'a>(docs: &'a Documents, panes: &'a [PaneStore], id: u64) -> Option<&'a Buffer> {
+    std::iter::once(docs)
+        .chain(panes.iter().map(|p| &p.docs))
+        .flat_map(|d| d.iter())
+        .find(|b| b.id() == id)
+}
+
+fn buffer_by_id_mut<'a>(
+    docs: &'a mut Documents,
+    panes: &'a mut [PaneStore],
+    id: u64,
+) -> Option<&'a mut Buffer> {
+    std::iter::once(docs)
+        .chain(panes.iter_mut().map(|p| &mut p.docs))
+        .flat_map(|d| d.iter_mut())
+        .find(|b| b.id() == id)
+}
+
 fn all_docs_mut(state: &mut State) -> Vec<&mut Documents> {
     let State { docs, panes, .. } = state;
     std::iter::once(docs)
@@ -950,14 +970,19 @@ fn choose_path(
 /// what has been typed since its anchor, closed once the caret is before
 /// the anchor, in another document, or past a space or a `/` (a path
 /// completion starts again after the slash). Whether it is still open.
+/// What was typed in `buffer` since `popup` opened: its anchor to the caret,
+/// while the popup is on this document and the caret has not gone before it.
+fn typed_since(buffer: &Buffer, popup: &CompletionPopup) -> Option<String> {
+    let caret = buffer.cursor();
+    (popup.buffer == buffer.id() && caret >= popup.anchor)
+        .then(|| buffer.rope.slice_to_string(popup.anchor..caret))
+}
+
 fn follow_completion(state: &mut State) -> bool {
-    let buffer = state.docs.active();
-    let (id, caret) = (buffer.id(), buffer.cursor());
     let prefix = state
         .completion
         .as_ref()
-        .filter(|popup| popup.buffer == id && caret >= popup.anchor)
-        .map(|popup| buffer.rope.slice_to_string(popup.anchor..caret))
+        .and_then(|popup| typed_since(state.docs.active(), popup))
         .filter(|prefix| !prefix.contains(char::is_whitespace) && !prefix.contains('/'));
     match (prefix, &mut state.completion) {
         (Some(prefix), Some(popup)) => {
@@ -1631,7 +1656,7 @@ define_class!(
                             return;
                         };
                         state.docs.push(Buffer::new());
-                        state.tab_scroll = state.docs.active_index();
+                        reveal_active_tab(&mut state);
                         drop(state);
                         self.sync_title();
                         self.request_redraw();
@@ -6405,13 +6430,8 @@ impl EditorView {
             let Some(mut state) = self.state_mut() else {
                 return;
             };
-            let count = state
-                .palette
-                .as_ref()
-                .map(|(query, _)| {
-                    palette_rows(&palette_sources(&state), &query.rope.to_string()).len()
-                })
-                .unwrap_or(0);
+            let rows = open_palette_rows(&state);
+            let count = rows.len();
             let rect = layout::palette_rect(state.viewport, count);
             if !rect.contains(x, y) || (x >= rect.x + rect.width - 52.0 && y < rect.y + 50.0) {
                 drop(state);
@@ -6434,9 +6454,6 @@ impl EditorView {
                 self.pump();
                 return;
             }
-            let Some((query, _)) = &state.palette else {
-                return;
-            };
             let Some(row) = layout::palette_row_at(rect, x, y) else {
                 return;
             };
@@ -6444,10 +6461,7 @@ impl EditorView {
                 count,
                 layout::palette_visible_rows(rect),
             ));
-            palette_rows(&palette_sources(&state), &query.rope.to_string())
-                .into_iter()
-                .nth(first + row)
-                .map(|(_, pick)| pick)
+            rows.into_iter().nth(first + row).map(|(_, pick)| pick)
         };
         if let Some(pick) = chosen {
             self.close_palette();
@@ -6591,12 +6605,12 @@ impl EditorView {
                     let Some(state) = self.state() else {
                         return false;
                     };
-                    let Some((query, selected)) = &state.palette else {
+                    let Some(selected) = state.palette.as_ref().map(|(_, s)| *s) else {
                         return false;
                     };
-                    palette_rows(&palette_sources(&state), &query.rope.to_string())
+                    open_palette_rows(&state)
                         .into_iter()
-                        .nth(*selected)
+                        .nth(selected)
                         .map(|(_, pick)| pick)
                 };
                 self.close_palette();
@@ -6609,13 +6623,7 @@ impl EditorView {
                 let Some(mut state) = self.state_mut() else {
                     return false;
                 };
-                let count = state
-                    .palette
-                    .as_ref()
-                    .map(|(query, _)| {
-                        palette_rows(&palette_sources(&state), &query.rope.to_string()).len()
-                    })
-                    .unwrap_or(0);
+                let count = open_palette_rows(&state).len();
                 let visible =
                     layout::palette_visible_rows(layout::palette_rect(state.viewport, count));
                 if let Some((_, selected)) = &mut state.palette {
@@ -6947,10 +6955,7 @@ impl EditorView {
         let (text, ext) = view.text(view.segment);
         // In whichever pane the tab is: the focus may have moved to another
         // since the request went out.
-        let buffer = std::iter::once(&mut *docs)
-            .chain(panes.iter_mut().map(|p| &mut p.docs))
-            .flat_map(|d| d.iter_mut())
-            .find(|b| b.id() == id);
+        let buffer = buffer_by_id_mut(docs, panes, id);
         if let Some(buffer) = buffer {
             buffer.regenerate(&text);
             buffer.display_ext = ext;
@@ -10169,11 +10174,7 @@ impl EditorView {
             if !server.is_ready() || server.knows(&path) {
                 continue;
             }
-            let text = std::iter::once(&*docs)
-                .chain(panes.iter().map(|p| &p.docs))
-                .flat_map(|d| d.iter())
-                .find(|b| b.id() == id)
-                .map(|b| b.rope.to_string());
+            let text = buffer_by_id(docs, panes, id).map(|b| b.rope.to_string());
             if let Some(text) = text {
                 server.did_open(&path, crate::lsp::servers::language_id(language), &text);
             }
@@ -10269,10 +10270,7 @@ impl EditorView {
             let Some(head) = entry.head.clone() else {
                 continue;
             };
-            let buffer = std::iter::once(&*docs)
-                .chain(panes.iter().map(|p| &p.docs))
-                .flat_map(|d| d.iter())
-                .find(|b| b.id() == id);
+            let buffer = buffer_by_id(docs, panes, id);
             let Some(buffer) = buffer else {
                 continue;
             };
@@ -10314,10 +10312,7 @@ impl EditorView {
         } = &mut *state;
         for id in due {
             lsp_dirty.remove(&id);
-            let buffer = std::iter::once(&*docs)
-                .chain(panes.iter().map(|p| &p.docs))
-                .flat_map(|d| d.iter())
-                .find(|b| b.id() == id);
+            let buffer = buffer_by_id(docs, panes, id);
             let Some(buffer) = buffer else {
                 continue;
             };
@@ -10408,18 +10403,11 @@ impl EditorView {
                     let Some(mut state) = self.state_mut() else {
                         return;
                     };
-                    let caret = state.docs.active().cursor();
-                    let id = state.docs.active().id();
-                    let prefix = state.completion.as_ref().and_then(|popup| {
-                        (popup.request == request && popup.buffer == id && caret >= popup.anchor)
-                            .then(|| {
-                                state
-                                    .docs
-                                    .active()
-                                    .rope
-                                    .slice_to_string(popup.anchor..caret)
-                            })
-                    });
+                    let prefix = state
+                        .completion
+                        .as_ref()
+                        .filter(|popup| popup.request == request)
+                        .and_then(|popup| typed_since(state.docs.active(), popup));
                     if let (Some(prefix), Some(popup)) = (prefix, state.completion.as_mut()) {
                         popup.items = items;
                         popup.refilter(&prefix);
@@ -10723,13 +10711,11 @@ impl EditorView {
             self.pump();
             return;
         };
-        let caret = state.docs.active().cursor();
-        let id = state.docs.active().id();
         let prefix = state
             .completion
             .as_ref()
-            .filter(|p| p.buffer == id && p.generation == answer.generation && caret >= p.anchor)
-            .map(|p| state.docs.active().rope.slice_to_string(p.anchor..caret));
+            .filter(|p| p.generation == answer.generation)
+            .and_then(|p| typed_since(state.docs.active(), p));
         if let (Some(prefix), Some(popup)) = (prefix, state.completion.as_mut()) {
             popup.local = answer.candidates;
             popup.boosts = answer.boosts;
@@ -14347,6 +14333,13 @@ struct PaletteSources<'a> {
     branches: Option<&'a [crate::project::git::Branch]>,
     /// Set while picking a code action.
     actions: Option<&'a (Language, Vec<crate::lsp::CodeAction>)>,
+}
+
+/// The rows of the open palette for its query; none when it is closed.
+fn open_palette_rows(state: &State) -> Vec<(layout::PaletteRow, Pick)> {
+    state.palette.as_ref().map_or_else(Vec::new, |(query, _)| {
+        palette_rows(&palette_sources(state), &query.rope.to_string())
+    })
 }
 
 fn palette_sources(state: &State) -> PaletteSources<'_> {

@@ -264,14 +264,7 @@ impl Term {
         let lines: Vec<String> = self
             .screen
             .iter()
-            .map(|row| {
-                let line: String = row
-                    .iter()
-                    .filter(|c| c.flags & WIDE_TAIL == 0)
-                    .map(|c| c.ch)
-                    .collect();
-                line.trim_end().to_owned()
-            })
+            .map(|row| cells_text(row).trim_end().to_owned())
             .collect();
         let end = lines
             .iter()
@@ -315,11 +308,7 @@ impl Term {
             };
             let from = if number == start.0 { start.1 } else { 0 };
             let to = if number == end.0 { end.1 } else { cells.len() };
-            let piece: String = cells[from.min(cells.len())..to.min(cells.len())]
-                .iter()
-                .filter(|c| c.flags & WIDE_TAIL == 0)
-                .map(|c| c.ch)
-                .collect();
+            let piece = cells_text(&cells[from.min(cells.len())..to.min(cells.len())]);
             let wrapped = to >= cells.len() && cells.last().is_some_and(|c| c.flags & WRAPPED != 0);
             if number == end.0 || wrapped {
                 out.push_str(if number == end.0 {
@@ -391,8 +380,8 @@ impl Term {
         if rows < self.rows {
             let lost = (self.row + 1).saturating_sub(rows);
             for line in self.screen.drain(..lost) {
-                if !self.alternate && push_history(&mut self.scrollback, line) {
-                    self.dropped += 1;
+                if !self.alternate {
+                    retire(&mut self.scrollback, &mut self.dropped, line);
                 }
             }
             self.screen.truncate(rows);
@@ -402,8 +391,8 @@ impl Term {
             // screen: its top lines go to history as they would have with
             // it showing, not away.
             for line in self.other.drain(..lost_other) {
-                if self.alternate && push_history(&mut self.scrollback, line) {
-                    self.dropped += 1;
+                if self.alternate {
+                    retire(&mut self.scrollback, &mut self.dropped, line);
                 }
             }
         } else {
@@ -984,8 +973,8 @@ impl Term {
         let blank = vec![Cell::blank(&self.pen); self.cols];
         for _ in 0..n {
             let line = self.screen.remove(from);
-            if keep && from == 0 && !self.alternate && push_history(&mut self.scrollback, line) {
-                self.dropped += 1;
+            if keep && from == 0 && !self.alternate {
+                retire(&mut self.scrollback, &mut self.dropped, line);
             }
             self.screen.insert(self.bottom, blank.clone());
         }
@@ -1152,14 +1141,24 @@ impl Term {
     }
 }
 
-/// Adds a line to history; whether the oldest had to go to make room.
-fn push_history(history: &mut VecDeque<Vec<Cell>>, line: Vec<Cell>) -> bool {
-    let full = history.len() == SCROLLBACK;
-    if full {
+/// The characters of `cells`, a wide character once.
+fn cells_text(cells: &[Cell]) -> String {
+    cells
+        .iter()
+        .filter(|c| c.flags & WIDE_TAIL == 0)
+        .map(|c| c.ch)
+        .collect()
+}
+
+/// Adds a line to history, counting in `dropped` the oldest line when it
+/// had to go to make room. Free, not a method: callers drain the screen
+/// while they push.
+fn retire(history: &mut VecDeque<Vec<Cell>>, dropped: &mut u64, line: Vec<Cell>) {
+    if history.len() == SCROLLBACK {
         history.pop_front();
+        *dropped += 1;
     }
     history.push_back(line);
-    full
 }
 
 /// A colour from the parameters after 38 or 48: `5;n` or `2;r;g;b`, where

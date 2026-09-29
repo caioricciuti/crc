@@ -1,7 +1,7 @@
 //! Bounded cold-fallback rasterization. Only chars and owned RGBA bytes cross
 //! threads; all native font/context objects are created and dropped there.
 use super::{
-    CGFloat, CGPoint, CTFontSymbolicTraits, PAD, display_width, load_monospace, rasterize_bitmap,
+    CTFontSymbolicTraits, baseline_origin, display_width, load_monospace, rasterize_bitmap,
     resolve_glyph,
 };
 use std::collections::HashSet;
@@ -36,10 +36,7 @@ impl Worker {
                         let (fallback, glyph) = resolve_glyph(&font, ch.encode_utf16(&mut units))?;
                         let font = fallback.as_deref().unwrap_or(&font);
                         let cells = display_width(ch);
-                        let pos = CGPoint {
-                            x: (PAD / 2) as CGFloat,
-                            y: (cell_px.1 as f32 - (PAD / 2) as f32 - ascent) as CGFloat,
-                        };
+                        let pos = baseline_origin(cell_px, ascent, 0.0);
                         Some(Bitmap {
                             pixels: rasterize_bitmap(cell_px, font, glyph, pos, cells)?,
                             cells,

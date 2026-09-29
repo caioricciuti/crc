@@ -857,17 +857,8 @@ impl Atlas {
             let ch = char::from_u32(FIRST_ASCII + i as u32).expect("ascii");
             let Some(cell) = atlas.alloc(1) else { break };
             atlas.draw_glyph_into(cell, &font, *glyph, ascent_px, 1);
-            let uv = atlas.cell_uv(cell, 1);
-            atlas.slots.insert(
-                ch,
-                Slot {
-                    dx: 0.0,
-                    uv,
-                    cells: 1,
-                    color: false,
-                    page: 0,
-                },
-            );
+            let slot = atlas.slot_at(cell, 1, false);
+            atlas.slots.insert(ch, slot);
         }
 
         atlas
@@ -887,16 +878,8 @@ impl Atlas {
                 if let Some(bitmap) = bitmap {
                     if let Some(cell) = self.alloc(bitmap.cells) {
                         self.copy_bitmap(cell, bitmap.cells, &bitmap.pixels);
-                        self.slots.insert(
-                            ch,
-                            Slot {
-                                dx: 0.0,
-                                uv: self.cell_uv(cell, bitmap.cells),
-                                page: (cell / CELLS) as u32,
-                                cells: bitmap.cells as u8,
-                                color: bitmap.color,
-                            },
-                        );
+                        let slot = self.slot_at(cell, bitmap.cells, bitmap.color);
+                        self.slots.insert(ch, slot);
                     }
                 } else {
                     self.missing.insert(ch);
@@ -1062,13 +1045,7 @@ impl Atlas {
         let cell = self.alloc(cells)?;
         let ascent = self.metrics.ascent * self.metrics.scale;
         self.draw_glyph_into(cell, &font, glyph, ascent, cells);
-        let slot = Slot {
-            dx: 0.0,
-            uv: self.cell_uv(cell, cells),
-            page: (cell / CELLS) as u32,
-            cells: cells as u8,
-            color: false,
-        };
+        let slot = self.slot_at(cell, cells, false);
         self.face_slots.insert((ch, face), slot);
         self.dirty = true;
         Some(slot)
@@ -1461,13 +1438,11 @@ impl Atlas {
             ascent.max(self.metrics.ascent * self.metrics.scale)
         };
         self.draw_glyph_shifted(cell, font, glyph.glyph, ascent_px, cells, shift as f32);
+        let color =
+            unsafe { font.symbolic_traits() }.contains(CTFontSymbolicTraits::ColorGlyphsTrait);
         let slot = Slot {
             dx: -(shift as f32) / self.metrics.scale,
-            uv: self.cell_uv(cell, cells),
-            page: (cell / CELLS) as u32,
-            cells: cells as u8,
-            color: unsafe { font.symbolic_traits() }
-                .contains(CTFontSymbolicTraits::ColorGlyphsTrait),
+            ..self.slot_at(cell, cells, color)
         };
         self.shaped_slots
             .entry(font_key.clone())
@@ -1548,6 +1523,17 @@ impl Atlas {
         ((cell % COLS) * cw, (cell / COLS) * ch)
     }
 
+    /// The slot for a glyph drawn at `cell`, `cells` wide, with no shift.
+    fn slot_at(&self, cell: usize, cells: usize, color: bool) -> Slot {
+        Slot {
+            dx: 0.0,
+            uv: self.cell_uv(cell, cells),
+            page: (cell / CELLS) as u32,
+            cells: cells as u8,
+            color,
+        }
+    }
+
     fn cell_uv(&self, cell: usize, cells: usize) -> [f32; 4] {
         let (cw, ch) = self.cell_px;
         let (x, y) = self.cell_origin(cell);
@@ -1602,13 +1588,7 @@ impl Atlas {
             let cells = display_width(ch);
             let cell = self.alloc(cells)?;
             self.draw_icon_into(cell, &icons, glyph, cells);
-            return Some(Slot {
-                dx: 0.0,
-                uv: self.cell_uv(cell, cells),
-                page: (cell / CELLS) as u32,
-                cells: cells as u8,
-                color: false,
-            });
+            return Some(self.slot_at(cell, cells, false));
         }
 
         // Try the primary font, then let CoreText pick a fallback. This is
@@ -1630,13 +1610,7 @@ impl Atlas {
         let ascent = self.metrics.ascent * self.metrics.scale;
         self.draw_glyph_into(cell, &font, glyph, ascent, cells);
 
-        Some(Slot {
-            dx: 0.0,
-            uv: self.cell_uv(cell, cells),
-            page: (cell / CELLS) as u32,
-            cells: cells as u8,
-            color: is_color,
-        })
+        Some(self.slot_at(cell, cells, is_color))
     }
 
     /// Rasterizes one glyph into a scratch bitmap and blits it into the cell.
@@ -1706,11 +1680,7 @@ impl Atlas {
         cells: usize,
         shift: f32,
     ) {
-        // CoreGraphics puts the origin at the bottom left.
-        let origin = CGPoint {
-            x: ((PAD / 2) as f32 + shift) as CGFloat,
-            y: (self.cell_px.1 as f32 - (PAD / 2) as f32 - ascent_px) as CGFloat,
-        };
+        let origin = baseline_origin(self.cell_px, ascent_px, shift);
         self.draw_glyph_at(cell, font, glyph, origin, cells);
     }
 
@@ -1759,6 +1729,16 @@ impl Atlas {
             }
         }
         self.dirty = true;
+    }
+}
+
+/// Where a glyph's pen starts in its cell: past half the padding, `shift`
+/// further right, on the baseline `ascent_px` below the top. CoreGraphics
+/// puts the origin at the bottom left.
+fn baseline_origin(cell_px: (usize, usize), ascent_px: f32, shift: f32) -> CGPoint {
+    CGPoint {
+        x: ((PAD / 2) as f32 + shift) as CGFloat,
+        y: (cell_px.1 as f32 - (PAD / 2) as f32 - ascent_px) as CGFloat,
     }
 }
 

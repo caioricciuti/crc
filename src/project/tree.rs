@@ -170,10 +170,7 @@ impl Tree {
             .filter(|e| e.is_dir && e.expanded)
             .map(|e| e.path.clone())
             .collect();
-        let selected_path = self
-            .selected
-            .and_then(|i| self.rows.get(i))
-            .map(|e| e.path.clone());
+        let selected_path = self.selected_path();
 
         self.rows = read_dir(&root, 0);
         // Re-expand outermost-first, so nested paths exist by the time they
@@ -186,7 +183,7 @@ impl Tree {
             }
         }
 
-        self.selected = selected_path.and_then(|p| self.rows.iter().position(|e| e.path == p));
+        self.selected = self.row_of(selected_path);
     }
 
     /// Closes every expanded directory, leaving the top level showing.
@@ -196,10 +193,7 @@ impl Tree {
         if self.root.is_none() {
             return;
         }
-        let selected_path = self
-            .selected
-            .and_then(|i| self.rows.get(i))
-            .map(|e| e.path.clone());
+        let selected_path = self.selected_path();
         // The entries are already in memory. Collapse must not rescan a large
         // project on the AppKit event thread or silently act as Refresh.
         self.rows.retain(|entry| entry.depth == 0);
@@ -209,7 +203,7 @@ impl Tree {
         self.scroll = 0;
         // A selection inside a directory that is now closed has no row to
         // point at; keep it only if its row survived.
-        self.selected = selected_path.and_then(|p| self.rows.iter().position(|e| e.path == p));
+        self.selected = self.row_of(selected_path);
     }
 
     /// Expands or collapses the directory at `index`.
@@ -241,14 +235,10 @@ impl Tree {
         else {
             return false;
         };
-        let selected_path = self
-            .selected
-            .and_then(|i| self.rows.get(i))
-            .map(|e| e.path.clone());
+        let selected_path = self.selected_path();
         self.rows[index].expanded = true;
         self.rows.splice(index + 1..index + 1, children);
-        self.selected =
-            selected_path.and_then(|path| self.rows.iter().position(|e| e.path == path));
+        self.selected = self.row_of(selected_path);
         true
     }
 
@@ -270,6 +260,11 @@ impl Tree {
         self.selected
             .and_then(|i| self.rows.get(i))
             .map(|e| e.path.clone())
+    }
+
+    /// The row showing `path`, if one does.
+    fn row_of(&self, path: Option<PathBuf>) -> Option<usize> {
+        path.and_then(|path| self.rows.iter().position(|e| e.path == path))
     }
 
     /// The selection follows its row when rows are added or removed above
