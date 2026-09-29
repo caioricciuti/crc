@@ -203,6 +203,19 @@ fn to_relative(entry: &Entry, positions: Vec<usize>) -> Vec<usize> {
 /// matches at a word boundary score far higher, which is why `rlay` puts
 /// `render/layout.rs` above some file that merely contains r, l, a, y in
 /// that order.
+/// The indexes of `items` whose `name` matches `query`, best first, ties
+/// in their own order. An empty query keeps every item in order.
+pub fn ranked<T>(items: &[T], query: &str, name: impl Fn(&T) -> &str) -> Vec<usize> {
+    let needle: Vec<char> = query.trim().to_lowercase().chars().collect();
+    let mut hits: Vec<(i32, usize)> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(i, item)| score(&name(item).to_lowercase(), &needle).map(|(p, _)| (p, i)))
+        .collect();
+    hits.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    hits.into_iter().map(|(_, i)| i).collect()
+}
+
 pub fn score(haystack: &str, needle: &[char]) -> Option<(i32, Vec<usize>)> {
     if needle.is_empty() {
         return Some((0, Vec::new()));

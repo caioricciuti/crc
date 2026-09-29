@@ -6218,12 +6218,11 @@ impl EditorView {
         } else if g.message.contains(x, y) {
             state.git_focus = true;
             let State { git, renderer, .. } = &mut *state;
-            let text = git.message.rope.to_string();
-            let (shown, start) = layout::ui_input_window(&text, git.message.cursor());
-            if let Some(line) = renderer.atlas.shape_ui(&shown) {
-                git.message
-                    .place_cursor(start + line.byte_at_x(x - g.message.x - 9.0), Motion::Move);
-            }
+            place_field_caret(
+                &mut renderer.atlas,
+                &mut git.message,
+                x - g.message.x - crate::platform::git_panel::MESSAGE_PAD,
+            );
         } else if let Some((entry, rect)) = state.git.entry_at(g, x, y) {
             match entry {
                 // A conflict is resolved in the file, not read as a diff.
@@ -6424,11 +6423,11 @@ impl EditorView {
                     palette, renderer, ..
                 } = &mut *state;
                 if let Some((query, _)) = palette {
-                    let text = query.rope.to_string();
-                    let (shown, start) = layout::ui_input_window(&text, query.cursor());
-                    if let Some(line) = renderer.atlas.shape_ui(&shown) {
-                        query.place_cursor(start + line.byte_at_x(x - rect.x - 18.0), Motion::Move);
-                    }
+                    place_field_caret(
+                        &mut renderer.atlas,
+                        query,
+                        x - rect.x - layout::PALETTE_INPUT_PAD,
+                    );
                 }
                 drop(state);
                 self.request_redraw();
@@ -7177,12 +7176,7 @@ impl EditorView {
                 } else {
                     &mut bar.query
                 };
-                let text = field.rope.to_string();
-                let (shown, start) = layout::ui_input_window(&text, field.cursor());
-                if let Some(line) = renderer.atlas.shape_ui(&shown) {
-                    let at = line.byte_at_x(x - box_rect.x - 10.0);
-                    field.place_cursor(start + at, Motion::Move);
-                }
+                place_field_caret(&mut renderer.atlas, field, x - box_rect.x - FIND_FIELD_PAD);
             }
         }
         self.request_redraw();
@@ -12377,8 +12371,8 @@ impl EditorView {
                 layout::push_rounded_rect(glyphs, box_rect, 6.0, theme.tab_active);
                 let text = buffer.rope.to_string();
                 let inner = Viewport {
-                    x: box_rect.x + 10.0,
-                    width: (box_rect.width - 20.0).max(0.0),
+                    x: box_rect.x + FIND_FIELD_PAD,
+                    width: (box_rect.width - FIND_FIELD_PAD * 2.0).max(0.0),
                     ..box_rect
                 };
                 // The match count first, so the text knows how much room is
@@ -13753,6 +13747,19 @@ fn context_tab_path(state: &State) -> Option<std::path::PathBuf> {
         .and_then(|b| b.path.clone())
 }
 
+/// The find and replace fields' text inset inside their boxes.
+const FIND_FIELD_PAD: f32 = 10.0;
+
+/// Puts the caret of a one-line UI field where a click at `x`, measured
+/// from the start of its text, lands, as `layout::push_ui_field` drew it.
+fn place_field_caret(atlas: &mut crate::render::font::Atlas, field: &mut Buffer, x: f32) {
+    let text = field.rope.to_string();
+    let (shown, start) = layout::ui_input_window(&text, field.cursor());
+    if let Some(line) = atlas.shape_ui(&shown) {
+        field.place_cursor(start + line.byte_at_x(x), Motion::Move);
+    }
+}
+
 fn field_has_keys(state: &State) -> bool {
     state.sidebar_edit.is_some()
         || state.rename.is_some()
@@ -14280,19 +14287,9 @@ fn action_rows(
     actions: &[crate::lsp::CodeAction],
     query: &str,
 ) -> Vec<(layout::PaletteRow, Pick)> {
-    let needle: Vec<char> = query.trim().to_lowercase().chars().collect();
-    let mut hits: Vec<(i32, usize)> = actions
-        .iter()
-        .enumerate()
-        .filter_map(|(i, a)| {
-            crate::project::finder::score(&a.title.to_lowercase(), &needle).map(|(p, _)| (p, i))
-        })
-        .collect();
-    if !needle.is_empty() {
-        hits.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-    }
-    hits.into_iter()
-        .map(|(_, i)| {
+    crate::project::finder::ranked(actions, query, |a| &a.title)
+        .into_iter()
+        .map(|i| {
             let action = &actions[i];
             let kind = action.kind.split('.').next().unwrap_or("");
             let detail = match (&action.disabled, action.preferred) {
@@ -14325,34 +14322,26 @@ fn branch_rows(
     branches: &[crate::project::git::Branch],
     query: &str,
 ) -> Vec<(layout::PaletteRow, Pick)> {
-    let needle: Vec<char> = query.trim().to_lowercase().chars().collect();
-    let mut hits: Vec<(i32, usize)> = branches
-        .iter()
-        .enumerate()
-        .filter_map(|(i, b)| {
-            crate::project::finder::score(&b.name.to_lowercase(), &needle).map(|(p, _)| (p, i))
-        })
-        .collect();
-    hits.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-    let mut rows: Vec<(layout::PaletteRow, Pick)> = hits
-        .into_iter()
-        .map(|(_, i)| {
-            let b = &branches[i];
-            (
-                layout::PaletteRow {
-                    icon: None,
-                    title: b.name.clone(),
-                    detail: match (&b.upstream, b.current) {
-                        (_, true) => "current branch".into(),
-                        (Some(up), false) => format!("tracks {up}"),
-                        (None, false) => "local only".into(),
+    let mut rows: Vec<(layout::PaletteRow, Pick)> =
+        crate::project::finder::ranked(branches, query, |b| &b.name)
+            .into_iter()
+            .map(|i| {
+                let b = &branches[i];
+                (
+                    layout::PaletteRow {
+                        icon: None,
+                        title: b.name.clone(),
+                        detail: match (&b.upstream, b.current) {
+                            (_, true) => "current branch".into(),
+                            (Some(up), false) => format!("tracks {up}"),
+                            (None, false) => "local only".into(),
+                        },
+                        shortcut: String::new(),
                     },
-                    shortcut: String::new(),
-                },
-                Pick::Branch(b.name.clone()),
-            )
-        })
-        .collect();
+                    Pick::Branch(b.name.clone()),
+                )
+            })
+            .collect();
     let name = query.trim();
     if !name.is_empty() && !branches.iter().any(|b| b.name == name) {
         rows.push((

@@ -2576,7 +2576,7 @@ pub fn build_palette(
     }
     push_panel(out, viewport, 12.0, theme);
     let input = Viewport {
-        x: viewport.x + 18.0,
+        x: viewport.x + PALETTE_INPUT_PAD,
         y: viewport.y + 8.0,
         width: (viewport.width - 74.0).max(0.0),
         height: 38.0,
@@ -5267,6 +5267,9 @@ pub struct UiField<'a> {
     /// The caret is drawn only in the field that has the keyboard.
     pub focused: bool,
 }
+
+/// The palette query's text inset from the palette's left edge.
+pub const PALETTE_INPUT_PAD: f32 = 18.0;
 
 /// Draws `field` in `input`: the text scrolled to keep the caret in view,
 /// the selection band behind it and the caret, both `band` = (top offset,

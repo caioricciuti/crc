@@ -33,6 +33,9 @@ struct Reply {
     done: Option<String>,
 }
 
+/// The commit message's text inset inside its box, for drawing and clicks.
+pub const MESSAGE_PAD: f32 = 9.0;
+
 pub struct Panel {
     directory: PathBuf,
     pub snapshot: Option<Snapshot>,
@@ -791,8 +794,8 @@ impl Panel {
         layout::push_rounded_rect(out, g.message, 5.0, theme.tab_active);
         let full = self.message.rope.to_string();
         let text_rect = Viewport {
-            x: g.message.x + 9.0,
-            width: (g.message.width - 18.0).max(0.0),
+            x: g.message.x + MESSAGE_PAD,
+            width: (g.message.width - MESSAGE_PAD * 2.0).max(0.0),
             ..g.message
         };
         layout::push_ui_field(
