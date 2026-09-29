@@ -320,6 +320,19 @@ pub fn parse_spanned(source: &str) -> Vec<SpannedBlock> {
         let mut text = String::from(trimmed);
         i += 1;
         gather_continuation(&lines, &mut i, &mut text);
+        // An underline under a paragraph of several lines makes all of it
+        // the heading, as it does under one line above.
+        if let Some(level) = lines.get(i).and_then(|l| setext_level(l.trim())) {
+            i += 1;
+            blocks.push(SpannedBlock {
+                block: Block::Heading {
+                    level,
+                    runs: parse_inline(&text),
+                },
+                lines: start..i,
+            });
+            continue;
+        }
         blocks.push(SpannedBlock {
             block: Block::Paragraph {
                 runs: parse_inline(&text),
@@ -329,6 +342,16 @@ pub fn parse_spanned(source: &str) -> Vec<SpannedBlock> {
     }
 
     blocks
+}
+
+/// The heading level a setext underline gives: `===` 1, `---` 2.
+fn setext_level(line: &str) -> Option<u8> {
+    let first = line.chars().next()?;
+    (matches!(first, '=' | '-') && line.chars().all(|c| c == first)).then_some(if first == '=' {
+        1
+    } else {
+        2
+    })
 }
 
 /// Leading indentation in columns, with tabs advancing to the next multiple
@@ -370,6 +393,7 @@ fn gather_continuation(lines: &[&str], i: &mut usize, text: &mut String) {
             || heading_level(next).is_some()
             || fence_of(next).is_some()
             || is_rule(next)
+            || setext_level(next.trim_end()).is_some()
             || next.starts_with('>')
             || list_item(next).is_some()
         {
@@ -508,6 +532,8 @@ pub fn parse_inline(text: &str) -> Vec<Run> {
     let mut plain = String::new();
     let mut i = 0;
     let mut misses = Misses::default();
+    // The run of one marker character that `i` is in, as (start, end).
+    let mut run = (0, 0);
 
     let flush = |plain: &mut String, runs: &mut Vec<Run>| {
         if !plain.is_empty() {
@@ -560,7 +586,11 @@ pub fn parse_inline(text: &str) -> Vec<Run> {
             continue;
         }
 
-        if let Some((marker, style)) = delimiter_at(&chars, i)
+        if !(run.0..run.1).contains(&i) || chars[run.0] != chars[i] {
+            let end = i + chars[i..].iter().take_while(|x| **x == chars[i]).count();
+            run = (i, end);
+        }
+        if let Some((marker, style)) = delimiter_at(&chars, i, run.1)
             && let Some(end) = misses.find_run(&chars, i + marker, &chars[i], marker)
         {
             flush(&mut plain, &mut runs);
@@ -621,9 +651,12 @@ fn combine(outer: Style, inner: Style) -> Style {
 /// `_` is stricter still, and may not open inside a word. That rule exists so
 /// that `min_release_age` and `snake_case_name` survive, which they did not:
 /// they rendered as `minreleaseage` and `snakecasename`.
-fn delimiter_at(chars: &[char], i: usize) -> Option<(usize, Style)> {
+/// `run_end` is where the run of `chars[i]` holding `i` ends: every position
+/// in a run shares it, so the caller finds it once per run, not once per
+/// position (which made a long run of `*` quadratic).
+fn delimiter_at(chars: &[char], i: usize, run_end: usize) -> Option<(usize, Style)> {
     let c = chars[i];
-    let run = chars[i..].iter().take_while(|x| **x == c).count();
+    let run = run_end - i;
     let (len, style) = match (c, run) {
         ('~', n) if n >= 2 => (2, Style::Strike),
         ('*' | '_', n) if n >= 3 => (3, Style::StrongEmphasis),
@@ -708,9 +741,10 @@ impl Misses {
 fn find_run(chars: &[char], from: usize, marker: &char, len: usize) -> Option<usize> {
     let mut i = from;
     while i + len <= chars.len() {
-        if chars[i] == *marker
-            && chars[i..].iter().take_while(|c| *c == marker).count() >= len
-            && i > from
+        // At least `len` markers here: counted to `len`, not to the end of
+        // the run, or a long run made each search as long as the run.
+        if i > from
+            && chars[i..].iter().take(len).filter(|c| *c == marker).count() == len
             && !chars[i - 1].is_whitespace()
             && !(*marker == '_' && chars.get(i + len).is_some_and(|c| c.is_alphanumeric()))
         {
@@ -730,6 +764,28 @@ fn find_from(chars: &[char], from: usize, needle: char) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn a_long_run_of_markers_is_linear() {
+        for tail in ["", "a", " "] {
+            for marker in ['*', '_', '~'] {
+                let text = format!("{}{tail}", marker.to_string().repeat(200_000));
+                let started = std::time::Instant::now();
+                let runs = parse_inline(&text);
+                if tail != "a" {
+                    // Nothing can open: the whole run stays text.
+                    let text_back: String = runs.iter().map(|r| r.text.as_str()).collect();
+                    assert_eq!(text_back, text);
+                }
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(2),
+                    "{marker:?} then {tail:?} took {:?}",
+                    started.elapsed()
+                );
+            }
+        }
+    }
 
     /// The block rules the renderer and the styled source share, at the
     /// cases the two used to answer differently.
@@ -758,8 +814,6 @@ mod tests {
         assert!(!is_table_delimiter("|:|---|"), "a colon without dashes");
         assert!(!is_table_delimiter("---"), "no pipe: a rule");
     }
-
-    use super::*;
 
     #[test]
     fn table_cells_keep_escaped_and_code_pipes() {
@@ -822,6 +876,22 @@ mod tests {
             Block::Heading {
                 level: 2,
                 runs: plain("Two")
+            }
+        );
+
+        // An underline takes the whole paragraph above it.
+        assert_eq!(
+            parse("Title\nsecond\n===\n")[0],
+            Block::Heading {
+                level: 1,
+                runs: plain("Title second")
+            }
+        );
+        assert_eq!(
+            parse("Title\nsecond\n---\n")[0],
+            Block::Heading {
+                level: 2,
+                runs: plain("Title second")
             }
         );
     }

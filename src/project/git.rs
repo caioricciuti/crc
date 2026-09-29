@@ -851,7 +851,9 @@ pub fn stage(root: &Path, change: &Change, staged: bool) -> Result<(), String> {
     {
         cmd.args(["restore", "--staged", "--"]);
     } else {
-        cmd.args(["rm", "--cached", "--"]);
+        // No commit yet: out of the index. `-f`, or git refuses a file
+        // changed since it was added; with `--cached` the file is untouched.
+        cmd.args(["rm", "--cached", "-f", "--"]);
     }
     cmd.arg(&change.path);
     // Unstaging a rename restores both names. Staging one needs the old
@@ -1402,6 +1404,32 @@ mod tests {
         let root = std::fs::canonicalize(&root).unwrap();
         std::fs::write(root.join("a.txt"), "one\n").unwrap();
         assert_eq!(head_text(&root, &root.join("a.txt")), Ok(None));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unstaging_before_the_first_commit_keeps_the_edited_file() {
+        let root = std::env::temp_dir().join(format!("caio-unborn-unstage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        run(&root, &["init", "--quiet"]).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        run(&root, &["add", "a.txt"]).unwrap();
+        std::fs::write(root.join("a.txt"), "two\n").unwrap();
+        let change = snapshot(&root)
+            .unwrap()
+            .changes
+            .into_iter()
+            .find(|c| c.path.ends_with("a.txt"))
+            .expect("a.txt is a change");
+        stage(&root, &change, false).expect("unstage");
+        let status = String::from_utf8(run(&root, &["status", "--porcelain"]).unwrap()).unwrap();
+        assert_eq!(status, "?? a.txt\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "two\n"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

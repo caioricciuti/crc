@@ -61,7 +61,7 @@ pub struct Symbols {
     /// The active document when the palette opened: an O(1) rope clone.
     document: Option<(Language, Rope)>,
     root: Option<PathBuf>,
-    outline: RefCell<Option<Vec<Definition>>>,
+    outline: Option<Vec<Definition>>,
     /// The outline being parsed on a worker, from the moment the palette
     /// opens: a few megabytes of tree-sitter is not a main-thread job.
     parsing: Option<std::sync::mpsc::Receiver<Vec<Definition>>>,
@@ -78,7 +78,7 @@ impl Symbols {
     pub fn reset(&mut self, document: Option<(Language, Rope)>, root: Option<PathBuf>) {
         self.document = document;
         self.root = root;
-        *self.outline.get_mut() = None;
+        self.outline = None;
         *self.project_rx.get_mut() = None;
         self.parsing = None;
         if let Some((language, rope)) = &self.document {
@@ -90,7 +90,7 @@ impl Symbols {
                 });
                 self.parsing = Some(rx);
             } else {
-                *self.outline.get_mut() = Some(Vec::new());
+                self.outline = Some(Vec::new());
             }
         }
         *self.project.get_mut() = None;
@@ -129,13 +129,13 @@ impl Symbols {
         };
         match rx.try_recv() {
             Ok(definitions) => {
-                *self.outline.get_mut() = Some(definitions);
+                self.outline = Some(definitions);
                 self.parsing = None;
                 true
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => arrived,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                *self.outline.get_mut() = Some(Vec::new());
+                self.outline = Some(Vec::new());
                 self.parsing = None;
                 true
             }
@@ -148,9 +148,8 @@ impl Symbols {
     }
 
     fn document_hits(&self, needle: &str) -> Vec<Hit> {
-        let outline = self.outline.borrow();
         // Still parsing: nothing yet, and the palette fills in when it lands.
-        let Some(definitions) = outline.as_ref() else {
+        let Some(definitions) = self.outline.as_ref() else {
             return Vec::new();
         };
         let hits = rank(definitions.iter(), needle, |d| &d.name);
