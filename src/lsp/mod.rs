@@ -14,6 +14,7 @@
 pub mod client;
 pub mod servers;
 pub mod transport;
+mod wire;
 
 use std::path::{Path, PathBuf};
 

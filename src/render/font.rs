@@ -1203,6 +1203,51 @@ impl Atlas {
         Some(line)
     }
 
+    /// Makes `rope` of document `doc` the text the shaped editor lines belong
+    /// to: another document's lines are parked and this one's taken back,
+    /// and lines that survived the edit move to their new numbers.
+    fn adopt_snapshot(&mut self, doc: u64, rope: &Rope) {
+        let mut old = self.editor_snapshot.take();
+        // Another document: park this one's lines and take that one's,
+        // if they were kept.
+        if old.as_ref().is_some_and(|(id, _)| *id != doc) {
+            if let Some((id, rope)) = old.take() {
+                let lines = std::mem::take(&mut self.editor_lines);
+                self.parked.push(Parked { id, rope, lines });
+            }
+            if let Some(at) = self.parked.iter().position(|p| p.id == doc) {
+                let parked = self.parked.remove(at);
+                self.editor_lines = parked.lines;
+                old = Some((parked.id, parked.rope));
+            }
+            while self.parked.len() > MAX_PARKED {
+                let dropped = self.parked.remove(0);
+                self.cached_utf16 -= dropped.utf16();
+            }
+        }
+        let mapping = old
+            .as_ref()
+            .filter(|(id, _)| *id == doc)
+            .map(|(_, old)| reuse::LineReuse::new(old, rope));
+        let mut retained = HashMap::new();
+        for (line, shaped) in self.editor_lines.drain() {
+            if let Some((line, _)) = mapping.as_ref().and_then(|m| m.map(line)) {
+                // Deleting duplicate text can map two old paragraphs to
+                // one new line via overlapping prefix/suffix proofs.
+                if let Some(Some(displaced)) = retained.insert(line, shaped) {
+                    self.cached_utf16 -= displaced.offsets.len();
+                }
+            } else if let Some(shaped) = shaped {
+                self.cached_utf16 -= shaped.offsets.len();
+            }
+        }
+        self.editor_lines = retained;
+        if let Some(worker) = &mut self.worker {
+            worker.rebase(doc, mapping.as_ref());
+        }
+        self.editor_snapshot = Some((doc, rope.clone()));
+    }
+
     /// Cache by immutable rope identity, remapping proven unchanged complete
     /// lines on edits. Long source extraction and mapping stay on the worker.
     pub fn shape_editor_line(
@@ -1212,45 +1257,7 @@ impl Atlas {
         range: std::ops::Range<usize>,
     ) -> Option<Rc<ShapedLine>> {
         if !self.editor_snapshot_is(owner.0, rope) {
-            let mut old = self.editor_snapshot.take();
-            // Another document: park this one's lines and take that one's,
-            // if they were kept.
-            if old.as_ref().is_some_and(|(id, _)| *id != owner.0) {
-                if let Some((id, rope)) = old.take() {
-                    let lines = std::mem::take(&mut self.editor_lines);
-                    self.parked.push(Parked { id, rope, lines });
-                }
-                if let Some(at) = self.parked.iter().position(|p| p.id == owner.0) {
-                    let parked = self.parked.remove(at);
-                    self.editor_lines = parked.lines;
-                    old = Some((parked.id, parked.rope));
-                }
-                while self.parked.len() > MAX_PARKED {
-                    let dropped = self.parked.remove(0);
-                    self.cached_utf16 -= dropped.utf16();
-                }
-            }
-            let mapping = old
-                .as_ref()
-                .filter(|(id, _)| *id == owner.0)
-                .map(|(_, old)| reuse::LineReuse::new(old, rope));
-            let mut retained = HashMap::new();
-            for (line, shaped) in self.editor_lines.drain() {
-                if let Some((line, _)) = mapping.as_ref().and_then(|m| m.map(line)) {
-                    // Deleting duplicate text can map two old paragraphs to
-                    // one new line via overlapping prefix/suffix proofs.
-                    if let Some(Some(displaced)) = retained.insert(line, shaped) {
-                        self.cached_utf16 -= displaced.offsets.len();
-                    }
-                } else if let Some(shaped) = shaped {
-                    self.cached_utf16 -= shaped.offsets.len();
-                }
-            }
-            self.editor_lines = retained;
-            if let Some(worker) = &mut self.worker {
-                worker.rebase(owner.0, mapping.as_ref());
-            }
-            self.editor_snapshot = Some((owner.0, rope.clone()));
+            self.adopt_snapshot(owner.0, rope);
         }
         if let Some(shaped) = self.editor_lines.get(&owner.1) {
             if let Some(worker) = &mut self.worker {

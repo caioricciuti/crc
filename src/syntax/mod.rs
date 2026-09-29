@@ -20,7 +20,7 @@ mod predicate;
 use std::ffi::{CString, c_char, c_void};
 use std::ptr::NonNull;
 
-use crate::syntax::predicate::{Pattern, Predicate};
+use crate::syntax::predicate::{Predicate, load_predicates};
 use crate::text::rope::Rope;
 
 /// What a captured node means, once the capture name has been classified.
@@ -818,133 +818,6 @@ impl Drop for Highlighter {
 // SAFETY: a Highlighter owns its parser and query exclusively and exposes no
 // interior mutability. Moving one to a background thread is the intended use.
 unsafe impl Send for Highlighter {}
-
-/// Reads each pattern's predicates out of a compiled query.
-///
-/// A predicate this implementation cannot represent becomes
-/// [`Predicate::Unsupported`], which rejects everything, so the pattern goes
-/// inert. That is the safe direction: a missing highlight is invisible, a
-/// wrong one is not.
-fn load_predicates(query: *const ffi::TSQuery) -> Vec<Vec<Predicate>> {
-    // SAFETY: `query` is a live query for the life of the Highlighter.
-    let count = unsafe { ffi::ts_query_pattern_count(query) };
-    let mut out = Vec::with_capacity(count as usize);
-
-    for pattern in 0..count {
-        let mut step_count = 0u32;
-        let steps =
-            unsafe { ffi::ts_query_predicates_for_pattern(query, pattern, &mut step_count) };
-        if steps.is_null() || step_count == 0 {
-            out.push(Vec::new());
-            continue;
-        }
-        let steps = unsafe { std::slice::from_raw_parts(steps, step_count as usize) };
-
-        let string_at = |id: u32| -> String {
-            let mut len = 0u32;
-            let ptr = unsafe { ffi::ts_query_string_value_for_id(query, id, &mut len) };
-            // SAFETY: a pointer and length from the live query.
-            String::from_utf8_lossy(unsafe { ffi::query_bytes(ptr, len) }).into_owned()
-        };
-
-        // Steps come as a flat list of runs terminated by `Done`. Each run is
-        // the predicate name followed by its arguments.
-        let mut predicates = Vec::new();
-        let mut run: Vec<(u32, u32)> = Vec::new();
-        for step in steps {
-            if step.kind == ffi::TSQueryPredicateStep::DONE {
-                if !run.is_empty() {
-                    predicates.extend(build_predicate(&run, &string_at));
-                    run.clear();
-                }
-                continue;
-            }
-            run.push((step.kind, step.value_id));
-        }
-        if !run.is_empty() {
-            predicates.extend(build_predicate(&run, &string_at));
-        }
-        out.push(predicates);
-    }
-    out
-}
-
-/// The words of a pattern of the exact shape `^(word|word|...)$`.
-fn literal_alternatives(pattern: &str) -> Option<Vec<String>> {
-    let inner = pattern.strip_prefix("^(")?.strip_suffix(")$")?;
-    let words: Vec<String> = inner.split('|').map(str::to_string).collect();
-    let plain = |w: &String| {
-        !w.is_empty()
-            && w.chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    };
-    words.iter().all(plain).then_some(words)
-}
-
-/// Turns one predicate run into a [`Predicate`].
-fn build_predicate(run: &[(u32, u32)], string_at: &dyn Fn(u32) -> String) -> Option<Predicate> {
-    const CAPTURE: u32 = ffi::TSQueryPredicateStep::CAPTURE;
-    const STRING: u32 = ffi::TSQueryPredicateStep::STRING;
-
-    let Some(&(kind, name_id)) = run.first() else {
-        return Some(Predicate::Unsupported);
-    };
-    if kind != STRING {
-        return Some(Predicate::Unsupported);
-    }
-    let name = string_at(name_id);
-    let args = &run[1..];
-
-    Some(match name.as_str() {
-        "match?" | "not-match?" => {
-            let [(CAPTURE, capture), (STRING, pattern_id)] = args[..] else {
-                return Some(Predicate::Unsupported);
-            };
-            let source = string_at(pattern_id);
-            // `^(a|b|c)$` is how queries spell "one of these words", and it
-            // is the one use of alternation in the grammars vendored here.
-            // It needs no regex engine: it is `any-of?` with more typing.
-            if let Some(values) = literal_alternatives(&source).filter(|_| name == "match?") {
-                return Some(Predicate::AnyOf { capture, values });
-            }
-            match Pattern::compile(&source) {
-                Some(pattern) => Predicate::Match {
-                    capture,
-                    pattern,
-                    negated: name.starts_with("not-"),
-                },
-                None => Predicate::Unsupported,
-            }
-        }
-        "eq?" | "not-eq?" => {
-            let [(CAPTURE, capture), (STRING, value_id)] = args[..] else {
-                // Capture-to-capture equality needs both texts at once, which
-                // this pass does not carry.
-                return Some(Predicate::Unsupported);
-            };
-            Predicate::EqString {
-                capture,
-                value: string_at(value_id),
-                negated: name.starts_with("not-"),
-            }
-        }
-        "any-of?" => {
-            let Some(&(CAPTURE, capture)) = args.first() else {
-                return Some(Predicate::Unsupported);
-            };
-            let values = args[1..]
-                .iter()
-                .filter(|(k, _)| *k == STRING)
-                .map(|(_, id)| string_at(*id))
-                .collect();
-            Predicate::AnyOf { capture, values }
-        }
-        // `set!`, `is?` and friends are directives rather than filters; they
-        // do not constrain a match, so they are no predicate at all.
-        "set!" | "is?" | "is-not?" => return None,
-        _ => Predicate::Unsupported,
-    })
-}
 
 /// The row and byte column of `byte` in `rope`.
 fn point_at(rope: &Rope, byte: usize) -> ffi::TSPoint {

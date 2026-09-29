@@ -324,6 +324,15 @@ enum Reach {
     Both,
 }
 
+/// How the syntax layer catches up with the text: by the edits since it
+/// last drained them, so a re-parse is incremental, or from scratch when
+/// the text was replaced wholesale (undo, redo, reload), where no edits
+/// lead from the old text to the new.
+enum SyntaxSync {
+    Edits(Vec<Edit>),
+    Invalidated,
+}
+
 pub struct Buffer {
     pub rope: Rope,
     /// The moving end of the selection, and where text is inserted.
@@ -368,12 +377,8 @@ pub struct Buffer {
     redo_stack: Vec<Snapshot>,
     last_edit: Option<(EditKind, Instant)>,
 
-    /// Edits since the syntax layer last drained them. Kept so a re-parse
-    /// can be incremental instead of starting from scratch.
-    pending_edits: Vec<Edit>,
-    /// Set when history is replaced wholesale (undo, redo, reload), where
-    /// replaying edits is not possible and a full re-parse is required.
-    edits_invalidated: bool,
+    /// What the syntax layer needs to catch up with the text.
+    syntax_sync: SyntaxSync,
 
     /// Where this buffer came from, if anywhere.
     pub path: Option<std::path::PathBuf>,
@@ -972,8 +977,7 @@ impl Buffer {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             last_edit: None,
-            pending_edits: Vec::new(),
-            edits_invalidated: false,
+            syntax_sync: SyntaxSync::Edits(Vec::new()),
             path: None,
             label: None,
             display_ext: None,
@@ -2198,14 +2202,16 @@ impl Buffer {
                 }
             });
         }
-        self.pending_edits.push(Edit {
-            start_byte: start,
-            old_end_byte: old_end,
-            new_end_byte: new_end,
-            start_point,
-            old_end_point,
-            new_end_point,
-        });
+        if let SyntaxSync::Edits(edits) = &mut self.syntax_sync {
+            edits.push(Edit {
+                start_byte: start,
+                old_end_byte: old_end,
+                new_end_byte: new_end,
+                start_point,
+                old_end_point,
+                new_end_point,
+            });
+        }
     }
 
     /// Records the change from `before` to the current text as one edit:
@@ -2245,15 +2251,14 @@ impl Buffer {
     /// the old text to the new, so they go and the parser starts over.
     /// Folds cannot follow such a change either, so they open.
     fn invalidate_edits(&mut self) {
-        self.edits_invalidated = true;
+        self.syntax_sync = SyntaxSync::Invalidated;
         self.folds.clear();
-        self.pending_edits.clear();
         self.last_edit = None;
     }
 
     /// Whether the text changed since the last [`Buffer::drain_edits`].
     pub fn has_pending_edits(&self) -> bool {
-        self.edits_invalidated || !self.pending_edits.is_empty()
+        !matches!(&self.syntax_sync, SyntaxSync::Edits(edits) if edits.is_empty())
     }
 
     /// Hands over the edits since the last drain.
@@ -2261,12 +2266,10 @@ impl Buffer {
     /// Returns `None` when the text changed in a way edits cannot describe
     /// (undo, redo, a reload), meaning the caller must re-parse in full.
     pub fn drain_edits(&mut self) -> Option<Vec<Edit>> {
-        if self.edits_invalidated {
-            self.edits_invalidated = false;
-            self.pending_edits.clear();
-            return None;
+        match std::mem::replace(&mut self.syntax_sync, SyntaxSync::Edits(Vec::new())) {
+            SyntaxSync::Edits(edits) => Some(edits),
+            SyntaxSync::Invalidated => None,
         }
-        Some(std::mem::take(&mut self.pending_edits))
     }
 
     // ---- words -----------------------------------------------------------
