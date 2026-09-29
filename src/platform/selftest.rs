@@ -182,6 +182,30 @@ fn key_for(ch: char) -> Option<(u16, bool)> {
     })
 }
 
+/// The words after a step's command, read in order.
+struct Args<'a>(std::iter::Peekable<std::str::SplitWhitespace<'a>>);
+
+impl<'a> Args<'a> {
+    fn word(&mut self) -> Option<&'a str> {
+        self.0.next()
+    }
+
+    fn num(&mut self) -> Option<f64> {
+        self.word().and_then(|w| w.parse().ok())
+    }
+
+    /// A number if the next word is one; otherwise nothing is taken.
+    fn opt_num(&mut self) -> Option<f64> {
+        let value = self.0.peek()?.parse().ok()?;
+        self.0.next();
+        Some(value)
+    }
+
+    fn done(&mut self) -> bool {
+        self.0.peek().is_none()
+    }
+}
+
 /// Parses a script. A line that does not parse is an error with its number,
 /// because a test that silently skips a step passes for the wrong reason.
 pub fn parse(script: &str) -> Result<Vec<Step>, String> {
@@ -193,16 +217,88 @@ pub fn parse(script: &str) -> Result<Vec<Step>, String> {
         }
         let bad = || format!("line {}: cannot read {line:?}", n + 1);
         let (command, rest) = line.split_once(' ').unwrap_or((line, ""));
-        let mut words = rest.split_whitespace();
-        let mut number = || words.next().and_then(|w| w.parse::<f64>().ok());
-        match command {
+        // A region name comes first, after an `@`.
+        let mut args = Args(
+            rest.strip_prefix('@')
+                .unwrap_or(rest)
+                .split_whitespace()
+                .peekable(),
+        );
+        // Steps that take only numbers and names; anything left over is an
+        // error, so a mistyped modifier cannot pass as nothing.
+        let step = match command {
             "key" => {
-                let mut words = rest.split_whitespace();
-                let code = words.next().and_then(|w| w.parse().ok()).ok_or_else(bad)?;
-                let mods = Mods::parse(words.next().unwrap_or("-")).ok_or_else(bad)?;
-                let chars = words.next().unwrap_or("").to_string();
-                steps.push(Step::Key { code, mods, chars });
+                let code = args.word().and_then(|w| w.parse().ok()).ok_or_else(bad)?;
+                let mods = Mods::parse(args.word().unwrap_or("-")).ok_or_else(bad)?;
+                let chars = args.word().unwrap_or("").to_string();
+                Some(Step::Key { code, mods, chars })
             }
+            "click" if rest.starts_with('@') => {
+                let name = args.word().ok_or_else(bad)?.to_string();
+                let count = args.opt_num().map_or(1, |c| c as isize);
+                Some(Step::ClickNamed { name, count })
+            }
+            "click" => {
+                let (x, y) = (args.num().ok_or_else(bad)?, args.num().ok_or_else(bad)?);
+                let count = args.opt_num().map_or(1, |c| c as isize);
+                Some(Step::Click { x, y, count })
+            }
+            "clickin" if rest.starts_with('@') => {
+                let name = args.word().ok_or_else(bad)?.to_string();
+                let (dx, dy) = (args.num().ok_or_else(bad)?, args.num().ok_or_else(bad)?);
+                let count = args.opt_num().map_or(1, |c| c as isize);
+                let mods = Mods::parse(args.word().unwrap_or("-")).ok_or_else(bad)?;
+                Some(Step::ClickIn {
+                    name,
+                    dx,
+                    dy,
+                    count,
+                    mods,
+                })
+            }
+            "down" if rest.starts_with('@') => Some(Step::DownNamed {
+                name: args.word().ok_or_else(bad)?.to_string(),
+            }),
+            "dragby" => Some(Step::DragBy {
+                dx: args.num().ok_or_else(bad)?,
+                dy: args.num().ok_or_else(bad)?,
+            }),
+            "upby" => Some(Step::UpBy {
+                dx: args.num().ok_or_else(bad)?,
+                dy: args.num().ok_or_else(bad)?,
+            }),
+            "down" => {
+                let (x, y) = (args.num().ok_or_else(bad)?, args.num().ok_or_else(bad)?);
+                let count = args.opt_num().map_or(1, |c| c as isize);
+                Some(Step::Down { x, y, count })
+            }
+            "drag" => Some(Step::Drag {
+                x: args.num().ok_or_else(bad)?,
+                y: args.num().ok_or_else(bad)?,
+            }),
+            "up" => Some(Step::Up {
+                x: args.num().ok_or_else(bad)?,
+                y: args.num().ok_or_else(bad)?,
+            }),
+            "resize" => Some(Step::Resize {
+                width: args.num().ok_or_else(bad)?,
+                height: args.num().ok_or_else(bad)?,
+            }),
+            "trackpad" => Some(Step::Trackpad {
+                x: args.num().ok_or_else(bad)?,
+                y: args.num().ok_or_else(bad)?,
+                dy: args.num().ok_or_else(bad)?,
+            }),
+            _ => None,
+        };
+        if let Some(step) = step {
+            if !args.done() {
+                return Err(bad());
+            }
+            steps.push(step);
+            continue;
+        }
+        match command {
             "text" => {
                 for ch in rest.chars() {
                     let (code, shift) = key_for(ch).ok_or_else(bad)?;
@@ -216,60 +312,6 @@ pub fn parse(script: &str) -> Result<Vec<Step>, String> {
                     });
                 }
             }
-            "click" if rest.starts_with('@') => {
-                let mut words = rest[1..].split_whitespace();
-                let name = words.next().ok_or_else(bad)?.to_string();
-                let count = words.next().and_then(|w| w.parse().ok()).unwrap_or(1);
-                steps.push(Step::ClickNamed { name, count });
-            }
-            "click" => {
-                let (x, y) = (number().ok_or_else(bad)?, number().ok_or_else(bad)?);
-                let count = number().map_or(1, |c| c as isize);
-                steps.push(Step::Click { x, y, count });
-            }
-            "clickin" if rest.starts_with('@') => {
-                let mut words = rest[1..].split_whitespace();
-                let name = words.next().ok_or_else(bad)?.to_string();
-                let mut next = || words.next().and_then(|w| w.parse::<f64>().ok());
-                let (dx, dy) = (next().ok_or_else(bad)?, next().ok_or_else(bad)?);
-                let count = next().map_or(1, |c| c as isize);
-                let mods = Mods::parse(words.next().unwrap_or("-")).ok_or_else(bad)?;
-                steps.push(Step::ClickIn {
-                    name,
-                    dx,
-                    dy,
-                    count,
-                    mods,
-                });
-            }
-            "down" if rest.starts_with('@') => steps.push(Step::DownNamed {
-                name: rest[1..].trim().to_string(),
-            }),
-            "dragby" => steps.push(Step::DragBy {
-                dx: number().ok_or_else(bad)?,
-                dy: number().ok_or_else(bad)?,
-            }),
-            "upby" => steps.push(Step::UpBy {
-                dx: number().ok_or_else(bad)?,
-                dy: number().ok_or_else(bad)?,
-            }),
-            "down" => {
-                let (x, y) = (number().ok_or_else(bad)?, number().ok_or_else(bad)?);
-                let count = number().map_or(1, |c| c as isize);
-                steps.push(Step::Down { x, y, count });
-            }
-            "drag" => steps.push(Step::Drag {
-                x: number().ok_or_else(bad)?,
-                y: number().ok_or_else(bad)?,
-            }),
-            "up" => steps.push(Step::Up {
-                x: number().ok_or_else(bad)?,
-                y: number().ok_or_else(bad)?,
-            }),
-            "resize" => steps.push(Step::Resize {
-                width: number().ok_or_else(bad)?,
-                height: number().ok_or_else(bad)?,
-            }),
             "touch" if !rest.is_empty() => steps.push(Step::Touch(rest.to_string())),
             "write" if !rest.is_empty() => {
                 let (file, text) = rest.split_once(' ').unwrap_or((rest, ""));
@@ -280,11 +322,6 @@ pub fn parse(script: &str) -> Result<Vec<Step>, String> {
             "idle" => steps.push(Step::Idle(rest.parse().map_err(|_| bad())?)),
             "webjs" if !rest.is_empty() => steps.push(Step::WebJs(rest.to_string())),
             "wheel" => steps.push(Step::Wheel(rest.trim().parse().map_err(|_| bad())?)),
-            "trackpad" => steps.push(Step::Trackpad {
-                x: number().ok_or_else(bad)?,
-                y: number().ok_or_else(bad)?,
-                dy: number().ok_or_else(bad)?,
-            }),
             "reenter" => steps.push(Step::Reenter),
             "quit" => steps.push(Step::Quit),
             "panic" => steps.push(Step::Panic),
@@ -342,6 +379,28 @@ pub fn report(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_optional_count_does_not_swallow_the_modifiers() {
+        let steps =
+            parse("clickin @terminal 30 24 cmd\nclickin @terminal 30 24 2 shift\n").unwrap();
+        let mods: Vec<(isize, bool, bool)> = steps
+            .iter()
+            .map(|s| match s {
+                Step::ClickIn { count, mods, .. } => (*count, mods.command, mods.shift),
+                _ => panic!("{s:?}"),
+            })
+            .collect();
+        assert_eq!(mods, vec![(1, true, false), (2, false, true)]);
+        for junk in [
+            "click 1 2 x",
+            "click @tab 2 x",
+            "resize 10 20 30",
+            "key 36 - a b",
+        ] {
+            assert!(parse(junk).is_err(), "{junk} should be refused");
+        }
+    }
 
     #[test]
     fn parses_every_command() {

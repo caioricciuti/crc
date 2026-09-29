@@ -211,7 +211,14 @@ pub struct Pending {
     /// The directories those were read from, and the only ones
     /// [`Pending::clear`] will remove.
     crashes: Vec<PathBuf>,
+    /// Directories that could not be read whole. Once their documents were
+    /// offered, `clear` sets them aside rather than deleting them.
+    incomplete: Vec<PathBuf>,
 }
+
+/// The suffix of a crash directory set aside after an incomplete read: its
+/// files stay on disk, and it is not offered again.
+const KEPT: &str = ".kept";
 
 /// Reads everything left behind by earlier crashes.
 pub fn pending(dir: &Path) -> Pending {
@@ -220,12 +227,13 @@ pub fn pending(dir: &Path) -> Pending {
         .flatten()
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.is_dir())
+        .filter(|p| p.is_dir() && !p.to_string_lossy().ends_with(KEPT))
         .collect();
     crashes.sort();
 
     let mut documents = Vec::new();
     let mut complete = Vec::new();
+    let mut incomplete = Vec::new();
     for crash in &crashes {
         let Ok(entries) = std::fs::read_dir(crash) else {
             continue;
@@ -289,11 +297,14 @@ pub fn pending(dir: &Path) -> Pending {
         }
         if readable {
             complete.push(crash.clone());
+        } else {
+            incomplete.push(crash.clone());
         }
     }
     Pending {
         documents,
         crashes: complete,
+        incomplete,
     }
 }
 
@@ -305,6 +316,11 @@ impl Pending {
     pub fn clear(self) {
         for crash in self.crashes {
             let _ = std::fs::remove_dir_all(crash);
+        }
+        for crash in self.incomplete {
+            let mut kept = crash.clone().into_os_string();
+            kept.push(KEPT);
+            let _ = std::fs::rename(crash, kept);
         }
     }
 }
@@ -425,8 +441,12 @@ mod tests {
         );
         found.clear();
         assert!(
-            crash.join("2.txt").exists(),
+            dir.join("123-1.kept").join("2.txt").exists(),
             "a missing recovery entry must not erase later ones"
+        );
+        assert!(
+            pending(&dir).documents.is_empty(),
+            "and what was offered once is not offered again"
         );
         std::fs::remove_dir_all(dir).expect("cleanup");
     }
@@ -442,7 +462,8 @@ mod tests {
         let found = pending(&dir);
         assert_eq!(found.documents.len(), 1);
         found.clear();
-        assert!(crash.join("0.txt").exists());
+        assert!(dir.join("123-1.kept").join("0.txt").exists());
+        assert!(pending(&dir).documents.is_empty());
         std::fs::remove_dir_all(dir).expect("cleanup");
     }
 
@@ -461,7 +482,10 @@ mod tests {
             "a truncated text is never restored"
         );
         found.clear();
-        assert!(crash.join("0.part").exists(), "and nothing is deleted");
+        assert!(
+            dir.join("123-1.kept").join("0.part").exists(),
+            "and nothing is deleted"
+        );
         std::fs::remove_dir_all(dir).expect("cleanup");
 
         let crash = scratch("entry");

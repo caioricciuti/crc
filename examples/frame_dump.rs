@@ -56,18 +56,74 @@ fn write_bgra(path: &str, w: usize, h: usize, bgra: &[u8]) -> std::io::Result<()
     })
 }
 
+/// The command line, read once: flags, `--name=value` options, and the
+/// rest in order (the output file, then the file to draw, then a range).
+struct Args {
+    flags: Vec<String>,
+    values: Vec<(String, String)>,
+    positional: Vec<String>,
+}
+
+impl Args {
+    const FLAGS: [&str; 7] = [
+        "--atlas-stress",
+        "--tab-stress",
+        "--reuse-edit",
+        "--markdown",
+        "--find",
+        "--select-query",
+        "--git",
+    ];
+    const VALUES: [&str; 3] = ["--window-width", "--project-root", "--scroll"];
+
+    fn read() -> Args {
+        let mut args = Args {
+            flags: Vec::new(),
+            values: Vec::new(),
+            positional: Vec::new(),
+        };
+        for arg in std::env::args().skip(1) {
+            if let Some((name, value)) = arg.split_once('=')
+                && Self::VALUES.contains(&name)
+            {
+                args.values.push((name.to_owned(), value.to_owned()));
+            } else if Self::FLAGS.contains(&arg.as_str()) {
+                args.flags.push(arg);
+            } else if arg.starts_with("--") {
+                eprintln!("frame_dump: unknown option {arg}");
+                std::process::exit(2);
+            } else {
+                args.positional.push(arg);
+            }
+        }
+        args
+    }
+
+    fn flag(&self, name: &str) -> bool {
+        self.flags.iter().any(|f| f == name)
+    }
+
+    fn value(&self, name: &str) -> Option<&str> {
+        self.values
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
 fn main() -> std::io::Result<()> {
-    let out = std::env::args()
-        .nth(1)
+    let args = Args::read();
+    let out = args
+        .positional
+        .first()
+        .cloned()
         .unwrap_or_else(|| "frame.bmp".to_string());
 
     // Logical size, then device pixels at 2x, matching a Retina window.
     let scale = 2.0f32;
-    let logical_w = std::env::args()
-        .find_map(|arg| {
-            arg.strip_prefix("--window-width=")
-                .and_then(|value| value.parse::<f32>().ok())
-        })
+    let logical_w = args
+        .value("--window-width")
+        .and_then(|value| value.parse::<f32>().ok())
         .unwrap_or(1100.0)
         // The dump always draws the 240pt sidebar, which the layout only
         // gives a window wide enough for it and a usable editor; narrower
@@ -79,11 +135,9 @@ fn main() -> std::io::Result<()> {
                 + 1.0,
         );
     let logical_h = 720.0f32;
-    let project_root = std::env::args()
-        .find_map(|arg| {
-            arg.strip_prefix("--project-root=")
-                .map(std::path::PathBuf::from)
-        })
+    let project_root = args
+        .value("--project-root")
+        .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().expect("cwd"));
     let (px_w, px_h) = ((logical_w * scale) as usize, (logical_h * scale) as usize);
 
@@ -93,7 +147,7 @@ fn main() -> std::io::Result<()> {
 
     let mut renderer = Renderer::new(device, atlas);
 
-    if std::env::args().any(|arg| arg == "--atlas-stress") {
+    if args.flag("--atlas-stress") {
         // More unique wide glyphs than all pages can hold. Simulate scrolling
         // through different views so LRU eviction is exercised before drawing.
         for batch in 0..24 {
@@ -104,13 +158,8 @@ fn main() -> std::io::Result<()> {
             }
         }
     }
-    // Positional arguments, skipping flags. Taking `nth(2)` blindly meant
-    // `frame_dump out.bmp --git` tried to open a file called "--git" and
-    // failed before drawing anything.
-    let positional: Vec<String> = std::env::args()
-        .skip(2)
-        .filter(|arg| !arg.starts_with("--"))
-        .collect();
+    // The positional arguments after the output file.
+    let positional: Vec<String> = args.positional.iter().skip(1).cloned().collect();
     let file = positional.first().cloned();
     let mut buffer = match &file {
         Some(path) => Buffer::open(path)?,
@@ -139,9 +188,7 @@ fn main() -> std::io::Result<()> {
         let end = end.parse::<usize>().expect("selection end byte");
         buffer.select_range(start, end);
     }
-    if let Some(scroll) =
-        std::env::args().find_map(|arg| arg.strip_prefix("--scroll=").map(str::to_owned))
-    {
+    if let Some(scroll) = args.value("--scroll") {
         buffer.scroll_column = scroll.parse().expect("horizontal scroll column");
     }
     println!(
@@ -178,7 +225,7 @@ fn main() -> std::io::Result<()> {
     docs.push(scratch);
     docs.push(Buffer::from_text("# README\n"));
     docs.switch(0);
-    let tab_stress = std::env::args().any(|arg| arg == "--tab-stress");
+    let tab_stress = args.flag("--tab-stress");
     if tab_stress {
         for name in [
             "issues.md",
@@ -232,7 +279,7 @@ fn main() -> std::io::Result<()> {
         });
     // Export the first frame after an unrelated newline edit, proving that
     // the native paragraph survives a row shift without a fallback frame.
-    if std::env::args().any(|arg| arg == "--reuse-edit") {
+    if args.flag("--reuse-edit") {
         let active = docs.active();
         let original = renderer
             .atlas
@@ -306,7 +353,7 @@ fn main() -> std::io::Result<()> {
         &mut glyphs,
     );
     // The Markdown renderer extensions' READMEs use, on the given file.
-    if std::env::args().any(|arg| arg == "--markdown") {
+    if args.flag("--markdown") {
         let source = docs.active().rope.to_string();
         let blocks = crc::markdown::parse_spanned(&source);
         glyphs.clear();
@@ -367,7 +414,7 @@ fn main() -> std::io::Result<()> {
     }
 
     // The find bar, drawn from the same geometry the window hit-tests.
-    if std::env::args().any(|arg| arg == "--find") {
+    if args.flag("--find") {
         let find_rect = Viewport {
             x: viewport.x,
             y: chrome.breadcrumbs.y + chrome.breadcrumbs.height,
@@ -529,9 +576,7 @@ fn main() -> std::io::Result<()> {
                 cursor: query.len(),
                 // `--select-query` exports the state Select All leaves the
                 // field in, which used to draw nothing at all.
-                selection: std::env::args()
-                    .any(|arg| arg == "--select-query")
-                    .then_some(0..query.len()),
+                selection: args.flag("--select-query").then_some(0..query.len()),
             },
             &mut renderer.atlas,
             palette_rect,
@@ -542,7 +587,7 @@ fn main() -> std::io::Result<()> {
 
     // Source control as it is really composed: the sidebar column plus the
     // diff in the editor column, not a panel drawn over a window.
-    if std::env::args().any(|arg| arg == "--git") {
+    if args.flag("--git") {
         let mut panel = crc::platform::git_panel::Panel::new(project_root);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let settle = |panel: &mut crc::platform::git_panel::Panel| {
