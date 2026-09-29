@@ -2,6 +2,92 @@
   "source": "snapshot",
   "extensions": [
     {
+      "id": "crc.banner",
+      "name": "Banner",
+      "version": "0.1.0",
+      "description": "Turn the selection into big block letters, a boxed comment or a divider, in the file's comment syntax.",
+      "authors": [
+        "crc"
+      ],
+      "license": "MIT OR Apache-2.0",
+      "icon": "text-size",
+      "capabilities": [
+        "selection.read",
+        "selection.replace"
+      ],
+      "commands": [
+        {
+          "id": "banner",
+          "title": "ASCII Banner"
+        },
+        {
+          "id": "block_banner",
+          "title": "Block Banner"
+        },
+        {
+          "id": "comment_box",
+          "title": "Comment Box"
+        },
+        {
+          "id": "divider",
+          "title": "Comment Divider"
+        }
+      ],
+      "readme": "# Banner\n\nTurns the selection into big block letters, a boxed comment or a divider,\nwritten as a comment in the file's own syntax: `//` in Rust, JavaScript,\nTypeScript, C, C++ and Go, `#` in Python, TOML, YAML and shell, `/* */` in\nCSS, `<!-- -->` in HTML, and plain text everywhere else. The selection's\nindentation is kept.\n\n**ASCII Banner** draws the text in a five-row block font with `#`:\n\n```rust\n//  #### ####   ####\n// #     #   # #\n// #     ####  #\n// #     #  #  #\n//  #### #   #  ####\n```\n\n**Block Banner** draws the same letters with `█`:\n\n```python\n# █   █ ███ █\n# █   █  █  █\n# █████  █  █\n# █   █  █\n# █   █ ███ █\n```\n\nThe font has letters, digits and `! ? . , : ; - _ + = / ( ) ' \" # @ & * %`.\nAnything else comes out as a solid block so you notice. Each line of the\nselection becomes its own banner.\n\n**Comment Box** puts the selection's lines in a box:\n\n```rust\n// +------------------------------+\n// |  Public API                  |\n// |  Everything below is stable  |\n// +------------------------------+\n```\n\n**Comment Divider** centres each line in dashes reaching column 80:\n\n```python\n# ---------------------------------- Helpers -----------------------------------\n```\n\nText that is already a comment is not commented twice: select a `// note`\nand box it, and the box holds `note`.\n\nReads and replaces the text you give it. Nothing else: no files, no\nnetwork.\n"
+    },
+    {
+      "id": "crc.calculate",
+      "name": "Calculate",
+      "version": "0.1.0",
+      "description": "Evaluate arithmetic in place, sum and describe the numbers in a selection, convert number bases, and convert Unix timestamps to dates and back.",
+      "authors": [
+        "crc"
+      ],
+      "license": "MIT OR Apache-2.0",
+      "icon": "symbol-numeric",
+      "capabilities": [
+        "selection.read",
+        "selection.replace",
+        "document.read",
+        "document.edit"
+      ],
+      "commands": [
+        {
+          "id": "evaluate",
+          "title": "Evaluate"
+        },
+        {
+          "id": "sum",
+          "title": "Sum Numbers"
+        },
+        {
+          "id": "statistics",
+          "title": "Number Statistics"
+        },
+        {
+          "id": "to_hex",
+          "title": "To Hexadecimal"
+        },
+        {
+          "id": "to_binary",
+          "title": "To Binary"
+        },
+        {
+          "id": "to_decimal",
+          "title": "To Decimal"
+        },
+        {
+          "id": "timestamp_to_date",
+          "title": "Unix Timestamp to Date"
+        },
+        {
+          "id": "date_to_timestamp",
+          "title": "Date to Unix Timestamp"
+        }
+      ],
+      "readme": "# Calculate\n\nArithmetic and number tools for the selection, or the whole document when\nnothing is selected. Nothing asks for input: each command reads the text\nand decides from it.\n\n## Evaluate\n\nOne line: the expression becomes its result. Write `= something` after it\nand the answer goes there instead, so a line can be recomputed as often as\nyou like.\n\n```\n12 * (3 + 4)            ->  84\n2 ^ 10 = 999            ->  2 ^ 10 = 1024\n```\n\nSeveral lines: every line that is an expression becomes `expression =\nresult`; prose, code and bare numbers stay as they are.\n\n```\nrent 1200                       rent 1200\n100 * 12                  ->    100 * 12 = 1200\nsqrt(2) = 1.4                   sqrt(2) = 1.41421356237\n```\n\n| Piece | Written as |\n|---|---|\n| Operators | `+ - * / %`, `^` or `**` for powers, parentheses |\n| Numbers | `42`, `3.14`, `1e6`, `1_000_000`, `1,000` (groups of three), `0xff`, `0b101`, `0o17` |\n| Percent | `20% * 50` is 10, `200 * 15%` is 30. `7 % 4` is the remainder |\n| Functions | `sqrt abs floor ceil round min max sin cos tan asin acos atan log ln log2 exp pow` |\n| Constants | `pi`, `e` |\n\nIntegers stay exact (`2 ** 62` is `4611686018427387904`); everything else\nis shown with up to twelve significant digits. Division by zero and\nresults that are not a number are reported in the status line, and the\ntext is left alone.\n\n## Sum Numbers and Number Statistics\n\nBoth leave the text as it is and answer in the status line. Every number\nin the text counts: a column in a table, figures in a sentence, literals\nin code. `1,200.50` is one number; `abc123` and `v2` are names, not\nnumbers; `-3` is negative; `10px` is 10.\n\n```\nsum 2,000 of 2 numbers\n5 numbers: sum 70, min 1, max 40, mean 14, median 10\n```\n\n## To Hexadecimal, To Binary, To Decimal\n\nRewrites every whole number in the text.\n\n```\n255 and -16 and 0b11    ->  To Hexadecimal  ->  0xff and -0x10 and 0x3\n5 0x0a                  ->  To Binary       ->  0b101 0b1010\n0xff 0b101 0o17 1f      ->  To Decimal      ->  255 5 15 31\n```\n\nTo Decimal also reads a bare word as hexadecimal when it can be nothing\nelse: only hex digits, with at least one letter and one digit (`1f`,\n`c0ffee1`). `ff`, `add` and `deadbeef` are left alone, since they are also\nwords.\n\n## Unix Timestamp to Date, Date to Unix Timestamp\n\n```\n1727361600             ->  2024-09-26T14:40:00Z\n1700000000123          ->  2023-11-14T22:13:20.123Z\n2024-09-26T16:40+02:00 ->  1727361600\n2024-09-26             ->  1727308800\n```\n\nA run of 9 or 10 digits is seconds, 12 or 13 is milliseconds, 15 or 16\nis microseconds. Dates are ISO 8601: `YYYY-MM-DD`, optionally followed by\na time with `T` or a space, seconds, a fraction, and `Z` or an offset. A\ntime without an offset is UTC. Everything is in UTC: the sandbox has no\nclock and no time zones.\n\nReads and replaces the text you give it. Nothing else: no files, no\nnetwork.\n"
+    },
+    {
       "id": "crc.change-case",
       "name": "Change Case",
       "version": "0.1.0",
@@ -51,12 +137,12 @@
           "title": "CONSTANT_CASE"
         }
       ],
-      "readme": "# Change Case\n\nChange the case of the selection or document: upper, lower, title, snake_case, kebab-case, camelCase, PascalCase and CONSTANT_CASE.\n\nWorks on the selection, or on the whole document when nothing is selected:\n\n- **Upper Case**: what it does.\n- **Lower Case**: what it does.\n- **Title Case**: what it does.\n- **snake_case**: what it does.\n- **kebab-case**: what it does.\n- **camelCase**: what it does.\n- **PascalCase**: what it does.\n- **CONSTANT_CASE**: what it does.\n\nReads and replaces the text you give it. Nothing else: no files, no\nnetwork.\n"
+      "readme": "# Change Case\n\nChanges the case of the selection, or of the whole document when nothing\nis selected.\n\nFor prose:\n\n- **Upper Case**: EVERY LETTER UP, with the full Unicode rules (straße\n  becomes STRASSE).\n- **Lower Case**: every letter down.\n- **Title Case**: The First Letter Of Each Word Up, the rest down.\n\nFor names, line by line, keeping each line's indentation, so a column of\nnames converts together:\n\n- **snake_case**, **kebab-case**, **camelCase**, **PascalCase** and\n  **CONSTANT_CASE**.\n\nNames are split where people mean: at spaces, underscores and dashes, and\nwhere the case changes, so `parseHTTPResponse` is parse, HTTP, Response.\n\nReads and replaces the text you give it. Nothing else: no files, no\nnetwork.\n"
     },
     {
       "id": "crc.encode",
       "name": "Encode and Decode",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "description": "Base64, URL and HTML encoding of the selection or document, both ways.",
       "authors": [
         "crc"
@@ -95,12 +181,192 @@
           "title": "HTML Unescape"
         }
       ],
-      "readme": "# Encode and Decode\n\nBase64, URL and HTML encoding of the selection or document, both ways.\n\nWorks on the selection, or on the whole document when nothing is selected:\n\n- **Base64 Encode**: what it does.\n- **Base64 Decode**: what it does.\n- **URL Encode**: what it does.\n- **URL Decode**: what it does.\n- **HTML Escape**: what it does.\n- **HTML Unescape**: what it does.\n\nReads and replaces the text you give it. Nothing else: no files, no\nnetwork.\n"
+      "readme": "# Encode and Decode\n\nEncodes or decodes the selection, or the whole document when nothing is\nselected.\n\n- **Base64 Encode** and **Base64 Decode**: the standard alphabet with\n  padding. Decoding ignores line breaks, accepts missing padding and the\n  URL alphabet (`-` and `_`).\n- **URL Encode** and **URL Decode**: percent-encoding for a URL component;\n  everything but letters, digits and `-_.~` is escaped. Decoding also turns\n  `+` into a space, as forms send it.\n- **HTML Escape** and **HTML Unescape**: `& < > \" '`, the common named\n  entities and every numeric one.\n\nText that does not decode is left as it is, with a message saying why,\nand binary results are refused rather than pasted in as garbage.\n\nReads and replaces the text you give it. Nothing else: no files, no\nnetwork.\n"
+    },
+    {
+      "id": "crc.hash",
+      "name": "Hash",
+      "version": "0.1.0",
+      "description": "MD5, SHA-1, SHA-256, SHA-512 and CRC32 of the selection, and decode a JWT.",
+      "authors": [
+        "crc"
+      ],
+      "license": "MIT OR Apache-2.0",
+      "icon": "lock",
+      "capabilities": [
+        "selection.read",
+        "selection.replace"
+      ],
+      "commands": [
+        {
+          "id": "md5",
+          "title": "MD5"
+        },
+        {
+          "id": "sha1",
+          "title": "SHA-1"
+        },
+        {
+          "id": "sha256",
+          "title": "SHA-256"
+        },
+        {
+          "id": "sha512",
+          "title": "SHA-512"
+        },
+        {
+          "id": "crc32",
+          "title": "CRC32"
+        },
+        {
+          "id": "jwt_decode",
+          "title": "Decode JWT"
+        }
+      ],
+      "readme": "# Hash\n\nDigests of the selection, and a look inside a JWT. Works on the selection\nonly: select the text, run the command, and the selection becomes the\nresult. Undo brings the text back.\n\n- **MD5**: the 32 hex digit MD5 digest.\n- **SHA-1**: the 40 hex digit SHA-1 digest.\n- **SHA-256**: the 64 hex digit SHA-256 digest.\n- **SHA-512**: the 128 hex digit SHA-512 digest.\n- **CRC32**: the 8 hex digit CRC-32, the same one zlib, PNG and `cksum -o 3`\n  compute.\n- **Decode JWT**: replaces a token with its header and payload as readable\n  JSON, and says in the status line when it expires. The signature is not\n  verified; there is no key here to verify it with. Read the claims, do not\n  trust them.\n\nEvery digest is of the exact UTF-8 bytes of the selection, nothing trimmed:\na trailing newline or a leading space changes the result, the same way it\nwould for `shasum` on a file. The status line says how many bytes went in.\n\nMD5 and SHA-1 are broken as security primitives and are here for checksums\nand for talking to systems that still use them.\n\ncrc gives a command about two seconds. A digest of one megabyte takes half\na second; a selection of several megabytes runs out of time, and crc says\nso and changes nothing.\n\nReads and replaces the text you give it. Nothing else: no files, no\nnetwork.\n"
+    },
+    {
+      "id": "crc.json-tools",
+      "name": "JSON Tools",
+      "version": "0.1.0",
+      "description": "Format, minify and sort JSON, convert between JSON and YAML, and turn a JSON sample into types for the file's language.",
+      "authors": [
+        "crc"
+      ],
+      "license": "MIT OR Apache-2.0",
+      "icon": "json",
+      "capabilities": [
+        "selection.read",
+        "selection.replace",
+        "document.read",
+        "document.edit"
+      ],
+      "commands": [
+        {
+          "id": "format",
+          "title": "Format JSON"
+        },
+        {
+          "id": "minify",
+          "title": "Minify JSON"
+        },
+        {
+          "id": "sort_keys",
+          "title": "Sort JSON Keys"
+        },
+        {
+          "id": "to_yaml",
+          "title": "JSON to YAML"
+        },
+        {
+          "id": "from_yaml",
+          "title": "YAML to JSON"
+        },
+        {
+          "id": "to_types",
+          "title": "JSON to Types"
+        }
+      ],
+      "readme": "# JSON Tools\n\nFormat, minify and sort JSON, convert between JSON and YAML, and turn a\nJSON sample into types for the file's language.\n\nWorks on the selection, or on the whole document when nothing is selected.\nWhen the text is not valid JSON, nothing changes and the status line says\nwhere it stopped: `line 4, column 1: unexpected '}'`.\n\n## Commands\n\n**Format JSON**: two-space indentation, one member per line, keys in their\noriginal order. `{\"a\":[1,2]}` becomes\n\n```json\n{\n  \"a\": [\n    1,\n    2\n  ]\n}\n```\n\n**Minify JSON**: the same text with every space and newline removed. The\nstatus line says how many bytes it saved.\n\n**Sort JSON Keys**: every object's keys in order, at every depth, then\nformatted. `{\"b\":1,\"a\":{\"d\":1,\"c\":2}}` becomes `a` then `b`, with `c` before\n`d` inside.\n\n**JSON to YAML**: block style, two-space indentation. Strings are quoted\nonly when YAML would read them as something else (`\"12\"`, `\"yes\"`, `\"a: b\"`,\nan empty string). Multi-line strings become `|` literal blocks.\n\n```yaml\nname: crc\ntags:\n  - a\n  - b\nitems:\n  - id: 1\n    ok: true\n```\n\n**YAML to JSON**: one YAML document to formatted JSON. Reads what real\nconfiguration files use: block and flow mappings and sequences, plain,\nsingle and double quoted strings, `|` and `>` blocks with `-` and `+`\nchomping, comments, `---`, `true`/`false`/`null`/`~`, integers (decimal,\n`0x`, `0o`) and floats. Not read, on purpose: anchors (`&`), aliases (`*`),\ntags (`!`), and more than one document in the text. Those stop with a\nmessage naming the line.\n\n**JSON to Types**: type declarations inferred from the JSON, in the language\nof the file you are in. From\n\n```json\n{\"id\": 1, \"tags\": [\"a\"], \"owner\": {\"name\": \"x\", \"age\": null}}\n```\n\na `.ts` file gets\n\n```ts\nexport interface Owner {\n  name: string;\n  age: unknown | null;\n}\n\nexport interface Root {\n  id: number;\n  tags: string[];\n  owner: Owner;\n}\n```\n\nA `.rs` file gets `pub struct`s with `Option<T>` for null or missing fields,\na `.go` file gets structs with `json:\"...\"` tags, a `.py` file gets\n`@dataclass` classes with type hints. Anything else gets TypeScript. Object\nshapes are merged across array items, so a field missing from some items is\noptional. Nested types are named after their key (`user_address` becomes\n`UserAddress`, `items` becomes `Item`). Where the sample has different\nkinds of value in one place, the field is `unknown`, `any` or has a\n`// mixed types` note.\n\nReads and replaces the text you give it. Nothing else: no files, no\nnetwork.\n"
+    },
+    {
+      "id": "crc.lines",
+      "name": "Lines",
+      "version": "0.1.0",
+      "description": "Align, join, number, wrap, sort naturally and tidy lines, and count words.",
+      "authors": [
+        "crc"
+      ],
+      "license": "MIT OR Apache-2.0",
+      "icon": "list-flat",
+      "capabilities": [
+        "selection.read",
+        "selection.replace",
+        "document.read",
+        "document.edit"
+      ],
+      "commands": [
+        {
+          "id": "align_equals",
+          "title": "Align by ="
+        },
+        {
+          "id": "align_colon",
+          "title": "Align by :"
+        },
+        {
+          "id": "join",
+          "title": "Join Lines"
+        },
+        {
+          "id": "number",
+          "title": "Number Lines"
+        },
+        {
+          "id": "reverse",
+          "title": "Reverse Lines"
+        },
+        {
+          "id": "natural_sort",
+          "title": "Sort Lines Naturally"
+        },
+        {
+          "id": "sort_by_length",
+          "title": "Sort Lines by Length"
+        },
+        {
+          "id": "trim_trailing",
+          "title": "Trim Trailing Whitespace"
+        },
+        {
+          "id": "squeeze_blank",
+          "title": "Squeeze Blank Lines"
+        },
+        {
+          "id": "remove_blank",
+          "title": "Remove Blank Lines"
+        },
+        {
+          "id": "wrap",
+          "title": "Hard Wrap at 80"
+        },
+        {
+          "id": "unwrap",
+          "title": "Unwrap Paragraphs"
+        },
+        {
+          "id": "word_count",
+          "title": "Word Count"
+        }
+      ],
+      "readme": "# Lines\n\nAlign, join, number, wrap, sort naturally and tidy lines, and count words.\nWorks on the selection, or on the whole document when nothing is selected.\nEvery command keeps each line's own ending, so `\\r\\n` files stay `\\r\\n`.\n\n- **Align by =**: lines up `=` across consecutive lines with the same\n  indentation. Compound tokens (`==`, `+=`, `=>`, `:=` and the like) count\n  as one.\n\n      let a = 1;            let a     = 1;\n      let total += 2;   ->  let total += 2;\n\n- **Align by :**: lines up the values after `:`, one space after the\n  colon, for YAML, JSON, CSS and the like. `::` is left alone.\n\n      name: crc             name:    crc\n      version:   0.1    ->  version: 0.1\n\n- **Join Lines**: each paragraph becomes one line, its lines trimmed and\n  joined with a space. Blank lines keep paragraphs apart.\n- **Number Lines**: right-aligned numbers, then a space, then the line.\n- **Reverse Lines**: last line first.\n- **Sort Lines Naturally**: without regard to case, and with numbers\n  compared by value, so `file2` comes before `file10`.\n- **Sort Lines by Length**: shortest first; equal lengths keep their order.\n- **Trim Trailing Whitespace**: spaces and tabs at the end of every line.\n- **Squeeze Blank Lines**: a run of blank lines becomes one.\n- **Remove Blank Lines**: all of them.\n- **Hard Wrap at 80**: re-flows each paragraph to 80 columns. A paragraph\n  keeps its indentation and comment marker (`//`, `#`, `--`, `>` and so\n  on) on every line, and a list item gets a hanging indent. In code, only\n  comments are wrapped; in prose, everything except headings, tables,\n  fenced and indented code.\n\n      // alpha beta ... omicron pi       // alpha beta ... nu xi\n      // rho                         ->  // omicron pi rho\n\n- **Unwrap Paragraphs**: the reverse, each paragraph on one line.\n- **Word Count**: words, characters, lines and reading time, in the status\n  line. Changes nothing.\n\nReads and replaces the text you give it. Nothing else: no files, no\nnetwork.\n"
+    },
+    {
+      "id": "crc.markdown-preview",
+      "name": "Markdown Preview",
+      "version": "0.1.1",
+      "description": "A rendered preview of the Markdown document beside the editor, updated as you type.",
+      "authors": [
+        "crc"
+      ],
+      "license": "MIT OR Apache-2.0",
+      "icon": "book",
+      "capabilities": [
+        "document.read",
+        "preview.show"
+      ],
+      "commands": [
+        {
+          "id": "preview",
+          "title": "Open Preview"
+        }
+      ],
+      "readme": "# Markdown Preview\n\nA rendered preview of the Markdown document, in a pane beside the editor.\nPress **Cmd-E** in a Markdown file (or run **Open Preview**) to open it, and\nCmd-E again to close it. It follows your edits as you type and keeps its\nscroll position.\n\n- CommonMark, plus the GitHub additions: tables, task lists,\n  strikethrough and footnotes.\n- Images with a relative path, like `![](img/diagram.png)`, load from the\n  document's folder. An image from the network shows as its description,\n  since the preview loads nothing from the network.\n- Light and dark follow crc's appearance.\n\nWhat it may do, and what it may not:\n\n- It reads the whole document, and returns a page for crc to show. It never\n  changes your text.\n- HTML written in the Markdown is shown as text, not rendered.\n- crc shows the page with scripts turned off, loads nothing from the\n  network, reads files only from the document's folder, and does not follow\n  links.\n\nRendering is done by [pulldown-cmark](https://github.com/pulldown-cmark/pulldown-cmark),\nbuilt from source into the extension.\n"
     },
     {
       "id": "crc.sort-lines",
       "name": "Sort Lines",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "description": "Sort the selected lines, or the whole document, and remove duplicates.",
       "authors": [
         "crc"
@@ -128,6 +394,50 @@
         }
       ],
       "readme": "# Sort Lines\n\nThree commands on the selection, or on the whole document when nothing is\nselected:\n\n- **Sort Lines**: A to Z, by Unicode code point.\n- **Sort Lines Descending**: Z to A.\n- **Remove Duplicate Lines**: keeps the first of each, in order.\n\nReads and replaces the text you give it. Nothing else: no files, no\nnetwork.\n"
+    },
+    {
+      "id": "crc.tables",
+      "name": "Tables",
+      "version": "0.1.0",
+      "description": "Format Markdown tables, and turn CSV or TSV into Markdown tables, box-drawn tables, aligned columns or JSON.",
+      "authors": [
+        "crc"
+      ],
+      "license": "MIT OR Apache-2.0",
+      "icon": "table",
+      "capabilities": [
+        "selection.read",
+        "selection.replace",
+        "document.read",
+        "document.edit"
+      ],
+      "commands": [
+        {
+          "id": "format_markdown",
+          "title": "Format Markdown Table"
+        },
+        {
+          "id": "csv_to_markdown",
+          "title": "CSV to Markdown Table"
+        },
+        {
+          "id": "markdown_to_csv",
+          "title": "Markdown Table to CSV"
+        },
+        {
+          "id": "csv_to_box",
+          "title": "CSV to Box Table"
+        },
+        {
+          "id": "align_csv",
+          "title": "Align CSV Columns"
+        },
+        {
+          "id": "csv_to_json",
+          "title": "CSV to JSON"
+        }
+      ],
+      "readme": "# Tables\n\nFormats Markdown tables, and turns CSV or TSV into Markdown tables, box\ntables, aligned columns or JSON. Works on the selection, or on the whole\ndocument when nothing is selected.\n\n**Format Markdown Table** aligns every pipe table in the text and keeps\nthe alignment marks of the separator row. Everything around the tables\nstays as it is.\n\n```\nname|qty|  note                | name | qty | note |\n:--|--:|:-:            ->      | :--- | --: | :--: |\nPear | 10 | ripe               | Pear |  10 | ripe |\n|Kiwi|3|                       | Kiwi |   3 |      |\n```\n\n**CSV to Markdown Table** reads the first row as the header. Columns\nholding only numbers are right-aligned.\n\n```\nname,qty              | name | qty |\nPear,10       ->      | ---- | --: |\nKiwi,3                | Pear |  10 |\n                      | Kiwi |   3 |\n```\n\n**Markdown Table to CSV** is the way back: one comma-separated line per\nrow, quoted where a field holds a comma, a quote or a line break.\n\n**CSV to Box Table** draws the table with box characters, the header set\napart, ready for a README, a comment or a chat message.\n\n```\nName,Qty              ┌──────┬─────┐\nPear,10       ->      │ Name │ Qty │\nKiwi,3                ├──────┼─────┤\n                      │ Pear │  10 │\n                      │ Kiwi │   3 │\n                      └──────┴─────┘\n```\n\n**Align CSV Columns** pads the fields so the delimiters line up. The\nresult is still CSV with the same delimiter; quoted fields keep their\nquotes.\n\n```\nname,qty,note                 name  , qty, note\nPear,10,\"a, b\"       ->       Pear  ,  10, \"a, b\"\nKiwi,3,x                      Kiwi  ,   3, x\n```\n\n**CSV to JSON** gives an array of objects keyed by the header row.\nNumbers and `true`/`false` are typed, empty cells become `null`.\n\n```\nid,name              [\n1,Pear       ->        { \"id\": 1, \"name\": \"Pear\" }\n                     ]\n```\n\nThe delimiter is guessed from the first line: a tab if there is one, a\nsemicolon if there are more semicolons than commas, else a comma. Quoted\nfields, doubled quotes and line breaks inside quotes follow RFC 4180.\nColumns are measured for a monospace font: East Asian wide characters and\nemoji count double, combining marks count nothing. The ranges are\napproximate, so an unusual script may be a column off.\n\nReads and replaces the text you give it. Nothing else: no files, no\nnetwork.\n"
     }
   ]
 }

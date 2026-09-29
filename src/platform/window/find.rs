@@ -360,81 +360,8 @@ impl EditorView {
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         std::thread::spawn(move || {
-            let mut finder = Finder::new();
-            finder.scan(root);
-            let mut results = Vec::new();
-            for i in 0..finder.len() {
-                if worker_cancel.load(Ordering::Relaxed) {
-                    return;
-                }
-                let Some(path) = finder.entry(i).map(|e| e.path.clone()) else {
-                    continue;
-                };
-                if !std::fs::metadata(&path).is_ok_and(|m| m.len() <= 2 * 1024 * 1024) {
-                    continue;
-                }
-                let Ok(bytes) = std::fs::read(&path) else {
-                    continue;
-                };
-                let Ok((text, _)) = crate::text::file_format::decode(&bytes) else {
-                    continue;
-                };
-                let room = 500 - results.len();
-                let matches = match search::find_first(&text, &query, "", options, room) {
-                    Ok(found) => found,
-                    Err(error) => {
-                        let _ = tx.send(Err(error));
-                        return;
-                    }
-                };
-                // Lines counted on from the previous match, not from the
-                // top of the file each time.
-                let (mut counted_to, mut line, mut line_start) = (0, 0, 0);
-                for found in matches {
-                    if worker_cancel.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    let span = &text[counted_to..found.range.start];
-                    line += span.bytes().filter(|b| *b == b'\n').count();
-                    if let Some(i) = span.rfind('\n') {
-                        line_start = counted_to + i + 1;
-                    }
-                    counted_to = found.range.start;
-                    // The snippet is a hundred characters: look no further
-                    // than a couple of hundred bytes either way for the line's
-                    // ends, or a minified file is walked from its start for
-                    // every match.
-                    let mut lo = found.range.start.saturating_sub(200);
-                    while !text.is_char_boundary(lo) {
-                        lo += 1;
-                    }
-                    let mut hi = (found.range.end + 200).min(text.len());
-                    while !text.is_char_boundary(hi) {
-                        hi -= 1;
-                    }
-                    let start = text[lo..found.range.start]
-                        .rfind('\n')
-                        .map_or(lo, |i| lo + i + 1);
-                    let end = text[found.range.end..hi]
-                        .find('\n')
-                        .map_or(hi, |i| found.range.end + i);
-                    results.push(ProjectHit {
-                        path: path.clone(),
-                        column: found.range.start - line_start,
-                        range: found.range,
-                        line,
-                        snippet: text[start..end].trim().chars().take(100).collect(),
-                    });
-                    if results.len() >= 500 {
-                        break;
-                    }
-                }
-                if results.len() >= 500 {
-                    break;
-                }
-            }
-            if !worker_cancel.load(Ordering::Relaxed) {
-                let _ = tx.send(Ok(results));
+            if let Some(result) = search::search_tree(root, &query, options, &worker_cancel) {
+                let _ = tx.send(result);
             }
         });
         let Some(mut state) = self.state_mut() else {

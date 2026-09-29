@@ -40,7 +40,10 @@ else
     BIN=target/release/crc
 fi
 T=$(mktemp -d)
-trap 'result=$?; if [ "$result" -eq 0 ]; then rm -rf "$T"; else echo "Self-test failure artifacts: $T"; fi' EXIT
+trap 'result=$?; if [ "$result" -eq 0 ]; then rm -rf "$T"; else echo "Self-test failure artifacts: $T (what failed: $T/selftest.log)"; fi' EXIT
+# Everything said from here is also kept with the artifacts, so a failure
+# seen once can still be named after the terminal has scrolled past it.
+exec > >(tee "$T/selftest.log") 2>&1
 fail=0
 # Every launch serves Claude Code for its project. Keep the lock files out of
 # the real ~/.claude/ide, where a running claude would offer these windows.

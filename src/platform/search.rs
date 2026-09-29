@@ -3,6 +3,8 @@
 //! to UTF-8 byte ranges before they touch the rope.
 
 use std::ops::Range;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use objc2_foundation::{
     NSMatchingOptions, NSRange, NSRegularExpression, NSRegularExpressionOptions, NSString,
@@ -139,6 +141,117 @@ pub fn find_first(
     Ok(out)
 }
 
+/// A match in a file of the project, as project search lists it.
+pub struct ProjectHit {
+    pub path: PathBuf,
+    pub range: Range<usize>,
+    pub line: usize,
+    /// Bytes from the start of `line` to the match: how the hit is found
+    /// again in an open document edited since the search read the disk.
+    pub column: usize,
+    pub snippet: String,
+}
+
+/// Project search shows this many hits at most.
+pub const PROJECT_HITS: usize = 500;
+
+/// Files larger than this are not searched.
+const PROJECT_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Searches every file under `root` the project index would list, up to
+/// [`PROJECT_HITS`] hits. `None` when `cancel` was set before it finished.
+pub fn search_tree(
+    root: PathBuf,
+    query: &str,
+    options: Options,
+    cancel: &AtomicBool,
+) -> Option<Result<Vec<ProjectHit>, String>> {
+    let mut finder = crate::project::finder::Finder::new();
+    finder.scan(root);
+    let mut results = Vec::new();
+    for i in 0..finder.len() {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        let Some(path) = finder.entry(i).map(|e| e.path.clone()) else {
+            continue;
+        };
+        if !std::fs::metadata(&path).is_ok_and(|m| m.len() <= PROJECT_FILE_BYTES) {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok((text, _)) = crate::text::file_format::decode(&bytes) else {
+            continue;
+        };
+        let room = PROJECT_HITS - results.len();
+        match hits_in(&text, &path, query, options, room, cancel) {
+            Ok(Some(hits)) => results.extend(hits),
+            Ok(None) => return None,
+            Err(error) => return Some(Err(error)),
+        }
+        if results.len() >= PROJECT_HITS {
+            break;
+        }
+    }
+    (!cancel.load(Ordering::Relaxed)).then_some(Ok(results))
+}
+
+/// Up to `room` hits for `query` in `text`, the contents of `path`, with
+/// line, column and a snippet of the line around each. `Ok(None)` when
+/// `cancel` was set part way.
+pub fn hits_in(
+    text: &str,
+    path: &Path,
+    query: &str,
+    options: Options,
+    room: usize,
+    cancel: &AtomicBool,
+) -> Result<Option<Vec<ProjectHit>>, String> {
+    let matches = find_first(text, query, "", options, room)?;
+    let mut hits = Vec::with_capacity(matches.len());
+    // Lines counted on from the previous match, not from the top of the
+    // file each time.
+    let (mut counted_to, mut line, mut line_start) = (0, 0, 0);
+    for found in matches {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let span = &text[counted_to..found.range.start];
+        line += span.bytes().filter(|b| *b == b'\n').count();
+        if let Some(i) = span.rfind('\n') {
+            line_start = counted_to + i + 1;
+        }
+        counted_to = found.range.start;
+        // The snippet is a hundred characters: look no further than a
+        // couple of hundred bytes either way for the line's ends, or a
+        // minified file is walked from its start for every match.
+        let mut lo = found.range.start.saturating_sub(200);
+        while !text.is_char_boundary(lo) {
+            lo += 1;
+        }
+        let mut hi = (found.range.end + 200).min(text.len());
+        while !text.is_char_boundary(hi) {
+            hi -= 1;
+        }
+        let start = text[lo..found.range.start]
+            .rfind('\n')
+            .map_or(lo, |i| lo + i + 1);
+        let end = text[found.range.end..hi]
+            .find('\n')
+            .map_or(hi, |i| found.range.end + i);
+        hits.push(ProjectHit {
+            path: path.to_path_buf(),
+            column: found.range.start - line_start,
+            range: found.range,
+            line,
+            snippet: text[start..end].trim().chars().take(100).collect(),
+        });
+    }
+    Ok(Some(hits))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,5 +279,51 @@ mod tests {
         assert_eq!(found[0].replacement, "12-ab");
         assert_eq!(found[1].range, 5..9);
         assert!(find("x", "(", "", options).is_err());
+    }
+
+    #[test]
+    fn project_hits_carry_line_column_and_a_trimmed_snippet() {
+        let text = "soil: loam\n  water: evening\nwater the beds\n";
+        let none = AtomicBool::new(false);
+        let path = Path::new("garden-log/notes.txt");
+        let hits = hits_in(text, path, "water", Options::default(), 10, &none)
+            .unwrap()
+            .unwrap();
+        let at: Vec<_> = hits
+            .iter()
+            .map(|h| (h.line, h.column, h.snippet.as_str()))
+            .collect();
+        assert_eq!(at, [(1, 2, "water: evening"), (2, 0, "water the beds")]);
+        assert_eq!(&text[hits[0].range.clone()], "water");
+
+        let one = hits_in(text, path, "water", Options::default(), 1, &none)
+            .unwrap()
+            .unwrap();
+        assert_eq!(one.len(), 1, "room bounds the hits");
+        let cancelled = AtomicBool::new(true);
+        assert!(
+            hits_in(text, path, "water", Options::default(), 10, &cancelled)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_snippet_stops_near_the_match_on_a_long_line() {
+        let text = format!("{}needle{}", "é".repeat(300), "x".repeat(300));
+        let none = AtomicBool::new(false);
+        let hits = hits_in(
+            &text,
+            Path::new("min.js"),
+            "needle",
+            Options::default(),
+            10,
+            &none,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(hits[0].column, 600);
+        assert_eq!(hits[0].snippet.chars().count(), 100);
+        assert!(hits[0].snippet.starts_with('é'));
     }
 }

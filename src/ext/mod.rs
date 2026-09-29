@@ -103,7 +103,7 @@ mod tests {
 
     /// Markdown Preview, built from crc-extensions, through the interpreter:
     /// a page comes back only with `preview.show`, and a long document
-    /// renders inside half the deadline.
+    /// renders inside half the instruction budget.
     #[test]
     fn a_preview_answers_with_a_page() {
         let folder = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -138,16 +138,19 @@ mod tests {
         let section = "## Section\n\nSome *text* with `code`, a [link](x.md) and a list:\n\n\
                        - one\n- two\n  - nested\n\n```rust\nfn main() {}\n```\n\n";
         let long = section.repeat(100_000 / section.len());
-        let started = std::time::Instant::now();
+        // Half the instructions a command may run, counted rather than
+        // timed: a wall-clock bound failed whenever the machine was busy.
+        // The deadline is out of the way so only the count can stop it.
+        let (fuel, deadline) = (ext.fuel, ext.deadline);
+        ext.fuel /= 2;
+        ext.deadline = std::time::Duration::from_secs(600);
         let out = ext.run(&markdown(&long)).unwrap();
-        let took = started.elapsed();
-        assert!(out.html.is_some(), "{:?}", out.message);
-        // About 0.4 s here in release; half the deadline leaves room for a
-        // slow CI machine.
         assert!(
-            took < std::time::Duration::from_millis(1000),
-            "100 KB took {took:?}"
+            out.html.is_some(),
+            "100 KB within half the fuel: {:?}",
+            out.message
         );
+        (ext.fuel, ext.deadline) = (fuel, deadline);
 
         let mut manifest = package.manifest.clone();
         manifest

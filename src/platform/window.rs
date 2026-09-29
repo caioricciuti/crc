@@ -35,7 +35,7 @@ use crate::platform::clipboard;
 use crate::platform::commands::{self, Command};
 use crate::platform::latency::Latency;
 use crate::platform::recovery;
-use crate::platform::search::{self, Options as SearchOptions};
+use crate::platform::search::{self, Options as SearchOptions, ProjectHit};
 use crate::platform::selftest::{self, Step};
 use crate::platform::session::Session;
 use crate::platform::symbols;
@@ -1169,16 +1169,6 @@ enum Drag {
         /// scrolling under it.
         point: Option<(f32, f32)>,
     },
-}
-
-struct ProjectHit {
-    path: std::path::PathBuf,
-    range: std::ops::Range<usize>,
-    line: usize,
-    /// Bytes from the start of `line` to the match: how the hit is found
-    /// again in an open document edited since the search read the disk.
-    column: usize,
-    snippet: String,
 }
 
 pub struct Ivars {
