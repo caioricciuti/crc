@@ -691,6 +691,24 @@ mod tests {
         );
     }
 
+    /// `tools()` and `call` are two lists; every tool the first advertises
+    /// has to be one the second answers.
+    #[test]
+    fn every_listed_tool_is_handled() {
+        for tool in tools() {
+            let name = tool.get("name").and_then(Value::as_str).unwrap();
+            let params = json::object([
+                ("name", json::string(name)),
+                ("arguments", json::object([])),
+            ]);
+            let answer = call(&json::number(1), &params, &mut Fake::default());
+            assert!(
+                !matches!(&answer, Err(e) if e.starts_with("unknown tool")),
+                "{name} is listed but not handled"
+            );
+        }
+    }
+
     #[test]
     fn tools_are_listed_with_schemas_and_close_tab_is_not() {
         let mut host = Fake::default();

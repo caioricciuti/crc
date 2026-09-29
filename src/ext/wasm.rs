@@ -1375,43 +1375,35 @@ fn numeric(code: u8, stack: &mut Vec<u64>) -> Result<(), Trap> {
         0xa5 => bin!(|a, c| ok(wf64(fmax64(f64_(a), f64_(c))))),
         0xa6 => bin!(|a, c| ok(wf64(f64_(a).copysign(f64_(c))))),
         0xa7 => un!(|a: u64| a as u32 as u64),
-        0xa8 | 0xaa => {
+        // i32.trunc_f32_s .. i32.trunc_f64_u: 0xa8 to 0xab.
+        0xa8..=0xab => {
             let a = stack.pop().ok_or_else(underflow)?;
-            let v = if code == 0xa8 {
+            let v = if matches!(code, 0xa8 | 0xa9) {
                 f32_(a) as f64
             } else {
                 f64_(a)
             };
-            stack.push(trunc(v, -2147483648.0, 2147483648.0)? as i32 as u32 as u64);
-        }
-        0xa9 | 0xab => {
-            let a = stack.pop().ok_or_else(underflow)?;
-            let v = if code == 0xa9 {
-                f32_(a) as f64
+            stack.push(if matches!(code, 0xa8 | 0xaa) {
+                trunc(v, -2147483648.0, 2147483648.0)? as i32 as u32 as u64
             } else {
-                f64_(a)
-            };
-            stack.push(trunc(v, 0.0, 4294967296.0)? as u32 as u64);
+                trunc(v, 0.0, 4294967296.0)? as u32 as u64
+            });
         }
         0xac => un!(|a| a as u32 as i32 as i64 as u64),
         0xad => un!(|a| a as u32 as u64),
-        0xae | 0xb0 => {
+        // i64.trunc_f32_s .. i64.trunc_f64_u: 0xae to 0xb1.
+        0xae..=0xb1 => {
             let a = stack.pop().ok_or_else(underflow)?;
-            let v = if code == 0xae {
+            let v = if matches!(code, 0xae | 0xaf) {
                 f32_(a) as f64
             } else {
                 f64_(a)
             };
-            stack.push(trunc(v, -9223372036854775808.0, 9223372036854775808.0)? as i64 as u64);
-        }
-        0xaf | 0xb1 => {
-            let a = stack.pop().ok_or_else(underflow)?;
-            let v = if code == 0xaf {
-                f32_(a) as f64
+            stack.push(if matches!(code, 0xae | 0xb0) {
+                trunc(v, -9223372036854775808.0, 9223372036854775808.0)? as i64 as u64
             } else {
-                f64_(a)
-            };
-            stack.push(trunc(v, 0.0, 18446744073709551616.0)? as u64);
+                trunc(v, 0.0, 18446744073709551616.0)? as u64
+            });
         }
         0xb2 => un!(|a| wf32(i32_(a) as f32)),
         0xb3 => un!(|a| wf32(u32_(a) as f32)),
@@ -1455,39 +1447,29 @@ fn saturate(code: u8, stack: &mut Vec<u64>) -> Result<(), Trap> {
     Ok(())
 }
 
-fn fmin32(a: f32, b: f32) -> f32 {
-    if a.is_nan() || b.is_nan() {
-        f32::NAN
-    } else if a == b {
-        if a.is_sign_negative() { a } else { b }
-    } else {
-        a.min(b)
-    }
+/// Wasm's `min` and `max` for one float type: NaN wins, and -0 is below +0,
+/// where Rust's `min`/`max` return the other operand for NaN and either zero.
+macro_rules! wasm_min_max {
+    ($min:ident, $max:ident, $t:ty) => {
+        fn $min(a: $t, b: $t) -> $t {
+            if a.is_nan() || b.is_nan() {
+                <$t>::NAN
+            } else if a == b {
+                if a.is_sign_negative() { a } else { b }
+            } else {
+                a.min(b)
+            }
+        }
+        fn $max(a: $t, b: $t) -> $t {
+            if a.is_nan() || b.is_nan() {
+                <$t>::NAN
+            } else if a == b {
+                if a.is_sign_positive() { a } else { b }
+            } else {
+                a.max(b)
+            }
+        }
+    };
 }
-fn fmax32(a: f32, b: f32) -> f32 {
-    if a.is_nan() || b.is_nan() {
-        f32::NAN
-    } else if a == b {
-        if a.is_sign_positive() { a } else { b }
-    } else {
-        a.max(b)
-    }
-}
-fn fmin64(a: f64, b: f64) -> f64 {
-    if a.is_nan() || b.is_nan() {
-        f64::NAN
-    } else if a == b {
-        if a.is_sign_negative() { a } else { b }
-    } else {
-        a.min(b)
-    }
-}
-fn fmax64(a: f64, b: f64) -> f64 {
-    if a.is_nan() || b.is_nan() {
-        f64::NAN
-    } else if a == b {
-        if a.is_sign_positive() { a } else { b }
-    } else {
-        a.max(b)
-    }
-}
+wasm_min_max!(fmin32, fmax32, f32);
+wasm_min_max!(fmin64, fmax64, f64);

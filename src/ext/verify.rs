@@ -112,30 +112,7 @@ fn pem_der(pem: &str) -> Option<Vec<u8>> {
     if body.is_empty() {
         return None;
     }
-    let value = |c: u8| -> Option<u32> {
-        Some(match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => return None,
-        } as u32)
-    };
-    let mut out = Vec::new();
-    let (mut acc, mut bits) = (0u32, 0);
-    for c in body
-        .bytes()
-        .filter(|&c| c != b'=' && !c.is_ascii_whitespace())
-    {
-        acc = (acc << 6) | value(c)?;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-        }
-    }
-    Some(out)
+    crate::base64::decode(&body)
 }
 
 /// The 65-byte uncompressed point of a P-256 SubjectPublicKeyInfo, the only

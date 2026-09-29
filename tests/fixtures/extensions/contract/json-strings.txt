@@ -1,0 +1,27 @@
+# JSON string literals, one per line: the literal, a tab, then the UTF-8
+# hex of what it decodes to, or `error`. crc's parser (src/json.rs) and
+# the extension crate's (crc-extension/src/json.rs in crc-extensions) both
+# run these, and both writers must round-trip every decoded value, so the
+# text an extension reads cannot differ from what crc sent. crc-extensions
+# CI checks its copy against this file.
+#
+# Not covered: raw control characters inside a string. crc refuses them;
+# the crate accepts them. crc's writer never produces one.
+""	
+"plain text"	706c61696e2074657874
+"quote \" backslash \\ slash \/"	71756f74652022206261636b736c617368205c20736c617368202f
+"\b\f\n\r\t"	080c0a0d09
+"\u0000\u001f"	001f
+"caf\u00e9 caf\u00E9"	636166c3a920636166c3a9
+"café 漢字 😀"	636166c3a920e6bca2e5ad9720f09f9880
+"\u6f22"	e6bca2
+"\ud83d\ude00"	f09f9880
+"a\uD83D\uDE00b"	61f09f988062
+"\ud83d"	error
+"\ud83dx"	error
+"\ud83dA"	error
+"\ude00"	error
+"\x"	error
+"\u12"	error
+"\u12g4"	error
+"unterminated	error

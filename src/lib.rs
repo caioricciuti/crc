@@ -3,6 +3,7 @@
 //! Split into a library plus a thin binary so the text, layout and render
 //! layers can be tested and benchmarked without opening a window.
 
+pub mod base64;
 pub mod complete;
 pub mod ext;
 pub mod http;

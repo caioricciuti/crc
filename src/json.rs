@@ -560,6 +560,32 @@ mod tests {
     }
 
     #[test]
+    fn string_vectors_shared_with_the_extension_crate() {
+        let vectors = include_str!("../tests/fixtures/extensions/contract/json-strings.txt");
+        for line in vectors
+            .lines()
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        {
+            let (literal, expected) = line.split_once('\t').expect("literal, tab, expected");
+            let parsed = parse(literal);
+            if expected == "error" {
+                assert!(parsed.is_err(), "{literal} should be refused");
+                continue;
+            }
+            let bytes: Vec<u8> = (0..expected.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&expected[i..i + 2], 16).expect("hex"))
+                .collect();
+            let text = String::from_utf8(bytes).expect("UTF-8");
+            assert_eq!(parsed, Ok(Value::String(text.clone())), "{literal}");
+            assert_eq!(
+                parse(&compact(&Value::String(text.clone()))),
+                Ok(Value::String(text))
+            );
+        }
+    }
+
+    #[test]
     fn decodes_escapes_and_surrogates() {
         let v = parse(r#""a\"b\\c\né😀""#).expect("valid");
         assert_eq!(v, Value::String("a\"b\\c\né😀".into()));
