@@ -1,0 +1,1192 @@
+//! A frame: laying out and drawing everything the window shows, from the
+//! chrome to the text, the overlays and the other panes.
+
+use super::*;
+
+impl EditorView {
+    pub(super) fn resize(&self, size: NSSize) {
+        let scale = self.window().map_or(2.0, |w| w.backingScaleFactor());
+        let Some(mut state) = self.state_mut() else {
+            self.ivars().deferred_size.set(Some(size));
+            self.request_redraw();
+            return;
+        };
+        state.viewport = Viewport::new(size.width as f32, size.height as f32);
+        if (state.renderer.atlas.metrics.scale - scale as f32).abs() > 0.01 {
+            // Moved to a display with a different scale: the glyphs were
+            // rasterised for the old one and would be resampled, which is
+            // the blur the whole atlas exists to avoid.
+            let atlas = Atlas::build_with_ui(
+                &state.font,
+                state.font_size,
+                crate::platform::settings::DEFAULT_FONT_SIZE,
+                scale as f32,
+            );
+            state.renderer.replace_atlas(atlas);
+        }
+        state.layer.setContentsScale(scale);
+        state.layer.setDrawableSize(objc2_core_foundation::CGSize {
+            width: size.width * scale,
+            height: size.height * scale,
+        });
+        drop(state);
+        self.request_redraw();
+        self.pump();
+    }
+
+    pub(super) fn render(&self) -> Option<FrameTiming> {
+        // try_borrow_mut, not borrow_mut. AppKit re-enters this view at times
+        // we do not choose: the display link fires on any run-loop iteration
+        // including inside the nested loop of a modal alert or panel, and
+        // resetCursorRects is called during tracking. If a borrow is already
+        // live, the honest answer is to skip this frame and draw on the next
+        // one, not to abort the process.
+        let mut state = self.state_mut()?;
+        sync_conflicts(&mut state);
+        let side = side_by_side(&state);
+        let chrome = chrome_of(&state);
+        let carets_on = !self.caret_blinks(&state) || caret_phase(state.caret_since.elapsed()).0;
+        let State {
+            docs,
+            tree,
+            git,
+            git_open,
+            find,
+            find_cache,
+            tab_hits,
+            tab_scroll,
+            hovered_tab,
+            tree_drag,
+            syntax,
+            spans,
+            finder,
+            palette,
+            commands: command_list,
+            symbols: symbol_list,
+            palette_scroll,
+            palette_count,
+            goto,
+            rename,
+            signature,
+            word_wrap,
+            branch_list,
+            action_list,
+            bulb,
+            bulb_rect,
+            extensions,
+            blame,
+            renderer,
+            glyphs,
+            theme,
+            latency,
+            layer,
+            viewport,
+            drew_once,
+            worst,
+            message,
+            marked,
+            marked_caret,
+            responses,
+            sidebar_edit,
+            panes,
+            focused_pane,
+            lsp,
+            completion,
+            claude,
+            terminal: terminal_panel,
+            gutter,
+            home_hits,
+            recent_projects,
+            unshaped_on_screen,
+            completion_chips,
+            conflict_scans,
+            conflict_side,
+            diff_tab,
+            ..
+        } = &mut *state;
+        *unshaped_on_screen = false;
+
+        // First, before anything in the frame can go wrong: what the panic
+        // hook would write is the text as of this frame.
+        recovery::publish(docs.iter().chain(panes.iter().flat_map(|p| p.docs.iter())));
+
+        let viewport = *viewport;
+        if viewport.width <= 0.0 || viewport.height <= 0.0 {
+            return None;
+        }
+
+        let query = find
+            .as_ref()
+            .map(|f| f.query.rope.to_string())
+            .unwrap_or_default();
+
+        // The one layout. `chrome_of` needs the whole state, so it is asked
+        // before the state is taken apart field by field below.
+        let ext_details_rect = details_rect(&chrome);
+        let Chrome {
+            toolbar: toolbar_rect,
+            activity: activity_rect,
+            sidebar: sidebar_rect,
+            tabs: tab_rect,
+            breadcrumbs: breadcrumb_rect,
+            find: find_rect,
+            response: response_rect,
+            terminal: terminal_rect,
+            text: editor_rect,
+            status: status_rect,
+            preview: _,
+            panes: _,
+            others: other_panes,
+        } = chrome;
+
+        // Scroll positions are only ever clamped when something scrolls, and
+        // what they are clamped against changes without any scrolling: the
+        // window grows, text is deleted, a folder collapses. Left alone that
+        // is blank rows under the last line, which reads as having scrolled
+        // past the end. Re-clamped here, every frame, against the rows this
+        // frame really has.
+        {
+            let m = renderer.atlas.metrics;
+            let gutter = layout::gutter_width(docs.active(), &renderer.atlas);
+            let (rows, cols) = (
+                editor_rect.rows(m.line_height),
+                editor_rect.columns(m.advance, gutter),
+            );
+            apply_wrap(docs.active_mut(), *word_wrap, cols);
+            docs.active_mut().clamp_scroll(rows, cols);
+            if let Some(rect) = sidebar_rect {
+                tree.scroll_by(0, layout::sidebar_rows(rect));
+            }
+        }
+        let buffer = docs.active();
+        let search_matches = find
+            .as_ref()
+            .and_then(|bar| find_matches(find_cache, bar, buffer));
+
+        // Nothing open: the home screen, drawn by the same renderer. There is
+        // no home "mode" to get stuck in. Typing lands in the untouched buffer
+        // underneath, which stops being untouched, and the editor is back.
+        let home = docs.is_home();
+
+        // A change picked in Source Control has a tab of its own, and takes
+        // the editor column while that tab is active, the way a diff editor
+        // does. The list highlights the change only then.
+        let diffing = *diff_tab == Some(docs.active().id());
+        git.showing_diff = diffing;
+        let reviewing = claude.as_ref().and_then(|c| c.reviews.get(&buffer.id()));
+
+        if let Some(page) = extensions.as_mut().filter(|p| p.details) {
+            glyphs.clear();
+            crate::platform::extensions::draw_details(
+                page,
+                &mut renderer.atlas,
+                ext_details_rect,
+                theme,
+                glyphs,
+            );
+        } else if diffing {
+            glyphs.clear();
+            layout::push_rect(
+                glyphs,
+                &renderer.atlas,
+                [editor_rect.x, editor_rect.y],
+                [editor_rect.width, editor_rect.height],
+                theme.tab_active,
+            );
+            git.draw_diff(&mut renderer.atlas, editor_rect, theme, glyphs);
+        } else if side
+            && let Some(view) = conflict_scans
+                .get_mut(&buffer.id())
+                .and_then(|s| s.view.as_mut())
+        {
+            glyphs.clear();
+            layout::push_rect(
+                glyphs,
+                &renderer.atlas,
+                [editor_rect.x, editor_rect.y],
+                [editor_rect.width, editor_rect.height],
+                theme.tab_active,
+            );
+            crate::platform::conflicts::draw_side(
+                view,
+                &buffer.rope,
+                &mut renderer.atlas,
+                editor_rect,
+                theme,
+                glyphs,
+            );
+        } else if let Some(review) = reviewing {
+            glyphs.clear();
+            layout::push_rect(
+                glyphs,
+                &renderer.atlas,
+                [editor_rect.x, editor_rect.y],
+                [editor_rect.width, editor_rect.height],
+                theme.tab_active,
+            );
+            crate::platform::claude::draw_review(
+                review,
+                &mut renderer.atlas,
+                editor_rect,
+                theme,
+                glyphs,
+            );
+        } else if home {
+            glyphs.clear();
+            layout::push_rect(
+                glyphs,
+                &renderer.atlas,
+                [editor_rect.x, editor_rect.y],
+                [editor_rect.width, editor_rect.height],
+                theme.tab_active,
+            );
+            layout::build_home(
+                glyphs,
+                &mut renderer.atlas,
+                editor_rect,
+                theme,
+                tree.root(),
+                recent_projects,
+                home_hits,
+            );
+        } else {
+            // Highlight only what is on screen. Querying a whole file to draw
+            // sixty lines of it would cost more than everything else in the
+            // frame put together.
+            spans.clear();
+            // The rows on screen, worked out once for everything this frame
+            // draws on them.
+            let rows = layout::screen_rows(buffer, editor_rect, renderer.atlas.metrics.line_height);
+            if syntax.has(buffer.id())
+                && let Some(std::ops::Range {
+                    start: first,
+                    end: last,
+                }) = layout::lines_of(&rows)
+            {
+                let total = buffer.rope.len_lines();
+                let from = buffer.rope.line_to_byte(first);
+                let to = if last < total {
+                    buffer.rope.line_to_byte(last)
+                } else {
+                    buffer.rope.len_bytes()
+                };
+                // spans_with, not spans: predicates need the captured text, and
+                // without it a `#match?` pattern matches everything.
+                spans.extend(
+                    syntax.spans_with(buffer.id(), from..to, |r| buffer.rope.slice_to_string(r)),
+                );
+            }
+
+            let markdown = layout::Markdown::of(syntax.markdown(buffer.id()));
+            let ranges: Vec<_> = search_matches
+                .as_ref()
+                .map(|found| found.iter().map(|m| m.range.clone()).collect())
+                .unwrap_or_default();
+            let stats = layout::build_full_search(
+                buffer,
+                &mut renderer.atlas,
+                editor_rect,
+                &rows,
+                theme,
+                &query,
+                find.as_ref().map(|_| ranges.as_slice()),
+                spans,
+                &markdown,
+                carets_on,
+                glyphs,
+            );
+            *unshaped_on_screen = stats.unshaped > 0;
+            if let Some(marks) = gutter.get(&buffer.id()) {
+                layout::push_gutter_marks(
+                    glyphs,
+                    &renderer.atlas,
+                    editor_rect,
+                    &rows,
+                    theme,
+                    &marks.marks,
+                );
+            }
+            if palette.is_none()
+                && bulb.as_ref().is_some_and(|b| {
+                    (b.buffer, b.caret) == (buffer.id(), buffer.cursor()) && b.shows()
+                })
+            {
+                *bulb_rect = layout::push_bulb(
+                    glyphs,
+                    &mut renderer.atlas,
+                    buffer,
+                    editor_rect,
+                    &rows,
+                    theme,
+                );
+            } else {
+                *bulb_rect = None;
+            }
+            // Conflicts: washes under the text, which was drawn first into
+            // a cleared list, so they go in at the front; the buttons on
+            // each opening marker go on top.
+            if let Some(view) = conflict_scans
+                .get(&buffer.id())
+                .and_then(|s| s.view.as_ref())
+            {
+                let bands = crate::platform::conflicts::bands(
+                    view,
+                    &rows,
+                    &renderer.atlas,
+                    editor_rect,
+                    theme,
+                );
+                glyphs.splice(0..0, bands);
+                let hits = crate::platform::conflicts::inline_hits(
+                    view,
+                    buffer,
+                    &rows,
+                    &mut renderer.atlas,
+                    editor_rect,
+                );
+                crate::platform::conflicts::draw_inline_buttons(
+                    &hits,
+                    &mut renderer.atlas,
+                    theme,
+                    glyphs,
+                );
+            }
+
+            // A composition in progress, drawn at the caret it will land at.
+            if let Some(text) = marked.as_deref()
+                && find.is_none()
+                && palette.is_none()
+                && goto.is_none()
+                && let Some(at) =
+                    layout::caret_rect_on(buffer, &renderer.atlas, &markdown, editor_rect, &rows)
+            {
+                layout::push_marked_text(
+                    glyphs,
+                    &mut renderer.atlas,
+                    at,
+                    text,
+                    *marked_caret,
+                    theme,
+                );
+            }
+
+            // What the language server thinks of the visible lines.
+            if let (Some(path), Some(language)) = (&buffer.path, lsp_language(buffer))
+                && let Some(server) = lsp.get(&crate::lsp::servers::server_key(language))
+                && let Some(list) = server.diagnostics.get(path)
+            {
+                use crate::lsp::Severity;
+                let marks: Vec<_> = list
+                    .iter()
+                    .map(|diagnostic| {
+                        let start = crate::lsp::offset_of(&buffer.rope, diagnostic.start);
+                        let end = crate::lsp::offset_of(&buffer.rope, diagnostic.end);
+                        let color = match diagnostic.severity {
+                            Severity::Error => theme.diff_removed,
+                            Severity::Warning => theme.syn_constant,
+                            Severity::Information | Severity::Hint => theme.status_text,
+                        };
+                        (start..end, color)
+                    })
+                    .collect();
+                layout::push_underlines(
+                    glyphs,
+                    &renderer.atlas,
+                    buffer,
+                    editor_rect,
+                    &rows,
+                    &marks,
+                );
+            }
+
+            // Completion: ghost text at the caret, chips under the line.
+            completion_chips.clear();
+            if let Some(popup) = completion
+                .as_ref()
+                .filter(|p| p.buffer == buffer.id() && !p.shown.is_empty())
+                && let Some(caret) =
+                    layout::caret_rect_on(buffer, &renderer.atlas, &markdown, editor_rect, &rows)
+            {
+                let cursor = buffer.cursor();
+                let prefix = buffer
+                    .rope
+                    .slice_to_string(popup.anchor.min(cursor)..cursor);
+                let line = buffer.rope.byte_to_line(cursor);
+                let line_end = buffer.rope.line_range(line).end;
+                let rest = buffer.rope.slice_to_string(cursor..line_end);
+                let picked = &popup.shown[popup.selected.min(popup.shown.len() - 1)];
+                // Only at the end of a line: drawn over text that follows the
+                // caret, it would read as if it were there.
+                let ghost = (rest.trim().is_empty() && picked.insert.starts_with(prefix.as_str()))
+                    .then(|| &picked.insert[prefix.len()..]);
+                let chips: Vec<layout::Chip> = popup
+                    .shown
+                    .iter()
+                    .map(|c| layout::Chip {
+                        label: c.label.as_str(),
+                        icon: completion_icon(c, &popup.items),
+                    })
+                    .collect();
+                let word_x =
+                    caret.x - prefix.chars().count() as f32 * renderer.atlas.metrics.advance;
+                *completion_chips = layout::build_completion_ribbon(
+                    &chips,
+                    popup.selected,
+                    &picked.why,
+                    ghost,
+                    caret,
+                    word_x,
+                    editor_rect,
+                    &mut renderer.atlas,
+                    theme,
+                    glyphs,
+                );
+            }
+
+            // Signature help, above the caret's line.
+            if let Some(tip) = signature.as_ref().filter(|t| t.buffer == buffer.id())
+                && let Some(caret) =
+                    layout::caret_rect_on(buffer, &renderer.atlas, &markdown, editor_rect, &rows)
+            {
+                layout::build_signature(
+                    &tip.signature.label,
+                    tip.signature.active.clone(),
+                    caret,
+                    editor_rect,
+                    &mut renderer.atlas,
+                    theme,
+                    glyphs,
+                );
+            }
+        }
+
+        // After build_full, not before: that call clears the glyph buffer it
+        // is handed, so anything drawn earlier in the frame is silently
+        // erased. The sidebar and status line already append after it for
+        // the same reason.
+        for (index, rects) in &other_panes {
+            let Some(store) = panes.get_mut(index - usize::from(*index > *focused_pane)) else {
+                continue;
+            };
+            draw_other_pane(
+                store, rects, tree, syntax, responses, gutter, renderer, theme, glyphs, *word_wrap,
+            );
+        }
+        layout::build_toolbar(tree, &mut renderer.atlas, toolbar_rect, theme, glyphs);
+
+        // Under the Extensions details the tabs are still laid out, so
+        // their hit list stays true, but drawn into nothing.
+        let mut hidden = Vec::new();
+        let details = extensions.as_ref().is_some_and(|p| p.details);
+        layout::build_tab_bar(
+            docs,
+            *tab_scroll,
+            *hovered_tab,
+            &mut renderer.atlas,
+            tab_rect,
+            theme,
+            if details { &mut hidden } else { glyphs },
+            tab_hits,
+        );
+
+        if extensions.as_ref().is_some_and(|p| p.details) {
+            // The Extensions details cover this row; a document's path here
+            // would label them as something they are not.
+        } else if diffing {
+            // The breadcrumb row says which change is on screen, so the
+            // editor column is never an unlabelled wall of diff.
+            layout::push_rect(
+                glyphs,
+                &renderer.atlas,
+                [breadcrumb_rect.x, breadcrumb_rect.y],
+                [breadcrumb_rect.width, breadcrumb_rect.height],
+                theme.tab_active,
+            );
+            layout::push_ui_text(
+                glyphs,
+                &mut renderer.atlas,
+                Viewport {
+                    x: breadcrumb_rect.x + 12.0,
+                    width: (breadcrumb_rect.width - 120.0).max(0.0),
+                    ..breadcrumb_rect
+                },
+                &git.diff_title(),
+                theme.text,
+            );
+            layout::push_ui_text_right(
+                glyphs,
+                &mut renderer.atlas,
+                Viewport {
+                    width: (breadcrumb_rect.width - 12.0).max(0.0),
+                    ..breadcrumb_rect
+                },
+                &git.diff_summary(),
+                theme.status_text,
+            );
+        } else {
+            layout::build_breadcrumbs(
+                buffer,
+                tree,
+                home,
+                &mut renderer.atlas,
+                breadcrumb_rect,
+                theme,
+                glyphs,
+            );
+            if let Some(strip) = response_rect
+                && let Some(view) = responses.get(&buffer.id())
+            {
+                layout::build_response_strip(view, &mut renderer.atlas, strip, theme, glyphs);
+            }
+            if let Some(strip) = response_rect
+                && !responses.contains_key(&buffer.id())
+                && claude
+                    .as_ref()
+                    .and_then(|c| c.reviews.get(&buffer.id()))
+                    .is_none()
+                && let Some(view) = conflict_scans
+                    .get(&buffer.id())
+                    .and_then(|s| s.view.as_ref())
+            {
+                let file = buffer
+                    .path
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                crate::platform::conflicts::draw_strip(
+                    view,
+                    *conflict_side,
+                    &file,
+                    buffer.is_dirty(),
+                    &mut renderer.atlas,
+                    strip,
+                    theme,
+                    glyphs,
+                );
+            }
+            if let Some(strip) = response_rect
+                && let Some(review) = claude.as_ref().and_then(|c| c.reviews.get(&buffer.id()))
+            {
+                crate::platform::claude::draw_review_strip(
+                    review,
+                    tree.root(),
+                    &mut renderer.atlas,
+                    strip,
+                    theme,
+                    glyphs,
+                );
+            }
+        }
+
+        if let Some(rect) = find_rect {
+            layout::push_rect(
+                glyphs,
+                &renderer.atlas,
+                [rect.x, rect.y],
+                [rect.width, rect.height],
+                theme.find_background,
+            );
+            let bar = find.as_ref().expect("find_rect implies a bar");
+            let g = layout::FindGeometry::new(rect);
+
+            // A field that looks like a field. There was no box at all: a
+            // "Find" label sat at the far left and the text began eleven
+            // monospace columns later, with nothing to say where you could
+            // type or how far the field reached.
+            let field = |glyphs: &mut Vec<GlyphInstance>,
+                         atlas: &mut Atlas,
+                         box_rect: Viewport,
+                         placeholder: &str,
+                         buffer: &Buffer,
+                         focused: bool,
+                         trailing: Option<&str>| {
+                if focused {
+                    layout::push_focus_ring(glyphs, box_rect, 6.0, 1.5);
+                }
+                layout::push_rounded_rect(glyphs, box_rect, 6.0, theme.tab_active);
+                let text = buffer.rope.to_string();
+                let inner = Viewport {
+                    x: box_rect.x + FIND_FIELD_PAD,
+                    width: (box_rect.width - FIND_FIELD_PAD * 2.0).max(0.0),
+                    ..box_rect
+                };
+                // The match count first, so the text knows how much room is
+                // left and never runs underneath it.
+                let mut room = inner.width;
+                if let Some(trailing) = trailing {
+                    layout::push_ui_text_right(glyphs, atlas, inner, trailing, theme.status_text);
+                    room = (room - layout::ui_text_width(atlas, trailing) - 12.0).max(0.0);
+                }
+                layout::push_ui_field(
+                    glyphs,
+                    atlas,
+                    Viewport {
+                        width: room,
+                        ..inner
+                    },
+                    (5.0, box_rect.height - 10.0),
+                    &layout::UiField {
+                        text: &text,
+                        cursor: buffer.cursor(),
+                        selection: buffer.selection(),
+                        placeholder,
+                        focused,
+                    },
+                    theme,
+                );
+            };
+
+            // "3 of 17" in the field it belongs to, which the bar never
+            // reported at all: there was no way to tell a search that found
+            // nothing from one that found everything.
+            let count = if bar.project {
+                (!bar.results.is_empty()).then(|| format!("{} found", bar.results.len()))
+            } else {
+                search_matches.as_ref().map(|found| {
+                    if found.is_empty() {
+                        "No matches".to_string()
+                    } else {
+                        // From the selection's start: a found match is
+                        // selected with the caret at its end.
+                        let from = buffer.selection().map_or(buffer.cursor(), |r| r.start);
+                        let at = found
+                            .iter()
+                            .position(|m| m.range.start >= from)
+                            .unwrap_or(0);
+                        format!("{} of {}", at + 1, found.len())
+                    }
+                })
+            };
+            field(
+                glyphs,
+                &mut renderer.atlas,
+                g.find_field,
+                if bar.project {
+                    "Search the project"
+                } else {
+                    "Find"
+                },
+                &bar.query,
+                !bar.replacing,
+                count.as_deref(),
+            );
+            field(
+                glyphs,
+                &mut renderer.atlas,
+                g.replace_field,
+                if bar.project {
+                    "Replace in every file listed"
+                } else {
+                    "Replace with"
+                },
+                &bar.replacement,
+                bar.replacing,
+                None,
+            );
+
+            // Buttons with their text centred, in the UI font the rest of the
+            // window uses, rather than monospace pushed in by one advance.
+            let button = |glyphs: &mut Vec<GlyphInstance>,
+                          atlas: &mut Atlas,
+                          r: Viewport,
+                          label: &str,
+                          enabled: bool| {
+                layout::push_rounded_rect(glyphs, r, 5.0, theme.tab_hover);
+                layout::push_ui_text_centered(
+                    glyphs,
+                    atlas,
+                    r,
+                    label,
+                    if enabled {
+                        theme.tab_text
+                    } else {
+                        theme.gutter_text
+                    },
+                );
+            };
+            let has_matches = if bar.project {
+                !bar.results.is_empty()
+            } else {
+                search_matches.as_ref().is_some_and(|f| !f.is_empty())
+            };
+            button(
+                glyphs,
+                &mut renderer.atlas,
+                g.previous,
+                "\u{2039}",
+                has_matches,
+            );
+            button(glyphs, &mut renderer.atlas, g.next, "\u{203a}", has_matches);
+            button(glyphs, &mut renderer.atlas, g.close, "\u{2715}", true);
+            if !bar.project {
+                button(
+                    glyphs,
+                    &mut renderer.atlas,
+                    g.replace_one,
+                    "Replace",
+                    has_matches,
+                );
+                button(
+                    glyphs,
+                    &mut renderer.atlas,
+                    g.replace_all,
+                    "All",
+                    has_matches,
+                );
+            } else {
+                button(glyphs, &mut renderer.atlas, g.replace_one, "Search", true);
+                // Rows open with a click or Return; this button replaces
+                // in every file the results list.
+                button(
+                    glyphs,
+                    &mut renderer.atlas,
+                    g.replace_all,
+                    "Replace All",
+                    has_matches,
+                );
+            }
+
+            // Toggles that show their state: filled and accented when on,
+            // quiet when off. They were the same flat rectangle either way.
+            for (slot, (label, on)) in [
+                ("Aa", bar.options.case_sensitive),
+                ("Word", bar.options.whole_word),
+                (".*", bar.options.regex),
+                ("Project", bar.project),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let r = g.options[slot];
+                layout::push_rounded_rect(
+                    glyphs,
+                    r,
+                    5.0,
+                    if on {
+                        theme.palette_selected
+                    } else {
+                        theme.tab_hover
+                    },
+                );
+                layout::push_ui_text_centered(
+                    glyphs,
+                    &mut renderer.atlas,
+                    r,
+                    label,
+                    if on { theme.accent } else { theme.status_text },
+                );
+            }
+            if bar.project {
+                for (row, hit) in bar
+                    .results
+                    .iter()
+                    .skip(bar.result_scroll)
+                    .take(FIND_RESULT_ROWS)
+                    .enumerate()
+                {
+                    let y = g.results.y + layout::FIND_ROW_HEIGHT * row as f32;
+                    let row_rect = Viewport {
+                        x: g.results.x + 8.0,
+                        y,
+                        width: (g.results.width - 16.0).max(0.0),
+                        height: layout::FIND_ROW_HEIGHT,
+                    };
+                    if bar.selected == bar.result_scroll + row {
+                        layout::push_rounded_rect(
+                            glyphs,
+                            Viewport {
+                                y: y + 1.0,
+                                height: layout::FIND_ROW_HEIGHT - 2.0,
+                                ..row_rect
+                            },
+                            5.0,
+                            theme.palette_selected,
+                        );
+                    }
+                    let path = tree
+                        .root()
+                        .and_then(|root| hit.path.strip_prefix(root).ok())
+                        .unwrap_or(&hit.path);
+                    // Where it is, then what it says, told apart by colour
+                    // rather than run together into one monospace string.
+                    let where_it_is = format!("{}:{}", path.display(), hit.line + 1);
+                    let width = layout::ui_text_width(&mut renderer.atlas, &where_it_is);
+                    layout::push_ui_text(
+                        glyphs,
+                        &mut renderer.atlas,
+                        Viewport {
+                            x: row_rect.x + 8.0,
+                            ..row_rect
+                        },
+                        &where_it_is,
+                        theme.accent,
+                    );
+                    layout::push_ui_text(
+                        glyphs,
+                        &mut renderer.atlas,
+                        Viewport {
+                            x: row_rect.x + 20.0 + width,
+                            width: (row_rect.width - 28.0 - width).max(0.0),
+                            ..row_rect
+                        },
+                        hit.snippet.trim(),
+                        theme.sidebar_text,
+                    );
+                }
+                if bar.searching {
+                    layout::push_ui_text(
+                        glyphs,
+                        &mut renderer.atlas,
+                        Viewport {
+                            x: g.results.x + 16.0,
+                            ..g.results
+                        },
+                        "Searching project\u{2026}",
+                        theme.status_text,
+                    );
+                }
+            }
+        }
+
+        layout::push_activity(
+            glyphs,
+            &mut renderer.atlas,
+            activity_rect,
+            theme,
+            sidebar_rect.map(|_| {
+                if extensions.is_some() {
+                    2
+                } else if *git_open {
+                    1
+                } else {
+                    0
+                }
+            }),
+            git.snapshot.as_ref().map_or(0, |s| s.changes.len()),
+        );
+        if let Some(rect) = sidebar_rect
+            && let Some(page) = extensions.as_mut()
+        {
+            layout::push_rect(
+                glyphs,
+                &renderer.atlas,
+                [rect.x, rect.y],
+                [rect.width, rect.height],
+                theme.sidebar_background,
+            );
+            crate::platform::extensions::draw_list(page, &mut renderer.atlas, rect, theme, glyphs);
+        } else if let Some(rect) = sidebar_rect {
+            let edit_text = sidebar_edit.as_ref().map(|e| e.field.rope.to_string());
+            let edit = sidebar_edit
+                .as_ref()
+                .zip(edit_text.as_deref())
+                .map(|(e, text)| layout::SidebarEdit {
+                    row: e.row,
+                    depth: e.depth,
+                    replaces: e.replaces(),
+                    is_dir: matches!(e.kind, SidebarEditKind::NewFolder)
+                        || matches!(&e.kind, SidebarEditKind::Rename(path) if path.is_dir()),
+                    text,
+                    cursor: e.field.cursor(),
+                    selection: e.field.selection(),
+                });
+            tree.set_preview(ignore_preview(docs.active(), completion.as_ref(), tree));
+            layout::build_sidebar_with_edit(
+                tree,
+                *git_open,
+                edit,
+                &mut renderer.atlas,
+                rect,
+                theme,
+                glyphs,
+            );
+            if *git_open {
+                git.draw_sidebar(&mut renderer.atlas, rect, theme, glyphs);
+            } else if let Some(drag) = tree_drag.as_ref().filter(|d| d.active && d.valid) {
+                // Where it would land. A drag with no target drawn is a drag
+                // you have to guess at.
+                let band = match drag.over {
+                    Some(index) => Viewport {
+                        x: rect.x + 4.0,
+                        width: (rect.width - 8.0).max(0.0),
+                        ..layout::sidebar_row_rect(rect, index.saturating_sub(tree.scroll))
+                    },
+                    // The project root: the whole column below the tree.
+                    None => Viewport {
+                        x: rect.x + 4.0,
+                        y: rect.y + layout::SIDEBAR_HEADER_HEIGHT,
+                        width: (rect.width - 8.0).max(0.0),
+                        height: (rect.height - layout::SIDEBAR_HEADER_HEIGHT).max(0.0),
+                    },
+                };
+                layout::push_focus_ring(glyphs, band, 5.0, 1.5);
+            }
+        }
+
+        if let Some(rect) = terminal_rect {
+            crate::platform::terminal::draw(
+                terminal_panel,
+                &mut renderer.atlas,
+                rect,
+                theme,
+                glyphs,
+            );
+        }
+
+        // Status line along the bottom, spanning the full width.
+        let (y, status_height) = (status_rect.y, status_rect.height);
+        layout::push_rect(
+            glyphs,
+            &renderer.atlas,
+            [status_rect.x, y],
+            [status_rect.width, status_height],
+            theme.status_background,
+        );
+        let (line, column) = buffer.cursor_position();
+
+        // A transient note (save result, open error) takes over the status
+        // line briefly, then yields back to the steady-state readout.
+        let note = match message {
+            Some((text, at)) if at.elapsed() < Duration::from_secs(4) => Some(text.clone()),
+            _ => {
+                *message = None;
+                None
+            }
+        };
+
+        let name = buffer.display_name();
+        // The diagnostic under the caret, or the file's counts.
+        let (diag_note, diag_counts) = {
+            let list =
+                buffer
+                    .path
+                    .as_ref()
+                    .zip(lsp_language(buffer))
+                    .and_then(|(path, language)| {
+                        lsp.get(&crate::lsp::servers::server_key(language))
+                            .and_then(|s| s.diagnostics.get(path))
+                    });
+            match list {
+                Some(list) if !list.is_empty() => {
+                    let (line, _) = buffer.cursor_position();
+                    let here = list
+                        .iter()
+                        .find(|d| (d.start.line as usize..=d.end.line as usize).contains(&line))
+                        .map(|d| d.message.lines().next().unwrap_or("").to_owned());
+                    let errors = list
+                        .iter()
+                        .filter(|d| d.severity == crate::lsp::Severity::Error)
+                        .count();
+                    let warnings = list.len() - errors;
+                    (here, format!("✕ {errors}  ⚠ {warnings}     "))
+                }
+                _ => (None, String::new()),
+            }
+        };
+        let blamed = blame
+            .as_ref()
+            .filter(|(id, l, text)| *id == buffer.id() && *l == line && !text.is_empty())
+            .map(|(_, _, text)| format!("   ·   {text}"))
+            .unwrap_or_default();
+        let status = note.or(diag_note).unwrap_or_else(|| {
+            if buffer.is_view_only() {
+                return name.to_string();
+            }
+            format!(
+                "{}   {}{}{}",
+                name,
+                if buffer.is_read_only() {
+                    format!(
+                        "Read-only: over {}",
+                        crate::text::buffer::human_size(crate::text::buffer::read_only_limit())
+                    )
+                } else if buffer.is_dirty() {
+                    "Unsaved changes".to_string()
+                } else {
+                    "All changes saved".to_string()
+                },
+                // Known only from drawing: finding such a line up front
+                // would mean scanning the whole file.
+                if *unshaped_on_screen {
+                    "   Long lines drawn without shaping"
+                } else {
+                    ""
+                },
+                blamed
+            )
+        });
+        let detail = if std::env::var_os("CRC_SHOW_LATENCY").is_some() {
+            format!("{}  {:?}", latency.summary(), worst)
+        } else {
+            let branch = git.branch_status();
+            let position = if buffer.is_view_only() {
+                String::new()
+            } else {
+                format!(
+                    "Ln {}, Col {}     {}     {}",
+                    line + 1,
+                    column + 1,
+                    buffer.disk_format().label(),
+                    buffer.disk_format().line_ending_label()
+                )
+            };
+            format!(
+                "{}{}{}{}",
+                if claude.as_ref().is_some_and(|c| c.is_connected()) {
+                    "✻ Claude     "
+                } else {
+                    ""
+                },
+                if branch.is_empty() {
+                    String::new()
+                } else {
+                    format!("{branch}     ")
+                },
+                diag_counts,
+                position
+            )
+        };
+        let right_width = 320.0f32.min(status_rect.width * 0.55);
+        layout::push_ui_text(
+            glyphs,
+            &mut renderer.atlas,
+            Viewport {
+                x: 16.0,
+                width: (status_rect.width - right_width - 32.0).max(0.0),
+                ..status_rect
+            },
+            &status,
+            theme.status_text,
+        );
+        layout::push_ui_text(
+            glyphs,
+            &mut renderer.atlas,
+            Viewport {
+                x: status_rect.width - right_width,
+                width: (right_width - 12.0).max(0.0),
+                ..status_rect
+            },
+            &detail,
+            theme.status_text,
+        );
+        let advance = renderer.atlas.metrics.advance;
+
+        // Go-to-line takes over the status line: it is a line number, and
+        // that is where line numbers already live.
+        let prompt = goto
+            .as_ref()
+            .map(|field| ("Go to line: ", field))
+            .or_else(|| rename.as_ref().map(|r| ("Rename to: ", &r.field)));
+        if let Some((label, field)) = prompt {
+            let text = field.rope.to_string();
+            layout::push_rect(
+                glyphs,
+                &renderer.atlas,
+                [0.0, y],
+                [viewport.width, status_height],
+                theme.find_background,
+            );
+            layout::push_text(
+                glyphs,
+                &mut renderer.atlas,
+                advance,
+                y,
+                label,
+                theme.gutter_text,
+            );
+            let x = advance * (label.len() as f32 + 1.0);
+            // The field's own caret and selection: Left, Right and Shift
+            // move them. By the cells the text takes, as push_text lays it
+            // out: a wide character is two.
+            let column = |at: usize| {
+                let cells: usize = text[..at.min(text.len())]
+                    .chars()
+                    .map(crate::text::columns::display_width)
+                    .sum();
+                cells as f32 * advance
+            };
+            if let Some(range) = field.selection() {
+                layout::push_rect(
+                    glyphs,
+                    &renderer.atlas,
+                    [x + column(range.start), y],
+                    [column(range.end) - column(range.start), status_height],
+                    theme.selection,
+                );
+            }
+            layout::push_text(glyphs, &mut renderer.atlas, x, y, &text, theme.text);
+            layout::push_rect(
+                glyphs,
+                &renderer.atlas,
+                [x + column(field.cursor()), y],
+                [(advance * 0.15).max(1.0), status_height],
+                theme.cursor,
+            );
+        }
+
+        // The palette floats over everything, so it is drawn last.
+        if let Some((query, selected)) = palette {
+            let text = query.rope.to_string();
+            let sources = PaletteSources {
+                finder,
+                commands: command_list,
+                symbols: symbol_list,
+                root: tree.root(),
+                branches: branch_list.as_deref(),
+                actions: action_list.as_ref(),
+            };
+            let mode = PaletteMode::of(&sources);
+            let rows: Vec<layout::PaletteRow> = palette_rows(&sources, &text)
+                .into_iter()
+                .map(|(row, _)| row)
+                .collect();
+            *palette_count = rows.len();
+            let rect = layout::palette_rect(viewport, rows.len());
+            layout::push_rect(
+                glyphs,
+                &renderer.atlas,
+                [viewport.x, viewport.y],
+                [viewport.width, viewport.height],
+                theme.scrim,
+            );
+            layout::build_palette(
+                layout::PaletteView {
+                    rows: &rows,
+                    heading: palette_heading(&text, mode).0,
+                    empty: palette_heading(&text, mode).1,
+                    placeholder: match mode {
+                        PaletteMode::Branch => "Branch name",
+                        PaletteMode::Action => "Filter actions",
+                        PaletteMode::Open => {
+                            "Find a file  ·  > commands  ·  @ symbols  ·  # in project"
+                        }
+                    },
+                    action: if mode == PaletteMode::Branch {
+                        "Switch"
+                    } else if mode == PaletteMode::Action || commands::query(&text).is_some() {
+                        "Run"
+                    } else {
+                        "Open"
+                    },
+                    query: &text,
+                    selected: *selected,
+                    scroll: *palette_scroll,
+                    cursor: query.cursor(),
+                    selection: query.selection(),
+                },
+                &mut renderer.atlas,
+                rect,
+                theme,
+                glyphs,
+            );
+        }
+
+        let background = theme.background;
+        let timing = renderer.draw(layer, glyphs, (viewport.width, viewport.height), background);
+        if timing.is_some() {
+            *drew_once = true;
+        }
+        timing
+    }
+}
