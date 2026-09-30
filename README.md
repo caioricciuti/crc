@@ -163,9 +163,11 @@ the size and write it back.
   with HEAD, not the index. Conflict markers must be Git's default seven
   characters.
 - **No minimap.** Folding is by indentation, not by syntax.
-- **Markdown hiding stops at ASCII.** A line with non-ASCII text shows its
-  syntax and is not padded into table columns, and heading sizes are the
-  body size.
+- **Markdown styling has edges.** Italic is not drawn on lines with
+  non-ASCII text, and bold there is the regular face drawn twice; a line
+  with right-to-left text shows its syntax; a wrapped row breaks by the
+  raw text's width, hidden syntax included; heading sizes are the body
+  size.
 - **Panes are a way of looking.** A file is open in one pane at a time, and
   a session restores every pane's files into one pane.
 - **Bounded by design.** Project search skips files over 2 MiB and shows the

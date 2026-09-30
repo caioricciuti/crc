@@ -264,15 +264,26 @@ pub fn build_text_appending(
         {
             stats.unshaped += 1;
         }
-        // Markdown off the caret: syntax hidden, table cells padded.
-        let map = if shaped_line.is_none() {
-            markdown.line(buffer, &touched, line)
-        } else {
-            None
+        // Markdown off the caret: syntax hidden, table cells padded, on a
+        // shaped line through its CoreText positions.
+        let map = markdown.line(buffer, &touched, line);
+        // A quote's `>` is drawn as a bar, except on a line being edited.
+        let quote_bars = !touched.iter().any(|&(a, b)| a <= line && line <= b);
+        let quote_bar = |out: &mut Vec<GlyphInstance>, x: f32, color| {
+            out.push(GlyphInstance {
+                pos: [x + (m.advance - 2.0) * 0.5, y],
+                size: [2.0, m.line_height],
+                uv: solid,
+                color,
+                ..Default::default()
+            });
         };
+        let placed = shaped_line
+            .as_deref()
+            .map(|shaped| Placed::new(shaped, buffer, line_start, map, m.advance));
         let offset_at = |byte: usize| -> f32 {
-            if let Some(shaped) = &shaped_line {
-                shaped.x_of_byte(byte.saturating_sub(line_start))
+            if let Some(placed) = &placed {
+                placed.x(byte)
             } else if let Some(map) = &map {
                 map.column(&buffer.rope, byte) * m.advance
             } else {
@@ -394,7 +405,10 @@ pub fn build_text_appending(
         // `extend` more at its end (half a cell marks a selected newline).
         let right_edge = viewport.x + viewport.width;
         let band = |out: &mut Vec<GlyphInstance>, from: usize, to: usize, extend: f32, color| {
-            let intervals = if let Some(shaped) = &shaped_line {
+            let intervals = if let Some(shaped) = shaped_line
+                .as_ref()
+                .filter(|_| !placed.as_ref().is_some_and(Placed::remapped))
+            {
                 shaped.selection_intervals(
                     from - line_start,
                     to - line_start,
@@ -554,43 +568,66 @@ pub fn build_text_appending(
         }
 
         let source_quads = out.len();
-        if let Some(shaped) = shaped_line {
+        if let Some(shaped) = &shaped_line {
+            let placed = placed.as_ref().expect("a shaped line is placed");
+            // Pads push glyphs right and hidden runs pull them left, so the
+            // glyphs to look at reach that much further either way.
+            let (pads, hidden) = placed.spread();
             let utf16_bytes = &shaped.source_bytes;
             for glyph in shaped.visible_glyphs(
-                scroll_x,
-                scroll_x + viewport.x + viewport.width - text_x,
+                scroll_x - pads,
+                scroll_x + viewport.x + viewport.width - text_x + hidden,
                 cell_w * 2.0,
             ) {
                 let byte = line_start + utf16_bytes[glyph.source_utf16.min(utf16_bytes.len() - 1)];
                 if wrapping && (byte < row_start || byte >= row_end) {
                     continue;
                 }
+                if placed.hides(byte) {
+                    continue;
+                }
                 let span_at = spans.partition_point(|s| s.end <= byte);
-                let color = spans
+                let span = spans
                     .get(span_at)
-                    .filter(|s| s.start <= byte && byte < s.end)
-                    .map_or(theme.text, |s| theme.syntax(s.kind));
-                let x = text_x + glyph.x - scroll_x;
+                    .filter(|s| s.start <= byte && byte < s.end);
+                let color = span.map_or(theme.text, |s| theme.syntax(s.kind));
+                let x = text_x + glyph.x + placed.shift(byte, true) - scroll_x;
                 if x + cell_w * 2.0 <= text_x || x > viewport.x + viewport.width {
                     continue;
                 }
-                let Some(slot) = atlas.slot_for_shaped(&shaped, glyph) else {
+                if quote_bars
+                    && span.is_some_and(|s| s.kind == Kind::MdMarker)
+                    && quote_mark(buffer, line_start, byte)
+                {
+                    quote_bar(out, x, color);
+                    continue;
+                }
+                let Some(slot) = atlas.slot_for_shaped(shaped, glyph) else {
                     stats.unsupported += 1;
                     continue;
                 };
-                out.push(GlyphInstance {
+                let glyph = GlyphInstance {
                     pos: [x + slot.dx, y + glyph_dy],
                     size: [cell_w * slot.cells as f32, cell_h],
                     uv: slot.uv,
                     flags: slot.flags(),
                     color,
                     ..Default::default()
-                });
+                };
+                out.push(glyph);
+                // A shaped line is set in one face: Markdown's bold is the
+                // same glyph again one device pixel to the right.
+                if span.is_some_and(|s| s.kind.bold()) {
+                    out.push(GlyphInstance {
+                        pos: [glyph.pos[0] + 1.0 / atlas.metrics.scale, glyph.pos[1]],
+                        ..glyph
+                    });
+                }
             }
             for quad in &mut out[source_quads..] {
                 clip_horizontal(quad, text_x, viewport.x + viewport.width);
             }
-            shaped_carets.push((row_index, shaped, row_x0));
+            shaped_carets.push((row_index, shaped.clone(), row_x0, map));
             if row.first {
                 stats.lines += 1;
             }
@@ -619,6 +656,12 @@ pub fn build_text_appending(
                 buffer.scroll_column.saturating_sub(margin),
             )
         };
+        // Only pipes, dashes, colons and spaces: a table's delimiter row.
+        let delimiter_row = map.is_some_and(|map| !map.pads.is_empty())
+            && buffer.rope.chunks_in(line_start..line_end).all(|c| {
+                c.chars()
+                    .all(|ch| matches!(ch, '|' | '-' | ':' | ' ' | '\t' | '\r' | '\n'))
+            });
         // Columns the drawn text sits from where its raw column puts it.
         let mut shift = map.map_or(0.0, |map| {
             map.column(&buffer.rope, byte) - buffer.rope.visual_column(line_start..byte) as f32
@@ -653,7 +696,31 @@ pub fn build_text_appending(
                     _ => {}
                 }
                 if let Some(map) = &map {
-                    shift += map.pad_at(byte) as f32;
+                    let pad = map.pad_at(byte);
+                    // A delimiter row's cell runs on in dashes to its pipe.
+                    if pad > 0
+                        && delimiter_row
+                        && byte > line_start
+                        && buffer.rope.byte_at(byte - 1) == Some(b'-')
+                        && let Some(slot) = atlas.slot_for_fallback('-')
+                    {
+                        let color = theme.syntax(Kind::MdMarker);
+                        for k in 0..pad {
+                            let x =
+                                text_x + (column as f32 + shift + k as f32) * m.advance - scroll_x;
+                            if x >= text_x && x <= viewport.x + viewport.width {
+                                out.push(GlyphInstance {
+                                    pos: [x, y + glyph_dy],
+                                    size: [cell_w * slot.cells as f32, cell_h],
+                                    uv: slot.uv,
+                                    flags: slot.flags(),
+                                    color,
+                                    ..Default::default()
+                                });
+                            }
+                        }
+                    }
+                    shift += pad as f32;
                     if map.hides(byte) {
                         shift -= display_width(ch) as f32;
                         column += display_width(ch);
@@ -678,6 +745,16 @@ pub fn build_text_appending(
                     continue;
                 }
 
+                if ch == '>'
+                    && quote_bars
+                    && span.is_some_and(|s| s.kind == Kind::MdMarker)
+                    && quote_mark(buffer, line_start, byte)
+                {
+                    quote_bar(out, x, color);
+                    column += 1;
+                    byte += advance_bytes;
+                    continue;
+                }
                 let slot = if face == Face::Regular {
                     atlas.slot_for_fallback(ch)
                 } else {
@@ -723,10 +800,11 @@ pub fn build_text_appending(
         };
         let row = rows_on_screen[row_index];
         let line_start = buffer.rope.line_to_byte(caret_line);
-        let x = if let Some((_, shaped, row_x0)) =
+        let x = if let Some((_, shaped, row_x0, map)) =
             shaped_carets.iter().find(|(index, ..)| *index == row_index)
         {
-            text_x + shaped.x_of_byte(caret - line_start) - scroll_x - row_x0
+            let placed = Placed::new(shaped, buffer, line_start, *map, m.advance);
+            text_x + placed.x(caret) - scroll_x - row_x0
         } else if let Some(map) = markdown.line(buffer, &touched, caret_line) {
             let column = map.column(&buffer.rope, caret) - map.column(&buffer.rope, row.start);
             text_x + column * m.advance - scroll_x
@@ -997,10 +1075,7 @@ pub(super) fn push_underline_on(
 /// (Hebrew, Arabic and the scripts after them): a wrapped row cut out of
 /// the whole line's shaping is wrong there, and only there.
 pub(super) fn has_rtl(buffer: &Buffer, line: usize) -> bool {
-    let rtl = |c: char| {
-        matches!(c as u32,
-            0x0590..=0x08FF | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFF | 0x10800..=0x10FFF | 0x1E800..=0x1EFFF)
-    };
+    let rtl = is_rtl;
     let starts = buffer.row_starts(line);
     starts.iter().skip(1).any(|&at| {
         // The letters either side of the break, past any spaces.
@@ -1010,6 +1085,19 @@ pub(super) fn has_rtl(buffer: &Buffer, line: usize) -> bool {
         before.trim_end().chars().next_back().is_some_and(rtl)
             || after.trim_start().chars().next().is_some_and(rtl)
     })
+}
+
+/// Whether the `>` at `byte` opens a quote: nothing but spaces and other
+/// `>` before it on its line.
+fn quote_mark(buffer: &Buffer, line_start: usize, byte: usize) -> bool {
+    buffer.rope.byte_at(byte) == Some(b'>')
+        && (line_start..byte).all(|b| matches!(buffer.rope.byte_at(b), Some(b' ' | b'>')))
+}
+
+/// Hebrew, Arabic and the right-to-left scripts after them.
+fn is_rtl(c: char) -> bool {
+    matches!(c as u32,
+        0x0590..=0x08FF | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFF | 0x10800..=0x10FFF | 0x1E800..=0x1EFFF)
 }
 
 /// How many of `chars` fit in `cells`, without ending between the parts of
@@ -1319,8 +1407,10 @@ pub fn offset_at_point(
             .cached_editor_line((buffer.id(), row.line), &buffer.rope)
             .filter(|_| !split_rtl)
         {
-            let x0 = shaped.x_of_byte(row.start - line_start);
-            let at = line_start + shaped.byte_at_x(x - text_x + x0 + scrolled);
+            let map = markdown.line(buffer, &touched_lines(buffer), row.line);
+            let placed = Placed::new(shaped, buffer, line_start, map, m.advance);
+            let x0 = placed.x(row.start);
+            let at = placed.byte_at(x - text_x + x0 + scrolled);
             return at.clamp(
                 row.start,
                 if row.last {
@@ -1365,7 +1455,8 @@ pub fn offset_at_point(
     let start = buffer.rope.line_to_byte(line);
     if let Some(shaped) = atlas.cached_editor_line((buffer.id(), line), &buffer.rope) {
         let target_x = x - text_x + buffer.scroll_column as f32 * m.advance;
-        return start + shaped.byte_at_x(target_x);
+        let map = markdown.line(buffer, &touched_lines(buffer), line);
+        return Placed::new(shaped, buffer, start, map, m.advance).byte_at(target_x);
     }
     let column = ((x - text_x) / m.advance).max(0.0) + buffer.scroll_column as f32;
     if let Some(map) = markdown.line(buffer, &touched_lines(buffer), line) {
@@ -1450,7 +1541,8 @@ pub fn caret_rect_on(
             .cached_editor_line((buffer.id(), line), &buffer.rope)
             .filter(|_| !split_rtl)
         {
-            shaped.x_of_byte(caret - line_start) - shaped.x_of_byte(row.start - line_start)
+            let placed = Placed::new(shaped, buffer, line_start, map, m.advance);
+            placed.x(caret) - placed.x(row.start)
         } else if let Some(map) = &map {
             (map.column(&buffer.rope, caret) - map.column(&buffer.rope, row.start)) * m.advance
         } else {
@@ -1473,9 +1565,9 @@ pub fn caret_rect_on(
     }
     let line_start = buffer.rope.line_to_byte(line);
     if let Some(shaped) = atlas.cached_editor_line((buffer.id(), line), &buffer.rope) {
-        let x =
-            text.x + gutter_width(buffer, atlas) + shaped.x_of_byte(buffer.cursor() - line_start)
-                - buffer.scroll_column as f32 * m.advance;
+        let placed = Placed::new(shaped, buffer, line_start, map, m.advance);
+        let x = text.x + gutter_width(buffer, atlas) + placed.x(buffer.cursor())
+            - buffer.scroll_column as f32 * m.advance;
         if x < text.x + gutter_width(buffer, atlas) {
             return None;
         }
@@ -1654,7 +1746,7 @@ impl<'a> Markdown<'a> {
 
     /// `line` drawn off the monospace grid, or `None` when it is drawn as
     /// written. A line in `touched` shows its syntax; its pads stay.
-    fn line(
+    pub(super) fn line(
         &self,
         buffer: &Buffer,
         touched: &[(usize, usize)],
@@ -1691,6 +1783,135 @@ pub(super) fn touched_lines(buffer: &Buffer) -> Vec<(usize, usize)> {
         .into_iter()
         .map(|(a, b)| (buffer.rope.byte_to_line(a), buffer.rope.byte_to_line(b)))
         .collect()
+}
+
+/// A shaped line where it is drawn: CoreText's positions, less the width
+/// of the Markdown syntax hidden before a byte, plus the table pads. A line
+/// holding right-to-left text is drawn as shaped, syntax and all: a hidden
+/// run could cut through its visual order.
+pub(super) struct Placed<'a> {
+    shaped: &'a crate::render::font::ShapedLine,
+    start: usize,
+    map: Option<LineMap<'a>>,
+    advance: f32,
+}
+
+impl<'a> Placed<'a> {
+    pub(super) fn new(
+        shaped: &'a crate::render::font::ShapedLine,
+        buffer: &Buffer,
+        start: usize,
+        map: Option<LineMap<'a>>,
+        advance: f32,
+    ) -> Self {
+        let map = map.filter(|map| {
+            !buffer
+                .rope
+                .chunks_in(map.start..map.end)
+                .any(|chunk| chunk.chars().any(is_rtl))
+        });
+        Placed {
+            shaped,
+            start,
+            map,
+            advance,
+        }
+    }
+
+    /// Whether Markdown moves anything on this line.
+    pub(super) fn remapped(&self) -> bool {
+        self.map.is_some()
+    }
+
+    fn raw(&self, byte: usize) -> f32 {
+        self.shaped.x_of_byte(byte.saturating_sub(self.start))
+    }
+
+    /// Whether the syntax at `byte` is hidden.
+    pub(super) fn hides(&self, byte: usize) -> bool {
+        self.map.is_some_and(|map| map.hides(byte))
+    }
+
+    /// How far what is at `byte` moves from where CoreText put it: left by
+    /// the hidden runs before it, right by the pads before it, and by its
+    /// own pad too when `own_pad` (a glyph is drawn after its pad, a caret
+    /// before it).
+    pub(super) fn shift(&self, byte: usize, own_pad: bool) -> f32 {
+        let Some(map) = &self.map else {
+            return 0.0;
+        };
+        let mut shift = 0.0;
+        for h in map.hidden.iter().take_while(|h| h.start < byte) {
+            let (from, to) = (h.start.max(map.start), h.end.min(byte));
+            if to > from {
+                shift -= self.raw(to) - self.raw(from);
+            }
+        }
+        for p in map
+            .pads
+            .iter()
+            .take_while(|p| p.0 < byte || (own_pad && p.0 == byte))
+        {
+            shift += p.1 as f32 * self.advance;
+        }
+        shift
+    }
+
+    /// Where the caret at `byte` is drawn, in points from the line start.
+    pub(super) fn x(&self, byte: usize) -> f32 {
+        let byte = self.map.map_or(byte, |map| byte.clamp(map.start, map.end));
+        self.raw(byte) + self.shift(byte, false)
+    }
+
+    /// The pads' total width and the hidden runs' total width.
+    pub(super) fn spread(&self) -> (f32, f32) {
+        let Some(map) = &self.map else {
+            return (0.0, 0.0);
+        };
+        let pads = map.pads.iter().map(|p| p.1 as f32).sum::<f32>() * self.advance;
+        (pads, pads - self.shift(map.end, false))
+    }
+
+    /// The caret stop drawn nearest `x`, in points from the line start; the
+    /// earliest of those drawn at the same place, which a hidden run makes
+    /// several. Each stretch between hidden runs and pads moves as a whole,
+    /// so it is CoreText's own answer inside the stretch, shifted.
+    pub(super) fn byte_at(&self, x: f32) -> usize {
+        let Some(map) = &self.map else {
+            return self.start + self.shaped.byte_at_x(x);
+        };
+        let mut cuts = vec![map.start, map.end];
+        for h in map.hidden {
+            cuts.push(h.start.clamp(map.start, map.end));
+            cuts.push(h.end.clamp(map.start, map.end));
+        }
+        cuts.extend(map.pads.iter().map(|p| p.0.clamp(map.start, map.end)));
+        cuts.sort_unstable();
+        cuts.dedup();
+        let mut best = (map.start, f32::INFINITY);
+        for pair in cuts.windows(2) {
+            let (from, to) = (pair[0], pair[1]);
+            if map.hides(from) {
+                continue;
+            }
+            let shift = self.x(from) - self.raw(from);
+            let at = (self.start + self.shaped.byte_at_x(x - shift)).clamp(from, to);
+            let distance = (self.x(at) - x).abs();
+            if distance < best.1 {
+                best = (at, distance);
+            }
+        }
+        if best.1.is_infinite() {
+            return map.start;
+        }
+        // A hidden run is drawn where it ends: its start is the earliest
+        // stop there, as on a line drawn by cells.
+        let mut at = best.0;
+        while let Some(h) = map.hidden.iter().find(|h| h.end == at && h.start < at) {
+            at = h.start.max(map.start);
+        }
+        at
+    }
 }
 
 /// One Markdown line's hidden syntax and pads, for placing its text.

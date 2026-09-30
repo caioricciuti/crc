@@ -1328,6 +1328,92 @@ mod tests {
     }
 
     #[test]
+    fn markdown_hides_syntax_on_a_shaped_line_too() {
+        let mut atlas = atlas();
+        // "é" makes the line shaped by CoreText rather than drawn by cells.
+        let text = "x\n**café** fim\n";
+        let styled = crate::markdown::source::style(text);
+        let markdown = Markdown::of(Some(&styled));
+        let mut buffer = Buffer::from_text(text);
+        let range = buffer.rope.line_to_byte(1)..buffer.rope.line_to_byte(2);
+        // Measured by CoreText's own advances, not the rounded grid's.
+        let shaped = atlas
+            .shape_editor_line((buffer.id(), 1), &buffer.rope, range)
+            .unwrap();
+        let m = atlas.metrics;
+        let gutter = gutter_width(&buffer, &atlas);
+        let y = m.line_height + 2.0;
+        let at = |buffer: &Buffer, column: f32| {
+            offset_at_point(buffer, &atlas, &markdown, gutter + column * m.advance, y)
+        };
+        // Drawn as "café fim": the stars take no room.
+        assert_eq!(at(&buffer, 0.0), 2, "the start of the hidden stars");
+        assert_eq!(at(&buffer, 2.0), 6, "between a and f");
+        assert_eq!(at(&buffer, 4.0), 9, "after é, before the closing stars");
+        assert_eq!(at(&buffer, 5.0), 12, "after the space");
+        // With the caret on it the line is drawn as written.
+        buffer.place_cursor(12, crate::text::buffer::Motion::Move);
+        assert_eq!(at(&buffer, 2.0), 4, "before c, after the stars");
+        let rect = caret_rect(&buffer, &atlas, &markdown, Viewport::new(800.0, 600.0)).unwrap();
+        assert!(
+            (rect.x - (gutter + shaped.x_of_byte(10))).abs() < 0.01,
+            "{}",
+            rect.x
+        );
+    }
+
+    #[test]
+    fn markdown_table_cells_pad_on_a_shaped_line_too() {
+        let mut atlas = atlas();
+        let text = "| é | bbb |\n|---|---|\n| cc | d |\n";
+        let styled = crate::markdown::source::style(text);
+        let markdown = Markdown::of(Some(&styled));
+        let mut buffer = Buffer::from_text(text);
+        let range = 0..buffer.rope.line_to_byte(1);
+        // Measured by CoreText's own advances, not the rounded grid's.
+        let shaped = atlas
+            .shape_editor_line((buffer.id(), 0), &buffer.rope, range)
+            .unwrap();
+        let m = atlas.metrics;
+        let gutter = gutter_width(&buffer, &atlas);
+        let viewport = Viewport::new(800.0, 600.0);
+        // After "| é |", which a blank column widens to "| cc |".
+        buffer.place_cursor(6, crate::text::buffer::Motion::Move);
+        let rect = caret_rect(&buffer, &atlas, &markdown, viewport).unwrap();
+        let after_pad = gutter + shaped.x_of_byte(6) + m.advance;
+        assert!((rect.x - after_pad).abs() < 0.01, "{}", rect.x);
+        // Before the pipe: the caret stays by the text, not the pad.
+        buffer.place_cursor(5, crate::text::buffer::Motion::Move);
+        let rect = caret_rect(&buffer, &atlas, &markdown, viewport).unwrap();
+        assert!(
+            (rect.x - (gutter + shaped.x_of_byte(5))).abs() < 0.01,
+            "{}",
+            rect.x
+        );
+    }
+
+    #[test]
+    fn a_right_to_left_line_keeps_its_markdown_syntax() {
+        let mut atlas = atlas();
+        let text = "x\n**שלום** a\n";
+        let styled = crate::markdown::source::style(text);
+        let markdown = Markdown::of(Some(&styled));
+        let buffer = Buffer::from_text(text);
+        let range = buffer.rope.line_to_byte(1)..buffer.rope.line_to_byte(2);
+        let shaped = atlas
+            .shape_editor_line((buffer.id(), 1), &buffer.rope, range)
+            .unwrap();
+        let map = markdown.line(&buffer, &[], 1);
+        assert!(
+            map.is_some(),
+            "the stars are hidden on a left-to-right line"
+        );
+        let placed = editor::Placed::new(&shaped, &buffer, 2, map, atlas.metrics.advance);
+        assert!(!placed.remapped());
+        assert!(!placed.hides(2));
+    }
+
+    #[test]
     fn hit_testing_accounts_for_tabs() {
         let atlas = atlas();
         let buffer = Buffer::from_text("\tx");

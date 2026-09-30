@@ -253,13 +253,21 @@ fn main() -> std::io::Result<()> {
         active.rope.slice_to_string(r)
     });
     println!("syntax      {} spans", spans.len());
-    let mut stats = layout::build_full(
-        docs.active(),
+    // A Markdown file as the app draws it: syntax hidden off the caret's
+    // lines, table cells padded, code blocks on a band.
+    let markdown = layout::Markdown::of(syntax.markdown(active.id()));
+    let rows = layout::screen_rows(active, viewport, renderer.atlas.metrics.line_height);
+    let mut stats = layout::build_full_search(
+        active,
         &mut renderer.atlas,
         viewport,
+        &rows,
         &theme,
         "",
+        None,
         &spans,
+        &markdown,
+        true,
         &mut glyphs,
     );
     // The live display link polls pending shaping without waiting for input.
@@ -267,13 +275,17 @@ fn main() -> std::io::Result<()> {
     renderer
         .atlas
         .settle_shaping(std::time::Duration::from_secs(30), |atlas| {
-            stats = layout::build_full(
-                docs.active(),
+            stats = layout::build_full_search(
+                active,
                 atlas,
                 viewport,
+                &rows,
                 &theme,
                 "",
+                None,
                 &spans,
+                &markdown,
+                true,
                 &mut glyphs,
             );
         });
