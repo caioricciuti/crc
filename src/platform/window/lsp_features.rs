@@ -127,6 +127,7 @@ impl EditorView {
             query,
             replacement: Buffer::new(),
             replacing: false,
+            has_keys: true,
             options: SearchOptions {
                 case_sensitive: true,
                 whole_word: true,

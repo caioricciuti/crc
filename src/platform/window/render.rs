@@ -360,7 +360,7 @@ impl EditorView {
 
             // A composition in progress, drawn at the caret it will land at.
             if let Some(text) = marked.as_deref()
-                && find.is_none()
+                && !find.as_ref().is_some_and(|bar| bar.has_keys)
                 && palette.is_none()
                 && goto.is_none()
                 && let Some(at) =
@@ -928,7 +928,7 @@ fn draw_find_bar(
             "Find"
         },
         &bar.query,
-        !bar.replacing,
+        bar.has_keys && !bar.replacing,
         count.as_deref(),
     );
     field(
@@ -941,7 +941,7 @@ fn draw_find_bar(
             "Replace with"
         },
         &bar.replacement,
-        bar.replacing,
+        bar.has_keys && bar.replacing,
         None,
     );
 

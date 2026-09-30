@@ -1082,6 +1082,10 @@ struct FindBar {
     replacement: Buffer,
     /// Tab moves between them.
     replacing: bool,
+    /// Whether typing goes to the bar. A click in the text gives the
+    /// document the keys and leaves the bar open with its matches drawn;
+    /// Cmd-F or a click on a field gives them back.
+    has_keys: bool,
     options: SearchOptions,
     project: bool,
     results: Vec<ProjectHit>,
@@ -1737,6 +1741,13 @@ define_class!(
                 }
             }
 
+            // The find bar stays open with its matches, but typing now goes
+            // to the document the press put the caret in.
+            if let Some(mut state) = self.state_mut()
+                && let Some(bar) = &mut state.find
+            {
+                bar.has_keys = false;
+            }
             self.text_press(event, started);
         }
 
@@ -5097,7 +5108,7 @@ fn keys(state: &State) -> Keys {
         Keys::Goto
     } else if state.palette.is_some() {
         Keys::Palette
-    } else if let Some(bar) = &state.find {
+    } else if let Some(bar) = state.find.as_ref().filter(|bar| bar.has_keys) {
         if bar.replacing {
             Keys::FindReplace
         } else {

@@ -371,6 +371,12 @@ impl EditorView {
             // Opening a file now adds a tab rather than replacing what is
             // showing, so nothing has to be saved or discarded first.
             self.load_path(&path.to_string_lossy());
+            // The opened file has the keys, not a find bar left open.
+            if let Some(mut state) = self.state_mut()
+                && let Some(bar) = &mut state.find
+            {
+                bar.has_keys = false;
+            }
             self.sync_title();
             self.reparse();
         }

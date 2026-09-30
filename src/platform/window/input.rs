@@ -495,7 +495,13 @@ impl EditorView {
         {
             return true;
         }
-        if self.state().is_some_and(|state| state.find.is_some()) && self.handle_find_key(event) {
+        if self.state().is_some_and(|state| {
+            state
+                .find
+                .as_ref()
+                .is_some_and(|bar| bar.has_keys || event.keyCode() == ESCAPE_KEY)
+        }) && self.handle_find_key(event)
+        {
             return true;
         }
         if self

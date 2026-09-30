@@ -296,18 +296,37 @@ impl EditorView {
                 .filter(|t| !t.contains('\n') && t.len() < 200)
         };
         let mut query = Buffer::new();
-        if let Some(seed) = seed {
-            query.insert(&seed);
+        if let Some(seed) = &seed {
+            query.insert(seed);
             query.select_all();
         }
         if let Some(mut state) = self.state_mut() {
             close_fields(&mut state);
+        }
+        if let Some(mut state) = self.state_mut()
+            && let Some(bar) = &mut state.find
+        {
+            // Already open: the keys come back to it, with its options, its
+            // replacement and its results; a selection becomes the query.
+            if seed.is_some() {
+                bar.query = query;
+            } else {
+                bar.query.select_all();
+            }
+            bar.has_keys = true;
+            bar.replacing = false;
+            drop(state);
+            self.refresh_find();
+            self.request_redraw();
+            self.pump();
+            return;
         }
         if let Some(mut state) = self.state_mut() {
             state.find = Some(FindBar {
                 query,
                 replacement: Buffer::new(),
                 replacing: false,
+                has_keys: true,
                 options: SearchOptions::default(),
                 project: false,
                 results: Vec::new(),
@@ -555,6 +574,7 @@ impl EditorView {
             let State { find, renderer, .. } = &mut *state;
             if let Some(bar) = find {
                 bar.replacing = replace;
+                bar.has_keys = true;
                 let box_rect = if replace {
                     g.replace_field
                 } else {
