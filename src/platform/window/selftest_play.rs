@@ -316,7 +316,7 @@ impl EditorView {
                 // from one whose clicks were ignored.
                 let chrome = chrome_of(&state);
                 let layout = format!(
-                    "window {}x{} sidebar {:?} text {},{} {}x{} font {} theme {}",
+                    "window {}x{} sidebar {:?} text {},{} {}x{} preview {:?} font {} theme {}",
                     state.viewport.width,
                     state.viewport.height,
                     chrome.sidebar.map(|r| r.width),
@@ -324,6 +324,7 @@ impl EditorView {
                     chrome.text.y,
                     chrome.text.width,
                     chrome.text.height,
+                    chrome.preview.map(|r| r.width),
                     state.font_size,
                     if state.theme.is_dark() {
                         "dark"

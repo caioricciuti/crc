@@ -391,6 +391,7 @@ impl EditorView {
                 changed_at: None,
                 running: false,
                 answered: false,
+                only: false,
             };
             state.html_preview = Some(preview);
         }
@@ -470,7 +471,21 @@ impl EditorView {
             self.close_preview();
             return;
         }
-        let frame = chrome_of(&state).preview.map(ns_rect);
+        let chrome = chrome_of(&state);
+        let frame = chrome
+            .preview
+            .map(|p| {
+                if chrome.text.width > 0.0 {
+                    Viewport {
+                        x: p.x + layout::PREVIEW_GRAB,
+                        width: (p.width - layout::PREVIEW_GRAB).max(0.0),
+                        ..p
+                    }
+                } else {
+                    p
+                }
+            })
+            .map(ns_rect);
         // Crc's own overlays are drawn under any native view; the page
         // steps aside while one is up.
         let veiled = frame.is_none()

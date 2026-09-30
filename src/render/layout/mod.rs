@@ -275,6 +275,36 @@ mod tests {
     }
 
     #[test]
+    fn the_preview_split_follows_its_share_within_limits() {
+        let window = Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: 1201.0,
+            height: 800.0,
+        };
+        let plain = Chrome::new(window, None, 0);
+        let room = plain.text.width - PANE_GAP;
+        let split = |share: f32, only: bool| {
+            let mut chrome = Chrome::new(window, None, 0);
+            chrome.split_preview(share, only);
+            chrome
+        };
+        // A quarter for the text, the page the rest, meeting at the gap.
+        let quarter = split(0.25, false);
+        let page = quarter.preview.unwrap();
+        assert_eq!(quarter.text.width, (room * 0.25).floor());
+        assert_eq!(page.x, quarter.text.x + quarter.text.width + PANE_GAP);
+        assert_eq!(page.x + page.width, plain.text.x + plain.text.width);
+        // Dragged to either edge, each side keeps its least width.
+        assert_eq!(split(0.0, false).text.width, PREVIEW_MIN);
+        assert_eq!(split(1.0, false).preview.unwrap().width, PREVIEW_MIN);
+        // Only: the page has the column, the text none of it.
+        let only = split(0.5, true);
+        assert_eq!(only.preview.unwrap(), plain.text);
+        assert_eq!(only.text.width, 0.0);
+    }
+
+    #[test]
     fn the_preview_takes_the_right_half_of_the_focused_text() {
         let window = Viewport {
             x: 0.0,
@@ -284,7 +314,7 @@ mod tests {
         };
         let plain = Chrome::new(window, None, 0);
         let mut split = Chrome::new(window, None, 0);
-        split.split_preview();
+        split.split_preview(0.5, false);
         let preview = split.preview.unwrap();
         assert_eq!(split.text.x, plain.text.x);
         assert_eq!(split.text.width.fract(), 0.0, "text on a whole point");

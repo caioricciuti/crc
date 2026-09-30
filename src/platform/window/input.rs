@@ -281,6 +281,21 @@ impl EditorView {
         if self.terminal_has_keys() {
             return self.terminal_key(event);
         }
+        if self
+            .state()
+            .is_some_and(|state| preview_only(&state) && !field_has_keys(&state))
+        {
+            const ESCAPE: u16 = 53;
+            if event.keyCode() == ESCAPE
+                && let Some(mut state) = self.state_mut()
+                && let Some(preview) = state.html_preview.as_mut()
+            {
+                preview.only = false;
+                drop(state);
+                self.request_redraw();
+            }
+            return true;
+        }
         // Typing goes to the document, so the tree no longer has the keys.
         if !event
             .modifierFlags()

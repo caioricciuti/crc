@@ -140,7 +140,8 @@ the size and write it back.
   VS Code REST Client format, with environments and a response tab.
 - **Markdown** is styled where it is written: its syntax hidden on lines
   the caret is not on, table columns lined up, fenced code coloured by its
-  language, with a rendered preview beside it (`Cmd-E`) from the Markdown
+  language, with a rendered preview beside it (`Cmd-E`, the divider
+  dragged to size) or in the whole tab (`Cmd-Shift-E`) from the Markdown
   Preview extension; images, PDFs, audio, video and office files open as
   Quick Look previews.
 - **A native, themed UI**: system-font chrome, light and dark following the

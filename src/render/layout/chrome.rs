@@ -230,6 +230,11 @@ impl PaneChrome {
 
 /// Between two panes.
 pub const PANE_GAP: f32 = 1.0;
+/// The narrowest the text or the page beside it is dragged to.
+pub const PREVIEW_MIN: f32 = 160.0;
+/// Points on the page's side of the split that take the divider's drag
+/// rather than the page: a native view over the text would take the press.
+pub const PREVIEW_GRAB: f32 = 6.0;
 
 impl Chrome {
     /// `sidebar` is its width when showing. `find_rows` is 0, 1 or 2.
@@ -354,8 +359,20 @@ impl Chrome {
 
     /// Gives the right half of the focused pane's text to the preview. The
     /// text keeps the left half, on a whole point.
-    pub fn split_preview(&mut self) {
-        let left = ((self.text.width - PANE_GAP) / 2.0).floor().max(0.0);
+    /// Gives the text `share` of the editor column's room and the page
+    /// beside it the rest, each at least [`PREVIEW_MIN`] wide while the
+    /// column has room for both. `only` gives the page the whole column.
+    pub fn split_preview(&mut self, share: f32, only: bool) {
+        if only {
+            self.preview = Some(self.text);
+            self.text.width = 0.0;
+            return;
+        }
+        let room = (self.text.width - PANE_GAP).max(0.0);
+        let least = PREVIEW_MIN.min(room / 2.0);
+        let left = (room * share.clamp(0.0, 1.0))
+            .floor()
+            .clamp(least, (room - least).max(least));
         let preview = Viewport {
             x: self.text.x + left + PANE_GAP,
             width: (self.text.width - left - PANE_GAP).max(0.0),
@@ -2173,6 +2190,8 @@ pub enum Hit {
     SidebarRow(usize),
     /// The grab band on the divider between sidebar and editor.
     SidebarDivider,
+    /// The grab band between the text and the page beside it.
+    PreviewDivider,
     Tab(usize),
     TabClose(usize),
     /// Empty tab strip, right of the last tab.
@@ -2218,6 +2237,7 @@ impl Hit {
             Hit::SidebarAction(i) => format!("sidebar.action.{i}"),
             Hit::SidebarRow(i) => format!("sidebar.row.{i}"),
             Hit::SidebarDivider => "sidebar.divider".into(),
+            Hit::PreviewDivider => "preview.divider".into(),
             Hit::Tab(i) => format!("tab.{i}"),
             Hit::TabClose(i) => format!("tab.close.{i}"),
             Hit::TabStrip => "tab.strip".into(),

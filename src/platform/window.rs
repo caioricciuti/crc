@@ -351,6 +351,8 @@ struct HtmlPreview {
     running: bool,
     /// A page has come back. Until one does, a failed run closes the pane.
     answered: bool,
+    /// The page takes the whole tab, the text hidden behind it.
+    only: bool,
 }
 
 impl HtmlPreview {
@@ -696,6 +698,8 @@ struct State {
     native_preview: Option<NativePreview>,
     /// An extension's page beside the active document (Cmd-E).
     html_preview: Option<HtmlPreview>,
+    /// The page's share of the editor column while it is beside the text.
+    preview_share: f32,
     /// The project tree behind the sidebar.
     tree: Tree,
     tree_version: u64,
@@ -1150,6 +1154,8 @@ struct TreeDrag {
 enum Drag {
     /// The sidebar's divider.
     Divider,
+    /// The divider between the text and the page beside it.
+    PreviewDivider,
     /// The terminal panel's top edge.
     Terminal,
     /// The editor's scrollbar thumb: where on the thumb the press landed,
@@ -1465,6 +1471,12 @@ define_class!(
                 Some(Hit::SidebarDivider) => {
                     if let Some(mut state) = self.state_mut() {
                         state.drag = Some(Drag::Divider);
+                    }
+                    return;
+                }
+                Some(Hit::PreviewDivider) => {
+                    if let Some(mut state) = self.state_mut() {
+                        state.drag = Some(Drag::PreviewDivider);
                     }
                     return;
                 }
@@ -1831,6 +1843,25 @@ define_class!(
                 return;
             }
 
+            if self.state().is_some_and(|state| matches!(state.drag, Some(Drag::PreviewDivider))) {
+                {
+                    let Some(mut state) = self.state_mut() else {
+                        return;
+                    };
+                    let chrome = chrome_of(&state);
+                    if let Some(page) = chrome.preview {
+                        let column = page.x + page.width - chrome.text.x;
+                        if column > 0.0 {
+                            let text = (point.x as f32 - chrome.text.x) / column;
+                            state.preview_share = (1.0 - text).clamp(0.0, 1.0);
+                        }
+                    }
+                }
+                self.request_redraw();
+                self.pump();
+                return;
+            }
+
             if self.state().is_some_and(|state| matches!(state.drag, Some(Drag::Divider))) {
                 {
                     let Some(mut state) = self.state_mut() else {
@@ -1987,6 +2018,12 @@ define_class!(
                 use objc2::ClassType;
                 let cursor = if NSCursor::class().class_method(objc2::sel!(columnResizeCursor)).is_some() { NSCursor::columnResizeCursor() } else { #[allow(deprecated)] NSCursor::resizeLeftRightCursor() };
                 add(divider, &cursor);
+            }
+            if let Some(page) = chrome.preview.filter(|_| chrome.text.width > 0.0) {
+                use objc2::ClassType;
+                let band = Viewport { x: page.x - layout::PANE_GAP, width: layout::PANE_GAP + layout::PREVIEW_GRAB, ..page };
+                let cursor = if NSCursor::class().class_method(objc2::sel!(columnResizeCursor)).is_some() { NSCursor::columnResizeCursor() } else { #[allow(deprecated)] NSCursor::resizeLeftRightCursor() };
+                add(band, &cursor);
             }
             if let Some(rect) = chrome.terminal {
                 use objc2::ClassType;
@@ -2316,6 +2353,42 @@ define_class!(
                     Instant::now(),
                 ));
                 }
+            }
+            self.request_redraw();
+            self.pump();
+        }
+
+        /// The page in the whole tab, or back beside the text; opened in
+        /// the whole tab when it was closed.
+        #[unsafe(method(togglePreviewOnly:))]
+        fn action_toggle_preview_only(&self, _sender: Option<&AnyObject>) {
+            let (open, command) = {
+                let Some(state) = self.state() else {
+                    return;
+                };
+                let active = state.docs.active().id();
+                (
+                    state.html_preview.as_ref().is_some_and(|p| p.buffer == active),
+                    preview_command(&state),
+                )
+            };
+            if !open {
+                let Some(command) = command else {
+                    if let Some(mut state) = self.state_mut() {
+                        state.message = Some((
+                            "No preview installed: get Markdown Preview from crc > Extensions".into(),
+                            Instant::now(),
+                        ));
+                    }
+                    self.request_redraw();
+                    return;
+                };
+                self.open_preview(command);
+            }
+            if let Some(mut state) = self.state_mut()
+                && let Some(preview) = state.html_preview.as_mut()
+            {
+                preview.only = !open || !preview.only;
             }
             self.request_redraw();
             self.pump();
@@ -5119,6 +5192,16 @@ fn keys(state: &State) -> Keys {
     }
 }
 
+/// Whether the active document's page has the whole tab, its text hidden.
+fn preview_only(state: &State) -> bool {
+    let active = state.docs.active().id();
+    state
+        .html_preview
+        .as_ref()
+        .is_some_and(|p| p.only && p.buffer == active)
+        && !preview_displaced(state)
+}
+
 /// Whether typing goes to a field (palette, find, go to line, a sidebar
 /// name, the commit message) rather than to the document.
 fn field_has_keys(state: &State) -> bool {
@@ -5355,6 +5438,16 @@ fn frame_of(state: &mut State) -> Frame {
             },
         );
     }
+    if let Some(page) = chrome.preview.filter(|_| chrome.text.width > 0.0) {
+        frame.push(
+            Hit::PreviewDivider,
+            Viewport {
+                x: page.x - layout::PANE_GAP,
+                width: layout::PANE_GAP + layout::PREVIEW_GRAB,
+                ..page
+            },
+        );
+    }
     if let Some(rect) = chrome.sidebar {
         frame.push(
             Hit::SidebarDivider,
@@ -5525,7 +5618,8 @@ fn chrome_of(state: &State) -> Chrome {
         .is_some_and(|p| p.buffer == state.docs.active().id())
         && !preview_displaced(state)
     {
-        chrome.split_preview();
+        let only = state.html_preview.as_ref().is_some_and(|p| p.only);
+        chrome.split_preview(1.0 - state.preview_share, only);
     }
     chrome
 }
@@ -6180,6 +6274,12 @@ fn install_menu(mtm: MainThreadMarker, app: &NSApplication) {
         "e",
         false,
     ));
+    view_menu.addItem(&item(
+        "Markdown Preview Only",
+        sel!(togglePreviewOnly:),
+        "E",
+        false,
+    ));
     let fold = item("Fold", sel!(foldBlock:), "\u{f702}", false);
     fold.setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
     view_menu.addItem(&fold);
@@ -6511,6 +6611,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         docs,
         native_preview: None,
         html_preview: None,
+        preview_share: 0.5,
         git,
         git_open: false,
         diff_tab: None,
