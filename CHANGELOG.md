@@ -2,6 +2,34 @@
 
 One entry per tag, written for people who use the editor.
 
+## v0.2.0-alpha.8, 2026-09-30
+
+Markdown that reads like the page it becomes, fixes for saving, Git and
+renaming, and a great deal of internal cleanup behind the same editor.
+
+- Markdown hides its syntax on every line the caret is not on: emphasis,
+  code and strike markers, link targets and heading hashes take no room,
+  and the line you are editing shows everything. Table cells line up with
+  their column. Lines with non-ASCII text still show their syntax for now.
+- Markdown with a long run of `*`, `_` or `~` no longer freezes the
+  editor or the Extensions page, and an underline under a paragraph of
+  several lines makes it a heading, as CommonMark reads it.
+- A save that failed in a file with mixed line endings no longer gives
+  lines the wrong endings on the next save.
+- In a repository with no commits yet, unstaging a file you edited since
+  adding it works.
+- Renaming `café.txt` in the sidebar selects `café`, not `café.`.
+- A crash folder that could not be read whole is offered once, then kept
+  aside instead of being offered at every launch.
+- Go to line, rename and the commit message have Home, End, forward
+  delete and Option word moves, like the find bar.
+- The Extensions page no longer draws past the bottom of a short window.
+- A large JSON response in an HTTP tab no longer stalls the window the
+  first time it shows: it is formatted before it arrives.
+- Replace in Project keeps saying how many files are open and unsaved
+  when some also failed. HTTP responses and file completions show sizes
+  the way the status line does.
+
 ## v0.2.0-alpha.7, 2026-09-28
 
 Fixes where two copies of the same path had drifted apart, a faster
