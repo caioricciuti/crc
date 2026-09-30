@@ -2,6 +2,17 @@
 
 One entry per tag, written for people who use the editor.
 
+## v0.2.0-alpha.9, 2026-09-30
+
+A fix for editing with the find bar open.
+
+- Clicking in the text while the find bar is open now lets you edit the
+  file; before, typing kept going into the search field. The bar stays
+  open with its matches highlighted. Cmd-F or a click on the search field
+  puts the keyboard back there, with your query and options kept, and the
+  focus ring shows which one has it. Opening a file from the Explorer
+  gives that file the keyboard too. Escape still closes the bar.
+
 ## v0.2.0-alpha.8, 2026-09-30
 
 Markdown that reads like the page it becomes, fixes for saving, Git and
