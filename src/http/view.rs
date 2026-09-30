@@ -38,6 +38,14 @@ pub enum Verdict {
     Failed,
 }
 
+/// The body as shown and the extension to highlight it as.
+pub type Shown = (String, Option<&'static str>);
+
+/// What the request worker hands back: the reply with its body already
+/// worked out there, since pretty-printing up to 4 MB of JSON would stall
+/// the frame that received it.
+pub type Answer = Result<(Response, Shown), String>;
+
 /// A request and what came back, behind one response tab.
 #[derive(Debug, Clone, PartialEq)]
 pub struct View {
@@ -47,7 +55,7 @@ pub struct View {
     pub segment: Segment,
     /// The body as shown, worked out once: pretty-printing a few megabytes
     /// of JSON is not a job for every switch between segments.
-    body: std::cell::OnceCell<(String, Option<&'static str>)>,
+    body: std::cell::OnceCell<Shown>,
 }
 
 impl View {
@@ -61,9 +69,12 @@ impl View {
     }
 
     /// The answer, replacing whatever was there.
-    pub fn set_outcome(&mut self, outcome: Result<Response, String>) {
-        self.outcome = Some(outcome);
+    pub fn set_outcome(&mut self, answer: Answer) {
         self.body = std::cell::OnceCell::new();
+        self.outcome = Some(answer.map(|(response, shown)| {
+            let _ = self.body.set(shown);
+            response
+        }));
     }
 
     pub fn verdict(&self) -> Verdict {
@@ -169,7 +180,7 @@ fn reason_for(status: u16) -> &'static str {
 
 /// The body as shown: pretty-printed when it is JSON, a note when it is
 /// binary, cut with a note when it went past the cap.
-pub fn body_text(response: &Response) -> (String, Option<&'static str>) {
+pub fn body_text(response: &Response) -> Shown {
     if response.body.is_empty() {
         return (String::new(), None);
     }

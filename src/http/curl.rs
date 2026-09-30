@@ -251,11 +251,16 @@ fn split_head(raw: &[u8]) -> Option<(&[u8], &[u8])> {
     Some((raw, &[]))
 }
 
-/// Sends on a worker thread. The receiver yields the outcome.
-pub fn spawn(request: Prepared) -> mpsc::Receiver<Result<Response, String>> {
+/// Sends on a worker thread. The receiver yields the outcome, its body
+/// already formatted.
+pub fn spawn(request: Prepared) -> mpsc::Receiver<super::view::Answer> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(send(&request));
+        let answer = send(&request).map(|response| {
+            let shown = super::view::body_text(&response);
+            (response, shown)
+        });
+        let _ = tx.send(answer);
     });
     rx
 }
@@ -417,6 +422,23 @@ mod tests {
             assert_eq!(view.verdict(), verdict);
         }
         assert_eq!(view.status(), "503 Service Unavailable");
+    }
+
+    #[test]
+    fn the_body_formatted_by_the_worker_is_the_one_shown() {
+        let mut view = View::pending(prepared("GET", "https://x.test", None));
+        let response = Response {
+            status: 200,
+            body: b"{\"a\":1}".to_vec(),
+            ..Response::default()
+        };
+        view.set_outcome(Ok((response, ("from the worker".to_owned(), Some("json")))));
+        assert_eq!(
+            view.text(Segment::Body),
+            ("from the worker".to_owned(), Some("json"))
+        );
+        view.set_outcome(Err("refused".to_owned()));
+        assert_eq!(view.text(Segment::Body), ("refused".to_owned(), None));
     }
 
     #[test]

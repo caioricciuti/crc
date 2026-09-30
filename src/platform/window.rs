@@ -775,10 +775,7 @@ struct State {
     project_search: ProjectSearch,
     /// A request in flight: the id of its response tab's buffer, and where
     /// the reply arrives.
-    http: Option<(
-        u64,
-        mpsc::Receiver<Result<crate::http::curl::Response, String>>,
-    )>,
+    http: Option<(u64, mpsc::Receiver<crate::http::view::Answer>)>,
     /// Response tabs, by buffer id. The buffer holds the text of the chosen
     /// segment; this holds the request and the reply it came from.
     responses: HashMap<u64, crate::http::view::View>,
