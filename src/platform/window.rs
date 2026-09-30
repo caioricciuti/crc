@@ -6379,10 +6379,13 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
     // no Dock icon, never activated, its window see-through and deaf to the
     // pointer. The script drives the view directly, so none of that matters
     // to it. CRC_SELFTEST_VISIBLE shows it, for capturing the live window.
+    // Prohibited, not Accessory: macOS activates an accessory binary started
+    // from a terminal, so every launch took the keyboard from whatever the
+    // person was typing in. Its window still orders front and draws.
     let hidden_test = std::env::var_os("CRC_SELFTEST").is_some()
         && std::env::var_os("CRC_SELFTEST_VISIBLE").is_none();
     app.setActivationPolicy(if hidden_test {
-        NSApplicationActivationPolicy::Accessory
+        NSApplicationActivationPolicy::Prohibited
     } else {
         NSApplicationActivationPolicy::Regular
     });
