@@ -134,6 +134,8 @@ pub struct ShapedLine {
     line: CFRetained<CTLine>,
     #[cfg(test)]
     scale: f32,
+    #[cfg(test)]
+    stretch: f32,
     /// Each font used, with its glyph-cache key: the PostScript name and the
     /// size, worked out once here rather than per glyph per frame.
     fonts: Vec<(String, CFRetained<CTFont>)>,
@@ -215,13 +217,39 @@ pub(crate) fn shape_paragraph(
     rope: &Rope,
     range: std::ops::Range<usize>,
     scale: f32,
+    stretch: f32,
     cancel: &AtomicBool,
 ) -> Option<ShapedLine> {
     let text = rope.slice_to_string(range);
-    shape(font, text.trim_end_matches(['\r', '\n']), scale, cancel)
+    shape(
+        font,
+        text.trim_end_matches(['\r', '\n']),
+        scale,
+        stretch,
+        cancel,
+    )
 }
 
-fn shape(font: &CTFont, source: &str, scale: f32, cancel: &AtomicBool) -> Option<ShapedLine> {
+/// How much wider the cell grid's advance is than the font's own: the grid
+/// rounds up to a whole device pixel, and a shaped line stretched by this
+/// keeps its columns over the lines drawn by cells.
+pub(crate) fn grid_stretch(natural_px: f32) -> f32 {
+    if natural_px > 0.0 {
+        natural_px.ceil() / natural_px
+    } else {
+        1.0
+    }
+}
+
+/// Shapes `source`. Every horizontal position CoreText gives back is
+/// multiplied by `stretch` (see [`grid_stretch`]).
+fn shape(
+    font: &CTFont,
+    source: &str,
+    scale: f32,
+    stretch: f32,
+    cancel: &AtomicBool,
+) -> Option<ShapedLine> {
     let started = std::time::Instant::now();
     let (text, bytes) = shape_input_bounded(source, MAX_CACHED_UTF16 - 1, cancel)?;
     let input_time = started.elapsed();
@@ -270,6 +298,13 @@ fn shape(font: &CTFont, source: &str, scale: f32, cancel: &AtomicBool) -> Option
         )
     } {
         return None;
+    }
+    for x in offsets
+        .iter_mut()
+        .chain(secondary_offsets.iter_mut())
+        .chain(primary_carets.iter_mut())
+    {
+        *x *= stretch;
     }
     let edges_time = started.elapsed();
     // Use the original source: expanded tab spaces are not cursor stops,
@@ -353,7 +388,7 @@ fn shape(font: &CTFont, source: &str, scale: f32, cancel: &AtomicBool) -> Option
         });
         for ((glyph, pos), index) in glyphs.into_iter().zip(positions).zip(indices) {
             result.push(ShapedGlyph {
-                x: pos.x as f32 / scale,
+                x: pos.x as f32 / scale * stretch,
                 source_utf16: index.max(0) as usize,
                 glyph,
                 font: font_index,
@@ -379,6 +414,8 @@ fn shape(font: &CTFont, source: &str, scale: f32, cancel: &AtomicBool) -> Option
         line,
         #[cfg(test)]
         scale,
+        #[cfg(test)]
+        stretch,
         fonts,
         glyphs: result,
         offsets,
@@ -598,6 +635,8 @@ pub struct Atlas {
     /// RGBA8, premultiplied, `width * height * 4` bytes.
     pub pixels: Vec<u8>,
     pub metrics: Metrics,
+    /// Shaped positions onto the cell grid; see [`grid_stretch`].
+    stretch: f32,
     /// Which font candidate actually resolved. See [`load_monospace`].
     pub font_name: String,
     /// Set when new glyphs have landed and the texture needs re-uploading.
@@ -672,6 +711,7 @@ impl Atlas {
         let descent_px = unsafe { font.descent() } as f32;
         let leading_px = unsafe { font.leading() } as f32;
 
+        let stretch = grid_stretch(advance_px);
         let advance_px = advance_px.ceil();
         // The rasterisation cell keeps the font's natural metrics.
         let cell_px_h = (ascent_px + descent_px + leading_px).ceil();
@@ -696,6 +736,7 @@ impl Atlas {
                 descent: descent_px / scale,
                 scale,
             },
+            stretch,
             font_name: resolved_name,
             dirty: true,
             ui_font: unsafe {
@@ -942,6 +983,7 @@ impl Atlas {
             &self.font,
             text,
             self.metrics.scale,
+            self.stretch,
             &AtomicBool::new(false),
         )?;
         Some(self.cache_shaped(text.to_owned(), shaped))
@@ -1031,6 +1073,8 @@ impl Atlas {
             &font,
             text,
             self.metrics.scale,
+            // Proportional: not on the cell grid.
+            1.0,
             &AtomicBool::new(false),
         )?);
         // Bounded like every other shaping cache here: a document is not
@@ -1052,6 +1096,8 @@ impl Atlas {
             &self.ui_font,
             text,
             self.metrics.scale,
+            // Proportional: not on the cell grid.
+            1.0,
             &AtomicBool::new(false),
         )?);
         self.ui_lines
@@ -1422,7 +1468,8 @@ mod tests {
                             .line
                             .offset_for_string_index(index as isize, std::ptr::null_mut())
                     } as f32
-                        / shaped.scale;
+                        / shaped.scale
+                        * shaped.stretch;
                     assert_eq!(shaped.caret_offset(index), expected);
                     assert_eq!(shaped.caret_offset(index), expected);
                 }
@@ -1457,7 +1504,8 @@ mod tests {
                 "\u{2067}\0abc e\u{301} 👩‍💻\u{2069}\0xyz ",
             ] {
                 let source = fixture.repeat(43);
-                let shaped = shape(&native_font, &source, 1.25, &AtomicBool::new(false)).unwrap();
+                let shaped =
+                    shape(&native_font, &source, 1.25, 1.0, &AtomicBool::new(false)).unwrap();
                 let (text, _) = shape_input(&source);
                 let (left, right) =
                     caret_offsets(&shaped.line, &text, 1.25, &AtomicBool::new(false)).unwrap();
@@ -1487,11 +1535,12 @@ mod tests {
     fn long_paragraphs_keep_native_clusters_and_direction() {
         let atlas = atlas();
         let fixture = "e\u{301} 👩‍💻 لا שלום 漢字\t";
-        let short = shape(&atlas.font, fixture, 2.0, &AtomicBool::new(false)).unwrap();
+        let short = shape(&atlas.font, fixture, 2.0, 1.0, &AtomicBool::new(false)).unwrap();
         let long = shape(
             &atlas.font,
             &fixture.repeat(2400),
             2.0,
+            1.0,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -1549,7 +1598,7 @@ mod tests {
                     },
                 );
             }
-            let shaped = shape(&atlas.font, &source, 2.0, &AtomicBool::new(false)).unwrap();
+            let shaped = shape(&atlas.font, &source, 2.0, 1.0, &AtomicBool::new(false)).unwrap();
             let (text, _) = shape_input(&source);
             let (left, right) =
                 caret_offsets(&shaped.line, &text, 2.0, &AtomicBool::new(false)).unwrap();
@@ -1637,7 +1686,8 @@ mod tests {
                     .line
                     .offset_for_string_index(index as isize, std::ptr::null_mut())
             } as f32
-                / shaped.scale;
+                / shaped.scale
+                * shaped.stretch;
             assert_eq!(shaped.caret_offset(index), expected);
         }
     }

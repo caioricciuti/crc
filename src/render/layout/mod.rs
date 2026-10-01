@@ -1358,6 +1358,27 @@ mod tests {
     }
 
     #[test]
+    fn a_shaped_line_keeps_to_the_cell_grid() {
+        // Shaped by CoreText at the font's own advance, then stretched to
+        // the grid's rounded one: its columns stand over an ASCII line's.
+        let mut atlas = atlas();
+        let text = "Pão de queijo | x\n";
+        let buffer = Buffer::from_text(text);
+        let shaped = atlas
+            .shape_editor_line((buffer.id(), 0), &buffer.rope, 0..text.len())
+            .unwrap();
+        let advance = atlas.metrics.advance;
+        for (column, (byte, _)) in text.trim_end().char_indices().enumerate() {
+            let x = shaped.x_of_byte(byte);
+            assert!(
+                (x - column as f32 * advance).abs() < 0.01,
+                "column {column}: {x} against {}",
+                column as f32 * advance
+            );
+        }
+    }
+
+    #[test]
     fn markdown_hides_syntax_on_a_shaped_line_too() {
         let mut atlas = atlas();
         // "é" makes the line shaped by CoreText rather than drawn by cells.

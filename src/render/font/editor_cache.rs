@@ -127,6 +127,7 @@ impl Atlas {
                 rope,
                 range,
                 self.metrics.scale,
+                self.stretch,
                 &AtomicBool::new(false),
             )
             .map(Rc::new);

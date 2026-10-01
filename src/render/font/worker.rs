@@ -55,7 +55,9 @@ impl Worker {
         std::thread::Builder::new()
             .name("text-shaping".into())
             .spawn(move || {
-                let font = load_monospace(&font, size).font;
+                let loaded = load_monospace(&font, size);
+                let stretch = super::grid_stretch(loaded.advance_px);
+                let font = loaded.font;
                 loop {
                     let job = {
                         let (lock, wake) = &*work;
@@ -76,6 +78,7 @@ impl Worker {
                         &job.rope,
                         job.range.clone(),
                         scale,
+                        stretch,
                         &job.cancelled,
                     );
                     if job.cancelled.load(Ordering::Relaxed) {
