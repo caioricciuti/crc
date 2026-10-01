@@ -1662,7 +1662,7 @@ define_class!(
                         return;
                     }
                 }
-                Some(Hit::StatusBranch) => {
+                Some(Hit::StatusBranch) | Some(Hit::GitBranch) => {
                     self.open_branch_picker(BranchIntent::Switch);
                     return;
                 }
@@ -2005,6 +2005,7 @@ define_class!(
                     // empty column below the last change is not clickable.
                     let g = crate::platform::git_panel::Sidebar::new(rect);
                     if !state.git.busy() { add(g.refresh, &NSCursor::pointingHandCursor()); }
+                    if !state.git.branch().is_empty() { add(g.branch, &NSCursor::pointingHandCursor()); }
                     add(g.message, &NSCursor::IBeamCursor());
                     if state.git.can_commit() { add(g.commit, &NSCursor::pointingHandCursor()); }
                     for (entry, row) in state.git.rows(g) {
@@ -2510,6 +2511,12 @@ define_class!(
         #[unsafe(method(openQuickly:))]
         fn action_quick_open(&self, _sender: Option<&AnyObject>) {
             self.open_palette();
+        }
+
+        /// The palette on its commands: `>` typed already.
+        #[unsafe(method(showCommands:))]
+        fn action_show_commands(&self, _sender: Option<&AnyObject>) {
+            self.open_palette_with(">");
         }
 
         #[unsafe(method(switchBranch:))]
@@ -5507,6 +5514,12 @@ fn frame_of(state: &mut State) -> Frame {
                 height: rect.height,
             },
         );
+        if *git_open && extensions.is_none() {
+            frame.push(
+                Hit::GitBranch,
+                crate::platform::git_panel::Sidebar::new(rect).branch,
+            );
+        }
         if !*git_open && extensions.is_none() {
             let (_, actions) = layout::sidebar_actions(rect);
             for (index, action) in actions.into_iter().enumerate() {
@@ -6375,6 +6388,12 @@ fn install_menu(mtm: MainThreadMarker, app: &NSApplication) {
         "Open Quickly\u{2026}",
         sel!(openQuickly:),
         "p",
+        false,
+    ));
+    file_menu.addItem(&item(
+        "Command Palette\u{2026}",
+        sel!(showCommands:),
+        "P",
         false,
     ));
     file_menu.addItem(&NSMenuItem::separatorItem(mtm));

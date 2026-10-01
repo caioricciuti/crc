@@ -849,7 +849,30 @@ impl Panel {
         out: &mut Vec<GlyphInstance>,
     ) {
         let g = Sidebar::new(column);
-        layout::push_ui_text(out, atlas, g.branch, &self.branch(), theme.text);
+        // The branch reads as a menu: a box with a chevron, the branch list
+        // behind it.
+        let branch = self.branch();
+        if branch.is_empty() {
+            layout::push_ui_text(out, atlas, g.branch, &branch, theme.text);
+        } else {
+            layout::push_rounded_rect(out, g.branch, 5.0, theme.tab_hover);
+            let inner = Viewport {
+                x: g.branch.x + 8.0,
+                width: (g.branch.width - 16.0).max(0.0),
+                ..g.branch
+            };
+            layout::push_ui_text(
+                out,
+                atlas,
+                Viewport {
+                    width: (inner.width - 14.0).max(0.0),
+                    ..inner
+                },
+                &branch,
+                theme.text,
+            );
+            layout::push_ui_text_right(out, atlas, inner, "\u{25be}", theme.status_text);
+        }
         layout::push_rounded_rect(out, g.refresh, 5.0, theme.tab_hover);
         layout::push_ui_text_centered(
             out,

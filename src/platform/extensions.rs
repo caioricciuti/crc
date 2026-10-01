@@ -682,12 +682,23 @@ pub fn draw_list(
         hits.push((row, Action::Select(id.clone())));
         y += ROW_H;
     }
-    if rows.is_empty() {
-        let note = match page.registry {
-            Registry::Loading => "Checking the registry\u{2026}",
-            _ => "Nothing installed yet.",
-        };
-        text(out, atlas, x, y, width, note, dim);
+    // Until the registry answers, Available is there with a note in it, so
+    // the list does not grow under the pointer when it arrives.
+    let waiting = match &page.registry {
+        Registry::Loading => Some("Checking the registry\u{2026}".to_owned()),
+        Registry::Failed(why) => Some(format!("The registry did not answer: {why}")),
+        Registry::Ready(..) => None,
+    };
+    if let Some(note) = waiting {
+        if last != "Available" && y + 46.0 <= bottom {
+            text(out, atlas, x, y, width, "Available", dim);
+            y += 24.0;
+        }
+        if y + 22.0 <= bottom {
+            text(out, atlas, x, y, width, &note, dim);
+        }
+    } else if rows.is_empty() {
+        text(out, atlas, x, y, width, "Nothing installed yet.", dim);
     }
     page.list_hits = hits;
 }

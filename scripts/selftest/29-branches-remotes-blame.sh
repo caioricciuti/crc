@@ -59,7 +59,9 @@ git -C "$T/branchorigin.git" rev-parse --verify -q refs/heads/feature > /dev/nul
     || failed "branch push: origin has no feature branch"
 
 # ---- renaming and deleting branches -------------------------------------------
-# The branch in the status bar opens the list. Git > Rename Branch picks a
+# The branch in the status bar opens the list, as does the one at the top
+# of Source Control; Cmd-Shift-P opens the palette on its commands.
+# Git > Rename Branch picks a
 # branch, then takes its new name; Git > Delete Branch deletes a merged
 # one at once and asks before one with commits nowhere else (answered
 # here through the environment, as a test cannot answer a modal).
@@ -80,6 +82,21 @@ click @status.branch
 wait 400
 wait 200
 dump $T/edit-status.out
+key 53
+key 35 cmd,shift P
+wait 200
+dump $T/edit-commands.out
+key 53
+key 35 cmd p
+wait 200
+text >source control
+key 36
+wait 600
+wait 300
+click @git.branch
+wait 400
+wait 200
+dump $T/edit-panel-branch.out
 key 53
 key 35 cmd p
 wait 200
@@ -126,6 +143,11 @@ CRC_DELETE_BRANCH_ANSWER=delete CRC_SELFTEST="$T/edit.script" "$BIN" "$T/editpro
 # Both commits can share a second, so either branch may lead the list.
 grep -Eq '^palette_first: (main|wip)$' "$T/edit-status.out" \
     || failed "edit-status.out: the status bar's branch did not open the list: $(grep '^palette_first:' "$T/edit-status.out")"
+# Cmd-Shift-P is the palette on its commands.
+expect "$T/edit-commands.out" palette_query ">"
+# The branch at the top of Source Control opens the same list.
+grep -Eq '^palette_first: (main|wip)$' "$T/edit-panel-branch.out" \
+    || failed "edit-panel-branch.out: Source Control's branch did not open the list: $(grep '^palette_first:' "$T/edit-panel-branch.out")"
 expect "$T/edit-rename-to.out" palette_first "Rename “old” to “archive”"
 expect "$T/edit-renamed.out" message "renamed old to archive"
 # The list to delete from leaves out the branch you are on.

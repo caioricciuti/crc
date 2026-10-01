@@ -1061,7 +1061,7 @@ pub fn build_toolbar(
                 width: (search.width - 24.0).max(0.0),
                 ..search
             },
-            "Find a file…",
+            "Search files and commands…",
             theme.status_text,
         );
         push_ui_text_right(
@@ -2216,6 +2216,8 @@ pub enum Hit {
     Status,
     /// The branch named in the status bar: it opens the branch list.
     StatusBranch,
+    /// The branch at the top of Source Control: it opens the branch list.
+    GitBranch,
     /// An unfocused editor pane, tabs through text. A click gives it the
     /// keyboard and is then handled as a click in the focused pane.
     Pane(usize),
@@ -2265,6 +2267,7 @@ impl Hit {
             Hit::Text => "text".into(),
             Hit::Status => "status".into(),
             Hit::StatusBranch => "status.branch".into(),
+            Hit::GitBranch => "git.branch".into(),
             Hit::Pane(i) => format!("pane.{i}"),
         }
     }
