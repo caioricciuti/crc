@@ -2,6 +2,27 @@
 
 One entry per tag, written for people who use the editor.
 
+## v0.2.0-alpha.11, 2026-10-01
+
+Branches you can rename and delete, a way out of a merge or rebase, and
+pulls for branches that have diverged.
+
+- Git > Rename Branch and Delete Branch, also in the palette. A rename
+  keeps the branch's upstream; a delete never offers the branch you are
+  on, and asks before deleting one whose commits are on no other branch.
+- The branch at the top of Source Control and the one in the status bar
+  open the branch list.
+- Git > Abort Merge or Rebase gives up a merge, rebase, cherry-pick or
+  revert after asking, and Continue Rebase goes on once the conflicts are
+  resolved, without opening an editor.
+- Pull stays fast-forward only; when the branches have diverged it says
+  to use the new Pull with Rebase or Pull with Merge.
+- Conflicts Side by Side shows a checkmark while the columns are up.
+- Cmd-Shift-P (File > Command Palette) opens the palette on its commands.
+  The toolbar box says it searches files and commands.
+- The Extensions list shows that it is checking the registry, instead of
+  growing when the registry answers.
+
 ## v0.2.0-alpha.10, 2026-10-01
 
 Markdown that hides its syntax in any language, and a preview you can
