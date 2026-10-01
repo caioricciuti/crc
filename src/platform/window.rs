@@ -641,9 +641,9 @@ struct State {
     ssh_auth_sock: Option<std::path::PathBuf>,
     /// The palette is picking a branch: the local branches, read when it
     /// opened. `None` in every other mode.
-    branch_list: Option<Vec<crate::project::git::Branch>>,
+    branch_list: Option<BranchPick>,
     /// The branch picker's list, being read by a worker.
-    branch_rx: Option<mpsc::Receiver<Result<Vec<crate::project::git::Branch>, String>>>,
+    branch_rx: Option<mpsc::Receiver<Result<BranchPick, String>>>,
     /// `organize_imports_on_save` from the settings.
     organize_on_save: bool,
     /// The Extensions page, when it has the editor column.
@@ -1662,6 +1662,10 @@ define_class!(
                         return;
                     }
                 }
+                Some(Hit::StatusBranch) => {
+                    self.open_branch_picker(BranchIntent::Switch);
+                    return;
+                }
                 Some(Hit::SidebarRow(_)) | Some(Hit::Status) | None => {}
             }
 
@@ -2018,6 +2022,9 @@ define_class!(
                 use objc2::ClassType;
                 let cursor = if NSCursor::class().class_method(objc2::sel!(columnResizeCursor)).is_some() { NSCursor::columnResizeCursor() } else { #[allow(deprecated)] NSCursor::resizeLeftRightCursor() };
                 add(divider, &cursor);
+            }
+            if let Some(branch) = status_branch_rect(&mut state, chrome.status) {
+                add(branch, &NSCursor::pointingHandCursor());
             }
             if let Some(page) = chrome.preview.filter(|_| chrome.text.width > 0.0) {
                 use objc2::ClassType;
@@ -2507,7 +2514,17 @@ define_class!(
 
         #[unsafe(method(switchBranch:))]
         fn action_switch_branch(&self, _sender: Option<&AnyObject>) {
-            self.open_branch_picker();
+            self.open_branch_picker(BranchIntent::Switch);
+        }
+
+        #[unsafe(method(renameBranch:))]
+        fn action_rename_branch(&self, _sender: Option<&AnyObject>) {
+            self.open_branch_picker(BranchIntent::Rename);
+        }
+
+        #[unsafe(method(deleteBranch:))]
+        fn action_delete_branch(&self, _sender: Option<&AnyObject>) {
+            self.open_branch_picker(BranchIntent::Delete);
         }
 
         #[unsafe(method(gitFetch:))]
@@ -2518,6 +2535,30 @@ define_class!(
         #[unsafe(method(gitPull:))]
         fn action_git_pull(&self, _sender: Option<&AnyObject>) {
             self.git_remote(crate::project::git::Remote::Pull);
+        }
+
+        #[unsafe(method(gitPullRebase:))]
+        fn action_git_pull_rebase(&self, _sender: Option<&AnyObject>) {
+            self.git_remote(crate::project::git::Remote::PullRebase);
+        }
+
+        #[unsafe(method(gitPullMerge:))]
+        fn action_git_pull_merge(&self, _sender: Option<&AnyObject>) {
+            self.git_remote(crate::project::git::Remote::PullMerge);
+        }
+
+        #[unsafe(method(gitAbort:))]
+        fn action_git_abort(&self, _sender: Option<&AnyObject>) {
+            self.git_abort();
+        }
+
+        #[unsafe(method(gitContinueRebase:))]
+        fn action_git_continue_rebase(&self, _sender: Option<&AnyObject>) {
+            if let Some(mut state) = self.state_mut() {
+                state.git.continue_rebase();
+            }
+            self.resume_display_link();
+            self.request_redraw();
         }
 
         #[unsafe(method(gitPush:))]
@@ -3303,7 +3344,15 @@ define_class!(
                 active_conflicts(&state).is_some_and(|v| !v.conflicts.is_empty())
             } else if action == sel!(acceptBase:) {
                 active_conflicts(&state).is_some_and(|v| v.has_base())
+            } else if action == sel!(gitAbort:) {
+                state.git.in_progress().is_some()
+            } else if action == sel!(gitContinueRebase:) {
+                state.git.in_progress() == Some(crate::project::git::InProgress::Rebase)
             } else if action == sel!(toggleConflictColumns:) {
+                // Checked while the columns show. `setState:` is behind a
+                // feature of the AppKit crate crc does not enable.
+                let on: isize = if state.conflict_side { 1 } else { 0 };
+                let _: () = unsafe { msg_send![item, setState: on] };
                 active_conflicts(&state).is_some_and(|v| !v.conflicts.is_empty())
             } else if action == sel!(markResolved:) {
                 active_conflicts(&state).is_some_and(|v| v.can_resolve())
@@ -5566,8 +5615,43 @@ fn frame_of(state: &mut State) -> Frame {
         frame.push(Hit::Terminal, rect);
     }
     frame.push(Hit::Text, chrome.text);
+    if let Some(branch) = status_branch_rect(state, chrome.status) {
+        frame.push(Hit::StatusBranch, branch);
+    }
     frame.push(Hit::Status, chrome.status);
     frame
+}
+
+/// The right half of the status line, where the branch, counts and the
+/// caret's position are written.
+fn status_detail_rect(status: Viewport) -> Viewport {
+    let right_width = 320.0f32.min(status.width * 0.55);
+    Viewport {
+        x: status.x + status.width - right_width,
+        width: (right_width - 12.0).max(0.0),
+        ..status
+    }
+}
+
+/// Where the status line writes the branch, as `status_texts` lays it out:
+/// first in the right half, after Claude's mark when it is there.
+fn status_branch_rect(state: &mut State, status: Viewport) -> Option<Viewport> {
+    let branch = state.git.branch_status();
+    if branch.is_empty() {
+        return None;
+    }
+    let detail = status_detail_rect(status);
+    let claude = if state.claude.as_ref().is_some_and(|c| c.is_connected()) {
+        layout::ui_text_width(&mut state.renderer.atlas, "✻ Claude     ")
+    } else {
+        0.0
+    };
+    let width = layout::ui_text_width(&mut state.renderer.atlas, &branch);
+    Some(Viewport {
+        x: detail.x + claude,
+        width: width.min((detail.width - claude).max(0.0)),
+        ..status
+    })
 }
 
 /// A layout rectangle as AppKit takes it. The view is flipped, so the two
@@ -5713,6 +5797,27 @@ fn restore_summary(documents: &[recovery::Recovered]) -> String {
     )
 }
 
+/// What the branch list is open for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BranchIntent {
+    /// Switch to one, or create one by typing a new name.
+    Switch,
+    /// Pick one to rename.
+    Rename,
+    /// Type the new name for this one.
+    RenameTo(String),
+    /// Pick one to delete; not the current one.
+    Delete,
+}
+
+/// The branch list in the palette.
+struct BranchPick {
+    branches: Vec<crate::project::git::Branch>,
+    intent: BranchIntent,
+    /// Branches whose commits HEAD does not have, read for a delete.
+    unmerged: Vec<String>,
+}
+
 /// What choosing a palette row does.
 enum Pick {
     File(std::path::PathBuf),
@@ -5723,6 +5828,10 @@ enum Pick {
     Symbol(Option<std::path::PathBuf>, u32),
     Branch(String),
     NewBranch(String),
+    /// A branch to delete, and whether it has commits HEAD does not.
+    DeleteBranch(String, bool),
+    RenameBranch(String),
+    RenameBranchTo(String, String),
     /// A code action, and the server that offered it.
     Action(Language, crate::lsp::CodeAction),
 }
@@ -5763,9 +5872,69 @@ fn action_rows(
         .collect()
 }
 
-/// The branch picker's rows: branches matching the query, then a row to
-/// create one named by the query when no branch has that name.
-fn branch_rows(
+/// The branch list's rows for what it is open for.
+fn branch_rows(pick: &BranchPick, query: &str) -> Vec<(layout::PaletteRow, Pick)> {
+    let branches = &pick.branches;
+    let row = |title: String, detail: String, pick: Pick| {
+        (
+            layout::PaletteRow {
+                icon: None,
+                title,
+                detail,
+                shortcut: String::new(),
+            },
+            pick,
+        )
+    };
+    match &pick.intent {
+        BranchIntent::Switch => switch_rows(branches, query),
+        BranchIntent::Rename => crate::project::finder::ranked(branches, query, |b| &b.name)
+            .into_iter()
+            .map(|i| {
+                let b = &branches[i];
+                let detail = if b.current { "current branch" } else { "" };
+                row(
+                    b.name.clone(),
+                    detail.into(),
+                    Pick::RenameBranch(b.name.clone()),
+                )
+            })
+            .collect(),
+        BranchIntent::RenameTo(old) => {
+            let name = query.trim();
+            if name.is_empty() || name == old || branches.iter().any(|b| b.name == name) {
+                return Vec::new();
+            }
+            vec![row(
+                format!("Rename \u{201c}{old}\u{201d} to \u{201c}{name}\u{201d}"),
+                "keeps its upstream and history".into(),
+                Pick::RenameBranchTo(old.clone(), name.to_owned()),
+            )]
+        }
+        BranchIntent::Delete => crate::project::finder::ranked(branches, query, |b| &b.name)
+            .into_iter()
+            .filter(|&i| !branches[i].current)
+            .map(|i| {
+                let name = branches[i].name.clone();
+                let unmerged = pick.unmerged.contains(&name);
+                let detail = if unmerged {
+                    "has commits not on this branch: asks first"
+                } else {
+                    "merged"
+                };
+                row(
+                    name.clone(),
+                    detail.into(),
+                    Pick::DeleteBranch(name, unmerged),
+                )
+            })
+            .collect(),
+    }
+}
+
+/// Switch Branch's rows: branches matching the query, then a row to create
+/// one named by the query when no branch has that name.
+fn switch_rows(
     branches: &[crate::project::git::Branch],
     query: &str,
 ) -> Vec<(layout::PaletteRow, Pick)> {
@@ -5811,7 +5980,7 @@ struct PaletteSources<'a> {
     symbols: &'a symbols::Symbols,
     root: Option<&'a Path>,
     /// Set while picking a branch.
-    branches: Option<&'a [crate::project::git::Branch]>,
+    branches: Option<&'a BranchPick>,
     /// Set while picking a code action.
     actions: Option<&'a (Language, Vec<crate::lsp::CodeAction>)>,
 }
@@ -5829,7 +5998,7 @@ fn palette_sources(state: &State) -> PaletteSources<'_> {
         commands: &state.commands,
         symbols: &state.symbols,
         root: state.tree.root(),
-        branches: state.branch_list.as_deref(),
+        branches: state.branch_list.as_ref(),
         actions: state.lsp.action_list.as_ref(),
     }
 }
@@ -5856,9 +6025,22 @@ impl PaletteMode {
 }
 
 /// The palette's heading and what it says when nothing matches, by mode.
-fn palette_heading(query: &str, mode: PaletteMode) -> (&'static str, &'static str) {
+fn palette_heading(
+    query: &str,
+    mode: PaletteMode,
+    intent: Option<&BranchIntent>,
+) -> (&'static str, &'static str) {
     match mode {
-        PaletteMode::Branch => return ("Switch branch, or type a new name", "No branches"),
+        PaletteMode::Branch => {
+            return match intent {
+                Some(BranchIntent::Rename) => ("Rename which branch?", "No branches"),
+                Some(BranchIntent::RenameTo(_)) => {
+                    ("Type the new name", "Type a name no branch has")
+                }
+                Some(BranchIntent::Delete) => ("Delete which branch?", "No other branches"),
+                _ => ("Switch branch, or type a new name", "No branches"),
+            };
+        }
         PaletteMode::Action => return ("Code actions", "No matching actions"),
         PaletteMode::Open => {}
     }
@@ -6334,9 +6516,31 @@ fn install_menu(mtm: MainThreadMarker, app: &NSApplication) {
         "",
         false,
     ));
+    git_menu.addItem(&item(
+        "Rename Branch\u{2026}",
+        sel!(renameBranch:),
+        "",
+        false,
+    ));
+    git_menu.addItem(&item(
+        "Delete Branch\u{2026}",
+        sel!(deleteBranch:),
+        "",
+        false,
+    ));
     git_menu.addItem(&item("Fetch", sel!(gitFetch:), "", false));
     git_menu.addItem(&item("Pull", sel!(gitPull:), "", false));
+    git_menu.addItem(&item("Pull with Rebase", sel!(gitPullRebase:), "", false));
+    git_menu.addItem(&item("Pull with Merge", sel!(gitPullMerge:), "", false));
     git_menu.addItem(&item("Push", sel!(gitPush:), "", false));
+    git_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    git_menu.addItem(&item("Abort Merge or Rebase", sel!(gitAbort:), "", false));
+    git_menu.addItem(&item(
+        "Continue Rebase",
+        sel!(gitContinueRebase:),
+        "",
+        false,
+    ));
     git_menu.addItem(&NSMenuItem::separatorItem(mtm));
     git_menu.addItem(&item("Next Conflict", sel!(nextConflict:), "", false));
     git_menu.addItem(&item(

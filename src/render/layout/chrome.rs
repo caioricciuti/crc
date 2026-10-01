@@ -2214,6 +2214,8 @@ pub enum Hit {
     Find,
     Text,
     Status,
+    /// The branch named in the status bar: it opens the branch list.
+    StatusBranch,
     /// An unfocused editor pane, tabs through text. A click gives it the
     /// keyboard and is then handled as a click in the focused pane.
     Pane(usize),
@@ -2262,6 +2264,7 @@ impl Hit {
             Hit::Find => "find".into(),
             Hit::Text => "text".into(),
             Hit::Status => "status".into(),
+            Hit::StatusBranch => "status.branch".into(),
             Hit::Pane(i) => format!("pane.{i}"),
         }
     }

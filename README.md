@@ -115,8 +115,11 @@ the size and write it back.
 - **Local Git** (`Cmd-Option-G`): branch and status, changed files, staged
   and working-tree diffs, whole-file and hunk stage/unstage, commit. Git runs
   on workers and reads saved disk state; hooks and signing stay as Git has
-  them. Branch switch and create from the palette, fetch, fast-forward pull
-  and push (never forced), and the caret line's blame in the status line.
+  them. Branches switched, created, renamed and deleted from the palette
+  (or the branch in the status bar), an unmerged one only after asking;
+  fetch, pull (fast-forward, or with rebase or merge when the branches
+  have diverged) and push (never forced); and the caret line's blame in
+  the status line.
 - **Merge conflicts**, however the merge, rebase, cherry-pick or stash pop
   that left them was run: conflicted files get their own group in Source
   Control and the status bar says `MERGING` or `REBASING`. In the file,
@@ -125,7 +128,9 @@ the size and write it back.
   line; or switch to side by side, where the current, base and incoming
   versions sit in aligned columns with the same buttons. Every accept is
   one undo step. Mark Resolved saves and stages the file once no markers
-  are left, and refuses while any are.
+  are left, and refuses while any are. Git > Abort Merge or Rebase gives
+  the operation up after asking, and Continue Rebase goes on once the
+  conflicts are resolved.
 - **Files you can trust**: atomic saves that keep mode, links and symlink
   targets; a file changed by another program reloads if the tab is clean,
   and Save asks Overwrite, Cancel or Reload if it is not; a deleted file
@@ -157,9 +162,9 @@ the size and write it back.
 - **Language coverage is the list above.** A grammar is vendored generated C
   pinned in `third_party/CHECKSUMS`; there is no SQL grammar, and Svelte
   and Vue files are highlighted as HTML.
-- **Git stops short of history.** No history browser, branch deletion or
-  merge and rebase commands of its own (abort and continue are the
-  terminal's). Pull is fast-forward only. Hunk staging covers tracked text
+- **Git stops short of history.** No history browser, and no merge or
+  rebase of your own branches from the menus (start one in the terminal;
+  crc resolves, aborts and continues it). Hunk staging covers tracked text
   changes; other change types use whole-file actions. Gutter marks compare
   with HEAD, not the index. Conflict markers must be Git's default seven
   characters.

@@ -68,6 +68,16 @@ impl InProgress {
         }
     }
 
+    /// Its command: `git merge`, `git rebase`, ...
+    pub fn command(self) -> &'static str {
+        match self {
+            InProgress::Merge => "merge",
+            InProgress::Rebase => "rebase",
+            InProgress::CherryPick => "cherry-pick",
+            InProgress::Revert => "revert",
+        }
+    }
+
     /// What the files in `git_dir` say is under way, if anything.
     pub fn read(git_dir: &Path) -> Option<InProgress> {
         if git_dir.join("rebase-merge").is_dir() || git_dir.join("rebase-apply").is_dir() {
@@ -941,12 +951,68 @@ pub fn create_branch(root: &Path, name: &str) -> Result<(), String> {
     run(root, &["switch", "-c", name]).map(|_| ())
 }
 
+/// Branches with commits HEAD does not have: deleting one loses them.
+pub fn unmerged_branches(root: &Path) -> Result<Vec<String>, String> {
+    let bytes = run(
+        root,
+        &[
+            "for-each-ref",
+            "--no-merged=HEAD",
+            "--format=%(refname:short)",
+            "refs/heads",
+        ],
+    )?;
+    Ok(String::from_utf8_lossy(&bytes)
+        .lines()
+        .map(str::to_owned)
+        .collect())
+}
+
+/// Deletes the branch `name`. Without `force` Git refuses one whose commits
+/// are on neither its upstream nor HEAD, and that refusal is the answer.
+pub fn delete_branch(root: &Path, name: &str, force: bool) -> Result<(), String> {
+    let flag = if force { "-D" } else { "-d" };
+    run(root, &["branch", flag, "--", name]).map(|_| ())
+}
+
+/// Renames the branch `old` to `new`, keeping its upstream and reflog. Git
+/// refuses a name another branch has.
+pub fn rename_branch(root: &Path, old: &str, new: &str) -> Result<(), String> {
+    if !valid_branch_name(root, new) {
+        return Err(format!("{new:?} is not a valid branch name"));
+    }
+    run(root, &["branch", "-m", "--", old, new]).map(|_| ())
+}
+
+/// Gives up the merge, rebase, cherry-pick or revert under way, putting
+/// the branch and files back as they were before it.
+pub fn abort(root: &Path, what: InProgress) -> Result<(), String> {
+    run(root, &[what.command(), "--abort"]).map(|_| ())
+}
+
+/// Goes on with a rebase whose conflicts are resolved and added. The
+/// commit keeps the message it had; no editor opens.
+pub fn continue_rebase(root: &Path) -> Result<(), String> {
+    checked(
+        command(root)
+            .env("GIT_EDITOR", "true")
+            .args(["rebase", "--continue"])
+            .output()
+            .map_err(|e| e.to_string())?,
+    )
+    .map(|_| ())
+}
+
 /// A command that talks to a remote.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Remote {
     Fetch,
     /// Fast-forward only: a pull never creates a merge commit or rebases.
     Pull,
+    /// For branches that have diverged: your commits replayed on top.
+    PullRebase,
+    /// For branches that have diverged: a merge commit, its message Git's.
+    PullMerge,
     /// Never forced. A branch without an upstream is pushed to `origin`
     /// and tracks it.
     Push,
@@ -956,7 +1022,7 @@ impl Remote {
     pub fn verb(self) -> &'static str {
         match self {
             Remote::Fetch => "Fetching",
-            Remote::Pull => "Pulling",
+            Remote::Pull | Remote::PullRebase | Remote::PullMerge => "Pulling",
             Remote::Push => "Pushing",
         }
     }
@@ -982,6 +1048,8 @@ pub fn remote(root: &Path, what: Remote, ssh_auth_sock: Option<&Path>) -> Result
     let mut args: Vec<String> = match what {
         Remote::Fetch => vec!["fetch".into(), "--prune".into()],
         Remote::Pull => vec!["pull".into(), "--ff-only".into()],
+        Remote::PullRebase => vec!["pull".into(), "--rebase".into()],
+        Remote::PullMerge => vec!["pull".into(), "--no-rebase".into(), "--no-edit".into()],
         Remote::Push => vec!["push".into()],
     };
     if what == Remote::Push && !upstream {
@@ -997,7 +1065,8 @@ pub fn remote(root: &Path, what: Remote, ssh_auth_sock: Option<&Path>) -> Result
         }
         args.extend(["--set-upstream".into(), "origin".into(), branch.clone()]);
     }
-    if what == Remote::Pull && !upstream {
+    let pull = matches!(what, Remote::Pull | Remote::PullRebase | Remote::PullMerge);
+    if pull && !upstream {
         return Err("this branch has no upstream to pull from".into());
     }
     let mut cmd = command(root);
@@ -1075,6 +1144,9 @@ pub fn remote(root: &Path, what: Remote, ssh_auth_sock: Option<&Path>) -> Result
     let said = String::from_utf8_lossy(&stderr).trim().to_owned();
     if status.success() {
         Ok(said)
+    } else if what == Remote::Pull && said.contains("fast-forward") {
+        // Git's own hint names `git config` and command-line flags.
+        Err("the branches have diverged: use Git > Pull with Rebase or Pull with Merge".into())
     } else {
         Err(if said.is_empty() {
             format!("git {} failed", args[0])
@@ -1189,6 +1261,113 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn diverged_pulls_and_aborting_or_continuing_what_git_left() {
+        // An origin with two clones; each commits, so they diverge.
+        let base = TempRepo::new("diverge");
+        let dir = base.path();
+        let origin = dir.join("origin.git");
+        run(dir, &["init", "--quiet", "--bare", "origin.git"]).unwrap();
+        let clone = |name: &str| {
+            run(dir, &["clone", "--quiet", "origin.git", name]).unwrap_or_default();
+            let path = dir.join(name);
+            for (key, value) in [
+                ("user.name", "caio test"),
+                ("user.email", "test@example.invalid"),
+                ("commit.gpgsign", "false"),
+            ] {
+                run(&path, &["config", key, value]).unwrap();
+            }
+            path
+        };
+        let commit = |path: &Path, file: &str, text: &str| {
+            std::fs::write(path.join(file), text).unwrap();
+            run(path, &["add", file]).unwrap();
+            run(path, &["commit", "--quiet", "-m", file]).unwrap();
+        };
+        let mine = clone("mine");
+        commit(&mine, "shared.txt", "one\n");
+        run(&mine, &["push", "--quiet", "-u", "origin", "HEAD"]).unwrap();
+        let theirs = clone("theirs");
+        commit(&theirs, "theirs.txt", "theirs\n");
+        run(&theirs, &["push", "--quiet"]).unwrap();
+        commit(&mine, "mine.txt", "mine\n");
+
+        let error = remote(&mine, Remote::Pull, None).unwrap_err();
+        assert!(error.contains("Pull with Rebase"), "{error}");
+        remote(&mine, Remote::PullRebase, None).unwrap();
+        assert!(mine.join("theirs.txt").exists());
+
+        commit(&theirs, "again.txt", "again\n");
+        run(&theirs, &["push", "--quiet"]).unwrap();
+        commit(&mine, "more.txt", "more\n");
+        remote(&mine, Remote::PullMerge, None).unwrap();
+        assert!(mine.join("again.txt").exists());
+        let parents = run(&mine, &["rev-list", "--parents", "-n", "1", "HEAD"]).unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&parents).split_whitespace().count(),
+            3,
+            "a merge commit"
+        );
+
+        // A conflicting merge, given up.
+        let git_dir = mine.join(".git");
+        run(&mine, &["switch", "--quiet", "-c", "side"]).unwrap();
+        commit(&mine, "shared.txt", "side\n");
+        run(&mine, &["switch", "--quiet", "-"]).unwrap();
+        commit(&mine, "shared.txt", "main\n");
+        assert!(run(&mine, &["merge", "side"]).is_err());
+        assert_eq!(InProgress::read(&git_dir), Some(InProgress::Merge));
+        abort(&mine, InProgress::Merge).unwrap();
+        assert_eq!(InProgress::read(&git_dir), None);
+        assert_eq!(
+            std::fs::read_to_string(mine.join("shared.txt")).unwrap(),
+            "main\n"
+        );
+
+        // A conflicting rebase, resolved and continued without an editor.
+        assert!(run(&mine, &["rebase", "side"]).is_err());
+        assert_eq!(InProgress::read(&git_dir), Some(InProgress::Rebase));
+        std::fs::write(mine.join("shared.txt"), "both\n").unwrap();
+        run(&mine, &["add", "shared.txt"]).unwrap();
+        continue_rebase(&mine).unwrap();
+        assert_eq!(InProgress::read(&git_dir), None);
+        assert!(origin.exists());
+    }
+
+    #[test]
+    fn branches_rename_and_delete_with_their_refusals() {
+        let repo = TempRepo::new("branch-edit");
+        let dir = repo.path();
+        std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+        run(dir, &["add", "a.txt"]).unwrap();
+        run(dir, &["commit", "--quiet", "-m", "one"]).unwrap();
+        let main = run(dir, &["symbolic-ref", "--short", "HEAD"]).unwrap();
+        let main = String::from_utf8_lossy(&main).trim().to_owned();
+        // A merged branch, and one with a commit of its own.
+        run(dir, &["branch", "merged"]).unwrap();
+        run(dir, &["switch", "--quiet", "-c", "ahead"]).unwrap();
+        std::fs::write(dir.join("b.txt"), "b\n").unwrap();
+        run(dir, &["add", "b.txt"]).unwrap();
+        run(dir, &["commit", "--quiet", "-m", "two"]).unwrap();
+        run(dir, &["switch", "--quiet", &main]).unwrap();
+
+        assert_eq!(unmerged_branches(dir).unwrap(), vec!["ahead".to_owned()]);
+        assert!(rename_branch(dir, "merged", "bad..name").is_err());
+        assert!(
+            rename_branch(dir, "merged", "ahead").is_err(),
+            "a taken name"
+        );
+        rename_branch(dir, "merged", "done").unwrap();
+        // A name that looks like an option is a branch, not a flag.
+        assert!(delete_branch(dir, "-D", false).is_err());
+        assert!(delete_branch(dir, "ahead", false).is_err(), "not merged");
+        delete_branch(dir, "ahead", true).unwrap();
+        delete_branch(dir, "done", false).unwrap();
+        let names: Vec<String> = branches(dir).unwrap().into_iter().map(|b| b.name).collect();
+        assert_eq!(names, vec![main]);
     }
 
     #[test]

@@ -9,7 +9,7 @@ impl EditorView {
     /// then the project's.
     /// Git > Switch Branch: the palette lists the local branches, and a
     /// name that is not one offers to create it.
-    pub(super) fn open_branch_picker(&self) {
+    pub(super) fn open_branch_picker(&self, intent: BranchIntent) {
         let root = self
             .ivars()
             .state
@@ -28,7 +28,21 @@ impl EditorView {
         // opens when the list arrives.
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(crate::project::git::branches(&root));
+            let read = || -> Result<BranchPick, String> {
+                let branches = crate::project::git::branches(&root)?;
+                // What a delete would lose, so the list can say so.
+                let unmerged = if intent == BranchIntent::Delete {
+                    crate::project::git::unmerged_branches(&root)?
+                } else {
+                    Vec::new()
+                };
+                Ok(BranchPick {
+                    branches,
+                    intent,
+                    unmerged,
+                })
+            };
+            let _ = tx.send(read());
         });
         if let Some(mut state) = self.state_mut() {
             state.branch_rx = Some(rx);
@@ -51,10 +65,18 @@ impl EditorView {
             reply
         };
         match reply {
-            Ok(branches) => {
-                self.open_palette_with("");
+            Ok(pick) => {
+                // A rename starts from the old name, all of it selected.
+                let old = match &pick.intent {
+                    BranchIntent::RenameTo(old) => old.clone(),
+                    _ => String::new(),
+                };
+                self.open_palette_with(&old);
                 if let Some(mut state) = self.state_mut() {
-                    state.branch_list = Some(branches);
+                    if let Some((query, _)) = state.palette.as_mut() {
+                        query.select_all();
+                    }
+                    state.branch_list = Some(pick);
                 }
             }
             Err(error) => {
@@ -80,6 +102,73 @@ impl EditorView {
             state.git.switch_branch(name);
         }
         drop(state);
+        self.resume_display_link();
+        self.request_redraw();
+    }
+
+    /// Deletes `name`, asking first when it has commits HEAD does not.
+    pub(super) fn delete_branch(&self, name: String, unmerged: bool) {
+        if unmerged {
+            let detail = "It has commits that are on no other branch here. Deleting it \
+                          loses them, except from Git's reflog.";
+            let delete = if self.ivars().testing {
+                // A test instance cannot answer a modal: it says what it
+                // would have asked, and takes the answer from the environment.
+                eprintln!("crc: delete branch prompt: {name}: {detail}");
+                std::env::var("CRC_DELETE_BRANCH_ANSWER").is_ok_and(|a| a == "delete")
+            } else {
+                ask(
+                    MainThreadMarker::from(self),
+                    &format!("Delete \u{201c}{name}\u{201d}?"),
+                    detail,
+                    &["Delete", "Cancel"],
+                ) == 0
+            };
+            if !delete {
+                return;
+            }
+        }
+        if let Some(mut state) = self.state_mut() {
+            state.git.delete_branch(name, unmerged);
+        }
+        self.resume_display_link();
+        self.request_redraw();
+    }
+
+    pub(super) fn rename_branch(&self, old: String, new: String) {
+        if let Some(mut state) = self.state_mut() {
+            state.git.rename_branch(old, new);
+        }
+        self.resume_display_link();
+        self.request_redraw();
+    }
+
+    /// Gives up the merge, rebase, cherry-pick or revert under way, once
+    /// asked: it throws away whatever was resolved so far.
+    pub(super) fn git_abort(&self) {
+        let Some(what) = self.state().and_then(|state| state.git.in_progress()) else {
+            return;
+        };
+        let command = what.command();
+        let detail = "The branch and its files go back to how they were before it began. \
+                      Conflicts resolved so far are lost.";
+        let abort = if self.ivars().testing {
+            eprintln!("crc: abort prompt: {command}: {detail}");
+            std::env::var("CRC_ABORT_ANSWER").is_ok_and(|a| a == "abort")
+        } else {
+            ask(
+                MainThreadMarker::from(self),
+                &format!("Abort the {command}?"),
+                detail,
+                &["Abort", "Cancel"],
+            ) == 0
+        };
+        if !abort {
+            return;
+        }
+        if let Some(mut state) = self.state_mut() {
+            state.git.abort(what);
+        }
         self.resume_display_link();
         self.request_redraw();
     }

@@ -3,6 +3,10 @@
 //! Split into a library plus a thin binary so the text, layout and render
 //! layers can be tested and benchmarked without opening a window.
 
+// The window's `define_class!` holds every menu action, and expanding that
+// many `sel!`s goes past the default macro recursion limit of 128.
+#![recursion_limit = "256"]
+
 pub mod base64;
 pub mod complete;
 pub mod ext;

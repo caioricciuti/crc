@@ -19,6 +19,12 @@ enum Operation {
     Commit(String),
     Switch(String),
     CreateBranch(String),
+    /// A branch, and whether to delete it unmerged.
+    DeleteBranch(String, bool),
+    RenameBranch(String, String),
+    /// Give up what Git left half done.
+    Abort(git::InProgress),
+    ContinueRebase,
     Remote(git::Remote, Option<PathBuf>),
     /// `git add` on a path whose conflict the user has resolved.
     Resolve(Change),
@@ -338,6 +344,22 @@ impl Panel {
     pub fn create_branch(&mut self, name: String) {
         self.start(Operation::CreateBranch(name));
     }
+    pub fn delete_branch(&mut self, name: String, force: bool) {
+        self.start(Operation::DeleteBranch(name, force));
+    }
+    pub fn rename_branch(&mut self, old: String, new: String) {
+        self.start(Operation::RenameBranch(old, new));
+    }
+    pub fn abort(&mut self, what: git::InProgress) {
+        self.start(Operation::Abort(what));
+    }
+    pub fn continue_rebase(&mut self) {
+        self.start(Operation::ContinueRebase);
+    }
+    /// The merge, rebase, cherry-pick or revert Git has under way.
+    pub fn in_progress(&self) -> Option<git::InProgress> {
+        self.snapshot.as_ref().and_then(|s| s.in_progress)
+    }
     pub fn remote(&mut self, what: git::Remote, ssh_auth_sock: Option<PathBuf>) {
         if self.busy() {
             self.announcement = Some("Git is busy; try again in a moment".into());
@@ -576,6 +598,10 @@ impl Panel {
             operation,
             Operation::Switch(_)
                 | Operation::CreateBranch(_)
+                | Operation::DeleteBranch(..)
+                | Operation::RenameBranch(..)
+                | Operation::Abort(_)
+                | Operation::ContinueRebase
                 | Operation::Remote(..)
                 | Operation::Resolve(_)
         );
@@ -610,12 +636,46 @@ impl Panel {
                         }
                         Err(error) => Some(error),
                     },
+                    Operation::DeleteBranch(name, force) => {
+                        match git::delete_branch(&root, &name, force) {
+                            Ok(()) => {
+                                done = Some(format!("deleted {name}"));
+                                None
+                            }
+                            Err(error) => Some(error),
+                        }
+                    }
+                    Operation::Abort(what) => match git::abort(&root, what) {
+                        Ok(()) => {
+                            done = Some(format!("{} aborted", what.command()));
+                            None
+                        }
+                        Err(error) => Some(error),
+                    },
+                    Operation::ContinueRebase => match git::continue_rebase(&root) {
+                        Ok(()) => {
+                            done = Some("rebase continued".into());
+                            None
+                        }
+                        Err(error) => Some(error),
+                    },
+                    Operation::RenameBranch(old, new) => {
+                        match git::rename_branch(&root, &old, &new) {
+                            Ok(()) => {
+                                done = Some(format!("renamed {old} to {new}"));
+                                None
+                            }
+                            Err(error) => Some(error),
+                        }
+                    }
                     Operation::Remote(what, sock) => {
                         match git::remote(&root, what, sock.as_deref()) {
                             Ok(said) => {
                                 let verb = match what {
                                     git::Remote::Fetch => "fetched",
-                                    git::Remote::Pull => "pulled",
+                                    git::Remote::Pull
+                                    | git::Remote::PullRebase
+                                    | git::Remote::PullMerge => "pulled",
                                     git::Remote::Push => "pushed",
                                 };
                                 let last = said.lines().last().unwrap_or("").trim().to_owned();

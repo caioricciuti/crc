@@ -728,13 +728,13 @@ impl EditorView {
         } else {
             detail
         };
-        let right_width = 320.0f32.min(status_rect.width * 0.55);
+        let right = status_detail_rect(status_rect);
         layout::push_ui_text(
             glyphs,
             &mut renderer.atlas,
             Viewport {
                 x: 16.0,
-                width: (status_rect.width - right_width - 32.0).max(0.0),
+                width: (right.x - status_rect.x - 32.0).max(0.0),
                 ..status_rect
             },
             &status,
@@ -743,11 +743,7 @@ impl EditorView {
         layout::push_ui_text(
             glyphs,
             &mut renderer.atlas,
-            Viewport {
-                x: status_rect.width - right_width,
-                width: (right_width - 12.0).max(0.0),
-                ..status_rect
-            },
+            right,
             &detail,
             theme.status_text,
         );
@@ -774,10 +770,11 @@ impl EditorView {
                 commands: command_list,
                 symbols: symbol_list,
                 root: tree.root(),
-                branches: branch_list.as_deref(),
+                branches: branch_list.as_ref(),
                 actions: action_list.as_ref(),
             };
             let mode = PaletteMode::of(&sources);
+            let intent = sources.branches.map(|pick| &pick.intent);
             let rows: Vec<layout::PaletteRow> = palette_rows(&sources, &text)
                 .into_iter()
                 .map(|(row, _)| row)
@@ -794,8 +791,8 @@ impl EditorView {
             layout::build_palette(
                 layout::PaletteView {
                     rows: &rows,
-                    heading: palette_heading(&text, mode).0,
-                    empty: palette_heading(&text, mode).1,
+                    heading: palette_heading(&text, mode, intent).0,
+                    empty: palette_heading(&text, mode, intent).1,
                     placeholder: match mode {
                         PaletteMode::Branch => "Branch name",
                         PaletteMode::Action => "Filter actions",
@@ -804,7 +801,11 @@ impl EditorView {
                         }
                     },
                     action: if mode == PaletteMode::Branch {
-                        "Switch"
+                        match intent {
+                            Some(BranchIntent::Rename | BranchIntent::RenameTo(_)) => "Rename",
+                            Some(BranchIntent::Delete) => "Delete",
+                            _ => "Switch",
+                        }
                     } else if mode == PaletteMode::Action || commands::query(&text).is_some() {
                         "Run"
                     } else {

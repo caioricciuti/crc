@@ -180,6 +180,9 @@ impl EditorView {
             Pick::Action(server, action) => self.run_code_action(server, action),
             Pick::Branch(name) => self.switch_branch(name, false),
             Pick::NewBranch(name) => self.switch_branch(name, true),
+            Pick::DeleteBranch(name, unmerged) => self.delete_branch(name, unmerged),
+            Pick::RenameBranch(name) => self.open_branch_picker(BranchIntent::RenameTo(name)),
+            Pick::RenameBranchTo(old, new) => self.rename_branch(old, new),
             Pick::Symbol(path, line) => self.go_to_symbol(path, line),
             Pick::Command(at, tag) => self.run_command(at, tag),
             Pick::File(path) => {

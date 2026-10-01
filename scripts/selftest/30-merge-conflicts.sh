@@ -81,3 +81,43 @@ expect "$T/merge-resolved.out" message "marked plan.txt resolved"
 [ -z "$(mgit ls-files -u)" ] || failed "merge: plan.txt is still unmerged"
 [ "$(mgit diff --cached --name-only)" = "plan.txt" ] \
     || failed "merge: plan.txt is not staged"
+
+# ---- giving up a merge ----------------------------------------------------------
+# Git > Abort Merge or Rebase asks first (answered here through the
+# environment), then puts the branch and file back as they were before
+# the merge: MERGING leaves the status bar and the markers leave the file.
+mkdir -p "$T/abortproj"
+testgit "$T/abortproj" init -q -b main
+printf 'garden plan\nbeds: 3\n' > "$T/abortproj/plan.txt"
+testgit "$T/abortproj" add plan.txt
+testgit "$T/abortproj" commit -q -m base
+testgit "$T/abortproj" switch -q -c topic
+printf 'garden plan\nbeds: 4\n' > "$T/abortproj/plan.txt"
+testgit "$T/abortproj" commit -q -am topic
+testgit "$T/abortproj" switch -q main
+printf 'garden plan\nbeds: 5\n' > "$T/abortproj/plan.txt"
+testgit "$T/abortproj" commit -q -am main
+testgit "$T/abortproj" merge -q topic > /dev/null 2>&1 && failed "abort: the fixture did not conflict"
+cat > "$T/abort.script" <<SCRIPT
+wait 800
+wait 600
+dump $T/abort-merging.out
+key 35 cmd p
+wait 200
+text >abort merge
+key 36
+wait 600
+wait 300
+dump $T/abort-done.out
+quit
+SCRIPT
+CRC_ABORT_ANSWER=abort CRC_SELFTEST="$T/abort.script" "$BIN" "$T/abortproj/plan.txt" 2> "$T/abort.err"
+expect "$T/abort-merging.out" branch "main · MERGING"
+expect "$T/abort-done.out" branch "main"
+expect "$T/abort-done.out" message "merge aborted"
+[ "$(cat "$T/abortproj/plan.txt")" = "$(printf 'garden plan\nbeds: 5')" ] \
+    || failed "abort: plan.txt is not back to main's: $(cat "$T/abortproj/plan.txt")"
+grep -q '^crc: abort prompt: merge: ' "$T/abort.err" \
+    || failed "abort: giving up the merge did not ask first"
+grep -v '^crc: abort prompt: ' "$T/abort.err" > "$T/abort.err.rest" || true
+mv "$T/abort.err.rest" "$T/abort.err"
