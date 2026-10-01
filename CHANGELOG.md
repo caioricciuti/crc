@@ -2,6 +2,25 @@
 
 One entry per tag, written for people who use the editor.
 
+## v0.2.0-alpha.10, 2026-10-01
+
+Markdown that hides its syntax in any language, and a preview you can
+size or give the whole tab.
+
+- Markdown hides its syntax and lines up table columns on lines with
+  accents, CJK or emoji too, not only on plain ASCII lines. Bold shows
+  there as well; italic on those lines is still to come, and a line
+  with right-to-left text keeps its syntax visible.
+- A table's delimiter row runs on in dashes to its pipes, and a quote's
+  `>` is drawn as a bar while you are not editing that line.
+- Lines with accents, CJK or emoji now keep to the same columns as the
+  lines around them; they used to come out about 2% narrower, which put
+  table pipes out of line.
+- The divider between the text and the Markdown preview drags, so either
+  side can have more room.
+- View > Markdown Preview Only (Cmd-Shift-E) shows the preview in the
+  whole tab; again, or Escape, puts it back beside the text.
+
 ## v0.2.0-alpha.9, 2026-09-30
 
 A fix for editing with the find bar open.
