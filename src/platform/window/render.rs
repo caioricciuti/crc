@@ -257,6 +257,11 @@ impl EditorView {
                 tree.root(),
                 recent_projects,
                 home_summary.as_ref(),
+                &terminal_panel
+                    .tabs
+                    .iter()
+                    .map(|t| (t.name(), t.state()))
+                    .collect::<Vec<_>>(),
                 home_hits,
             );
         } else {

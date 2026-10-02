@@ -53,6 +53,14 @@ them opens as one project.
   `calls/` folder, never over another; Home lists saved calls, and a
   click runs one. Refused when the open folder is itself a repository,
   where the call would be committed.
+- The terminal knows when a session waits on you. A program that sends
+  a notification (OSC 9, as iTerm2 takes it, OSC 777 `notify` or kitty's
+  OSC 99) or rings the bell marks its tab with a dot until you type into
+  it, and the status line says which session asked and what, when you
+  are not already typing there. Claude Code sends these with its iTerm2
+  notification channel; Codex with its terminal notifications turned on.
+- Home lists the terminal sessions first, the waiting ones on top with
+  their question, the others as working or idle; a click opens one.
 
 ## v0.2.0-alpha.11, 2026-10-01
 

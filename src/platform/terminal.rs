@@ -40,6 +40,33 @@ pub struct Tab {
     /// Runs Claude Code, connected to this window.
     pub claude: bool,
     pub launch: Launch,
+    /// What the program last asked to be told, until someone types into
+    /// the tab: the notification's text, empty for the bell.
+    pub attention: Option<String>,
+    /// When it last printed something.
+    pub last_output: Option<std::time::Instant>,
+}
+
+impl Tab {
+    /// How Home and the status line say what the tab is doing.
+    pub fn state(&self) -> String {
+        match &self.attention {
+            Some(text) if text.is_empty() => "waiting: rang the bell".into(),
+            Some(text) => format!("waiting: {text}"),
+            None if self
+                .last_output
+                .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(3)) =>
+            {
+                "working".into()
+            }
+            None => "idle".into(),
+        }
+    }
+
+    /// The title shown for it.
+    pub fn name(&self) -> String {
+        label(self)
+    }
 }
 
 pub struct Panel {
@@ -159,7 +186,8 @@ pub fn header_hits(
     let mut x = header.x + 8.0;
     let mut tabs = Vec::new();
     for tab in &panel.tabs {
-        let width = layout::ui_text_width(atlas, &label(tab)) + 44.0;
+        let dot = if tab.attention.is_some() { 5.0 } else { 0.0 };
+        let width = layout::ui_text_width(atlas, &label(tab)) + 44.0 + dot;
         let rect = Viewport {
             x,
             y: header.y + 4.0,
@@ -288,6 +316,20 @@ pub fn draw(
         if active {
             layout::push_rounded_rect(out, rect, 5.0, theme.tab_hover);
         }
+        // A tab waiting on the person: a dot before its title.
+        if tab.attention.is_some() {
+            layout::push_rounded_rect(
+                out,
+                Viewport {
+                    x: rect.x + 5.0,
+                    y: rect.y + rect.height / 2.0 - 3.0,
+                    width: 6.0,
+                    height: 6.0,
+                },
+                3.0,
+                theme.accent,
+            );
+        }
         let colour = if tab.claude {
             theme.accent
         } else if active {
@@ -299,7 +341,7 @@ pub fn draw(
             out,
             atlas,
             Viewport {
-                x: rect.x + 10.0,
+                x: rect.x + if tab.attention.is_some() { 15.0 } else { 10.0 },
                 width: (rect.width - 34.0).max(0.0),
                 ..rect
             },

@@ -497,7 +497,7 @@ impl EditorView {
                 };
                 let report = format!(
                     // First: the report ends with the document's text.
-                    "message: {}\npreview: {}\nmd: {md}\nactivity: {}\npointer_targets: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nrepo: {}\ngit_note: {}\nhome: {}\nmcp: {}\nconflicts: {}\ngit_conflicts: {}\nblame: {}\nfind_results: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\n{report}",
+                    "message: {}\npreview: {}\nmd: {md}\nactivity: {}\npointer_targets: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nrepo: {}\ngit_note: {}\nhome: {}\nmcp: {}\nterminals: {}\nconflicts: {}\ngit_conflicts: {}\nblame: {}\nfind_results: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\n{report}",
                     state.message.as_ref().map_or("", |(text, _)| text.as_str()),
                     state.html_preview.as_ref().map_or("closed".to_string(), |p| format!(
                         "open ext={} view={} probe={}",
@@ -583,6 +583,13 @@ impl EditorView {
                         state.home_hits.len(),
                     )),
                     state.mcp.report(),
+                    state
+                        .terminal
+                        .tabs
+                        .iter()
+                        .map(|t| t.state())
+                        .collect::<Vec<_>>()
+                        .join("|"),
                     active_conflicts(&state).map_or("none".to_string(), |v| format!(
                         "{} side={} unmerged={} resolvable={} scroll={}",
                         v.conflicts.len(),

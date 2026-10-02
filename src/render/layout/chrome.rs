@@ -402,6 +402,8 @@ pub enum HomeAction {
     ShowRepo(std::path::PathBuf),
     /// Open this saved MCP call and run it.
     RunCall(std::path::PathBuf),
+    /// Show this terminal session, with the keyboard.
+    ShowTerminal(usize),
 }
 
 /// A clickable row on the home screen.
@@ -426,6 +428,7 @@ pub fn build_home(
     project: Option<&std::path::Path>,
     recent: &[std::path::PathBuf],
     summary: Option<&crate::project::workspace::Summary>,
+    terminals: &[(String, String)],
     hits: &mut Vec<HomeHit>,
 ) {
     const ROW: f32 = 30.0;
@@ -462,6 +465,40 @@ pub fn build_home(
         *y += 22.0;
         push_rect(out, atlas, [x, *y - 4.0], [width, 1.0], theme.hairline);
     };
+
+    // Terminals first: a session waiting on you matters more than what
+    // to open next, and the panel under Home leaves little height.
+    // Waiting ones lead.
+    if !terminals.is_empty() && y + 22.0 + ROW <= bottom {
+        section(out, atlas, &mut y, "Terminals");
+        let mut order: Vec<usize> = (0..terminals.len()).collect();
+        order.sort_by_key(|&i| !terminals[i].1.starts_with("waiting"));
+        for i in order {
+            if y + ROW > bottom {
+                break;
+            }
+            let (name, doing) = &terminals[i];
+            let rect = home_row(
+                out,
+                atlas,
+                theme,
+                (x, width),
+                y,
+                icons::TERMINAL,
+                name,
+                doing,
+            );
+            if doing.starts_with("waiting") {
+                push_rect(out, atlas, [x - 6.0, y + 12.0], [5.0, 5.0], theme.accent);
+            }
+            hits.push(HomeHit {
+                rect,
+                action: HomeAction::ShowTerminal(i),
+            });
+            y += ROW;
+        }
+        y += GAP;
+    }
 
     // Start: the three things to do from here, each with its shortcut.
     section(out, atlas, &mut y, "Start");
@@ -2929,6 +2966,7 @@ mod home_tests {
             Some(&here),
             &recent,
             None,
+            &[],
             &mut hits,
         );
         let actions: Vec<&HomeAction> = hits.iter().map(|h| &h.action).collect();
@@ -3001,11 +3039,13 @@ mod home_tests {
             Some(&root),
             &[],
             Some(&summary),
+            &[("claude".into(), "waiting: Approve?".into())],
             &mut hits,
         );
         let actions: Vec<HomeAction> = hits.iter().map(|h| h.action.clone()).collect();
+        assert_eq!(actions[0], HomeAction::ShowTerminal(0));
         assert_eq!(
-            actions[3..],
+            actions[4..],
             [
                 HomeAction::OpenFiles(vec![state.clone()]),
                 HomeAction::OpenFiles(vec![log, state.clone()]),
@@ -3040,6 +3080,7 @@ mod home_tests {
             None,
             &[],
             None,
+            &[],
             &mut hits,
         );
         assert!(hits.is_empty());

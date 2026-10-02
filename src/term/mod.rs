@@ -167,6 +167,10 @@ pub struct Term {
     /// panel keeps them in step with the theme.
     pub colors: ([u8; 3], [u8; 3]),
     replies: Vec<u8>,
+    /// What the program asked to be told, newest last, until taken:
+    /// the text of an OSC 9, 777 or 99 notification, or an empty string
+    /// for the bell.
+    notices: Vec<String>,
     state: State,
     params: Vec<Vec<u16>>,
     private: Option<u8>,
@@ -209,6 +213,7 @@ impl Term {
             title: String::new(),
             colors: ([0xdd, 0xe1, 0xe1], [0x1c, 0x1e, 0x1f]),
             replies: Vec::new(),
+            notices: Vec::new(),
             state: State::Ground,
             params: Vec::new(),
             private: None,
@@ -260,6 +265,22 @@ impl Term {
     /// What the program has asked to be told, to write back to it.
     pub fn take_replies(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.replies)
+    }
+
+    /// The notifications since the last call, oldest first.
+    pub fn take_notices(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.notices)
+    }
+
+    /// Keeps a notification, dropping the oldest past a handful: only the
+    /// newest is shown, and a program that rings in a loop must not grow
+    /// this without bound.
+    pub(super) fn notice(&mut self, text: String) {
+        if self.notices.len() == 8 {
+            self.notices.remove(0);
+        }
+        let text: String = text.chars().filter(|c| !c.is_control()).take(300).collect();
+        self.notices.push(text.trim().to_owned());
     }
 
     /// The number of screen row 0, counting from the first line kept.
@@ -898,6 +919,31 @@ fn line_drawing(ch: char) -> char {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notifications_and_the_bell_are_kept_for_the_window() {
+        let mut t = Term::new(10, 40);
+        t.advance(b"\x1b]9;Claude needs your permission\x07");
+        t.advance(b"\x1b]9;4;1;50\x07");
+        t.advance(b"\x1b]777;notify;Codex;Approve the patch?\x1b\\");
+        t.advance(b"\x1b]99;i=1:d=0;Build done\x1b\\");
+        t.advance(b"plain\x07text");
+        assert_eq!(
+            t.take_notices(),
+            [
+                "Claude needs your permission",
+                "Codex: Approve the patch?",
+                "Build done",
+                "",
+            ]
+        );
+        assert!(t.take_notices().is_empty());
+        // A program that rings in a loop keeps only the newest few.
+        for _ in 0..50 {
+            t.advance(b"\x07");
+        }
+        assert_eq!(t.take_notices().len(), 8);
+    }
 
     fn term(input: &str) -> Term {
         let mut t = Term::new(20, 5);

@@ -113,6 +113,8 @@ impl Term {
                 self.col = 0;
                 self.pending_wrap = false;
             }
+            // The bell: the program wants attention.
+            0x07 => self.notice(String::new()),
             // SO and SI shift to G1 and back; G1 is never line drawing here.
             0x0E | 0x0F => {}
             _ => {}
@@ -217,6 +219,28 @@ impl Term {
             if let Some((kind, value)) = text.split_once(';') {
                 match (kind, value) {
                     ("0" | "2", _) => self.title = value.to_owned(),
+                    // iTerm2's notification. `9;4;...` is ConEmu's progress
+                    // report, which is not one.
+                    ("9", text) if !text.starts_with("4;") => self.notice(text.to_owned()),
+                    // `777;notify;title;body`, as rxvt and Ghostty have it.
+                    ("777", rest) if rest.starts_with("notify;") => {
+                        let mut parts = rest["notify;".len()..].splitn(2, ';');
+                        let title = parts.next().unwrap_or("");
+                        let body = parts.next().unwrap_or("");
+                        self.notice(match (title.is_empty(), body.is_empty()) {
+                            (_, true) => title.to_owned(),
+                            (true, false) => body.to_owned(),
+                            (false, false) => format!("{title}: {body}"),
+                        });
+                    }
+                    // kitty's: metadata, then the payload.
+                    ("99", rest) => {
+                        if let Some((_, payload)) = rest.split_once(';')
+                            && !payload.is_empty()
+                        {
+                            self.notice(payload.to_owned());
+                        }
+                    }
                     // A query: answered, or the program waits out its timeout.
                     ("10" | "11", "?") => {
                         let [r, g, b] = if kind == "10" {

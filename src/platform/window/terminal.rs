@@ -24,9 +24,26 @@ impl EditorView {
             return;
         };
         let mut changed = false;
-        for tab in &state.terminal.tabs {
-            changed |= tab.session.drain_wake();
+        let mut noticed = Vec::new();
+        for (index, tab) in state.terminal.tabs.iter().enumerate() {
+            if tab.session.drain_wake() {
+                changed = true;
+                let notices = tab
+                    .session
+                    .term
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take_notices();
+                noticed.push((index, notices.into_iter().last()));
+            }
         }
+        drop(state);
+        if !noticed.is_empty() {
+            self.take_notices(noticed);
+        }
+        let Some(state) = self.state() else {
+            return;
+        };
         let exited = state
             .terminal
             .tabs
@@ -193,6 +210,8 @@ impl EditorView {
                     title,
                     claude,
                     launch,
+                    attention: None,
+                    last_output: None,
                 });
                 state.terminal.active = state.terminal.tabs.len() - 1;
                 state.terminal.back = 0;
@@ -243,7 +262,37 @@ impl EditorView {
         state.terminal.back = 0;
         state.terminal.selection = None;
         if let Some(tab) = state.terminal.active_tab_mut() {
+            // Typing into it is the answer to what it asked.
+            tab.attention = None;
             tab.session.write(bytes);
+        }
+    }
+
+    /// Output arrived in these tabs, with the newest notification each
+    /// carried. A notification marks its tab; the status line says it
+    /// when the tab is not the one being typed into.
+    fn take_notices(&self, noticed: Vec<(usize, Option<String>)>) {
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
+        let now = Instant::now();
+        let mut said = None;
+        let watching = state.terminal.has_keys();
+        let active = state.terminal.active;
+        for (index, notice) in noticed {
+            let Some(tab) = state.terminal.tabs.get_mut(index) else {
+                continue;
+            };
+            tab.last_output = Some(now);
+            if let Some(text) = notice {
+                tab.attention = Some(text);
+                if !(watching && index == active) {
+                    said = Some(format!("{}: {}", tab.name(), tab.state()));
+                }
+            }
+        }
+        if let Some(said) = said {
+            state.message = Some((said, now));
         }
     }
 

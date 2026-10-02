@@ -1800,6 +1800,12 @@ define_class!(
                             self.select_repo(&path);
                             self.set_sidebar_view(true);
                         }
+                        layout::HomeAction::ShowTerminal(index) => {
+                            if let Some(mut state) = self.state_mut() {
+                                state.terminal.active = index.min(state.terminal.tabs.len().saturating_sub(1));
+                            }
+                            self.open_terminal(false);
+                        }
                         layout::HomeAction::RunCall(path) => {
                             self.run_pick(Pick::File(path));
                             self.run_mcp_call();
@@ -5443,6 +5449,7 @@ fn draw_other_pane(
             tree.root(),
             &[],
             None,
+            &[],
             &mut hits,
         );
         return;

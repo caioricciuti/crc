@@ -41,6 +41,7 @@ pub const SYMBOL_FIELD: char = '\u{eb5f}'; // cod-symbol_field
 pub const HISTORY: char = '\u{ea82}'; // cod-history
 pub const FILE: char = '\u{ea7b}'; // cod-file
 pub const FOLDER_OUTLINE: char = '\u{ea83}'; // cod-folder
+pub const TERMINAL: char = '\u{ea85}'; // cod-terminal
 
 /// The icons an extension may name in its manifest (`"icon": "wand"`).
 /// A name, never an image: crc does not decode files from extensions, and
