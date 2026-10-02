@@ -3,6 +3,7 @@
 //! click on one of those opens its call document.
 
 use crate::mcp_client::{Config, Server, Status};
+use crate::project::icons;
 use crate::render::{
     font::Atlas,
     layout::{self, Theme, Viewport},
@@ -151,25 +152,10 @@ impl Panel {
         self.scroll = (self.scroll as isize + lines).clamp(0, max as isize) as usize;
     }
 
-    /// The header's buttons: Edit and Reload, right-aligned in the row the
-    /// Explorer uses for its own.
+    /// The header's buttons: Edit and Reload, in the title row where the
+    /// Explorer keeps its own.
     fn buttons(column: Viewport) -> [Viewport; 2] {
-        let y = column.y + 38.0;
-        let right = column.x + column.width - 10.0;
-        [
-            Viewport {
-                x: right - 64.0 - 4.0 - 64.0,
-                y,
-                width: 64.0,
-                height: 26.0,
-            },
-            Viewport {
-                x: right - 64.0,
-                y,
-                width: 64.0,
-                height: 26.0,
-            },
-        ]
+        layout::sidebar_header_buttons::<2>(column)
     }
 
     pub fn draw(
@@ -189,25 +175,17 @@ impl Panel {
         );
         let x = column.x + 10.0;
         let width = (column.width - 20.0).max(0.0);
-        layout::push_ui_text(
-            out,
-            atlas,
-            Viewport {
-                x: x + 2.0,
-                y: column.y + 11.0,
-                width,
-                height: 20.0,
-            },
-            "MCP SERVERS",
-            theme.status_text,
-        );
+        layout::push_sidebar_title(out, atlas, column, "MCP SERVERS", 2, theme);
         let [edit, reload] = Panel::buttons(column);
-        for (rect, label, action) in [
-            (edit, "Edit", Action::Edit),
-            (reload, "Reload", Action::Reload),
+        for (rect, icon, tip, action) in [
+            (edit, icons::EDIT, "Edit mcp.json", Action::Edit),
+            (reload, icons::REFRESH, "Reload Servers", Action::Reload),
         ] {
-            layout::push_rounded_rect(out, rect, 5.0, theme.tab_hover);
-            layout::push_ui_text_centered(out, atlas, rect, label, theme.status_text);
+            layout::Button::new(rect)
+                .icon(icon)
+                .tone(layout::Tone::Ghost)
+                .tip(tip)
+                .draw(out, atlas, theme);
             self.hits.push((rect, action));
         }
         let top = column.y + layout::SIDEBAR_HEADER_HEIGHT;
@@ -231,7 +209,12 @@ impl Panel {
         }
         if self.servers.is_empty() {
             say(out, atlas, top, "No servers yet.");
-            say(out, atlas, top + ROW, "Edit adds them to mcp.json.");
+            say(
+                out,
+                atlas,
+                top + ROW,
+                "Add them in mcp.json: the pencil above opens it.",
+            );
             return;
         }
         let lines = self.lines();
