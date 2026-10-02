@@ -894,12 +894,43 @@ const MODAL_RESPONSE_OK: isize = 1;
 
 /// Runs the open panel for one file, or with `directories` one folder, and
 /// answers the path picked.
+/// Whether a self-test asked for the system panels to come back nil.
+fn nil_panel() -> bool {
+    std::env::var_os("CRC_SELFTEST").is_some() && std::env::var_os("CRC_NIL_PANEL").is_some()
+}
+
+/// A Save panel, or `None` when AppKit gives none.
+///
+/// `+[NSSavePanel savePanel]` returned nil once on macOS 27 (BUG-031).
+/// objc2's generated `NSSavePanel::savePanel` panics on nil, and a release
+/// build aborts on panic: Cmd-S quit the app. Asking for an `Option`
+/// lets the caller say so and keep the text.
+pub(super) fn save_panel(mtm: MainThreadMarker) -> Option<Retained<NSSavePanel>> {
+    let _ = mtm;
+    if nil_panel() {
+        return None;
+    }
+    unsafe { msg_send![<NSSavePanel as objc2::ClassType>::class(), savePanel] }
+}
+
+/// An Open panel, or `None` when AppKit gives none; see [`save_panel`].
+fn open_panel(mtm: MainThreadMarker) -> Option<Retained<NSOpenPanel>> {
+    let _ = mtm;
+    if nil_panel() {
+        return None;
+    }
+    unsafe { msg_send![<NSOpenPanel as objc2::ClassType>::class(), openPanel] }
+}
+
+/// What the status line says when AppKit gives no panel.
+const NO_PANEL: &str = "macOS did not open the panel; nothing was saved or opened, try again";
+
 fn choose_path(
     mtm: MainThreadMarker,
     directories: bool,
     message: Option<&str>,
 ) -> Option<std::path::PathBuf> {
-    let panel = NSOpenPanel::openPanel(mtm);
+    let panel = open_panel(mtm)?;
     panel.setCanChooseFiles(!directories);
     panel.setCanChooseDirectories(directories);
     panel.setAllowsMultipleSelection(false);

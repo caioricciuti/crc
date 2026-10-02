@@ -2,6 +2,12 @@
 
 One entry per tag, written for people who use the editor.
 
+## Unreleased
+
+- Cmd-S on a document never saved, Save As and New File no longer quit
+  the app when macOS gives no Save panel: the status line says so and
+  the text stays, unsaved.
+
 ## v0.2.0-alpha.12, 2026-10-02
 
 Workspaces, MCP servers you can use yourself, crc as an MCP server for

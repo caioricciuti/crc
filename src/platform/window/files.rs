@@ -470,7 +470,14 @@ impl EditorView {
         let untitled = self.state()?.docs.active().path.is_none();
         if force_panel || untitled {
             let mtm = MainThreadMarker::from(self);
-            let panel = NSSavePanel::savePanel(mtm);
+            let Some(panel) = save_panel(mtm) else {
+                // No panel is a cancel: the text stays in memory.
+                if let Some(mut state) = self.state_mut() {
+                    state.message = Some((NO_PANEL.into(), Instant::now()));
+                }
+                self.request_redraw();
+                return None;
+            };
             let suggested = {
                 let state = self.state()?;
                 state

@@ -415,7 +415,12 @@ impl EditorView {
         };
 
         let mtm = MainThreadMarker::from(self);
-        let panel = NSSavePanel::savePanel(mtm);
+        let Some(panel) = save_panel(mtm) else {
+            if let Some(mut state) = self.state_mut() {
+                state.message = Some((NO_PANEL.into(), Instant::now()));
+            }
+            return true;
+        };
         panel.setNameFieldStringValue(&NSString::from_str("untitled.txt"));
         if let Some(dir) = &start_dir {
             let url = NSURL::fileURLWithPath(&NSString::from_str(&dir.to_string_lossy()));
