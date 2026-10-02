@@ -74,7 +74,7 @@ pub fn strip_pill(
         x: strip.x + 16.0,
         y: strip.y + 6.0,
         width: ui_text_width(atlas, label) + 20.0,
-        height: 26.0,
+        height: 28.0,
     };
     push_rounded_rect(out, pill, 6.0, [tone[0], tone[1], tone[2], 0.18]);
     push_ui_text_centered(out, atlas, pill, label, tone);
@@ -109,9 +109,9 @@ pub fn strip_facts(
 pub fn strip_button(atlas: &mut Atlas, strip: Viewport, x: f32, label: &str, pad: f32) -> Viewport {
     Viewport {
         x,
-        y: strip.y + 38.0,
+        y: strip.y + 39.0,
         width: ui_text_width(atlas, label) + pad,
-        height: 26.0,
+        height: 28.0,
     }
 }
 
@@ -127,7 +127,7 @@ pub fn strip_hairline(out: &mut Vec<GlyphInstance>, atlas: &Atlas, strip: Viewpo
 }
 
 /// The palette query's text inset from the palette's left edge.
-pub const PALETTE_INPUT_PAD: f32 = 18.0;
+pub const PALETTE_INPUT_PAD: f32 = 42.0;
 
 /// Draws `field` in `input`: the text scrolled to keep the caret in view,
 /// the selection band behind it and the caret, both `band` = (top offset,

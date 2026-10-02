@@ -167,16 +167,23 @@ pub fn strip_hits(view: &View, atlas: &mut Atlas, strip: Viewport) -> Vec<(Hit, 
         hits.push((Hit::ConflictMode(index == 1), rect));
         x += rect.width;
     }
-    x += 14.0;
+    x += layout::UI_GAP * 2.0;
     if !view.conflicts.is_empty() {
         for (forward, label) in [(false, "Previous"), (true, "Next")] {
-            let rect = layout::strip_button(atlas, strip, x, label, 24.0);
+            let rect = layout::strip_button(atlas, strip, x, label, 28.0);
             hits.push((Hit::ConflictStep(forward), rect));
-            x += rect.width + 6.0;
+            x += rect.width + layout::UI_GAP;
         }
     }
     if view.unmerged {
-        let button = layout::strip_button(atlas, strip, x, "Mark Resolved", 28.0);
+        // A shorter label before none at all: the button is the way out
+        // of the conflict, and a narrow window still needs it.
+        let full = layout::strip_button(atlas, strip, x, "Mark Resolved", 28.0);
+        let button = if (strip.x + strip.width - 16.0 - full.width) >= x {
+            full
+        } else {
+            layout::strip_button(atlas, strip, x, "Resolved", 24.0)
+        };
         let right = Viewport {
             x: (strip.x + strip.width - 16.0 - button.width).max(x),
             ..button
@@ -254,7 +261,7 @@ pub fn draw_strip(
                 width: last.x + last.width - first.x,
                 ..*first
             },
-            6.0,
+            layout::UI_RADIUS,
             theme.tab_hover,
         );
     }
@@ -262,19 +269,18 @@ pub fn draw_strip(
         match hit {
             Hit::ConflictMode(is_side) => {
                 let chosen = is_side == side;
+                let inner = Viewport {
+                    x: rect.x + 2.0,
+                    y: rect.y + 2.0,
+                    width: rect.width - 4.0,
+                    height: rect.height - 4.0,
+                };
                 if chosen {
-                    layout::push_rounded_rect(
-                        out,
-                        Viewport {
-                            x: rect.x + 2.0,
-                            y: rect.y + 2.0,
-                            width: rect.width - 4.0,
-                            height: rect.height - 4.0,
-                        },
-                        5.0,
-                        theme.palette_selected,
-                    );
+                    layout::push_rounded_rect(out, inner, 5.0, theme.palette_selected);
+                } else if layout::hovered(rect) {
+                    layout::push_rounded_rect(out, inner, 5.0, theme.control_hover);
                 }
+                layout::hotspot(rect, layout::Cursor::Pointing, None);
                 layout::push_ui_text_centered(
                     out,
                     atlas,
@@ -288,35 +294,32 @@ pub fn draw_strip(
                 );
             }
             Hit::ConflictStep(forward) => {
-                layout::push_rounded_rect(out, rect, 6.0, theme.tab_hover);
-                layout::push_ui_text_centered(
-                    out,
-                    atlas,
-                    rect,
-                    if forward { "Next" } else { "Previous" },
-                    theme.status_text,
-                );
+                layout::Button::new(rect)
+                    .label(if forward { "Next" } else { "Previous" })
+                    .tip(if forward {
+                        "Next Conflict"
+                    } else {
+                        "Previous Conflict"
+                    })
+                    .draw(out, atlas, theme);
             }
             Hit::ConflictResolve => {
                 let can = view.can_resolve();
-                let accent = theme.accent;
-                layout::push_rounded_rect(
-                    out,
-                    rect,
-                    6.0,
-                    if can {
-                        [accent[0], accent[1], accent[2], 0.22]
-                    } else {
-                        theme.tab_hover
-                    },
-                );
-                layout::push_ui_text_centered(
-                    out,
-                    atlas,
-                    rect,
-                    "Mark Resolved",
-                    if can { theme.text } else { theme.gutter_text },
-                );
+                let label = if layout::ui_text_width(atlas, "Mark Resolved") + 28.0 <= rect.width {
+                    "Mark Resolved"
+                } else {
+                    "Resolved"
+                };
+                let mut button = layout::Button::new(rect)
+                    .label(label)
+                    .tone(layout::Tone::Primary)
+                    .enabled(can);
+                button = if can {
+                    button.tip("Stage the file as resolved")
+                } else {
+                    button.tip("Resolve every conflict first")
+                };
+                button.draw(out, atlas, theme);
             }
             _ => {}
         }

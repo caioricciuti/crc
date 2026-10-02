@@ -532,6 +532,7 @@ pub fn build_home(
             width: width + 16.0,
             height: ROW,
         };
+        push_home_hover(out, row, theme);
         push_icon_centered(
             out,
             atlas,
@@ -613,6 +614,7 @@ pub fn build_home(
                 width: width + 16.0,
                 height: ROW,
             };
+            push_home_hover(out, row, theme);
             push_icon_centered(
                 out,
                 atlas,
@@ -716,6 +718,14 @@ pub fn build_home(
 
 /// One clickable Home row: an icon, a label, and a dimmed detail after it.
 /// Returns the row's rectangle.
+/// A Home row under the pointer gets the list wash.
+fn push_home_hover(out: &mut Vec<GlyphInstance>, row: Viewport, theme: &Theme) {
+    if super::ui::hovered(row) {
+        push_rounded_rect(out, row, UI_RADIUS, theme.row_hover);
+    }
+    hotspot(row, Cursor::Pointing, None);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn home_row(
     out: &mut Vec<GlyphInstance>,
@@ -728,6 +738,17 @@ fn home_row(
     detail: &str,
 ) -> Viewport {
     const ROW: f32 = 30.0;
+    let whole = Viewport {
+        x: x - 8.0,
+        y,
+        width: width + 16.0,
+        height: ROW,
+    };
+    let over = super::ui::hovered(whole);
+    if over {
+        push_rounded_rect(out, whole, UI_RADIUS, theme.row_hover);
+    }
+    hotspot(whole, Cursor::Pointing, None);
     push_icon_centered(
         out,
         atlas,
@@ -738,7 +759,11 @@ fn home_row(
             height: ROW,
         },
         glyph,
-        theme.status_text,
+        if over {
+            theme.accent
+        } else {
+            theme.status_text
+        },
     );
     let label_w = (ui_text_width(atlas, label) + 4.0).min(width * 0.6);
     push_ui_text(
@@ -1501,6 +1526,31 @@ pub fn palette_file_row(finder: &Finder, hit: &Match) -> Option<PaletteRow> {
 ///
 /// Characters that the query matched are tinted, which is what makes a fuzzy
 /// list readable: without it, a subsequence match looks arbitrary.
+/// The palette's query field, right of its search glyph. Drawing, clicks
+/// and the I-beam all use this.
+pub fn palette_input(rect: Viewport) -> Viewport {
+    Viewport {
+        x: rect.x + PALETTE_INPUT_PAD,
+        y: rect.y + 8.0,
+        width: (rect.width - PALETTE_INPUT_PAD - palette_escape_width() - 30.0).max(0.0),
+        height: 38.0,
+    }
+}
+
+fn palette_escape_width() -> f32 {
+    34.0
+}
+
+/// The palette's "esc" key cap, which closes it.
+pub fn palette_escape(rect: Viewport) -> Viewport {
+    Viewport {
+        x: rect.x + rect.width - 16.0 - palette_escape_width(),
+        y: rect.y + 8.0 + ((38.0 - UI_CONTROL_SM) * 0.5).floor(),
+        width: palette_escape_width(),
+        height: UI_CONTROL_SM,
+    }
+}
+
 pub fn build_palette(
     palette: PaletteView<'_>,
     atlas: &mut Atlas,
@@ -1534,12 +1584,20 @@ pub fn build_palette(
         );
     }
     push_panel(out, viewport, 12.0, theme);
-    let input = Viewport {
-        x: viewport.x + PALETTE_INPUT_PAD,
-        y: viewport.y + 8.0,
-        width: (viewport.width - 74.0).max(0.0),
-        height: 38.0,
-    };
+    let input = palette_input(viewport);
+    push_icon_scaled(
+        out,
+        atlas,
+        Viewport {
+            x: viewport.x + 12.0,
+            width: PALETTE_INPUT_PAD - 16.0,
+            ..input
+        },
+        icons::SEARCH,
+        theme.gutter_text,
+        1.15,
+    );
+    hotspot(input, Cursor::Text, None);
     push_ui_field(
         out,
         atlas,
@@ -1554,23 +1612,27 @@ pub fn build_palette(
         },
         theme,
     );
-    let escape = Viewport {
-        x: viewport.x + viewport.width - 48.0,
-        y: viewport.y + 16.0,
-        width: 30.0,
-        height: 22.0,
-    };
-    push_rounded_rect(out, escape, 4.0, theme.tab_hover);
-    push_ui_text(
+    // A key cap: an outline, since a filled control vanishes on the
+    // palette's own fill, lit when the pointer is on it.
+    let escape = palette_escape(viewport);
+    push_rounded_rect(out, escape, UI_RADIUS_SM + 1.0, theme.control_pressed);
+    push_rounded_rect(
         out,
-        atlas,
         Viewport {
-            x: escape.x + 5.0,
-            ..escape
+            x: escape.x + 1.0,
+            y: escape.y + 1.0,
+            width: escape.width - 2.0,
+            height: escape.height - 2.0,
         },
-        "esc",
-        theme.status_text,
+        UI_RADIUS_SM,
+        if super::ui::hovered(escape) {
+            theme.control_hover
+        } else {
+            theme.palette_background
+        },
     );
+    push_ui_text_scaled(out, atlas, escape, "esc", theme.status_text, 0.85);
+    hotspot(escape, Cursor::Pointing, Some("Close"));
     push_rect(
         out,
         atlas,
@@ -1641,15 +1703,22 @@ pub fn build_palette(
             height: PALETTE_ROW,
         };
         if index == selected {
-            push_rounded_rect(out, rect, 6.0, theme.palette_selected);
+            push_rounded_rect(out, rect, UI_RADIUS, theme.palette_selected);
+        } else if super::ui::hovered(rect) {
+            push_rounded_rect(out, rect, UI_RADIUS, theme.row_hover);
         }
+        hotspot(rect, Cursor::Pointing, None);
         if let Some(icon) = item.icon {
-            push_text(
+            // Centred on the row, beside both of its lines.
+            push_icon_centered(
                 out,
                 atlas,
-                rect.x + 10.0,
-                y + 12.0,
-                &icon.to_string(),
+                Viewport {
+                    x: rect.x + 6.0,
+                    width: 24.0,
+                    ..rect
+                },
+                icon,
                 if index == selected {
                     theme.accent
                 } else {
@@ -2821,7 +2890,7 @@ pub fn tree_row_at(visible: usize, field: Option<SidebarField>) -> Option<usize>
 /// The segment buttons of a response strip, in [`Segment::ALL`] order.
 pub fn response_segments(atlas: &mut Atlas, strip: Viewport, labels: [&str; 3]) -> [Viewport; 3] {
     let mut x = strip.x + 16.0;
-    let y = strip.y + 38.0;
+    let y = strip.y + 39.0;
     let mut rects = [strip; 3];
     for (rect, label) in rects.iter_mut().zip(labels) {
         let width = ui_text_width(atlas, label) + 24.0;
@@ -2829,9 +2898,9 @@ pub fn response_segments(atlas: &mut Atlas, strip: Viewport, labels: [&str; 3]) 
             x,
             y,
             width,
-            height: 26.0,
+            height: UI_CONTROL,
         };
-        x += width + 6.0;
+        x += width + 4.0;
     }
     rects
 }
@@ -2857,7 +2926,7 @@ pub fn build_response_strip(
         x: strip.x + 16.0,
         y: strip.y + 6.0,
         width: ui_text_width(atlas, &status) + 20.0,
-        height: 26.0,
+        height: 28.0,
     };
     push_rounded_rect(out, pill, 6.0, [tone[0], tone[1], tone[2], 0.18]);
     push_ui_text_centered(out, atlas, pill, &status, tone);
@@ -2885,28 +2954,11 @@ pub fn build_response_strip(
         .zip(labels)
         .zip(Segment::ALL)
     {
-        let active = segment == view.segment;
-        push_rounded_rect(
-            out,
-            rect,
-            6.0,
-            if active {
-                theme.tab_active
-            } else {
-                theme.tab_hover
-            },
-        );
-        push_ui_text_centered(
-            out,
-            atlas,
-            rect,
-            label,
-            if active {
-                theme.text
-            } else {
-                theme.status_text
-            },
-        );
+        Button::new(rect)
+            .label(label)
+            .tone(Tone::Ghost)
+            .on(segment == view.segment)
+            .draw(out, atlas, theme);
     }
     push_rect(
         out,
@@ -3011,6 +3063,16 @@ pub fn build_breadcrumbs(
     let right = rect.x + rect.width - 20.0;
     let last = crumbs.len().saturating_sub(1);
     for (index, crumb) in crumbs.iter().enumerate() {
+        // Each part opens its folder's menu: it lights up like a button.
+        let pad = Viewport {
+            y: crumb.rect.y + ((crumb.rect.height - UI_CONTROL_SM) * 0.5).floor(),
+            height: UI_CONTROL_SM,
+            ..crumb.rect
+        };
+        if super::ui::hovered(crumb.rect) {
+            push_rounded_rect(out, pad, UI_RADIUS_SM, theme.control_hover);
+        }
+        hotspot(crumb.rect, Cursor::Pointing, None);
         let x = crumb.rect.x + 4.0;
         // The file itself reads brighter than the folders leading to it.
         let color = if index == last {
@@ -3043,6 +3105,11 @@ pub fn build_breadcrumbs(
                 theme.gutter_text,
             );
         }
+    }
+    // Home has no path to show: the band is part of the page, with no
+    // rule cutting an empty strip off the top of it.
+    if home && crumbs.is_empty() {
+        return;
     }
     push_rect(
         out,

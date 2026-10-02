@@ -680,6 +680,9 @@ struct State {
     /// rectangles and tooltips, and the one under the pointer.
     hotspots: Vec<layout::Hotspot>,
     hot: Option<usize>,
+    /// Where the status line's right-hand readout starts, as last drawn:
+    /// it is right-aligned, so where the branch is depends on its length.
+    status_detail_x: Option<f32>,
     /// The code font as asked for, and its size in points. The atlas holds
     /// the resolved face; this is what a rebuild at a new size starts from.
     font: String,
@@ -2091,8 +2094,8 @@ define_class!(
             if state.palette.is_some() {
                 let count = state.palette_count;
                 let rect = layout::palette_rect(state.viewport, count);
-                add(Viewport { x: rect.x + 12.0, y: rect.y + 8.0, width: rect.width - 68.0, height: 40.0 }, &NSCursor::IBeamCursor());
-                add(Viewport { x: rect.x + rect.width - 52.0, y: rect.y + 8.0, width: 40.0, height: 40.0 }, &NSCursor::pointingHandCursor());
+                // The field and esc are shared controls: their hotspots
+                // are added below, inside the palette.
                 let first = state.palette_scroll.min(layout::palette_max_scroll(count, layout::palette_visible_rows(rect)));
                 let rows = count.saturating_sub(first).min(layout::palette_visible_rows(rect));
                 add(Viewport { x: rect.x + 8.0, y: rect.y + layout::PALETTE_HEADER, width: rect.width - 16.0, height: rows as f32 * layout::PALETTE_ROW }, &NSCursor::pointingHandCursor());
@@ -6120,6 +6123,7 @@ fn status_branch_rect(state: &mut State, status: Viewport) -> Option<Viewport> {
         return None;
     }
     let detail = status_detail_rect(status);
+    let start = state.status_detail_x.unwrap_or(detail.x);
     let claude = if state.claude.as_ref().is_some_and(|c| c.is_connected()) {
         layout::ui_text_width(&mut state.renderer.atlas, "✻ Claude     ")
     } else {
@@ -6127,8 +6131,8 @@ fn status_branch_rect(state: &mut State, status: Viewport) -> Option<Viewport> {
     };
     let width = layout::ui_text_width(&mut state.renderer.atlas, &branch);
     Some(Viewport {
-        x: detail.x + claude,
-        width: width.min((detail.width - claude).max(0.0)),
+        x: start + claude,
+        width: width.min((detail.x + detail.width - start - claude).max(0.0)),
         ..status
     })
 }
@@ -7709,6 +7713,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         pointer_targets: Vec::new(),
         hotspots: Vec::new(),
         hot: None,
+        status_detail_x: None,
         font: font.to_owned(),
         font_size: size_pt,
         theme_choice: settings.theme,

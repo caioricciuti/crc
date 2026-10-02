@@ -139,7 +139,7 @@ impl EditorView {
             let rows = open_palette_rows(&state);
             let count = rows.len();
             let rect = layout::palette_rect(state.viewport, count);
-            if !rect.contains(x, y) || (x >= rect.x + rect.width - 52.0 && y < rect.y + 50.0) {
+            if !rect.contains(x, y) || layout::palette_escape(rect).contains(x, y) {
                 drop(state);
                 self.close_palette();
                 return;

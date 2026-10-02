@@ -664,10 +664,10 @@ impl Panel {
 
     pub fn hunk_action_rect(row: Viewport) -> Viewport {
         Viewport {
-            x: row.x + row.width - 80.0,
-            y: row.y + 2.0,
-            width: 72.0,
-            height: row.height - 4.0,
+            x: row.x + row.width - 96.0,
+            y: row.y + 1.0,
+            width: 88.0,
+            height: row.height - 2.0,
         }
     }
 
@@ -1734,8 +1734,20 @@ pub fn draw_diff_lines(
                 }
             }
             if let Some((label, button)) = action {
-                layout::push_rounded_rect(out, button, 4.0, theme.tab_hover);
-                layout::push_ui_text_centered(out, atlas, button, label, theme.accent);
+                Button::new(button)
+                    .label(label)
+                    .icon(if label == "Stage" {
+                        icons::ADD
+                    } else {
+                        icons::REMOVE
+                    })
+                    .radius(layout::UI_RADIUS_SM)
+                    .tip(if label == "Stage" {
+                        "Stage this hunk"
+                    } else {
+                        "Unstage this hunk"
+                    })
+                    .draw(out, atlas, theme);
             }
             continue;
         }

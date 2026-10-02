@@ -107,6 +107,7 @@ impl EditorView {
             home_hits,
             recent_projects,
             home: home_summary,
+            status_detail_x,
             unshaped_on_screen,
             completion_chips,
             conflict_scans,
@@ -806,7 +807,11 @@ impl EditorView {
             // pointer's rest away.
             layout::hotspot(left, layout::Cursor::Arrow, Some(note));
         }
-        layout::push_ui_text(
+        // Right-aligned, so the readout ends at the window's edge however
+        // long the branch name is, instead of leaving a ragged gap.
+        let detail_w = layout::ui_text_width(&mut renderer.atlas, &detail).min(right.width);
+        *status_detail_x = Some(right.x + right.width - detail_w);
+        layout::push_ui_text_right(
             glyphs,
             &mut renderer.atlas,
             right,
