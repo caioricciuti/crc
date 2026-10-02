@@ -1597,16 +1597,17 @@ mod tests {
     }
 
     #[test]
-    fn ellipsis_budgets_cells_and_keeps_joined_emoji_whole() {
-        let wide: Vec<char> = "日本語のファイル名.txt".chars().collect();
-        // Four cells hold two wide characters, not four.
-        assert_eq!(fit_cells(wide.iter(), 4), 2);
+    fn ellipsis_keeps_joined_emoji_whole() {
         let family: Vec<char> = "a👨\u{200d}👩\u{200d}👧b".chars().collect();
-        let n = fit_cells(family.iter(), 4);
-        assert!(
-            n == 1 || n == family.len() - 1,
-            "not inside the family: {n}"
-        );
+        for head in 0..family.len() {
+            let cut = middle_ellipsis(&family, head, 1);
+            let kept: Vec<char> = cut.chars().collect();
+            let at = kept.iter().position(|c| *c == '\u{2026}').unwrap();
+            assert!(
+                at == 0 || kept[at - 1] != '\u{200d}',
+                "cut inside the family at {head}: {cut}"
+            );
+        }
     }
 
     #[test]

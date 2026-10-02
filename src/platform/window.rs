@@ -798,6 +798,9 @@ struct State {
     /// The Source Control row a context menu was opened on: a change and
     /// the section it is listed under.
     context_change: Option<(usize, crate::platform::git_panel::Group)>,
+    /// The extension and the MCP row a context menu was opened on.
+    context_ext: Option<String>,
+    context_mcp: Option<crate::platform::mcp_panel::Action>,
     /// Parse trees, one per open document that has a grammar.
     syntax: SyntaxStore,
     /// Reused each frame so highlighting allocates nothing in steady state.
@@ -1089,11 +1092,10 @@ fn can_send_from(state: &State) -> bool {
 fn reveal_active_tab(state: &mut State) {
     let active = state.docs.active_index();
     if !state.tab_hits.iter().any(|hit| hit.index == active) {
+        let next = layout::tab_width_ui(&state.docs, active, &mut state.renderer.atlas);
         if let Some(last) = state.tab_hits.last()
             && active == last.index + 1
-            && last.x1
-                + layout::tab_width(&state.docs, active, state.renderer.atlas.metrics.advance)
-                <= chrome_of(state).tabs.x + chrome_of(state).tabs.width
+            && last.x1 + next <= chrome_of(state).tabs.x + chrome_of(state).tabs.width
         {
             return;
         }
@@ -3082,6 +3084,61 @@ define_class!(
             }
         }
 
+        #[unsafe(method(extContextInstall:))]
+        fn action_ext_install(&self, _sender: Option<&AnyObject>) {
+            if let Some(id) = self.state().and_then(|state| state.context_ext.clone()) {
+                self.extensions_action(crate::platform::extensions::Action::Install(id));
+            }
+        }
+
+        #[unsafe(method(extContextToggle:))]
+        fn action_ext_toggle(&self, _sender: Option<&AnyObject>) {
+            if let Some(id) = self.state().and_then(|state| state.context_ext.clone()) {
+                self.extensions_action(crate::platform::extensions::Action::Toggle(id));
+            }
+        }
+
+        #[unsafe(method(extContextUninstall:))]
+        fn action_ext_uninstall(&self, _sender: Option<&AnyObject>) {
+            if let Some(id) = self.state().and_then(|state| state.context_ext.clone()) {
+                self.extensions_action(crate::platform::extensions::Action::Uninstall(id));
+            }
+        }
+
+        #[unsafe(method(extContextDetails:))]
+        fn action_ext_details(&self, _sender: Option<&AnyObject>) {
+            if let Some(id) = self.state().and_then(|state| state.context_ext.clone()) {
+                self.extensions_action(crate::platform::extensions::Action::Select(id));
+            }
+        }
+
+        #[unsafe(method(extInstallFolder:))]
+        fn action_ext_folder(&self, _sender: Option<&AnyObject>) {
+            self.extensions_action(crate::platform::extensions::Action::InstallFolder);
+        }
+
+        #[unsafe(method(extRefresh:))]
+        fn action_ext_refresh(&self, _sender: Option<&AnyObject>) {
+            self.extensions_action(crate::platform::extensions::Action::Refresh);
+        }
+
+        #[unsafe(method(mcpContextRun:))]
+        fn action_mcp_run(&self, _sender: Option<&AnyObject>) {
+            if let Some(action) = self.state().and_then(|state| state.context_mcp.clone()) {
+                self.mcp_action(action);
+            }
+        }
+
+        #[unsafe(method(mcpEdit:))]
+        fn action_mcp_edit(&self, _sender: Option<&AnyObject>) {
+            self.mcp_action(crate::platform::mcp_panel::Action::Edit);
+        }
+
+        #[unsafe(method(mcpReload:))]
+        fn action_mcp_reload(&self, _sender: Option<&AnyObject>) {
+            self.mcp_action(crate::platform::mcp_panel::Action::Reload);
+        }
+
         #[unsafe(method(clearTerminal:))]
         fn action_clear_terminal(&self, _sender: Option<&AnyObject>) {
             self.clear_terminal();
@@ -3993,6 +4050,16 @@ impl EditorView {
         if in_sidebar && git_showing {
             let rect = sidebar.expect("in_sidebar implies a sidebar rectangle");
             return Some(self.git_context_menu(rect, x, y));
+        }
+        // Extensions and MCP Servers fill it the same way, each with its own.
+        let (extensions, mcp) = self.state().map_or((false, false), |state| {
+            (state.extensions.is_some(), state.mcp.open)
+        });
+        if in_sidebar && extensions {
+            return Some(self.extensions_context_menu(x, y));
+        }
+        if in_sidebar && mcp {
+            return Some(self.mcp_context_menu(x, y));
         }
         // The terminal has its own: copy and paste, never the document's
         // Cut or Find.
@@ -7671,6 +7738,8 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         tab_scroll_carry: 0.0,
         context_tab: None,
         context_change: None,
+        context_ext: None,
+        context_mcp: None,
         ephemeral_session: launched_with_file,
         discard_confirmed: false,
         quit_session: None,

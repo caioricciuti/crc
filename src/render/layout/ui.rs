@@ -692,6 +692,27 @@ pub fn push_skeleton_row(
     ANIMATING.with(|a| a.set(true));
 }
 
+/// A heading in bold prose at `size` points, top-left at `(x, y)`; its
+/// width. For page titles, which the 13pt UI face is too small for.
+#[allow(clippy::too_many_arguments)]
+pub fn push_title(
+    out: &mut Vec<GlyphInstance>,
+    atlas: &mut Atlas,
+    x: f32,
+    y: f32,
+    size: f32,
+    text: &str,
+    color: [f32; 4],
+    limit: f32,
+) -> f32 {
+    super::markdown::push_prose(out, atlas, x, y, size, Face::Bold, text, color, limit)
+}
+
+/// A panel of grouped facts on a page: a faint rounded card.
+pub fn push_card(out: &mut Vec<GlyphInstance>, rect: Viewport, theme: &Theme) {
+    push_rounded_rect(out, rect, UI_RADIUS + 2.0, theme.md_code_background);
+}
+
 /// What a status-line message is: news, a success, or a failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Feedback {

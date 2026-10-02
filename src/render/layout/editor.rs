@@ -1100,28 +1100,6 @@ fn is_rtl(c: char) -> bool {
         0x0590..=0x08FF | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFF | 0x10800..=0x10FFF | 0x1E800..=0x1EFFF)
 }
 
-/// How many of `chars` fit in `cells`, without ending between the parts of
-/// a joined emoji (a zero-width joiner or a variation selector and what it
-/// joins stay together).
-pub(super) fn fit_cells<'a>(chars: impl Iterator<Item = &'a char>, cells: usize) -> usize {
-    let joins = |c: char| c == '\u{200d}' || ('\u{fe00}'..='\u{fe0f}').contains(&c);
-    let chars: Vec<char> = chars.copied().collect();
-    let (mut count, mut used) = (0, 0);
-    while count < chars.len() {
-        let width = display_width(chars[count]);
-        if used + width > cells {
-            break;
-        }
-        used += width;
-        count += 1;
-    }
-    // Back off to a boundary that is not inside a joined sequence.
-    while count > 0 && count < chars.len() && (joins(chars[count]) || joins(chars[count - 1])) {
-        count -= 1;
-    }
-    count
-}
-
 /// One suggestion as the ribbon draws it.
 pub struct Chip<'a> {
     pub label: &'a str,

@@ -387,4 +387,43 @@ impl EditorView {
             }
         }
     }
+
+    /// A right-click in MCP Servers: what the row under the pointer does,
+    /// then the panel's own commands.
+    pub(super) fn mcp_context_menu(&self, x: f32, y: f32) -> Retained<NSMenu> {
+        use crate::mcp_client::Status;
+        let mtm = MainThreadMarker::from(self);
+        let menu = NSMenu::new(mtm);
+        menu.setAllowsContextMenuPlugIns(false);
+        let add = |title: &str, action: Sel| menu.addItem(&menu_item(mtm, title, action));
+        let row = self.state().and_then(|state| {
+            let action = state
+                .mcp
+                .hits
+                .iter()
+                .find(|(r, _)| r.contains(x, y))
+                .map(|(_, a)| a.clone())?;
+            let title = match &action {
+                McpAction::Toggle(si) => match state.mcp.servers.get(*si).map(|s| &s.status) {
+                    Some(Status::Ready | Status::Starting) => "Stop Server",
+                    _ => "Start Server",
+                },
+                McpAction::Tool(..) => "Call Tool\u{2026}",
+                McpAction::Prompt(..) => "Get Prompt\u{2026}",
+                McpAction::Resource(..) => "Read Resource",
+                McpAction::Edit | McpAction::Reload => return None,
+            };
+            Some((action, title))
+        });
+        if let Some((action, title)) = row {
+            if let Some(mut state) = self.state_mut() {
+                state.context_mcp = Some(action);
+            }
+            add(title, sel!(mcpContextRun:));
+            menu.addItem(&NSMenuItem::separatorItem(mtm));
+        }
+        add("Edit mcp.json", sel!(mcpEdit:));
+        add("Reload Servers", sel!(mcpReload:));
+        menu
+    }
 }

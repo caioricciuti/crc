@@ -878,3 +878,57 @@ pub(super) fn preview_command(state: &State) -> Option<ExtCommand> {
         })
         .cloned()
 }
+
+impl EditorView {
+    /// A right-click in the Extensions list: the row's own commands, or
+    /// the list's when it lands between rows.
+    pub(super) fn extensions_context_menu(&self, x: f32, y: f32) -> Retained<NSMenu> {
+        let mtm = MainThreadMarker::from(self);
+        let menu = NSMenu::new(mtm);
+        menu.setAllowsContextMenuPlugIns(false);
+        let add = |title: &str, action: Sel| menu.addItem(&menu_item(mtm, title, action));
+        let line = || menu.addItem(&NSMenuItem::separatorItem(mtm));
+        let row = self.state().and_then(|state| {
+            let page = state.extensions.as_ref()?;
+            let id = page.list_hits.iter().find_map(|(r, a)| match a {
+                crate::platform::extensions::Action::Select(id) if r.contains(x, y) => {
+                    Some(id.clone())
+                }
+                _ => None,
+            })?;
+            let installed = page.installed(&id).map(|i| i.enabled);
+            let update = match (page.installed(&id), page.available(&id)) {
+                (Some(i), Some(e)) => {
+                    crate::platform::extensions::newer(&e.manifest.version, &i.manifest.version)
+                }
+                _ => false,
+            };
+            Some((id, installed, update))
+        });
+        if let Some((id, installed, update)) = row {
+            if let Some(mut state) = self.state_mut() {
+                state.context_ext = Some(id);
+            }
+            add("Show Details", sel!(extContextDetails:));
+            line();
+            match installed {
+                None => add("Install\u{2026}", sel!(extContextInstall:)),
+                Some(enabled) => {
+                    if update {
+                        add("Update\u{2026}", sel!(extContextInstall:));
+                    }
+                    add(
+                        if enabled { "Disable" } else { "Enable" },
+                        sel!(extContextToggle:),
+                    );
+                    line();
+                    add("Uninstall", sel!(extContextUninstall:));
+                }
+            }
+            line();
+        }
+        add("Install from Folder\u{2026}", sel!(extInstallFolder:));
+        add("Check the Registry Again", sel!(extRefresh:));
+        menu
+    }
+}

@@ -305,7 +305,16 @@ fn draw_page(
     if home {
         // The header is the home page's: the title, the count, and the
         // actions that are about extensions in general.
-        text(out, atlas, x, y, 200.0, "Extensions", theme.text);
+        layout::push_title(
+            out,
+            atlas,
+            x,
+            y - 6.0,
+            20.0,
+            "Extensions",
+            theme.text,
+            260.0,
+        );
         let mut bx = right;
         for (label, action) in [
             ("Close", Action::Close),
@@ -371,16 +380,17 @@ fn draw_page(
     let dx = detail_x;
     if let Some(pending) = &page.confirm {
         let m = pending.manifest();
-        text(
+        layout::push_title(
             out,
             atlas,
             dx,
-            y,
-            detail_w,
+            y - 6.0,
+            20.0,
             &format!("Install {} {}?", m.name, m.version),
             theme.text,
+            detail_w,
         );
-        y += 30.0;
+        y += 34.0;
         if !pending.signed() {
             for line in layout::wrap_words(
                 atlas,
@@ -445,8 +455,35 @@ fn draw_page(
         page.hits = hits;
         return;
     };
-    text(out, atlas, dx, y, detail_w, &manifest.name, theme.text);
-    y += 24.0;
+    // A tile with its icon, the name large beside it, and the facts.
+    let tile = Viewport {
+        x: dx,
+        y,
+        width: 52.0,
+        height: 52.0,
+    };
+    layout::push_rounded_rect(out, tile, 12.0, theme.tab_hover);
+    layout::push_icon_scaled(
+        out,
+        atlas,
+        tile,
+        crate::project::icons::extension_icon(&manifest.icon),
+        theme.accent,
+        1.9,
+    );
+    let nx = dx + tile.width + 14.0;
+    layout::push_title(
+        out,
+        atlas,
+        nx,
+        y + 2.0,
+        20.0,
+        &manifest.name,
+        theme.text,
+        detail_w - 66.0,
+    );
+    let header_y = y;
+    y += 30.0;
     let mut facts = vec![manifest.version.clone(), manifest.license.clone()];
     if !manifest.authors.is_empty() {
         facts.push(format!("by {}", manifest.authors.join(", ")));
@@ -457,8 +494,16 @@ fn draw_page(
         Some(_) => "unsigned".into(),
         None => "signed".into(),
     });
-    text(out, atlas, dx, y, detail_w, &facts.join(" \u{b7} "), dim);
-    y += 30.0;
+    text(
+        out,
+        atlas,
+        nx,
+        y,
+        detail_w - 66.0,
+        &facts.join(" \u{b7} "),
+        dim,
+    );
+    y = header_y + tile.height + 18.0;
 
     // What can be done with it here.
     let mut bx = dx;
@@ -502,44 +547,82 @@ fn draw_page(
         text(out, atlas, dx, y, detail_w, &line, theme.text);
         y += 20.0;
     }
-    y += 12.0;
-    text(out, atlas, dx, y, detail_w, "May:", dim);
-    y += 22.0;
-    for capability in &manifest.capabilities {
+    y += 14.0;
+    // What it may touch and what it adds, each on a card with a heading,
+    // one line per item behind an icon.
+    let card = |out: &mut Vec<GlyphInstance>,
+                atlas: &mut Atlas,
+                y: f32,
+                heading: &str,
+                glyph: char,
+                items: &[String]|
+     -> f32 {
+        let height = 34.0 + items.len().max(1) as f32 * 22.0 + 8.0;
+        layout::push_card(
+            out,
+            Viewport {
+                x: dx,
+                y,
+                width: detail_w,
+                height,
+            },
+            theme,
+        );
         text(
             out,
             atlas,
-            dx + 12.0,
-            y,
-            detail_w - 12.0,
-            &format!("\u{2022} {}", capability.describe()),
-            theme.text,
+            dx + 14.0,
+            y + 10.0,
+            detail_w - 28.0,
+            &heading.to_uppercase(),
+            dim,
         );
-        y += 20.0;
-    }
-    y += 12.0;
-    text(
+        let mut ry = y + 34.0;
+        if items.is_empty() {
+            text(out, atlas, dx + 14.0, ry, detail_w - 28.0, "Nothing", dim);
+        }
+        for item in items {
+            let w = layout::icon_width(atlas, glyph);
+            layout::push_icon_centered(
+                out,
+                atlas,
+                Viewport {
+                    x: dx + 14.0,
+                    y: ry,
+                    width: w,
+                    height: 20.0,
+                },
+                glyph,
+                theme.accent,
+            );
+            text(
+                out,
+                atlas,
+                dx + 14.0 + w + 8.0,
+                ry,
+                detail_w - 36.0 - w,
+                item,
+                theme.text,
+            );
+            ry += 22.0;
+        }
+        y + height
+    };
+    let may: Vec<String> = manifest
+        .capabilities
+        .iter()
+        .map(|c| c.describe().to_owned())
+        .collect();
+    y = card(out, atlas, y, "It may", crate::project::icons::CHECK, &may) + 12.0;
+    let commands: Vec<String> = manifest.commands.iter().map(|c| c.title.clone()).collect();
+    y = card(
         out,
         atlas,
-        dx,
         y,
-        detail_w,
-        "Commands, in the Extensions menu, the right-click menu and the palette:",
-        dim,
+        "Commands: Extensions menu, right-click, palette",
+        crate::project::icons::CHEVRON_RIGHT,
+        &commands,
     );
-    y += 22.0;
-    for command in &manifest.commands {
-        text(
-            out,
-            atlas,
-            dx + 12.0,
-            y,
-            detail_w - 12.0,
-            &format!("\u{2022} {}", command.title),
-            theme.text,
-        );
-        y += 20.0;
-    }
     if let Some(log) = page.logs.get(&id).filter(|l| !l.is_empty()) {
         y += 12.0;
         text(out, atlas, dx, y, detail_w, "Log:", dim);

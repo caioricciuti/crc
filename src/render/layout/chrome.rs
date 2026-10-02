@@ -1261,7 +1261,21 @@ pub(super) fn project_label(atlas: &mut Atlas, name: &str, width: f32) -> String
 }
 
 /// The first `head` and last `tail` characters joined by an ellipsis.
+///
+/// Neither cut lands inside a joined emoji: a zero-width joiner or a
+/// variation selector stays with what it joins.
 pub(super) fn middle_ellipsis(chars: &[char], head: usize, tail: usize) -> String {
+    let joins = |c: char| c == '\u{200d}' || ('\u{fe00}'..='\u{fe0f}').contains(&c);
+    let mut head = head.min(chars.len());
+    while head > 0 && head < chars.len() && (joins(chars[head]) || joins(chars[head - 1])) {
+        head -= 1;
+    }
+    let mut tail = tail.min(chars.len() - head);
+    let mut from = chars.len() - tail;
+    while tail > 0 && from > head && (joins(chars[from]) || joins(chars[from - 1])) {
+        tail -= 1;
+        from += 1;
+    }
     chars[..head]
         .iter()
         .chain(std::iter::once(&'\u{2026}'))
@@ -1862,21 +1876,49 @@ pub fn build_tab_bar(
 /// not fit from there (or is that tab), in which case as many tabs before
 /// the active one as fit in `width`.
 pub fn tab_strip_start(docs: &Documents, requested: usize, width: f32, advance: f32) -> usize {
+    tab_strip_start_by(docs, requested, width, |index| {
+        tab_width(docs, index, advance)
+    })
+}
+
+/// The icon a tab leads with, if any.
+fn tab_icon(docs: &Documents, index: usize) -> Option<icons::Icon> {
+    match docs.iter().nth(index).and_then(|b| b.path.as_deref()) {
+        Some(path) => Some(icons::for_file(path)),
+        None if docs.is_home() => Some(icons::Icon { glyph: icons::HOME }),
+        None => None,
+    }
+}
+
+/// A tab's width with its title measured in the UI font it is drawn in.
+/// [`tab_width`] counts monospace cells, which a proportional title does
+/// not fill: every tab had a different amount of air after its name.
+pub fn tab_width_ui(docs: &Documents, index: usize, atlas: &mut Atlas) -> f32 {
+    let icon = tab_icon(docs, index).map_or(0.0, |i| icon_width(atlas, i.glyph) + 6.0);
+    let label = ui_text_width(atlas, &docs.title(index));
+    (icon + label + TAB_PADDING_X * 2.0 + TAB_CLOSE_SLOT + 4.0).clamp(TAB_MIN_WIDTH, TAB_MAX_WIDTH)
+}
+
+/// [`tab_strip_start`] with the widths given by `width_of`.
+pub fn tab_strip_start_by(
+    docs: &Documents,
+    requested: usize,
+    width: f32,
+    mut width_of: impl FnMut(usize) -> f32,
+) -> usize {
     let requested = requested.min(docs.len().saturating_sub(1));
     let active = docs.active_index();
-    let fits_from = |start: usize, target: usize| {
-        let used: f32 = (start..=target)
-            .map(|index| tab_width(docs, index, advance))
-            .sum();
+    let mut fits_from = |start: usize, target: usize| {
+        let used: f32 = (start..=target).map(&mut width_of).sum();
         used <= width
     };
     if active >= requested && fits_from(requested, active) && requested != active {
         return requested;
     }
     let mut start = active;
-    let mut used = tab_width(docs, active, advance);
+    let mut used = width_of(active);
     while start > 0 {
-        let previous = tab_width(docs, start - 1, advance);
+        let previous = width_of(start - 1);
         if used + previous > width {
             break;
         }
@@ -1902,10 +1944,8 @@ pub fn build_tab_bar_in(
 ) {
     hits.clear();
     let m = atlas.metrics;
-    let (cell_w, cell_h) = atlas.cell_size();
     let solid = atlas.solid_uv();
     let hairline = 1.0 / m.scale;
-    let glyph_dy = m.glyph_dy(viewport.height);
 
     // The strip is DARKER than the editor and the active tab is exactly the
     // editor colour. That inversion is the whole fix: the active tab stops
@@ -1919,31 +1959,25 @@ pub fn build_tab_bar_in(
         ..Default::default()
     });
 
-    let start = tab_strip_start(docs, first, viewport.width, m.advance);
+    let widths: Vec<f32> = (0..docs.len())
+        .map(|index| tab_width_ui(docs, index, atlas))
+        .collect();
+    let start = tab_strip_start_by(docs, first, viewport.width, |index| widths[index]);
 
     let mut x = viewport.x;
     let mut active_span: Option<(f32, f32)> = None;
 
-    for index in start.min(docs.len())..docs.len() {
+    for (index, &natural_width) in widths.iter().enumerate().skip(start.min(docs.len())) {
         let active = index == docs.active_index();
         let dirty = docs.iter().nth(index).is_some_and(|b| b.is_dirty());
         let title = docs.title(index);
 
-        // The file's icon leads the title: two cells and one of air.
-        const ICON_CELLS: usize = 3;
-        let icon = match docs.iter().nth(index).and_then(|b| b.path.as_deref()) {
-            Some(path) => Some(icons::for_file(path)),
-            None if docs.is_home() => Some(icons::Icon { glyph: icons::HOME }),
-            None => None,
-        };
-        let lead = if icon.is_some() { ICON_CELLS } else { 0 };
-
-        let label_cells: usize = title.chars().map(display_width).sum();
+        // The file's icon leads the title, then a little air.
+        let icon = tab_icon(docs, index);
         let remaining = viewport.x + viewport.width - x;
         if remaining <= 0.0 {
             break;
         }
-        let natural_width = tab_width(docs, index, m.advance);
         if natural_width > remaining && !hits.is_empty() {
             break;
         }
@@ -2000,42 +2034,31 @@ pub fn build_tab_bar_in(
             theme.tab_text_inactive
         };
         let mut label_x = x + TAB_PADDING_X;
-        if let Some(icon) = icon
-            && let Some(slot) = atlas.slot_for(icon.glyph)
-        {
-            out.push(GlyphInstance {
-                pos: [label_x, viewport.y + glyph_dy],
-                size: [cell_w * slot.cells as f32, cell_h],
-                uv: slot.uv,
-                flags: slot.flags(),
+        if let Some(icon) = icon {
+            let w = icon_width(atlas, icon.glyph);
+            push_icon_centered(
+                out,
+                atlas,
+                Viewport {
+                    x: label_x,
+                    width: w,
+                    ..viewport
+                },
+                icon.glyph,
                 // Dimmed with the rest of an inactive tab, so the active one
                 // is still the one that stands out.
-                color: if active {
+                if active {
                     theme.accent
                 } else {
                     theme.tab_text_inactive
                 },
-                ..Default::default()
-            });
+            );
+            label_x += w + 6.0;
         }
-        label_x += lead as f32 * m.advance;
-        let room = (((width - TAB_PADDING_X * 2.0 - TAB_CLOSE_SLOT) / m.advance).floor() as usize)
-            .saturating_sub(lead);
-        let shown: String = if label_cells > room && room > 1 {
-            // Middle ellipsis keeps the extension visible, which is the half
-            // people actually scan for.
-            // Budgeted in cells, as `room` is: a CJK or emoji name takes two
-            // per character, and counting characters drew it twice as wide.
-            let keep = room - 1;
-            let head_cells = keep / 2;
-            let tail_cells = keep - head_cells;
-            let chars: Vec<char> = title.chars().collect();
-            let head = fit_cells(chars.iter(), head_cells);
-            let tail = fit_cells(chars[head..].iter().rev(), tail_cells);
-            middle_ellipsis(&chars, head, tail)
-        } else {
-            title
-        };
+        // Middle ellipsis keeps the extension visible, which is the half
+        // people actually scan for; measured in the font it is drawn in.
+        let room = (x + width - TAB_PADDING_X - TAB_CLOSE_SLOT - label_x).max(0.0);
+        let shown = project_label(atlas, &title, room);
         push_ui_text(
             out,
             atlas,
