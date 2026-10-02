@@ -396,6 +396,10 @@ pub enum HomeAction {
     NewFile,
     FindFile,
     OpenProject(std::path::PathBuf),
+    /// Open these files, the last one shown.
+    OpenFiles(Vec<std::path::PathBuf>),
+    /// Show this repository in Source Control.
+    ShowRepo(std::path::PathBuf),
 }
 
 /// A clickable row on the home screen.
@@ -411,6 +415,7 @@ pub struct HomeHit {
 /// you click, the project's recent folders, and the UI font instead of a
 /// monospace table. Appends to `out`; the caller clears and paints the
 /// background first, as for every other panel. `hits` receives the rows.
+#[allow(clippy::too_many_arguments)]
 pub fn build_home(
     out: &mut Vec<GlyphInstance>,
     atlas: &mut Atlas,
@@ -418,6 +423,7 @@ pub fn build_home(
     theme: &Theme,
     project: Option<&std::path::Path>,
     recent: &[std::path::PathBuf],
+    summary: Option<&crate::project::workspace::Summary>,
     hits: &mut Vec<HomeHit>,
 ) {
     const ROW: f32 = 30.0;
@@ -527,6 +533,10 @@ pub fn build_home(
         y += ROW;
     }
     y += GAP;
+
+    if let Some(summary) = summary {
+        y = home_workspace(out, atlas, theme, (x, width), y, bottom, summary, hits);
+    }
 
     // Recent: folders opened before, name first, path dimmed after it.
     let recent: Vec<&std::path::PathBuf> = recent
@@ -663,6 +673,268 @@ pub fn build_home(
             dim,
         );
     }
+}
+
+/// One clickable Home row: an icon, a label, and a dimmed detail after it.
+/// Returns the row's rectangle.
+#[allow(clippy::too_many_arguments)]
+fn home_row(
+    out: &mut Vec<GlyphInstance>,
+    atlas: &mut Atlas,
+    theme: &Theme,
+    (x, width): (f32, f32),
+    y: f32,
+    glyph: char,
+    label: &str,
+    detail: &str,
+) -> Viewport {
+    const ROW: f32 = 30.0;
+    push_icon_centered(
+        out,
+        atlas,
+        Viewport {
+            x,
+            y,
+            width: 24.0,
+            height: ROW,
+        },
+        glyph,
+        theme.status_text,
+    );
+    let label_w = (ui_text_width(atlas, label) + 4.0).min(width * 0.6);
+    push_ui_text(
+        out,
+        atlas,
+        Viewport {
+            x: x + 32.0,
+            y: y + 5.0,
+            width: label_w,
+            height: 20.0,
+        },
+        label,
+        theme.text,
+    );
+    push_ui_text(
+        out,
+        atlas,
+        Viewport {
+            x: x + 32.0 + label_w + 10.0,
+            y: y + 5.0,
+            width: (width - 32.0 - label_w - 10.0).max(0.0),
+            height: 20.0,
+        },
+        detail,
+        theme.status_text,
+    );
+    Viewport {
+        x: x - 8.0,
+        y,
+        width: width + 16.0,
+        height: ROW,
+    }
+}
+
+/// Home's workspace sections: what waits on you, the repositories, and
+/// what changed since the last visit. Each is left out when empty or when
+/// it no longer fits. Returns where the next section starts.
+#[allow(clippy::too_many_arguments)]
+fn home_workspace(
+    out: &mut Vec<GlyphInstance>,
+    atlas: &mut Atlas,
+    theme: &Theme,
+    (x, width): (f32, f32),
+    mut y: f32,
+    bottom: f32,
+    summary: &crate::project::workspace::Summary,
+    hits: &mut Vec<HomeHit>,
+) -> f32 {
+    const ROW: f32 = 30.0;
+    const GAP: f32 = 18.0;
+    let dim = theme.status_text;
+    let section = |out: &mut Vec<GlyphInstance>, atlas: &mut Atlas, y: &mut f32, title: &str| {
+        push_ui_text(
+            out,
+            atlas,
+            Viewport {
+                x,
+                y: *y,
+                width,
+                height: 20.0,
+            },
+            title,
+            dim,
+        );
+        *y += 22.0;
+        push_rect(out, atlas, [x, *y - 4.0], [width, 1.0], theme.hairline);
+    };
+    let settings = &summary.settings;
+
+    // The session: the state doc to start from, the log and state to end with.
+    let mut session = Vec::new();
+    if let Some(state) = &settings.state {
+        session.push((
+            icons::FILE,
+            "Start Session",
+            "read where things stand",
+            HomeAction::OpenFiles(vec![state.clone()]),
+        ));
+        let mut end = Vec::new();
+        end.extend(settings.log.clone());
+        end.push(state.clone());
+        session.push((
+            icons::HISTORY,
+            "End Session",
+            if settings.log.is_some() {
+                "update the log and the state"
+            } else {
+                "update the state"
+            },
+            HomeAction::OpenFiles(end),
+        ));
+    }
+    if !session.is_empty() && y + 22.0 + ROW <= bottom {
+        section(out, atlas, &mut y, "Session");
+        for (glyph, label, detail, action) in session {
+            if y + ROW > bottom {
+                break;
+            }
+            let rect = home_row(out, atlas, theme, (x, width), y, glyph, label, detail);
+            hits.push(HomeHit { rect, action });
+            y += ROW;
+        }
+        y += GAP;
+    }
+
+    if !summary.waiting.is_empty()
+        && let Some(state) = &settings.state
+        && y + 22.0 + ROW <= bottom
+    {
+        section(out, atlas, &mut y, "Waiting on you");
+        for item in &summary.waiting {
+            if y + ROW > bottom {
+                break;
+            }
+            push_rect(out, atlas, [x + 9.0, y + 13.0], [5.0, 5.0], theme.accent);
+            push_ui_text(
+                out,
+                atlas,
+                Viewport {
+                    x: x + 32.0,
+                    y: y + 5.0,
+                    width: width - 32.0,
+                    height: 20.0,
+                },
+                item,
+                theme.text,
+            );
+            hits.push(HomeHit {
+                rect: Viewport {
+                    x: x - 8.0,
+                    y,
+                    width: width + 16.0,
+                    height: ROW,
+                },
+                action: HomeAction::OpenFiles(vec![state.clone()]),
+            });
+            y += ROW;
+        }
+        y += GAP;
+    }
+
+    if !summary.repos.is_empty() && y + 22.0 + ROW <= bottom {
+        section(out, atlas, &mut y, "Repositories");
+        for repo in &summary.repos {
+            if y + ROW > bottom {
+                break;
+            }
+            let detail = match repo.changes {
+                0 => repo.status.clone(),
+                1 => format!("{}  ·  1 change", repo.status),
+                n => format!("{}  ·  {n} changes", repo.status),
+            };
+            let rect = home_row(
+                out,
+                atlas,
+                theme,
+                (x, width),
+                y,
+                icons::FOLDER,
+                &repo.label,
+                &detail,
+            );
+            hits.push(HomeHit {
+                rect,
+                action: HomeAction::ShowRepo(repo.path.clone()),
+            });
+            y += ROW;
+        }
+        y += GAP;
+    }
+
+    let committed: Vec<_> = summary
+        .repos
+        .iter()
+        .filter(|r| !r.commits.is_empty())
+        .collect();
+    if summary.since.is_some()
+        && (!committed.is_empty() || !summary.notes.is_empty())
+        && y + 22.0 + ROW <= bottom
+    {
+        section(out, atlas, &mut y, "Since you were last here");
+        for repo in committed {
+            if y + ROW > bottom {
+                break;
+            }
+            let detail = match repo.commits.len() {
+                1 => format!("1 commit: {}", repo.commits[0]),
+                n => format!("{n} commits, latest: {}", repo.commits[0]),
+            };
+            let rect = home_row(
+                out,
+                atlas,
+                theme,
+                (x, width),
+                y,
+                icons::HISTORY,
+                &repo.label,
+                &detail,
+            );
+            hits.push(HomeHit {
+                rect,
+                action: HomeAction::ShowRepo(repo.path.clone()),
+            });
+            y += ROW;
+        }
+        for note in &summary.notes {
+            if y + ROW > bottom {
+                break;
+            }
+            let label = note
+                .file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+            let detail = note
+                .parent()
+                .map(|p| shorten_home(&p.display().to_string()))
+                .unwrap_or_default();
+            let rect = home_row(
+                out,
+                atlas,
+                theme,
+                (x, width),
+                y,
+                icons::FILE,
+                &label,
+                &detail,
+            );
+            hits.push(HomeHit {
+                rect,
+                action: HomeAction::OpenFiles(vec![note.clone()]),
+            });
+            y += ROW;
+        }
+        y += GAP;
+    }
+    y
 }
 
 /// `/Users/name/...` as `~/...`, the way people read their own paths.
@@ -2628,6 +2900,7 @@ mod home_tests {
             &Theme::default(),
             Some(&here),
             &recent,
+            None,
             &mut hits,
         );
         let actions: Vec<&HomeAction> = hits.iter().map(|h| &h.action).collect();
@@ -2655,6 +2928,70 @@ mod home_tests {
     }
 
     #[test]
+    fn a_workspace_adds_its_session_waiting_repositories_and_changes() {
+        use crate::project::workspace::{RepoSummary, Settings, Summary};
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let mut out = Vec::new();
+        let mut hits = Vec::new();
+        let rect = Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: 860.0,
+            height: 1400.0,
+        };
+        let root = std::path::PathBuf::from("/tmp/garden-log");
+        let state = root.join("docs/state.md");
+        let log = root.join("docs/log.md");
+        let repo = |name: &str, commits: &[&str]| RepoSummary {
+            path: root.join(name),
+            label: name.into(),
+            status: "main".into(),
+            changes: 1,
+            commits: commits.iter().map(|c| c.to_string()).collect(),
+        };
+        let summary = Summary {
+            settings: Settings {
+                state: Some(state.clone()),
+                log: Some(log.clone()),
+                waiting_heading: None,
+            },
+            waiting: vec!["Water the tomatoes".into()],
+            repos: vec![
+                repo("app", &["fix the watering schedule"]),
+                repo("site", &[]),
+            ],
+            notes: vec![root.join("docs/plants.md")],
+            since: Some(1),
+        };
+        build_home(
+            &mut out,
+            &mut atlas,
+            rect,
+            &Theme::default(),
+            Some(&root),
+            &[],
+            Some(&summary),
+            &mut hits,
+        );
+        let actions: Vec<HomeAction> = hits.iter().map(|h| h.action.clone()).collect();
+        assert_eq!(
+            actions[3..],
+            [
+                HomeAction::OpenFiles(vec![state.clone()]),
+                HomeAction::OpenFiles(vec![log, state.clone()]),
+                HomeAction::OpenFiles(vec![state]),
+                HomeAction::ShowRepo(root.join("app")),
+                HomeAction::ShowRepo(root.join("site")),
+                HomeAction::ShowRepo(root.join("app")),
+                HomeAction::OpenFiles(vec![root.join("docs/plants.md")]),
+            ]
+        );
+        for pair in hits.windows(2) {
+            assert!(pair[0].rect.y + pair[0].rect.height <= pair[1].rect.y + 0.01);
+        }
+    }
+
+    #[test]
     fn a_tiny_pane_draws_nothing_rather_than_overflowing() {
         let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
         let mut out = Vec::new();
@@ -2672,6 +3009,7 @@ mod home_tests {
             &Theme::default(),
             None,
             &[],
+            None,
             &mut hits,
         );
         assert!(hits.is_empty());

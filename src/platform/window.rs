@@ -122,6 +122,9 @@ fn set_project_root(state: &mut State, dir: &Path) {
     state.tree.set_root(dir);
     state.workspace = crate::project::workspace::Workspace::open(dir);
     state.git = git_panel_for(&state.workspace);
+    state.home = None;
+    state.home_since = visit_workspace(dir);
+    start_home_summary(state);
     state.tree_version = 0;
     state.watch.children_pending.clear();
     state.finder = Finder::new();
@@ -620,6 +623,11 @@ struct State {
     git: crate::platform::git_panel::Panel,
     /// The open folder's repositories; Source Control shows one.
     workspace: crate::project::workspace::Workspace,
+    /// What Home shows for the workspace, and the read in flight.
+    home: Option<crate::project::workspace::Summary>,
+    home_rx: Option<mpsc::Receiver<crate::project::workspace::Summary>>,
+    /// The workspace's previous visit, for "since you were last here".
+    home_since: Option<u64>,
     git_open: bool,
     /// The tab a Source Control diff is shown in, by buffer id. The diff
     /// is on screen exactly when that tab is the active one.
@@ -1759,6 +1767,15 @@ define_class!(
                         layout::HomeAction::OpenProject(path) => {
                             self.load_folder_path(&path.to_string_lossy());
                         }
+                        layout::HomeAction::OpenFiles(paths) => {
+                            for path in paths {
+                                self.run_pick(Pick::File(path));
+                            }
+                        }
+                        layout::HomeAction::ShowRepo(path) => {
+                            self.select_repo(&path);
+                            self.set_sidebar_view(true);
+                        }
                     }
                     self.request_redraw();
                     self.pump();
@@ -2227,6 +2244,7 @@ define_class!(
             self.poll_project_index();
             self.poll_project_search();
             self.poll_branches();
+            self.poll_home();
             self.poll_reloads();
             if self
                 .state_mut().is_some_and(|mut state| state.symbols.poll())
@@ -5361,6 +5379,7 @@ fn draw_other_pane(
             theme,
             tree.root(),
             &[],
+            None,
             &mut hits,
         );
         return;
@@ -5936,6 +5955,35 @@ fn repo_rows(repos: &[RepoRow], query: &str) -> Vec<(layout::PaletteRow, Pick)> 
             )
         })
         .collect()
+}
+
+/// The previous visit to the workspace at `root`, recording this one.
+fn visit_workspace(root: &Path) -> Option<u64> {
+    let before = crate::project::workspace::last_seen(root);
+    crate::project::workspace::mark_seen(root, crate::platform::unix_seconds());
+    before
+}
+
+/// Reads what Home shows on a worker; the answer replaces the last one.
+fn spawn_home_summary(
+    workspace: crate::project::workspace::Workspace,
+    since: Option<u64>,
+) -> mpsc::Receiver<crate::project::workspace::Summary> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(workspace.summary(since));
+    });
+    rx
+}
+
+/// Reads Home's workspace sections again, when a project is open.
+fn start_home_summary(state: &mut State) {
+    if state.tree.root().is_some() {
+        state.home_rx = Some(spawn_home_summary(
+            state.workspace.clone(),
+            state.home_since,
+        ));
+    }
 }
 
 /// Source Control for the workspace's selected repository, named in its
@@ -6902,13 +6950,17 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         }
     }
 
-    let workspace = crate::project::workspace::Workspace::open(
-        &tree
-            .root()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default()),
-    );
+    let workspace = match tree.root() {
+        Some(root) => crate::project::workspace::Workspace::open(root),
+        None => crate::project::workspace::Workspace::unopened(
+            &std::env::current_dir().unwrap_or_default(),
+        ),
+    };
     let git = git_panel_for(&workspace);
+    let home_since = tree.root().and_then(visit_workspace);
+    let home_rx = tree
+        .root()
+        .map(|_| spawn_home_summary(workspace.clone(), home_since));
     let recent_projects = with_recent(session.recent.clone(), tree.root());
     // Read once: each field below used to parse config.toml again.
     let settings = crate::platform::settings::Settings::load();
@@ -6981,6 +7033,9 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         branch_list: None,
         repo_list: None,
         workspace,
+        home: None,
+        home_rx,
+        home_since,
         branch_rx: None,
         organize_on_save: settings.organize_imports_on_save,
         extensions: None,

@@ -185,6 +185,7 @@ impl State {
             && self.http.is_none()
             && self.update.is_none()
             && self.branch_rx.is_none()
+            && self.home_rx.is_none()
             && self.reloads.pending.is_empty()
             && !self.symbols.pending()
             && self

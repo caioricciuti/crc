@@ -86,6 +86,7 @@ impl EditorView {
             state.watch.git_changed_at = None;
             state.gutter.docs.clear();
             state.git.refresh();
+            start_home_summary(&mut state);
         }
         let Some(at) = state.watch.tree_changed_at else {
             return;
@@ -98,6 +99,7 @@ impl EditorView {
             indexer.poke();
         }
         start_project_refresh(&mut state);
+        start_home_summary(&mut state);
         if state.git_open {
             state.git.refresh();
         }

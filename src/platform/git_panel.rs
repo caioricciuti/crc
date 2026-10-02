@@ -271,26 +271,9 @@ impl Panel {
     }
     /// The branch and how far it is from its upstream: `main ↑2 ↓1`.
     pub fn branch_status(&self) -> String {
-        let Some(snapshot) = &self.snapshot else {
-            return String::new();
-        };
-        let header = &snapshot.branch;
-        let mut out = self.branch();
-        if let Some(open) = header.find('[') {
-            let counts = &header[open + 1..header.rfind(']').unwrap_or(header.len())];
-            for part in counts.split(", ") {
-                if let Some(n) = part.strip_prefix("ahead ") {
-                    out.push_str(&format!(" ↑{n}"));
-                } else if let Some(n) = part.strip_prefix("behind ") {
-                    out.push_str(&format!(" ↓{n}"));
-                }
-            }
-        }
-        if let Some(what) = snapshot.in_progress {
-            out.push_str(" · ");
-            out.push_str(what.label());
-        }
-        out
+        self.snapshot
+            .as_ref()
+            .map_or_else(String::new, snapshot_status)
     }
     /// Whether `path`, absolute, is unmerged as of the last status.
     pub fn is_conflicted(&self, path: &std::path::Path) -> bool {
@@ -1369,6 +1352,28 @@ pub fn draw_diff_lines(
 /// The branch from the status header: `main` from `main...origin/main
 /// [ahead 1]`, `No commits yet on main` or `Initial commit on main`, and
 /// `detached HEAD` for `HEAD (no branch)`.
+/// A repository's branch, how far it is from its upstream, and any
+/// operation in progress: `main ↑2 ↓1 · merging`.
+pub fn snapshot_status(snapshot: &Snapshot) -> String {
+    let header = &snapshot.branch;
+    let mut out = branch_name(header);
+    if let Some(open) = header.find('[') {
+        let counts = &header[open + 1..header.rfind(']').unwrap_or(header.len())];
+        for part in counts.split(", ") {
+            if let Some(n) = part.strip_prefix("ahead ") {
+                out.push_str(&format!(" ↑{n}"));
+            } else if let Some(n) = part.strip_prefix("behind ") {
+                out.push_str(&format!(" ↓{n}"));
+            }
+        }
+    }
+    if let Some(what) = snapshot.in_progress {
+        out.push_str(" · ");
+        out.push_str(what.label());
+    }
+    out
+}
+
 fn branch_name(header: &str) -> String {
     let header = header
         .strip_prefix("No commits yet on ")

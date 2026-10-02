@@ -494,7 +494,7 @@ impl EditorView {
                 };
                 let report = format!(
                     // First: the report ends with the document's text.
-                    "message: {}\npreview: {}\nmd: {md}\nactivity: {}\npointer_targets: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nrepo: {}\ngit_changes: {}\nconflicts: {}\ngit_conflicts: {}\nblame: {}\nfind_results: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\n{report}",
+                    "message: {}\npreview: {}\nmd: {md}\nactivity: {}\npointer_targets: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nrepo: {}\ngit_changes: {}\nhome: {}\nconflicts: {}\ngit_conflicts: {}\nblame: {}\nfind_results: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\n{report}",
                     state.message.as_ref().map_or("", |(text, _)| text.as_str()),
                     state.html_preview.as_ref().map_or("closed".to_string(), |p| format!(
                         "open ext={} view={} probe={}",
@@ -566,6 +566,18 @@ impl EditorView {
                     state.git.branch_status(),
                     state.git.repo.as_deref().unwrap_or(""),
                     state.git.snapshot.as_ref().map_or(0, |s| s.changes.len()),
+                    state.home.as_ref().map_or("none".to_string(), |h| format!(
+                        "waiting={} repos={} commits={} notes={} hits={}",
+                        h.waiting.join("|"),
+                        h.repos
+                            .iter()
+                            .map(|r| format!("{}:{}:{}", r.label, r.status, r.changes))
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        h.repos.iter().map(|r| r.commits.len()).sum::<usize>(),
+                        h.notes.len(),
+                        state.home_hits.len(),
+                    )),
                     active_conflicts(&state).map_or("none".to_string(), |v| format!(
                         "{} side={} unmerged={} resolvable={} scroll={}",
                         v.conflicts.len(),

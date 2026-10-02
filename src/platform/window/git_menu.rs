@@ -94,6 +94,34 @@ impl EditorView {
         self.pump();
     }
 
+    /// Takes Home's workspace sections when the worker has read them.
+    pub(super) fn poll_home(&self) {
+        {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            let Some(rx) = &state.home_rx else { return };
+            match rx.try_recv() {
+                Ok(summary) => {
+                    state.home_rx = None;
+                    if state.home.as_ref() == Some(&summary) {
+                        return;
+                    }
+                    state.home = Some(summary);
+                }
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    state.home_rx = None;
+                    return;
+                }
+            }
+        }
+        self.request_redraw();
+        if let Some(window) = self.window() {
+            window.invalidateCursorRectsForView(self);
+        }
+    }
+
     pub(super) fn poll_branches(&self) {
         let reply = {
             let Some(mut state) = self.state_mut() else {

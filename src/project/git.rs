@@ -355,6 +355,21 @@ fn run(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     )
 }
 
+/// Subjects of the commits on HEAD made after `since` (Unix seconds),
+/// newest first, at most `limit`.
+pub fn commits_since(root: &Path, since: u64, limit: usize) -> Result<Vec<String>, String> {
+    // Git counts a commit made in the same second as `since`; it is not
+    // after it.
+    let since = format!("--since=@{}", since.saturating_add(1));
+    let limit = format!("--max-count={limit}");
+    let out = run(root, &["log", &since, &limit, "--format=%s"])?;
+    Ok(String::from_utf8_lossy(&out)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
 /// Files Git would show under `directory`: tracked ones and untracked
 /// ones it does not ignore, joined onto `directory`. What the project
 /// index reads.
@@ -1261,6 +1276,31 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn commits_since_are_strictly_after_the_visit() {
+        let base = TempRepo::new("since");
+        let dir = base.path();
+        run(dir, &["init", "--quiet"]).unwrap();
+        for (key, value) in [
+            ("user.name", "test"),
+            ("user.email", "test@example.invalid"),
+            ("commit.gpgsign", "false"),
+        ] {
+            run(dir, &["config", key, value]).unwrap();
+        }
+        std::fs::write(dir.join("a.txt"), "a").unwrap();
+        run(dir, &["add", "a.txt"]).unwrap();
+        run(dir, &["commit", "--quiet", "-m", "plant the beans"]).unwrap();
+        let at: u64 = String::from_utf8(run(dir, &["log", "-1", "--format=%ct"]).unwrap())
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(commits_since(dir, at - 1, 5).unwrap(), ["plant the beans"]);
+        // A visit in the same second as the commit came after it.
+        assert!(commits_since(dir, at, 5).unwrap().is_empty());
     }
 
     #[test]

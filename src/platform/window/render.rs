@@ -102,6 +102,7 @@ impl EditorView {
             gutter: Gutter { docs: gutter, .. },
             home_hits,
             recent_projects,
+            home: home_summary,
             unshaped_on_screen,
             completion_chips,
             conflict_scans,
@@ -254,6 +255,7 @@ impl EditorView {
                 theme,
                 tree.root(),
                 recent_projects,
+                home_summary.as_ref(),
                 home_hits,
             );
         } else {

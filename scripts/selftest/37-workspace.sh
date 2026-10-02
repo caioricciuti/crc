@@ -67,3 +67,29 @@ SCRIPT
 CRC_SELFTEST="$T/ws-plain.script" "$BIN" "$T/ws/app" 2> "$T/ws-plain.err"
 expect "$T/ws-plain.out" repo ""
 expect "$T/ws-plain.out" git_changes 1
+
+# ---- Home for a workspace ----------------------------------------------------
+# The state doc's "waiting" list and each repository are on Home; the
+# state doc, written after the launches above, is a note changed since
+# the last visit. A second visit lists the commits made since the first.
+mkdir -p "$T/ws/.crc"
+printf 'state = "docs/state.md"\nwaiting_heading = "for me"\n' > "$T/ws/.crc/workspace.toml"
+printf '# State\n\n## Open, for me\n\n- Water the tomatoes\n- Read the seed catalogue\n' > "$T/ws/docs/state.md"
+cat > "$T/ws-home.script" <<SCRIPT
+wait 800
+wait 600
+wait 300
+dump $T/ws-home.out
+quit
+SCRIPT
+CRC_SELFTEST="$T/ws-home.script" "$BIN" "$T/ws" 2> "$T/ws-home.err"
+expect "$T/ws-home.out" home "waiting=Water the tomatoes|Read the seed catalogue repos=app:main:1,site:main:2 commits=0 notes=1 hits=10"
+# The visit is recorded with a one-second clock: wait a second so the
+# commit is after it.
+sleep 1.1
+printf 'three\n' > "$T/ws/site/c.txt"
+git -C "$T/ws/site" add c.txt
+testgit "$T/ws/site" commit -q -m "plant the beans"
+CRC_SELFTEST="$T/ws-home.script" "$BIN" "$T/ws" 2> "$T/ws-home2.err"
+grep -q '^home: .* commits=1 ' "$T/ws-home.out" \
+    || failed "ws-home.out: the second visit does not list the new commit: $(grep '^home:' "$T/ws-home.out")"

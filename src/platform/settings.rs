@@ -320,7 +320,7 @@ fn set_bool(value: &str, field: &mut bool) {
 }
 
 /// `key = value` with comments and blank lines skipped.
-fn split_line(line: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_line(line: &str) -> Option<(&str, &str)> {
     let line = line.trim();
     if line.is_empty() || line.starts_with('#') {
         return None;
@@ -351,7 +351,7 @@ fn split_line(line: &str) -> Option<(&str, &str)> {
 
 /// A TOML string's contents: `"basic"` with its escapes, or `'literal'`
 /// as written.
-fn unquote(value: &str) -> Option<std::borrow::Cow<'_, str>> {
+pub(crate) fn unquote(value: &str) -> Option<std::borrow::Cow<'_, str>> {
     if let Some(inner) = value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')) {
         return Some(inner.into());
     }

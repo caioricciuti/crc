@@ -13,6 +13,17 @@ them opens as one project.
   repository works as before, with no menu.
 - Blame in the status line asks the repository the file is in, so it
   works for files in a repository nested inside the open folder.
+- Home is the workspace's front page. Waiting on You lists the items
+  under the state doc's "waiting" heading; Repositories shows each one's
+  branch and changes, a click opening it in Source Control; Since You
+  Were Last Here lists commits and edited notes since the folder was
+  last opened. Start Session opens the state doc, End Session the log
+  and the state doc.
+- `.crc/workspace.toml` in the open folder names the state doc, the log
+  and the heading to read (`state`, `log`, `waiting_heading`). Without
+  it, `docs/state.md` or `STATE.md` and `docs/log.md` or `LOG.md` are
+  used when they exist. When the folder was last opened is kept in
+  crc's own folder, never in the workspace.
 
 ## v0.2.0-alpha.11, 2026-10-01
 
