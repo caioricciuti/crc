@@ -69,6 +69,7 @@ impl EditorView {
             rename,
             word_wrap,
             branch_list,
+            repo_list,
             extensions,
             blame: Blame { shown: blame, .. },
             renderer,
@@ -772,6 +773,7 @@ impl EditorView {
                 root: tree.root(),
                 branches: branch_list.as_ref(),
                 actions: action_list.as_ref(),
+                repos: repo_list.as_deref(),
             };
             let mode = PaletteMode::of(&sources);
             let intent = sources.branches.map(|pick| &pick.intent);
@@ -796,6 +798,7 @@ impl EditorView {
                     placeholder: match mode {
                         PaletteMode::Branch => "Branch name",
                         PaletteMode::Action => "Filter actions",
+                        PaletteMode::Repo => "Repository name",
                         PaletteMode::Open => {
                             "Find a file  ·  > commands  ·  @ symbols  ·  # in project"
                         }

@@ -2218,6 +2218,9 @@ pub enum Hit {
     StatusBranch,
     /// The branch at the top of Source Control: it opens the branch list.
     GitBranch,
+    /// The repository menu in Source Control's header, in a workspace of
+    /// several: it opens the repository list.
+    GitRepo,
     /// An unfocused editor pane, tabs through text. A click gives it the
     /// keyboard and is then handled as a click in the focused pane.
     Pane(usize),
@@ -2268,6 +2271,7 @@ impl Hit {
             Hit::Status => "status".into(),
             Hit::StatusBranch => "status.branch".into(),
             Hit::GitBranch => "git.branch".into(),
+            Hit::GitRepo => "git.repo".into(),
             Hit::Pane(i) => format!("pane.{i}"),
         }
     }

@@ -118,6 +118,7 @@ impl EditorView {
             let root = state.tree.root().map(Path::to_path_buf);
             state.symbols.reset(document, root);
             state.branch_list = None;
+            state.repo_list = None;
             state.lsp.action_list = None;
             let mut query = Buffer::new();
             if !prefix.is_empty() {
@@ -183,6 +184,7 @@ impl EditorView {
             Pick::DeleteBranch(name, unmerged) => self.delete_branch(name, unmerged),
             Pick::RenameBranch(name) => self.open_branch_picker(BranchIntent::RenameTo(name)),
             Pick::RenameBranchTo(old, new) => self.rename_branch(old, new),
+            Pick::Repo(path) => self.select_repo(&path),
             Pick::Symbol(path, line) => self.go_to_symbol(path, line),
             Pick::Command(at, tag) => self.run_command(at, tag),
             Pick::File(path) => {
@@ -265,6 +267,7 @@ impl EditorView {
             };
             state.palette = None;
             state.branch_list = None;
+            state.repo_list = None;
             state.lsp.action_list = None;
         }
         self.request_redraw();

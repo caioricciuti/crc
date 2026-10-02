@@ -6,6 +6,7 @@ pub mod git;
 pub mod icons;
 pub mod tree;
 pub mod watch;
+pub mod workspace;
 
 /// Directories never worth showing in the sidebar: enormous, and nobody
 /// opens files in them by name. Hidden entries are filtered separately; the

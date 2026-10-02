@@ -120,7 +120,8 @@ fn spawn_project_scan(
 /// start over there, read on workers.
 fn set_project_root(state: &mut State, dir: &Path) {
     state.tree.set_root(dir);
-    state.git = crate::platform::git_panel::Panel::new(dir.to_path_buf());
+    state.workspace = crate::project::workspace::Workspace::open(dir);
+    state.git = git_panel_for(&state.workspace);
     state.tree_version = 0;
     state.watch.children_pending.clear();
     state.finder = Finder::new();
@@ -617,6 +618,8 @@ struct State {
     /// What keeps the project tree and index current.
     watch: Watch,
     git: crate::platform::git_panel::Panel,
+    /// The open folder's repositories; Source Control shows one.
+    workspace: crate::project::workspace::Workspace,
     git_open: bool,
     /// The tab a Source Control diff is shown in, by buffer id. The diff
     /// is on screen exactly when that tab is the active one.
@@ -642,6 +645,8 @@ struct State {
     /// The palette is picking a branch: the local branches, read when it
     /// opened. `None` in every other mode.
     branch_list: Option<BranchPick>,
+    /// Set while the palette picks a repository of the workspace.
+    repo_list: Option<Vec<RepoRow>>,
     /// The branch picker's list, being read by a worker.
     branch_rx: Option<mpsc::Receiver<Result<BranchPick, String>>>,
     /// `organize_imports_on_save` from the settings.
@@ -1666,6 +1671,10 @@ define_class!(
                     self.open_branch_picker(BranchIntent::Switch);
                     return;
                 }
+                Some(Hit::GitRepo) => {
+                    self.open_repo_picker();
+                    return;
+                }
                 Some(Hit::SidebarRow(_)) | Some(Hit::Status) | None => {}
             }
 
@@ -2006,6 +2015,7 @@ define_class!(
                     let g = crate::platform::git_panel::Sidebar::new(rect);
                     if !state.git.busy() { add(g.refresh, &NSCursor::pointingHandCursor()); }
                     if !state.git.branch().is_empty() { add(g.branch, &NSCursor::pointingHandCursor()); }
+                    if state.git.repo.is_some() { add(g.repo, &NSCursor::pointingHandCursor()); }
                     add(g.message, &NSCursor::IBeamCursor());
                     if state.git.can_commit() { add(g.commit, &NSCursor::pointingHandCursor()); }
                     for (entry, row) in state.git.rows(g) {
@@ -2517,6 +2527,11 @@ define_class!(
         #[unsafe(method(showCommands:))]
         fn action_show_commands(&self, _sender: Option<&AnyObject>) {
             self.open_palette_with(">");
+        }
+
+        #[unsafe(method(switchRepository:))]
+        fn action_switch_repository(&self, _sender: Option<&AnyObject>) {
+            self.open_repo_picker();
         }
 
         #[unsafe(method(switchBranch:))]
@@ -3319,6 +3334,8 @@ define_class!(
                 let active = state.docs.active();
                 active.path.is_some()
                     && (active.is_dirty() || active.disk_state() != DiskState::Unchanged)
+            } else if action == sel!(switchRepository:) {
+                state.workspace.has_several()
             } else if action == sel!(paste:) {
                 clipboard::has_text()
             } else if action == sel!(moveContextTabLeft:) {
@@ -5459,6 +5476,7 @@ fn frame_of(state: &mut State) -> Frame {
         claude,
         terminal,
         git_open,
+        git,
         tab_hits,
         sidebar_edit,
         extensions,
@@ -5515,10 +5533,11 @@ fn frame_of(state: &mut State) -> Frame {
             },
         );
         if *git_open && extensions.is_none() {
-            frame.push(
-                Hit::GitBranch,
-                crate::platform::git_panel::Sidebar::new(rect).branch,
-            );
+            let g = crate::platform::git_panel::Sidebar::new(rect);
+            frame.push(Hit::GitBranch, g.branch);
+            if git.repo.is_some() {
+                frame.push(Hit::GitRepo, g.repo);
+            }
         }
         if !*git_open && extensions.is_none() {
             let (_, actions) = layout::sidebar_actions(rect);
@@ -5845,6 +5864,8 @@ enum Pick {
     DeleteBranch(String, bool),
     RenameBranch(String),
     RenameBranchTo(String, String),
+    /// A repository of the workspace, for Source Control.
+    Repo(std::path::PathBuf),
     /// A code action, and the server that offered it.
     Action(Language, crate::lsp::CodeAction),
 }
@@ -5883,6 +5904,48 @@ fn action_rows(
             )
         })
         .collect()
+}
+
+/// A repository in the palette: its label, its folder, and whether
+/// Source Control shows it now.
+#[derive(Clone, Debug)]
+struct RepoRow {
+    label: String,
+    path: std::path::PathBuf,
+    current: bool,
+}
+
+/// The workspace's repositories as palette rows, the current one marked.
+fn repo_rows(repos: &[RepoRow], query: &str) -> Vec<(layout::PaletteRow, Pick)> {
+    crate::project::finder::ranked(repos, query, |r| &r.label)
+        .into_iter()
+        .map(|i| {
+            let repo = &repos[i];
+            (
+                layout::PaletteRow {
+                    icon: Some(crate::project::icons::FOLDER_OUTLINE),
+                    title: repo.label.clone(),
+                    detail: if repo.current {
+                        "shown".into()
+                    } else {
+                        String::new()
+                    },
+                    shortcut: String::new(),
+                },
+                Pick::Repo(repo.path.clone()),
+            )
+        })
+        .collect()
+}
+
+/// Source Control for the workspace's selected repository, named in its
+/// header when there are several to choose from.
+fn git_panel_for(
+    workspace: &crate::project::workspace::Workspace,
+) -> crate::platform::git_panel::Panel {
+    let mut panel = crate::platform::git_panel::Panel::new(workspace.git_dir().to_path_buf());
+    panel.repo = workspace.selected_label();
+    panel
 }
 
 /// The branch list's rows for what it is open for.
@@ -5996,6 +6059,8 @@ struct PaletteSources<'a> {
     branches: Option<&'a BranchPick>,
     /// Set while picking a code action.
     actions: Option<&'a (Language, Vec<crate::lsp::CodeAction>)>,
+    /// Set while picking a repository.
+    repos: Option<&'a [RepoRow]>,
 }
 
 /// The rows of the open palette for its query; none when it is closed.
@@ -6013,6 +6078,7 @@ fn palette_sources(state: &State) -> PaletteSources<'_> {
         root: state.tree.root(),
         branches: state.branch_list.as_ref(),
         actions: state.lsp.action_list.as_ref(),
+        repos: state.repo_list.as_deref(),
     }
 }
 
@@ -6023,11 +6089,14 @@ enum PaletteMode {
     Open,
     Branch,
     Action,
+    Repo,
 }
 
 impl PaletteMode {
     fn of(sources: &PaletteSources<'_>) -> PaletteMode {
-        if sources.branches.is_some() {
+        if sources.repos.is_some() {
+            PaletteMode::Repo
+        } else if sources.branches.is_some() {
             PaletteMode::Branch
         } else if sources.actions.is_some() {
             PaletteMode::Action
@@ -6055,6 +6124,7 @@ fn palette_heading(
             };
         }
         PaletteMode::Action => return ("Code actions", "No matching actions"),
+        PaletteMode::Repo => return ("Show which repository?", "No matching repositories"),
         PaletteMode::Open => {}
     }
     match symbols::query(query) {
@@ -6076,7 +6146,11 @@ fn palette_rows(sources: &PaletteSources<'_>, query: &str) -> Vec<(layout::Palet
         root,
         branches,
         actions,
+        repos,
     } = *sources;
+    if let Some(repos) = repos {
+        return repo_rows(repos, query);
+    }
     if let Some(branches) = branches {
         return branch_rows(branches, query);
     }
@@ -6530,6 +6604,12 @@ fn install_menu(mtm: MainThreadMarker, app: &NSApplication) {
     git_menu.addItem(&item("Commit\u{2026}", sel!(gitCommit:), "", false));
     git_menu.addItem(&NSMenuItem::separatorItem(mtm));
     git_menu.addItem(&item(
+        "Switch Repository\u{2026}",
+        sel!(switchRepository:),
+        "",
+        false,
+    ));
+    git_menu.addItem(&item(
         "Switch Branch\u{2026}",
         sel!(switchBranch:),
         "",
@@ -6822,11 +6902,13 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         }
     }
 
-    let git = crate::platform::git_panel::Panel::new(
-        tree.root()
+    let workspace = crate::project::workspace::Workspace::open(
+        &tree
+            .root()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default()),
     );
+    let git = git_panel_for(&workspace);
     let recent_projects = with_recent(session.recent.clone(), tree.root());
     // Read once: each field below used to parse config.toml again.
     let settings = crate::platform::settings::Settings::load();
@@ -6897,6 +6979,8 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         word_wrap: settings.word_wrap,
         ssh_auth_sock: settings.ssh_auth_sock.clone(),
         branch_list: None,
+        repo_list: None,
+        workspace,
         branch_rx: None,
         organize_on_save: settings.organize_imports_on_save,
         extensions: None,

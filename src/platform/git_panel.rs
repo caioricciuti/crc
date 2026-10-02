@@ -53,6 +53,9 @@ struct InFlight {
 
 pub struct Panel {
     directory: PathBuf,
+    /// The repository's name in a workspace of several, drawn as a menu
+    /// in the header row; `None` when there is nothing to choose.
+    pub repo: Option<String>,
     pub snapshot: Option<Snapshot>,
     pub selected: usize,
     pub list_scroll: usize,
@@ -146,6 +149,8 @@ impl Entry {
 /// sidebar is as wide as it is and the content simply flows down it.
 #[derive(Clone, Copy)]
 pub struct Sidebar {
+    /// The repository menu, in the header row under the panel's name.
+    pub repo: Viewport,
     pub branch: Viewport,
     pub refresh: Viewport,
     pub message: Viewport,
@@ -185,6 +190,12 @@ impl Sidebar {
             height: 28.0,
         };
         Self {
+            repo: Viewport {
+                x,
+                y: column.y + 38.0,
+                width,
+                height: 26.0,
+            },
             branch,
             refresh: Viewport {
                 x: column.x + column.width - 78.0,
@@ -226,6 +237,7 @@ impl Panel {
     fn idle(directory: PathBuf, snapshot: Option<Snapshot>) -> Self {
         Self {
             directory,
+            repo: None,
             snapshot,
             selected: 0,
             list_scroll: 0,
@@ -849,6 +861,27 @@ impl Panel {
         out: &mut Vec<GlyphInstance>,
     ) {
         let g = Sidebar::new(column);
+        // Which repository, in a workspace of several: a menu like the
+        // branch's, in the header row the Explorer uses for its buttons.
+        if let Some(repo) = &self.repo {
+            layout::push_rounded_rect(out, g.repo, 5.0, theme.tab_hover);
+            let inner = Viewport {
+                x: g.repo.x + 8.0,
+                width: (g.repo.width - 16.0).max(0.0),
+                ..g.repo
+            };
+            layout::push_ui_text(
+                out,
+                atlas,
+                Viewport {
+                    width: (inner.width - 14.0).max(0.0),
+                    ..inner
+                },
+                repo,
+                theme.text,
+            );
+            layout::push_ui_text_right(out, atlas, inner, "\u{25be}", theme.status_text);
+        }
         // The branch reads as a menu: a box with a chevron, the branch list
         // behind it.
         let branch = self.branch();
@@ -1531,6 +1564,7 @@ mod tests {
             let column = Viewport { height, ..column() };
             let g = Sidebar::new(column);
             for (name, rect) in [
+                ("repo", g.repo),
                 ("branch", g.branch),
                 ("refresh", g.refresh),
                 ("message", g.message),
@@ -1548,6 +1582,11 @@ mod tests {
                 g.list.y >= column.y + layout::SIDEBAR_HEADER_HEIGHT,
                 "the list overlaps the sidebar switcher"
             );
+            // The repository menu sits in the header, under the switcher
+            // and above the branch.
+            let (switcher, _) = layout::sidebar_switcher(column);
+            assert!(g.repo.y >= switcher.y + switcher.height);
+            assert!(g.repo.y + g.repo.height <= g.branch.y);
             assert!(
                 g.note.y + g.note.height <= column.y + column.height,
                 "the note falls out of the bottom at height {height}"

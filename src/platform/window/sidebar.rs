@@ -186,7 +186,11 @@ impl EditorView {
         let g = Sidebar::new(column);
         let mut handled = true;
         let mut conflict_file = None;
-        if g.branch.contains(x, y) && !state.git.branch().is_empty() {
+        if g.repo.contains(x, y) && state.git.repo.is_some() {
+            drop(state);
+            self.open_repo_picker();
+            return true;
+        } else if g.branch.contains(x, y) && !state.git.branch().is_empty() {
             drop(state);
             self.open_branch_picker(BranchIntent::Switch);
             return true;

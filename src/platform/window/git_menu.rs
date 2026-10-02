@@ -50,6 +50,50 @@ impl EditorView {
         self.resume_display_link();
     }
 
+    /// Git > Switch Repository: the palette lists the workspace's
+    /// repositories; the chosen one fills Source Control.
+    pub(super) fn open_repo_picker(&self) {
+        let rows = {
+            let Some(state) = self.state() else {
+                return;
+            };
+            let ws = &state.workspace;
+            if !ws.has_several() {
+                return;
+            }
+            ws.repos()
+                .iter()
+                .map(|repo| RepoRow {
+                    label: ws.label(repo),
+                    path: repo.clone(),
+                    current: repo == ws.git_dir(),
+                })
+                .collect::<Vec<_>>()
+        };
+        self.open_palette_with("");
+        if let Some(mut state) = self.state_mut() {
+            state.repo_list = Some(rows);
+        }
+        self.request_redraw();
+        self.pump();
+    }
+
+    /// Shows `repo` in Source Control.
+    pub(super) fn select_repo(&self, repo: &Path) {
+        {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            if state.workspace.git_dir() == repo || !state.workspace.select(repo) {
+                return;
+            }
+            state.git = git_panel_for(&state.workspace);
+        }
+        self.resume_display_link();
+        self.request_redraw();
+        self.pump();
+    }
+
     pub(super) fn poll_branches(&self) {
         let reply = {
             let Some(mut state) = self.state_mut() else {
@@ -239,9 +283,7 @@ impl EditorView {
             .get(&id)
             .is_some_and(|g| g.head.as_ref().is_some_and(|h| !h.is_empty()));
         let buffer = state.docs.active();
-        let (Some(root), Some(path)) =
-            (state.git.root().map(Path::to_path_buf), buffer.path.clone())
-        else {
+        let Some(path) = buffer.path.clone() else {
             return;
         };
         if !tracked || buffer.rope.len_bytes() > GUTTER_MAX_BYTES {
@@ -251,6 +293,15 @@ impl EditorView {
         let (tx, rx) = mpsc::channel();
         state.blame.rx = Some(rx);
         std::thread::spawn(move || {
+            // The repository the file is in, which in a workspace of
+            // several is not always the one Source Control shows.
+            let Some(root) = path
+                .parent()
+                .and_then(|dir| crate::project::git::toplevel(dir).ok())
+            else {
+                let _ = tx.send((id, line, String::new()));
+                return;
+            };
             let relative = path.strip_prefix(&root).unwrap_or(&path).to_path_buf();
             let note = match crate::project::git::blame_line(&root, &relative, line, &text) {
                 Ok(blame) => match blame.author {

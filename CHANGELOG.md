@@ -2,6 +2,18 @@
 
 One entry per tag, written for people who use the editor.
 
+## Unreleased
+
+Workspaces: a folder that holds several repositories and the notes about
+them opens as one project.
+
+- Opening a folder finds the Git repositories in it, up to two levels
+  down. Source Control shows one at a time and names it in a menu at the
+  top; the menu, or Git > Switch Repository, shows another. A plain
+  repository works as before, with no menu.
+- Blame in the status line asks the repository the file is in, so it
+  works for files in a repository nested inside the open folder.
+
 ## v0.2.0-alpha.11, 2026-10-01
 
 Branches you can rename and delete, a way out of a merge or rebase, and

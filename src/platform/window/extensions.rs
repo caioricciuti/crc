@@ -492,6 +492,7 @@ impl EditorView {
             || state.palette.is_some()
             || state.goto.is_some()
             || state.branch_list.is_some()
+            || state.repo_list.is_some()
             || state.lsp.action_list.is_some();
         let rope = active.rope.clone();
         let dark = state.theme.is_dark();

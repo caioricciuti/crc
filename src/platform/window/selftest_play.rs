@@ -494,7 +494,7 @@ impl EditorView {
                 };
                 let report = format!(
                     // First: the report ends with the document's text.
-                    "message: {}\npreview: {}\nmd: {md}\nactivity: {}\npointer_targets: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nconflicts: {}\ngit_conflicts: {}\nblame: {}\nfind_results: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\n{report}",
+                    "message: {}\npreview: {}\nmd: {md}\nactivity: {}\npointer_targets: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nrepo: {}\ngit_changes: {}\nconflicts: {}\ngit_conflicts: {}\nblame: {}\nfind_results: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\n{report}",
                     state.message.as_ref().map_or("", |(text, _)| text.as_str()),
                     state.html_preview.as_ref().map_or("closed".to_string(), |p| format!(
                         "open ext={} view={} probe={}",
@@ -564,6 +564,8 @@ impl EditorView {
                         .join("|"))
                         .unwrap_or_default(),
                     state.git.branch_status(),
+                    state.git.repo.as_deref().unwrap_or(""),
+                    state.git.snapshot.as_ref().map_or(0, |s| s.changes.len()),
                     active_conflicts(&state).map_or("none".to_string(), |v| format!(
                         "{} side={} unmerged={} resolvable={} scroll={}",
                         v.conflicts.len(),
