@@ -11,6 +11,20 @@ fn main() {
         println!("crc {}", crc::build_label());
         return;
     }
+    // An MCP server for agents, on stdio, for the folder given or the
+    // current one. No window.
+    if args.first().is_some_and(|a| a == "--mcp") {
+        let folder = match args.get(1) {
+            Some(path) => PathBuf::from(path),
+            None => std::env::current_dir().unwrap_or_default(),
+        };
+        if !folder.is_dir() {
+            eprintln!("crc: {} is not a folder", folder.display());
+            std::process::exit(2);
+        }
+        crc::mcp_server::run(&folder);
+        return;
+    }
 
     let folder = args
         .first()

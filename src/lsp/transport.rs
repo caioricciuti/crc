@@ -286,7 +286,9 @@ const MAX_LINE_BYTES: u64 = 64 * 1024 * 1024;
 /// One newline-delimited message, `None` at end of stream. Blank lines are
 /// skipped; a line that is not JSON, or too long, comes back as
 /// `Some(Err(..))` and the stream carries on after it.
-fn read_line_message<R: BufRead>(reader: &mut R) -> std::io::Result<Option<Result<Value, String>>> {
+pub(crate) fn read_line_message<R: BufRead>(
+    reader: &mut R,
+) -> std::io::Result<Option<Result<Value, String>>> {
     let mut line = Vec::new();
     loop {
         line.clear();

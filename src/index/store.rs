@@ -346,6 +346,25 @@ impl Reader {
         Ok(out)
     }
 
+    /// Indexed paths, relative to the project, that hold the characters of
+    /// `needle` in order. The caller ranks them.
+    pub fn paths(&self, needle: &str, limit: usize) -> Result<Vec<String>> {
+        let mut like = String::from("%");
+        for c in needle.chars().filter(|c| !c.is_whitespace()) {
+            like.push_str(&crate::index::db::escape_like(&c.to_string()));
+            like.push('%');
+        }
+        let mut statement = self.db.prepare(
+            "SELECT path FROM files WHERE path LIKE ?1 ESCAPE '\\' ORDER BY length(path) LIMIT ?2",
+        )?;
+        statement.bind(&[Value::Text(&like), Value::Int(limit as i64)])?;
+        let mut out = Vec::new();
+        while statement.step()? {
+            out.push(statement.text(0));
+        }
+        Ok(out)
+    }
+
     /// Words starting with `prefix`: the word, how often it is used across
     /// the project, and in how many files.
     pub fn words(&self, prefix: &str, limit: usize) -> Result<Vec<(String, u32, u32)>> {

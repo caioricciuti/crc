@@ -17,6 +17,7 @@ pub mod json;
 pub mod lsp;
 pub mod markdown;
 pub mod mcp_client;
+pub mod mcp_server;
 pub mod platform;
 pub mod project;
 pub mod render;

@@ -159,6 +159,27 @@ impl EditorView {
         self.reparse();
     }
 
+    /// Run > Copy crc MCP Server Command: the line that starts `crc --mcp`
+    /// for this workspace, for an agent's MCP settings. crc never writes
+    /// another tool's configuration itself.
+    pub(super) fn copy_mcp_server_command(&self) {
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
+        let said = match (std::env::current_exe(), state.tree.root()) {
+            (Ok(exe), Some(root)) => {
+                let line = crate::mcp_server::command_line(&exe, root);
+                crate::platform::clipboard::write_text(&line);
+                "copied: add it to your agent's MCP servers (for Claude Code: claude mcp add crc -- <the line>)".to_string()
+            }
+            (_, None) => "open a folder first".to_string(),
+            (Err(e), _) => e.to_string(),
+        };
+        state.message = Some((said, Instant::now()));
+        drop(state);
+        self.request_redraw();
+    }
+
     /// Run > Save MCP Call to Workspace: the active call document into
     /// the workspace's `calls/` folder, where Home lists it.
     pub(super) fn save_mcp_call(&self) {

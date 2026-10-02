@@ -61,6 +61,15 @@ them opens as one project.
   notification channel; Codex with its terminal notifications turned on.
 - Home lists the terminal sessions first, the waiting ones on top with
   their question, the others as working or idle; a click opens one.
+- `crc --mcp [folder]` runs no window: it answers MCP on stdio for the
+  folder, in both protocol eras, so any agent can ask what the editor
+  knows. Its tools only read: `project.symbols` and `project.files` from
+  the project index (built on the spot when the app has not built it),
+  `project.read` for lines of a file inside the folder, and
+  `workspace.state` and `workspace.repos` for the workspace's state doc,
+  what waits on you, and each repository's branch and changes. Run >
+  Copy crc MCP Server Command puts the line for the open folder on the
+  clipboard; crc never edits another tool's settings.
 
 ## v0.2.0-alpha.11, 2026-10-01
 

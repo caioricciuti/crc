@@ -54,6 +54,13 @@ or a formatter or an agent, reload a clean tab and ask before touching a
 dirty one. Unsaved text survives a crash as plain files you can open with
 anything.
 
+**It keeps the work, not just the code.** Real work is a folder: a few
+repositories and the notes about them, where things stand, what waits on
+you, how releases are done. crc opens that folder as a workspace. Home
+says what waits on you and what changed since you were last there, every
+repository's state is one click away, and a commit that would carry a
+private note into a public repository is stopped before it is made.
+
 **It lets the agent in, where you can see it.** Claude Code connects to crc
 as its IDE. It sees your file, your selection and your diagnostics, and every
 edit it proposes opens as a diff you accept or reject. Files it writes show up
@@ -73,7 +80,8 @@ the editor running.
 
 *Partly built.* crc keeps a SQLite index per project of what every file
 defines and uses. It drives completion and Go to Symbol in Project today, and
-you can query it with `sqlite3`. Apple's SQLite is compiled without extension
+you can query it with `sqlite3`. `crc --mcp` serves it to any agent over
+MCP, with the editor closed. Apple's SQLite is compiled without extension
 loading, so a database other programs are invited to open cannot be made to
 load code. Real references and syntax spans are next.
 
@@ -92,9 +100,12 @@ The buffer, the syntax tree and the index should sit behind one API. The
 editor's own UI is one client of it; a model is another, with exactly the
 same view of your code as you have.
 
-*First step built.* crc speaks the protocol Claude Code uses for IDEs, so
-the agent sees what you see and edits through reviewable diffs. The general
-API is not built yet.
+*First steps built.* crc speaks the protocol Claude Code uses for IDEs, so
+the agent sees what you see and edits through reviewable diffs. crc is an
+MCP client you use by hand, calling a server's tools from a document you
+can read and keep, and an MCP server agents call for the project's index
+and the workspace's state. A terminal session that asks for attention is
+marked until you answer it. The general API is not built yet.
 
 ## What crc will not do
 

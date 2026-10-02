@@ -3212,6 +3212,11 @@ define_class!(
             self.open_mcp();
         }
 
+        #[unsafe(method(copyMcpServerCommand:))]
+        fn action_copy_mcp_server_command(&self, _sender: Option<&AnyObject>) {
+            self.copy_mcp_server_command();
+        }
+
         #[unsafe(method(saveMcpCall:))]
         fn action_save_mcp_call(&self, _sender: Option<&AnyObject>) {
             self.save_mcp_call();
@@ -6861,6 +6866,12 @@ fn install_menu(mtm: MainThreadMarker, app: &NSApplication) {
     // so it never eats the key anywhere else.
     run_menu.addItem(&item("Send Request", sel!(sendRequest:), "\r", false));
     run_menu.addItem(&item("Run MCP Call", sel!(runMcpCall:), "", false));
+    run_menu.addItem(&item(
+        "Copy crc MCP Server Command",
+        sel!(copyMcpServerCommand:),
+        "",
+        false,
+    ));
     run_menu.addItem(&item(
         "Save MCP Call to Workspace",
         sel!(saveMcpCall:),

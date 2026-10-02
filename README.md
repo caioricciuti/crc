@@ -107,11 +107,36 @@ the size and write it back.
   (`Cmd-Return`) or Reject (`Esc`). Files Claude writes to disk show up in
   their tabs at once. The bridge listens on 127.0.0.1 only, behind a random
   token in a lock file readable by you alone; `CRC_NO_CLAUDE=1` turns it off.
+- **Workspaces**: open a folder that holds several repositories and the
+  notes about them, and Source Control shows one repository at a time
+  with a menu to switch. Home becomes the workspace's front page: what
+  waits on you (from the state doc you name in `.crc/workspace.toml`),
+  each repository's branch and changes, saved MCP calls, and what changed
+  since you were last here. File > New Workspace writes the usual notes
+  (`AGENTS.md`, a state doc, a log, runbooks) without touching existing
+  files. `private_markers` in the workspace file stops a commit from
+  Source Control whose staged lines mention one.
+- **MCP servers you use yourself** (the plug in the activity bar):
+  `~/.config/crc/mcp.json` lists them, in the shape Claude Code's
+  `.mcp.json` uses, over stdio or Streamable HTTP. A server starts when
+  you click it, never before, and launchers that download code to run it
+  (`npx`, `bunx`, `uvx`, `pnpm dlx`) are refused. Its tools, resources
+  and prompts are listed; a tool opens a call document whose arguments
+  you edit and run with `Cmd-Return`, and a tool marked as able to
+  change things asks first. Saved calls run again from Home.
+- **crc as an MCP server for agents**: `crc --mcp [folder]` answers on
+  stdio, without a window, with the project's symbols and files from the
+  index, bounded reads of files inside the folder, and the workspace's
+  state and repositories. It only reads. Run > Copy crc MCP Server
+  Command gives the line to add to an agent's settings.
 - **Terminal panel** (`` Ctrl-` `` or `Cmd-J`): sessions under the editor
   running your login shell in the project folder, on an xterm-compatible
   emulator of our own with 24-bit colour, scroll regions, alternate screen
   and bracketed paste. `Cmd`-click a path such as `src/main.rs:42:7` in the
-  output to open it at that line.
+  output to open it at that line. A session that sends a notification
+  (OSC 9, 777 or 99) or rings the bell gets a dot and a line in the status
+  bar saying what it asked, until you type into it; Home lists the
+  waiting ones first.
 - **Local Git** (`Cmd-Option-G`): branch and status, changed files, staged
   and working-tree diffs, whole-file and hunk stage/unstage, commit. Git runs
   on workers and reads saved disk state; hooks and signing stay as Git has
@@ -162,6 +187,11 @@ the size and write it back.
 - **Language coverage is the list above.** A grammar is vendored generated C
   pinned in `third_party/CHECKSUMS`; there is no SQL grammar, and Svelte
   and Vue files are highlighted as HTML.
+- **MCP is the core of it.** crc does not answer a server's requests for
+  sampling, elicitation or roots, does not sign in to an HTTP server
+  (OAuth), and shows interactive MCP Apps as nothing: their results show
+  as text. `crc --mcp` has no live editor state yet, only what is on disk
+  and in the index.
 - **Git stops short of history.** No history browser, and no merge or
   rebase of your own branches from the menus (start one in the terminal;
   crc resolves, aborts and continues it). Hunk staging covers tracked text
@@ -292,6 +322,9 @@ src/project/git.rs      local Git commands, status parsing and bounded diffs
 src/platform/git_panel.rs native Source Control panel and workers
 src/http/               .http request files, environments, curl runner
 src/json.rs             JSON reader and printer, shared by HTTP and LSP
+src/project/workspace.rs workspaces: member repositories, notes, Home's summary
+src/mcp_client/         MCP servers crc talks to: config, both eras, stdio and HTTP
+src/mcp_server.rs       crc --mcp: the project and workspace for agents
 src/lsp/                language servers: registry, stdio transport, client
 src/project/watch.rs    FSEvents watcher for the project root
 src/platform/dispatch.rs main-thread wake-ups from other threads
