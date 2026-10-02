@@ -164,6 +164,9 @@ pub struct Settings {
     /// Words that mark the state doc's heading for what waits on you;
     /// matched without case. Empty: the usual ones.
     pub waiting_heading: Option<String>,
+    /// Text that must never be committed into a member repository:
+    /// the notes' names, a home folder, a client's name.
+    pub private_markers: Vec<String>,
 }
 
 /// Where the state doc usually is, first match wins.
@@ -214,6 +217,17 @@ impl Settings {
             match key.trim() {
                 "state" => settings.state = inside(value),
                 "log" => settings.log = inside(value),
+                "private_markers" => {
+                    settings.private_markers = unquote(value)
+                        .map(|v| {
+                            v.split('|')
+                                .map(str::trim)
+                                .filter(|m| !m.is_empty())
+                                .map(str::to_owned)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                }
                 "waiting_heading" => {
                     settings.waiting_heading = unquote(value)
                         .map(|v| v.into_owned())
@@ -224,6 +238,115 @@ impl Settings {
         }
         settings
     }
+}
+
+impl Workspace {
+    /// What a commit into a member repository must not add: the
+    /// workspace's private markers, and its own folder's path, which only
+    /// a note would mention. Empty, and no check, when the workspace file
+    /// names no markers.
+    pub fn guard(&self) -> Vec<String> {
+        let mut markers = Settings::load(&self.root).private_markers;
+        if !markers.is_empty() {
+            markers.push(self.root.to_string_lossy().into_owned());
+        }
+        markers
+    }
+}
+
+/// The first staged line that holds a marker, said the way the refusal
+/// reads: `docs/a.md:12 mentions “secret-client”`.
+pub fn leak(added: &[super::git::Added], markers: &[String]) -> Option<String> {
+    added.iter().find_map(|a| {
+        markers
+            .iter()
+            .find(|m| a.text.contains(m.as_str()))
+            .map(|m| format!("{}:{} mentions \u{201c}{m}\u{201d}", a.path, a.line))
+    })
+}
+
+/// The files a new workspace starts with, relative to its folder.
+const SKELETON: &[(&str, &str)] = &[
+    (
+        "AGENTS.md",
+        "# Instructions for agents\n\n\
+         Read by Codex and, through CLAUDE.md, by Claude Code. Write here how\n\
+         this workspace is worked on: the repositories and how they connect,\n\
+         the commands that build and test them, and what must never happen.\n\n\
+         ## Starting a session\n\n\
+         Read docs/state.md first, then check it against the repositories:\n\
+         the state doc can be out of date.\n\n\
+         ## Ending a session\n\n\
+         Rewrite docs/state.md (where things stand, what is next, what waits\n\
+         on the person) and add an entry to docs/log.md.\n\n\
+         ## Private notes\n\n\
+         Nothing in this folder outside the repositories is ever committed\n\
+         into one of them.\n",
+    ),
+    ("CLAUDE.md", "@AGENTS.md\n"),
+    (
+        "docs/state.md",
+        "# State\n\nWhere things stand. Rewritten, not added to, at the end of\n\
+         each session.\n\n## Now\n\n## Next\n\n## Waiting on you\n\n",
+    ),
+    (
+        "docs/log.md",
+        "# Log\n\nOne entry per session, newest first: what was done and why.\n",
+    ),
+    (
+        "runbooks/README.md",
+        "# Runbooks\n\nOne file per procedure that is done more than once: the\n\
+         steps, in order, with the commands.\n",
+    ),
+    (
+        SETTINGS_FILE,
+        "# This workspace, for crc. Paths are relative to this folder.\n\n\
+         state = \"docs/state.md\"\n\
+         log = \"docs/log.md\"\n\
+         # The state doc's heading that lists what waits on you.\n\
+         waiting_heading = \"waiting on you\"\n\
+         # Text never to commit into a repository here, separated by |.\n\
+         # Setting it turns on the check before each commit from crc.\n\
+         # private_markers = \"docs/state.md|runbooks/\"\n",
+    ),
+];
+
+/// Writes the files a workspace starts with into `root`, leaving every
+/// existing file alone. Returns the ones written. A folder inside a
+/// repository is refused: a workspace holds repositories, and its notes
+/// would end up committed.
+pub fn scaffold(root: &Path) -> Result<Vec<PathBuf>, String> {
+    if super::git::toplevel(root).is_ok() {
+        return Err(
+            "this folder is inside a Git repository; choose the folder that holds it".into(),
+        );
+    }
+    let mut written = Vec::new();
+    for (rel, text) in SKELETON {
+        let path = root.join(rel);
+        if path.exists() {
+            continue;
+        }
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
+        // create_new: a file that appeared since the check is kept.
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                use std::io::Write;
+                file.write_all(text.as_bytes())
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                written.push(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        }
+    }
+    Ok(written)
 }
 
 /// How many waiting items Home lists.
@@ -508,6 +631,74 @@ mod tests {
         let s = Settings::load(&bare.0);
         assert_eq!(s.state, Some(bare.0.join("STATE.md")));
         assert_eq!(s.log, None);
+    }
+
+    #[test]
+    fn the_guard_finds_a_marker_in_a_staged_line() {
+        use crate::project::git::Added;
+        let t = TempTree::new(
+            "ws-guard",
+            &[(
+                ".crc/workspace.toml",
+                "private_markers = \"docs/state.md | secret-client\"\n",
+            )],
+        );
+        let ws = Workspace::open(&t.0);
+        let markers = ws.guard();
+        assert_eq!(markers[..2], ["docs/state.md", "secret-client"]);
+        assert_eq!(markers[2], t.0.to_string_lossy());
+        let line = |path: &str, line, text: &str| Added {
+            path: path.into(),
+            line,
+            text: text.into(),
+        };
+        let clean = [line("src/a.rs", 3, "let x = 1;")];
+        assert_eq!(leak(&clean, &markers), None);
+        let dirty = [
+            line("src/a.rs", 3, "let x = 1;"),
+            line("README.md", 9, "see docs/state.md"),
+        ];
+        assert_eq!(
+            leak(&dirty, &markers).as_deref(),
+            Some("README.md:9 mentions \u{201c}docs/state.md\u{201d}")
+        );
+        // No markers named: no check at all.
+        let none = TempTree::new("ws-guard-none", &[]);
+        assert!(Workspace::open(&none.0).guard().is_empty());
+    }
+
+    #[test]
+    fn scaffold_writes_what_is_missing_and_refuses_a_repository() {
+        let t = TempTree::new("ws-scaffold", &[("AGENTS.md", "mine")]);
+        let written = scaffold(&t.0).unwrap();
+        assert!(!written.contains(&t.0.join("AGENTS.md")));
+        assert_eq!(
+            std::fs::read_to_string(t.0.join("AGENTS.md")).unwrap(),
+            "mine"
+        );
+        assert_eq!(
+            std::fs::read_to_string(t.0.join("CLAUDE.md")).unwrap(),
+            "@AGENTS.md\n"
+        );
+        let s = Settings::load(&t.0);
+        assert_eq!(s.state, Some(t.0.join("docs/state.md")));
+        assert_eq!(s.log, Some(t.0.join("docs/log.md")));
+        let doc = std::fs::read_to_string(t.0.join("docs/state.md")).unwrap();
+        assert!(waiting_items(&doc, s.waiting_heading.as_deref()).is_empty());
+        // Again: nothing left to write.
+        assert!(scaffold(&t.0).unwrap().is_empty());
+
+        let repo = TempTree::new("ws-scaffold-repo", &[]);
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&repo.0)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(scaffold(&repo.0).is_err());
+        assert!(!repo.0.join("AGENTS.md").exists());
     }
 
     #[test]

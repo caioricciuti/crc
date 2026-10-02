@@ -897,6 +897,7 @@ fn choose_path(
     panel.setCanChooseFiles(!directories);
     panel.setCanChooseDirectories(directories);
     panel.setAllowsMultipleSelection(false);
+    panel.setCanCreateDirectories(directories);
     if let Some(message) = message {
         panel.setMessage(Some(&NSString::from_str(message)));
     }
@@ -2338,6 +2339,13 @@ define_class!(
                 self.request_redraw();
                 self.pump();
             }
+        }
+
+        #[unsafe(method(newWorkspace:))]
+        fn action_new_workspace(&self, _sender: Option<&AnyObject>) {
+            self.new_workspace();
+            self.request_redraw();
+            self.pump();
         }
 
         #[unsafe(method(openFolder:))]
@@ -5993,6 +6001,7 @@ fn git_panel_for(
 ) -> crate::platform::git_panel::Panel {
     let mut panel = crate::platform::git_panel::Panel::new(workspace.git_dir().to_path_buf());
     panel.repo = workspace.selected_label();
+    panel.guard = workspace.guard();
     panel
 }
 
@@ -6506,6 +6515,12 @@ fn install_menu(mtm: MainThreadMarker, app: &NSApplication) {
     file_menu.addItem(&NSMenuItem::separatorItem(mtm));
     file_menu.addItem(&item("Open\u{2026}", sel!(openDocument:), "o", false));
     file_menu.addItem(&item("Open Folder\u{2026}", sel!(openFolder:), "o", true));
+    file_menu.addItem(&item(
+        "New Workspace\u{2026}",
+        sel!(newWorkspace:),
+        "",
+        false,
+    ));
     file_menu.addItem(&item(
         "Open Quickly\u{2026}",
         sel!(openQuickly:),

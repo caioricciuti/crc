@@ -24,6 +24,14 @@ them opens as one project.
   it, `docs/state.md` or `STATE.md` and `docs/log.md` or `LOG.md` are
   used when they exist. When the folder was last opened is kept in
   crc's own folder, never in the workspace.
+- `private_markers` in `.crc/workspace.toml` (text separated by `|`)
+  turns on a check before each commit from Source Control: a staged line
+  holding a marker, or the workspace's own path, stops the commit, and
+  the status line names the file, line and marker.
+- File > New Workspace writes the notes a workspace starts with into a
+  folder you pick (`AGENTS.md`, a `CLAUDE.md` that reads it, a state doc,
+  a log, `runbooks/` and `.crc/workspace.toml`), never over an existing
+  file, and opens it. A folder inside a repository is refused.
 
 ## v0.2.0-alpha.11, 2026-10-01
 

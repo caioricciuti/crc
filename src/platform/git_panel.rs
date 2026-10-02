@@ -56,6 +56,9 @@ pub struct Panel {
     /// The repository's name in a workspace of several, drawn as a menu
     /// in the header row; `None` when there is nothing to choose.
     pub repo: Option<String>,
+    /// Text a commit must not add (see `Workspace::guard`); empty for
+    /// no check.
+    pub guard: Vec<String>,
     pub snapshot: Option<Snapshot>,
     pub selected: usize,
     pub list_scroll: usize,
@@ -89,6 +92,9 @@ pub struct Panel {
     /// knows when to look again.
     generation: u64,
 }
+
+/// How a commit the workspace's leak guard refused is said.
+const REFUSED: &str = "Not committed: ";
 
 /// Height of one file row in the change list.
 pub const ROW: f32 = 26.0;
@@ -238,6 +244,7 @@ impl Panel {
         Self {
             directory,
             repo: None,
+            guard: Vec::new(),
             snapshot,
             selected: 0,
             list_scroll: 0,
@@ -601,6 +608,7 @@ impl Panel {
                 | Operation::Resolve(_)
         );
         let directory = self.directory.clone();
+        let guard = self.guard.clone();
         let previous = self.selected_change().map(|c| c.path.clone());
         let (tx, rx) = mpsc::channel();
         self.in_flight = Some(InFlight {
@@ -700,13 +708,28 @@ impl Panel {
                     Operation::StageHunk(change, hunk) => {
                         git::stage_hunk(&root, &change, &hunk).err()
                     }
-                    Operation::Commit(message) => match git::commit(&root, &message) {
-                        Ok(()) => {
-                            committed = true;
+                    Operation::Commit(message) => {
+                        // The workspace's private markers, checked
+                        // against exactly what would be committed.
+                        let leaked = if guard.is_empty() {
                             None
+                        } else {
+                            crate::project::workspace::leak(&git::staged_additions(&root)?, &guard)
+                        };
+                        match leaked {
+                            Some(hit) => Some(format!(
+                                "{REFUSED}{hit}, which this workspace keeps out of its repositories. \
+                                 Remove it from the staged change, or change private_markers in .crc/workspace.toml."
+                            )),
+                            None => match git::commit(&root, &message) {
+                                Ok(()) => {
+                                    committed = true;
+                                    None
+                                }
+                                Err(error) => Some(error),
+                            },
                         }
-                        Err(error) => Some(error),
-                    },
+                    }
                 };
                 let snapshot = git::snapshot(&root)?;
                 let selected = selected_path
@@ -776,8 +799,19 @@ impl Panel {
                 // than as diff lines, so git's stderr is never mistaken for
                 // part of the change.
                 if let Some(error) = &reply.error {
+                    // The workspace's own refusal is not a Git failure, and
+                    // the sidebar's note is too narrow to read it whole: the
+                    // status line says which line and marker.
+                    let heading = match error.strip_prefix(REFUSED) {
+                        Some(rest) => {
+                            let hit = rest.split(", which").next().unwrap_or(rest);
+                            self.announcement = Some(format!("{REFUSED}{hit}"));
+                            "Commit refused"
+                        }
+                        None => "Git command failed",
+                    };
                     let mut failure = git::Diff::default();
-                    for line in format!("Git command failed\n\n{error}").lines() {
+                    for line in format!("{heading}\n\n{error}").lines() {
                         failure.lines.push(git::DiffLine {
                             kind: git::DiffKind::Note,
                             old: None,

@@ -2954,6 +2954,7 @@ mod home_tests {
                 state: Some(state.clone()),
                 log: Some(log.clone()),
                 waiting_heading: None,
+                private_markers: Vec::new(),
             },
             waiting: vec!["Water the tomatoes".into()],
             repos: vec![

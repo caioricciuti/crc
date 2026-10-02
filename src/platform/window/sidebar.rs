@@ -411,6 +411,42 @@ impl EditorView {
         true
     }
 
+    /// File > New Workspace: picks a folder, writes the notes a workspace
+    /// starts with where they are missing, and opens it. A test instance
+    /// takes the folder from `CRC_NEW_WORKSPACE` instead of a panel.
+    pub(super) fn new_workspace(&self) {
+        let path = if self.ivars().testing {
+            std::env::var_os("CRC_NEW_WORKSPACE").map(std::path::PathBuf::from)
+        } else {
+            choose_path(
+                MainThreadMarker::from(self),
+                true,
+                Some("Choose or create the folder that holds the repositories and their notes"),
+            )
+        };
+        let Some(path) = path else {
+            return;
+        };
+        match crate::project::workspace::scaffold(&path) {
+            Ok(written) => {
+                self.load_folder_path(&path.to_string_lossy());
+                if let Some(mut state) = self.state_mut() {
+                    let said = match written.len() {
+                        0 => "Workspace opened; its notes were all there".to_string(),
+                        1 => "Workspace ready: 1 note written".to_string(),
+                        n => format!("Workspace ready: {n} notes written"),
+                    };
+                    state.message = Some((said, Instant::now()));
+                }
+            }
+            Err(error) => {
+                if let Some(mut state) = self.state_mut() {
+                    state.message = Some((error, Instant::now()));
+                }
+            }
+        }
+    }
+
     pub(super) fn load_folder_path(&self, path: &str) {
         let Some(mut state) = self.state_mut() else {
             return;

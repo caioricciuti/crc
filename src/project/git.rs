@@ -355,6 +355,57 @@ fn run(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     )
 }
 
+/// One line a commit would add: the file, its line number there, and
+/// the text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Added {
+    pub path: String,
+    pub line: usize,
+    pub text: String,
+}
+
+/// The lines the index adds over HEAD: what committing now would add.
+pub fn staged_additions(root: &Path) -> Result<Vec<Added>, String> {
+    let out = run(
+        root,
+        &[
+            "diff",
+            "--cached",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-renames",
+            "-U0",
+        ],
+    )?;
+    Ok(parse_additions(&String::from_utf8_lossy(&out)))
+}
+
+fn parse_additions(diff: &str) -> Vec<Added> {
+    let mut added = Vec::new();
+    let mut path = String::new();
+    let mut line = 0;
+    for row in diff.lines() {
+        if let Some(name) = row.strip_prefix("+++ ") {
+            path = name.strip_prefix("b/").unwrap_or(name).to_owned();
+        } else if let Some(counts) = row.strip_prefix("@@ ") {
+            line = counts
+                .split(' ')
+                .find_map(|c| c.strip_prefix('+'))
+                .and_then(|c| c.split(',').next())
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0);
+        } else if let Some(text) = row.strip_prefix('+') {
+            added.push(Added {
+                path: path.clone(),
+                line,
+                text: text.to_owned(),
+            });
+            line += 1;
+        }
+    }
+    added
+}
+
 /// Subjects of the commits on HEAD made after `since` (Unix seconds),
 /// newest first, at most `limit`.
 pub fn commits_since(root: &Path, since: u64, limit: usize) -> Result<Vec<String>, String> {
@@ -1276,6 +1327,26 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn additions_carry_their_file_and_line() {
+        let diff = "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n\
+                    @@ -3,0 +4,2 @@ fn x()\n+four\n+five\n\
+                    diff --git a/new.md b/new.md\nnew file mode 100644\n\
+                    --- /dev/null\n+++ b/new.md\n@@ -0,0 +1 @@\n+only\n";
+        let got: Vec<(String, usize, String)> = parse_additions(diff)
+            .into_iter()
+            .map(|a| (a.path, a.line, a.text))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("a.txt".into(), 4, "four".into()),
+                ("a.txt".into(), 5, "five".into()),
+                ("new.md".into(), 1, "only".into()),
+            ]
+        );
     }
 
     #[test]

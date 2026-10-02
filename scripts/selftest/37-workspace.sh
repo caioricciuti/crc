@@ -93,3 +93,59 @@ testgit "$T/ws/site" commit -q -m "plant the beans"
 CRC_SELFTEST="$T/ws-home.script" "$BIN" "$T/ws" 2> "$T/ws-home2.err"
 grep -q '^home: .* commits=1 ' "$T/ws-home.out" \
     || failed "ws-home.out: the second visit does not list the new commit: $(grep '^home:' "$T/ws-home.out")"
+
+# ---- the leak guard and New Workspace -----------------------------------------
+# With private markers set, a commit from Source Control whose staged lines
+# mention one is refused and nothing is committed; without them it goes in.
+printf 'state = "docs/state.md"\nprivate_markers = "tomato-secret"\n' > "$T/ws/.crc/workspace.toml"
+printf 'the tomato-secret recipe\n' > "$T/ws/app/leak.txt"
+git -C "$T/ws/app" add leak.txt
+cat > "$T/ws-guard.script" <<SCRIPT
+wait 800
+wait 600
+key 35 cmd p
+wait 200
+text >source control
+key 36
+wait 600
+wait 300
+# The message field and the Commit button, as in the audit scenario:
+# the 240pt sidebar, the header 70pt under the 48pt toolbar.
+click 164 161
+text keep the recipe
+click 164 196
+wait 600
+wait 300
+dump $T/ws-guard.out
+quit
+SCRIPT
+before=$(git -C "$T/ws/app" rev-list --count HEAD)
+CRC_SELFTEST="$T/ws-guard.script" "$BIN" "$T/ws" 2> "$T/ws-guard.err"
+[ "$(git -C "$T/ws/app" rev-list --count HEAD)" = "$before" ] \
+    || failed "ws-guard: a commit mentioning a private marker went in"
+grep -q '^git_note: Not committed: leak.txt:1 mentions “tomato-secret”' "$T/ws-guard.out" \
+    || failed "ws-guard.out: $(grep '^git_note:' "$T/ws-guard.out")"
+# The sidebar's note is narrow; the status line names the line and marker.
+expect "$T/ws-guard.out" message "Not committed: leak.txt:1 mentions “tomato-secret”"
+
+# File > New Workspace writes the skeleton into an empty folder and opens it;
+# Home then offers its session.
+mkdir -p "$T/fresh"
+cat > "$T/ws-new.script" <<SCRIPT
+wait 600
+key 35 cmd p
+wait 200
+text >new workspace
+key 36
+wait 800
+wait 300
+dump $T/ws-new.out
+quit
+SCRIPT
+CRC_NEW_WORKSPACE="$T/fresh" CRC_SELFTEST="$T/ws-new.script" "$BIN" "$T/ws/docs/state.md" 2> "$T/ws-new.err"
+expect "$T/ws-new.out" message "Workspace ready: 6 notes written"
+for f in AGENTS.md CLAUDE.md docs/state.md docs/log.md runbooks/README.md .crc/workspace.toml; do
+    [ -f "$T/fresh/$f" ] || failed "ws-new: $f was not written"
+done
+grep -q '^home: waiting= repos= ' "$T/ws-new.out" \
+    || failed "ws-new.out: $(grep '^home:' "$T/ws-new.out")"
