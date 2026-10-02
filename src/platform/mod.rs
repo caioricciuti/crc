@@ -9,6 +9,7 @@ pub mod dispatch;
 pub mod extensions;
 pub mod git_panel;
 pub mod latency;
+pub mod mcp_panel;
 pub mod recovery;
 pub mod report;
 pub mod search;

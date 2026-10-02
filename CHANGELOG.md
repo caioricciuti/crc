@@ -32,6 +32,19 @@ them opens as one project.
   folder you pick (`AGENTS.md`, a `CLAUDE.md` that reads it, a state doc,
   a log, `runbooks/` and `.crc/workspace.toml`), never over an existing
   file, and opens it. A folder inside a repository is refused.
+- MCP servers you can use yourself (View > MCP Servers, or the plug in
+  the activity bar). `~/.config/crc/mcp.json` lists them in the shape
+  Claude Code's `.mcp.json` uses; nothing starts until its name is
+  clicked. A running server lists its tools, resources and prompts. A
+  tool or prompt opens a call document, JSON with a placeholder for each
+  argument, and Cmd-Return (Run > Run MCP Call) runs it into an answer
+  tab; Cmd-Return there runs it again, and a saved call runs the same
+  way. A resource opens at once. A tool the server marks as able to
+  change or delete things asks first.
+- Servers started through `npx`, `bunx`, `uvx`, `pnpm dlx` or another
+  command that downloads code when it runs are refused, with the reason.
+  Both protocol eras are spoken: the stateless revision of 2026-07-28 and
+  the earlier `initialize` handshake. Only stdio servers for now.
 
 ## v0.2.0-alpha.11, 2026-10-01
 

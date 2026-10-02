@@ -16,6 +16,7 @@ pub mod index;
 pub mod json;
 pub mod lsp;
 pub mod markdown;
+pub mod mcp_client;
 pub mod platform;
 pub mod project;
 pub mod render;

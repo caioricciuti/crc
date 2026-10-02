@@ -60,6 +60,7 @@ mod http;
 mod input;
 mod lsp;
 mod lsp_features;
+mod mcp;
 mod palette;
 mod project;
 mod render;
@@ -628,6 +629,11 @@ struct State {
     home_rx: Option<mpsc::Receiver<crate::project::workspace::Summary>>,
     /// The workspace's previous visit, for "since you were last here".
     home_since: Option<u64>,
+    /// MCP servers and the sidebar panel that lists them.
+    mcp: crate::platform::mcp_panel::Panel,
+    /// The call behind each MCP answer tab, so Cmd-Return there runs it
+    /// again.
+    mcp_calls: HashMap<u64, crate::mcp_client::call::Call>,
     git_open: bool,
     /// The tab a Source Control diff is shown in, by buffer id. The diff
     /// is on screen exactly when that tab is the active one.
@@ -1015,11 +1021,24 @@ fn show_response(state: &mut State, title: &str, view: crate::http::view::View) 
     id
 }
 
+/// Whether the active document is an MCP call, or the answer to one.
+fn is_mcp_call(state: &State) -> bool {
+    let buffer = state.docs.active();
+    if state.mcp_calls.contains_key(&buffer.id()) {
+        return true;
+    }
+    let head = buffer
+        .rope
+        .slice_to_string(0..buffer.rope.len_bytes().min(400));
+    crate::mcp_client::call::looks_like_call(&head)
+}
+
 /// Whether Cmd-Return has a request to send: a `.http` document, or a
 /// response tab, which re-sends its own request.
 fn can_send_from(state: &State) -> bool {
     let buffer = state.docs.active();
-    state.responses.contains_key(&buffer.id())
+    is_mcp_call(state)
+        || state.responses.contains_key(&buffer.id())
         || buffer
             .path
             .as_deref()
@@ -1702,6 +1721,10 @@ define_class!(
                     self.git_click(rect, x, y);
                     return;
                 }
+                if self.state().is_some_and(|state| state.mcp.open) {
+                    self.mcp_click(x, y);
+                    return;
+                }
                 // Remember what is under the pointer in case this turns into
                 // a drag. Selecting still happens now, so a plain click is
                 // unaffected.
@@ -2246,6 +2269,7 @@ define_class!(
             self.poll_project_search();
             self.poll_branches();
             self.poll_home();
+            self.poll_mcp();
             self.poll_reloads();
             if self
                 .state_mut().is_some_and(|mut state| state.symbols.poll())
@@ -3173,6 +3197,16 @@ define_class!(
             self.pump();
         }
 
+        #[unsafe(method(showMcp:))]
+        fn action_show_mcp(&self, _sender: Option<&AnyObject>) {
+            self.open_mcp();
+        }
+
+        #[unsafe(method(runMcpCall:))]
+        fn action_run_mcp_call(&self, _sender: Option<&AnyObject>) {
+            self.run_mcp_call();
+        }
+
         #[unsafe(method(showSourceControl:))]
         fn action_source_control(&self, _sender: Option<&AnyObject>) {
             self.open_git();
@@ -3378,6 +3412,8 @@ define_class!(
                 || action == sel!(gitCommit:)
             {
                 state.tree.root().is_some()
+            } else if action == sel!(runMcpCall:) {
+                is_mcp_call(&state)
             } else if action == sel!(sendRequest:) {
                 state.http.is_none() && can_send_from(&state)
             } else if action == sel!(closePane:)
@@ -4074,6 +4110,14 @@ impl EditorView {
                     .map(|(r, _)| *r)
             })
             .chain(state.lsp.bulb_rect)
+            .chain(
+                state
+                    .mcp
+                    .hits
+                    .iter()
+                    .filter(|_| state.mcp.open)
+                    .map(|(r, _)| *r),
+            )
             .collect();
         if state.pointer_targets != pointer_targets {
             state.pointer_targets = pointer_targets;
@@ -5504,6 +5548,7 @@ fn frame_of(state: &mut State) -> Frame {
         terminal,
         git_open,
         git,
+        mcp,
         tab_hits,
         sidebar_edit,
         extensions,
@@ -5566,7 +5611,7 @@ fn frame_of(state: &mut State) -> Frame {
                 frame.push(Hit::GitRepo, g.repo);
             }
         }
-        if !*git_open && extensions.is_none() {
+        if !*git_open && extensions.is_none() && !mcp.open {
             let (_, actions) = layout::sidebar_actions(rect);
             for (index, action) in actions.into_iter().enumerate() {
                 frame.push(Hit::SidebarAction(index), action);
@@ -6660,9 +6705,11 @@ fn install_menu(mtm: MainThreadMarker, app: &NSApplication) {
 
     let (git_item, git_menu) = submenu("Git");
     let source_control = item("Source Control", sel!(showSourceControl:), "g", false);
+    let mcp_servers = item("MCP Servers", sel!(showMcp:), "", false);
     source_control
         .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
     git_menu.addItem(&source_control);
+    git_menu.addItem(&mcp_servers);
     git_menu.addItem(&item("Refresh", sel!(gitRefresh:), "", false));
     git_menu.addItem(&item("Commit\u{2026}", sel!(gitCommit:), "", false));
     git_menu.addItem(&NSMenuItem::separatorItem(mtm));
@@ -6795,6 +6842,7 @@ fn install_menu(mtm: MainThreadMarker, app: &NSApplication) {
     // Cmd-Return. Greyed out unless the active document is a `.http` file,
     // so it never eats the key anywhere else.
     run_menu.addItem(&item("Send Request", sel!(sendRequest:), "\r", false));
+    run_menu.addItem(&item("Run MCP Call", sel!(runMcpCall:), "", false));
     run_item.setSubmenu(Some(&run_menu));
     menubar.addItem(&run_item);
 
@@ -7051,6 +7099,8 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         home: None,
         home_rx,
         home_since,
+        mcp: Default::default(),
+        mcp_calls: HashMap::new(),
         branch_rx: None,
         organize_on_save: settings.organize_imports_on_save,
         extensions: None,

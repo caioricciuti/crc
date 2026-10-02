@@ -51,6 +51,7 @@ impl EditorView {
             tree,
             git,
             git_open,
+            mcp,
             find,
             find_cache,
             tab_hits,
@@ -604,7 +605,9 @@ impl EditorView {
             activity_rect,
             theme,
             sidebar_rect.map(|_| {
-                if extensions.is_some() {
+                if mcp.open {
+                    3
+                } else if extensions.is_some() {
                     2
                 } else if *git_open {
                     1
@@ -625,6 +628,10 @@ impl EditorView {
                 theme.sidebar_background,
             );
             crate::platform::extensions::draw_list(page, &mut renderer.atlas, rect, theme, glyphs);
+        } else if let Some(rect) = sidebar_rect
+            && mcp.open
+        {
+            mcp.draw(&mut renderer.atlas, rect, theme, glyphs);
         } else if let Some(rect) = sidebar_rect {
             let edit_text = sidebar_edit.as_ref().map(|e| e.field.rope.to_string());
             let edit = sidebar_edit

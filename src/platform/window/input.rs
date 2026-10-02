@@ -122,6 +122,9 @@ impl EditorView {
         }
 
         match chrome.sidebar {
+            Some(rect) if rect.contains(x, y) && state.mcp.open => {
+                state.mcp.scroll_by(lines, rect);
+            }
             Some(rect) if rect.contains(x, y) => {
                 state.tree.scroll_by(lines, layout::sidebar_rows(rect));
             }

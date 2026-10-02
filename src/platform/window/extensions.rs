@@ -16,6 +16,7 @@ impl EditorView {
             let mut page = crate::platform::extensions::Page::new(installed);
             page.logs = state.ext.logs.clone();
             state.extensions = Some(page);
+            state.mcp.open = false;
             state.palette = None;
             state.completion = None;
             state.git_open = false;

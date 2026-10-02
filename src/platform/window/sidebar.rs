@@ -157,6 +157,7 @@ impl EditorView {
                 return;
             };
             state.extensions = None;
+            state.mcp.open = false;
             state.git_open = scm;
             // Typing belongs to the editor until the message field is asked
             // for. Focusing it here would swallow the next keystroke.

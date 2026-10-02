@@ -11,6 +11,11 @@ impl EditorView {
     /// when curl answers. Re-sending reuses the tab, so a request edited and
     /// sent ten times leaves one tab, not ten.
     pub(super) fn send_request(&self) {
+        // Cmd-Return in an MCP call document runs the call.
+        if self.state().is_some_and(|state| is_mcp_call(&state)) {
+            self.run_mcp_call();
+            return;
+        }
         let Some(mut state) = self.state_mut() else {
             return;
         };

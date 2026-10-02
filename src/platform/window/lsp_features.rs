@@ -739,7 +739,9 @@ impl EditorView {
             let Some(state) = self.state() else {
                 return;
             };
-            let current = if state.extensions.is_some() {
+            let current = if state.mcp.open {
+                3
+            } else if state.extensions.is_some() {
                 2
             } else if state.git_open {
                 1
@@ -761,7 +763,8 @@ impl EditorView {
         match index {
             0 => self.set_sidebar_view(false),
             1 => self.set_sidebar_view(true),
-            _ => self.open_extensions(),
+            2 => self.open_extensions(),
+            _ => self.open_mcp(),
         }
         let Some(mut state) = self.state_mut() else {
             return;

@@ -1974,14 +1974,15 @@ pub fn sidebar_rows(viewport: Viewport) -> usize {
 pub const ACTIVITY_WIDTH: f32 = 44.0;
 
 /// The panels the icon strip switches between, top to bottom.
-pub const ACTIVITY_ICONS: [(char, &str); 3] = [
+pub const ACTIVITY_ICONS: [(char, &str); 4] = [
     ('\u{eaf0}', "explorer"),       // cod-files
     ('\u{ea68}', "source-control"), // cod-source_control
     ('\u{eae6}', "extensions"),     // cod-extensions
+    ('\u{eb2d}', "mcp"),            // cod-plug
 ];
 
 /// Each icon's square in the strip.
-pub fn activity_items(strip: Viewport) -> [Viewport; 3] {
+pub fn activity_items(strip: Viewport) -> [Viewport; 4] {
     let size = ACTIVITY_WIDTH;
     std::array::from_fn(|i| Viewport {
         x: strip.x,

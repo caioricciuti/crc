@@ -1,4 +1,5 @@
-//! JSON-RPC over a child process's stdio, framed with `Content-Length`.
+//! JSON-RPC over a child process's stdio, framed with `Content-Length`
+//! (language servers) or one message per line (MCP and agent servers).
 //!
 //! A reader thread turns the byte stream into messages and hands them over
 //! a channel; after each one it calls the wake-up the owner gave it, which
@@ -25,9 +26,21 @@ pub enum Incoming {
 /// Called after a message is queued, from the reader thread.
 pub use crate::platform::dispatch::Wake;
 
+/// How messages are delimited on the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Framing {
+    /// `Content-Length` headers, then the body: the Language Server
+    /// Protocol.
+    ContentLength,
+    /// One JSON message per line, no newline inside one: MCP's stdio
+    /// transport.
+    Lines,
+}
+
 pub struct Transport {
     /// `None` only while being dropped.
     child: Option<Child>,
+    framing: Framing,
     /// Frames for the writer thread; `None` once it has stopped.
     writer: Option<mpsc::Sender<Vec<u8>>>,
     /// Set by the writer thread when a write failed: the server is gone.
@@ -46,8 +59,22 @@ impl Transport {
         root: &Path,
         wake: Wake,
     ) -> std::io::Result<Transport> {
+        Transport::spawn_with(program, args, root, &[], Framing::ContentLength, wake)
+    }
+
+    /// Starts `program args` in `root` with `env` added to the
+    /// environment, speaking `framing`.
+    pub fn spawn_with(
+        program: &Path,
+        args: &[&str],
+        root: &Path,
+        env: &[(String, String)],
+        framing: Framing,
+        wake: Wake,
+    ) -> std::io::Result<Transport> {
         let mut child = Command::new(program)
             .args(args)
+            .envs(env.iter().map(|(k, v)| (k, v)))
             .current_dir(root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -69,7 +96,11 @@ impl Transport {
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             loop {
-                match read_message(&mut reader) {
+                let message = match framing {
+                    Framing::ContentLength => read_message(&mut reader),
+                    Framing::Lines => read_line_message(&mut reader),
+                };
+                match message {
                     Ok(Some(Ok(value))) => {
                         if tx.send(Incoming::Message(value)).is_err() {
                             break;
@@ -104,6 +135,7 @@ impl Transport {
         std::thread::spawn(move || write_frames(stdin, frames, &failed));
         Ok(Transport {
             child: Some(child),
+            framing,
             writer: Some(writer),
             broken,
             rx,
@@ -119,8 +151,16 @@ impl Transport {
             return Err(gone());
         }
         let body = json::compact(message);
-        let mut frame = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
-        frame.extend_from_slice(body.as_bytes());
+        let frame = match self.framing {
+            Framing::ContentLength => {
+                let mut frame = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+                frame.extend_from_slice(body.as_bytes());
+                frame
+            }
+            // `compact` escapes every newline inside strings, so the
+            // only one is the delimiter.
+            Framing::Lines => format!("{body}\n").into_bytes(),
+        };
         self.writer
             .as_ref()
             .ok_or_else(gone)?
@@ -240,9 +280,64 @@ fn read_message<R: BufRead>(reader: &mut R) -> std::io::Result<Option<Result<Val
     ))
 }
 
+/// The most one line-framed message may hold before it is skipped.
+const MAX_LINE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// One newline-delimited message, `None` at end of stream. Blank lines are
+/// skipped; a line that is not JSON, or too long, comes back as
+/// `Some(Err(..))` and the stream carries on after it.
+fn read_line_message<R: BufRead>(reader: &mut R) -> std::io::Result<Option<Result<Value, String>>> {
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let n = reader
+            .by_ref()
+            .take(MAX_LINE_BYTES)
+            .read_until(b'\n', &mut line)?;
+        if n == 0 {
+            return Ok(None);
+        }
+        if line.last() != Some(&b'\n') && n as u64 == MAX_LINE_BYTES {
+            // Read past the rest of it, so the next line is a message.
+            let mut rest = Vec::new();
+            reader.read_until(b'\n', &mut rest)?;
+            return Ok(Some(Err("message too large".into())));
+        }
+        let text = String::from_utf8_lossy(&line);
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        return Ok(Some(
+            json::parse(text).map_err(|e| format!("bad JSON from server: {e}")),
+        ));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lines_are_one_message_each_and_a_bad_one_is_skipped() {
+        let stream = b"{\"a\":1}\n\n  \nnot json\r\n[2]\n{\"tail\":true}";
+        let mut reader = BufReader::new(&stream[..]);
+        assert_eq!(
+            read_line_message(&mut reader).unwrap(),
+            Some(Ok(json::parse("{\"a\":1}").unwrap()))
+        );
+        assert!(matches!(read_line_message(&mut reader), Ok(Some(Err(_)))));
+        assert_eq!(
+            read_line_message(&mut reader).unwrap(),
+            Some(Ok(json::parse("[2]").unwrap()))
+        );
+        // The last line needs no newline.
+        assert_eq!(
+            read_line_message(&mut reader).unwrap(),
+            Some(Ok(json::parse("{\"tail\":true}").unwrap()))
+        );
+        assert_eq!(read_line_message(&mut reader).unwrap(), None);
+    }
 
     #[test]
     fn frames_are_read_by_content_length_and_case_insensitively() {
