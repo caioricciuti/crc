@@ -2,11 +2,47 @@
 
 One entry per tag, written for people who use the editor.
 
-## Unreleased
+## v0.2.0-alpha.13, 2026-10-02
+
+A window that looks and answers like one app: every button, row and
+menu reworked, and the Save panel crash fixed.
 
 - Cmd-S on a document never saved, Save As and New File no longer quit
   the app when macOS gives no Save panel: the status line says so and
   the text stays, unsaved.
+- One set of controls everywhere: buttons, toggles and fields share one
+  height and corner, light up under the pointer, show when held, and dim
+  when they cannot act. Icon buttons say what they do, with their
+  shortcut, when the pointer rests on them.
+- Source Control is rebuilt. Refresh and a menu of every Git command sit
+  in the header; Pull and Push sit beside the branch and show how many
+  commits it is behind or ahead; Commit says what it will commit, shows
+  Cmd-Return, and says why when it cannot run. Sections fold and offer
+  Stage All or Unstage All; each file shows Open and Stage under the
+  pointer, its status letter at the right. A clean tree and a folder
+  that is not a repository each get a plain explanation.
+- Right-click menus of their own: a changed file (open it, open its
+  changes, stage or unstage, copy its path, reveal it), a Source Control
+  section, the terminal (copy, paste, clear), the empty tab strip, and
+  the Extensions and MCP Servers lists. A right-click in those panels no
+  longer acts on the file tree hidden behind them. Menus show the same
+  shortcuts as the menu bar, and Move to Trash and Close All Tabs sit
+  apart from their neighbours.
+- Loading shows as it happens: placeholder rows while the extension
+  registry or the repository is first read, a progress bar under the
+  panel's header, and a spinner in the status line while a push, pull or
+  fetch runs or a language server starts.
+- The status line marks a failure in red with an icon and keeps it on
+  screen longer; a success gets a check. Git errors lead with the line
+  Git itself marks as the error, the rest in the tooltip.
+- The sidebar header is one row, the panel's name with its buttons
+  beside it. The change count on Source Control's icon is a small badge
+  that no longer covers the icon.
+- The palette has a search glyph and an esc key that closes it; the
+  terminal header has New Terminal and Hide Panel; the find bar's arrows,
+  close and options are the shared controls; tabs are sized by their
+  titles; the Extensions page shows each extension with its icon and
+  what it may do on cards.
 
 ## v0.2.0-alpha.12, 2026-10-02
 

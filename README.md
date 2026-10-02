@@ -138,13 +138,16 @@ the size and write it back.
   bar saying what it asked, until you type into it; Home lists the
   waiting ones first.
 - **Local Git** (`Cmd-Option-G`): branch and status, changed files, staged
-  and working-tree diffs, whole-file and hunk stage/unstage, commit. Git runs
-  on workers and reads saved disk state; hooks and signing stay as Git has
-  them. Branches switched, created, renamed and deleted from the palette
-  (or the branch in the status bar), an unmerged one only after asking;
-  fetch, pull (fast-forward, or with rebase or merge when the branches
-  have diverged) and push (never forced); and the caret line's blame in
-  the status line.
+  and working-tree diffs, whole-file and hunk stage/unstage, Stage All and
+  Unstage All per section, commit, and a right-click menu on every change.
+  Git runs on workers and reads saved disk state; hooks and signing stay
+  as Git has them. Branches switched, created, renamed and deleted from
+  Source Control's branch menu, the palette or the branch in the status
+  bar, an unmerged one only after asking; fetch, pull (fast-forward, or
+  with rebase or merge when the branches have diverged) and push (never
+  forced) from the buttons beside the branch, which count the commits to
+  pull and push, or from the Git menu; and the caret line's blame in the
+  status line.
 - **Merge conflicts**, however the merge, rebase, cherry-pick or stash pop
   that left them was run: conflicted files get their own group in Source
   Control and the status bar says `MERGING` or `REBASING`. In the file,
