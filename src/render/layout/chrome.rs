@@ -2167,34 +2167,8 @@ pub fn push_activity(
             },
             1.45,
         );
-        if i == 1 && badge > 0 {
-            let label = if badge > 99 {
-                "99+".to_owned()
-            } else {
-                badge.to_string()
-            };
-            let w = (ui_text_width(atlas, &label) + 8.0).max(16.0);
-            let pill = Viewport {
-                x: rect.x + rect.width - w - 5.0,
-                y: rect.y + rect.height - 21.0,
-                width: w,
-                height: 16.0,
-            };
-            // A ring in the strip's own colour cuts the badge out of the
-            // icon under it, so neither reads as part of the other.
-            push_rounded_rect(
-                out,
-                Viewport {
-                    x: pill.x - 2.0,
-                    y: pill.y - 2.0,
-                    width: pill.width + 4.0,
-                    height: pill.height + 4.0,
-                },
-                10.0,
-                theme.sidebar_background,
-            );
-            push_rounded_rect(out, pill, 8.0, theme.accent);
-            push_ui_text_centered(out, atlas, pill, &label, theme.sidebar_background);
+        if i == 1 {
+            push_badge(out, atlas, rect, badge, theme.sidebar_background, theme);
         }
     }
 }

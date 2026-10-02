@@ -85,12 +85,14 @@ quit
 SCRIPT
 HOME="$T/exthome" CRC_EXT_REGISTRY="file://$T/extreg/" CRC_EXT_REGISTRY_KEY="$T/extreg/pub.pem" CRC_EXT_FOLDER="$T/extfolder" CRC_SELFTEST="$T/ext.script" "$BIN" "$T/extproj/notes.txt" 2> "$T/ext.err"
 # The page opens on its home: the header with Close, Refresh and Install
-# from Folder, and the row in the sidebar, each a pointing hand.
+# from Folder, the sidebar's own two header buttons, and the row, each a
+# pointing hand.
 expect "$T/ext-open.out" extensions "open selected=- installed= registry=ready:crc.sort-lines confirm=- busy=- note=-"
-expect "$T/ext-open.out" pointer_targets 4
-# One extension: the way back, Install, and the row; no header.
+expect "$T/ext-open.out" pointer_targets 6
+# One extension: the way back, Install, the row and the sidebar's two
+# header buttons; no page header.
 expect "$T/ext-details.out" extensions "open selected=crc.sort-lines installed= registry=ready:crc.sort-lines confirm=- busy=- note=-"
-expect "$T/ext-details.out" pointer_targets 3
+expect "$T/ext-details.out" pointer_targets 5
 expect "$T/ext-confirm.out" extensions "open selected=crc.sort-lines installed= registry=ready:crc.sort-lines confirm=crc.sort-lines busy=- note=-"
 expect "$T/ext-installed.out" extensions "open selected=crc.sort-lines installed=crc.sort-lines:0.1.0:on:signed registry=ready:crc.sort-lines confirm=- busy=- note=Installed Sort Lines 0.1.0"
 expect "$T/ext-installed.out" ext_commands "Sort Lines|Sort Lines Descending|Remove Duplicate Lines"

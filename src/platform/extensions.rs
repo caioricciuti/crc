@@ -177,7 +177,7 @@ pub fn newer(a: &str, b: &str) -> bool {
 }
 
 const PAD: f32 = 28.0;
-const BUTTON_H: f32 = 26.0;
+const BUTTON_H: f32 = layout::UI_CONTROL;
 
 fn button(
     out: &mut Vec<GlyphInstance>,
@@ -188,20 +188,21 @@ fn button(
     label: &str,
     primary: bool,
 ) -> Viewport {
-    let width = layout::ui_text_width(atlas, label) + 24.0;
+    let width = layout::ui_text_width(atlas, label) + 28.0;
     let rect = Viewport {
         x,
         y,
         width,
         height: BUTTON_H,
     };
-    if primary {
-        layout::push_rounded_rect(out, rect, 5.0, theme.accent);
-        layout::push_ui_text_centered(out, atlas, rect, label, theme.tab_active);
-    } else {
-        layout::push_rounded_rect(out, rect, 5.0, theme.palette_selected);
-        layout::push_ui_text_centered(out, atlas, rect, label, theme.text);
-    }
+    layout::Button::new(rect)
+        .label(label)
+        .tone(if primary {
+            layout::Tone::Primary
+        } else {
+            layout::Tone::Secondary
+        })
+        .draw(out, atlas, theme);
     rect
 }
 
@@ -275,6 +276,9 @@ fn draw_page(
     let mut y = rect.y + 22.0;
     page.readme_rect = None;
     let home = page.selected.is_none() && page.confirm.is_none();
+    // Work under way gets a spinner before its words.
+    let working =
+        page.busy.is_some() || (page.note.is_none() && matches!(page.registry, Registry::Loading));
     let status = match (&page.busy, &page.note, &page.registry) {
         (Some(busy), _, _) => busy.clone(),
         (None, Some(note), _) => note.clone(),
@@ -308,14 +312,28 @@ fn draw_page(
             ("Refresh", Action::Refresh),
             ("Install from Folder\u{2026}", Action::InstallFolder),
         ] {
-            let w = layout::ui_text_width(atlas, label) + 24.0;
+            let w = layout::ui_text_width(atlas, label) + 28.0;
             bx -= w;
             let r = button(out, atlas, theme, bx, y - 4.0, label, false);
             hits.push((r, action));
             bx -= 8.0;
         }
         y += 26.0;
-        text(out, atlas, x, y, right - x, &status, dim);
+        let mut sx = x;
+        if working {
+            sx += layout::push_spinner(
+                out,
+                x + 1.0,
+                Viewport {
+                    x,
+                    y,
+                    width: 20.0,
+                    height: 20.0,
+                },
+                theme.accent,
+            ) + 8.0;
+        }
+        text(out, atlas, sx, y, right - sx, &status, dim);
         y += 28.0;
         layout::push_rect(out, atlas, [x, y], [right - x, 1.0], theme.hairline);
         y += 12.0;
@@ -325,7 +343,21 @@ fn draw_page(
         let r = link(out, atlas, theme, x, y - 4.0, "\u{2039} Extensions");
         hits.push((r, Action::Home));
         if page.busy.is_some() || page.note.is_some() {
-            text(out, atlas, r.x + r.width + 16.0, y, right - x, &status, dim);
+            let mut sx = r.x + r.width + 16.0;
+            if working {
+                sx += layout::push_spinner(
+                    out,
+                    sx,
+                    Viewport {
+                        x: sx,
+                        y,
+                        width: 20.0,
+                        height: 20.0,
+                    },
+                    theme.accent,
+                ) + 8.0;
+            }
+            text(out, atlas, sx, y, right - sx, &status, dim);
         }
         y += 34.0;
     }
@@ -585,20 +617,76 @@ pub fn draw_list(
 ) {
     let mut hits = Vec::new();
     let dim = theme.status_text;
-    let (title, _) = layout::sidebar_switcher(rect);
-    text(
-        out,
-        atlas,
-        title.x + 2.0,
-        title.y + 3.0,
-        title.width,
-        "EXTENSIONS",
-        dim,
-    );
-    let x = rect.x + 12.0;
-    let width = rect.width - 24.0;
+    // The title row: the panel's name, then Install from Folder and a new
+    // look at the registry.
+    layout::push_sidebar_title(out, atlas, rect, "EXTENSIONS", 2, theme);
+    let [folder, refresh] = layout::sidebar_header_buttons::<2>(rect);
+    let loading = matches!(page.registry, Registry::Loading);
+    for (r, icon, tip, action, enabled) in [
+        (
+            folder,
+            crate::project::icons::NEW_FOLDER,
+            "Install from a Folder\u{2026}",
+            Action::InstallFolder,
+            true,
+        ),
+        (
+            refresh,
+            crate::project::icons::REFRESH,
+            "Check the Registry Again",
+            Action::Refresh,
+            !loading,
+        ),
+    ] {
+        layout::Button::new(r)
+            .icon(icon)
+            .tone(layout::Tone::Ghost)
+            .enabled(enabled)
+            .tip(tip)
+            .draw(out, atlas, theme);
+        if enabled {
+            hits.push((r, action));
+        }
+    }
+    if loading {
+        layout::push_progress(
+            out,
+            atlas,
+            Viewport {
+                x: rect.x,
+                y: rect.y + layout::SIDEBAR_HEADER_HEIGHT - 2.0,
+                width: rect.width - 1.0,
+                height: 2.0,
+            },
+            theme,
+        );
+    }
+    let x = rect.x + layout::UI_INSET;
+    let width = rect.width - layout::UI_INSET * 2.0;
     let bottom = rect.y + rect.height - 8.0;
-    let mut y = title.y + title.height + 14.0;
+    let mut y = rect.y + layout::SIDEBAR_HEADER_HEIGHT + 4.0;
+
+    // A section heading, as Source Control draws its own: small capitals
+    // and a count.
+    let heading = |out: &mut Vec<GlyphInstance>,
+                   atlas: &mut Atlas,
+                   y: f32,
+                   title: &str,
+                   count: Option<usize>| {
+        let row = Viewport {
+            x,
+            y,
+            width,
+            height: 24.0,
+        };
+        let upper = title.to_uppercase();
+        layout::push_ui_text(out, atlas, row, &upper, dim);
+        let w = layout::ui_text_width(atlas, &upper);
+        if let Some(count) = count {
+            layout::push_count(out, atlas, x + w + 8.0, row, count, theme);
+        }
+        w
+    };
 
     let mut rows: Vec<(&'static str, String, String, String, char)> = Vec::new();
     for i in &page.installed {
@@ -619,7 +707,8 @@ pub fn draw_list(
             crate::project::icons::extension_icon(&i.manifest.icon),
         ));
     }
-    for e in page.offered() {
+    let offered = page.offered();
+    for e in &offered {
         let state = if page.installed(&e.manifest.id).is_some() {
             format!("update to {}", e.manifest.version)
         } else {
@@ -633,72 +722,189 @@ pub fn draw_list(
             crate::project::icons::extension_icon(&e.manifest.icon),
         ));
     }
+    let count_of = |section: &str| rows.iter().filter(|r| r.0 == section).count();
+    const ROW_H: f32 = 44.0;
     let mut last = "";
     for (section, id, name, state, icon) in &rows {
         if *section != last {
-            if y + 22.0 > bottom {
+            if !last.is_empty() {
+                y += 8.0;
+            }
+            if y + 24.0 > bottom {
                 break;
             }
-            text(out, atlas, x, y, width, section, dim);
-            y += 24.0;
+            heading(out, atlas, y, section, Some(count_of(section)));
+            y += 26.0;
             last = section;
         }
-        const ROW_H: f32 = 44.0;
         if y + ROW_H > bottom {
             break;
         }
         let row = Viewport {
-            x: rect.x + 4.0,
+            x: rect.x,
             y,
-            width: rect.width - 8.0,
-            height: ROW_H - 4.0,
+            width: rect.width,
+            height: ROW_H,
         };
         if page.selected.as_deref() == Some(id.as_str()) && page.details {
-            layout::push_rounded_rect(out, row, 6.0, theme.sidebar_selected);
+            layout::push_rounded_rect(
+                out,
+                Viewport {
+                    x: row.x + 6.0,
+                    y: row.y + 1.0,
+                    width: row.width - 12.0,
+                    height: row.height - 2.0,
+                },
+                layout::UI_RADIUS,
+                theme.sidebar_selected,
+            );
+            layout::hotspot(row, layout::Cursor::Pointing, None);
+        } else {
+            layout::push_row_hover(out, row, theme);
         }
-        layout::push_icon_scaled(
-            out,
-            atlas,
-            Viewport {
-                x,
-                y: y + 3.0,
-                width: 26.0,
-                height: 34.0,
-            },
-            *icon,
-            theme.accent,
-            1.3,
-        );
-        text(
-            out,
-            atlas,
-            x + 36.0,
-            y + 2.0,
-            width - 36.0,
-            name,
-            theme.sidebar_text,
-        );
-        text(out, atlas, x + 36.0, y + 20.0, width - 36.0, state, dim);
+        // The icon on a tile, so a row of extensions reads as a row of
+        // things, not a column of glyphs.
+        let tile = Viewport {
+            x,
+            y: y + 6.0,
+            width: 32.0,
+            height: 32.0,
+        };
+        layout::push_rounded_rect(out, tile, layout::UI_RADIUS + 1.0, theme.tab_hover);
+        layout::push_icon_scaled(out, atlas, tile, *icon, theme.accent, 1.25);
+        let tx = x + 32.0 + 10.0;
+        let tw = (width - 42.0).max(0.0);
+        text(out, atlas, tx, y + 4.0, tw, name, theme.text);
+        let state_colour = if state.contains("update to") {
+            theme.accent
+        } else if state.contains("changed") {
+            theme.diff_removed
+        } else {
+            theme.gutter_text
+        };
+        text(out, atlas, tx, y + 21.0, tw, state, state_colour);
         hits.push((row, Action::Select(id.clone())));
         y += ROW_H;
     }
-    // Until the registry answers, Available is there with a note in it, so
-    // the list does not grow under the pointer when it arrives.
-    let waiting = match &page.registry {
-        Registry::Loading => Some("Checking the registry\u{2026}".to_owned()),
-        Registry::Failed(why) => Some(format!("The registry did not answer: {why}")),
-        Registry::Ready(..) => None,
-    };
-    if let Some(note) = waiting {
-        if last != "Available" && y + 46.0 <= bottom {
-            text(out, atlas, x, y, width, "Available", dim);
-            y += 24.0;
+    // Until the registry answers, Available is there with rows sketched in
+    // it, so the list has its shape at once and does not jump when the
+    // answer lands.
+    match &page.registry {
+        Registry::Loading => {
+            if last != "Available" {
+                if !last.is_empty() {
+                    y += 8.0;
+                }
+                if y + 24.0 <= bottom {
+                    let w = heading(out, atlas, y, "Available", None);
+                    layout::push_spinner(
+                        out,
+                        x + w + 10.0,
+                        Viewport {
+                            x,
+                            y,
+                            width,
+                            height: 24.0,
+                        },
+                        theme.accent,
+                    );
+                    layout::hotspot(
+                        Viewport {
+                            x,
+                            y,
+                            width,
+                            height: 24.0,
+                        },
+                        layout::Cursor::Arrow,
+                        Some("Checking the registry\u{2026}"),
+                    );
+                    y += 26.0;
+                }
+            }
+            for (n, widths) in [(0.55, 0.3), (0.7, 0.25), (0.45, 0.35)]
+                .into_iter()
+                .enumerate()
+            {
+                if y + ROW_H > bottom {
+                    break;
+                }
+                let _ = n;
+                layout::push_skeleton_row(
+                    out,
+                    Viewport {
+                        x,
+                        y,
+                        width,
+                        height: ROW_H,
+                    },
+                    32.0,
+                    widths,
+                    true,
+                    theme,
+                );
+                y += ROW_H;
+            }
         }
-        if y + 22.0 <= bottom {
-            text(out, atlas, x, y, width, &note, dim);
+        Registry::Failed(why) => {
+            if last != "Available" {
+                if !last.is_empty() {
+                    y += 8.0;
+                }
+                if y + 24.0 <= bottom {
+                    heading(out, atlas, y, "Available", None);
+                    y += 26.0;
+                }
+            }
+            let icon_w = layout::icon_width(atlas, crate::project::icons::ERROR);
+            if y + 22.0 <= bottom {
+                layout::push_icon_centered(
+                    out,
+                    atlas,
+                    Viewport {
+                        x,
+                        y,
+                        width: icon_w,
+                        height: 22.0,
+                    },
+                    crate::project::icons::ERROR,
+                    theme.diff_removed,
+                );
+                text(
+                    out,
+                    atlas,
+                    x + icon_w + 6.0,
+                    y + 1.0,
+                    width - icon_w - 6.0,
+                    "The registry did not answer",
+                    theme.text,
+                );
+                y += 24.0;
+            }
+            for line in layout::wrap_words(atlas, why, width).into_iter().take(4) {
+                if y + 20.0 > bottom {
+                    break;
+                }
+                text(out, atlas, x, y, width, &line, dim);
+                y += 20.0;
+            }
+            let retry = Viewport {
+                x,
+                y: y + 6.0,
+                width: layout::ui_text_width(atlas, "Try Again") + 28.0,
+                height: layout::UI_CONTROL,
+            };
+            if retry.y + retry.height <= bottom {
+                layout::Button::new(retry)
+                    .label("Try Again")
+                    .draw(out, atlas, theme);
+                hits.push((retry, Action::Refresh));
+            }
         }
-    } else if rows.is_empty() {
-        text(out, atlas, x, y, width, "Nothing installed yet.", dim);
+        Registry::Ready(..) => {
+            if rows.is_empty() {
+                text(out, atlas, x, y, width, "Nothing installed yet.", dim);
+            }
+        }
     }
     page.list_hits = hits;
 }

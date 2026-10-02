@@ -1282,13 +1282,10 @@ impl Panel {
                 },
             )
         };
-        // Git's stderr can run to many lines; the first one names it, and
-        // the whole of it is in the editor column.
-        let first = self
-            .note
-            .lines()
-            .find(|l| !l.trim().is_empty())
-            .unwrap_or("");
+        // Git's stderr can run to many lines, and the first is often ssh
+        // talking about a key file; the line Git itself marks as the error
+        // names it. The whole of it is in the tooltip.
+        let first = headline(&self.note);
         layout::push_ui_text(
             out,
             atlas,
@@ -1297,7 +1294,7 @@ impl Panel {
                 width: (rect.width - lead).max(0.0),
                 ..rect
             },
-            first,
+            &first,
             colour,
         );
         layout::hotspot(rect, layout::Cursor::Arrow, Some(&self.note));
@@ -1363,24 +1360,28 @@ impl Panel {
         let width = g.message.width;
         let mut y = g.branch.y + 4.0;
         if self.busy() {
-            let row = Viewport {
-                x,
-                y,
-                width,
-                height: 22.0,
-            };
-            let w = layout::push_spinner(out, x + 2.0, row, theme.accent);
-            layout::push_ui_text(
-                out,
-                atlas,
-                Viewport {
-                    x: x + w + 10.0,
-                    width: (width - w - 10.0).max(0.0),
-                    ..row
-                },
-                "Reading repository\u{2026}",
-                theme.status_text,
-            );
+            // The panel's own shape, sketched, while Git is first asked:
+            // the branch, the message and Commit, then a few rows.
+            for rect in [g.branch, g.message, g.commit] {
+                layout::push_skeleton_row(out, rect, 0.0, (1.0, 0.0), false, theme);
+            }
+            let mut row_y = g.list.y + 4.0;
+            for widths in [(0.35, 0.0), (0.6, 0.0), (0.5, 0.0), (0.7, 0.0)] {
+                layout::push_skeleton_row(
+                    out,
+                    Viewport {
+                        x: g.list.x + 24.0,
+                        y: row_y,
+                        width: (g.list.width - 48.0).max(0.0),
+                        height: ROW,
+                    },
+                    16.0,
+                    widths,
+                    false,
+                    theme,
+                );
+                row_y += ROW;
+            }
             return;
         }
         let not_a_repo = self
@@ -1838,6 +1839,27 @@ pub fn snapshot_status(snapshot: &Snapshot) -> String {
     out
 }
 
+/// The line of Git's output that says what went wrong, without its
+/// `fatal:` or `error:`, and capitalised: what a one-line note shows.
+pub fn headline(text: &str) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("fatal:") || l.starts_with("error:"))
+        .or_else(|| text.lines().map(str::trim).find(|l| !l.is_empty()))
+        .unwrap_or("");
+    let bare = line
+        .strip_prefix("fatal:")
+        .or_else(|| line.strip_prefix("error:"))
+        .unwrap_or(line)
+        .trim();
+    let mut chars = bare.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
 fn branch_name(header: &str) -> String {
     let header = header
         .strip_prefix("No commits yet on ")
@@ -1875,6 +1897,14 @@ mod tests {
         let mut panel = Panel::idle(PathBuf::from("/tmp"), Some(snapshot));
         panel.note = String::new();
         panel
+    }
+
+    #[test]
+    fn a_note_leads_with_the_line_git_marks_as_the_error() {
+        let said = "Load key \"/tmp/key.pub\": invalid format\ngit@github.com: Permission denied (publickey).\nfatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights";
+        assert_eq!(headline(said), "Could not read from remote repository.");
+        assert_eq!(headline("nothing to commit"), "Nothing to commit");
+        assert_eq!(headline(""), "");
     }
 
     #[test]

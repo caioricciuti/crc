@@ -554,6 +554,144 @@ pub fn push_section_heading(
     }
 }
 
+/// A UI label at `scale` times the UI size, centred in `rect`: badges and
+/// counts, where the 13pt UI face crowds a 16pt pill. Drawn from the same
+/// atlas glyphs, scaled, so it costs nothing new.
+pub fn push_ui_text_scaled(
+    out: &mut Vec<GlyphInstance>,
+    atlas: &mut Atlas,
+    rect: Viewport,
+    text: &str,
+    color: [f32; 4],
+    scale: f32,
+) {
+    let Some(line) = atlas.shape_ui(text) else {
+        return;
+    };
+    let m = atlas.metrics;
+    let (cw, ch) = atlas.cell_size();
+    let width = ui_text_width(atlas, text) * scale;
+    let x0 = rect.x + (rect.width - width) * 0.5;
+    let y0 = m.snap(rect.y + (rect.height - ch * scale) * 0.5);
+    for glyph in &line.glyphs {
+        let Some(slot) = atlas.slot_for_shaped(&line, glyph) else {
+            continue;
+        };
+        out.push(GlyphInstance {
+            pos: [x0 + (glyph.x + slot.dx) * scale, y0],
+            size: [cw * slot.cells as f32 * scale, ch * scale],
+            uv: slot.uv,
+            flags: slot.flags(),
+            color,
+            ..Default::default()
+        });
+    }
+}
+
+/// A count on an icon: a small accent pill at its top right, cut out of
+/// the icon by a ring in `ground`, the surface it sits on.
+pub fn push_badge(
+    out: &mut Vec<GlyphInstance>,
+    atlas: &mut Atlas,
+    icon: Viewport,
+    count: usize,
+    ground: [f32; 4],
+    theme: &Theme,
+) {
+    if count == 0 {
+        return;
+    }
+    let label = if count > 99 {
+        "99+".to_owned()
+    } else {
+        count.to_string()
+    };
+    const SCALE: f32 = 0.78;
+    const H: f32 = 15.0;
+    let w = (ui_text_width(atlas, &label) * SCALE + 8.0).max(H);
+    let pill = Viewport {
+        x: (icon.x + icon.width * 0.5 + 2.0).round(),
+        y: (icon.y + icon.height * 0.5 - 15.0).round(),
+        width: w.round(),
+        height: H,
+    };
+    push_rounded_rect(
+        out,
+        Viewport {
+            x: pill.x - 2.0,
+            y: pill.y - 2.0,
+            width: pill.width + 4.0,
+            height: pill.height + 4.0,
+        },
+        (H + 4.0) * 0.5,
+        ground,
+    );
+    push_rounded_rect(out, pill, H * 0.5, theme.accent);
+    let ink = if theme.is_dark() {
+        [0.063, 0.086, 0.078, 1.0]
+    } else {
+        [1.0, 1.0, 1.0, 1.0]
+    };
+    push_ui_text_scaled(out, atlas, pill, &label, ink, SCALE);
+}
+
+/// A placeholder for a list row that is on its way: an icon square and
+/// two bars, breathing, so a list being fetched has a shape before it has
+/// content. `two_lines` for rows with a title and a detail.
+pub fn push_skeleton_row(
+    out: &mut Vec<GlyphInstance>,
+    row: Viewport,
+    icon: f32,
+    widths: (f32, f32),
+    two_lines: bool,
+    theme: &Theme,
+) {
+    let t = phase(1.6);
+    let breathe = 0.55 + 0.45 * (t * std::f32::consts::TAU).sin().abs();
+    let fill = faded(theme.control_hover, breathe);
+    let mut x = row.x;
+    if icon > 0.0 {
+        push_rounded_rect(
+            out,
+            Viewport {
+                x,
+                y: row.y + ((row.height - icon) * 0.5).round(),
+                width: icon,
+                height: icon,
+            },
+            UI_RADIUS_SM + 1.0,
+            fill,
+        );
+        x += icon + 10.0;
+    }
+    let room = (row.x + row.width - x).max(0.0);
+    let bar = |out: &mut Vec<GlyphInstance>, y: f32, w: f32, h: f32| {
+        push_rounded_rect(
+            out,
+            Viewport {
+                x,
+                y,
+                width: (room * w).max(12.0).min(room),
+                height: h,
+            },
+            h * 0.5,
+            fill,
+        )
+    };
+    if two_lines {
+        bar(out, row.y + row.height * 0.5 - 10.0, widths.0, 8.0);
+        bar(out, row.y + row.height * 0.5 + 3.0, widths.1, 7.0);
+    } else {
+        bar(
+            out,
+            row.y + ((row.height - 8.0) * 0.5).round(),
+            widths.0,
+            8.0,
+        );
+    }
+    ANIMATING.with(|a| a.set(true));
+}
+
 /// What a status-line message is: news, a success, or a failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Feedback {
