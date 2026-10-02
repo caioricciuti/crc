@@ -2,10 +2,12 @@
 
 One entry per tag, written for people who use the editor.
 
-## Unreleased
+## v0.2.0-alpha.12, 2026-10-02
 
-Workspaces: a folder that holds several repositories and the notes about
-them opens as one project.
+Workspaces, MCP servers you can use yourself, crc as an MCP server for
+agents, and a terminal that knows which session waits on you. A folder
+that holds several repositories and the notes about them opens as one
+project.
 
 - Opening a folder finds the Git repositories in it, up to two levels
   down. Source Control shows one at a time and names it in a menu at the
