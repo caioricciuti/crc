@@ -8,8 +8,9 @@
 
 use std::path::PathBuf;
 
+use crate::project::icons;
 use crate::render::font::Atlas;
-use crate::render::layout::{self, Theme, Viewport};
+use crate::render::layout::{self, Button, Theme, Tone, Viewport};
 use crate::render::metal::GlyphInstance;
 use crate::term::pty::Session;
 use crate::term::{self, BOLD, Cell, Color, DIM, HIDDEN, INVERSE, STRIKE, UNDERLINE, WIDE_TAIL};
@@ -205,10 +206,21 @@ pub fn header_hits(
     let new = Viewport {
         x,
         y: header.y + 4.0,
-        width: 26.0,
+        width: HEADER - 8.0,
         height: HEADER - 8.0,
     };
     (tabs, new)
+}
+
+/// Hide Panel, at the header's trailing edge.
+pub fn header_hide(header: Viewport) -> Viewport {
+    let size = layout::UI_CONTROL_SM;
+    Viewport {
+        x: header.x + header.width - layout::UI_INSET + 4.0 - size,
+        y: header.y + ((header.height - size) * 0.5).floor(),
+        width: size,
+        height: size,
+    }
 }
 
 /// The title the program set, when it set one (`claude` does, and so do
@@ -314,8 +326,11 @@ pub fn draw(
     for (index, (tab, (rect, close))) in panel.tabs.iter().zip(tabs).enumerate() {
         let active = index == panel.active;
         if active {
-            layout::push_rounded_rect(out, rect, 5.0, theme.tab_hover);
+            layout::push_rounded_rect(out, rect, layout::UI_RADIUS_SM, theme.tab_hover);
+        } else if layout::hovered(rect) {
+            layout::push_rounded_rect(out, rect, layout::UI_RADIUS_SM, theme.row_hover);
         }
+        layout::hotspot(rect, layout::Cursor::Pointing, None);
         // A tab waiting on the person: a dot before its title.
         if tab.attention.is_some() {
             layout::push_rounded_rect(
@@ -348,9 +363,32 @@ pub fn draw(
             &label(tab),
             colour,
         );
-        layout::push_ui_text_centered(out, atlas, close, "×", theme.status_text);
+        // The close cross on the tab that is showing and the one under the
+        // pointer, the way editor tabs do it.
+        if active || layout::hovered(rect) {
+            let square = Viewport {
+                y: close.y + ((close.height - 18.0) * 0.5).floor(),
+                height: 18.0,
+                ..close
+            };
+            Button::new(square)
+                .icon(icons::CLOSE)
+                .tone(Tone::Ghost)
+                .radius(layout::UI_RADIUS_SM)
+                .tip("Close Terminal")
+                .draw(out, atlas, theme);
+        }
     }
-    layout::push_ui_text_centered(out, atlas, new, "+", theme.status_text);
+    Button::new(new)
+        .icon(icons::ADD)
+        .tone(Tone::Ghost)
+        .tip("New Terminal")
+        .draw(out, atlas, theme);
+    Button::new(header_hide(header))
+        .icon(icons::CHEVRON_DOWN)
+        .tone(Tone::Ghost)
+        .tip("Hide Panel  \u{2303}`")
+        .draw(out, atlas, theme);
 
     let Some(tab) = panel.active_tab() else {
         return;

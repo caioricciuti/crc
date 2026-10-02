@@ -305,8 +305,9 @@ impl EditorView {
             state.message = Some(("not a Git repository".into(), Instant::now()));
         } else {
             let sock = state.ssh_auth_sock.clone();
+            // The status line shows a spinner and the verb for as long as
+            // the command runs, and the outcome once it is done.
             state.git.remote(what, sock);
-            state.message = Some((format!("{}…", what.verb()), Instant::now()));
         }
         drop(state);
         self.resume_display_link();

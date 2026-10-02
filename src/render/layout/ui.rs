@@ -554,6 +554,73 @@ pub fn push_section_heading(
     }
 }
 
+/// What a status-line message is: news, a success, or a failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Feedback {
+    Info,
+    Success,
+    Failure,
+}
+
+/// Reads a status-line message for what kind it is. Messages are plain
+/// sentences from all over the app; their wording is consistent enough to
+/// tell a failure from a success, and a failure must not look like news.
+pub fn feedback_of(text: &str) -> Feedback {
+    let lower = text.to_lowercase();
+    const FAILURE: [&str; 15] = [
+        "fail",
+        "could not",
+        "couldn't",
+        "error",
+        "refused",
+        "not committed",
+        "cannot",
+        "can't",
+        "invalid",
+        "no upstream",
+        "not a git",
+        "rejected",
+        "fatal:",
+        "did not",
+        "not saved",
+    ];
+    const SUCCESS: [&str; 17] = [
+        "saved",
+        "committed",
+        "pushed",
+        "pulled",
+        "fetched",
+        "staged",
+        "unstaged",
+        "switched",
+        "created",
+        "deleted",
+        "renamed",
+        "copied",
+        "installed",
+        "removed",
+        "moved",
+        "replaced",
+        "marked",
+    ];
+    if FAILURE.iter().any(|w| lower.contains(w)) {
+        Feedback::Failure
+    } else if SUCCESS.iter().any(|w| lower.starts_with(w)) {
+        Feedback::Success
+    } else {
+        Feedback::Info
+    }
+}
+
+/// How long a status-line message stays: a failure twice as long, since
+/// it has to be read, not just noticed.
+pub fn message_lasts(text: &str) -> std::time::Duration {
+    std::time::Duration::from_secs(match feedback_of(text) {
+        Feedback::Failure => 8,
+        _ => 4,
+    })
+}
+
 /// The time-based phase of anything animated, 0..1 over `period` seconds.
 pub fn phase(period: f32) -> f32 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -636,6 +703,24 @@ mod tests {
         set_pressed(None);
         set_pointer(None);
         assert!(!hovered(r));
+    }
+
+    #[test]
+    fn messages_are_told_apart_by_their_wording() {
+        assert_eq!(
+            feedback_of("could not start zsh: denied"),
+            Feedback::Failure
+        );
+        assert_eq!(feedback_of("Not committed: leak.txt:1"), Feedback::Failure);
+        assert_eq!(
+            feedback_of("this branch has no upstream to pull from"),
+            Feedback::Failure
+        );
+        assert_eq!(feedback_of("pushed: main -> main"), Feedback::Success);
+        assert_eq!(feedback_of("staged 3 files"), Feedback::Success);
+        assert_eq!(feedback_of("Folder opened"), Feedback::Info);
+        assert_eq!(feedback_of("Fetching…"), Feedback::Info);
+        assert!(message_lasts("push failed") > message_lasts("saved"));
     }
 
     #[test]

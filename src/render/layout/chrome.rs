@@ -2646,6 +2646,8 @@ pub enum Hit {
     TerminalTab(usize),
     TerminalClose(usize),
     TerminalNew,
+    /// Hides the panel; the sessions keep running.
+    TerminalHide,
     /// The terminal's screen.
     Terminal,
     /// An icon in the strip: 0 Explorer, 1 Source Control, 2 Extensions.
@@ -2712,6 +2714,7 @@ impl Hit {
             Hit::TerminalTab(i) => format!("terminal.tab.{i}"),
             Hit::TerminalClose(i) => format!("terminal.close.{i}"),
             Hit::TerminalNew => "terminal.new".into(),
+            Hit::TerminalHide => "terminal.hide".into(),
             Hit::Terminal => "terminal".into(),
             Hit::Activity(i) => format!("activity.{}", ACTIVITY_ICONS[*i].1),
             Hit::SidebarAction(i) => format!("sidebar.action.{i}"),

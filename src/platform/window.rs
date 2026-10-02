@@ -42,7 +42,7 @@ use crate::platform::symbols;
 use crate::project::finder::Finder;
 use crate::project::tree::{Entry as TreeEntry, Tree, move_without_replace};
 use crate::render::font::Atlas;
-use crate::render::layout::{self, Chrome, Frame, Hit, Theme, Viewport};
+use crate::render::layout::{self, Button, Chrome, Frame, Hit, Theme, Tone, Viewport};
 use crate::render::metal::{DRAWABLE_FORMAT, FrameTiming, GlyphInstance, Renderer};
 use crate::syntax::{Language, Span, SyntaxStore};
 use crate::text::buffer::{Buffer, DiskState, Motion};
@@ -1604,6 +1604,14 @@ define_class!(
                     self.spawn_terminal(false);
                     return;
                 }
+                Some(Hit::TerminalHide) => {
+                    if let Some(mut state) = self.state_mut() {
+                        state.terminal.open = false;
+                        state.terminal.focus = false;
+                    }
+                    self.after_terminal_layout();
+                    return;
+                }
                 Some(Hit::Terminal) => {
                     self.terminal_press(event, x, y);
                     return;
@@ -2100,10 +2108,12 @@ define_class!(
                     add(action, &NSCursor::pointingHandCursor());
                 }
             }
-            if let Some(find) = chrome.find {
-                add(Viewport { width: (find.width - 180.0).max(0.0), height: find.height.min(layout::FIND_ROW_HEIGHT * 2.0), ..find }, &NSCursor::IBeamCursor());
-                add(Viewport { x: find.x + (find.width - 180.0).max(0.0), width: find.width.min(180.0), ..find }, &NSCursor::pointingHandCursor());
-                if find.height > layout::FIND_ROW_HEIGHT * 2.0 { add(Viewport { y: find.y + layout::FIND_ROW_HEIGHT * 2.0, height: find.height - layout::FIND_ROW_HEIGHT * 2.0, ..find }, &NSCursor::pointingHandCursor()); }
+            // The find bar's fields and buttons are shared controls with
+            // hotspots of their own; only the project results are added here.
+            if let Some(find) = chrome.find
+                && find.height > layout::FIND_ROW_HEIGHT * 2.0
+            {
+                add(Viewport { y: find.y + layout::FIND_ROW_HEIGHT * 2.0, height: find.height - layout::FIND_ROW_HEIGHT * 2.0, ..find }, &NSCursor::pointingHandCursor());
             }
             if let Some(rect) = chrome.sidebar {
                 if state.git_open {
@@ -2346,7 +2356,7 @@ define_class!(
                 if interval > 0.0 && interval < 1.0 {
                     state.frame_interval = Duration::from_secs_f64(interval);
                 }
-                if state.message.as_ref().is_some_and(|(_, at)| at.elapsed() >= Duration::from_secs(4)) {
+                if state.message.as_ref().is_some_and(|(text, at)| at.elapsed() >= layout::message_lasts(text)) {
                     state.message = None;
                     self.ivars().needs_redraw.set(true);
                 }
@@ -6043,6 +6053,10 @@ fn frame_of(state: &mut State) -> Frame {
             frame.push(Hit::TerminalTab(index), tab);
         }
         frame.push(Hit::TerminalNew, new);
+        frame.push(
+            Hit::TerminalHide,
+            crate::platform::terminal::header_hide(header),
+        );
         // The screen first, so a script's offsets land on rows and columns;
         // the padding around it is the terminal too.
         frame.push(Hit::Terminal, crate::platform::terminal::split(rect).1);

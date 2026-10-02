@@ -2,6 +2,7 @@
 //! chrome to the text, the overlays and the other panes.
 
 use super::*;
+use crate::project::icons;
 
 impl EditorView {
     pub(super) fn resize(&self, size: NSSize) {
@@ -712,7 +713,7 @@ impl EditorView {
         // A transient note (save result, open error) takes over the status
         // line briefly, then yields back to the steady-state readout.
         let note = match message {
-            Some((text, at)) if at.elapsed() < Duration::from_secs(4) => Some(text.clone()),
+            Some((text, at)) if at.elapsed() < layout::message_lasts(text) => Some(text.clone()),
             _ => {
                 *message = None;
                 None
@@ -746,17 +747,65 @@ impl EditorView {
             detail
         };
         let right = status_detail_rect(status_rect);
-        layout::push_ui_text(
-            glyphs,
-            &mut renderer.atlas,
-            Viewport {
-                x: 16.0,
-                width: (right.x - status_rect.x - 32.0).max(0.0),
-                ..status_rect
-            },
-            &status,
-            theme.status_text,
-        );
+        // Work that outlasts a message: Git talking to a remote, a
+        // language server starting. A spinner and what it is, until done.
+        let shown_note = message.as_ref().map(|(text, _)| text.as_str());
+        let working = if shown_note.is_some() {
+            None
+        } else if git.busy() && git.note.ends_with('\u{2026}') && git.note != "Working\u{2026}" {
+            Some(git.note.clone())
+        } else {
+            lsp_language(buffer)
+                .and_then(|language| lsp.get(&crate::lsp::servers::server_key(language)))
+                .filter(|server| !server.is_ready())
+                .map(|server| format!("{} starting\u{2026}", server.name))
+        };
+        let mut left = Viewport {
+            x: status_rect.x + layout::UI_INSET,
+            width: (right.x - status_rect.x - layout::UI_INSET * 2.0).max(0.0),
+            ..status_rect
+        };
+        let lead = |left: &mut Viewport, w: f32| {
+            left.x += w;
+            left.width = (left.width - w).max(0.0);
+        };
+        let (text, colour) = if let Some(work) = &working {
+            let w = layout::push_spinner(glyphs, left.x, left, theme.accent);
+            lead(&mut left, w + 8.0);
+            (work.as_str(), theme.status_text)
+        } else {
+            let feedback = shown_note.map_or(layout::Feedback::Info, layout::feedback_of);
+            let icon = match feedback {
+                layout::Feedback::Failure => Some((icons::ERROR, theme.diff_removed)),
+                layout::Feedback::Success => Some((icons::PASS, theme.diff_added)),
+                layout::Feedback::Info => None,
+            };
+            if let Some((glyph, tint)) = icon {
+                let w = layout::icon_width(&mut renderer.atlas, glyph);
+                layout::push_icon_centered(
+                    glyphs,
+                    &mut renderer.atlas,
+                    Viewport { width: w, ..left },
+                    glyph,
+                    tint,
+                );
+                lead(&mut left, w + 6.0);
+            }
+            (
+                status.as_str(),
+                if feedback == layout::Feedback::Failure {
+                    theme.diff_removed
+                } else {
+                    theme.status_text
+                },
+            )
+        };
+        layout::push_ui_text(glyphs, &mut renderer.atlas, left, text, colour);
+        if let Some(note) = shown_note {
+            // A long message is cut by the window; the whole of it is a
+            // pointer's rest away.
+            layout::hotspot(left, layout::Cursor::Arrow, Some(note));
+        }
         layout::push_ui_text(
             glyphs,
             &mut renderer.atlas,
@@ -887,7 +936,8 @@ fn draw_find_bar(
         if focused {
             layout::push_focus_ring(glyphs, box_rect, 6.0, 1.5, theme);
         }
-        layout::push_rounded_rect(glyphs, box_rect, 6.0, theme.tab_active);
+        layout::push_rounded_rect(glyphs, box_rect, layout::UI_RADIUS, theme.tab_active);
+        layout::hotspot(box_rect, layout::Cursor::Text, None);
         let text = buffer.rope.to_string();
         let inner = Viewport {
             x: box_rect.x + FIND_FIELD_PAD,
@@ -965,97 +1015,76 @@ fn draw_find_bar(
         None,
     );
 
-    // Buttons with their text centred, in the UI font the rest of the
-    // window uses, rather than monospace pushed in by one advance.
-    let button = |glyphs: &mut Vec<GlyphInstance>,
-                  atlas: &mut Atlas,
-                  r: Viewport,
-                  label: &str,
-                  enabled: bool| {
-        layout::push_rounded_rect(glyphs, r, 5.0, theme.tab_hover);
-        layout::push_ui_text_centered(
-            glyphs,
-            atlas,
-            r,
-            label,
-            if enabled {
-                theme.tab_text
-            } else {
-                theme.gutter_text
-            },
-        );
-    };
+    // The shared button: the same height, corners and hover as every
+    // other control, with arrows and a cross from the icon font rather
+    // than guillemets and a multiplication sign.
     let has_matches = if bar.project {
         !bar.results.is_empty()
     } else {
         found.is_some_and(|(f, _)| !f.is_empty())
     };
-    button(
-        glyphs,
-        &mut renderer.atlas,
-        g.previous,
-        "\u{2039}",
-        has_matches,
-    );
-    button(glyphs, &mut renderer.atlas, g.next, "\u{203a}", has_matches);
-    button(glyphs, &mut renderer.atlas, g.close, "\u{2715}", true);
+    let atlas = &mut renderer.atlas;
+    Button::new(g.previous)
+        .icon(icons::ARROW_UP)
+        .tone(Tone::Ghost)
+        .enabled(has_matches)
+        .tip("Previous Match  \u{21e7}\u{2318}G")
+        .draw(glyphs, atlas, theme);
+    Button::new(g.next)
+        .icon(icons::ARROW_DOWN)
+        .tone(Tone::Ghost)
+        .enabled(has_matches)
+        .tip("Next Match  \u{2318}G")
+        .draw(glyphs, atlas, theme);
+    Button::new(g.close)
+        .icon(icons::CLOSE)
+        .tone(Tone::Ghost)
+        .tip("Close  \u{238b}")
+        .draw(glyphs, atlas, theme);
     if !bar.project {
-        button(
-            glyphs,
-            &mut renderer.atlas,
-            g.replace_one,
-            "Replace",
-            has_matches,
-        );
-        button(
-            glyphs,
-            &mut renderer.atlas,
-            g.replace_all,
-            "All",
-            has_matches,
-        );
+        Button::new(g.replace_one)
+            .label("Replace")
+            .enabled(has_matches)
+            .draw(glyphs, atlas, theme);
+        Button::new(g.replace_all)
+            .label("All")
+            .enabled(has_matches)
+            .tip("Replace All")
+            .draw(glyphs, atlas, theme);
     } else {
-        button(glyphs, &mut renderer.atlas, g.replace_one, "Search", true);
+        Button::new(g.replace_one)
+            .label("Search")
+            .draw(glyphs, atlas, theme);
         // Rows open with a click or Return; this button replaces
         // in every file the results list.
-        button(
-            glyphs,
-            &mut renderer.atlas,
-            g.replace_all,
-            "Replace All",
-            has_matches,
-        );
+        Button::new(g.replace_all)
+            .label("Replace All")
+            .tone(Tone::Danger)
+            .enabled(has_matches)
+            .draw(glyphs, atlas, theme);
     }
 
     // Toggles that show their state: filled and accented when on,
-    // quiet when off. They were the same flat rectangle either way.
-    for (slot, (label, on)) in [
-        ("Aa", bar.options.case_sensitive),
-        ("Word", bar.options.whole_word),
-        (".*", bar.options.regex),
-        ("Project", bar.project),
+    // quiet when off.
+    for (slot, (label, on, tip)) in [
+        ("Aa", bar.options.case_sensitive, "Match Case"),
+        ("Word", bar.options.whole_word, "Match Whole Word"),
+        (".*", bar.options.regex, "Use Regular Expression"),
+        (
+            "Project",
+            bar.project,
+            "Search the Whole Project  \u{21e7}\u{2318}F",
+        ),
     ]
     .into_iter()
     .enumerate()
     {
-        let r = g.options[slot];
-        layout::push_rounded_rect(
-            glyphs,
-            r,
-            5.0,
-            if on {
-                theme.palette_selected
-            } else {
-                theme.tab_hover
-            },
-        );
-        layout::push_ui_text_centered(
-            glyphs,
-            &mut renderer.atlas,
-            r,
-            label,
-            if on { theme.accent } else { theme.status_text },
-        );
+        Button::new(g.options[slot])
+            .label(label)
+            .tone(Tone::Ghost)
+            .on(on)
+            .tip(tip)
+            .draw(glyphs, atlas, theme);
     }
     if bar.project {
         for (row, hit) in bar
