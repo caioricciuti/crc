@@ -1800,6 +1800,10 @@ define_class!(
                             self.select_repo(&path);
                             self.set_sidebar_view(true);
                         }
+                        layout::HomeAction::RunCall(path) => {
+                            self.run_pick(Pick::File(path));
+                            self.run_mcp_call();
+                        }
                     }
                     self.request_redraw();
                     self.pump();
@@ -3202,6 +3206,11 @@ define_class!(
             self.open_mcp();
         }
 
+        #[unsafe(method(saveMcpCall:))]
+        fn action_save_mcp_call(&self, _sender: Option<&AnyObject>) {
+            self.save_mcp_call();
+        }
+
         #[unsafe(method(runMcpCall:))]
         fn action_run_mcp_call(&self, _sender: Option<&AnyObject>) {
             self.run_mcp_call();
@@ -3412,6 +3421,8 @@ define_class!(
                 || action == sel!(gitCommit:)
             {
                 state.tree.root().is_some()
+            } else if action == sel!(saveMcpCall:) {
+                is_mcp_call(&state) && !state.mcp_calls.contains_key(&state.docs.active().id())
             } else if action == sel!(runMcpCall:) {
                 is_mcp_call(&state)
             } else if action == sel!(sendRequest:) {
@@ -6843,6 +6854,12 @@ fn install_menu(mtm: MainThreadMarker, app: &NSApplication) {
     // so it never eats the key anywhere else.
     run_menu.addItem(&item("Send Request", sel!(sendRequest:), "\r", false));
     run_menu.addItem(&item("Run MCP Call", sel!(runMcpCall:), "", false));
+    run_menu.addItem(&item(
+        "Save MCP Call to Workspace",
+        sel!(saveMcpCall:),
+        "",
+        false,
+    ));
     run_item.setSubmenu(Some(&run_menu));
     menubar.addItem(&run_item);
 

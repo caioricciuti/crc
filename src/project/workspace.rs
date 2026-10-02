@@ -552,6 +552,100 @@ pub struct Summary {
     pub notes: Vec<PathBuf>,
     /// The last visit, before this one, in Unix seconds.
     pub since: Option<u64>,
+    /// MCP calls saved in the workspace's `calls/` folder.
+    pub calls: Vec<SavedCall>,
+}
+
+/// A call document saved as a file, as Home lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SavedCall {
+    pub path: PathBuf,
+    /// The file's name without `.json`.
+    pub name: String,
+    /// What it calls: `garden · add`.
+    pub target: String,
+}
+
+/// Where a workspace keeps its saved calls.
+pub const CALLS_DIR: &str = "calls";
+/// How many saved calls Home lists.
+const CALLS_LIMIT: usize = 12;
+
+impl Workspace {
+    /// The call documents in `calls/`, by name.
+    pub fn saved_calls(&self) -> Vec<SavedCall> {
+        let Ok(entries) = std::fs::read_dir(self.root.join(CALLS_DIR)) else {
+            return Vec::new();
+        };
+        let mut calls: Vec<SavedCall> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "json"))
+            .filter_map(|path| {
+                // A call is a small file; anything large is not one.
+                if std::fs::metadata(&path).ok()?.len() > 256 * 1024 {
+                    return None;
+                }
+                let text = std::fs::read_to_string(&path).ok()?;
+                let call = crate::mcp_client::call::parse(&text).ok()?;
+                Some(SavedCall {
+                    name: path.file_stem()?.to_string_lossy().into_owned(),
+                    target: call.title(),
+                    path,
+                })
+            })
+            .collect();
+        calls.sort_by(|a, b| a.name.cmp(&b.name));
+        calls.truncate(CALLS_LIMIT);
+        calls
+    }
+
+    /// Writes `text`, a call document, into `calls/` as `stem.json`, or
+    /// `stem-2.json` and so on when that name is taken. Refused when the
+    /// open folder is inside a repository: the call would be committed.
+    pub fn save_call(&self, stem: &str, text: &str) -> Result<PathBuf, String> {
+        if super::git::toplevel(&self.root).is_ok() {
+            return Err(
+                "the open folder is in a repository; save the call with Save As where it belongs"
+                    .into(),
+            );
+        }
+        let dir = self.root.join(CALLS_DIR);
+        std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let stem: String = stem
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        for n in 1..1000 {
+            let name = if n == 1 {
+                format!("{stem}.json")
+            } else {
+                format!("{stem}-{n}.json")
+            };
+            let path = dir.join(name);
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    use std::io::Write;
+                    file.write_all(text.as_bytes())
+                        .map_err(|e| format!("{}: {e}", path.display()))?;
+                    return Ok(path);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(format!("{}: {e}", path.display())),
+            }
+        }
+        Err("too many calls with that name".into())
+    }
 }
 
 /// How many commits a repository lists under "since you were last here".
@@ -599,6 +693,7 @@ impl Workspace {
             repos,
             notes,
             since,
+            calls: self.saved_calls(),
         }
     }
 }
@@ -699,6 +794,42 @@ mod tests {
         );
         assert!(scaffold(&repo.0).is_err());
         assert!(!repo.0.join("AGENTS.md").exists());
+    }
+
+    #[test]
+    fn calls_are_saved_without_overwriting_and_listed() {
+        let t = TempTree::new("ws-calls", &[("calls/notes.md", "not a call")]);
+        let ws = Workspace::open(&t.0);
+        let doc = "{\"server\": \"garden\", \"tool\": \"add\", \"arguments\": {}}";
+        let first = ws.save_call("garden add", doc).unwrap();
+        let second = ws.save_call("garden add", doc).unwrap();
+        assert_eq!(first, t.0.join("calls/garden-add.json"));
+        assert_eq!(second, t.0.join("calls/garden-add-2.json"));
+        std::fs::write(t.0.join("calls/broken.json"), "{").unwrap();
+        let calls = ws.saved_calls();
+        let names: Vec<(&str, &str)> = calls
+            .iter()
+            .map(|c| (c.name.as_str(), c.target.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("garden-add", "garden \u{b7} add"),
+                ("garden-add-2", "garden \u{b7} add")
+            ]
+        );
+        assert_eq!(ws.summary(None).calls.len(), 2);
+
+        let repo = TempTree::new("ws-calls-repo", &[]);
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&repo.0)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(Workspace::open(&repo.0).save_call("x", doc).is_err());
     }
 
     #[test]

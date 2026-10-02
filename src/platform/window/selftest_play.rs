@@ -570,7 +570,7 @@ impl EditorView {
                     state.git.repo.as_deref().unwrap_or(""),
                     state.git.note,
                     state.home.as_ref().map_or("none".to_string(), |h| format!(
-                        "waiting={} repos={} commits={} notes={} hits={}",
+                        "waiting={} repos={} commits={} notes={} calls={} hits={}",
                         h.waiting.join("|"),
                         h.repos
                             .iter()
@@ -579,6 +579,7 @@ impl EditorView {
                             .join(","),
                         h.repos.iter().map(|r| r.commits.len()).sum::<usize>(),
                         h.notes.len(),
+                        h.calls.len(),
                         state.home_hits.len(),
                     )),
                     state.mcp.report(),

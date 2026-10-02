@@ -13,19 +13,24 @@
 //! and writer threads: [`Server::poll`] takes what arrived and moves the
 //! state machine, the way the language-server client does.
 //!
+//! A server is reached over stdio, or over Streamable HTTP when its entry
+//! has a `url` (see [`link`]).
+//!
 //! What crc does not do yet, and says so when a server asks: answer
 //! sampling, elicitation or roots requests (legacy servers send them as
-//! requests, modern ones as `input_required` results), Streamable HTTP,
-//! and OAuth.
+//! requests, modern ones as `input_required` results), and sign in
+//! (OAuth) to an HTTP server.
 
 pub mod call;
 pub mod config;
+pub mod link;
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crate::json::{self, Value, object, string};
 use crate::lsp::transport::{Framing, Incoming, Transport, Wake};
+use link::Link;
 
 pub use config::{Config, ServerConfig};
 
@@ -133,7 +138,7 @@ pub struct Server {
     pub prompts: Vec<Prompt>,
     /// What the server says it is, from its info.
     pub info: String,
-    transport: Option<Transport>,
+    link: Option<Link>,
     next_id: u64,
     pending: HashMap<u64, Pending>,
     /// Calls asked for before the server was ready, sent once it is.
@@ -151,7 +156,7 @@ impl Server {
             resources: Vec::new(),
             prompts: Vec::new(),
             info: String::new(),
-            transport: None,
+            link: None,
             next_id: 1,
             pending: HashMap::new(),
             queued: Vec::new(),
@@ -159,14 +164,26 @@ impl Server {
     }
 
     pub fn is_running(&self) -> bool {
-        self.transport.is_some()
+        self.link.is_some()
     }
 
-    /// Starts the server in `cwd` and probes its era. A command that would
-    /// fetch code, or that is not installed, is refused before anything
-    /// runs.
+    /// Starts the server in `cwd`, or opens its URL, and probes its era. A
+    /// command that would fetch code, or that is not installed, is refused
+    /// before anything runs.
     pub fn start(&mut self, cwd: &std::path::Path, wake: Wake) {
         self.stop();
+        if let Some(url) = self
+            .config
+            .url
+            .clone()
+            .filter(|_| self.config.command.is_empty())
+        {
+            match link::Http::new(&url, wake) {
+                Ok(http) => self.opened(Link::Http(http)),
+                Err(why) => self.status = Status::Failed(why),
+            }
+            return;
+        }
         let program = match self.config.resolve() {
             Ok(program) => program,
             Err(why) => {
@@ -185,22 +202,25 @@ impl Server {
         }
         let cwd = self.config.cwd.clone().unwrap_or_else(|| cwd.to_path_buf());
         match Transport::spawn_with(&program, &args, &cwd, &env, Framing::Lines, wake) {
-            Ok(transport) => {
-                self.transport = Some(transport);
-                self.status = Status::Starting;
-                self.era = None;
-                let params = self.modern_params(Value::Object(Vec::new()));
-                self.send(Purpose::Discover, "server/discover", params);
-            }
+            Ok(transport) => self.opened(Link::Stdio(transport)),
             Err(e) => {
                 self.status = Status::Failed(format!("could not start {}: {e}", program.display()))
             }
         }
     }
 
+    /// Probes a link just opened with `server/discover`.
+    fn opened(&mut self, link: Link) {
+        self.link = Some(link);
+        self.status = Status::Starting;
+        self.era = None;
+        let params = self.modern_params(Value::Object(Vec::new()));
+        self.send(Purpose::Discover, "server/discover", params);
+    }
+
     /// Stops the server: its process is killed, waiting calls fail.
     pub fn stop(&mut self) {
-        self.transport = None;
+        self.link = None;
         self.pending.clear();
         self.queued.clear();
         self.era = None;
@@ -241,8 +261,8 @@ impl Server {
         let mut events = Vec::new();
         let mut incoming = Vec::new();
         let mut closed = false;
-        if let Some(transport) = &self.transport {
-            while let Some(message) = transport.try_recv() {
+        if let Some(link) = &self.link {
+            while let Some(message) = link.try_recv() {
                 match message {
                     Incoming::Message(value) => incoming.push(value),
                     Incoming::Closed => closed = true,
@@ -274,9 +294,9 @@ impl Server {
         }
         if closed {
             let tail = self
-                .transport
+                .link
                 .as_ref()
-                .map(Transport::stderr_tail)
+                .map(Link::stderr_tail)
                 .unwrap_or_default();
             let last = tail.lines().last().unwrap_or("").trim().to_owned();
             for (_, pending) in std::mem::take(&mut self.pending) {
@@ -288,7 +308,7 @@ impl Server {
                     });
                 }
             }
-            self.transport = None;
+            self.link = None;
             self.status = Status::Failed(if last.is_empty() {
                 "the server exited".into()
             } else {
@@ -367,7 +387,7 @@ impl Server {
                 self.status = Status::Failed(format!(
                     "the server speaks MCP {supported}; crc speaks {MODERN} and {LEGACY}"
                 ));
-                self.transport = None;
+                self.link = None;
                 events.push(Event::Changed);
             } else {
                 self.initialize();
@@ -382,7 +402,7 @@ impl Server {
             Purpose::Discover => self.initialize(),
             Purpose::Initialize => {
                 self.status = Status::Failed(why);
-                self.transport = None;
+                self.link = None;
                 events.push(Event::Changed);
             }
             Purpose::ListTools(..) | Purpose::ListResources(..) | Purpose::ListPrompts(..) => {
@@ -582,9 +602,8 @@ impl Server {
     }
 
     fn write(&mut self, message: &Value) {
-        if let Some(transport) = self.transport.as_mut() {
-            // A failed write shows up as the stream closing.
-            let _ = transport.send(message);
+        if let Some(link) = self.link.as_mut() {
+            link.send(message);
         }
     }
 }

@@ -400,6 +400,8 @@ pub enum HomeAction {
     OpenFiles(Vec<std::path::PathBuf>),
     /// Show this repository in Source Control.
     ShowRepo(std::path::PathBuf),
+    /// Open this saved MCP call and run it.
+    RunCall(std::path::PathBuf),
 }
 
 /// A clickable row on the home screen.
@@ -865,6 +867,31 @@ fn home_workspace(
             hits.push(HomeHit {
                 rect,
                 action: HomeAction::ShowRepo(repo.path.clone()),
+            });
+            y += ROW;
+        }
+        y += GAP;
+    }
+
+    if !summary.calls.is_empty() && y + 22.0 + ROW <= bottom {
+        section(out, atlas, &mut y, "Saved calls");
+        for saved in &summary.calls {
+            if y + ROW > bottom {
+                break;
+            }
+            let rect = home_row(
+                out,
+                atlas,
+                theme,
+                (x, width),
+                y,
+                icons::SYMBOL_METHOD,
+                &saved.name,
+                &saved.target,
+            );
+            hits.push(HomeHit {
+                rect,
+                action: HomeAction::RunCall(saved.path.clone()),
             });
             y += ROW;
         }
@@ -2964,6 +2991,7 @@ mod home_tests {
             ],
             notes: vec![root.join("docs/plants.md")],
             since: Some(1),
+            calls: Vec::new(),
         };
         build_home(
             &mut out,

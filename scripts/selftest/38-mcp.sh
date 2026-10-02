@@ -77,3 +77,37 @@ grep -Eq '^tabs: (.* \| )?garden · wipe( \||$)' "$T/mcp-wipe.out" \
 grep -v '^crc: mcp confirm prompt: ' "$T/mcp.err" > "$T/mcp.err.rest" || true
 mv "$T/mcp.err.rest" "$T/mcp.err"
 expect_line "$T/mcp-resource.out" 1 "# Beds"
+
+# ---- saved calls ------------------------------------------------------------------
+# Run > Save MCP Call to Workspace writes the call into calls/; Home lists
+# it, and a click runs it once the server is up.
+mkdir -p "$T/mcpws/app"
+git init -q "$T/mcpws/app"
+cat > "$T/mcp-save.script" <<SCRIPT
+wait 800
+wait 300
+key 35 cmd p
+wait 200
+text >mcp servers
+key 36
+wait 300
+click @mcp.server.garden
+wait 800
+wait 600
+wait 300
+click @mcp.tool.garden.add
+wait 300
+key 35 cmd p
+wait 200
+text >save mcp call
+key 36
+wait 600
+wait 300
+dump $T/mcp-saved.out
+quit
+SCRIPT
+HOME="$T/mcphome" CRC_SELFTEST="$T/mcp-save.script" "$BIN" "$T/mcpws" 2> "$T/mcp-save.err"
+expect "$T/mcp-saved.out" message "saved as calls/garden-add.json; Home lists it"
+[ -f "$T/mcpws/calls/garden-add.json" ] || failed "mcp-save: calls/garden-add.json was not written"
+grep -q '^home: .* calls=1 ' "$T/mcp-saved.out" \
+    || failed "mcp-saved.out: Home does not list the saved call: $(grep '^home:' "$T/mcp-saved.out")"

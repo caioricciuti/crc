@@ -22,8 +22,7 @@ pub struct ServerConfig {
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
     pub cwd: Option<PathBuf>,
-    /// A Streamable HTTP server's address. Not spoken yet: listed, and
-    /// refused when started.
+    /// A Streamable HTTP server's address, used when there is no command.
     pub url: Option<String>,
 }
 
@@ -163,11 +162,8 @@ impl ServerConfig {
     }
 
     /// The program to run, found the way language servers are found. Refused
-    /// when it would fetch code, is an HTTP server, or is not installed.
+    /// when it would fetch code or is not installed.
     pub fn resolve(&self) -> Result<PathBuf, String> {
-        if self.url.is_some() && self.command.is_empty() {
-            return Err("HTTP servers are not supported yet; only stdio".into());
-        }
         if self.command.is_empty() {
             return Err("no command in mcp.json".into());
         }
@@ -213,7 +209,13 @@ mod tests {
             config.servers[1].1.url.as_deref(),
             Some("https://example.com/mcp")
         );
-        assert!(config.servers[1].1.resolve().unwrap_err().contains("HTTP"));
+        assert!(
+            config.servers[1]
+                .1
+                .resolve()
+                .unwrap_err()
+                .contains("no command")
+        );
         assert!(Config::parse("{nope").error.is_some());
         assert!(Config::parse("{}").servers.is_empty());
     }

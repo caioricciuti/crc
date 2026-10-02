@@ -44,7 +44,15 @@ them opens as one project.
 - Servers started through `npx`, `bunx`, `uvx`, `pnpm dlx` or another
   command that downloads code when it runs are refused, with the reason.
   Both protocol eras are spoken: the stateless revision of 2026-07-28 and
-  the earlier `initialize` handshake. Only stdio servers for now.
+  the earlier `initialize` handshake.
+- An entry with a `url` and no `command` is reached over Streamable HTTP,
+  through the system curl: plain JSON or event-stream replies, and a
+  legacy server's session kept. A server that needs a sign-in says so;
+  crc does not sign in yet.
+- Run > Save MCP Call to Workspace writes the call into the workspace's
+  `calls/` folder, never over another; Home lists saved calls, and a
+  click runs one. Refused when the open folder is itself a repository,
+  where the call would be committed.
 
 ## v0.2.0-alpha.11, 2026-10-01
 

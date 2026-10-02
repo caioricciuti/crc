@@ -120,4 +120,71 @@ fn a_refused_command_never_starts() {
     assert!(!server.is_running());
 }
 
+/// The fake as an HTTP server: started, its port read, killed on drop.
+struct HttpFake(std::process::Child, u16);
+
+impl HttpFake {
+    fn start(mode: &str) -> HttpFake {
+        use std::io::BufRead;
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/fake-mcp.py");
+        let mut child = std::process::Command::new("/usr/bin/python3")
+            .args([script, mode])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        HttpFake(child, line.trim().parse().unwrap())
+    }
+}
+
+impl Drop for HttpFake {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn over_http(mode: &str, era: Era, info: &str) {
+    let fake = HttpFake::start(mode);
+    let mut server = Server::new(
+        "garden",
+        ServerConfig {
+            url: Some(format!("http://127.0.0.1:{}/mcp", fake.1)),
+            ..ServerConfig::default()
+        },
+    );
+    server.start(Path::new("/tmp"), Box::new(|| {}));
+    server.call_tool(1, "add", json::parse(r#"{"a": 4, "b": 5}"#).unwrap());
+    let events = until(&mut server, |s, e| {
+        lists_loaded(s) && answer(e, 1).is_some()
+    });
+    assert_eq!(server.era, Some(era));
+    assert_eq!(server.info, info);
+    assert_eq!(answer(&events, 1), Some(("9\n", false)));
+    server.read_resource(2, "note://beds");
+    let events = until(&mut server, |_, e| answer(e, 2).is_some());
+    assert_eq!(
+        answer(&events, 2),
+        Some(("# Beds\ntomatoes, beans\n", false))
+    );
+    // The server gone: a request fails locally, and says HTTP or curl.
+    drop(fake);
+    server.call_tool(3, "add", Value::Object(Vec::new()));
+    let events = until(&mut server, |_, e| answer(e, 3).is_some());
+    assert_eq!(answer(&events, 3).map(|(_, e)| e), Some(true));
+}
+
+#[test]
+fn a_legacy_http_server_keeps_its_session_and_streams() {
+    over_http("http-legacy", Era::Legacy, "fake-legacy 0.9");
+}
+
+#[test]
+fn a_modern_http_server_gets_its_headers() {
+    over_http("http-modern", Era::Modern, "fake-modern 1.0");
+}
+
 use std::path::Path;

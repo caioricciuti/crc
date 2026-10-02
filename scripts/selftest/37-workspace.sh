@@ -83,7 +83,7 @@ dump $T/ws-home.out
 quit
 SCRIPT
 CRC_SELFTEST="$T/ws-home.script" "$BIN" "$T/ws" 2> "$T/ws-home.err"
-expect "$T/ws-home.out" home "waiting=Water the tomatoes|Read the seed catalogue repos=app:main:1,site:main:2 commits=0 notes=1 hits=10"
+expect "$T/ws-home.out" home "waiting=Water the tomatoes|Read the seed catalogue repos=app:main:1,site:main:2 commits=0 notes=1 calls=0 hits=10"
 # The visit is recorded with a one-second clock: wait a second so the
 # commit is after it.
 sleep 1.1

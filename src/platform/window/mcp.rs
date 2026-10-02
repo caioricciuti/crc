@@ -159,6 +159,42 @@ impl EditorView {
         self.reparse();
     }
 
+    /// Run > Save MCP Call to Workspace: the active call document into
+    /// the workspace's `calls/` folder, where Home lists it.
+    pub(super) fn save_mcp_call(&self) {
+        let saved = {
+            let Some(state) = self.state() else {
+                return;
+            };
+            let text = state.docs.active().rope.to_string();
+            call::parse(&text).and_then(|parsed| {
+                let what = match &parsed.target {
+                    Target::Tool(name) | Target::Prompt(name) => name.clone(),
+                    Target::Resource(_) => "resource".into(),
+                };
+                state
+                    .workspace
+                    .save_call(&format!("{}-{what}", parsed.server), &text)
+            })
+        };
+        if let Some(mut state) = self.state_mut() {
+            let said = match saved {
+                Ok(path) => {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    start_home_summary(&mut state);
+                    format!("saved as calls/{name}; Home lists it")
+                }
+                Err(error) => error,
+            };
+            state.message = Some((said, Instant::now()));
+        }
+        self.resume_display_link();
+        self.request_redraw();
+    }
+
     /// Runs the active call document, or the call behind the active
     /// answer tab again.
     pub(super) fn run_mcp_call(&self) {
@@ -188,6 +224,9 @@ impl EditorView {
             let Some(mut state) = self.state_mut() else {
                 return;
             };
+            if !state.mcp.loaded {
+                state.mcp.reload();
+            }
             let Some(si) = state.mcp.find(&call.server) else {
                 state.message = Some((
                     format!(
