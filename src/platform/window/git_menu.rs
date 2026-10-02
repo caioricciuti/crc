@@ -245,6 +245,58 @@ impl EditorView {
         self.request_redraw();
     }
 
+    /// A right-click in Source Control: the row's menu, or the Git menu.
+    pub(super) fn git_context_menu(&self, column: Viewport, x: f32, y: f32) -> Retained<NSMenu> {
+        use crate::platform::git_panel::{Entry, Group, Sidebar};
+        let mtm = MainThreadMarker::from(self);
+        let g = Sidebar::new(column);
+        let entry = self
+            .state()
+            .and_then(|state| state.git.entry_at(g, x, y).map(|(e, _)| e));
+        match entry {
+            Some(Entry::File { change, group }) => {
+                if let Some(mut state) = self.state_mut() {
+                    state.context_change = Some((change, group));
+                }
+                git_change_menu(mtm, group == Group::Staged, group == Group::Conflicts)
+            }
+            Some(Entry::Section { group, .. }) if group != Group::Conflicts => {
+                git_section_menu(mtm, group == Group::Staged)
+            }
+            _ => git_actions_menu(mtm),
+        }
+    }
+
+    /// Puts `text` on the clipboard and says so.
+    pub(super) fn copy_and_say(&self, text: &str) {
+        clipboard::write_text(text);
+        if let Some(mut state) = self.state_mut() {
+            state.message = Some((format!("copied {text}"), Instant::now()));
+        }
+        self.request_redraw();
+        self.pump();
+    }
+
+    /// Source Control's "more" button: the Git commands as a menu under it.
+    pub(super) fn pop_up_git_menu(&self, below: Viewport) {
+        let mtm = MainThreadMarker::from(self);
+        let menu = git_actions_menu(mtm);
+        let at = NSPoint::new(below.x as f64, (below.y + below.height + 4.0) as f64);
+        layout::set_pressed(None);
+        menu.popUpMenuPositioningItem_atLocation_inView(None, at, Some(self));
+        self.request_redraw();
+    }
+
+    /// The change a Source Control context menu was opened on: its path in
+    /// the repository and on disk.
+    pub(super) fn context_change_paths(&self) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        let state = self.state()?;
+        let (index, _) = state.context_change?;
+        let snapshot = state.git.snapshot.as_ref()?;
+        let change = snapshot.changes.get(index)?;
+        Some((change.path.clone(), snapshot.root.join(&change.path)))
+    }
+
     pub(super) fn git_remote(&self, what: crate::project::git::Remote) {
         let Some(mut state) = self.state_mut() else {
             return;
@@ -253,8 +305,9 @@ impl EditorView {
             state.message = Some(("not a Git repository".into(), Instant::now()));
         } else {
             let sock = state.ssh_auth_sock.clone();
+            // The status line shows a spinner and the verb for as long as
+            // the command runs, and the outcome once it is done.
             state.git.remote(what, sock);
-            state.message = Some((format!("{}…", what.verb()), Instant::now()));
         }
         drop(state);
         self.resume_display_link();

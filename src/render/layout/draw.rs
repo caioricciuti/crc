@@ -294,7 +294,13 @@ pub fn push_ui_text_centered(
 /// A focus ring: drawn *behind* the control's own fill, which then covers
 /// all but `width` of it. Drawing a transparent rectangle on top would not
 /// erase anything, since it is blended rather than punched out.
-pub fn push_focus_ring(out: &mut Vec<GlyphInstance>, rect: Viewport, radius: f32, width: f32) {
+pub fn push_focus_ring(
+    out: &mut Vec<GlyphInstance>,
+    rect: Viewport,
+    radius: f32,
+    width: f32,
+    theme: &Theme,
+) {
     push_rounded_rect(
         out,
         Viewport {
@@ -304,7 +310,7 @@ pub fn push_focus_ring(out: &mut Vec<GlyphInstance>, rect: Viewport, radius: f32
             height: rect.height + width * 2.0,
         },
         radius + width,
-        [0.651, 0.867, 0.761, 0.55],
+        faded(theme.accent, 0.55),
     );
 }
 
@@ -327,7 +333,7 @@ pub fn push_icon_centered(
     out.push(GlyphInstance {
         pos: [
             atlas.metrics.snap(rect.x + (rect.width - width) * 0.5),
-            rect.y + (rect.height - cell_h) * 0.5,
+            atlas.metrics.snap(rect.y + (rect.height - cell_h) * 0.5),
         ],
         size: [width, cell_h],
         uv: slot.uv,
@@ -355,7 +361,7 @@ pub fn push_icon_scaled(
     out.push(GlyphInstance {
         pos: [
             atlas.metrics.snap(rect.x + (rect.width - width) * 0.5),
-            rect.y + (rect.height - height) * 0.5,
+            atlas.metrics.snap(rect.y + (rect.height - height) * 0.5),
         ],
         size: [width, height],
         uv: slot.uv,

@@ -255,6 +255,13 @@ impl EditorView {
         }
     }
 
+    /// Clears the active session's screen the way Control-L does in a
+    /// shell: the program redraws its prompt at the top.
+    pub(super) fn clear_terminal(&self) {
+        self.terminal_write(b"\x0c");
+        self.request_redraw();
+    }
+
     pub(super) fn terminal_write(&self, bytes: &[u8]) {
         let Some(mut state) = self.state_mut() else {
             return;

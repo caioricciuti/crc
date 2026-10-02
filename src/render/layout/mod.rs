@@ -26,11 +26,13 @@ mod draw;
 mod editor;
 mod markdown;
 mod theme;
+mod ui;
 pub use chrome::*;
 pub use draw::*;
 pub use editor::*;
 pub use markdown::*;
 pub use theme::*;
+pub use ui::*;
 
 /// A rectangle of the window, in logical points, that something draws into.
 ///
@@ -1882,11 +1884,11 @@ mod sidebar_action_tests {
         }
     }
 
-    /// The buttons must not sit on top of the switcher above them or the
-    /// first tree row below them, or a click creates a file when it meant to
-    /// change view.
+    /// The buttons sit in the header's title row, right of the title, and
+    /// never on the first tree row below it, or a click creates a file when
+    /// it meant to open one.
     #[test]
-    fn the_action_row_sits_between_the_switcher_and_the_tree() {
+    fn the_action_row_sits_in_the_header_above_the_tree() {
         let column = column();
         let (label, actions) = sidebar_actions(column);
         let (explorer, source) = sidebar_switcher(column);
@@ -1899,9 +1901,10 @@ mod sidebar_action_tests {
                 _ => ("refresh", *r),
             }))
         {
+            assert!(r.y >= column.y, "{name} is above the sidebar");
             assert!(
-                r.y >= explorer.y + explorer.height,
-                "{name} overlaps the switcher"
+                r.y >= explorer.y && r.y + r.height <= explorer.y + explorer.height,
+                "{name} is not in the title row"
             );
             assert!(
                 r.y + r.height <= column.y + SIDEBAR_HEADER_HEIGHT,
@@ -1932,12 +1935,13 @@ mod sidebar_action_tests {
                 "uneven spacing between buttons"
             );
         }
-        // Flush with the switcher's trailing edge, which is the card's too.
+        // At the title row's trailing edge, out by the icons' own side
+        // bearing so the glyph lines up with the content below.
         let (_, source) = sidebar_switcher(column);
         let last = actions[3];
         assert!(
-            (last.x + last.width - (source.x + source.width)).abs() < 0.01,
-            "the action row does not end where the switcher does"
+            (last.x + last.width - (source.x + source.width + 4.0)).abs() < 0.01,
+            "the action row does not end where the title row does"
         );
         assert!(
             label.x + label.width <= actions[0].x,

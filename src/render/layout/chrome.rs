@@ -14,9 +14,9 @@ pub const TAB_BAR_HEIGHT: f32 = 30.0;
 pub const TOOLBAR_HEIGHT: f32 = 48.0;
 pub const STATUS_HEIGHT: f32 = 28.0;
 pub const BREADCRUMB_HEIGHT: f32 = 30.0;
-/// Project card, the Explorer / Source Control switcher, then the row of
-/// file actions.
-pub const SIDEBAR_HEADER_HEIGHT: f32 = 70.0;
+/// The panel's title, with its actions at the right of the same row. Every
+/// sidebar panel starts its content this far down.
+pub const SIDEBAR_HEADER_HEIGHT: f32 = 40.0;
 pub const SIDEBAR_ROW_HEIGHT: f32 = 26.0;
 pub const FIND_ROW_HEIGHT: f32 = 34.0;
 
@@ -1194,10 +1194,16 @@ pub fn palette_follow(scroll: usize, selected: usize, count: usize, visible: usi
 pub fn toolbar_sidebar(rect: Viewport) -> Viewport {
     Viewport {
         x: rect.x + 88.0,
-        y: rect.y + 9.0,
-        width: 30.0,
-        height: 30.0,
+        y: toolbar_control_y(rect),
+        width: UI_CONTROL,
+        height: UI_CONTROL,
     }
+}
+
+/// The top of every toolbar control: centred in the bar, above its
+/// hairline.
+fn toolbar_control_y(rect: Viewport) -> f32 {
+    rect.y + ((rect.height - UI_CONTROL) * 0.5).floor()
 }
 
 pub(super) fn project_name(tree: &Tree) -> String {
@@ -1241,7 +1247,7 @@ pub(super) fn middle_ellipsis(chars: &[char], head: usize, tail: usize) -> Strin
 /// The project title and disclosure share this rectangle for drawing, clicks
 /// and cursor shape. Its width follows the measured system-font label.
 pub fn toolbar_project(tree: &Tree, atlas: &mut Atlas, rect: Viewport) -> Viewport {
-    let x = toolbar_sidebar(rect).x + 38.0;
+    let x = toolbar_sidebar(rect).x + UI_CONTROL + UI_GAP;
     let right = toolbar_terminal(rect).x;
     let available = (right - x - 12.0).max(0.0);
     let width = if available >= 42.0 {
@@ -1253,9 +1259,9 @@ pub fn toolbar_project(tree: &Tree, atlas: &mut Atlas, rect: Viewport) -> Viewpo
     };
     Viewport {
         x,
-        y: rect.y + 9.0,
+        y: toolbar_control_y(rect),
         width,
-        height: 30.0,
+        height: UI_CONTROL,
     }
 }
 
@@ -1266,12 +1272,12 @@ pub(super) const PROJECT_CHROME: f32 = 62.0;
 /// before the project switcher; the menu and the shortcut remain.
 pub fn toolbar_terminal(rect: Viewport) -> Viewport {
     let search = toolbar_search(rect);
-    let width = if rect.width >= 620.0 { 92.0 } else { 0.0 };
+    let width = if rect.width >= 520.0 { UI_CONTROL } else { 0.0 };
     Viewport {
-        x: search.x - width - if width > 0.0 { 8.0 } else { 0.0 },
-        y: rect.y + 9.0,
+        x: search.x - width - if width > 0.0 { UI_GAP } else { 0.0 },
+        y: toolbar_control_y(rect),
         width,
-        height: 30.0,
+        height: UI_CONTROL,
     }
 }
 
@@ -1287,10 +1293,10 @@ pub fn toolbar_search(rect: Viewport) -> Viewport {
     };
     let width = preferred.min((rect.width - 156.0).max(0.0));
     Viewport {
-        x: rect.x + rect.width - width - 18.0,
-        y: rect.y + 9.0,
+        x: rect.x + rect.width - width - UI_INSET,
+        y: toolbar_control_y(rect),
         width,
-        height: 30.0,
+        height: UI_CONTROL,
     }
 }
 
@@ -1308,44 +1314,23 @@ pub fn build_toolbar(
         [rect.width, rect.height],
         theme.sidebar_background,
     );
-    let toggle = toolbar_sidebar(rect);
-    push_rounded_rect(out, toggle, 6.0, theme.tab_hover);
-    push_rounded_rect(
-        out,
-        Viewport {
-            x: toggle.x + 8.0,
-            y: toggle.y + 8.0,
-            width: 14.0,
-            height: 14.0,
-        },
-        2.0,
-        theme.status_text,
-    );
-    push_rounded_rect(
-        out,
-        Viewport {
-            x: toggle.x + 9.0,
-            y: toggle.y + 9.0,
-            width: 12.0,
-            height: 12.0,
-        },
-        1.0,
-        theme.tab_hover,
-    );
-    push_rect(
-        out,
-        atlas,
-        [toggle.x + 13.0, toggle.y + 9.0],
-        [1.0, 12.0],
-        theme.status_text,
-    );
+    // Icon buttons with no fill until the pointer is over them: a row of
+    // filled pills read as a second tab bar.
+    Button::new(toolbar_sidebar(rect))
+        .icon(icons::SIDEBAR_LEFT)
+        .tone(Tone::Ghost)
+        .tip("Show or Hide the Sidebar  \u{2318}B")
+        .draw(out, atlas, theme);
     let search = toolbar_search(rect);
     let project = project_name(tree);
     let project_rect = toolbar_project(tree, atlas, rect);
     if project_rect.width > 0.0 {
-        // A control like the sidebar toggle beside it: folder, name, chevron
-        // on one pill, so it reads as the menu it is.
-        push_rounded_rect(out, project_rect, 6.0, theme.tab_hover);
+        // The folder, its name and a chevron on one control, so it reads
+        // as the menu it is.
+        Button::new(project_rect)
+            .tone(Tone::Ghost)
+            .tip("Project: open, reveal or add files")
+            .draw(out, atlas, theme);
         push_icon_centered(
             out,
             atlas,
@@ -1384,20 +1369,46 @@ pub fn build_toolbar(
     }
     let terminal = toolbar_terminal(rect);
     if terminal.width > 0.0 {
-        push_rounded_rect(out, terminal, 6.0, theme.tab_hover);
-        push_ui_text_centered(out, atlas, terminal, "Terminal", theme.text);
+        Button::new(terminal)
+            .icon(icons::TERMINAL)
+            .tone(Tone::Ghost)
+            .tip("Terminal  \u{2303}`")
+            .draw(out, atlas, theme);
     }
-    push_rounded_rect(out, search, 6.0, theme.tab_active);
+    // The finder reads as a field: a search glyph, the prompt, the key.
+    let over = hovered(search);
+    push_rounded_rect(
+        out,
+        search,
+        UI_RADIUS,
+        if over {
+            theme.control_hover
+        } else {
+            theme.tab_active
+        },
+    );
+    hotspot(search, Cursor::Pointing, None);
     if search.width >= 220.0 {
+        push_icon_centered(
+            out,
+            atlas,
+            Viewport {
+                x: search.x + 8.0,
+                width: 20.0,
+                ..search
+            },
+            icons::SEARCH,
+            theme.gutter_text,
+        );
         push_ui_text(
             out,
             atlas,
             Viewport {
-                x: search.x + 12.0,
-                width: (search.width - 24.0).max(0.0),
+                x: search.x + 32.0,
+                width: (search.width - 44.0).max(0.0),
                 ..search
             },
-            "Search files and commands…",
+            "Search files and commands\u{2026}",
             theme.status_text,
         );
         push_ui_text_right(
@@ -1407,11 +1418,16 @@ pub fn build_toolbar(
                 width: (search.width - 12.0).max(0.0),
                 ..search
             },
-            "⌘ P",
+            "\u{2318}P",
             theme.gutter_text,
         );
     } else {
-        push_ui_text_centered(out, atlas, search, "Find", theme.status_text);
+        Button::new(search)
+            .icon(icons::SEARCH)
+            .label(if search.width >= 80.0 { "Find" } else { "" })
+            .tone(Tone::Ghost)
+            .tip("Search files and commands  \u{2318}P")
+            .draw(out, atlas, theme);
     }
     push_rect(
         out,
@@ -1884,6 +1900,16 @@ pub fn build_tab_bar_in(
                 ..Default::default()
             });
             active_span = Some((x, x + width));
+        } else if hovered == Some(index) {
+            // The tab under the pointer lifts toward the page, so it reads
+            // as something to click before it is clicked.
+            out.push(GlyphInstance {
+                pos: [x, viewport.y],
+                size: [width, viewport.height - hairline],
+                uv: solid,
+                color: theme.row_hover,
+                ..Default::default()
+            });
         } else if index > 0 {
             // Separator between inactive tabs, suppressed either side of the
             // active one so it reads as one shape with the page.
@@ -1965,37 +1991,48 @@ pub fn build_tab_bar_in(
         // tab shows the cross on hover too, so the dot never blocks closing.
         let close_x = x + width - TAB_PADDING_X - m.advance;
         let hovered_here = hovered == Some(index);
-        let marker = if hovered_here || (active && focused && !dirty) {
-            Some((
-                '\u{2715}',
+        // A generous hit box, TAB_CLOSE_HIT points square and centred on the
+        // glyph. A one-character target is the reason closing a tab felt bad:
+        // the glyph is about 8pt wide and the finger is not.
+        let centre_x = close_x + m.advance * 0.5;
+        let close_box = Viewport {
+            x: centre_x - TAB_CLOSE_HIT * 0.5,
+            y: viewport.y + ((viewport.height - TAB_CLOSE_HIT) * 0.5).floor(),
+            width: TAB_CLOSE_HIT,
+            height: TAB_CLOSE_HIT,
+        };
+        if hovered_here || (active && focused && !dirty) {
+            // The same close glyph as every other close button, on a
+            // square that lights up under the pointer.
+            if super::ui::hovered(close_box) {
+                push_rounded_rect(out, close_box, UI_RADIUS_SM, theme.control_hover);
+            }
+            push_icon_centered(
+                out,
+                atlas,
+                close_box,
+                icons::CLOSE,
                 if hovered_here {
                     theme.tab_text
                 } else {
                     theme.tab_text_inactive
                 },
-            ))
+            );
+            hotspot(close_box, Cursor::Pointing, Some("Close Tab  \u{2318}W"));
         } else if dirty {
-            Some(('\u{2022}', theme.tab_dirty))
-        } else {
-            None
-        };
-        if let Some((glyph, color)) = marker
-            && let Some(slot) = atlas.slot_for(glyph)
-        {
-            out.push(GlyphInstance {
-                pos: [close_x, viewport.y + glyph_dy],
-                size: [cell_w, cell_h],
-                uv: slot.uv,
-                flags: slot.flags(),
-                color,
-                ..Default::default()
-            });
+            // Unsaved: a dot where the cross would be.
+            push_rounded_rect(
+                out,
+                Viewport {
+                    x: centre_x - 4.0,
+                    y: close_box.y + TAB_CLOSE_HIT * 0.5 - 4.0,
+                    width: 8.0,
+                    height: 8.0,
+                },
+                4.0,
+                theme.tab_dirty,
+            );
         }
-
-        // A generous hit box, TAB_CLOSE_HIT points square and centred on the
-        // glyph. A one-character target is the reason closing a tab felt bad:
-        // the glyph is about 8pt wide and the finger is not.
-        let centre_x = close_x + m.advance * 0.5;
         hits.push(TabHit {
             index,
             x0: x,
@@ -2043,6 +2080,14 @@ pub const ACTIVITY_ICONS: [(char, &str); 4] = [
     ('\u{ea68}', "source-control"), // cod-source_control
     ('\u{eae6}', "extensions"),     // cod-extensions
     ('\u{eb2d}', "mcp"),            // cod-plug
+];
+
+/// What each icon in the strip is, said when the pointer rests on it.
+pub const ACTIVITY_TIPS: [&str; 4] = [
+    "Explorer",
+    "Source Control  \u{2325}\u{2318}G",
+    "Extensions",
+    "MCP Servers",
 ];
 
 /// Each icon's square in the strip.
@@ -2094,13 +2139,32 @@ pub fn push_activity(
                 theme.accent,
             );
         }
+        let over = hovered(rect);
+        if over && !on {
+            push_rounded_rect(
+                out,
+                Viewport {
+                    x: rect.x + 6.0,
+                    y: rect.y + 4.0,
+                    width: rect.width - 12.0,
+                    height: rect.height - 8.0,
+                },
+                UI_RADIUS,
+                theme.control_hover,
+            );
+        }
+        hotspot(rect, Cursor::Pointing, Some(ACTIVITY_TIPS[i]));
         let [r, g, b, a] = theme.sidebar_text;
         push_icon_scaled(
             out,
             atlas,
             rect,
             ACTIVITY_ICONS[i].0,
-            if on { theme.text } else { [r, g, b, a * 0.55] },
+            if on || over {
+                theme.text
+            } else {
+                [r, g, b, a * 0.55]
+            },
             1.45,
         );
         if i == 1 && badge > 0 {
@@ -2111,26 +2175,45 @@ pub fn push_activity(
             };
             let w = (ui_text_width(atlas, &label) + 8.0).max(16.0);
             let pill = Viewport {
-                x: rect.x + rect.width - w - 3.0,
-                y: rect.y + rect.height - 18.0,
+                x: rect.x + rect.width - w - 5.0,
+                y: rect.y + rect.height - 21.0,
                 width: w,
-                height: 15.0,
+                height: 16.0,
             };
-            push_rounded_rect(out, pill, 7.5, theme.accent);
+            // A ring in the strip's own colour cuts the badge out of the
+            // icon under it, so neither reads as part of the other.
+            push_rounded_rect(
+                out,
+                Viewport {
+                    x: pill.x - 2.0,
+                    y: pill.y - 2.0,
+                    width: pill.width + 4.0,
+                    height: pill.height + 4.0,
+                },
+                10.0,
+                theme.sidebar_background,
+            );
+            push_rounded_rect(out, pill, 8.0, theme.accent);
             push_ui_text_centered(out, atlas, pill, &label, theme.sidebar_background);
         }
     }
 }
 
-/// The top row of the sidebar, where the panel's title is written. Split in
-/// two halves, which the action row below lines up with.
+/// The sidebar's title row: the panel's name at the left, its actions at
+/// the right, one control tall, centred in the header.
+pub fn sidebar_title_row(viewport: Viewport) -> Viewport {
+    Viewport {
+        x: viewport.x + UI_INSET,
+        y: viewport.y + ((SIDEBAR_HEADER_HEIGHT - UI_CONTROL) * 0.5).floor(),
+        width: (viewport.width - UI_INSET * 2.0).max(0.0),
+        height: UI_CONTROL,
+    }
+}
+
+/// The title row in two halves, for anything that lines up with the old
+/// Explorer / Source Control switcher.
 pub fn sidebar_switcher(viewport: Viewport) -> (Viewport, Viewport) {
-    let track = Viewport {
-        x: viewport.x + 10.0,
-        y: viewport.y + 8.0,
-        width: (viewport.width - 20.0).max(0.0),
-        height: 26.0,
-    };
+    let track = sidebar_title_row(viewport);
     let half = track.width * 0.5;
     (
         Viewport {
@@ -2145,36 +2228,59 @@ pub fn sidebar_switcher(viewport: Viewport) -> (Viewport, Viewport) {
     )
 }
 
-/// Side of each action button. Square, so a row of them is a row and not a
+/// Side of each header action. Square, so a row of them is a row and not a
 /// ragged line of differently sized pills.
-pub const SIDEBAR_ACTION: f32 = 26.0;
+pub const SIDEBAR_ACTION: f32 = 24.0;
 
-/// The Explorer's action buttons, right to left, and the label beside them.
+/// `N` square header actions, right-aligned in the title row, left to right.
+pub fn sidebar_header_buttons<const N: usize>(viewport: Viewport) -> [Viewport; N] {
+    const GAP: f32 = 2.0;
+    let row = sidebar_title_row(viewport);
+    // The icons' own side bearing puts the last one a few points in from
+    // the edge; moving the row out by as much lines the glyph up with the
+    // content below.
+    let right = row.x + row.width + 4.0;
+    let y = row.y + ((row.height - SIDEBAR_ACTION) * 0.5).floor();
+    std::array::from_fn(|index| {
+        let from_right = (N - index) as f32;
+        Viewport {
+            x: right - from_right * SIDEBAR_ACTION - (from_right - 1.0) * GAP,
+            y,
+            width: SIDEBAR_ACTION,
+            height: SIDEBAR_ACTION,
+        }
+    })
+}
+
+/// A sidebar panel's name in its title row, clipped short of `actions`
+/// buttons. Returns the rectangle it took.
+pub fn push_sidebar_title(
+    out: &mut Vec<GlyphInstance>,
+    atlas: &mut Atlas,
+    viewport: Viewport,
+    title: &str,
+    actions: usize,
+    theme: &Theme,
+) -> Viewport {
+    let row = sidebar_title_row(viewport);
+    let used = actions as f32 * (SIDEBAR_ACTION + 2.0);
+    let rect = Viewport {
+        width: (row.width - used - UI_GAP).max(0.0),
+        ..row
+    };
+    push_ui_text(out, atlas, rect, title, theme.status_text);
+    rect
+}
+
+/// The Explorer's action buttons and the label beside them.
 ///
 /// Returns the label rectangle and the buttons in drawing order: new file,
-/// new folder, collapse all, refresh. They are identical squares on a single
-/// pitch and the row ends flush with the switcher above it.
+/// new folder, collapse all, refresh, on the title row's right.
 pub fn sidebar_actions(viewport: Viewport) -> (Viewport, [Viewport; 4]) {
-    const GAP: f32 = 4.0;
-    let row = Viewport {
-        x: viewport.x + 10.0,
-        y: viewport.y + 38.0,
-        width: (viewport.width - 20.0).max(0.0),
-        height: SIDEBAR_ACTION,
-    };
-    let right = row.x + row.width;
-    let mut buttons = [row; 4];
-    for (index, slot) in buttons.iter_mut().enumerate() {
-        // Index 0 is the leftmost of the four, so it sits four pitches back.
-        let from_right = 4.0 - index as f32;
-        *slot = Viewport {
-            x: right - from_right * SIDEBAR_ACTION - (from_right - 1.0) * GAP,
-            width: SIDEBAR_ACTION,
-            ..row
-        };
-    }
+    let buttons = sidebar_header_buttons::<4>(viewport);
+    let row = sidebar_title_row(viewport);
     let label = Viewport {
-        width: (buttons[0].x - row.x - GAP * 2.0).max(0.0),
+        width: (buttons[0].x - row.x - UI_GAP).max(0.0),
         ..row
     };
     (label, buttons)
@@ -2254,52 +2360,50 @@ pub fn build_sidebar_with_edit(
 
     // An empty panel with no explanation reads as a bug. Say what to do.
     if tree.root().is_none() {
-        let lines = [
+        push_sidebar_title(out, atlas, viewport, "EXPLORER", 0, theme);
+        let x = viewport.x + UI_INSET;
+        let width = (viewport.width - UI_INSET * 2.0).max(0.0);
+        let mut y = viewport.y + SIDEBAR_HEADER_HEIGHT + 8.0;
+        push_ui_text(
+            out,
+            atlas,
+            Viewport {
+                x,
+                y,
+                width,
+                height: 22.0,
+            },
             "No folder open",
-            "",
-            "Cmd-Shift-O   open a folder",
-            "Cmd-O         open a file",
-        ];
-        for (i, line) in lines.iter().enumerate() {
-            push_text(
-                out,
-                atlas,
-                viewport.x + m.advance,
-                viewport.y + (i as f32 + 1.0) * m.line_height,
-                line,
-                if i == 0 {
-                    theme.sidebar_directory
-                } else {
-                    theme.gutter_text
-                },
-            );
+            theme.text,
+        );
+        y += 26.0;
+        for (keys, what) in [
+            ("\u{21e7}\u{2318}O", "Open a folder"),
+            ("\u{2318}O", "Open a file"),
+        ] {
+            let line = Viewport {
+                x,
+                y,
+                width,
+                height: 22.0,
+            };
+            push_ui_text(out, atlas, line, what, theme.status_text);
+            push_ui_text_right(out, atlas, line, keys, theme.gutter_text);
+            y += 24.0;
         }
         return 0;
     }
 
-    // The panel's name; the icon strip switches panels.
-    let (title, source) = sidebar_switcher(viewport);
-    push_ui_text(
-        out,
-        atlas,
-        Viewport {
-            x: title.x + 2.0,
-            y: title.y + 3.0,
-            width: title.width + source.width,
-            height: 20.0,
-        },
-        if scm { "SOURCE CONTROL" } else { "EXPLORER" },
-        theme.status_text,
-    );
+    // The panel's name and its actions, on one row.
+    let title = if scm { "SOURCE CONTROL" } else { "EXPLORER" };
     if scm {
-        // The panel draws the rest of the column.
+        // The panel draws its own actions and the rest of the column.
         return 0;
     }
-
-    // Where a new file would go, then the buttons that make one. The label
-    // matters: the commands act on the selected item's directory, and without
-    // it there is no way to know which that is before committing.
-    let (label_rect, actions) = sidebar_actions(viewport);
+    let (_, actions) = sidebar_actions(viewport);
+    push_sidebar_title(out, atlas, viewport, title, actions.len(), theme);
+    // The commands act on the selected item's folder; the tooltip says
+    // which, so there is no guessing before committing.
     let where_to = tree
         .target_dir()
         .and_then(|dir| {
@@ -2307,17 +2411,32 @@ pub fn build_sidebar_with_edit(
                 .and_then(|root| dir.strip_prefix(root).ok())
                 .map(|rel| rel.to_string_lossy().into_owned())
         })
-        .filter(|rel| !rel.is_empty())
-        .unwrap_or_else(|| "Project root".into());
-    push_ui_text(out, atlas, label_rect, &where_to, theme.gutter_text);
-    for (rect, glyph) in actions.iter().zip([
-        icons::NEW_FILE,
-        icons::NEW_FOLDER,
-        icons::COLLAPSE_ALL,
-        icons::REFRESH,
-    ]) {
-        push_rounded_rect(out, *rect, 5.0, theme.tab_hover);
-        push_icon_centered(out, atlas, *rect, glyph, theme.status_text);
+        .filter(|rel| !rel.is_empty());
+    let in_folder = |what: &str| match &where_to {
+        Some(dir) => format!("{what} in {dir}"),
+        None => format!("{what} at the Project Root"),
+    };
+    let tips = [
+        in_folder("New File"),
+        in_folder("New Folder"),
+        "Collapse Folders".to_owned(),
+        "Refresh Explorer".to_owned(),
+    ];
+    for ((rect, glyph), tip) in actions
+        .iter()
+        .zip([
+            icons::NEW_FILE,
+            icons::NEW_FOLDER,
+            icons::COLLAPSE_ALL,
+            icons::REFRESH,
+        ])
+        .zip(&tips)
+    {
+        Button::new(*rect)
+            .icon(glyph)
+            .tone(Tone::Ghost)
+            .tip(tip)
+            .draw(out, atlas, theme);
     }
 
     // An inserted field is one more row; a rename takes its item's row.
@@ -2341,23 +2460,32 @@ pub fn build_sidebar_with_edit(
             break;
         };
 
+        let row_rect = Viewport {
+            y,
+            height: SIDEBAR_ROW_HEIGHT,
+            ..viewport
+        };
         if tree.selected == Some(i) {
             push_rounded_rect(
                 out,
                 Viewport {
-                    x: viewport.x + 8.0,
+                    x: viewport.x + 6.0,
                     y: y + 1.0,
-                    width: (viewport.width - 16.0).max(0.0),
+                    width: (viewport.width - 12.0).max(0.0),
                     height: SIDEBAR_ROW_HEIGHT - 2.0,
                 },
-                5.0,
+                UI_RADIUS_SM + 1.0,
                 theme.sidebar_selected,
             );
+        } else {
+            push_row_hover(out, row_rect, theme);
         }
 
         // Chevron, icon, name. Each icon is two cells wide, and a file gets
         // the chevron's two blank cells so names line up down a folder.
-        let indent = 12.0 + entry.depth as f32 * 16.0;
+        let indent = UI_INSET + entry.depth as f32 * 16.0;
+        let chevron_w = (cell_w * 2.0).max(16.0);
+        let icon_w = (cell_w * 2.0).max(18.0) + 6.0;
         let mut column = indent;
         let mut draw_icon = |glyph: char, color: [f32; 4], column: f32| {
             if let Some(slot) = atlas.slot_for(glyph) {
@@ -2392,7 +2520,7 @@ pub fn build_sidebar_with_edit(
                 [r, g, b, a * 0.45]
             }
         };
-        column += 16.0;
+        column += chevron_w;
         draw_icon(
             icon.glyph,
             if tree.selected == Some(i) {
@@ -2402,7 +2530,7 @@ pub fn build_sidebar_with_edit(
             },
             column,
         );
-        column += 24.0;
+        column += icon_w;
 
         let color = if tree.selected == Some(i) {
             theme.accent
@@ -2518,6 +2646,8 @@ pub enum Hit {
     TerminalTab(usize),
     TerminalClose(usize),
     TerminalNew,
+    /// Hides the panel; the sessions keep running.
+    TerminalHide,
     /// The terminal's screen.
     Terminal,
     /// An icon in the strip: 0 Explorer, 1 Source Control, 2 Extensions.
@@ -2558,6 +2688,14 @@ pub enum Hit {
     /// The repository menu in Source Control's header, in a workspace of
     /// several: it opens the repository list.
     GitRepo,
+    /// Source Control's other controls, named for scripts: `refresh`,
+    /// `more`, `pull`, `push`, `message`, `commit`. Clicks on them go
+    /// through the panel's own hit testing, with the same geometry.
+    Git(&'static str),
+    /// The `n`th row of Source Control's list on screen, and its staging
+    /// control.
+    GitRow(usize),
+    GitToggle(usize),
     /// An unfocused editor pane, tabs through text. A click gives it the
     /// keyboard and is then handled as a click in the focused pane.
     Pane(usize),
@@ -2576,6 +2714,7 @@ impl Hit {
             Hit::TerminalTab(i) => format!("terminal.tab.{i}"),
             Hit::TerminalClose(i) => format!("terminal.close.{i}"),
             Hit::TerminalNew => "terminal.new".into(),
+            Hit::TerminalHide => "terminal.hide".into(),
             Hit::Terminal => "terminal".into(),
             Hit::Activity(i) => format!("activity.{}", ACTIVITY_ICONS[*i].1),
             Hit::SidebarAction(i) => format!("sidebar.action.{i}"),
@@ -2609,6 +2748,9 @@ impl Hit {
             Hit::StatusBranch => "status.branch".into(),
             Hit::GitBranch => "git.branch".into(),
             Hit::GitRepo => "git.repo".into(),
+            Hit::Git(name) => format!("git.{name}"),
+            Hit::GitRow(i) => format!("git.row.{i}"),
+            Hit::GitToggle(i) => format!("git.toggle.{i}"),
             Hit::Pane(i) => format!("pane.{i}"),
         }
     }

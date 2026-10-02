@@ -42,7 +42,7 @@ use crate::platform::symbols;
 use crate::project::finder::Finder;
 use crate::project::tree::{Entry as TreeEntry, Tree, move_without_replace};
 use crate::render::font::Atlas;
-use crate::render::layout::{self, Chrome, Frame, Hit, Theme, Viewport};
+use crate::render::layout::{self, Button, Chrome, Frame, Hit, Theme, Tone, Viewport};
 use crate::render::metal::{DRAWABLE_FORMAT, FrameTiming, GlyphInstance, Renderer};
 use crate::syntax::{Language, Span, SyntaxStore};
 use crate::text::buffer::{Buffer, DiskState, Motion};
@@ -676,6 +676,10 @@ struct State {
     /// The Extensions page's targets and the bulb, as last drawn, so their
     /// pointing-hand cursor rects are rebuilt when they move.
     pointer_targets: Vec<Viewport>,
+    /// The controls of the last frame (see `layout::ui`), for cursor
+    /// rectangles and tooltips, and the one under the pointer.
+    hotspots: Vec<layout::Hotspot>,
+    hot: Option<usize>,
     /// The code font as asked for, and its size in points. The atlas holds
     /// the resolved face; this is what a rebuild at a new size starts from.
     font: String,
@@ -788,6 +792,9 @@ struct State {
     /// by which time the pointer has moved, so the target has to be recorded
     /// at click time rather than looked up again.
     context_tab: Option<usize>,
+    /// The Source Control row a context menu was opened on: a change and
+    /// the section it is listed under.
+    context_change: Option<(usize, crate::platform::git_panel::Group)>,
     /// Parse trees, one per open document that has a grammar.
     syntax: SyntaxStore,
     /// Reused each frame so highlighting allocates nothing in steady state.
@@ -1253,6 +1260,9 @@ pub struct Ivars {
     /// path does when it cannot do anything else, including the path taken
     /// because the state is already borrowed, so it must not need a borrow.
     needs_redraw: Cell<bool>,
+    /// The last frame drew a spinner or a progress bar, so the display
+    /// link keeps drawing (at a gentler pace) until one draws none.
+    animating: Cell<bool>,
     /// Set while `keyDown:` is handing an event to the input system. Text
     /// that arrives then is a keystroke, and `keyDown:` redraws and times it.
     /// Text that arrives at any other moment (the emoji picker, dictation, a
@@ -1356,6 +1366,27 @@ define_class!(
             self.note_hover(f32::NAN, f32::NAN);
         }
 
+        /// The tooltip of the control under `point`, asked by AppKit once
+        /// the pointer has rested on one of the rectangles added in
+        /// `resetCursorRects`.
+        #[unsafe(method_id(view:stringForToolTip:point:userData:))]
+        fn tool_tip(
+            &self,
+            _view: &NSView,
+            _tag: isize,
+            point: NSPoint,
+            _data: *mut std::ffi::c_void,
+        ) -> Retained<NSString> {
+            let text = self
+                .state()
+                .and_then(|state| {
+                    let at = layout::hotspot_at(&state.hotspots, point.x as f32, point.y as f32)?;
+                    state.hotspots[at].tip.clone()
+                })
+                .unwrap_or_default();
+            NSString::from_str(&text)
+        }
+
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
             if self.ivars().testing && event.timestamp() != 0.0 { return; }
@@ -1393,6 +1424,12 @@ define_class!(
             let started = Instant::now();
             let point = self.convertPoint_fromView(event.locationInWindow(), None);
             let (x, y) = (point.x as f32, point.y as f32);
+            // The control under the press shows it is held.
+            layout::set_pointer(Some((x, y)));
+            layout::set_pressed(Some((x, y)));
+            if self.state().is_some_and(|state| layout::hotspot_at(&state.hotspots, x, y).is_some()) {
+                self.request_redraw();
+            }
             let chrome = self.chrome();
             // A press only starts a text selection if it lands in the text.
             if let Some(mut state) = self.state_mut() {
@@ -1598,6 +1635,14 @@ define_class!(
                     self.spawn_terminal(false);
                     return;
                 }
+                Some(Hit::TerminalHide) => {
+                    if let Some(mut state) = self.state_mut() {
+                        state.terminal.open = false;
+                        state.terminal.focus = false;
+                    }
+                    self.after_terminal_layout();
+                    return;
+                }
                 Some(Hit::Terminal) => {
                     self.terminal_press(event, x, y);
                     return;
@@ -1734,7 +1779,12 @@ define_class!(
                     self.open_repo_picker();
                     return;
                 }
-                Some(Hit::SidebarRow(_)) | Some(Hit::Status) | None => {}
+                Some(Hit::SidebarRow(_))
+                | Some(Hit::Status)
+                | Some(Hit::Git(_))
+                | Some(Hit::GitRow(_))
+                | Some(Hit::GitToggle(_))
+                | None => {}
             }
 
             if chrome.toolbar.contains(x, y) {
@@ -1862,6 +1912,7 @@ define_class!(
         fn mouse_dragged(&self, event: &NSEvent) {
             if self.ivars().testing && event.timestamp() != 0.0 { return; }
             let point = self.convertPoint_fromView(event.locationInWindow(), None);
+            layout::set_pointer(Some((point.x as f32, point.y as f32)));
 
             let moved = {
                 let Some(mut state) = self.state_mut() else {
@@ -1998,6 +2049,8 @@ define_class!(
         #[unsafe(method(mouseUp:))]
         fn mouse_up(&self, _event: &NSEvent) {
             if self.ivars().testing && _event.timestamp() != 0.0 { return; }
+            layout::set_pressed(None);
+            self.request_redraw();
             let drop = {
                 let Some(mut state) = self.state_mut() else {
                     return;
@@ -2043,6 +2096,7 @@ define_class!(
                 let first = state.palette_scroll.min(layout::palette_max_scroll(count, layout::palette_visible_rows(rect)));
                 let rows = count.saturating_sub(first).min(layout::palette_visible_rows(rect));
                 add(Viewport { x: rect.x + 8.0, y: rect.y + layout::PALETTE_HEADER, width: rect.width - 16.0, height: rows as f32 * layout::PALETTE_ROW }, &NSCursor::pointingHandCursor());
+                self.add_hotspot_rects(&state.hotspots, Some(rect));
                 return;
             }
             for (hit, rect) in frame_of(&mut state).regions {
@@ -2085,29 +2139,18 @@ define_class!(
                     add(action, &NSCursor::pointingHandCursor());
                 }
             }
-            if let Some(find) = chrome.find {
-                add(Viewport { width: (find.width - 180.0).max(0.0), height: find.height.min(layout::FIND_ROW_HEIGHT * 2.0), ..find }, &NSCursor::IBeamCursor());
-                add(Viewport { x: find.x + (find.width - 180.0).max(0.0), width: find.width.min(180.0), ..find }, &NSCursor::pointingHandCursor());
-                if find.height > layout::FIND_ROW_HEIGHT * 2.0 { add(Viewport { y: find.y + layout::FIND_ROW_HEIGHT * 2.0, height: find.height - layout::FIND_ROW_HEIGHT * 2.0, ..find }, &NSCursor::pointingHandCursor()); }
+            // The find bar's fields and buttons are shared controls with
+            // hotspots of their own; only the project results are added here.
+            if let Some(find) = chrome.find
+                && find.height > layout::FIND_ROW_HEIGHT * 2.0
+            {
+                add(Viewport { y: find.y + layout::FIND_ROW_HEIGHT * 2.0, height: find.height - layout::FIND_ROW_HEIGHT * 2.0, ..find }, &NSCursor::pointingHandCursor());
             }
             if let Some(rect) = chrome.sidebar {
                 if state.git_open {
-                    // Only over the controls that are actually there: the
-                    // empty column below the last change is not clickable.
-                    let g = crate::platform::git_panel::Sidebar::new(rect);
-                    if !state.git.busy() { add(g.refresh, &NSCursor::pointingHandCursor()); }
-                    if !state.git.branch().is_empty() { add(g.branch, &NSCursor::pointingHandCursor()); }
-                    if state.git.repo.is_some() { add(g.repo, &NSCursor::pointingHandCursor()); }
-                    add(g.message, &NSCursor::IBeamCursor());
-                    if state.git.can_commit() { add(g.commit, &NSCursor::pointingHandCursor()); }
-                    for (entry, row) in state.git.rows(g) {
-                        if matches!(entry, crate::platform::git_panel::Entry::File { .. }) {
-                            add(row, &NSCursor::pointingHandCursor());
-                        }
-                    }
+                    // Every control of Source Control is a shared one, with
+                    // its own hotspot: see `add_hotspot_rects`.
                 } else {
-                let (_, actions) = layout::sidebar_actions(rect);
-                for action in actions { add(action, &NSCursor::pointingHandCursor()); }
                 let rows = state.tree.len().saturating_sub(state.tree.scroll).min(layout::sidebar_rows(rect));
                 add(Viewport { y: rect.y + layout::SIDEBAR_HEADER_HEIGHT, height: rows as f32 * layout::SIDEBAR_ROW_HEIGHT, ..rect }, &NSCursor::pointingHandCursor());
                 }
@@ -2131,6 +2174,9 @@ define_class!(
                 let cursor = if NSCursor::class().class_method(objc2::sel!(rowResizeCursor)).is_some() { NSCursor::rowResizeCursor() } else { #[allow(deprecated)] NSCursor::resizeUpDownCursor() };
                 add(band, &cursor);
             }
+            // The shared controls last: they are the most specific, and
+            // each is exactly the rectangle that was drawn.
+            self.add_hotspot_rects(&state.hotspots, None);
 
         }
 
@@ -2341,11 +2387,16 @@ define_class!(
                 if interval > 0.0 && interval < 1.0 {
                     state.frame_interval = Duration::from_secs_f64(interval);
                 }
-                if state.message.as_ref().is_some_and(|(_, at)| at.elapsed() >= Duration::from_secs(4)) {
+                if state.message.as_ref().is_some_and(|(text, at)| at.elapsed() >= layout::message_lasts(text)) {
                     state.message = None;
                     self.ivars().needs_redraw.set(true);
                 }
-                if !self.ivars().needs_redraw.get() && state.idle() {
+                if self.ivars().animating.get()
+                    && state.last_draw.is_none_or(|at| at.elapsed() >= Duration::from_millis(33))
+                {
+                    self.ivars().needs_redraw.set(true);
+                }
+                if !self.ivars().needs_redraw.get() && !self.ivars().animating.get() && state.idle() {
                     link.setPaused(true);
                     return;
                 }
@@ -2949,6 +3000,149 @@ define_class!(
             self.pump();
         }
 
+        #[unsafe(method(gitOpenContextChange:))]
+        fn action_git_open_change(&self, _sender: Option<&AnyObject>) {
+            if let Some((_, path)) = self.context_change_paths() {
+                self.load_path(&path.to_string_lossy());
+            }
+        }
+
+        #[unsafe(method(gitDiffContextChange:))]
+        fn action_git_diff_change(&self, _sender: Option<&AnyObject>) {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            if let Some((change, group)) = state.context_change {
+                state.git.select(change);
+                open_diff_tab(&mut state, change, group == crate::platform::git_panel::Group::Staged);
+            }
+            drop(state);
+            self.sync_title();
+            self.request_redraw();
+            self.resume_display_link();
+        }
+
+        #[unsafe(method(gitStageContextChange:))]
+        fn action_git_stage_change(&self, _sender: Option<&AnyObject>) {
+            if let Some(mut state) = self.state_mut()
+                && let Some((change, _)) = state.context_change
+            {
+                state.git.stage_index(change, true);
+            }
+            self.resume_display_link();
+        }
+
+        #[unsafe(method(gitUnstageContextChange:))]
+        fn action_git_unstage_change(&self, _sender: Option<&AnyObject>) {
+            if let Some(mut state) = self.state_mut()
+                && let Some((change, _)) = state.context_change
+            {
+                state.git.stage_index(change, false);
+            }
+            self.resume_display_link();
+        }
+
+        #[unsafe(method(gitStageAll:))]
+        fn action_git_stage_all(&self, _sender: Option<&AnyObject>) {
+            if let Some(mut state) = self.state_mut() {
+                state.git.stage_group(crate::platform::git_panel::Group::Changes);
+            }
+            self.resume_display_link();
+        }
+
+        #[unsafe(method(gitUnstageAll:))]
+        fn action_git_unstage_all(&self, _sender: Option<&AnyObject>) {
+            if let Some(mut state) = self.state_mut() {
+                state.git.stage_group(crate::platform::git_panel::Group::Staged);
+            }
+            self.resume_display_link();
+        }
+
+        #[unsafe(method(gitCopyContextChangePath:))]
+        fn action_git_copy_change_path(&self, _sender: Option<&AnyObject>) {
+            if let Some((_, path)) = self.context_change_paths() {
+                self.copy_and_say(&path.to_string_lossy());
+            }
+        }
+
+        #[unsafe(method(gitCopyContextChangeRelativePath:))]
+        fn action_git_copy_change_relative(&self, _sender: Option<&AnyObject>) {
+            if let Some((relative, _)) = self.context_change_paths() {
+                self.copy_and_say(&relative.to_string_lossy());
+            }
+        }
+
+        #[unsafe(method(gitRevealContextChange:))]
+        fn action_git_reveal_change(&self, _sender: Option<&AnyObject>) {
+            if let Some((_, path)) = self.context_change_paths() {
+                let _ = self.open(true, path.as_os_str());
+            }
+        }
+
+        #[unsafe(method(clearTerminal:))]
+        fn action_clear_terminal(&self, _sender: Option<&AnyObject>) {
+            self.clear_terminal();
+        }
+
+        #[unsafe(method(closeTabsToRight:))]
+        fn action_close_tabs_to_right(&self, _sender: Option<&AnyObject>) {
+            let Some(keep) = self.state().and_then(|state| state.context_tab) else {
+                return;
+            };
+            let Some(count) = self.state().map(|state| state.docs.len()) else {
+                return;
+            };
+            for index in ((keep + 1)..count).rev() {
+                self.close_tab(index);
+            }
+            self.sync_title();
+            self.reparse();
+            self.request_redraw();
+            self.pump();
+        }
+
+        #[unsafe(method(closeSavedTabs:))]
+        fn action_close_saved_tabs(&self, _sender: Option<&AnyObject>) {
+            let Some(clean) = self.state().map(|state| {
+                state
+                    .docs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, b)| !b.is_dirty())
+                    .map(|(i, _)| i)
+                    .collect::<Vec<_>>()
+            }) else {
+                return;
+            };
+            for index in clean.into_iter().rev() {
+                self.close_tab(index);
+            }
+            self.sync_title();
+            self.reparse();
+            self.request_redraw();
+            self.pump();
+        }
+
+        #[unsafe(method(copyProjectItemPath:))]
+        fn action_copy_item_path(&self, _sender: Option<&AnyObject>) {
+            let path = self.state().and_then(|state| state.tree.selected_path());
+            if let Some(path) = path {
+                self.copy_and_say(&path.to_string_lossy());
+            }
+        }
+
+        #[unsafe(method(copyProjectItemRelativePath:))]
+        fn action_copy_item_relative_path(&self, _sender: Option<&AnyObject>) {
+            let path = self.state().and_then(|state| {
+                let path = state.tree.selected_path()?;
+                let root = state.tree.root()?;
+                Some(path.strip_prefix(root).map(Path::to_path_buf).unwrap_or(path))
+            });
+            if let Some(path) = path {
+                self.copy_and_say(&path.to_string_lossy());
+            }
+        }
+
         #[unsafe(method(copyContextTabPath:))]
         fn action_copy_context_path(&self, _sender: Option<&AnyObject>) {
             let Some(path) = self.state().map(|state| context_tab_path(&state)) else {
@@ -3483,6 +3677,35 @@ define_class!(
                 active_conflicts(&state).is_some_and(|v| !v.conflicts.is_empty())
             } else if action == sel!(acceptBase:) {
                 active_conflicts(&state).is_some_and(|v| v.has_base())
+            } else if action == sel!(gitFetch:)
+                || action == sel!(gitPull:)
+                || action == sel!(gitPullRebase:)
+                || action == sel!(gitPullMerge:)
+                || action == sel!(gitPush:)
+            {
+                // Busy is answered by the command itself, in words.
+                state.git.root().is_some()
+            } else if action == sel!(switchBranch:)
+                || action == sel!(renameBranch:)
+                || action == sel!(deleteBranch:)
+            {
+                state.git.root().is_some()
+            } else if action == sel!(gitStageAll:) {
+                state.git.snapshot.as_ref().is_some_and(|s| s.changes.iter().any(|c| c.unstaged())) && !state.git.busy()
+            } else if action == sel!(gitUnstageAll:) {
+                state.git.staged_count() > 0 && !state.git.busy()
+            } else if action == sel!(gitStageContextChange:) {
+                state.context_change.is_some_and(|(_, g)| g == crate::platform::git_panel::Group::Changes) && !state.git.busy()
+            } else if action == sel!(gitUnstageContextChange:) {
+                state.context_change.is_some_and(|(_, g)| g == crate::platform::git_panel::Group::Staged) && !state.git.busy()
+            } else if action == sel!(closeOtherTabs:) {
+                state.docs.len() > 1
+            } else if action == sel!(closeTabsToRight:) {
+                state.context_tab.is_some_and(|index| index + 1 < state.docs.len())
+            } else if action == sel!(clearTerminal:) {
+                !state.terminal.tabs.is_empty()
+            } else if action == sel!(copyProjectItemPath:) || action == sel!(copyProjectItemRelativePath:) {
+                state.tree.selected.is_some()
             } else if action == sel!(gitAbort:) {
                 state.git.in_progress().is_some()
             } else if action == sel!(gitContinueRebase:) {
@@ -3759,6 +3982,20 @@ impl EditorView {
         let (x, y) = (point.x as f32, point.y as f32);
 
         let in_sidebar = sidebar.is_some_and(|r| r.contains(x, y));
+        // Source Control fills the sidebar while it shows: a right-click
+        // there is about Git, never about the file tree hidden behind it.
+        let git_showing = self
+            .state()
+            .is_some_and(|state| state.git_open && state.extensions.is_none() && !state.mcp.open);
+        if in_sidebar && git_showing {
+            let rect = sidebar.expect("in_sidebar implies a sidebar rectangle");
+            return Some(self.git_context_menu(rect, x, y));
+        }
+        // The terminal has its own: copy and paste, never the document's
+        // Cut or Find.
+        if chrome.terminal.is_some_and(|r| r.contains(x, y)) {
+            return Some(terminal_context_menu(mtm));
+        }
         let in_tab_bar = chrome.tabs.contains(x, y);
         let in_project = chrome.toolbar.contains(x, y)
             && self.state_mut().is_some_and(|mut state| {
@@ -3783,11 +4020,10 @@ impl EditorView {
             if let Some(mut state) = self.state_mut() {
                 state.context_tab = hit;
             }
-            // Empty strip still belongs to the bar, so it is consumed
-            // with an empty menu rather than falling through.
+            // The empty strip right of the tabs offers a new one.
             Some(match hit {
                 Some(_) => tab_menu(mtm),
-                None => NSMenu::new(mtm),
+                None => tab_strip_menu(mtm),
             })
         } else if in_sidebar {
             let rect = sidebar.expect("in_sidebar implies a sidebar rectangle");
@@ -3807,8 +4043,11 @@ impl EditorView {
                 Some(project_menu(mtm))
             }
         } else {
-            let commands = self.state().map(|state| state.ext.commands.clone())?;
-            Some(editor_context_menu(mtm, &commands))
+            let (commands, lsp) = self.state().map(|state| {
+                let lsp = lsp_server_for(&state, state.docs.active()).is_some();
+                (state.ext.commands.clone(), lsp)
+            })?;
+            Some(editor_context_menu(mtm, &commands, lsp))
         }
     }
 
@@ -3839,6 +4078,7 @@ impl EditorView {
             testing: std::env::var_os("CRC_SELFTEST").is_some(),
             state: RefCell::new(state),
             needs_redraw: Cell::new(false),
+            animating: Cell::new(false),
             in_key_down: Cell::new(false),
             handling_key: Cell::new(false),
             draws_during_key_handler: Cell::new(0),
@@ -4111,6 +4351,7 @@ impl EditorView {
             return;
         };
         self.ivars().needs_redraw.set(false);
+        self.ivars().animating.set(layout::take_animating());
         self.arm_caret_blink();
 
         let Some(mut state) = self.state_mut() else {
@@ -4174,6 +4415,11 @@ impl EditorView {
             .collect();
         if state.pointer_targets != pointer_targets {
             state.pointer_targets = pointer_targets;
+            state.cursor_rects_for = None;
+        }
+        let hotspots = layout::hotspots();
+        if state.hotspots != hotspots {
+            state.hotspots = hotspots;
             state.cursor_rects_for = None;
         }
         if state.cursor_rects_for != Some(key) {
@@ -4399,6 +4645,21 @@ impl EditorView {
     /// would spend a frame on nothing. A non-finite point means the pointer
     /// left the window.
     fn note_hover(&self, x: f32, y: f32) {
+        layout::set_pointer(Some((x, y)));
+        let hot_changed = self.state_mut().is_some_and(|mut state| {
+            let hot = if x.is_finite() {
+                layout::hotspot_at(&state.hotspots, x, y)
+            } else {
+                None
+            };
+            let changed = state.hot != hot;
+            state.hot = hot;
+            changed
+        });
+        if hot_changed {
+            self.request_redraw();
+            self.pump();
+        }
         let chrome = self.chrome();
         let over = (x.is_finite() && chrome.tabs.contains(x, y))
             .then(|| {
@@ -4421,6 +4682,37 @@ impl EditorView {
         self.invalidate_tab_cursors();
         self.request_redraw();
         self.pump();
+    }
+
+    /// Cursor rectangles and tooltips for the frame's shared controls,
+    /// only those inside `within` when a modal panel covers the rest.
+    fn add_hotspot_rects(&self, spots: &[layout::Hotspot], within: Option<Viewport>) {
+        self.removeAllToolTips();
+        let inside = |r: Viewport| {
+            within.is_none_or(|w| {
+                r.x >= w.x
+                    && r.y >= w.y
+                    && r.x + r.width <= w.x + w.width
+                    && r.y + r.height <= w.y + w.height
+            })
+        };
+        for spot in spots.iter().filter(|s| inside(s.rect)) {
+            let rect = ns_rect(spot.rect);
+            match spot.cursor {
+                layout::Cursor::Pointing => {
+                    self.addCursorRect_cursor(rect, &NSCursor::pointingHandCursor())
+                }
+                layout::Cursor::Text => self.addCursorRect_cursor(rect, &NSCursor::IBeamCursor()),
+                layout::Cursor::Arrow => self.addCursorRect_cursor(rect, &NSCursor::arrowCursor()),
+            }
+            if spot.tip.is_some() {
+                // Asked back through `view:stringForToolTip:point:userData:`,
+                // which finds the control by the point.
+                unsafe {
+                    self.addToolTipRect_owner_userData(rect, self, std::ptr::null_mut());
+                }
+            }
+        }
     }
 
     /// The close button appears and disappears with hover, so its pointer
@@ -4810,6 +5102,12 @@ fn side_by_side(state: &State) -> bool {
 /// Shows change `change` of Source Control in the diff tab: the one
 /// already open, renamed for this change, or a new one. A diff tab left in
 /// another pane moves to this one.
+/// A change's file on disk.
+fn change_path(state: &State, change: usize) -> Option<std::path::PathBuf> {
+    let snapshot = state.git.snapshot.as_ref()?;
+    Some(snapshot.root.join(&snapshot.changes.get(change)?.path))
+}
+
 fn open_diff_tab(state: &mut State, change: usize, staged: bool) {
     let Some(path) = state
         .git
@@ -5664,6 +5962,25 @@ fn frame_of(state: &mut State) -> Frame {
             if git.repo.is_some() {
                 frame.push(Hit::GitRepo, g.repo);
             }
+            for (name, rect) in [
+                ("refresh", g.refresh),
+                ("more", g.more),
+                ("pull", g.pull),
+                ("push", g.push),
+                ("message", g.message),
+                ("commit", g.commit),
+            ] {
+                frame.push(Hit::Git(name), rect);
+            }
+            let rows = git.rows(g);
+            for (i, (entry, rect)) in rows.iter().enumerate() {
+                if matches!(entry, crate::platform::git_panel::Entry::File { .. }) {
+                    frame.push(Hit::GitToggle(i), g.toggle(*rect));
+                }
+            }
+            for (i, (_, rect)) in rows.into_iter().enumerate() {
+                frame.push(Hit::GitRow(i), rect);
+            }
         }
         if !*git_open && extensions.is_none() && !mcp.open {
             let (_, actions) = layout::sidebar_actions(rect);
@@ -5767,6 +6084,10 @@ fn frame_of(state: &mut State) -> Frame {
             frame.push(Hit::TerminalTab(index), tab);
         }
         frame.push(Hit::TerminalNew, new);
+        frame.push(
+            Hit::TerminalHide,
+            crate::platform::terminal::header_hide(header),
+        );
         // The screen first, so a script's offsets land on rows and columns;
         // the padding around it is the terminal too.
         frame.push(Hit::Terminal, crate::platform::terminal::split(rect).1);
@@ -6361,24 +6682,175 @@ fn palette_rows(sources: &PaletteSources<'_>, query: &str) -> Vec<(layout::Palet
 
 /// Right-click menu for a tab.
 fn tab_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
-    let menu = NSMenu::new(mtm);
-    // No AutoFill or Services items: see project_menu.
-    menu.setAllowsContextMenuPlugIns(false);
+    let menu = context_menu_new(mtm);
     let add = |title: &str, action: Sel| menu.addItem(&menu_item(mtm, title, action));
-    add("Close Tab", sel!(closeContextTab:));
+    menu.addItem(&hinted_menu_item(
+        mtm,
+        "Close Tab",
+        sel!(closeContextTab:),
+        "w",
+        NSEventModifierFlags::Command,
+    ));
     add("Close Other Tabs", sel!(closeOtherTabs:));
-    add("Close All Tabs", sel!(closeAllTabs:));
+    add("Close Tabs to the Right", sel!(closeTabsToRight:));
+    add("Close Saved Tabs", sel!(closeSavedTabs:));
     menu.addItem(&NSMenuItem::separatorItem(mtm));
     add("Move Tab Left", sel!(moveContextTabLeft:));
     add("Move Tab Right", sel!(moveContextTabRight:));
     menu.addItem(&NSMenuItem::separatorItem(mtm));
     add("Copy Path", sel!(copyContextTabPath:));
     add("Reveal in Finder", sel!(revealContextTab:));
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
+    // Everything, last and apart, so it is not hit by a slip from Close.
+    add("Close All Tabs", sel!(closeAllTabs:));
     menu
 }
 
 fn menu_item(mtm: MainThreadMarker, title: &str, action: Sel) -> Retained<NSMenuItem> {
     keyed_menu_item(mtm, title, action, "")
+}
+
+/// A context-menu item that shows the shortcut the same command has in the
+/// menu bar. The key works from the menu bar either way; showing it here
+/// is how a right-click teaches it.
+fn hinted_menu_item(
+    mtm: MainThreadMarker,
+    title: &str,
+    action: Sel,
+    key: &str,
+    mods: NSEventModifierFlags,
+) -> Retained<NSMenuItem> {
+    let item = keyed_menu_item(mtm, title, action, key);
+    item.setKeyEquivalentModifierMask(mods);
+    item
+}
+
+/// A context menu with no AutoFill or Services items: see project_menu.
+fn context_menu_new(mtm: MainThreadMarker) -> Retained<NSMenu> {
+    let menu = NSMenu::new(mtm);
+    menu.setAllowsContextMenuPlugIns(false);
+    menu
+}
+
+/// Source Control's "more" menu and the empty part of its column: every
+/// Git command, grouped the way the work goes.
+fn git_actions_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
+    let menu = context_menu_new(mtm);
+    let add = |title: &str, action: Sel| menu.addItem(&menu_item(mtm, title, action));
+    let line = || menu.addItem(&NSMenuItem::separatorItem(mtm));
+    add("Fetch", sel!(gitFetch:));
+    add("Pull", sel!(gitPull:));
+    add("Pull with Rebase", sel!(gitPullRebase:));
+    add("Pull with Merge", sel!(gitPullMerge:));
+    add("Push", sel!(gitPush:));
+    line();
+    add("Stage All Changes", sel!(gitStageAll:));
+    add("Unstage All Changes", sel!(gitUnstageAll:));
+    line();
+    add("Switch or Create Branch\u{2026}", sel!(switchBranch:));
+    add("Rename Branch\u{2026}", sel!(renameBranch:));
+    add("Delete Branch\u{2026}", sel!(deleteBranch:));
+    add("Switch Repository\u{2026}", sel!(switchRepository:));
+    line();
+    add("Abort Merge, Rebase or Cherry-Pick", sel!(gitAbort:));
+    add("Continue Rebase", sel!(gitContinueRebase:));
+    line();
+    add("Refresh", sel!(gitRefresh:));
+    menu
+}
+
+/// A changed file in Source Control: open it or its diff, stage it, find
+/// it. `staged` says which section the row is in.
+fn git_change_menu(mtm: MainThreadMarker, staged: bool, conflicted: bool) -> Retained<NSMenu> {
+    let menu = context_menu_new(mtm);
+    let add = |title: &str, action: Sel| menu.addItem(&menu_item(mtm, title, action));
+    let line = || menu.addItem(&NSMenuItem::separatorItem(mtm));
+    add("Open File", sel!(gitOpenContextChange:));
+    if !conflicted {
+        add("Open Changes", sel!(gitDiffContextChange:));
+        line();
+        if staged {
+            add("Unstage Changes", sel!(gitUnstageContextChange:));
+        } else {
+            add("Stage Changes", sel!(gitStageContextChange:));
+        }
+    }
+    line();
+    add("Copy Path", sel!(gitCopyContextChangePath:));
+    add(
+        "Copy Relative Path",
+        sel!(gitCopyContextChangeRelativePath:),
+    );
+    add("Reveal in Finder", sel!(gitRevealContextChange:));
+    menu
+}
+
+/// A section heading in Source Control.
+fn git_section_menu(mtm: MainThreadMarker, staged: bool) -> Retained<NSMenu> {
+    let menu = context_menu_new(mtm);
+    if staged {
+        menu.addItem(&menu_item(mtm, "Unstage All Changes", sel!(gitUnstageAll:)));
+    } else {
+        menu.addItem(&menu_item(mtm, "Stage All Changes", sel!(gitStageAll:)));
+    }
+    menu
+}
+
+/// The terminal's own: what a terminal does with text.
+fn terminal_context_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
+    let menu = context_menu_new(mtm);
+    let cmd = NSEventModifierFlags::Command;
+    menu.addItem(&hinted_menu_item(mtm, "Copy", sel!(copy:), "c", cmd));
+    menu.addItem(&hinted_menu_item(mtm, "Paste", sel!(paste:), "v", cmd));
+    menu.addItem(&hinted_menu_item(
+        mtm,
+        "Select All",
+        sel!(selectAll:),
+        "a",
+        cmd,
+    ));
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
+    menu.addItem(&menu_item(mtm, "Clear", sel!(clearTerminal:)));
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
+    menu.addItem(&menu_item(mtm, "New Terminal", sel!(newTerminal:)));
+    menu.addItem(&hinted_menu_item(
+        mtm,
+        "Hide Terminal",
+        sel!(toggleTerminal:),
+        "`",
+        NSEventModifierFlags::Control,
+    ));
+    menu
+}
+
+/// The empty tab strip, right of the last tab.
+fn tab_strip_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
+    let menu = context_menu_new(mtm);
+    let cmd = NSEventModifierFlags::Command;
+    menu.addItem(&hinted_menu_item(
+        mtm,
+        "New File\u{2026}",
+        sel!(newDocument:),
+        "n",
+        cmd,
+    ));
+    menu.addItem(&hinted_menu_item(
+        mtm,
+        "Open\u{2026}",
+        sel!(openDocument:),
+        "o",
+        cmd,
+    ));
+    menu.addItem(&hinted_menu_item(
+        mtm,
+        "Go to File\u{2026}",
+        sel!(openQuickly:),
+        "p",
+        cmd,
+    ));
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
+    menu.addItem(&menu_item(mtm, "Close Saved Tabs", sel!(closeSavedTabs:)));
+    menu
 }
 
 /// A menu item whose Command-`key` shortcut sends `action`.
@@ -6491,40 +6963,100 @@ fn crumb_folder_menu(
 }
 
 fn sidebar_item_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
-    let menu = NSMenu::new(mtm);
-    menu.setAllowsContextMenuPlugIns(false);
-    menu.addItem(&menu_item(mtm, "New File…", sel!(newDocument:)));
-    menu.addItem(&menu_item(mtm, "New Folder…", sel!(newFolder:)));
-    menu.addItem(&NSMenuItem::separatorItem(mtm));
-    menu.addItem(&menu_item(mtm, "Rename…", sel!(renameProjectItem:)));
-    menu.addItem(&menu_item(mtm, "Move to Trash", sel!(trashProjectItem:)));
-    menu.addItem(&NSMenuItem::separatorItem(mtm));
+    let menu = context_menu_new(mtm);
+    let line = || menu.addItem(&NSMenuItem::separatorItem(mtm));
+    menu.addItem(&hinted_menu_item(
+        mtm,
+        "New File\u{2026}",
+        sel!(newDocument:),
+        "n",
+        NSEventModifierFlags::Command,
+    ));
+    menu.addItem(&menu_item(mtm, "New Folder\u{2026}", sel!(newFolder:)));
+    line();
+    menu.addItem(&menu_item(mtm, "Copy Path", sel!(copyProjectItemPath:)));
+    menu.addItem(&menu_item(
+        mtm,
+        "Copy Relative Path",
+        sel!(copyProjectItemRelativePath:),
+    ));
     menu.addItem(&menu_item(mtm, "Reveal in Finder", sel!(revealInFinder:)));
+    line();
+    menu.addItem(&menu_item(mtm, "Rename\u{2026}", sel!(renameProjectItem:)));
+    line();
+    // Apart from Rename, the one that throws something away.
+    menu.addItem(&hinted_menu_item(
+        mtm,
+        "Move to Trash",
+        sel!(trashProjectItem:),
+        "\u{8}",
+        NSEventModifierFlags::Command,
+    ));
     menu
 }
 
-fn editor_context_menu(mtm: MainThreadMarker, commands: &[ExtCommand]) -> Retained<NSMenu> {
+fn editor_context_menu(
+    mtm: MainThreadMarker,
+    commands: &[ExtCommand],
+    lsp: bool,
+) -> Retained<NSMenu> {
     let menu = NSMenu::new(mtm);
-    menu.addItem(&menu_item(mtm, "Cut", sel!(cut:)));
-    menu.addItem(&menu_item(mtm, "Copy", sel!(copy:)));
-    menu.addItem(&menu_item(mtm, "Paste", sel!(paste:)));
-    menu.addItem(&NSMenuItem::separatorItem(mtm));
-    menu.addItem(&menu_item(mtm, "Select All", sel!(selectAll:)));
-    menu.addItem(&NSMenuItem::separatorItem(mtm));
-    menu.addItem(&menu_item(mtm, "Find…", sel!(performFindPanelAction:)));
-    menu.addItem(&NSMenuItem::separatorItem(mtm));
+    let cmd = NSEventModifierFlags::Command;
+    let line = || menu.addItem(&NSMenuItem::separatorItem(mtm));
+    if lsp {
+        // What a language server knows about the code under the pointer.
+        menu.addItem(&hinted_menu_item(
+            mtm,
+            "Go to Definition",
+            sel!(goToDefinition:),
+            "\u{F70F}",
+            NSEventModifierFlags::empty(),
+        ));
+        menu.addItem(&menu_item(mtm, "Find References", sel!(findReferences:)));
+        menu.addItem(&menu_item(
+            mtm,
+            "Rename Symbol\u{2026}",
+            sel!(renameSymbol:),
+        ));
+        menu.addItem(&menu_item(mtm, "Quick Fix\u{2026}", sel!(quickFix:)));
+        line();
+    }
+    menu.addItem(&hinted_menu_item(mtm, "Cut", sel!(cut:), "x", cmd));
+    menu.addItem(&hinted_menu_item(mtm, "Copy", sel!(copy:), "c", cmd));
+    menu.addItem(&hinted_menu_item(mtm, "Paste", sel!(paste:), "v", cmd));
+    line();
+    menu.addItem(&hinted_menu_item(
+        mtm,
+        "Select All",
+        sel!(selectAll:),
+        "a",
+        cmd,
+    ));
+    menu.addItem(&hinted_menu_item(
+        mtm,
+        "Toggle Comment",
+        sel!(toggleComment:),
+        "/",
+        cmd,
+    ));
+    line();
+    menu.addItem(&hinted_menu_item(
+        mtm,
+        "Find\u{2026}",
+        sel!(performFindPanelAction:),
+        "f",
+        cmd,
+    ));
+    if commands.is_empty() {
+        return menu;
+    }
+    line();
     // Extensions, right where the text is: each installed extension, then
     // its commands, run on the selection (or the document) under the
     // pointer. Two clicks rather than the palette and a typed name.
     let extensions = NSMenu::new(mtm);
     extensions.setTitle(&NSString::from_str("Extensions"));
-    let items = extension_items(mtm, commands);
-    if items.is_empty() {
-        let none = menu_item(mtm, "No extensions installed", sel!(openExtensions:));
-        none.setEnabled(false);
-        extensions.addItem(&none);
-    }
-    for item in items {
+    for item in extension_items(mtm, commands) {
         extensions.addItem(&item);
     }
     extensions.addItem(&NSMenuItem::separatorItem(mtm));
@@ -7134,6 +7666,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         tab_scroll: 0,
         tab_scroll_carry: 0.0,
         context_tab: None,
+        context_change: None,
         ephemeral_session: launched_with_file,
         discard_confirmed: false,
         quit_session: None,
@@ -7174,6 +7707,8 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         conflict_side: settings.conflict_side_by_side,
         conflict_cursor_key: None,
         pointer_targets: Vec::new(),
+        hotspots: Vec::new(),
+        hot: None,
         font: font.to_owned(),
         font_size: size_pt,
         theme_choice: settings.theme,

@@ -109,11 +109,10 @@ text >source control
 key 36
 wait 600
 wait 300
-# The message field and the Commit button, as in the audit scenario:
-# the 240pt sidebar, the header 70pt under the 48pt toolbar.
-click 164 161
+# The message field and the Commit button, by name.
+click @git.message
 text keep the recipe
-click 164 196
+click @git.commit
 wait 600
 wait 300
 dump $T/ws-guard.out

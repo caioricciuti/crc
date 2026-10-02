@@ -187,16 +187,36 @@ impl EditorView {
         let g = Sidebar::new(column);
         let mut handled = true;
         let mut conflict_file = None;
+        let mut open_file = None;
         if g.repo.contains(x, y) && state.git.repo.is_some() {
             drop(state);
             self.open_repo_picker();
             return true;
+        } else if g.more.contains(x, y) {
+            drop(state);
+            self.pop_up_git_menu(g.more);
+            return true;
+        } else if g.refresh.contains(x, y) {
+            state.git.refresh();
+        } else if state.git.snapshot.is_none() {
+            // No repository: nothing below the header is a control.
+            handled = false;
         } else if g.branch.contains(x, y) && !state.git.branch().is_empty() {
             drop(state);
             self.open_branch_picker(BranchIntent::Switch);
             return true;
-        } else if g.refresh.contains(x, y) {
-            state.git.refresh();
+        } else if g.pull.contains(x, y) || g.push.contains(x, y) {
+            let what = if g.pull.contains(x, y) {
+                crate::project::git::Remote::Pull
+            } else {
+                crate::project::git::Remote::Push
+            };
+            if state.git.busy() {
+                return true;
+            }
+            drop(state);
+            self.git_remote(what);
+            return true;
         } else if g.commit.contains(x, y) {
             state.git.commit();
         } else if g.message.contains(x, y) {
@@ -223,22 +243,34 @@ impl EditorView {
                 }
                 Entry::File { change, group } => {
                     let staged = group == Group::Staged;
-                    // The staging control is on the row, so a click near the
-                    // trailing edge stages rather than selects.
+                    // The row's controls are at its trailing edge, so a click
+                    // there acts rather than selects.
                     if g.toggle(rect).contains(x, y) {
                         state.git.stage_index(change, !staged);
+                    } else if g.open(rect).contains(x, y) {
+                        state.git_focus = false;
+                        open_file = change_path(&state, change);
                     } else {
                         state.git_focus = false;
                         state.git.select(change);
                         open_diff_tab(&mut state, change, staged);
                     }
                 }
-                Entry::Section { .. } => handled = false,
+                Entry::Section { group, .. } => {
+                    if group != Group::Conflicts && g.section_action(rect).contains(x, y) {
+                        state.git.stage_group(group);
+                    } else {
+                        state.git.toggle_group(group);
+                    }
+                }
             }
         } else {
             handled = false;
         }
         drop(state);
+        if let Some(path) = open_file {
+            self.load_path(&path.to_string_lossy());
+        }
         if let Some(path) = conflict_file
             && self.load_path(&path.to_string_lossy())
         {

@@ -446,7 +446,7 @@ fn main() -> std::io::Result<()> {
             (g.replace_field, "Replace with", "", false, None),
         ] {
             if focused {
-                layout::push_focus_ring(&mut glyphs, rect, 6.0, 1.5);
+                layout::push_focus_ring(&mut glyphs, rect, 6.0, 1.5, &theme);
             }
             layout::push_rounded_rect(&mut glyphs, rect, 6.0, theme.tab_active);
             let inner = Viewport {
@@ -684,7 +684,13 @@ fn main() -> std::io::Result<()> {
             &theme,
             &mut glyphs,
         );
-        panel.draw_sidebar(&mut renderer.atlas, sidebar_rect, &theme, &mut glyphs);
+        panel.draw_sidebar(
+            &mut renderer.atlas,
+            sidebar_rect,
+            false,
+            &theme,
+            &mut glyphs,
+        );
         println!(
             "git         {} entries, diff {}",
             panel.entries().len(),
