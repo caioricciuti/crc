@@ -42,6 +42,7 @@ impl EditorView {
         // live, the honest answer is to skip this frame and draw on the next
         // one, not to abort the process.
         let mut state = self.state_mut()?;
+        layout::begin_frame();
         sync_conflicts(&mut state);
         let column = column_of(&state);
         let chrome = chrome_of(&state);
@@ -51,6 +52,7 @@ impl EditorView {
             tree,
             git,
             git_open,
+            git_focus,
             mcp,
             find,
             find_cache,
@@ -663,7 +665,7 @@ impl EditorView {
                 glyphs,
             );
             if *git_open {
-                git.draw_sidebar(&mut renderer.atlas, rect, theme, glyphs);
+                git.draw_sidebar(&mut renderer.atlas, rect, *git_focus, theme, glyphs);
             } else if let Some(Drag::Tree(drag)) = drag
                 && drag.active
                 && drag.valid
@@ -684,7 +686,7 @@ impl EditorView {
                         height: (rect.height - layout::SIDEBAR_HEADER_HEIGHT).max(0.0),
                     },
                 };
-                layout::push_focus_ring(glyphs, band, 5.0, 1.5);
+                layout::push_focus_ring(glyphs, band, 5.0, 1.5, theme);
             }
         }
 
@@ -883,7 +885,7 @@ fn draw_find_bar(
                  focused: bool,
                  trailing: Option<&str>| {
         if focused {
-            layout::push_focus_ring(glyphs, box_rect, 6.0, 1.5);
+            layout::push_focus_ring(glyphs, box_rect, 6.0, 1.5, theme);
         }
         layout::push_rounded_rect(glyphs, box_rect, 6.0, theme.tab_active);
         let text = buffer.rope.to_string();

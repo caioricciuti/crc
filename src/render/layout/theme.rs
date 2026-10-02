@@ -32,7 +32,14 @@ pub struct Theme {
     pub status_text: [f32; 4],
     /// The current line's own number, which is the one you actually read.
     pub gutter_text_active: [f32; 4],
+    /// A control's resting fill: buttons, menu boxes, the tab under the
+    /// pointer.
     pub tab_hover: [f32; 4],
+    /// A control under the pointer, and one held down.
+    pub control_hover: [f32; 4],
+    pub control_pressed: [f32; 4],
+    /// The wash behind a list row under the pointer.
+    pub row_hover: [f32; 4],
     pub tab_dirty: [f32; 4],
     /// One device pixel. AppKit never draws a two-pixel hairline.
     pub hairline: [f32; 4],
@@ -116,6 +123,12 @@ impl Theme {
 }
 
 impl Theme {
+    /// The window background as the other colours are given, for a field
+    /// drawn in it.
+    pub fn background_f32(&self) -> [f32; 4] {
+        self.background.map(|c| c as f32)
+    }
+
     /// The dark appearance, which is also the default.
     pub fn dark() -> Theme {
         Theme::default()
@@ -142,6 +155,9 @@ impl Theme {
             tab_bar: [0.925, 0.933, 0.933, 1.0],
             tab_active: [0.969, 0.973, 0.973, 1.0],
             tab_hover: [0.886, 0.898, 0.898, 1.0],
+            control_hover: [0.847, 0.863, 0.863, 1.0],
+            control_pressed: [0.800, 0.816, 0.816, 1.0],
+            row_hover: [0.000, 0.000, 0.000, 0.045],
             divider: [0.835, 0.851, 0.851, 1.0],
             hairline: [0.867, 0.882, 0.882, 1.0],
             palette_border: [0.725, 0.788, 0.761, 1.0],
@@ -209,6 +225,9 @@ impl Default for Theme {
             tab_bar: [0.125, 0.141, 0.145, 1.0],
             tab_active: [0.098, 0.110, 0.114, 1.0],
             tab_hover: [0.161, 0.180, 0.184, 1.0],
+            control_hover: [0.204, 0.227, 0.231, 1.0],
+            control_pressed: [0.243, 0.271, 0.275, 1.0],
+            row_hover: [1.000, 1.000, 1.000, 0.045],
             divider: [0.188, 0.212, 0.216, 1.0],
             hairline: [0.157, 0.180, 0.180, 1.0],
             palette_border: [0.325, 0.388, 0.357, 1.0],

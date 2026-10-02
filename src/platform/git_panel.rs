@@ -1,8 +1,9 @@
 //! Native local source-control panel; Git processes run on workers.
 use crate::project::git::{self, Change, Snapshot};
+use crate::project::icons;
 use crate::render::{
     font::Atlas,
-    layout::{self, Theme, Viewport},
+    layout::{self, Button, Theme, Tone, Viewport},
     metal::GlyphInstance,
 };
 use crate::text::buffer::Buffer;
@@ -15,6 +16,8 @@ enum Operation {
     Refresh,
     Select(PathBuf),
     Stage(Change, bool),
+    /// Every change of a section, staged or unstaged together.
+    StageAll(Vec<Change>, bool),
     StageHunk(Change, git::Hunk),
     Commit(String),
     Switch(String),
@@ -65,6 +68,10 @@ pub struct Panel {
     pub diff_scroll: usize,
     pub message: Buffer,
     pub note: String,
+    /// The note says something went right (a commit), not wrong.
+    note_success: bool,
+    /// Sections folded shut, by [`Group::index`].
+    pub collapsed: [bool; 3],
     /// Whether the editor column is showing the selected change instead of
     /// the active document.
     pub showing_diff: bool,
@@ -119,6 +126,13 @@ impl Group {
             Group::Changes => "Changes",
         }
     }
+    pub fn index(self) -> usize {
+        match self {
+            Group::Conflicts => 0,
+            Group::Staged => 1,
+            Group::Changes => 2,
+        }
+    }
     fn holds(self, change: &Change) -> bool {
         match self {
             Group::Conflicts => change.conflicted(),
@@ -153,81 +167,136 @@ impl Entry {
 /// files left roughly 700pt of empty column between the list and the buttons
 /// that acted on it, and the editor was unusable while it was open. The
 /// sidebar is as wide as it is and the content simply flows down it.
+///
+/// The header row is the Explorer's: the panel's name (or, in a workspace,
+/// the repository menu) with Refresh and the Git menu at its right. Below
+/// it, one control-height row each: the branch with Pull and Push beside
+/// it, the message, Commit. Then the list, and a status line at the bottom.
 #[derive(Clone, Copy)]
 pub struct Sidebar {
-    /// The repository menu, in the header row under the panel's name.
+    /// The repository menu, in the title row, in a workspace of several.
     pub repo: Viewport,
-    pub branch: Viewport,
     pub refresh: Viewport,
+    /// Opens the Git menu: fetch, pull, push and the branch commands.
+    pub more: Viewport,
+    pub branch: Viewport,
+    pub pull: Viewport,
+    pub push: Viewport,
     pub message: Viewport,
     pub commit: Viewport,
     pub list: Viewport,
     pub note: Viewport,
 }
 
+/// Width of the Pull and Push buttons: an arrow and a count.
+const SYNC_WIDTH: f32 = 44.0;
+
 impl Sidebar {
     pub fn new(column: Viewport) -> Self {
-        let x = column.x + 10.0;
-        let width = (column.width - 20.0).max(0.0);
-        let top = column.y + layout::SIDEBAR_HEADER_HEIGHT;
-        let note_height = 20.0;
+        let x = column.x + layout::UI_INSET;
+        let width = (column.width - layout::UI_INSET * 2.0).max(0.0);
+        let [refresh, more] = layout::sidebar_header_buttons::<2>(column);
+        let title = layout::sidebar_title_row(column);
+        let repo = Viewport {
+            x: title.x - 6.0,
+            width: (refresh.x - title.x + 6.0 - layout::UI_GAP).max(0.0),
+            ..title
+        };
+        let top = column.y + layout::SIDEBAR_HEADER_HEIGHT + 2.0;
+        let control = layout::UI_CONTROL;
+        let push = Viewport {
+            x: x + width - SYNC_WIDTH,
+            y: top,
+            width: SYNC_WIDTH.min(width),
+            height: control,
+        };
+        let pull = Viewport {
+            x: push.x - 4.0 - SYNC_WIDTH,
+            ..push
+        };
+        let branch = Viewport {
+            x,
+            y: top,
+            width: (pull.x - layout::UI_GAP - x).max(0.0),
+            height: control,
+        };
+        let message = Viewport {
+            x,
+            y: branch.y + control + 8.0,
+            width,
+            height: control,
+        };
+        let commit = Viewport {
+            x,
+            y: message.y + control + layout::UI_GAP,
+            width,
+            height: control,
+        };
+        let note_height = 24.0;
         let note = Viewport {
             x,
             y: column.y + column.height - note_height - 6.0,
             width,
             height: note_height,
         };
-        let branch = Viewport {
-            x,
-            y: top,
-            width: (width - 78.0).max(0.0),
-            height: 22.0,
-        };
-        let message = Viewport {
-            x,
-            y: top + 28.0,
-            width,
-            height: 30.0,
-        };
-        let commit = Viewport {
-            x,
-            y: top + 64.0,
-            width,
-            height: 28.0,
-        };
+        let list_top = commit.y + control + 12.0;
         Self {
-            repo: Viewport {
-                x,
-                y: column.y + 38.0,
-                width,
-                height: 26.0,
-            },
+            repo,
+            refresh,
+            more,
             branch,
-            refresh: Viewport {
-                x: column.x + column.width - 78.0,
-                y: top,
-                width: 68.0,
-                height: 22.0,
-            },
+            pull,
+            push,
             message,
             commit,
             list: Viewport {
                 x: column.x,
-                y: top + 102.0,
+                y: list_top,
                 width: column.width,
-                height: (note.y - (top + 102.0) - 6.0).max(0.0),
+                height: (note.y - list_top - 4.0).max(0.0),
             },
             note,
         }
     }
 
-    /// The staging control at the trailing edge of a file row.
+    /// The staging control at the trailing edge of a file row, shown while
+    /// the pointer is on the row.
     pub fn toggle(&self, row: Viewport) -> Viewport {
+        let size = layout::UI_CONTROL_SM;
         Viewport {
-            x: row.x + row.width - 30.0,
-            y: row.y + 3.0,
-            width: 22.0,
-            height: ROW - 6.0,
+            x: row.x + row.width - layout::UI_INSET - 16.0 - 4.0 - size,
+            y: row.y + ((row.height - size) * 0.5).floor(),
+            width: size,
+            height: size,
+        }
+    }
+
+    /// Open File, left of the staging control.
+    pub fn open(&self, row: Viewport) -> Viewport {
+        let toggle = self.toggle(row);
+        Viewport {
+            x: toggle.x - 2.0 - toggle.width,
+            ..toggle
+        }
+    }
+
+    /// The section heading's Stage All or Unstage All.
+    pub fn section_action(&self, row: Viewport) -> Viewport {
+        let size = layout::UI_CONTROL_SM;
+        Viewport {
+            x: row.x + row.width - layout::UI_INSET + 4.0 - size,
+            y: row.y + ((row.height - size) * 0.5).floor(),
+            width: size,
+            height: size,
+        }
+    }
+
+    /// The status letter at a row's trailing edge.
+    fn letter(&self, row: Viewport) -> Viewport {
+        Viewport {
+            x: row.x + row.width - layout::UI_INSET - 16.0,
+            width: 16.0,
+            ..row
         }
     }
 }
@@ -251,6 +320,8 @@ impl Panel {
             diff_scroll: 0,
             message: Buffer::new(),
             note: "Reading repository…".into(),
+            note_success: false,
+            collapsed: [false; 3],
             showing_diff: false,
             diff: git::Diff::default(),
             in_flight: None,
@@ -406,6 +477,9 @@ impl Panel {
                 group,
                 count: files.len(),
             });
+            if self.collapsed[group.index()] {
+                continue;
+            }
             entries.extend(
                 files
                     .into_iter()
@@ -460,6 +534,71 @@ impl Panel {
             return;
         }
         self.start(Operation::Stage(change, staged));
+    }
+
+    /// Folds a section shut, or opens it.
+    pub fn toggle_group(&mut self, group: Group) {
+        let i = group.index();
+        self.collapsed[i] = !self.collapsed[i];
+        self.list_scroll = self.list_scroll.min(self.entries().len().saturating_sub(1));
+    }
+
+    /// Stages every change under Changes, or unstages every one under
+    /// Staged.
+    pub fn stage_group(&mut self, group: Group) {
+        let stage = match group {
+            Group::Changes => true,
+            Group::Staged => false,
+            Group::Conflicts => return,
+        };
+        let changes: Vec<Change> = self
+            .snapshot
+            .as_ref()
+            .map(|s| {
+                s.changes
+                    .iter()
+                    .filter(|c| group.holds(c))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !changes.is_empty() {
+            self.start(Operation::StageAll(changes, stage));
+        }
+    }
+
+    /// How far the branch is ahead of and behind its upstream, if it has
+    /// one.
+    pub fn ahead_behind(&self) -> Option<(usize, usize)> {
+        let header = &self.snapshot.as_ref()?.branch;
+        if !header.contains("...") {
+            return None;
+        }
+        let mut counts = (0, 0);
+        if let Some(open) = header.find('[') {
+            let inside = &header[open + 1..header.rfind(']').unwrap_or(header.len())];
+            for part in inside.split(", ") {
+                if let Some(n) = part.strip_prefix("ahead ") {
+                    counts.0 = n.trim().parse().unwrap_or(0);
+                } else if let Some(n) = part.strip_prefix("behind ") {
+                    counts.1 = n.trim().parse().unwrap_or(0);
+                }
+            }
+        }
+        Some(counts)
+    }
+
+    /// Why Commit cannot run, for its tooltip; `None` when it can.
+    pub fn commit_blocker(&self) -> Option<&'static str> {
+        if self.busy() {
+            Some("Git is busy")
+        } else if self.staged_count() == 0 {
+            Some("Stage a change to commit it")
+        } else if self.message.rope.to_string().trim().is_empty() {
+            Some("Write a commit message first")
+        } else {
+            None
+        }
     }
 
     pub fn staged_count(&self) -> usize {
@@ -606,6 +745,8 @@ impl Panel {
                 | Operation::ContinueRebase
                 | Operation::Remote(..)
                 | Operation::Resolve(_)
+                | Operation::StageAll(..)
+                | Operation::Commit(_)
         );
         let directory = self.directory.clone();
         let guard = self.guard.clone();
@@ -617,6 +758,7 @@ impl Panel {
             announces,
         });
         self.note = "Working…".into();
+        self.note_success = false;
         std::thread::spawn(move || {
             let result = (|| {
                 // The root alone: a whole status here was thrown away.
@@ -698,6 +840,22 @@ impl Panel {
                         None
                     }
                     Operation::Stage(change, stage) => git::stage(&root, &change, stage).err(),
+                    Operation::StageAll(changes, stage) => {
+                        let mut error = None;
+                        for change in &changes {
+                            if let Err(e) = git::stage(&root, change, stage) {
+                                error = Some(e);
+                                break;
+                            }
+                        }
+                        if error.is_none() {
+                            let n = changes.len();
+                            let files = if n == 1 { "file" } else { "files" };
+                            let verb = if stage { "staged" } else { "unstaged" };
+                            done = Some(format!("{verb} {n} {files}"));
+                        }
+                        error
+                    }
                     Operation::Resolve(change) => match git::stage(&root, &change, true) {
                         Ok(()) => {
                             done = Some(format!("marked {} resolved", change.label()));
@@ -724,6 +882,8 @@ impl Panel {
                             None => match git::commit(&root, &message) {
                                 Ok(()) => {
                                     committed = true;
+                                    let subject = message.lines().next().unwrap_or("").trim();
+                                    done = Some(format!("committed \u{201c}{subject}\u{201d}"));
                                     None
                                 }
                                 Err(error) => Some(error),
@@ -822,6 +982,7 @@ impl Panel {
                     }
                     self.diff = failure;
                 }
+                self.note_success = reply.error.is_none() && reply.committed;
                 self.note = reply.error.unwrap_or_else(|| {
                     if reply.committed {
                         "Commit created".into()
@@ -867,169 +1028,401 @@ impl Panel {
         }
     }
 
-    /// Source control down the sidebar column: branch, commit box, then the
-    /// changes grouped by whether they are staged, each row carrying the
-    /// control that stages it.
+    /// Source control down the sidebar column: the header's actions, the
+    /// branch with Pull and Push, the commit box, then the changes grouped
+    /// by whether they are staged, each row carrying the controls that act
+    /// on it. `focused` is whether the message field has the keyboard.
     pub fn draw_sidebar(
         &self,
         atlas: &mut Atlas,
         column: Viewport,
+        focused: bool,
         theme: &Theme,
         out: &mut Vec<GlyphInstance>,
     ) {
         let g = Sidebar::new(column);
-        // Which repository, in a workspace of several: a menu like the
-        // branch's, in the header row the Explorer uses for its buttons.
-        if let Some(repo) = &self.repo {
-            layout::push_rounded_rect(out, g.repo, 5.0, theme.tab_hover);
-            let inner = Viewport {
-                x: g.repo.x + 8.0,
-                width: (g.repo.width - 16.0).max(0.0),
-                ..g.repo
-            };
-            layout::push_ui_text(
+        let busy = self.busy();
+
+        // The title row: the panel's name, or in a workspace of several
+        // the repository menu, then Refresh and the Git menu.
+        match &self.repo {
+            Some(repo) => Button::new(g.repo)
+                .label(repo)
+                .icon(icons::FOLDER_OUTLINE)
+                .tone(Tone::Ghost)
+                .menu()
+                .tip("Switch Repository")
+                .draw(out, atlas, theme),
+            None => {
+                layout::push_sidebar_title(out, atlas, column, "SOURCE CONTROL", 2, theme);
+            }
+        }
+        Button::new(g.refresh)
+            .icon(icons::REFRESH)
+            .tone(Tone::Ghost)
+            .enabled(!busy)
+            .tip("Refresh")
+            .draw(out, atlas, theme);
+        Button::new(g.more)
+            .icon(icons::ELLIPSIS)
+            .tone(Tone::Ghost)
+            .tip("More Git Actions")
+            .draw(out, atlas, theme);
+        if busy {
+            // Work under way, where the eye already is.
+            layout::push_progress(
                 out,
                 atlas,
                 Viewport {
-                    width: (inner.width - 14.0).max(0.0),
-                    ..inner
+                    x: column.x,
+                    y: column.y + layout::SIDEBAR_HEADER_HEIGHT - 2.0,
+                    width: column.width - 1.0,
+                    height: 2.0,
                 },
-                repo,
-                theme.text,
+                theme,
             );
-            layout::push_ui_text_right(out, atlas, inner, "\u{25be}", theme.status_text);
         }
+
+        let Some(snapshot) = &self.snapshot else {
+            self.draw_no_repository(atlas, g, theme, out);
+            return;
+        };
+        let _ = snapshot;
+
         // The branch reads as a menu: a box with a chevron, the branch list
-        // behind it.
+        // behind it. Pull and Push beside it say how far apart the branch
+        // and its upstream are.
         let branch = self.branch();
-        if branch.is_empty() {
-            layout::push_ui_text(out, atlas, g.branch, &branch, theme.text);
+        let detached = branch == "detached HEAD";
+        let tip_branch = if detached {
+            "Switch Branch"
         } else {
-            layout::push_rounded_rect(out, g.branch, 5.0, theme.tab_hover);
-            let inner = Viewport {
-                x: g.branch.x + 8.0,
-                width: (g.branch.width - 16.0).max(0.0),
-                ..g.branch
-            };
-            layout::push_ui_text(
-                out,
-                atlas,
-                Viewport {
-                    width: (inner.width - 14.0).max(0.0),
-                    ..inner
-                },
-                &branch,
-                theme.text,
-            );
-            layout::push_ui_text_right(out, atlas, inner, "\u{25be}", theme.status_text);
+            "Switch, Create or Delete Branches"
+        };
+        let branch_label = match self.in_progress() {
+            Some(what) => format!("{branch} \u{b7} {}", what.label()),
+            None => branch,
+        };
+        Button::new(g.branch)
+            .label(&branch_label)
+            .icon(crate::render::layout::ACTIVITY_ICONS[1].0)
+            .menu()
+            .tip(tip_branch)
+            .draw(out, atlas, theme);
+        let sync = self.ahead_behind();
+        let (ahead, behind) = sync.unwrap_or((0, 0));
+        let count = |n: usize| if n > 0 { n.to_string() } else { String::new() };
+        let behind_label = count(behind);
+        let ahead_label = count(ahead);
+        let pull_tip = match sync {
+            None => "Pull (no upstream)".to_owned(),
+            Some((_, 0)) => "Pull: up to date with upstream".to_owned(),
+            Some((_, n)) => format!(
+                "Pull {n} commit{} from upstream",
+                if n == 1 { "" } else { "s" }
+            ),
+        };
+        let push_tip = match sync {
+            None => "Push and set upstream".to_owned(),
+            Some((0, _)) => "Push: nothing to push".to_owned(),
+            Some((n, _)) => format!(
+                "Push {n} commit{} to upstream",
+                if n == 1 { "" } else { "s" }
+            ),
+        };
+        Button::new(g.pull)
+            .icon(icons::ARROW_DOWN)
+            .label(&behind_label)
+            .on(behind > 0)
+            .enabled(!busy)
+            .tip(&pull_tip)
+            .draw(out, atlas, theme);
+        Button::new(g.push)
+            .icon(icons::ARROW_UP)
+            .label(&ahead_label)
+            .on(ahead > 0)
+            .enabled(!busy)
+            .tip(&push_tip)
+            .draw(out, atlas, theme);
+
+        // The message: a field, ringed while it has the keyboard.
+        if focused {
+            layout::push_focus_ring(out, g.message, layout::UI_RADIUS, 1.5, theme);
         }
-        layout::push_rounded_rect(out, g.refresh, 5.0, theme.tab_hover);
-        layout::push_ui_text_centered(
+        layout::push_rounded_rect(
             out,
-            atlas,
-            g.refresh,
-            if self.busy() { "…" } else { "Refresh" },
-            if self.busy() {
-                theme.gutter_text
+            g.message,
+            layout::UI_RADIUS,
+            if focused || layout::hovered(g.message) {
+                theme.background_f32()
             } else {
-                theme.status_text
+                theme.tab_active
             },
         );
-
-        layout::push_rounded_rect(out, g.message, 5.0, theme.tab_active);
+        layout::hotspot(g.message, layout::Cursor::Text, None);
         let full = self.message.rope.to_string();
         let text_rect = Viewport {
             x: g.message.x + MESSAGE_PAD,
             width: (g.message.width - MESSAGE_PAD * 2.0).max(0.0),
             ..g.message
         };
+        let band = ((g.message.height - 18.0) * 0.5).floor();
         layout::push_ui_field(
             out,
             atlas,
             text_rect,
-            (6.0, 18.0),
+            (band, 18.0),
             &layout::UiField {
                 text: &full,
                 cursor: self.message.cursor(),
                 selection: self.message.selection(),
-                placeholder: "Message",
-                focused: true,
+                placeholder: if focused {
+                    "Message"
+                } else {
+                    "Message (\u{2318}\u{21a9} to commit)"
+                },
+                focused,
             },
             theme,
         );
 
-        let staged = self.staged_count();
-        let can_commit = self.can_commit();
-        layout::push_rounded_rect(
-            out,
-            g.commit,
-            5.0,
-            if can_commit {
-                theme.palette_selected
-            } else {
-                theme.tab_hover
-            },
-        );
         // The button says what it will commit. "Commit" alone next to a list
         // that mixes staged and unstaged files does not.
+        let staged = self.staged_count();
         let commit_label = match staged {
             0 => "Commit".to_owned(),
-            1 => "Commit 1 file".to_owned(),
-            n => format!("Commit {n} files"),
+            1 => "Commit 1 File".to_owned(),
+            n => format!("Commit {n} Files"),
         };
-        layout::push_ui_text_centered(
-            out,
-            atlas,
-            g.commit,
-            &commit_label,
-            if can_commit {
-                theme.accent
-            } else {
-                theme.gutter_text
-            },
-        );
+        let blocker = self.commit_blocker();
+        let mut commit = Button::new(g.commit)
+            .label(&commit_label)
+            .icon(icons::CHECK)
+            .tone(Tone::Primary)
+            .enabled(blocker.is_none());
+        commit = match blocker {
+            Some(why) => commit.tip(why),
+            None => commit.hint("\u{2318}\u{21a9}"),
+        };
+        commit.draw(out, atlas, theme);
 
         let rows = self.rows(g);
-        if rows.is_empty() && !self.busy() {
-            layout::push_ui_text(
-                out,
-                atlas,
-                Viewport {
-                    x: g.list.x + 10.0,
-                    y: g.list.y + 4.0,
-                    width: (g.list.width - 20.0).max(0.0),
-                    height: ROW,
-                },
-                "No changes",
-                theme.status_text,
-            );
+        if rows.is_empty() && !busy {
+            self.draw_clean(atlas, g, theme, out);
         }
         for (entry, rect) in rows {
             match entry {
                 Entry::Section { group, count } => {
-                    layout::push_ui_text(
+                    let expanded = !self.collapsed[group.index()];
+                    layout::push_row_hover(out, rect, theme);
+                    layout::push_section_heading(
                         out,
                         atlas,
-                        Viewport {
-                            x: rect.x + 10.0,
-                            y: rect.y + 4.0,
-                            width: (rect.width - 20.0).max(0.0),
-                            height: rect.height - 4.0,
-                        },
-                        &format!("{}  {count}", group.title()),
+                        rect,
+                        group.title(),
+                        Some(count),
+                        expanded,
                         if group == Group::Conflicts {
                             theme.diff_removed
                         } else {
                             theme.status_text
                         },
+                        theme,
                     );
+                    if layout::hovered(rect) && group != Group::Conflicts {
+                        let (icon, tip) = match group {
+                            Group::Staged => (icons::REMOVE, "Unstage All"),
+                            _ => (icons::ADD, "Stage All"),
+                        };
+                        Button::new(g.section_action(rect))
+                            .icon(icon)
+                            .tone(Tone::Ghost)
+                            .enabled(!busy)
+                            .tip(tip)
+                            .draw(out, atlas, theme);
+                    }
                 }
                 Entry::File { change, group } => {
                     self.draw_file_row(atlas, g, rect, change, group, theme, out);
                 }
             }
         }
-        layout::push_ui_text(out, atlas, g.note, &self.note, theme.status_text);
+        self.draw_note(atlas, g, theme, out);
+    }
+
+    /// Below the list: what Git is doing, or what went wrong or right.
+    fn draw_note(
+        &self,
+        atlas: &mut Atlas,
+        g: Sidebar,
+        theme: &Theme,
+        out: &mut Vec<GlyphInstance>,
+    ) {
+        if self.note.is_empty() {
+            return;
+        }
+        let rect = g.note;
+        let (lead, colour) = if self.busy() {
+            let w = layout::push_spinner(out, rect.x + 2.0, rect, theme.accent);
+            (w + 8.0, theme.status_text)
+        } else {
+            let (icon, colour) = if self.note_success {
+                (icons::PASS, theme.diff_added)
+            } else {
+                (icons::ERROR, theme.diff_removed)
+            };
+            let w = layout::icon_width(atlas, icon);
+            layout::push_icon_centered(out, atlas, Viewport { width: w, ..rect }, icon, colour);
+            (
+                w + 6.0,
+                if self.note_success {
+                    theme.status_text
+                } else {
+                    colour
+                },
+            )
+        };
+        // Git's stderr can run to many lines; the first one names it, and
+        // the whole of it is in the editor column.
+        let first = self
+            .note
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("");
+        layout::push_ui_text(
+            out,
+            atlas,
+            Viewport {
+                x: rect.x + lead,
+                width: (rect.width - lead).max(0.0),
+                ..rect
+            },
+            first,
+            colour,
+        );
+        layout::hotspot(rect, layout::Cursor::Arrow, Some(&self.note));
+    }
+
+    /// The list when there is nothing in it: the working tree is clean.
+    fn draw_clean(
+        &self,
+        atlas: &mut Atlas,
+        g: Sidebar,
+        theme: &Theme,
+        out: &mut Vec<GlyphInstance>,
+    ) {
+        let x = g.list.x + layout::UI_INSET;
+        let width = (g.list.width - layout::UI_INSET * 2.0).max(0.0);
+        let line = |y: f32| Viewport {
+            x,
+            y,
+            width,
+            height: 22.0,
+        };
+        let icon = layout::icon_width(atlas, icons::PASS);
+        layout::push_icon_centered(
+            out,
+            atlas,
+            Viewport {
+                width: icon,
+                ..line(g.list.y + 4.0)
+            },
+            icons::PASS,
+            theme.diff_added,
+        );
+        layout::push_ui_text(
+            out,
+            atlas,
+            Viewport {
+                x: x + icon + 6.0,
+                width: (width - icon - 6.0).max(0.0),
+                ..line(g.list.y + 4.0)
+            },
+            "No changes",
+            theme.text,
+        );
+        layout::push_ui_text(
+            out,
+            atlas,
+            line(g.list.y + 28.0),
+            "The working tree matches the last commit.",
+            theme.gutter_text,
+        );
+    }
+
+    /// The column when there is no repository to show: reading one, or
+    /// none here, said in words rather than as Git's error.
+    fn draw_no_repository(
+        &self,
+        atlas: &mut Atlas,
+        g: Sidebar,
+        theme: &Theme,
+        out: &mut Vec<GlyphInstance>,
+    ) {
+        let x = g.branch.x;
+        let width = g.message.width;
+        let mut y = g.branch.y + 4.0;
+        if self.busy() {
+            let row = Viewport {
+                x,
+                y,
+                width,
+                height: 22.0,
+            };
+            let w = layout::push_spinner(out, x + 2.0, row, theme.accent);
+            layout::push_ui_text(
+                out,
+                atlas,
+                Viewport {
+                    x: x + w + 10.0,
+                    width: (width - w - 10.0).max(0.0),
+                    ..row
+                },
+                "Reading repository\u{2026}",
+                theme.status_text,
+            );
+            return;
+        }
+        let not_a_repo = self
+            .note
+            .to_ascii_lowercase()
+            .contains("not a git repository");
+        let (title, body) = if not_a_repo {
+            (
+                "No Git repository",
+                "This folder is not under version control. Open a folder that is, or run git init in the terminal.",
+            )
+        } else {
+            ("Git could not read this folder", self.note.as_str())
+        };
+        layout::push_ui_text(
+            out,
+            atlas,
+            Viewport {
+                x,
+                y,
+                width,
+                height: 22.0,
+            },
+            title,
+            theme.text,
+        );
+        y += 26.0;
+        for line in layout::wrap_words(atlas, body, width).into_iter().take(8) {
+            layout::push_ui_text(
+                out,
+                atlas,
+                Viewport {
+                    x,
+                    y,
+                    width,
+                    height: 20.0,
+                },
+                &line,
+                theme.gutter_text,
+            );
+            y += 20.0;
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1048,21 +1441,26 @@ impl Panel {
         };
         let staged = group == Group::Staged;
         let conflicted = group == Group::Conflicts;
-        if change == self.selected && self.showing_diff {
+        let selected = change == self.selected && self.showing_diff;
+        if selected {
             layout::push_rounded_rect(
                 out,
                 Viewport {
-                    x: rect.x + 4.0,
+                    x: rect.x + 6.0,
                     y: rect.y + 1.0,
-                    width: (rect.width - 8.0).max(0.0),
+                    width: (rect.width - 12.0).max(0.0),
                     height: rect.height - 2.0,
                 },
-                4.0,
+                layout::UI_RADIUS_SM + 1.0,
                 theme.palette_selected,
             );
+            layout::hotspot(rect, layout::Cursor::Pointing, None);
+        } else {
+            layout::push_row_hover(out, rect, theme);
         }
-        // One status letter, coloured, instead of a whole second line reading
-        // "M Unstaged" under every file.
+        let over = layout::hovered(rect);
+        // One status letter, coloured, at the trailing edge, the way every
+        // Git client lines them up, instead of a second line per file.
         let code = if staged { item.index } else { item.worktree };
         let code = if conflicted {
             b'!'
@@ -1076,20 +1474,8 @@ impl Panel {
             b'A' | b'?' => theme.diff_added,
             b'D' => theme.diff_removed,
             b'R' => theme.accent,
-            _ => theme.syn_number,
+            _ => theme.diff_modified,
         };
-        layout::push_ui_text(
-            out,
-            atlas,
-            Viewport {
-                x: rect.x + 10.0,
-                y: rect.y,
-                width: 14.0,
-                height: rect.height,
-            },
-            &String::from_utf8_lossy(&[code]),
-            colour,
-        );
         let path = item.path.to_string_lossy();
         let name = item
             .path
@@ -1101,21 +1487,55 @@ impl Panel {
             .parent()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let toggle = g.toggle(rect);
-        let name_rect = Viewport {
-            x: rect.x + 28.0,
-            y: rect.y,
-            width: (if conflicted {
-                rect.x + rect.width - 8.0
+        // Indented under the section's title, file icon first, like the tree.
+        let icon = icons::for_file(&item.path).glyph;
+        let icon_x = rect.x + 24.0;
+        let icon_w = layout::icon_width(atlas, icon);
+        layout::push_icon_centered(
+            out,
+            atlas,
+            Viewport {
+                x: icon_x,
+                width: icon_w,
+                ..rect
+            },
+            icon,
+            if selected {
+                theme.accent
             } else {
-                toggle.x
-            } - rect.x
-                - 34.0)
-                .max(0.0),
+                theme.status_text
+            },
+        );
+        let name_x = icon_x + icon_w.max(18.0) + 6.0;
+        let trailing = if over && !conflicted {
+            g.open(rect).x - 4.0
+        } else {
+            g.letter(rect).x - 4.0
+        };
+        let name_rect = Viewport {
+            x: name_x,
+            y: rect.y,
+            width: (trailing - name_x).max(0.0),
             height: rect.height,
         };
+        let deleted = code == b'D';
+        let name_colour = if deleted {
+            layout::faded(theme.text, 0.6)
+        } else {
+            theme.text
+        };
         let name_width = layout::ui_text_width(atlas, &name);
-        layout::push_ui_text(out, atlas, name_rect, &name, theme.text);
+        layout::push_ui_text(out, atlas, name_rect, &name, name_colour);
+        if deleted {
+            // Struck through, so a removal reads as one before the letter.
+            layout::push_rect(
+                out,
+                atlas,
+                [name_x, rect.y + (rect.height * 0.5).round()],
+                [name_width.min(name_rect.width), 1.0],
+                layout::faded(theme.text, 0.6),
+            );
+        }
         if !parent.is_empty() && name_width + 8.0 < name_rect.width {
             layout::push_ui_text(
                 out,
@@ -1129,25 +1549,35 @@ impl Panel {
                 theme.gutter_text,
             );
         }
-        // A conflicted file is staged by Mark Resolved above its text, once
-        // no markers are left in it; a plus here would stage the markers.
-        if conflicted {
-            return;
-        }
-        // Stage/unstage sits on the row it acts on. The old pair lived at the
-        // bottom of the panel, an empty column away from the list.
-        layout::push_rounded_rect(out, toggle, 4.0, theme.tab_hover);
         layout::push_ui_text_centered(
             out,
             atlas,
-            toggle,
-            if staged { "−" } else { "+" },
-            if self.busy() {
-                theme.gutter_text
-            } else {
-                theme.status_text
-            },
+            g.letter(rect),
+            &String::from_utf8_lossy(&[code]),
+            colour,
         );
+        // A conflicted file is staged by Mark Resolved above its text, once
+        // no markers are left in it; a plus here would stage the markers.
+        if conflicted || !over {
+            return;
+        }
+        // Stage/unstage sits on the row it acts on, with Open File beside
+        // it, both shown while the pointer is on the row.
+        Button::new(g.open(rect))
+            .icon(icons::GO_TO_FILE)
+            .tone(Tone::Ghost)
+            .tip("Open File")
+            .draw(out, atlas, theme);
+        Button::new(g.toggle(rect))
+            .icon(if staged { icons::REMOVE } else { icons::ADD })
+            .tone(Tone::Ghost)
+            .enabled(!self.busy())
+            .tip(if staged {
+                "Unstage Changes"
+            } else {
+                "Stage Changes"
+            })
+            .draw(out, atlas, theme);
     }
 }
 
@@ -1621,11 +2051,15 @@ mod tests {
                 g.list.y >= column.y + layout::SIDEBAR_HEADER_HEIGHT,
                 "the list overlaps the sidebar switcher"
             );
-            // The repository menu sits in the header, under the switcher
-            // and above the branch.
+            // The repository menu is the title, in the header row, left of
+            // the header's buttons and above the branch.
             let (switcher, _) = layout::sidebar_switcher(column);
-            assert!(g.repo.y >= switcher.y + switcher.height);
+            assert_eq!(g.repo.y, switcher.y);
+            assert!(g.repo.x + g.repo.width <= g.refresh.x);
+            assert!(g.refresh.x + g.refresh.width <= g.more.x);
             assert!(g.repo.y + g.repo.height <= g.branch.y);
+            assert!(g.branch.x + g.branch.width <= g.pull.x);
+            assert!(g.pull.x + g.pull.width <= g.push.x);
             assert!(
                 g.note.y + g.note.height <= column.y + column.height,
                 "the note falls out of the bottom at height {height}"

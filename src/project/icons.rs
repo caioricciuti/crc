@@ -24,6 +24,32 @@ pub const NEW_FOLDER: char = '\u{ea80}'; // cod-new_folder
 pub const COLLAPSE_ALL: char = '\u{eac5}'; // cod-collapse_all
 pub const REFRESH: char = '\u{eb37}'; // cod-refresh
 
+// Controls. Each one was drawn from the bundled font and looked at before
+// it went in here.
+pub const ADD: char = '\u{ea60}'; // cod-add
+pub const REMOVE: char = '\u{eb3b}'; // cod-remove
+pub const CLOSE: char = '\u{ea76}'; // cod-close
+pub const SYNC: char = '\u{ea77}'; // cod-sync
+pub const ELLIPSIS: char = '\u{ea7c}'; // cod-ellipsis
+pub const TRASH: char = '\u{ea81}'; // cod-trash
+pub const DISCARD: char = '\u{eae2}'; // cod-discard
+pub const ARROW_UP: char = '\u{eaa1}'; // cod-arrow_up
+pub const ARROW_DOWN: char = '\u{ea9a}'; // cod-arrow_down
+pub const CHEVRON_UP: char = '\u{eab7}'; // cod-chevron_up
+pub const CHEVRON_LEFT: char = '\u{eab5}'; // cod-chevron_left
+pub const CHECK: char = '\u{eab2}'; // cod-check
+pub const GIT_COMMIT: char = '\u{eafc}'; // cod-git_commit
+pub const REPO_PULL: char = '\u{eb40}'; // cod-repo_pull
+pub const REPO_PUSH: char = '\u{eb41}'; // cod-repo_push
+pub const CLOUD_DOWNLOAD: char = '\u{eac2}'; // cod-cloud_download
+pub const GO_TO_FILE: char = '\u{ea94}'; // cod-go_to_file
+pub const WARNING: char = '\u{ea6c}'; // cod-warning
+pub const ERROR: char = '\u{ea87}'; // cod-error
+pub const INFO: char = '\u{ea74}'; // cod-info
+pub const PASS: char = '\u{eba4}'; // cod-pass
+pub const SPLIT: char = '\u{eb56}'; // cod-split_horizontal
+pub const SIDEBAR_LEFT: char = '\u{ebf3}'; // cod-layout_sidebar_left
+
 pub const CHEVRON_RIGHT: char = '\u{eab6}'; // cod-chevron_right
 pub const CHEVRON_DOWN: char = '\u{eab4}'; // cod-chevron_down
 pub const HOME: char = '\u{eb06}'; // cod-home

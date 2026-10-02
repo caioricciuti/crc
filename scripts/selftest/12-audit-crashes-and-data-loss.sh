@@ -234,11 +234,10 @@ printf 'EXAMPLE=value\n' > "$T/treeproj/subdir/.env"
 printf 'visible\n' > "$T/treeproj/visible.txt"
 cat > "$T/tree-expand.script" <<SCRIPT
 wait 250
-# Tree rows start below the 48pt toolbar and 70pt sidebar header, so row n
-# is centred at 118 + 26n + 13; the sidebar starts after the 44pt strip.
-click 114 131
+# The first tree row is the folder; once it opens, the next is its file.
+click @sidebar.row.0
 wait 250
-click 124 157
+click @sidebar.row.1
 dump $T/tree-expand.out
 key 35 cmd p
 text visible.txt
@@ -268,7 +267,7 @@ click 145 24
 dump $T/title-menu.out
 touch $T/personal-project-with-a-long-folder-name/after.txt
 dump $T/title-stale.out
-click 261 99
+click @sidebar.action.3
 wait 500
 dump $T/title-refreshed.out
 key 35 cmd p
@@ -303,9 +302,11 @@ printf 'personal sample\n' > "$T/moveproj/source.txt"
 ln -s missing-target "$T/moveproj/holder/source.txt"
 cat > "$T/move.script" <<SCRIPT
 wait 400
-down 104 157
-drag 104 131
-up 104 131
+# Tree rows start below the 48pt toolbar and the 40pt sidebar header:
+# row n is centred at 88 + 26n + 13. The file is row 1, the folder row 0.
+down 104 127
+drag 104 101
+up 104 101
 wait 400
 quit
 SCRIPT
@@ -363,30 +364,28 @@ dump $T/palette-click.out
 key 5 cmd,opt g
 wait 500
 dump $T/git-status.out
-# Source control is docked in the 240pt sidebar. Header is 70pt below the
-# 48pt toolbar, so the branch row is at 118, the message field at 146, the
-# Commit button at 182 and the list at 220. One untracked file means a
-# section heading at 220 and its row at 246, with the stage control inset
-# 30pt from the trailing edge of the column.
-click 264 259
+# Source control is docked in the 240pt sidebar. One untracked file means
+# a section heading in row 0 and the file in row 1, whose staging control
+# is at its trailing edge. Rows and controls are clicked by name.
+click @git.toggle.1
 wait 500
 dump $T/git-stage.out
-click 264 259
+click @git.toggle.1
 wait 500
 dump $T/git-unstage.out
-click 264 259
+click @git.toggle.1
 wait 500
 # Git answers on its own thread; under load it can take longer than the
 # wait, and the row would still read as unstaged when it is clicked.
 idle 1000
 # Click the row body, not the control: it selects and opens the diff.
-click 104 259
+click @git.row.1
 wait 500
 dump $T/git-diff.out
-click 164 161
+click @git.message
 text Personal commit
 dump $T/git-message.out
-click 164 196
+click @git.commit
 wait 700
 dump $T/git-commit.out
 # Escape steps back out: first the message field, then the diff, then the
@@ -442,7 +441,7 @@ cat > "$T/hunk-ui.script" <<SCRIPT
 wait 350
 key 5 cmd,opt g
 wait 500
-click 104 259
+click @git.row.1
 wait 500
 dump $T/hunk-before.out
 click 1050 145
