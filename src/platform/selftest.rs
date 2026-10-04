@@ -178,6 +178,8 @@ fn key_for(ch: char) -> Option<(u16, bool)> {
         '_' => (27, true),
         '{' => (33, true),
         '}' => (30, true),
+        '\'' => (39, false),
+        '"' => (39, true),
         _ => return None,
     })
 }

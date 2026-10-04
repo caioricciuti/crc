@@ -503,8 +503,19 @@ impl EditorView {
     /// What follows a save: settings and ignore rules re-read when the file
     /// was one of those, the servers told, and format or organize on save.
     pub(super) fn after_saved(&self, saved_path: Option<std::path::PathBuf>, ok: bool) {
-        if saved_path.is_some() && saved_path == crate::platform::settings::Settings::path() {
+        // By name or once resolved: a save reports the real path, and a
+        // home under /var is really /private/var.
+        let is = |target: Option<std::path::PathBuf>| {
+            saved_path
+                .as_deref()
+                .zip(target.as_deref())
+                .is_some_and(|(a, b)| same_file(a, b))
+        };
+        if is(crate::platform::settings::Settings::path()) {
             self.apply_settings_file();
+        }
+        if is(crate::mcp_client::config::path()) {
+            self.mcp_config_saved();
         }
         // The watcher ignores this process's own writes, so a .gitignore
         // saved here would otherwise leave the Explorer showing the old rules.

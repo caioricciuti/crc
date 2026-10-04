@@ -440,10 +440,12 @@ impl EditorView {
         if git_turn && self.handle_git_key(event) {
             return true;
         }
-        // The Extensions page has the column: Escape leaves its
+        // The Extensions or MCP page has the column: Escape leaves its
         // confirmation, then the page; nothing types into the document
         // underneath. The palette, opened over it, keeps its own keys.
-        if self.state().is_some_and(|state| ext_details(&state))
+        if self
+            .state()
+            .is_some_and(|state| ext_details(&state) || mcp_details(&state))
             && self.state().is_some_and(|state| state.palette.is_none())
             && !event
                 .modifierFlags()
@@ -465,6 +467,7 @@ impl EditorView {
                     if let Some(page) = &mut state.extensions {
                         page.details = false;
                     }
+                    state.mcp.details = false;
                 }
                 self.request_redraw();
             }

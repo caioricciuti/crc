@@ -116,14 +116,18 @@ the size and write it back.
   (`AGENTS.md`, a state doc, a log, runbooks) without touching existing
   files. `private_markers` in the workspace file stops a commit from
   Source Control whose staged lines mention one.
-- **MCP servers you use yourself** (the plug in the activity bar):
-  `~/.config/crc/mcp.json` lists them, in the shape Claude Code's
-  `.mcp.json` uses, over stdio or Streamable HTTP. A server starts when
-  you click it, never before, and launchers that download code to run it
-  (`npx`, `bunx`, `uvx`, `pnpm dlx`) are refused. Its tools, resources
-  and prompts are listed; a tool opens a call document whose arguments
-  you edit and run with `Cmd-Return`, and a tool marked as able to
-  change things asks first. Saved calls run again from Home.
+- **MCP servers you use yourself** (the plug in the activity bar): a
+  page explains what a server is and shows each one as a card with its
+  command, status and Start/Stop; a card opens its tools, resources and
+  prompts with their descriptions. Add Server picks an installed program
+  with the Open panel, Add by URL takes a Streamable HTTP address, and
+  both write to `~/.config/crc/mcp.json`, which has the shape Claude
+  Code's `.mcp.json` uses and is read again whenever it is saved in crc.
+  A server starts when you click Start, never before, and launchers that
+  download code to run it (`npx`, `bunx`, `uvx`, `pnpm dlx`) are
+  refused. A tool opens a call document whose arguments you edit and run
+  with `Cmd-Return`, and a tool marked as able to change things asks
+  first. Saved calls run again from Home.
 - **crc as an MCP server for agents**: `crc --mcp [folder]` answers on
   stdio, without a window, with the project's symbols and files from the
   index, bounded reads of files inside the folder, and the workspace's

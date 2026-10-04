@@ -120,6 +120,7 @@ impl EditorView {
             state.branch_list = None;
             state.repo_list = None;
             state.lsp.action_list = None;
+            state.mcp_url_prompt = false;
             let mut query = Buffer::new();
             if !prefix.is_empty() {
                 query.insert(prefix);
@@ -184,6 +185,7 @@ impl EditorView {
             Pick::DeleteBranch(name, unmerged) => self.delete_branch(name, unmerged),
             Pick::RenameBranch(name) => self.open_branch_picker(BranchIntent::RenameTo(name)),
             Pick::RenameBranchTo(old, new) => self.rename_branch(old, new),
+            Pick::McpUrl(url) => self.add_mcp_url(url),
             Pick::Repo(path) => self.select_repo(&path),
             Pick::Symbol(path, line) => self.go_to_symbol(path, line),
             Pick::Command(at, tag) => self.run_command(at, tag),
@@ -269,6 +271,7 @@ impl EditorView {
             state.branch_list = None;
             state.repo_list = None;
             state.lsp.action_list = None;
+            state.mcp_url_prompt = false;
         }
         self.request_redraw();
         self.pump();

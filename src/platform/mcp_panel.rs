@@ -1,6 +1,7 @@
 //! The MCP sidebar: the servers in `mcp.json`, each started and stopped by
 //! a click, and under a running one its tools, resources and prompts. A
-//! click on one of those opens its call document.
+//! click on one of those opens its call document. The page in the editor
+//! column (`mcp_page`) shows the same servers with room to explain them.
 
 use crate::mcp_client::{Config, Server, Status};
 use crate::project::icons;
@@ -24,6 +25,16 @@ pub enum Action {
     Edit,
     /// Read `mcp.json` again.
     Reload,
+    /// Show a server's details on the page.
+    Select(usize),
+    /// Back to the page's home: every server.
+    Home,
+    /// Give the editor column back; the list stays in the sidebar.
+    Close,
+    /// Pick an installed program with the Open panel and add it.
+    AddCommand,
+    /// Type a Streamable HTTP server's URL in the palette and add it.
+    AddUrl,
 }
 
 #[derive(Default)]
@@ -39,6 +50,21 @@ pub struct Panel {
     pub hits: Vec<(Viewport, Action)>,
     /// Whether `mcp.json` has been read since the app started.
     pub loaded: bool,
+    /// Whether the page has the editor column. Escape, Close and a tab
+    /// give the column back; the list stays in the sidebar.
+    pub details: bool,
+    /// The server whose details the page shows; the home otherwise.
+    pub selected: Option<usize>,
+    /// What the last action came to, on the page.
+    pub note: Option<String>,
+    /// The page's buttons and rows as last drawn.
+    pub page_hits: Vec<(Viewport, Action)>,
+    /// How far the page's body is scrolled, in points.
+    pub page_scroll: f32,
+    /// Where the page's body was drawn, for the wheel.
+    pub page_rect: Option<Viewport>,
+    /// How tall the body was last frame, which bounds the scroll.
+    pub page_content: f32,
 }
 
 /// One line of the list.
@@ -55,6 +81,10 @@ impl Panel {
     pub fn reload(&mut self) {
         let config = Config::load();
         self.error = config.error;
+        let selected = self
+            .selected
+            .and_then(|i| self.servers.get(i))
+            .map(|s| s.name.clone());
         let mut old = std::mem::take(&mut self.servers);
         for (name, entry) in config.servers {
             match old.iter().position(|s| s.name == name && s.config == entry) {
@@ -65,6 +95,14 @@ impl Panel {
         // What is left in `old` is dropped, which stops it.
         self.loaded = true;
         self.scroll = 0;
+        self.selected = selected.and_then(|name| self.find(&name));
+    }
+
+    /// Scrolls the page's body by `points`, within what was drawn.
+    pub fn scroll_page(&mut self, points: f32) {
+        let visible = self.page_rect.map_or(0.0, |r| r.height);
+        let max = (self.page_content - visible).max(0.0);
+        self.page_scroll = (self.page_scroll + points).clamp(0.0, max);
     }
 
     /// Whether a server waits on an answer.
@@ -231,6 +269,15 @@ impl Panel {
             match line {
                 Line::Server(si) => {
                     let server = &self.servers[*si];
+                    if self.details && self.selected == Some(*si) {
+                        layout::push_rect(
+                            out,
+                            atlas,
+                            [row.x, row.y],
+                            [row.width, row.height],
+                            theme.sidebar_selected,
+                        );
+                    }
                     let dot = match server.status {
                         Status::Ready => theme.diff_added,
                         Status::Starting => theme.diff_modified,
@@ -264,19 +311,34 @@ impl Panel {
                         Status::Ready | Status::Starting => "Stop",
                         _ => "Start",
                     };
+                    let verb_rect = Viewport {
+                        x: x + width - 52.0,
+                        y,
+                        width: 52.0,
+                        height: ROW,
+                    };
                     layout::push_ui_text_right(
                         out,
                         atlas,
                         Viewport {
-                            x: x + width - 52.0,
                             y: y + 4.0,
                             width: 48.0,
                             height: 20.0,
+                            ..verb_rect
                         },
                         verb,
                         theme.accent,
                     );
-                    self.hits.push((row, Action::Toggle(*si)));
+                    // The verb starts or stops; the rest of the row shows
+                    // the server on the page without starting anything.
+                    self.hits.push((verb_rect, Action::Toggle(*si)));
+                    self.hits.push((
+                        Viewport {
+                            width: (row.width - verb_rect.width).max(0.0),
+                            ..row
+                        },
+                        Action::Select(*si),
+                    ));
                 }
                 Line::Note(text) => {
                     layout::push_ui_text(
@@ -350,27 +412,52 @@ impl Panel {
         }
     }
 
+    /// What a click does: on the page while it has the column, or in the
+    /// sidebar. The two never overlap, so the order is only a tie-break.
     pub fn hit(&self, x: f32, y: f32) -> Option<Action> {
-        self.hits
+        self.page_hits
             .iter()
+            .filter(|_| self.details)
+            .chain(self.hits.iter())
             .find(|(rect, _)| rect.contains(x, y))
             .map(|(_, action)| action.clone())
     }
 
-    /// A region for scripts: `mcp.edit`, `mcp.reload`, `mcp.server.NAME`,
-    /// `mcp.tool.SERVER.TOOL`, `mcp.resource.SERVER.N`, `mcp.prompt.SERVER.NAME`.
+    /// A region for scripts: `mcp.edit`, `mcp.reload`, `mcp.server.NAME`
+    /// (its Start/Stop), `mcp.select.NAME`, `mcp.tool.SERVER.TOOL`,
+    /// `mcp.resource.SERVER.N`, `mcp.prompt.SERVER.NAME`; on the page
+    /// `mcp.page.add`, `mcp.page.add-url`, `mcp.page.close`,
+    /// `mcp.page.home` and the same server, tool, resource and prompt
+    /// names with a `page.` in front (`mcp.page.server.NAME`).
     pub fn named(&self, name: &str) -> Option<Viewport> {
-        self.hits
-            .iter()
-            .find(|(_, action)| self.name_of(action) == name)
-            .map(|(rect, _)| *rect)
+        let page = name
+            .strip_prefix("mcp.page.")
+            .map(|rest| format!("mcp.{rest}"));
+        match page {
+            Some(name) => self
+                .page_hits
+                .iter()
+                .filter(|_| self.details)
+                .find(|(_, action)| self.name_of(action) == name)
+                .map(|(rect, _)| *rect),
+            None => self
+                .hits
+                .iter()
+                .find(|(_, action)| self.name_of(action) == name)
+                .map(|(rect, _)| *rect),
+        }
     }
 
-    fn name_of(&self, action: &Action) -> String {
+    pub(crate) fn name_of(&self, action: &Action) -> String {
         let server = |si: usize| self.servers.get(si).map_or("", |s| s.name.as_str());
         match action {
             Action::Edit => "mcp.edit".into(),
             Action::Reload => "mcp.reload".into(),
+            Action::Home => "mcp.home".into(),
+            Action::Close => "mcp.close".into(),
+            Action::AddCommand => "mcp.add".into(),
+            Action::AddUrl => "mcp.add-url".into(),
+            Action::Select(si) => format!("mcp.select.{}", server(*si)),
             Action::Toggle(si) => format!("mcp.server.{}", server(*si)),
             Action::Tool(si, ti) => format!(
                 "mcp.tool.{}.{}",
@@ -399,5 +486,19 @@ impl Panel {
             .map(|s| format!("{}:{}:{}", s.name, s.status.label(), s.tools.len()))
             .collect::<Vec<_>>()
             .join(",")
+    }
+
+    /// The page for the self-test: whether it has the column, which
+    /// server it shows, its note and how many targets it drew.
+    pub fn page_report(&self) -> String {
+        format!(
+            "{} selected={} note={} targets={}",
+            if self.details { "open" } else { "closed" },
+            self.selected
+                .and_then(|i| self.servers.get(i))
+                .map_or("-", |s| s.name.as_str()),
+            self.note.as_deref().unwrap_or("-"),
+            self.page_hits.len()
+        )
     }
 }

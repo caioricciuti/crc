@@ -111,3 +111,74 @@ expect "$T/mcp-saved.out" message "saved as calls/garden-add.json; Home lists it
 [ -f "$T/mcpws/calls/garden-add.json" ] || failed "mcp-save: calls/garden-add.json was not written"
 grep -q '^home: .* calls=1 ' "$T/mcp-saved.out" \
     || failed "mcp-saved.out: Home does not list the saved call: $(grep '^home:' "$T/mcp-saved.out")"
+
+# ---- the page ------------------------------------------------------------------
+# Opening MCP Servers takes the editor column with the page. Close gives the
+# column back; a card shows a server's details without starting it; Add
+# Server writes an entry for an installed program (the panel's choice comes
+# from CRC_MCP_ADD here) and Add by URL takes an address in the palette;
+# Open mcp.json shows the file, and saving it in crc reads it again.
+mkdir -p "$T/mcphome2/.config/crc" "$T/mcpproj2"
+cat > "$T/mcphome2/.config/crc/mcp.json" <<JSON
+{"mcpServers": {
+  "garden": {"command": "/usr/bin/python3", "args": ["$PWD/scripts/fake-mcp.py", "legacy"]}
+}}
+JSON
+cat > "$T/mcp-page.script" <<SCRIPT
+wait 800
+wait 300
+key 35 cmd p
+wait 200
+text >mcp servers
+key 36
+wait 300
+dump $T/mcp-page-open.out
+click @mcp.page.close
+wait 300
+dump $T/mcp-page-closed.out
+click @mcp.select.garden
+wait 300
+dump $T/mcp-page-selected.out
+click @mcp.page.add
+wait 300
+dump $T/mcp-page-added.out
+click @mcp.page.add-url
+wait 300
+text example.com/mcp
+key 36
+wait 300
+dump $T/mcp-page-url.out
+click @mcp.page.home
+wait 300
+click @mcp.page.edit
+wait 300
+dump $T/mcp-page-edit.out
+key 0 cmd a
+text {"mcpServers": {"only": {"url": "https://only.example/mcp"}}}
+key 1 cmd s
+wait 600
+wait 300
+dump $T/mcp-page-saved.out
+quit
+SCRIPT
+HOME="$T/mcphome2" CRC_MCP_ADD="/bin/cat" CRC_SELFTEST="$T/mcp-page.script" "$BIN" "$T/mcpproj2" 2> "$T/mcp-page.err"
+grep -q '^mcp_page: open selected=- note=- ' "$T/mcp-page-open.out" \
+    || failed "mcp-page-open.out: the page did not take the column: $(grep '^mcp_page:' "$T/mcp-page-open.out")"
+grep -q '^mcp_page: closed ' "$T/mcp-page-closed.out" \
+    || failed "mcp-page-closed.out: Close did not give the column back: $(grep '^mcp_page:' "$T/mcp-page-closed.out")"
+grep -q '^mcp_page: open selected=garden note=- ' "$T/mcp-page-selected.out" \
+    || failed "mcp-page-selected.out: the card did not open the details: $(grep '^mcp_page:' "$T/mcp-page-selected.out")"
+expect "$T/mcp-page-selected.out" mcp "garden:stopped:0"
+expect "$T/mcp-page-added.out" mcp "garden:stopped:0,cat:stopped:0"
+grep -q '^mcp_page: open selected=cat note=Added cat to mcp.json: Start runs it ' "$T/mcp-page-added.out" \
+    || failed "mcp-page-added.out: $(grep '^mcp_page:' "$T/mcp-page-added.out")"
+expect "$T/mcp-page-url.out" mcp "garden:stopped:0,cat:stopped:0,example.com:stopped:0"
+# The file opened in the tab holds what Add Server and Add by URL wrote.
+expect_line "$T/mcp-page-edit.out" 11 '      "command": "/bin/cat"'
+expect_line "$T/mcp-page-edit.out" 14 '      "url": "https://example.com/mcp"'
+grep -q '^mcp_page: closed ' "$T/mcp-page-edit.out" \
+    || failed "mcp-page-edit.out: Open mcp.json left the page over the file: $(grep '^mcp_page:' "$T/mcp-page-edit.out")"
+grep -q '^tabs: .*mcp.json' "$T/mcp-page-edit.out" \
+    || failed "mcp-page-edit.out: $(grep '^tabs:' "$T/mcp-page-edit.out")"
+expect "$T/mcp-page-saved.out" mcp "only:stopped:0"
+expect "$T/mcp-page-saved.out" message "mcp.json saved and read: 1 server"

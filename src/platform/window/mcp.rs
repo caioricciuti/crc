@@ -6,8 +6,6 @@ use crate::mcp_client::call::{self, Target};
 use crate::platform::mcp_panel::Action as McpAction;
 
 /// What `mcp.json` starts as when Edit finds none.
-const CONFIG_TEMPLATE: &str = "{\n  \"mcpServers\": {\n  }\n}\n";
-
 impl EditorView {
     /// The wake-up a server's reader thread uses: a main-thread poll.
     pub(super) fn mcp_wake(&self) -> crate::lsp::transport::Wake {
@@ -24,14 +22,36 @@ impl EditorView {
             state.extensions = None;
             state.git_open = false;
             state.git_focus = false;
+            state.palette = None;
+            state.completion = None;
             if !state.mcp.loaded {
                 state.mcp.reload();
             }
             state.mcp.open = true;
+            // The page takes the editor column, as the Extensions page
+            // does; Escape, Close or a tab gives it back.
+            state.mcp.details = true;
+            state.mcp.note = None;
             state.sidebar = true;
         }
         self.request_redraw();
         self.pump();
+    }
+
+    /// `mcp.json` saved in crc: the list follows it at once, where the
+    /// watcher would not (it ignores this process's own writes).
+    pub(super) fn mcp_config_saved(&self) {
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
+        state.mcp.reload();
+        let said = match (&state.mcp.error, state.mcp.servers.len()) {
+            (Some(error), _) => error.clone(),
+            (None, 1) => "mcp.json saved and read: 1 server".into(),
+            (None, n) => format!("mcp.json saved and read: {n} servers"),
+        };
+        state.mcp.note = Some(said.clone());
+        state.message = Some((said, Instant::now()));
     }
 
     pub(super) fn mcp_click(&self, x: f32, y: f32) {
@@ -52,9 +72,42 @@ impl EditorView {
                         (None, 1) => "mcp.json read: 1 server".into(),
                         (None, n) => format!("mcp.json read: {n} servers"),
                     };
+                    state.mcp.note = Some(said.clone());
                     state.message = Some((said, Instant::now()));
                 }
             }
+            McpAction::Select(si) => {
+                if let Some(mut state) = self.state_mut() {
+                    if state.mcp.selected != Some(si) {
+                        state.mcp.page_scroll = 0.0;
+                    }
+                    state.mcp.selected = Some(si);
+                    state.mcp.details = true;
+                    state.mcp.note = None;
+                }
+            }
+            McpAction::Home => {
+                if let Some(mut state) = self.state_mut() {
+                    state.mcp.selected = None;
+                    state.mcp.page_scroll = 0.0;
+                    state.mcp.details = true;
+                }
+            }
+            McpAction::Close => {
+                if let Some(mut state) = self.state_mut() {
+                    state.mcp.details = false;
+                }
+            }
+            McpAction::AddCommand => {
+                if let Some(program) = self.choose_mcp_program() {
+                    let entry = crate::mcp_client::ServerConfig {
+                        command: program.to_string_lossy().into_owned(),
+                        ..Default::default()
+                    };
+                    self.add_mcp_server(entry);
+                }
+            }
+            McpAction::AddUrl => self.open_mcp_url_prompt(),
             McpAction::Toggle(si) => {
                 let wake = self.mcp_wake();
                 if let Some(mut state) = self.state_mut() {
@@ -75,6 +128,7 @@ impl EditorView {
                         _ => None,
                     });
                     if let Some(said) = failed {
+                        state.mcp.note = Some(said.clone());
                         state.message = Some((said, Instant::now()));
                     }
                 }
@@ -135,14 +189,84 @@ impl EditorView {
             if let Some(dir) = path.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
-            if let Err(e) = crate::platform::write_atomically(&path, CONFIG_TEMPLATE.as_bytes())
-                && let Some(mut state) = self.state_mut()
+            if let Err(e) = crate::platform::write_atomically(
+                &path,
+                crate::mcp_client::config::TEMPLATE.as_bytes(),
+            ) && let Some(mut state) = self.state_mut()
             {
                 state.message = Some((format!("{}: {e}", path.display()), Instant::now()));
                 return;
             }
         }
+        // The file is the point: the page gives the column back.
+        if let Some(mut state) = self.state_mut() {
+            state.mcp.details = false;
+        }
         self.run_pick(Pick::File(path));
+    }
+
+    /// The program a new entry runs: the Open panel's choice. A test
+    /// instance never shows the panel: `CRC_MCP_ADD` names it instead.
+    fn choose_mcp_program(&self) -> Option<std::path::PathBuf> {
+        if self.ivars().testing {
+            return std::env::var_os("CRC_MCP_ADD").map(Into::into);
+        }
+        choose_path(
+            MainThreadMarker::from(self),
+            false,
+            Some("Choose the installed MCP server program to run"),
+        )
+    }
+
+    /// Writes `entry` into `mcp.json` under a name made from it, reads the
+    /// file again and shows the new server on the page.
+    fn add_mcp_server(&self, entry: crate::mcp_client::ServerConfig) {
+        let name = {
+            let Some(state) = self.state() else {
+                return;
+            };
+            let taken: Vec<String> = state.mcp.servers.iter().map(|s| s.name.clone()).collect();
+            crate::mcp_client::config::suggest_name(&entry, &taken)
+        };
+        let written = crate::mcp_client::config::add(&name, &entry);
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
+        let said = match written {
+            Ok(path) => {
+                state.mcp.reload();
+                state.mcp.selected = state.mcp.find(&name);
+                state.mcp.details = true;
+                state.mcp.page_scroll = 0.0;
+                format!(
+                    "Added {name} to {}: Start runs it",
+                    path.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string())
+                )
+            }
+            Err(e) => format!("Not added: {e}"),
+        };
+        state.mcp.note = Some(said.clone());
+        state.message = Some((said, Instant::now()));
+    }
+
+    /// Add by URL: the palette takes the address; Return adds it.
+    fn open_mcp_url_prompt(&self) {
+        self.open_palette_with("https://");
+        if let Some(mut state) = self.state_mut() {
+            state.mcp_url_prompt = true;
+        }
+    }
+
+    /// The palette's answer to Add by URL.
+    pub(super) fn add_mcp_url(&self, url: String) {
+        self.add_mcp_server(crate::mcp_client::ServerConfig {
+            url: Some(url),
+            ..Default::default()
+        });
+        self.request_redraw();
+        self.pump();
     }
 
     /// A call document in a tab of its own, ready to edit and run.
@@ -152,6 +276,8 @@ impl EditorView {
                 return;
             };
             state.docs.push(Buffer::generated(title, "json", text));
+            // The document is the point: the page gives the column back.
+            state.mcp.details = false;
             reveal_active_tab(&mut state);
             state.message = Some(("Cmd-Return runs the call".into(), Instant::now()));
         }
@@ -321,6 +447,8 @@ impl EditorView {
                     state.docs.active().id()
                 }
             };
+            // The answer is the point: the page gives the column back.
+            state.mcp.details = false;
             reveal_active_tab(&mut state);
             let Some(si) = state.mcp.find(&call.server) else {
                 return;
@@ -411,7 +539,13 @@ impl EditorView {
                 McpAction::Tool(..) => "Call Tool\u{2026}",
                 McpAction::Prompt(..) => "Get Prompt\u{2026}",
                 McpAction::Resource(..) => "Read Resource",
-                McpAction::Edit | McpAction::Reload => return None,
+                McpAction::Select(..) => "Show Details",
+                McpAction::Edit
+                | McpAction::Reload
+                | McpAction::Home
+                | McpAction::Close
+                | McpAction::AddCommand
+                | McpAction::AddUrl => return None,
             };
             Some((action, title))
         });
@@ -422,8 +556,40 @@ impl EditorView {
             add(title, sel!(mcpContextRun:));
             menu.addItem(&NSMenuItem::separatorItem(mtm));
         }
+        add("Add Server\u{2026}", sel!(addMcpServer:));
+        add("Add Server by URL\u{2026}", sel!(addMcpServerUrl:));
         add("Edit mcp.json", sel!(mcpEdit:));
         add("Reload Servers", sel!(mcpReload:));
         menu
     }
+}
+
+/// Whether the MCP page has the editor column.
+pub(super) fn mcp_details(state: &State) -> bool {
+    state.mcp.open && state.mcp.details
+}
+
+/// Add by URL's rows: the one address typed, once it is one.
+pub(super) fn mcp_url_rows(query: &str) -> Vec<(layout::PaletteRow, Pick)> {
+    let url = query.trim();
+    let scheme_only = url == "http://" || url == "https://";
+    if scheme_only || !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Vec::new();
+    }
+    let entry = crate::mcp_client::ServerConfig {
+        url: Some(url.to_owned()),
+        ..Default::default()
+    };
+    vec![(
+        layout::PaletteRow {
+            icon: None,
+            title: format!(
+                "Add \u{201c}{}\u{201d}",
+                crate::mcp_client::config::suggest_name(&entry, &[])
+            ),
+            detail: format!("{url} \u{b7} written to mcp.json, started by a click"),
+            shortcut: String::new(),
+        },
+        Pick::McpUrl(url.to_owned()),
+    )]
 }

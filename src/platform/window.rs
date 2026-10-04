@@ -70,6 +70,7 @@ mod state;
 mod tabs;
 mod terminal;
 use extensions::{ext_details, preview_command, preview_displaced};
+use mcp::{mcp_details, mcp_url_rows};
 use state::{Blame, Ext, Gutter, Lsp, ProjectSearch, Reloads, Watch};
 
 struct ProjectIndexResult {
@@ -661,6 +662,8 @@ struct State {
     branch_list: Option<BranchPick>,
     /// Set while the palette picks a repository of the workspace.
     repo_list: Option<Vec<RepoRow>>,
+    /// Set while the palette takes a URL for a new MCP server.
+    mcp_url_prompt: bool,
     /// The branch picker's list, being read by a worker.
     branch_rx: Option<mpsc::Receiver<Result<BranchPick, String>>>,
     /// `organize_imports_on_save` from the settings.
@@ -1464,6 +1467,22 @@ define_class!(
                 }
                 return;
             }
+            // So does the MCP page.
+            let mcp_page_action = {
+                let Some(state) = self.state() else {
+                    return;
+                };
+                (mcp_details(&state)
+                    && state.palette.is_none()
+                    && details_rect(&chrome).contains(x, y))
+                .then(|| state.mcp.hit(x, y))
+            };
+            if let Some(action) = mcp_page_action {
+                if let Some(action) = action {
+                    self.mcp_action(action);
+                }
+                return;
+            }
 
             // The scrollbar thumb, before anything that treats a press in
             // the text as a caret placement. A press on the track outside
@@ -1708,6 +1727,7 @@ define_class!(
                         if let Some(page) = &mut state.extensions {
                             page.details = false;
                         }
+                        state.mcp.details = false;
                         state.drag = Some(Drag::Tab(index));
                     }
                     self.tab_click(x);
@@ -2192,6 +2212,30 @@ define_class!(
             if self.state().is_some_and(|state| state.palette.is_some()) {
                 self.palette_wheel(event);
                 return;
+            }
+            {
+                // The MCP page's body scrolls under its header.
+                let point = self.convertPoint_fromView(event.locationInWindow(), None);
+                let over_page = self.state().is_some_and(|state| {
+                    mcp_details(&state)
+                        && state
+                            .mcp
+                            .page_rect
+                            .is_some_and(|r| r.contains(point.x as f32, point.y as f32))
+                });
+                if over_page {
+                    let lines = self.wheel_lines(event, WheelTarget::Readme);
+                    if lines != 0
+                        && let Some(mut state) = self.state_mut()
+                    {
+                        state
+                            .mcp
+                            .scroll_page(lines as f32 * crate::platform::mcp_panel::ROW);
+                    }
+                    self.request_redraw();
+                    self.pump();
+                    return;
+                }
             }
             {
                 // An extension's README scrolls a block at a time.
@@ -3497,6 +3541,18 @@ define_class!(
             self.open_mcp();
         }
 
+        #[unsafe(method(addMcpServer:))]
+        fn action_add_mcp_server(&self, _sender: Option<&AnyObject>) {
+            self.open_mcp();
+            self.mcp_action(crate::platform::mcp_panel::Action::AddCommand);
+        }
+
+        #[unsafe(method(addMcpServerUrl:))]
+        fn action_add_mcp_server_url(&self, _sender: Option<&AnyObject>) {
+            self.open_mcp();
+            self.mcp_action(crate::platform::mcp_panel::Action::AddUrl);
+        }
+
         #[unsafe(method(copyMcpServerCommand:))]
         fn action_copy_mcp_server_command(&self, _sender: Option<&AnyObject>) {
             self.copy_mcp_server_command();
@@ -4482,6 +4538,14 @@ impl EditorView {
                     .filter(|_| state.mcp.open)
                     .map(|(r, _)| *r),
             )
+            .chain(
+                state
+                    .mcp
+                    .page_hits
+                    .iter()
+                    .filter(|_| mcp_details(&state))
+                    .map(|(r, _)| *r),
+            )
             .collect();
         if state.pointer_targets != pointer_targets {
             state.pointer_targets = pointer_targets;
@@ -5241,6 +5305,8 @@ fn forget_document(state: &mut State, id: u64) {
 enum Column {
     /// The Extensions page's details.
     Extensions,
+    /// The MCP page.
+    Mcp,
     /// A Source Control change, in its tab.
     GitDiff,
     /// A document's merge conflicts as columns.
@@ -5258,6 +5324,8 @@ enum Column {
 fn column_of(state: &State) -> Column {
     if ext_details(state) {
         Column::Extensions
+    } else if mcp_details(state) {
+        Column::Mcp
     } else if diffing(state) {
         Column::GitDiff
     } else if side_by_side(state) {
@@ -6077,7 +6145,7 @@ fn frame_of(state: &mut State) -> Frame {
     for (index, pane) in &chrome.others {
         frame.push(Hit::Pane(*index), pane.whole());
     }
-    let covered = extensions.as_ref().is_some_and(|p| p.details);
+    let covered = extensions.as_ref().is_some_and(|p| p.details) || (mcp.open && mcp.details);
     for hit in tab_hits.iter().filter(|_| !covered) {
         if hit.index == docs.active_index() {
             frame.push(
@@ -6386,6 +6454,8 @@ enum Pick {
     Repo(std::path::PathBuf),
     /// A code action, and the server that offered it.
     Action(Language, crate::lsp::CodeAction),
+    /// A Streamable HTTP MCP server to add, by its URL.
+    McpUrl(String),
 }
 
 /// The code action picker's rows: the actions whose titles match, in the
@@ -6609,6 +6679,8 @@ struct PaletteSources<'a> {
     actions: Option<&'a (Language, Vec<crate::lsp::CodeAction>)>,
     /// Set while picking a repository.
     repos: Option<&'a [RepoRow]>,
+    /// Set while taking a URL for a new MCP server.
+    mcp_url: bool,
 }
 
 /// The rows of the open palette for its query; none when it is closed.
@@ -6627,6 +6699,7 @@ fn palette_sources(state: &State) -> PaletteSources<'_> {
         branches: state.branch_list.as_ref(),
         actions: state.lsp.action_list.as_ref(),
         repos: state.repo_list.as_deref(),
+        mcp_url: state.mcp_url_prompt,
     }
 }
 
@@ -6638,11 +6711,15 @@ enum PaletteMode {
     Branch,
     Action,
     Repo,
+    /// A URL for a new MCP server.
+    McpUrl,
 }
 
 impl PaletteMode {
     fn of(sources: &PaletteSources<'_>) -> PaletteMode {
-        if sources.repos.is_some() {
+        if sources.mcp_url {
+            PaletteMode::McpUrl
+        } else if sources.repos.is_some() {
             PaletteMode::Repo
         } else if sources.branches.is_some() {
             PaletteMode::Branch
@@ -6673,6 +6750,12 @@ fn palette_heading(
         }
         PaletteMode::Action => return ("Code actions", "No matching actions"),
         PaletteMode::Repo => return ("Show which repository?", "No matching repositories"),
+        PaletteMode::McpUrl => {
+            return (
+                "Add an MCP server by URL",
+                "Type the server's http:// or https:// address",
+            );
+        }
         PaletteMode::Open => {}
     }
     match symbols::query(query) {
@@ -6695,7 +6778,11 @@ fn palette_rows(sources: &PaletteSources<'_>, query: &str) -> Vec<(layout::Palet
         branches,
         actions,
         repos,
+        mcp_url,
     } = *sources;
+    if mcp_url {
+        return mcp_url_rows(query);
+    }
     if let Some(repos) = repos {
         return repo_rows(repos, query);
     }
@@ -7367,6 +7454,18 @@ fn install_menu(mtm: MainThreadMarker, app: &NSApplication) {
         .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
     git_menu.addItem(&source_control);
     git_menu.addItem(&mcp_servers);
+    git_menu.addItem(&item(
+        "Add MCP Server\u{2026}",
+        sel!(addMcpServer:),
+        "",
+        false,
+    ));
+    git_menu.addItem(&item(
+        "Add MCP Server by URL\u{2026}",
+        sel!(addMcpServerUrl:),
+        "",
+        false,
+    ));
     git_menu.addItem(&item("Refresh", sel!(gitRefresh:), "", false));
     git_menu.addItem(&item("Commit\u{2026}", sel!(gitCommit:), "", false));
     git_menu.addItem(&NSMenuItem::separatorItem(mtm));
@@ -7767,6 +7866,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         ssh_auth_sock: settings.ssh_auth_sock.clone(),
         branch_list: None,
         repo_list: None,
+        mcp_url_prompt: false,
         workspace,
         home: None,
         home_rx,

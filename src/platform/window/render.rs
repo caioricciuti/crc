@@ -74,6 +74,7 @@ impl EditorView {
             word_wrap,
             branch_list,
             repo_list,
+            mcp_url_prompt,
             extensions,
             blame: Blame { shown: blame, .. },
             renderer,
@@ -192,6 +193,15 @@ impl EditorView {
             glyphs.clear();
             crate::platform::extensions::draw_details(
                 page,
+                &mut renderer.atlas,
+                ext_details_rect,
+                theme,
+                glyphs,
+            );
+        } else if column == Column::Mcp {
+            glyphs.clear();
+            crate::platform::mcp_page::draw(
+                mcp,
                 &mut renderer.atlas,
                 ext_details_rect,
                 theme,
@@ -496,7 +506,7 @@ impl EditorView {
         // Under the Extensions details the tabs are still laid out, so
         // their hit list stays true, but drawn into nothing.
         let mut hidden = Vec::new();
-        let details = extensions.as_ref().is_some_and(|p| p.details);
+        let details = extensions.as_ref().is_some_and(|p| p.details) || column == Column::Mcp;
         layout::build_tab_bar(
             docs,
             *tab_scroll,
@@ -508,9 +518,9 @@ impl EditorView {
             tab_hits,
         );
 
-        if column == Column::Extensions {
-            // The Extensions details cover this row; a document's path here
-            // would label them as something they are not.
+        if matches!(column, Column::Extensions | Column::Mcp) {
+            // The Extensions and MCP pages cover this row; a document's
+            // path here would label them as something they are not.
         } else if diffing {
             // The breadcrumb row says which change is on screen, so the
             // editor column is never an unlabelled wall of diff.
@@ -844,6 +854,7 @@ impl EditorView {
                 branches: branch_list.as_ref(),
                 actions: action_list.as_ref(),
                 repos: repo_list.as_deref(),
+                mcp_url: *mcp_url_prompt,
             };
             let mode = PaletteMode::of(&sources);
             let intent = sources.branches.map(|pick| &pick.intent);
@@ -869,6 +880,7 @@ impl EditorView {
                         PaletteMode::Branch => "Branch name",
                         PaletteMode::Action => "Filter actions",
                         PaletteMode::Repo => "Repository name",
+                        PaletteMode::McpUrl => "https://host/mcp",
                         PaletteMode::Open => {
                             "Find a file  ·  > commands  ·  @ symbols  ·  # in project"
                         }
@@ -879,6 +891,8 @@ impl EditorView {
                             Some(BranchIntent::Delete) => "Delete",
                             _ => "Switch",
                         }
+                    } else if mode == PaletteMode::McpUrl {
+                        "Add"
                     } else if mode == PaletteMode::Action || commands::query(&text).is_some() {
                         "Run"
                     } else {

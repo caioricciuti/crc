@@ -2,6 +2,25 @@
 
 One entry per tag, written for people who use the editor.
 
+## Unreleased
+
+MCP servers get a page instead of an empty JSON file.
+
+- Opening MCP Servers shows a page in the editor column: what a server
+  is, a card per server with its command or URL, its status and
+  Start/Stop, and a server's tools, resources and prompts with their
+  descriptions. Close, Escape or a tab gives the column back; the list
+  stays in the sidebar.
+- Add Server picks an installed program with the Open panel and Add by
+  URL takes a Streamable HTTP address in the palette; both write the
+  entry to mcp.json and show it. Nothing starts until Start is clicked.
+- With no servers the page says how to add the first one and shows the
+  file's shape, which is Claude Code's .mcp.json shape.
+- Saving mcp.json in crc reads it again at once; the status line says
+  how many servers it holds, or what is wrong with it.
+- In the sidebar a server's name shows its details and only its
+  Start/Stop starts or stops it.
+
 ## v0.2.0-alpha.13, 2026-10-02
 
 A window that looks and answers like one app: every button, row and

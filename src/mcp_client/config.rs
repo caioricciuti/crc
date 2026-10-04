@@ -39,6 +39,96 @@ pub fn path() -> Option<PathBuf> {
     crate::platform::settings::Settings::path().and_then(|p| p.parent().map(|d| d.join("mcp.json")))
 }
 
+/// What a new `mcp.json` holds: the one key, empty.
+pub const TEMPLATE: &str = "{\n  \"mcpServers\": {\n  }\n}\n";
+
+/// Adds `entry` under `name`, writing the file first when there is none.
+/// An entry of that name is replaced; everything else in the file stays
+/// as written. Answers the file's path.
+pub fn add(name: &str, entry: &ServerConfig) -> Result<PathBuf, String> {
+    let Some(path) = path() else {
+        return Err("no configuration folder for mcp.json".into());
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => TEMPLATE.to_owned(),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let text = added(&text, name, entry)?;
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    crate::platform::write_atomically(&path, text.as_bytes())
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// `text` with `entry` under `name` in `mcpServers`, pretty-printed.
+pub fn added(text: &str, name: &str, entry: &ServerConfig) -> Result<String, String> {
+    let mut root = if text.trim().is_empty() {
+        Value::Object(Vec::new())
+    } else {
+        crate::json::parse(text).map_err(|e| format!("mcp.json is not valid JSON: {e}"))?
+    };
+    let Value::Object(members) = &mut root else {
+        return Err("mcp.json is not a JSON object".into());
+    };
+    if !members.iter().any(|(k, _)| k == "mcpServers") {
+        members.push(("mcpServers".into(), Value::Object(Vec::new())));
+    }
+    let servers = members
+        .iter_mut()
+        .find(|(k, _)| k == "mcpServers")
+        .map(|(_, v)| v)
+        .expect("just made sure it is there");
+    if !matches!(servers, Value::Object(_)) {
+        *servers = Value::Object(Vec::new());
+    }
+    let Value::Object(list) = servers else {
+        unreachable!("made an object above");
+    };
+    let json = entry.to_json();
+    match list.iter_mut().find(|(k, _)| k == name) {
+        Some((_, v)) => *v = json,
+        None => list.push((name.to_owned(), json)),
+    }
+    let mut out = crate::json::pretty(&root);
+    out.push('\n');
+    Ok(out)
+}
+
+/// A name for a new entry: the program's file name without its extension,
+/// or a URL's host; `-2`, `-3`... when one of `taken` has it already.
+pub fn suggest_name(entry: &ServerConfig, taken: &[String]) -> String {
+    let base = match &entry.url {
+        Some(url) if entry.command.is_empty() => url
+            .split("://")
+            .nth(1)
+            .unwrap_or(url)
+            .split(['/', ':', '?'])
+            .next()
+            .unwrap_or("server")
+            .to_owned(),
+        _ => Path::new(&entry.command)
+            .file_stem()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    };
+    let base = base.trim().to_lowercase();
+    let base = if base.is_empty() {
+        "server".to_owned()
+    } else {
+        base
+    };
+    if !taken.contains(&base) {
+        return base;
+    }
+    (2..)
+        .map(|n| format!("{base}-{n}"))
+        .find(|candidate| !taken.contains(candidate))
+        .expect("the integers do not run out")
+}
+
 impl Config {
     pub fn load() -> Config {
         let Some(path) = path() else {
@@ -134,6 +224,41 @@ const FETCHING_SUBCOMMANDS: &[(&str, &[&str])] = &[
 ];
 
 impl ServerConfig {
+    /// The entry as `mcp.json` writes it: only the keys that are set.
+    pub fn to_json(&self) -> Value {
+        let mut members = Vec::new();
+        if let Some(url) = &self.url {
+            members.push(("url".to_owned(), Value::String(url.clone())));
+        }
+        if !self.command.is_empty() {
+            members.push(("command".to_owned(), Value::String(self.command.clone())));
+        }
+        if !self.args.is_empty() {
+            members.push((
+                "args".to_owned(),
+                Value::Array(self.args.iter().map(|a| Value::String(a.clone())).collect()),
+            ));
+        }
+        if !self.env.is_empty() {
+            members.push((
+                "env".to_owned(),
+                Value::Object(
+                    self.env
+                        .iter()
+                        .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+                        .collect(),
+                ),
+            ));
+        }
+        if let Some(cwd) = &self.cwd {
+            members.push((
+                "cwd".to_owned(),
+                Value::String(cwd.to_string_lossy().into_owned()),
+            ));
+        }
+        Value::Object(members)
+    }
+
     /// Why this entry would run code fetched at start, if it would.
     pub fn fetches(&self) -> Option<String> {
         let program = Path::new(&self.command)
@@ -218,6 +343,93 @@ mod tests {
         );
         assert!(Config::parse("{nope").error.is_some());
         assert!(Config::parse("{}").servers.is_empty());
+    }
+
+    #[test]
+    fn adding_an_entry_keeps_the_rest_of_the_file() {
+        let notes = ServerConfig {
+            command: "/opt/notes-mcp".into(),
+            args: vec!["--root".into(), "/tmp/n".into()],
+            ..ServerConfig::default()
+        };
+        // An empty template gets its first entry.
+        let text = added(TEMPLATE, "notes", &notes).unwrap();
+        assert_eq!(
+            text,
+            "{\n  \"mcpServers\": {\n    \"notes\": {\n      \"command\": \"/opt/notes-mcp\",\n      \"args\": [\n        \"--root\",\n        \"/tmp/n\"\n      ]\n    }\n  }\n}\n"
+        );
+        let parsed = Config::parse(&text);
+        assert_eq!(parsed.servers, vec![("notes".to_string(), notes.clone())]);
+        // Other keys and other servers stay; a same-named one is replaced.
+        let remote = ServerConfig {
+            url: Some("https://example.com/mcp".into()),
+            ..ServerConfig::default()
+        };
+        let text = added(
+            r#"{"other": true, "mcpServers": {"notes": {"command": "/old"}, "a": {"url": "https://a"}}}"#,
+            "notes",
+            &notes,
+        )
+        .unwrap();
+        let text = added(&text, "remote", &remote).unwrap();
+        let parsed = Config::parse(&text);
+        assert_eq!(
+            parsed
+                .servers
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>(),
+            ["notes", "a", "remote"]
+        );
+        assert_eq!(parsed.servers[0].1, notes);
+        assert_eq!(parsed.servers[2].1, remote);
+        assert!(text.contains("\"other\": true"));
+        // A file with no mcpServers key, and one that is not JSON.
+        assert_eq!(
+            Config::parse(&added("{}", "x", &remote).unwrap())
+                .servers
+                .len(),
+            1
+        );
+        assert_eq!(
+            Config::parse(&added("", "x", &remote).unwrap())
+                .servers
+                .len(),
+            1
+        );
+        assert!(
+            added("{nope", "x", &remote)
+                .unwrap_err()
+                .contains("not valid JSON")
+        );
+        assert!(
+            added("[]", "x", &remote)
+                .unwrap_err()
+                .contains("not a JSON object")
+        );
+    }
+
+    #[test]
+    fn suggested_names_come_from_the_program_or_host() {
+        let cmd = |c: &str| ServerConfig {
+            command: c.into(),
+            ..ServerConfig::default()
+        };
+        let url = |u: &str| ServerConfig {
+            url: Some(u.into()),
+            ..ServerConfig::default()
+        };
+        assert_eq!(suggest_name(&cmd("/opt/bin/Notes-MCP"), &[]), "notes-mcp");
+        assert_eq!(suggest_name(&cmd("/opt/server.py"), &[]), "server");
+        assert_eq!(suggest_name(&cmd(""), &[]), "server");
+        assert_eq!(
+            suggest_name(&url("https://api.example.com:8443/mcp?x=1"), &[]),
+            "api.example.com"
+        );
+        assert_eq!(
+            suggest_name(&cmd("/opt/notes"), &["notes".into(), "notes-2".into()]),
+            "notes-3"
+        );
     }
 
     #[test]
