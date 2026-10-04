@@ -57,6 +57,8 @@ if ! grep -m1 '^terminal: ' "$T/term-claude.out" | grep -qE 'port=[0-9]+ ide=tru
 fi
 expect_terminal "$T/term-closed.out" "tabs=sh "
 expect_terminal "$T/term-exit.out" "open=false focus=false height=420 tabs= "
+# The tab that went says so, instead of vanishing.
+expect "$T/term-exit.out" message "Terminal: sh ended"
 expect_terminal "$T/term-again.out" "open=true focus=true height=420 tabs=sh "
 
 # ---- terminal selection and file references ---------------------------------

@@ -62,7 +62,25 @@ impl EditorView {
                 .iter()
                 .position(|tab| tab.session.has_exited())
             {
+                // Said in the status line: a tab that vanishes with its
+                // program otherwise looks like a crash of the panel.
+                let tab = &state.terminal.tabs[index];
+                let (kind, said) = match tab.session.exit_code() {
+                    Some(0) => (
+                        layout::Feedback::Info,
+                        format!("Terminal: {} ended", tab.title),
+                    ),
+                    Some(code) => (
+                        layout::Feedback::Failure,
+                        format!("Terminal: {} exited with code {code}", tab.title),
+                    ),
+                    None => (
+                        layout::Feedback::Info,
+                        format!("Terminal: {} ended", tab.title),
+                    ),
+                };
                 state.terminal.close_tab(index);
+                state.say(kind, said);
             }
             drop(state);
             self.after_terminal_layout();

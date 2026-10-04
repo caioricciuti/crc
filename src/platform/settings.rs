@@ -149,73 +149,132 @@ impl Settings {
 
     /// The settings on disk, with defaults for anything missing or wrong.
     pub fn load() -> Settings {
+        Settings::load_checked().0
+    }
+
+    /// The settings, and every line of the file that was not used: an
+    /// unknown key, or a value the key does not take. A file that cannot
+    /// be read gives the defaults and says why.
+    pub fn load_checked() -> (Settings, Vec<String>) {
         let Some(path) = Settings::path() else {
-            return Settings::default();
+            return (Settings::default(), Vec::new());
         };
         match std::fs::read_to_string(&path) {
-            Ok(text) => Settings::parse(&text),
-            Err(_) => Settings::default(),
+            Ok(text) => Settings::parse_checked(&text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Settings::default(), Vec::new()),
+            Err(e) => (
+                Settings::default(),
+                vec![format!("config.toml could not be read: {e}")],
+            ),
         }
     }
 
+    /// One status-line sentence for `problems`, or none.
+    pub fn describe_problems(problems: &[String]) -> Option<String> {
+        let first = problems.first()?;
+        Some(match problems.len() {
+            1 => first.clone(),
+            n => format!("{first} (and {} more)", n - 1),
+        })
+    }
+
     pub fn parse(text: &str) -> Settings {
+        Settings::parse_checked(text).0
+    }
+
+    pub fn parse_checked(text: &str) -> (Settings, Vec<String>) {
         let mut settings = Settings::default();
-        for line in text.lines() {
+        let mut problems = Vec::new();
+        for (n, line) in text.lines().enumerate() {
             let Some((key, value)) = split_line(line) else {
                 continue;
             };
-            match key {
-                "font" => {
-                    if let Some(name) = unquote(value)
-                        && !name.is_empty()
-                    {
-                        settings.font = name.into_owned();
+            let bare = unquote(value);
+            let word = bare.as_deref().unwrap_or(value);
+            // What the key takes, when the value is not it.
+            let takes: Option<&str> = match key {
+                "font" => match bare.as_deref() {
+                    Some(name) if !name.is_empty() => {
+                        settings.font = name.to_owned();
+                        None
                     }
-                }
-                "font_size" => {
-                    if let Ok(size) = value.parse::<f32>()
-                        && size.is_finite()
-                    {
+                    _ => Some("a font name in quotes"),
+                },
+                "font_size" => match value.parse::<f32>() {
+                    Ok(size) if size.is_finite() => {
                         settings.font_size = size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+                        None
                     }
-                }
-                "theme" => {
-                    if let Some(choice) = unquote(value).and_then(|v| ThemeChoice::parse(&v)) {
+                    _ => Some("a number"),
+                },
+                "theme" => match ThemeChoice::parse(word) {
+                    Some(choice) => {
                         settings.theme = choice;
+                        None
                     }
-                }
+                    None => Some("\"system\", \"dark\" or \"light\""),
+                },
                 "caret_blink" => set_bool(value, &mut settings.caret_blink),
                 "update_check" => set_bool(value, &mut settings.update_check),
-                "word_wrap" => match unquote(value).as_deref().unwrap_or(value) {
-                    "auto" => settings.word_wrap = WordWrap::Auto,
-                    "on" | "true" => settings.word_wrap = WordWrap::On,
-                    "off" | "false" => settings.word_wrap = WordWrap::Off,
-                    _ => {}
+                "word_wrap" => match word {
+                    "auto" => {
+                        settings.word_wrap = WordWrap::Auto;
+                        None
+                    }
+                    "on" | "true" => {
+                        settings.word_wrap = WordWrap::On;
+                        None
+                    }
+                    "off" | "false" => {
+                        settings.word_wrap = WordWrap::Off;
+                        None
+                    }
+                    _ => Some("\"auto\", \"on\" or \"off\""),
                 },
-                "ssh_auth_sock" => {
-                    if let Some(path) = unquote(value).filter(|p| !p.is_empty()) {
+                "ssh_auth_sock" => match bare.as_deref() {
+                    Some(path) if !path.is_empty() => {
                         settings.ssh_auth_sock = Some(match path.strip_prefix("~/") {
                             Some(rest) => std::env::var_os("HOME")
                                 .map(PathBuf::from)
                                 .unwrap_or_default()
                                 .join(rest),
-                            None => PathBuf::from(path.as_ref()),
+                            None => PathBuf::from(path),
                         });
+                        None
                     }
-                }
-                "conflict_view" => match unquote(value).as_deref().unwrap_or(value) {
-                    "inline" => settings.conflict_side_by_side = false,
-                    "side-by-side" | "side" => settings.conflict_side_by_side = true,
-                    _ => {}
+                    _ => Some("a path in quotes"),
+                },
+                "conflict_view" => match word {
+                    "inline" => {
+                        settings.conflict_side_by_side = false;
+                        None
+                    }
+                    "side-by-side" | "side" => {
+                        settings.conflict_side_by_side = true;
+                        None
+                    }
+                    _ => Some("\"inline\" or \"side-by-side\""),
                 },
                 "format_on_save" => set_bool(value, &mut settings.format_on_save),
                 "organize_imports_on_save" => {
                     set_bool(value, &mut settings.organize_imports_on_save)
                 }
-                _ => {}
+                _ => {
+                    problems.push(format!(
+                        "config.toml line {}: no setting named {key}",
+                        n + 1
+                    ));
+                    continue;
+                }
+            };
+            if let Some(takes) = takes {
+                problems.push(format!(
+                    "config.toml line {}: {key} takes {takes}, not {value}",
+                    n + 1
+                ));
             }
         }
-        settings
+        (settings, problems)
     }
 
     /// Creates the settings file from the template if there is none, and
@@ -311,12 +370,14 @@ impl Settings {
 }
 
 /// `true` or `false` into `field`; anything else leaves it as it was.
-fn set_bool(value: &str, field: &mut bool) {
+/// Sets `field` from `true` or `false`; says what the key takes otherwise.
+fn set_bool(value: &str, field: &mut bool) -> Option<&'static str> {
     match value {
         "true" => *field = true,
         "false" => *field = false,
-        _ => {}
+        _ => return Some("true or false"),
     }
+    None
 }
 
 /// `key = value` with comments and blank lines skipped.
@@ -434,6 +495,30 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.starts_with("format_on_save = true\n"), "{text}");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn lines_that_are_not_used_are_reported_with_their_number() {
+        let (settings, problems) = Settings::parse_checked(
+            "font_size = 13\n# a comment\ncolour = \"red\"\nfont_size = big\ncaret_blink = yes\ntheme = \"sepia\"\nword_wrap = \"on\"\n",
+        );
+        assert_eq!(settings.font_size, 13.0);
+        assert_eq!(settings.word_wrap, WordWrap::On);
+        assert_eq!(
+            problems,
+            [
+                "config.toml line 3: no setting named colour",
+                "config.toml line 4: font_size takes a number, not big",
+                "config.toml line 5: caret_blink takes true or false, not yes",
+                "config.toml line 6: theme takes \"system\", \"dark\" or \"light\", not \"sepia\"",
+            ]
+        );
+        assert_eq!(Settings::parse_checked(TEMPLATE).1, Vec::<String>::new());
+        assert_eq!(Settings::describe_problems(&[]), None);
+        assert_eq!(
+            Settings::describe_problems(&["a".into(), "b".into(), "c".into()]).as_deref(),
+            Some("a (and 2 more)")
+        );
     }
 
     #[test]

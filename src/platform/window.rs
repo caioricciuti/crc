@@ -78,6 +78,9 @@ struct ProjectIndexResult {
     tree: Tree,
     finder: Finder,
     tree_version: u64,
+    /// Why the root could not be read, when it could not: the sidebar and
+    /// the finder are empty then, and the status line says so.
+    error: Option<String>,
 }
 
 fn spawn_project_index(root: std::path::PathBuf) -> mpsc::Receiver<ProjectIndexResult> {
@@ -108,7 +111,11 @@ fn spawn_project_scan(
         };
         let mut finder = Finder::new();
         finder.scan(&root);
+        let error = std::fs::read_dir(&root)
+            .err()
+            .map(|e| format!("Could not read {}: {e}", root.display()));
         let _ = tx.send(ProjectIndexResult {
+            error,
             root,
             tree,
             finder,
@@ -785,6 +792,11 @@ struct State {
     worst: Option<(std::time::Duration, FrameTiming)>,
     /// A transient note for the status line: save results, errors.
     message: Option<(String, Instant)>,
+    /// What `message` is, when whoever set it said so; see `State::say`.
+    message_kind: Option<(String, layout::Feedback)>,
+    /// What config.toml could not use, said again after the file AppKit
+    /// opens at launch has said "opened": that arrives after `run` is done.
+    launch_note: Option<String>,
     /// Where the tab bar last drew each tab, for hit-testing clicks.
     tab_hits: Vec<layout::TabHit>,
     /// First tab shown when the strip is narrower than all open tabs.
@@ -2436,7 +2448,13 @@ define_class!(
                 if interval > 0.0 && interval < 1.0 {
                     state.frame_interval = Duration::from_secs_f64(interval);
                 }
-                if state.message.as_ref().is_some_and(|(text, at)| at.elapsed() >= layout::message_lasts(text)) {
+                if state.message.as_ref().is_some_and(|(text, at)| {
+                    at.elapsed()
+                        >= layout::message_lasts_for(layout::feedback_for(
+                            text,
+                            state.message_kind.as_ref(),
+                        ))
+                }) {
                     state.message = None;
                     self.ivars().needs_redraw.set(true);
                 }
@@ -4910,6 +4928,11 @@ define_class!(
         fn open_file(&self, _app: &NSApplication, filename: &NSString) -> bool {
             let view = &self.ivars().view;
             let opened = view.load_path(&filename.to_string());
+            if let Some(mut state) = view.state_mut()
+                && let Some(note) = state.launch_note.take()
+            {
+                state.say(layout::Feedback::Failure, note);
+            }
             // Without this the window keeps whatever title it had, which for
             // a freshly launched app is "Untitled" over somebody's file.
             view.sync_title();
@@ -7793,8 +7816,10 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         .root()
         .map(|_| spawn_home_summary(workspace.clone(), home_since));
     let recent_projects = with_recent(session.recent.clone(), tree.root());
-    // Read once: each field below used to parse config.toml again.
-    let settings = crate::platform::settings::Settings::load();
+    // Read once: each field below used to parse config.toml again. A line
+    // it could not use is said once the window is up.
+    let (settings, settings_problems) = crate::platform::settings::Settings::load_checked();
+    let settings_said = crate::platform::settings::Settings::describe_problems(&settings_problems);
     let state = State {
         docs,
         native_preview: None,
@@ -7832,6 +7857,8 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         drew_once: false,
         worst: None,
         message: None,
+        message_kind: None,
+        launch_note: None,
         tab_hits: Vec::new(),
         tab_scroll: 0,
         tab_scroll_carry: 0.0,
@@ -8037,6 +8064,15 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
 
     if !testing && settings.update_check && crate::platform::update::launch_check_due() {
         view.start_update_check(false);
+    }
+
+    // Last, so nothing opened above says something else over it; the file
+    // AppKit opens once `run` is going says it again after itself.
+    if let Some(said) = settings_said
+        && let Some(mut state) = view.state_mut()
+    {
+        state.launch_note = Some(said.clone());
+        state.say(layout::Feedback::Failure, said);
     }
 
     if !testing {

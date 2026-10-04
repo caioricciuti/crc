@@ -523,9 +523,13 @@ impl EditorView {
             mut tree,
             finder,
             tree_version,
+            error,
         } = result;
         if state.tree.root() != Some(root.as_path()) {
             return;
+        }
+        if let Some(error) = error {
+            state.say(layout::Feedback::Failure, error);
         }
         if state.tree_version != tree_version {
             state.finder = finder;

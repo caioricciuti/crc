@@ -94,6 +94,9 @@ struct Status {
     /// The program has been waited for; its pid may belong to another
     /// process by now.
     reaped: AtomicBool,
+    /// How the program ended, once reaped: its exit code, or -1 when a
+    /// signal ended it.
+    code: std::sync::atomic::AtomicI32,
     /// A wake-up is queued and not yet taken by [`Session::drain_wake`].
     woken: AtomicBool,
 }
@@ -176,7 +179,9 @@ impl Session {
             let (status, wake) = (status.clone(), wake.clone());
             std::thread::spawn(move || {
                 let mut child = child;
-                let _ = child.wait();
+                let ended = child.wait();
+                let code = ended.ok().and_then(|s| s.code()).unwrap_or(-1);
+                status.code.store(code, Ordering::Release);
                 status.reaped.store(true, Ordering::Release);
                 status.exited.store(true, Ordering::Release);
                 if status.queue_wake() {
@@ -249,6 +254,15 @@ impl Session {
 
     pub fn has_exited(&self) -> bool {
         self.status.exited.load(Ordering::Acquire)
+    }
+
+    /// How the program ended, once it has been reaped: its exit code, or
+    /// `None` when a signal ended it or it is still running.
+    pub fn exit_code(&self) -> Option<i32> {
+        if !self.status.reaped.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(self.status.code.load(Ordering::Acquire)).filter(|c| *c >= 0)
     }
 
     /// Whether the reader asked for a redraw since the last call.

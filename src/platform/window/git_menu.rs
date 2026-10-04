@@ -396,7 +396,12 @@ impl EditorView {
                         )
                     }
                 },
-                Err(_) => String::new(),
+                // Said where the blame would be, so a Git that cannot
+                // answer is not mistaken for a line nobody touched.
+                Err(e) => format!(
+                    "blame unavailable: {}",
+                    crate::platform::git_panel::headline(&e)
+                ),
             };
             let _ = tx.send((id, line, note));
         });

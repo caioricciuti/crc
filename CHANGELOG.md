@@ -20,6 +20,17 @@ MCP servers get a page instead of an empty JSON file.
   how many servers it holds, or what is wrong with it.
 - In the sidebar a server's name shows its details and only its
   Start/Stop starts or stops it.
+- Push, pull or fetch that fails because ssh's key agent lives in another
+  app's container (Secretive) now says so: crc needs Full Disk Access,
+  and where to give it. Before, the note was ssh's "Load key" line.
+- Things that went wrong quietly are said in the status line: a line in
+  config.toml that cannot be used (with its line number, at launch and
+  on save), a project folder that cannot be read, a terminal program
+  that exited with an error code, and blame that Git could not give.
+  Failures are red and stay longer whatever their wording.
+- The status line shows the document's language server by name once it
+  has answered, and says when it stopped. Before, only its start had a
+  spinner.
 
 ## v0.2.0-alpha.13, 2026-10-02
 

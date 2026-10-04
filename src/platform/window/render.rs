@@ -86,6 +86,7 @@ impl EditorView {
             drew_once,
             worst,
             message,
+            message_kind,
             marked,
             marked_caret,
             responses,
@@ -724,7 +725,15 @@ impl EditorView {
         // A transient note (save result, open error) takes over the status
         // line briefly, then yields back to the steady-state readout.
         let note = match message {
-            Some((text, at)) if at.elapsed() < layout::message_lasts(text) => Some(text.clone()),
+            Some((text, at))
+                if at.elapsed()
+                    < layout::message_lasts_for(layout::feedback_for(
+                        text,
+                        message_kind.as_ref(),
+                    )) =>
+            {
+                Some(text.clone())
+            }
             _ => {
                 *message = None;
                 None
@@ -751,6 +760,15 @@ impl EditorView {
             unshaped: *unshaped_on_screen,
             branch: git.branch_status(),
             claude: claude.as_ref().is_some_and(|c| c.is_connected()),
+            lsp: lsp_language(buffer)
+                .and_then(|language| lsp.get(&crate::lsp::servers::server_key(language)))
+                .and_then(|server| match &server.phase {
+                    crate::lsp::client::Phase::Ready => Some(server.name.clone()),
+                    crate::lsp::client::Phase::Failed(_) => {
+                        Some(format!("{} stopped", server.name))
+                    }
+                    crate::lsp::client::Phase::Starting => None,
+                }),
         });
         let detail = if std::env::var_os("CRC_SHOW_LATENCY").is_some() {
             format!("{}  {:?}", latency.summary(), worst)
@@ -785,7 +803,9 @@ impl EditorView {
             lead(&mut left, w + 8.0);
             (work.as_str(), theme.status_text)
         } else {
-            let feedback = shown_note.map_or(layout::Feedback::Info, layout::feedback_of);
+            let feedback = shown_note.map_or(layout::Feedback::Info, |text| {
+                layout::feedback_for(text, message_kind.as_ref())
+            });
             let icon = match feedback {
                 layout::Feedback::Failure => Some((icons::ERROR, theme.diff_removed)),
                 layout::Feedback::Success => Some((icons::PASS, theme.diff_added)),
@@ -1242,6 +1262,9 @@ struct StatusParts<'a> {
     branch: String,
     /// Claude Code is connected.
     claude: bool,
+    /// The document's language server once it answers: its name, or that
+    /// it stopped. Nothing while it starts; the spinner says that.
+    lsp: Option<String>,
 }
 
 /// The status line's left and right text. The left is a note, else the
@@ -1306,8 +1329,13 @@ fn status_texts(parts: &StatusParts<'_>) -> (String, String) {
         )
     };
     let right = format!(
-        "{}{}{counts}{position}",
+        "{}{}{}{counts}{position}",
         if parts.claude { "✻ Claude     " } else { "" },
+        parts
+            .lsp
+            .as_deref()
+            .map(|lsp| format!("● {lsp}     "))
+            .unwrap_or_default(),
         if parts.branch.is_empty() {
             String::new()
         } else {
@@ -1332,7 +1360,23 @@ mod status_tests {
             unshaped: false,
             branch: String::new(),
             claude: false,
+            lsp: None,
         }
+    }
+
+    #[test]
+    fn the_language_server_shows_at_the_right_once_it_answers() {
+        let buffer = Buffer::new();
+        let mut p = parts(&buffer);
+        assert!(!status_texts(&p).1.contains('\u{25cf}'));
+        p.lsp = Some("rust-analyzer".into());
+        assert!(
+            status_texts(&p)
+                .1
+                .starts_with("\u{25cf} rust-analyzer     ")
+        );
+        p.lsp = Some("rust-analyzer stopped".into());
+        assert!(status_texts(&p).1.contains("rust-analyzer stopped"));
     }
 
     fn diagnostic(line: u32, severity: Severity, message: &str) -> Diagnostic {

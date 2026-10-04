@@ -774,10 +774,22 @@ pub fn feedback_of(text: &str) -> Feedback {
 /// How long a status-line message stays: a failure twice as long, since
 /// it has to be read, not just noticed.
 pub fn message_lasts(text: &str) -> std::time::Duration {
-    std::time::Duration::from_secs(match feedback_of(text) {
+    message_lasts_for(feedback_of(text))
+}
+
+/// How long a message of `feedback` stays: a failure long enough to read.
+pub fn message_lasts_for(feedback: Feedback) -> std::time::Duration {
+    std::time::Duration::from_secs(match feedback {
         Feedback::Failure => 8,
         _ => 4,
     })
+}
+
+/// What a message is: as said by whoever set it (`kind`, when it is about
+/// this very text), else as its wording reads.
+pub fn feedback_for(text: &str, kind: Option<&(String, Feedback)>) -> Feedback {
+    kind.filter(|(said, _)| said == text)
+        .map_or_else(|| feedback_of(text), |(_, kind)| *kind)
 }
 
 /// The time-based phase of anything animated, 0..1 over `period` seconds.

@@ -196,3 +196,13 @@ impl State {
             && self.html_preview.as_ref().is_none_or(|p| !p.busy())
     }
 }
+
+impl State {
+    /// Says `text` in the status line as `kind`: a failure shows red and
+    /// stays longer whatever its wording, a success green.
+    pub(super) fn say(&mut self, kind: layout::Feedback, text: impl Into<String>) {
+        let text = text.into();
+        self.message_kind = Some((text.clone(), kind));
+        self.message = Some((text, Instant::now()));
+    }
+}

@@ -151,7 +151,7 @@ impl EditorView {
     /// The settings file was just saved from a tab: read it back and apply
     /// what changed.
     pub(super) fn apply_settings_file(&self) {
-        let settings = crate::platform::settings::Settings::load();
+        let (settings, problems) = crate::platform::settings::Settings::load_checked();
         let (font, size) = {
             let Some(state) = self.state() else {
                 return;
@@ -175,7 +175,10 @@ impl EditorView {
         }
         self.apply_theme();
         if let Some(mut state) = self.state_mut() {
-            state.message = Some(("settings applied".to_string(), Instant::now()));
+            match crate::platform::settings::Settings::describe_problems(&problems) {
+                Some(said) => state.say(layout::Feedback::Failure, said),
+                None => state.say(layout::Feedback::Success, "settings applied"),
+            }
         }
     }
 

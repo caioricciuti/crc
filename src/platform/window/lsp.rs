@@ -81,8 +81,16 @@ impl EditorView {
                         return;
                     };
                     // Said once per language, in the status line, and then
-                    // the editor is simply an editor for that file.
-                    state.message = Some((reason.clone(), Instant::now()));
+                    // the editor is simply an editor for that file. Not over
+                    // something said just now (a save's outcome): that is
+                    // news, this is not.
+                    if state
+                        .message
+                        .as_ref()
+                        .is_none_or(|(_, at)| at.elapsed() > Duration::from_secs(1))
+                    {
+                        state.message = Some((reason.clone(), Instant::now()));
+                    }
                     state.lsp.unavailable.insert(key, reason);
                 }
             }

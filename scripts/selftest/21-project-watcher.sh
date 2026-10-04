@@ -33,3 +33,13 @@ CRC_SELFTEST="$T/watch.script" "$BIN" "$T/watchproj" 2> "$T/watch.err"
 wait
 expect "$T/watch-before.out" finder_entries 1
 expect "$T/watch-after.out" finder_entries 2
+
+# ---- a folder that cannot be read -----------------------------------------
+# Opening a folder the user may not read gives an empty Explorer; the
+# status line says why instead of leaving it looking empty on purpose.
+mkdir -p "$T/locked"
+chmod 000 "$T/locked"
+printf 'wait 600\nwait 300\ndump %s/locked.out\nquit\n' "$T" > "$T/locked.script"
+CRC_SELFTEST="$T/locked.script" "$BIN" "$T/locked" 2> "$T/locked.err"
+chmod 755 "$T/locked"
+expect "$T/locked.out" message "Could not read $T/locked: Permission denied (os error 13)"

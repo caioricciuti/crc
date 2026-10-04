@@ -24,6 +24,16 @@ if ! grep -q '^# crc settings' "$T/settingshome/.config/crc/config.toml"; then
     failed "settings: file not created from the template"
 fi
 expect "$T/settings-saved.out" dirty "false"
+expect "$T/settings-saved.out" message "settings applied"
+
+# ---- settings that cannot be used -----------------------------------------
+# A line with an unknown key or a value the key does not take is said in
+# the status line with its line number, at launch and again on save.
+mkdir -p "$T/badsettings/.config/crc"
+printf 'theme = "sepia"\ncolour = 1\nfont_size = 15\n' > "$T/badsettings/.config/crc/config.toml"
+printf 'wait 300\ndump %s/badsettings.out\nquit\n' "$T" > "$T/badsettings.script"
+HOME="$T/badsettings" CRC_SELFTEST="$T/badsettings.script" "$BIN" "$T/settings.txt" 2> "$T/badsettings.err"
+expect "$T/badsettings.out" message 'config.toml line 1: theme takes "system", "dark" or "light", not "sepia" (and 1 more)'
 
 # ---- light appearance -----------------------------------------------------
 # theme = "light" in the settings file picks the light table whatever the

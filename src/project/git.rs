@@ -1216,10 +1216,43 @@ pub fn remote(root: &Path, what: Remote, ssh_auth_sock: Option<&Path>) -> Result
     } else {
         Err(if said.is_empty() {
             format!("git {} failed", args[0])
+        } else if let Some(why) = explain_ssh_failure(&said) {
+            format!("error: {why}\n\n{said}")
         } else {
             said
         })
     }
+}
+
+/// What Git's output does not say when ssh failed on a key agent or key
+/// file inside another app's container (Secretive keeps its socket and
+/// public keys in `~/Library/Containers/...`): macOS keeps crc out of
+/// that folder until crc has Full Disk Access. The shell works because
+/// the terminal app has it. `None` when the output shows nothing of the
+/// kind.
+pub fn explain_ssh_failure(stderr: &str) -> Option<String> {
+    let line = stderr.lines().map(str::trim).find(|l| {
+        l.contains("/Library/Containers/")
+            && (l.starts_with("Load key")
+                || l.contains("Permission denied")
+                || l.contains("Operation not permitted")
+                || l.contains("No such file"))
+    })?;
+    let bundle = line
+        .split("/Library/Containers/")
+        .nth(1)
+        .and_then(|rest| rest.split('/').next())
+        .unwrap_or("");
+    let app = if bundle.contains("Secretive") {
+        "Secretive".to_owned()
+    } else if bundle.is_empty() {
+        "another app".to_owned()
+    } else {
+        bundle.to_owned()
+    };
+    Some(format!(
+        "Full Disk Access is needed: ssh's key agent lives in {app}'s container, which macOS keeps crc out of. System Settings > Privacy & Security > Full Disk Access, add crc, then try again. The shell works because the terminal app has it."
+    ))
 }
 
 /// Who last changed a line, and when, for the status line.
@@ -1297,6 +1330,22 @@ pub fn ago(time: i64, now: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_key_agent_in_another_apps_container_is_explained() {
+        let said = "Load key \"/Users/me/Library/Containers/com.maxgoedjen.Secretive.SecretAgent/Data/PublicKeys/abc.pub\": invalid format\ngit@github.com: Permission denied (publickey).\nfatal: Could not read from remote repository.";
+        let why = explain_ssh_failure(said).unwrap();
+        assert!(why.starts_with("Full Disk Access is needed"), "{why}");
+        assert!(why.contains("Secretive's container"), "{why}");
+        assert_eq!(
+            explain_ssh_failure("fatal: Could not read from remote repository."),
+            None
+        );
+        assert_eq!(
+            explain_ssh_failure("Load key \"/Users/me/.ssh/id\": bad"),
+            None
+        );
+    }
 
     /// A repository in a temporary folder, with a test identity and no
     /// signing, removed when dropped (a failed test included).
