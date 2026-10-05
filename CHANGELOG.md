@@ -2,9 +2,10 @@
 
 One entry per tag, written for people who use the editor.
 
-## Unreleased
+## v0.2.0-alpha.14, 2026-10-05
 
-MCP servers get a page instead of an empty JSON file.
+MCP servers get a page instead of an empty JSON file, and what goes
+wrong is said in the status line.
 
 - Opening MCP Servers shows a page in the editor column: what a server
   is, a card per server with its command or URL, its status and

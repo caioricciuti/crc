@@ -69,7 +69,8 @@ commented template the first time: `font`, `font_size`, `theme`
 (`system`, `dark` or `light`), `caret_blink`, `update_check`,
 `format_on_save`, `word_wrap`, `ssh_auth_sock` and `conflict_view`
 (`inline` or `side-by-side`), each explained in the file. Saving the file
-applies it. `Cmd-=`, `Cmd--` and `Cmd-0` change
+applies it; a line crc cannot use is said in the status line with its
+number. `Cmd-=`, `Cmd--` and `Cmd-0` change
 the size and write it back.
 
 ## What works
