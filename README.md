@@ -222,6 +222,10 @@ the size and write it back.
   changes; other change types use whole-file actions. Gutter marks compare
   with HEAD, not the index. Conflict markers must be Git's default seven
   characters.
+- **Agent review sees file tools only.** Claude's Write and Edit calls in
+  the Claude tab crc starts are kept; files an agent changes through shell
+  commands are not, and neither are agents without hooks. `claude` typed
+  in a crc shell gets the hooks only if you add them to its settings.
 - **No minimap.** Folding is by indentation, not by syntax.
 - **Markdown styling has edges.** Italic is not drawn on lines with
   non-ASCII text, and bold there is the regular face drawn twice; a line
