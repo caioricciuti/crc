@@ -404,6 +404,8 @@ pub enum HomeAction {
     RunCall(std::path::PathBuf),
     /// Show this terminal session, with the keyboard.
     ShowTerminal(usize),
+    /// Open the Review page.
+    OpenReview,
 }
 
 /// A clickable row on the home screen.
@@ -429,6 +431,7 @@ pub fn build_home(
     recent: &[std::path::PathBuf],
     summary: Option<&crate::project::workspace::Summary>,
     terminals: &[(String, String)],
+    review: &[(String, usize, bool)],
     hits: &mut Vec<HomeHit>,
 ) {
     const ROW: f32 = 30.0;
@@ -465,6 +468,37 @@ pub fn build_home(
         *y += 22.0;
         push_rect(out, atlas, [x, *y - 4.0], [width, 1.0], theme.hairline);
     };
+
+    // What agents changed and nobody has looked at yet comes first.
+    if !review.is_empty() && y + 22.0 + ROW <= bottom {
+        section(out, atlas, &mut y, "Review");
+        for (title, files, running) in review {
+            if y + ROW > bottom {
+                break;
+            }
+            let detail = format!(
+                "{files} file{}{}",
+                if *files == 1 { "" } else { "s" },
+                if *running { " \u{b7} running" } else { "" }
+            );
+            let rect = home_row(
+                out,
+                atlas,
+                theme,
+                (x, width),
+                y,
+                icons::TERMINAL,
+                title,
+                &detail,
+            );
+            hits.push(HomeHit {
+                rect,
+                action: HomeAction::OpenReview,
+            });
+            y += ROW;
+        }
+        y += GAP;
+    }
 
     // Terminals first: a session waiting on you matters more than what
     // to open next, and the panel under Home leaves little height.
@@ -3173,6 +3207,7 @@ mod home_tests {
             &recent,
             None,
             &[],
+            &[],
             &mut hits,
         );
         let actions: Vec<&HomeAction> = hits.iter().map(|h| &h.action).collect();
@@ -3246,6 +3281,7 @@ mod home_tests {
             &[],
             Some(&summary),
             &[("claude".into(), "waiting: Approve?".into())],
+            &[],
             &mut hits,
         );
         let actions: Vec<HomeAction> = hits.iter().map(|h| h.action.clone()).collect();
@@ -3286,6 +3322,7 @@ mod home_tests {
             None,
             &[],
             None,
+            &[],
             &[],
             &mut hits,
         );

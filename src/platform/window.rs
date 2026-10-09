@@ -64,6 +64,7 @@ mod mcp;
 mod palette;
 mod project;
 mod render;
+mod review;
 mod selftest_play;
 mod sidebar;
 mod state;
@@ -641,6 +642,8 @@ struct State {
     mcp: crate::platform::mcp_panel::Panel,
     /// The Settings page.
     settings_page: crate::platform::settings_page::Page,
+    /// The Review page, and Home's list of what is waiting for review.
+    review_page: crate::platform::review_page::Page,
     /// The call behind each MCP answer tab, so Cmd-Return there runs it
     /// again.
     mcp_calls: HashMap<u64, crate::mcp_client::call::Call>,
@@ -1515,6 +1518,31 @@ define_class!(
                 }
                 return;
             }
+            // And the Review page.
+            let review_action = {
+                let Some(state) = self.state() else {
+                    return;
+                };
+                (column_of(&state) == Column::AgentReview
+                    && state.palette.is_none()
+                    && details_rect(&chrome).contains(x, y))
+                .then(|| state.review_page.hit(x, y))
+            };
+            if let Some(action) = review_action {
+                match action {
+                    Some(action) => self.review_action(action),
+                    None => {
+                        // A click on nothing cancels a pending confirmation.
+                        if let Some(mut state) = self.state_mut()
+                            && state.review_page.confirm.take().is_some()
+                        {
+                            drop(state);
+                            self.request_redraw();
+                        }
+                    }
+                }
+                return;
+            }
 
             // The scrollbar thumb, before anything that treats a press in
             // the text as a caret placement. A press on the track outside
@@ -1761,6 +1789,7 @@ define_class!(
                         }
                         state.mcp.details = false;
                         state.settings_page.open = false;
+                        state.review_page.open = false;
                         state.drag = Some(Drag::Tab(index));
                     }
                     self.tab_click(x);
@@ -1949,6 +1978,7 @@ define_class!(
                             self.run_pick(Pick::File(path));
                             self.run_mcp_call();
                         }
+                        layout::HomeAction::OpenReview => self.open_review(),
                     }
                     self.request_redraw();
                     self.pump();
@@ -2264,6 +2294,25 @@ define_class!(
                         state
                             .settings_page
                             .scroll_by(lines as f32 * crate::platform::settings_page::ROW);
+                    }
+                    self.request_redraw();
+                    self.pump();
+                    return;
+                }
+            }
+            {
+                // So do the Review page's list and diff.
+                let point = self.convertPoint_fromView(event.locationInWindow(), None);
+                let (px, py) = (point.x as f32, point.y as f32);
+                let over_page = self.state().is_some_and(|state| {
+                    column_of(&state) == Column::AgentReview && state.review_page.over(px, py)
+                });
+                if over_page {
+                    let lines = self.wheel_lines(event, WheelTarget::Readme);
+                    if lines != 0
+                        && let Some(mut state) = self.state_mut()
+                    {
+                        state.review_page.scroll_at(px, py, lines);
                     }
                     self.request_redraw();
                     self.pump();
@@ -3601,6 +3650,11 @@ define_class!(
             self.open_mcp();
         }
 
+        #[unsafe(method(showReview:))]
+        fn action_show_review(&self, _sender: Option<&AnyObject>) {
+            self.open_review();
+        }
+
         #[unsafe(method(addMcpServer:))]
         fn action_add_mcp_server(&self, _sender: Option<&AnyObject>) {
             self.open_mcp();
@@ -4614,6 +4668,14 @@ impl EditorView {
                     .filter(|_| column_of(&state) == Column::Settings)
                     .map(|(r, _)| *r),
             )
+            .chain(
+                state
+                    .review_page
+                    .hits
+                    .iter()
+                    .filter(|_| column_of(&state) == Column::AgentReview)
+                    .map(|(r, _)| *r),
+            )
             .collect();
         if state.pointer_targets != pointer_targets {
             state.pointer_targets = pointer_targets;
@@ -5382,6 +5444,8 @@ enum Column {
     Mcp,
     /// The Settings page.
     Settings,
+    /// The Review page: agents' changes.
+    AgentReview,
     /// A Source Control change, in its tab.
     GitDiff,
     /// A document's merge conflicts as columns.
@@ -5403,6 +5467,8 @@ fn column_of(state: &State) -> Column {
         Column::Mcp
     } else if state.settings_page.open {
         Column::Settings
+    } else if state.review_page.open {
+        Column::AgentReview
     } else if diffing(state) {
         Column::GitDiff
     } else if side_by_side(state) {
@@ -5999,6 +6065,7 @@ fn draw_other_pane(
             &[],
             None,
             &[],
+            &[],
             &mut hits,
         );
         return;
@@ -6222,7 +6289,10 @@ fn frame_of(state: &mut State) -> Frame {
     for (index, pane) in &chrome.others {
         frame.push(Hit::Pane(*index), pane.whole());
     }
-    let covered = matches!(column, Column::Extensions | Column::Mcp | Column::Settings);
+    let covered = matches!(
+        column,
+        Column::Extensions | Column::Mcp | Column::Settings | Column::AgentReview
+    );
     for hit in tab_hits.iter().filter(|_| !covered) {
         if hit.index == docs.active_index() {
             frame.push(
@@ -7530,6 +7600,7 @@ fn install_menu(mtm: MainThreadMarker, app: &NSApplication) {
     source_control
         .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
     git_menu.addItem(&source_control);
+    git_menu.addItem(&item("Review Agent Changes", sel!(showReview:), "", false));
     git_menu.addItem(&mcp_servers);
     git_menu.addItem(&item(
         "Add MCP Server\u{2026}",
@@ -7954,6 +8025,11 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         home_since,
         mcp: Default::default(),
         settings_page: Default::default(),
+        review_page: crate::platform::review_page::Page {
+            summary: crate::project::review::root()
+                .map_or_else(Vec::new, |r| crate::project::review::summary(&r)),
+            ..Default::default()
+        },
         mcp_calls: HashMap::new(),
         branch_rx: None,
         organize_on_save: settings.organize_imports_on_save,

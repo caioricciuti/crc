@@ -128,6 +128,7 @@ impl EditorView {
         state.settings_page.reload();
         state.settings_page.open = true;
         state.settings_page.scroll = 0.0;
+        state.review_page.open = false;
         if let Some(page) = &mut state.extensions {
             page.details = false;
         }

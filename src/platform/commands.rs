@@ -40,6 +40,8 @@ fn keywords(action: Sel) -> &'static str {
         "file find go"
     } else if action == sel!(togglePreview:) {
         "markdown render"
+    } else if action == sel!(showReview:) {
+        "agent claude undo keep diff changes"
     } else {
         ""
     }

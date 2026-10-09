@@ -363,6 +363,70 @@ pub fn claude_settings_arg() -> Option<String> {
     Some(shell_quote(&path.to_string_lossy()))
 }
 
+/// Every session folder under `root`.
+pub fn sessions(root: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect()
+}
+
+/// How many files each session with something to review holds, with its
+/// title: what Home lists, without reading any file's text.
+pub fn summary(root: &Path) -> Vec<(PathBuf, String, usize)> {
+    let mut out: Vec<(PathBuf, String, usize)> = sessions(root)
+        .into_iter()
+        .filter_map(|dir| {
+            let n = files(&dir).len();
+            (n > 0).then(|| {
+                let title = about(&dir).0;
+                (dir, title, n)
+            })
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Records which tab and folder a session belongs to, once, so the review
+/// can name it after the tab is gone.
+pub fn describe(dir: &Path, title: &str, folder: &Path) {
+    let path = dir.join("about");
+    if path.exists() || !dir.is_dir() {
+        return;
+    }
+    let clean = |s: &str| s.replace(['\n', '\r'], " ");
+    let _ = std::fs::write(
+        path,
+        format!(
+            "title={}\nfolder={}\n",
+            clean(title),
+            // Resolved, as the file paths are, so one is a prefix of the other.
+            clean(&crate::platform::canonical(folder).to_string_lossy())
+        ),
+    );
+}
+
+/// The session's tab title and its folder, as [`describe`] wrote them;
+/// "Terminal" and an empty path when it never did.
+pub fn about(dir: &Path) -> (String, PathBuf) {
+    let text = std::fs::read_to_string(dir.join("about")).unwrap_or_default();
+    let field = |key: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(key)?.strip_prefix('='))
+            .map(str::to_owned)
+    };
+    let title = field("title").unwrap_or_else(|| "Terminal".into());
+    (
+        title,
+        field("folder").map(PathBuf::from).unwrap_or_default(),
+    )
+}
+
 /// What a review compares for one file: its checkpoint and its text now.
 /// A file the agent deleted reads as empty; so does one that did not
 /// exist before.
@@ -715,5 +779,19 @@ mod tests {
                 .next()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_session_is_named_after_its_tab() {
+        let tree = TempTree::new("review-about", &[("s/files/", "")]);
+        let dir = tree.0.join("s");
+        assert_eq!(about(&dir), ("Terminal".into(), PathBuf::new()));
+        describe(&dir, "\u{273b} Claude", Path::new("/work/garden-log"));
+        describe(&dir, "later", Path::new("/elsewhere"));
+        assert_eq!(
+            about(&dir),
+            ("\u{273b} Claude".into(), PathBuf::from("/work/garden-log"))
+        );
+        assert!(summary(&tree.0).is_empty(), "no files, nothing to list");
     }
 }

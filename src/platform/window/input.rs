@@ -445,7 +445,10 @@ impl EditorView {
         // document underneath. The palette, opened over it, keeps its own
         // keys.
         if self.state().is_some_and(|state| {
-            ext_details(&state) || mcp_details(&state) || state.settings_page.open
+            ext_details(&state)
+                || mcp_details(&state)
+                || state.settings_page.open
+                || state.review_page.open
         }) && self.state().is_some_and(|state| state.palette.is_none())
             && !event
                 .modifierFlags()
@@ -459,6 +462,7 @@ impl EditorView {
                     };
                     let page = state.extensions.as_mut();
                     page.is_some_and(|p| p.confirm.take().is_some())
+                        || state.review_page.confirm.take().is_some()
                 };
                 if !confirming {
                     let Some(mut state) = self.state_mut() else {
@@ -469,6 +473,7 @@ impl EditorView {
                     }
                     state.mcp.details = false;
                     state.settings_page.open = false;
+                    state.review_page.open = false;
                 }
                 self.request_redraw();
             }

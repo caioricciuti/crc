@@ -33,6 +33,7 @@ impl EditorView {
             state.mcp.details = true;
             state.mcp.note = None;
             state.settings_page.open = false;
+            state.review_page.open = false;
             state.sidebar = true;
         }
         self.request_redraw();

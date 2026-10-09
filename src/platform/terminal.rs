@@ -74,6 +74,11 @@ impl Tab {
     pub fn name(&self) -> String {
         label(self)
     }
+
+    /// The title without the review count, for naming its session.
+    pub fn base_name(&self) -> String {
+        title_of(self)
+    }
 }
 
 pub struct Panel {
@@ -232,6 +237,13 @@ pub fn header_hide(header: Viewport) -> Viewport {
 /// The title the program set, when it set one (`claude` does, and so do
 /// most shell prompts), otherwise the name the tab started with.
 fn label(tab: &Tab) -> String {
+    match tab.review_files {
+        0 => title_of(tab),
+        n => format!("{} \u{b7} {n} to review", title_of(tab)),
+    }
+}
+
+fn title_of(tab: &Tab) -> String {
     let term = tab.session.term.lock().unwrap_or_else(|e| e.into_inner());
     let title = term.title.trim();
     if title.is_empty() {

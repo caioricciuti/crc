@@ -337,6 +337,7 @@ impl EditorView {
         let mut said = None;
         let watching = state.terminal.has_keys();
         let active = state.terminal.active;
+        let mut wrote = false;
         for (index, mut notice) in noticed {
             let Some(tab) = state.terminal.tabs.get_mut(index) else {
                 continue;
@@ -349,7 +350,12 @@ impl EditorView {
             for event in events {
                 match event {
                     crate::project::review::Event::Wrote { .. } => {
-                        tab.review_files = crate::project::review::files(&tab.review).len();
+                        crate::project::review::describe(
+                            &tab.review,
+                            &tab.base_name(),
+                            &tab.launch.cwd,
+                        );
+                        wrote = true;
                     }
                     crate::project::review::Event::Asked(text) => notice = Some(text),
                     crate::project::review::Event::Failed(text) => {
@@ -363,6 +369,9 @@ impl EditorView {
                     said = Some(format!("{}: {}", tab.name(), tab.state()));
                 }
             }
+        }
+        if wrote {
+            super::review::refresh_review(&mut state);
         }
         if let Some(said) = said {
             state.message = Some((said, now));

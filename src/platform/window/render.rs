@@ -77,6 +77,7 @@ impl EditorView {
             mcp_url_prompt,
             extensions,
             settings_page,
+            review_page,
             blame: Blame { shown: blame, .. },
             renderer,
             glyphs,
@@ -200,6 +201,15 @@ impl EditorView {
                 theme,
                 glyphs,
             );
+        } else if column == Column::AgentReview {
+            glyphs.clear();
+            crate::platform::review_page::draw(
+                review_page,
+                &mut renderer.atlas,
+                ext_details_rect,
+                theme,
+                glyphs,
+            );
         } else if let Some(page) = extensions.as_mut().filter(|_| column == Column::Extensions) {
             glyphs.clear();
             crate::platform::extensions::draw_details(
@@ -286,6 +296,11 @@ impl EditorView {
                     .tabs
                     .iter()
                     .map(|t| (t.name(), t.state()))
+                    .collect::<Vec<_>>(),
+                &review_page
+                    .summary
+                    .iter()
+                    .map(|(dir, title, n)| (title.clone(), *n, review_page.running.contains(dir)))
                     .collect::<Vec<_>>(),
                 home_hits,
             );
@@ -517,7 +532,10 @@ impl EditorView {
         // Under the Extensions details the tabs are still laid out, so
         // their hit list stays true, but drawn into nothing.
         let mut hidden = Vec::new();
-        let details = matches!(column, Column::Extensions | Column::Mcp | Column::Settings);
+        let details = matches!(
+            column,
+            Column::Extensions | Column::Mcp | Column::Settings | Column::AgentReview
+        );
         layout::build_tab_bar(
             docs,
             *tab_scroll,
@@ -529,7 +547,10 @@ impl EditorView {
             tab_hits,
         );
 
-        if matches!(column, Column::Extensions | Column::Mcp | Column::Settings) {
+        if matches!(
+            column,
+            Column::Extensions | Column::Mcp | Column::Settings | Column::AgentReview
+        ) {
             // The Extensions, MCP and Settings pages cover this row; a document's
             // path here would label them as something they are not.
         } else if diffing {

@@ -115,8 +115,15 @@ the size and write it back.
   `--settings` so nothing in `~/.claude` changes: each file is kept as it
   was before Claude's first edit to it, in
   `~/Library/Application Support/crc/sessions/` for 14 days, and Claude's
-  questions mark its tab. `agent_review = false` turns them off. Reviewing
-  and undoing from those copies is not built yet.
+  questions mark its tab. `agent_review = false` turns them off.
+- **Review agent changes**: Home lists each session that changed files,
+  and the tab says how many are waiting. Git > Review Agent Changes (also
+  in the palette) shows every file a session changed against the copy kept
+  before its first edit: Keep a change and it leaves the review, Undo it
+  and it comes out of the file, by hunk, by file or for a whole session.
+  Undo is refused while the file has unsaved edits in crc; an open clean
+  file reloads, and `Cmd-Z` there brings the agent's version back. Edits
+  an agent makes through shell commands are not seen.
 - **Workspaces**: open a folder that holds several repositories and the
   notes about them, and Source Control shows one repository at a time
   with a menu to switch. Home becomes the workspace's front page: what
