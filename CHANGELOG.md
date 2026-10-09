@@ -2,6 +2,24 @@
 
 One entry per tag, written for people who use the editor.
 
+## v0.2.0-alpha.16, 2026-10-10
+
+crc installs its own updates now, and agent review also lists files an
+agent changed with shell commands.
+
+- Help > Check for Updates downloads a newer release and checks it before
+  offering it: its SHA256SUMS, a signature from crc's developer with crc's
+  bundle id, Gatekeeper's notarization check, and a version newer than the
+  running one. Then Help > Restart to Update, or the row on Home, quits the
+  way Cmd-Q does (unsaved documents ask first), puts the new crc in place
+  of the old one and opens it. The daily check still only announces, and
+  nothing installs without that click. This is the last release you need
+  to install from the DMG by hand.
+- Files changed while a terminal is busy, but not through the agent's file
+  tools (a shell command, an agent without hooks), show in Review with the
+  note that no copy from before was kept. They are compared with Git's
+  staged copy and can be kept, not undone. Files Git ignores are left out.
+
 ## v0.2.0-alpha.15, 2026-10-09
 
 What an agent changes in a crc terminal can now be reviewed and undone,
