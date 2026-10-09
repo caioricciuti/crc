@@ -2,6 +2,29 @@
 
 One entry per tag, written for people who use the editor.
 
+## v0.2.0-alpha.15, 2026-10-09
+
+What an agent changes in a crc terminal can now be reviewed and undone,
+change by change, and settings get a page of their own.
+
+- The Claude tab crc starts (Cmd-Shift-C) keeps each file as it was
+  before Claude's first edit to it. The hooks that do it are passed with
+  `claude --settings`, so nothing in ~/.claude changes; the copies stay in
+  crc's folder for 14 days. `agent_review = false` turns it off.
+- Git > Review Agent Changes, also in the palette and on Home, shows
+  every file a session changed against that copy. Keep a change and it
+  leaves the review; Undo it and it comes out of the file. By hunk, by
+  file, or a whole session at once; undoing a whole file or session asks
+  twice. Undo is refused while the file has unsaved edits in crc, and an
+  open file reloads with the agent's version one Cmd-Z away.
+- A terminal tab says how many of its files wait for review, and Claude's
+  questions mark its tab the way terminal notifications do.
+- Cmd-, opens a Settings page: every setting by group, what it does, its
+  value and its default. Edit opens config.toml at that setting; saving
+  the file updates the page.
+- Cmd-W on the last tab goes back to Home instead of closing the window
+  and quitting.
+
 ## v0.2.0-alpha.14, 2026-10-05
 
 MCP servers get a page instead of an empty JSON file, and what goes
