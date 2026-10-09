@@ -2974,9 +2974,10 @@ define_class!(
             self.cycle_tab(-1);
         }
 
-        /// Cmd-W closes the tab while more than one is open, and only falls
-        /// through to closing the window on the last one. That is what every
-        /// tabbed editor does and what muscle memory expects.
+        /// Cmd-W closes the tab. The last one goes back to Home, as its
+        /// close button does, and Cmd-W at Home does nothing: closing the
+        /// last window quits the app, which a tab shortcut must never do.
+        /// The window's close button and Cmd-Q still close it.
         #[unsafe(method(closeTabOrWindow:))]
         fn action_close_tab(&self, _sender: Option<&AnyObject>) {
             // Cmd-W in the terminal closes its session, as in any terminal.
@@ -2990,21 +2991,17 @@ define_class!(
                 self.after_terminal_layout();
                 return;
             }
-            let (count, active, panes) = {
+            let (home, active, panes) = {
                 let Some(state) = self.state() else {
                     return;
                 };
-                (state.docs.len(), state.docs.active_index(), pane_count(&state))
+                (state.docs.is_home(), state.docs.active_index(), pane_count(&state))
             };
             // In a split the last tab of a pane closes that pane, which
-            // `close_tab` already does; only the last tab of the last pane
-            // closes the window.
-            if count > 1 || panes > 1 {
+            // `close_tab` already does.
+            if !home || panes > 1 {
                 self.close_tab(active);
-            } else if self.confirm_discard_all()
-                && let Some(window) = self.window() {
-                    window.close();
-                }
+            }
         }
 
         #[unsafe(method(closeContextTab:))]
