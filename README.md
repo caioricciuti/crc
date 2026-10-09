@@ -55,7 +55,8 @@ cd crc
 scripts/bundle.sh --install
 ```
 
-That puts an ad-hoc signed `crc.app` in `/Applications`. Either way:
+That puts a `crc.app` in `/Applications`, ad-hoc signed unless your
+keychain holds a Developer ID Application certificate. Either way:
 
 ```sh
 open -a crc path/to/file    # open a file

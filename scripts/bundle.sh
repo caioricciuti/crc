@@ -8,7 +8,9 @@
 #
 # Usage:
 #   scripts/bundle.sh              build into target/crc.app, ad-hoc signed
-#   scripts/bundle.sh --install    build, then copy into /Applications
+#   scripts/bundle.sh --install    build, then copy into /Applications;
+#                                  signed with the Developer ID when this
+#                                  machine has one, ad-hoc otherwise
 #   scripts/bundle.sh --release    build, sign with the Developer ID in the
 #                                  keychain, notarize, staple, and write a
 #                                  signed, notarized DMG plus SHA256SUMS
@@ -139,13 +141,15 @@ NOTARY_PROFILE="crc-notary"
 # than the login one; the workflow says where.
 NOTARY_KEYCHAIN="${CRC_NOTARY_KEYCHAIN:+--keychain $CRC_NOTARY_KEYCHAIN}"
 
+# The identity is looked up, not configured: there is exactly one
+# Developer ID Application certificate on the release machine, and a
+# second one would be a question to answer, not a choice to make here.
+IDENTITY=$(security find-identity -v -p codesigning \
+    | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p')
+IDENTITY_COUNT=$(printf '%s\n' "$IDENTITY" | grep -c . || true)
+
 if [ "$MODE" = "--release" ]; then
-    # The identity is looked up, not configured: there is exactly one
-    # Developer ID Application certificate on the release machine, and a
-    # second one would be a question to answer, not a choice to make here.
-    IDENTITY=$(security find-identity -v -p codesigning \
-        | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p')
-    if [ "$(printf '%s\n' "$IDENTITY" | grep -c .)" -ne 1 ]; then
+    if [ "$IDENTITY_COUNT" -ne 1 ]; then
         echo "error: expected exactly one Developer ID Application identity, found:" >&2
         printf '%s\n' "$IDENTITY" >&2
         exit 1
@@ -185,6 +189,18 @@ if [ "$MODE" = "--release" ]; then
     (cd target && shasum -a 256 "$(basename "$DMG")" > SHA256SUMS)
     echo "    $DMG ($(( $(stat -f %z "$DMG") / 1024 )) KB)"
     echo "    target/SHA256SUMS"
+elif [ "$MODE" = "--install" ] && [ "$IDENTITY_COUNT" -eq 1 ]; then
+    # macOS ties a privacy grant (Full Disk Access, Automation) to the
+    # app's designated requirement. Ad-hoc, that is the exact CDHash, so
+    # every reinstall silently drops the grant; with the Developer ID it is
+    # the bundle id and team, which a rebuild keeps. Same flags as a
+    # release, without the timestamp server: an install works offline and
+    # is never notarized.
+    echo "==> signing as $IDENTITY (not notarized)"
+    codesign --force --options runtime --timestamp=none --sign "$IDENTITY" \
+        "$APP/Contents/MacOS/${APP_NAME}"
+    codesign --force --options runtime --timestamp=none --sign "$IDENTITY" "$APP"
+    codesign --verify --deep --strict --verbose=2 "$APP" 2>&1 | sed 's/^/    /'
 else
     # An unsigned bundle gets quarantined and Gatekeeper-blocked on first
     # launch. Ad-hoc signing is enough for a locally built app and avoids
