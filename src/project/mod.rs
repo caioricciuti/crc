@@ -4,6 +4,7 @@ pub mod conflict;
 pub mod finder;
 pub mod git;
 pub mod icons;
+pub mod review;
 pub mod tree;
 pub mod watch;
 pub mod workspace;

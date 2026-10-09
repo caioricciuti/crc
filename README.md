@@ -69,8 +69,8 @@ crc > Settings (`Cmd-,`) opens a page listing every setting with what it
 does, its value and its default. They live in `~/.config/crc/config.toml`,
 created from a commented template the first time: `font`, `font_size`,
 `theme` (`system`, `dark` or `light`), `caret_blink`, `update_check`,
-`format_on_save`, `organize_imports_on_save`, `word_wrap`, `ssh_auth_sock`
-and `conflict_view` (`inline` or `side-by-side`). Edit on the page opens
+`format_on_save`, `organize_imports_on_save`, `word_wrap`, `ssh_auth_sock`,
+`conflict_view` (`inline` or `side-by-side`) and `agent_review`. Edit on the page opens
 the file at that setting, and Open config.toml opens it whole. Saving the file
 applies it; a line crc cannot use is said in the status line with its
 number. `Cmd-=`, `Cmd--` and `Cmd-0` change
@@ -111,6 +111,12 @@ the size and write it back.
   (`Cmd-Return`) or Reject (`Esc`). Files Claude writes to disk show up in
   their tabs at once. The bridge listens on 127.0.0.1 only, behind a random
   token in a lock file readable by you alone; `CRC_NO_CLAUDE=1` turns it off.
+  The Claude tab crc starts also runs crc's own hooks, passed with
+  `--settings` so nothing in `~/.claude` changes: each file is kept as it
+  was before Claude's first edit to it, in
+  `~/Library/Application Support/crc/sessions/` for 14 days, and Claude's
+  questions mark its tab. `agent_review = false` turns them off. Reviewing
+  and undoing from those copies is not built yet.
 - **Workspaces**: open a folder that holds several repositories and the
   notes about them, and Source Control shows one repository at a time
   with a menu to switch. Home becomes the workspace's front page: what

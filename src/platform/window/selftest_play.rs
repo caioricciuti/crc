@@ -590,7 +590,10 @@ impl EditorView {
                         .terminal
                         .tabs
                         .iter()
-                        .map(|t| t.state())
+                        .map(|t| match t.review_files {
+                            0 => t.state(),
+                            n => format!("{} review={n}", t.state()),
+                        })
                         .collect::<Vec<_>>()
                         .join("|"),
                     active_conflicts(&state).map_or("none".to_string(), |v| format!(

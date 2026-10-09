@@ -683,6 +683,8 @@ struct State {
     conflict_scans: HashMap<u64, crate::platform::conflicts::Scan>,
     /// Conflicts are shown as columns rather than in the text.
     conflict_side: bool,
+    /// The Claude Code started here runs the review hooks.
+    agent_review: bool,
     /// What the conflict controls' cursor rects were built for.
     conflict_cursor_key: Option<(u64, usize, usize, usize, usize, bool)>,
     /// The Extensions page's targets and the bulb, as last drawn, so their
@@ -7958,6 +7960,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         extensions: None,
         conflict_scans: HashMap::new(),
         conflict_side: settings.conflict_side_by_side,
+        agent_review: settings.agent_review,
         conflict_cursor_key: None,
         pointer_targets: Vec::new(),
         hotspots: Vec::new(),

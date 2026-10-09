@@ -141,6 +141,16 @@ impl EditorView {
                 env!("CARGO_PKG_VERSION").to_owned(),
             ),
         ];
+        // Each session gets its own review folder, which the agent's hooks
+        // write into; created by the first hook, not here.
+        if let Some(dir) = crate::project::review::root() {
+            env.push((
+                crate::project::review::SESSION_VAR.to_owned(),
+                dir.join(crate::project::review::new_id())
+                    .to_string_lossy()
+                    .into_owned(),
+            ));
+        }
         // Every session knows this window's IDE port, so `claude` typed in
         // any of them connects without `/ide`.
         if let Some(bridge) = &state.claude {
@@ -148,7 +158,21 @@ impl EditorView {
             env.push(("ENABLE_IDE_INTEGRATION".to_owned(), "true".to_owned()));
         }
         let args = if claude {
-            let command = std::env::var("CRC_CLAUDE_COMMAND").unwrap_or_else(|_| "claude".into());
+            // A command given in CRC_CLAUDE_COMMAND runs exactly as given.
+            // Plain `claude` gets the review hooks as extra settings: Claude
+            // merges them with the person's own, and nothing in ~/.claude
+            // is touched.
+            let command = match std::env::var("CRC_CLAUDE_COMMAND") {
+                Ok(command) => command,
+                Err(_) => match state
+                    .agent_review
+                    .then(crate::project::review::claude_settings_arg)
+                    .flatten()
+                {
+                    Some(settings) => format!("claude --settings {settings}"),
+                    None => "claude".into(),
+                },
+            };
             vec!["-l".to_owned(), "-i".to_owned(), "-c".to_owned(), command]
         } else {
             vec!["-l".to_owned()]
@@ -223,6 +247,12 @@ impl EditorView {
                         .file_name()
                         .map_or_else(|| "shell".into(), |n| n.to_string_lossy().into_owned())
                 };
+                let review = launch
+                    .env
+                    .iter()
+                    .find(|(k, _)| k == crate::project::review::SESSION_VAR)
+                    .map(|(_, v)| std::path::PathBuf::from(v))
+                    .unwrap_or_default();
                 state.terminal.tabs.push(crate::platform::terminal::Tab {
                     session,
                     title,
@@ -230,6 +260,9 @@ impl EditorView {
                     launch,
                     attention: None,
                     last_output: None,
+                    review,
+                    events_read: 0,
+                    review_files: 0,
                 });
                 state.terminal.active = state.terminal.tabs.len() - 1;
                 state.terminal.back = 0;
@@ -304,11 +337,26 @@ impl EditorView {
         let mut said = None;
         let watching = state.terminal.has_keys();
         let active = state.terminal.active;
-        for (index, notice) in noticed {
+        for (index, mut notice) in noticed {
             let Some(tab) = state.terminal.tabs.get_mut(index) else {
                 continue;
             };
             tab.last_output = Some(now);
+            // What its agent's hooks wrote since the last look: an agent
+            // writes files and asks questions while it prints.
+            let (events, read) = crate::project::review::read_events(&tab.review, tab.events_read);
+            tab.events_read = read;
+            for event in events {
+                match event {
+                    crate::project::review::Event::Wrote { .. } => {
+                        tab.review_files = crate::project::review::files(&tab.review).len();
+                    }
+                    crate::project::review::Event::Asked(text) => notice = Some(text),
+                    crate::project::review::Event::Failed(text) => {
+                        said = Some(format!("{}: review hook: {text}", tab.name()));
+                    }
+                }
+            }
             if let Some(text) = notice {
                 tab.attention = Some(text);
                 if !(watching && index == active) {

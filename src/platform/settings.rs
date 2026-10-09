@@ -65,6 +65,9 @@ pub struct Settings {
     pub ssh_auth_sock: Option<PathBuf>,
     /// How a file with merge conflicts opens: in the text, or as columns.
     pub conflict_side_by_side: bool,
+    /// Whether the Claude Code crc starts runs its review hooks: each file
+    /// kept as it was before Claude's first edit, for review and undo.
+    pub agent_review: bool,
 }
 
 /// `word_wrap`: every document, none, or prose (Markdown and text) only.
@@ -88,6 +91,7 @@ impl Default for Settings {
             word_wrap: WordWrap::Auto,
             ssh_auth_sock: None,
             conflict_side_by_side: false,
+            agent_review: true,
         }
     }
 }
@@ -135,6 +139,11 @@ word_wrap = \"auto\"
 # conflict in the text, or \"side-by-side\", as columns. The strip above
 # the file switches between them.
 conflict_view = \"inline\"
+
+# When crc starts Claude Code in its terminal, keep each file as it was
+# before Claude's first edit to it, so the change can be reviewed and
+# undone. Nothing is sent anywhere; the copies stay in crc's folder.
+agent_review = true
 ";
 
 impl Settings {
@@ -216,6 +225,7 @@ impl Settings {
                 },
                 "caret_blink" => set_bool(value, &mut settings.caret_blink),
                 "update_check" => set_bool(value, &mut settings.update_check),
+                "agent_review" => set_bool(value, &mut settings.agent_review),
                 "word_wrap" => match word {
                     "auto" => {
                         settings.word_wrap = WordWrap::Auto;
@@ -379,7 +389,7 @@ pub struct Described {
 
 /// Every key the file takes, in the page's order. A test checks this
 /// against the template, so a new key cannot ship without a sentence here.
-pub const DESCRIBED: [Described; 10] = [
+pub const DESCRIBED: [Described; 11] = [
     Described {
         key: "theme",
         group: "Appearance",
@@ -430,6 +440,11 @@ pub const DESCRIBED: [Described; 10] = [
         group: "App",
         what: "Once a day at launch, ask GitHub whether a newer release exists. Nothing is downloaded.",
     },
+    Described {
+        key: "agent_review",
+        group: "Agents",
+        what: "Keep each file as it was before the Claude Code crc starts first edits it, so its changes can be reviewed and undone.",
+    },
 ];
 
 impl Settings {
@@ -442,6 +457,7 @@ impl Settings {
             "theme" => quote(self.theme.name()),
             "caret_blink" => flag(self.caret_blink),
             "update_check" => flag(self.update_check),
+            "agent_review" => flag(self.agent_review),
             "format_on_save" => flag(self.format_on_save),
             "organize_imports_on_save" => flag(self.organize_imports_on_save),
             "word_wrap" => quote(match self.word_wrap {
@@ -753,6 +769,7 @@ mod tests {
             word_wrap: WordWrap::Auto,
             ssh_auth_sock: None,
             conflict_side_by_side: false,
+            agent_review: true,
         }
         .merged_into(existing);
         assert_eq!(

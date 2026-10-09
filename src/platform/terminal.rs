@@ -46,6 +46,12 @@ pub struct Tab {
     pub attention: Option<String>,
     /// When it last printed something.
     pub last_output: Option<std::time::Instant>,
+    /// Its agent review session's folder, in its `CRC_SESSION_DIR`.
+    pub review: PathBuf,
+    /// How far into the session's events the window has read.
+    pub events_read: u64,
+    /// Files the session has checkpoints for.
+    pub review_files: usize,
 }
 
 impl Tab {
