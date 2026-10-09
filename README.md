@@ -65,11 +65,13 @@ open -a crc .               # open the current folder as a project
 
 ## Settings
 
-crc > Settings (`Cmd-,`) opens `~/.config/crc/config.toml`, created from a
-commented template the first time: `font`, `font_size`, `theme`
-(`system`, `dark` or `light`), `caret_blink`, `update_check`,
-`format_on_save`, `word_wrap`, `ssh_auth_sock` and `conflict_view`
-(`inline` or `side-by-side`), each explained in the file. Saving the file
+crc > Settings (`Cmd-,`) opens a page listing every setting with what it
+does, its value and its default. They live in `~/.config/crc/config.toml`,
+created from a commented template the first time: `font`, `font_size`,
+`theme` (`system`, `dark` or `light`), `caret_blink`, `update_check`,
+`format_on_save`, `organize_imports_on_save`, `word_wrap`, `ssh_auth_sock`
+and `conflict_view` (`inline` or `side-by-side`). Edit on the page opens
+the file at that setting, and Open config.toml opens it whole. Saving the file
 applies it; a line crc cannot use is said in the status line with its
 number. `Cmd-=`, `Cmd--` and `Cmd-0` change
 the size and write it back.
@@ -259,7 +261,7 @@ the size and write it back.
 | Escape | back to one cursor |
 | `Cmd-O` / `Cmd-Shift-O` | open file / open folder |
 | `Cmd-S` / `Cmd-Shift-S` | save / save as; File > Revert to Saved goes back to disk |
-| `Cmd-,` | settings file |
+| `Cmd-,` | Settings page |
 | `Cmd-=` / `Cmd--` / `Cmd-0` | zoom the code font in, out, back to 13 |
 | `Cmd-Shift-C` | Claude Code tab |
 | `` Ctrl-` `` / `Cmd-J` | terminal panel |

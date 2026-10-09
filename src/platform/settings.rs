@@ -369,6 +369,119 @@ impl Settings {
     }
 }
 
+/// One setting as the Settings page shows it: its key in the file, the
+/// group it is listed under, and what it does.
+pub struct Described {
+    pub key: &'static str,
+    pub group: &'static str,
+    pub what: &'static str,
+}
+
+/// Every key the file takes, in the page's order. A test checks this
+/// against the template, so a new key cannot ship without a sentence here.
+pub const DESCRIBED: [Described; 10] = [
+    Described {
+        key: "theme",
+        group: "Appearance",
+        what: "Light, dark, or whatever the system uses.",
+    },
+    Described {
+        key: "font",
+        group: "Appearance",
+        what: "The code font: any monospace face installed on this Mac.",
+    },
+    Described {
+        key: "font_size",
+        group: "Appearance",
+        what: "8 to 32 points. Cmd-= and Cmd-- change it, Cmd-0 goes back.",
+    },
+    Described {
+        key: "caret_blink",
+        group: "Appearance",
+        what: "Whether the caret blinks. It is solid while you type either way.",
+    },
+    Described {
+        key: "word_wrap",
+        group: "Editing",
+        what: "Wrap long lines: auto wraps Markdown and text files. Option-Z flips one document.",
+    },
+    Described {
+        key: "format_on_save",
+        group: "Editing",
+        what: "Format the file with its language server when saving it.",
+    },
+    Described {
+        key: "organize_imports_on_save",
+        group: "Editing",
+        what: "Sort and prune imports with the language server when saving, before any format.",
+    },
+    Described {
+        key: "conflict_view",
+        group: "Git",
+        what: "How a file with merge conflicts opens: in the text, or as columns.",
+    },
+    Described {
+        key: "ssh_auth_sock",
+        group: "Git",
+        what: "The SSH agent socket for fetch, pull and push, for when crc is opened from the Dock without your shell's SSH_AUTH_SOCK.",
+    },
+    Described {
+        key: "update_check",
+        group: "App",
+        what: "Once a day at launch, ask GitHub whether a newer release exists. Nothing is downloaded.",
+    },
+];
+
+impl Settings {
+    /// A key's value as the file would spell it, for the Settings page.
+    pub fn value_of(&self, key: &str) -> String {
+        let flag = |on: bool| if on { "true" } else { "false" }.to_owned();
+        match key {
+            "font" => quote(&self.font),
+            "font_size" => format_size(self.font_size),
+            "theme" => quote(self.theme.name()),
+            "caret_blink" => flag(self.caret_blink),
+            "update_check" => flag(self.update_check),
+            "format_on_save" => flag(self.format_on_save),
+            "organize_imports_on_save" => flag(self.organize_imports_on_save),
+            "word_wrap" => quote(match self.word_wrap {
+                WordWrap::Auto => "auto",
+                WordWrap::On => "on",
+                WordWrap::Off => "off",
+            }),
+            "ssh_auth_sock" => self
+                .ssh_auth_sock
+                .as_ref()
+                .map_or_else(|| "not set".to_owned(), |p| quote(&p.to_string_lossy())),
+            "conflict_view" => quote(if self.conflict_side_by_side {
+                "side-by-side"
+            } else {
+                "inline"
+            }),
+            _ => String::new(),
+        }
+    }
+}
+
+/// The 0-based line where `key` is set in `text`, or where the template
+/// has it commented out; the last setting wins, as in [`Settings::parse`].
+pub fn line_of(text: &str, key: &str) -> Option<usize> {
+    let set = text
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| split_line(line).is_some_and(|(k, _)| k == key))
+        .map(|(n, _)| n)
+        .last();
+    set.or_else(|| {
+        text.lines().position(|line| {
+            line.trim()
+                .strip_prefix('#')
+                .and_then(|rest| rest.trim_start().split_once('='))
+                .is_some_and(|(k, _)| k.trim() == key)
+        })
+    })
+}
+
 /// `true` or `false` into `field`; anything else leaves it as it was.
 /// Sets `field` from `true` or `false`; says what the key takes otherwise.
 fn set_bool(value: &str, field: &mut bool) -> Option<&'static str> {
@@ -467,6 +580,60 @@ fn format_size(size: f32) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn every_template_key_is_described_and_parsed() {
+        let template: Vec<&str> = TEMPLATE
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim().trim_start_matches('#').trim_start();
+                let (key, _) = line.split_once('=')?;
+                let key = key.trim();
+                key.chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '_')
+                    .then_some(key)
+            })
+            .collect();
+        let described: Vec<&str> = DESCRIBED.iter().map(|d| d.key).collect();
+        let mut a = template.clone();
+        let mut b = described.clone();
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(
+            a, b,
+            "the template and the Settings page list the same keys"
+        );
+        let defaults = Settings::default();
+        for key in described {
+            let value = match defaults.value_of(key).as_str() {
+                "not set" => "\"/tmp/agent.sock\"".to_owned(),
+                v => v.to_owned(),
+            };
+            let (_, problems) = Settings::parse_checked(&format!("{key} = {value}\n"));
+            assert!(problems.is_empty(), "{key} = {value}: {problems:?}");
+        }
+    }
+
+    #[test]
+    fn value_of_reads_back() {
+        let s = Settings::parse(
+            "font_size = 15\nword_wrap = \"off\"\nconflict_view = \"side-by-side\"\n",
+        );
+        assert_eq!(s.value_of("font_size"), "15");
+        assert_eq!(s.value_of("word_wrap"), "\"off\"");
+        assert_eq!(s.value_of("conflict_view"), "\"side-by-side\"");
+        assert_eq!(s.value_of("caret_blink"), "true");
+        assert_eq!(s.value_of("ssh_auth_sock"), "not set");
+    }
+
+    #[test]
+    fn line_of_finds_a_set_or_commented_key() {
+        let text = "# font = \"x\"\nfont = \"A\"\n# ssh_auth_sock = \"~/s\"\nfont = \"B\"\n";
+        assert_eq!(line_of(text, "font"), Some(3), "the last setting wins");
+        assert_eq!(line_of(text, "ssh_auth_sock"), Some(2), "commented out");
+        assert_eq!(line_of(text, "theme"), None);
+        assert!(line_of(TEMPLATE, "ssh_auth_sock").is_some());
+    }
     use super::*;
 
     #[test]

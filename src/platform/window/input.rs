@@ -440,13 +440,13 @@ impl EditorView {
         if git_turn && self.handle_git_key(event) {
             return true;
         }
-        // The Extensions or MCP page has the column: Escape leaves its
-        // confirmation, then the page; nothing types into the document
-        // underneath. The palette, opened over it, keeps its own keys.
-        if self
-            .state()
-            .is_some_and(|state| ext_details(&state) || mcp_details(&state))
-            && self.state().is_some_and(|state| state.palette.is_none())
+        // The Extensions, MCP or Settings page has the column: Escape
+        // leaves its confirmation, then the page; nothing types into the
+        // document underneath. The palette, opened over it, keeps its own
+        // keys.
+        if self.state().is_some_and(|state| {
+            ext_details(&state) || mcp_details(&state) || state.settings_page.open
+        }) && self.state().is_some_and(|state| state.palette.is_none())
             && !event
                 .modifierFlags()
                 .contains(NSEventModifierFlags::Command)
@@ -468,6 +468,7 @@ impl EditorView {
                         page.details = false;
                     }
                     state.mcp.details = false;
+                    state.settings_page.open = false;
                 }
                 self.request_redraw();
             }

@@ -639,6 +639,8 @@ struct State {
     home_since: Option<u64>,
     /// MCP servers and the sidebar panel that lists them.
     mcp: crate::platform::mcp_panel::Panel,
+    /// The Settings page.
+    settings_page: crate::platform::settings_page::Page,
     /// The call behind each MCP answer tab, so Cmd-Return there runs it
     /// again.
     mcp_calls: HashMap<u64, crate::mcp_client::call::Call>,
@@ -1495,6 +1497,22 @@ define_class!(
                 }
                 return;
             }
+            // And the Settings page.
+            let settings_action = {
+                let Some(state) = self.state() else {
+                    return;
+                };
+                (column_of(&state) == Column::Settings
+                    && state.palette.is_none()
+                    && details_rect(&chrome).contains(x, y))
+                .then(|| state.settings_page.hit(x, y))
+            };
+            if let Some(action) = settings_action {
+                if let Some(action) = action {
+                    self.settings_action(action);
+                }
+                return;
+            }
 
             // The scrollbar thumb, before anything that treats a press in
             // the text as a caret placement. A press on the track outside
@@ -1740,6 +1758,7 @@ define_class!(
                             page.details = false;
                         }
                         state.mcp.details = false;
+                        state.settings_page.open = false;
                         state.drag = Some(Drag::Tab(index));
                     }
                     self.tab_click(x);
@@ -2224,6 +2243,30 @@ define_class!(
             if self.state().is_some_and(|state| state.palette.is_some()) {
                 self.palette_wheel(event);
                 return;
+            }
+            {
+                // So does the Settings page's.
+                let point = self.convertPoint_fromView(event.locationInWindow(), None);
+                let over_page = self.state().is_some_and(|state| {
+                    column_of(&state) == Column::Settings
+                        && state
+                            .settings_page
+                            .rect
+                            .is_some_and(|r| r.contains(point.x as f32, point.y as f32))
+                });
+                if over_page {
+                    let lines = self.wheel_lines(event, WheelTarget::Readme);
+                    if lines != 0
+                        && let Some(mut state) = self.state_mut()
+                    {
+                        state
+                            .settings_page
+                            .scroll_by(lines as f32 * crate::platform::settings_page::ROW);
+                    }
+                    self.request_redraw();
+                    self.pump();
+                    return;
+                }
             }
             {
                 // The MCP page's body scrolls under its header.
@@ -4561,6 +4604,14 @@ impl EditorView {
                     .filter(|_| mcp_details(&state))
                     .map(|(r, _)| *r),
             )
+            .chain(
+                state
+                    .settings_page
+                    .hits
+                    .iter()
+                    .filter(|_| column_of(&state) == Column::Settings)
+                    .map(|(r, _)| *r),
+            )
             .collect();
         if state.pointer_targets != pointer_targets {
             state.pointer_targets = pointer_targets;
@@ -5327,6 +5378,8 @@ enum Column {
     Extensions,
     /// The MCP page.
     Mcp,
+    /// The Settings page.
+    Settings,
     /// A Source Control change, in its tab.
     GitDiff,
     /// A document's merge conflicts as columns.
@@ -5346,6 +5399,8 @@ fn column_of(state: &State) -> Column {
         Column::Extensions
     } else if mcp_details(state) {
         Column::Mcp
+    } else if state.settings_page.open {
+        Column::Settings
     } else if diffing(state) {
         Column::GitDiff
     } else if side_by_side(state) {
@@ -6165,7 +6220,7 @@ fn frame_of(state: &mut State) -> Frame {
     for (index, pane) in &chrome.others {
         frame.push(Hit::Pane(*index), pane.whole());
     }
-    let covered = extensions.as_ref().is_some_and(|p| p.details) || (mcp.open && mcp.details);
+    let covered = matches!(column, Column::Extensions | Column::Mcp | Column::Settings);
     for hit in tab_hits.iter().filter(|_| !covered) {
         if hit.index == docs.active_index() {
             frame.push(
@@ -7896,6 +7951,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         home_rx,
         home_since,
         mcp: Default::default(),
+        settings_page: Default::default(),
         mcp_calls: HashMap::new(),
         branch_rx: None,
         organize_on_save: settings.organize_imports_on_save,

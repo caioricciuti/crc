@@ -76,6 +76,7 @@ impl EditorView {
             repo_list,
             mcp_url_prompt,
             extensions,
+            settings_page,
             blame: Blame { shown: blame, .. },
             renderer,
             glyphs,
@@ -190,7 +191,16 @@ impl EditorView {
             .and_then(|c| c.reviews.get(&buffer.id()))
             .filter(|_| column == Column::Review);
 
-        if let Some(page) = extensions.as_mut().filter(|_| column == Column::Extensions) {
+        if column == Column::Settings {
+            glyphs.clear();
+            crate::platform::settings_page::draw(
+                settings_page,
+                &mut renderer.atlas,
+                ext_details_rect,
+                theme,
+                glyphs,
+            );
+        } else if let Some(page) = extensions.as_mut().filter(|_| column == Column::Extensions) {
             glyphs.clear();
             crate::platform::extensions::draw_details(
                 page,
@@ -507,7 +517,7 @@ impl EditorView {
         // Under the Extensions details the tabs are still laid out, so
         // their hit list stays true, but drawn into nothing.
         let mut hidden = Vec::new();
-        let details = extensions.as_ref().is_some_and(|p| p.details) || column == Column::Mcp;
+        let details = matches!(column, Column::Extensions | Column::Mcp | Column::Settings);
         layout::build_tab_bar(
             docs,
             *tab_scroll,
@@ -519,8 +529,8 @@ impl EditorView {
             tab_hits,
         );
 
-        if matches!(column, Column::Extensions | Column::Mcp) {
-            // The Extensions and MCP pages cover this row; a document's
+        if matches!(column, Column::Extensions | Column::Mcp | Column::Settings) {
+            // The Extensions, MCP and Settings pages cover this row; a document's
             // path here would label them as something they are not.
         } else if diffing {
             // The breadcrumb row says which change is on screen, so the

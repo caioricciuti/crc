@@ -700,7 +700,7 @@ fn summary_of(server: &Server, theme: &Theme) -> (String, [f32; 4]) {
     }
 }
 
-fn button(
+pub(crate) fn button(
     out: &mut Vec<GlyphInstance>,
     atlas: &mut Atlas,
     theme: &Theme,
@@ -726,7 +726,7 @@ fn button(
     rect
 }
 
-fn link(
+pub(crate) fn link(
     out: &mut Vec<GlyphInstance>,
     atlas: &mut Atlas,
     theme: &Theme,
@@ -755,7 +755,7 @@ fn link(
     r
 }
 
-fn text(
+pub(crate) fn text(
     out: &mut Vec<GlyphInstance>,
     atlas: &mut Atlas,
     x: f32,

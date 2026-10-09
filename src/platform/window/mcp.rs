@@ -32,6 +32,7 @@ impl EditorView {
             // does; Escape, Close or a tab gives it back.
             state.mcp.details = true;
             state.mcp.note = None;
+            state.settings_page.open = false;
             state.sidebar = true;
         }
         self.request_redraw();

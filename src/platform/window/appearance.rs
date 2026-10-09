@@ -120,12 +120,52 @@ impl EditorView {
 
     /// crc > Settings: the settings file as a tab, created from the template
     /// when there is none. Saving it applies it.
+    /// Cmd-,: the Settings page in the editor column, read fresh.
     pub(super) fn open_settings(&self) {
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
+        state.settings_page.reload();
+        state.settings_page.open = true;
+        state.settings_page.scroll = 0.0;
+        if let Some(page) = &mut state.extensions {
+            page.details = false;
+        }
+        state.mcp.details = false;
+        state.palette = None;
+        state.completion = None;
+    }
+
+    /// What a click on the Settings page does.
+    pub(super) fn settings_action(&self, action: crate::platform::settings_page::Action) {
+        use crate::platform::settings_page::Action;
+        match action {
+            Action::Close => {
+                if let Some(mut state) = self.state_mut() {
+                    state.settings_page.open = false;
+                }
+            }
+            Action::Reload => {
+                if let Some(mut state) = self.state_mut() {
+                    state.settings_page.reload();
+                }
+            }
+            Action::Open => self.open_settings_file(None),
+            Action::Edit(key) => self.open_settings_file(Some(key)),
+        }
+        self.request_redraw();
+        self.pump();
+    }
+
+    /// config.toml in a tab, created from the template when there is none,
+    /// with the caret on `key`'s line when it is given. The page gives the
+    /// column back to the tab.
+    pub(super) fn open_settings_file(&self, key: Option<&str>) {
         let path = match crate::platform::settings::Settings::ensure_file() {
             Ok(path) => path,
             Err(e) => {
                 if let Some(mut state) = self.state_mut() {
-                    state.message = Some((format!("settings: {e}"), Instant::now()));
+                    state.say(layout::Feedback::Failure, format!("settings: {e}"));
                 }
                 return;
             }
@@ -135,15 +175,28 @@ impl EditorView {
         let Some(mut state) = self.state_mut() else {
             return;
         };
+        state.settings_page.open = false;
         match state.docs.open(&path) {
             Ok(()) => {
                 reveal_active_tab(&mut state);
             }
             Err(e) => {
-                state.message = Some((format!("settings: {e}"), Instant::now()));
+                state.say(layout::Feedback::Failure, format!("settings: {e}"));
+                return;
             }
         }
+        let line = key.and_then(|key| {
+            crate::platform::settings::line_of(&state.docs.active().rope.to_string(), key)
+        });
         drop(state);
+        if let Some(line) = line {
+            let (rows, cols) = self.grid();
+            if let Some(mut state) = self.state_mut() {
+                let buffer = state.docs.active_mut();
+                buffer.goto_line(line);
+                buffer.scroll_to_cursor(rows, cols);
+            }
+        }
         self.sync_title();
         self.reparse();
     }
@@ -175,6 +228,7 @@ impl EditorView {
         }
         self.apply_theme();
         if let Some(mut state) = self.state_mut() {
+            state.settings_page.reload();
             match crate::platform::settings::Settings::describe_problems(&problems) {
                 Some(said) => state.say(layout::Feedback::Failure, said),
                 None => state.say(layout::Feedback::Success, "settings applied"),

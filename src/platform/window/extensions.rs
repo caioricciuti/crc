@@ -17,6 +17,7 @@ impl EditorView {
             page.logs = state.ext.logs.clone();
             state.extensions = Some(page);
             state.mcp.open = false;
+            state.settings_page.open = false;
             state.palette = None;
             state.completion = None;
             state.git_open = false;
