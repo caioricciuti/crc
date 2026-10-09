@@ -363,6 +363,132 @@ pub fn claude_settings_arg() -> Option<String> {
     Some(shell_quote(&path.to_string_lossy()))
 }
 
+/// What a review compares for one file: its checkpoint and its text now.
+/// A file the agent deleted reads as empty; so does one that did not
+/// exist before.
+pub fn texts(file: &File) -> Result<(String, String), String> {
+    let old = match &file.checkpoint {
+        Checkpoint::Text(kept) => std::fs::read_to_string(kept)
+            .map_err(|_| "not text: keep or undo the whole file".to_owned())?,
+        Checkpoint::Absent => String::new(),
+        Checkpoint::TooLarge => {
+            return Err("too large to review by change: keep it whole".into());
+        }
+    };
+    let new = match std::fs::read_to_string(&file.path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(_) => return Err("not text: keep or undo the whole file".into()),
+    };
+    Ok((old, new))
+}
+
+/// What the review showed was made from this text. A hunk number only
+/// means something against the text it was counted in, so every action
+/// takes the fingerprint of what was on screen and refuses when the file
+/// has moved on since.
+pub fn fingerprint(text: &str) -> u64 {
+    crate::platform::fnv1a(text.as_bytes())
+}
+
+fn current(file: &File, seen: u64) -> Result<(String, String), String> {
+    let (old, new) = texts(file)?;
+    if fingerprint(&new) != seen {
+        return Err(format!(
+            "{} changed since it was shown; look again",
+            file.path.display()
+        ));
+    }
+    Ok((old, new))
+}
+
+/// Keeps one change: the checkpoint takes it, so it leaves the review.
+/// The last change kept takes the file out of the session.
+pub fn keep(dir: &Path, file: &File, hunk: usize, seen: u64) -> Result<(), String> {
+    let (old, new) = current(file, seen)?;
+    let kept = crate::ide::diff::keep_hunk(&old, &new, hunk).ok_or("that change is gone")?;
+    if kept == new {
+        return forget(dir, file);
+    }
+    set_checkpoint(dir, &file.path, &kept).map_err(|e| format!("checkpoint: {e}"))
+}
+
+/// The file's text with one change undone, for the caller to put in place:
+/// through the open document when there is one, so it is one undo step,
+/// or with [`write_undone`] when there is not.
+pub fn undone(file: &File, hunk: usize, seen: u64) -> Result<String, String> {
+    let (old, new) = current(file, seen)?;
+    crate::ide::diff::undo_hunk(&old, &new, hunk).ok_or_else(|| "that change is gone".into())
+}
+
+/// Writes [`undone`]'s text to the file, for a file not open in crc, and
+/// takes the file out of the session when nothing is left to review.
+pub fn write_undone(dir: &Path, file: &File, text: &str) -> Result<(), String> {
+    std::fs::write(&file.path, text).map_err(|e| format!("{}: {e}", file.path.display()))?;
+    settle(dir, file)
+}
+
+/// After the file was changed through the editor: takes it out of the
+/// session when it matches its checkpoint again.
+pub fn settle(dir: &Path, file: &File) -> Result<(), String> {
+    match texts(file) {
+        Ok((old, new)) if old == new => forget(dir, file),
+        _ => Ok(()),
+    }
+}
+
+/// Keeps every change in the file.
+pub fn keep_all(dir: &Path, file: &File) -> Result<(), String> {
+    forget(dir, file)
+}
+
+/// Puts the whole file back as it was: its checkpoint copied over it, or
+/// the file removed when the agent created it.
+pub fn undo_all(dir: &Path, file: &File) -> Result<(), String> {
+    let said = |e: std::io::Error| format!("{}: {e}", file.path.display());
+    match &file.checkpoint {
+        Checkpoint::Text(kept) => {
+            std::fs::copy(kept, &file.path).map_err(said)?;
+        }
+        Checkpoint::Absent => match std::fs::remove_file(&file.path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(said(e)),
+            _ => {}
+        },
+        Checkpoint::TooLarge => return Err("too large: no copy was kept to undo to".into()),
+    }
+    forget(dir, file)
+}
+
+/// A new checkpoint for a file the session already has.
+fn set_checkpoint(dir: &Path, path: &Path, text: &str) -> std::io::Result<()> {
+    let files = dir.join("files");
+    let key = key(path);
+    let partial = files.join(format!("{key}.partial"));
+    std::fs::write(&partial, text)?;
+    std::fs::rename(partial, files.join(&key))?;
+    match std::fs::remove_file(files.join(format!("{key}.absent"))) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// Takes the file out of the session: nothing about it left to review.
+fn forget(dir: &Path, file: &File) -> Result<(), String> {
+    let files = dir.join("files");
+    let key = key(&file.path);
+    // The claim goes last: until it does, the file still lists, never
+    // half removed.
+    for suffix in ["", ".absent", ".large", ".partial", ".path"] {
+        match std::fs::remove_file(files.join(format!("{key}{suffix}"))) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(format!("forget {}: {e}", file.path.display()));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,5 +627,93 @@ mod tests {
             .and_then(|v| v.as_str())
             .expect("command");
         assert_eq!(command, r"'/Applications/crc'\''s.app/crc' --hook pre");
+    }
+
+    /// A session holding `name` as `before`, with the agent's `after` on
+    /// disk.
+    fn reviewed(tree: &TempTree, name: &str, before: &str, after: &str) -> (PathBuf, File) {
+        let dir = tree.0.join("session");
+        let path = tree.0.join(name);
+        std::fs::write(&path, before).expect("write");
+        let path = crate::platform::canonical(&path);
+        hook("pre", &pre(&path), &dir).expect("hook");
+        std::fs::write(&path, after).expect("agent writes");
+        let file = files(&dir).remove(0);
+        (dir, file)
+    }
+
+    const BEFORE: &str = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\n";
+    const AFTER: &str = "a\nB\nc\nd\ne\nf\ng\nh\ni\nj\nk\nL\n";
+
+    #[test]
+    fn keep_one_change_then_undo_the_other() {
+        let tree = TempTree::new("review-keep-undo", &[]);
+        let (dir, file) = reviewed(&tree, "f.txt", BEFORE, AFTER);
+
+        keep(&dir, &file, 0, fingerprint(AFTER)).expect("keep");
+        let file = files(&dir).remove(0);
+        let (old, new) = texts(&file).expect("texts");
+        assert_eq!(crate::ide::diff::diff(&old, &new).hunks.len(), 1);
+
+        let text = undone(&file, 0, fingerprint(&new)).expect("undo");
+        assert_eq!(text, "a\nB\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\n");
+        write_undone(&dir, &file, &text).expect("write");
+        assert_eq!(std::fs::read_to_string(&file.path).expect("read"), text);
+        assert!(files(&dir).is_empty(), "nothing left to review");
+    }
+
+    #[test]
+    fn a_file_changed_since_it_was_shown_is_refused() {
+        let tree = TempTree::new("review-stale", &[]);
+        let (dir, file) = reviewed(&tree, "f.txt", BEFORE, AFTER);
+        std::fs::write(&file.path, "moved on\n").expect("write");
+        assert!(keep(&dir, &file, 0, fingerprint(AFTER)).is_err());
+        assert!(undone(&file, 0, fingerprint(AFTER)).is_err());
+        assert_eq!(files(&dir).len(), 1);
+    }
+
+    #[test]
+    fn undo_all_restores_or_removes() {
+        let tree = TempTree::new("review-undo-all", &[]);
+        let (dir, file) = reviewed(&tree, "f.txt", BEFORE, AFTER);
+        undo_all(&dir, &file).expect("undo all");
+        assert_eq!(std::fs::read_to_string(&file.path).expect("read"), BEFORE);
+
+        let created = tree.0.join("new.txt");
+        hook("pre", &pre(&created), &dir).expect("hook");
+        std::fs::write(&created, "made by the agent\n").expect("write");
+        let file = files(&dir).remove(0);
+        assert_eq!(file.checkpoint, Checkpoint::Absent);
+        undo_all(&dir, &file).expect("undo all");
+        assert!(!created.exists());
+        assert!(files(&dir).is_empty());
+    }
+
+    #[test]
+    fn keeping_a_new_file_takes_it_out_of_the_session() {
+        let tree = TempTree::new("review-new-keep", &[]);
+        let dir = tree.0.join("session");
+        let created = tree.0.join("new.txt");
+        hook("pre", &pre(&created), &dir).expect("hook");
+        std::fs::write(&created, AFTER).expect("write");
+        let file = files(&dir).remove(0);
+        // One hunk from empty: keeping it is keeping the whole file.
+        keep(&dir, &file, 0, fingerprint(AFTER)).expect("keep");
+        assert!(files(&dir).is_empty());
+    }
+
+    #[test]
+    fn keep_all_forgets_and_leaves_the_file() {
+        let tree = TempTree::new("review-keep-all", &[]);
+        let (dir, file) = reviewed(&tree, "f.txt", BEFORE, AFTER);
+        keep_all(&dir, &file).expect("keep all");
+        assert!(files(&dir).is_empty());
+        assert_eq!(std::fs::read_to_string(&file.path).expect("read"), AFTER);
+        assert!(
+            std::fs::read_dir(dir.join("files"))
+                .expect("dir")
+                .next()
+                .is_none()
+        );
     }
 }

@@ -9,7 +9,7 @@
 //! differing middle is shown as removed then added, still correct, only
 //! coarser.
 
-use crate::project::git::{Diff, DiffKind, DiffLine};
+use crate::project::git::{Diff, DiffKind, DiffLine, Hunk};
 
 /// Unchanged lines shown around each change, as `git diff` shows.
 const CONTEXT: usize = 3;
@@ -33,30 +33,6 @@ pub fn diff(old: &str, new: &str) -> Diff {
     let b: Vec<&str> = new.split_inclusive('\n').collect();
     let ops = script(&a, &b);
     let mut out = Diff::default();
-    let changed: Vec<usize> = ops
-        .iter()
-        .enumerate()
-        .filter(|(_, op)| !matches!(op, Op::Equal(..)))
-        .map(|(i, _)| i)
-        .collect();
-    let Some(&first) = changed.first() else {
-        return out;
-    };
-    // Ranges of ops to show: each change widened by the context, merged
-    // when two would touch.
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
-    let mut start = first.saturating_sub(CONTEXT);
-    let mut end = (first + CONTEXT + 1).min(ops.len());
-    for &i in &changed[1..] {
-        if i.saturating_sub(CONTEXT) <= end {
-            end = (i + CONTEXT + 1).min(ops.len());
-        } else {
-            ranges.push((start, end));
-            start = i.saturating_sub(CONTEXT);
-            end = (i + CONTEXT + 1).min(ops.len());
-        }
-    }
-    ranges.push((start, end));
     let line = |kind, old: Option<usize>, new: Option<usize>, text: &str| DiffLine {
         kind,
         old: old.map(|n| n + 1),
@@ -64,8 +40,18 @@ pub fn diff(old: &str, new: &str) -> Diff {
         text: text.trim_end_matches(['\n', '\r']).to_owned(),
         hunk: None,
     };
-    for (start, end) in ranges {
-        out.lines.push(line(DiffKind::Hunk, None, None, ""));
+    for (ordinal, (start, end)) in hunk_ranges(&ops).into_iter().enumerate() {
+        // Numbered, so a review can act on one hunk; nothing is staged,
+        // and there is no patch text: the hunk is rebuilt from the texts.
+        out.lines.push(DiffLine {
+            hunk: Some(ordinal),
+            ..line(DiffKind::Hunk, None, None, "")
+        });
+        out.hunks.push(Hunk {
+            staged: false,
+            ordinal,
+            raw: String::new(),
+        });
         for op in &ops[start..end] {
             out.lines.push(match *op {
                 Op::Equal(i, j) => line(DiffKind::Context, Some(i), Some(j), a[i]),
@@ -81,6 +67,66 @@ pub fn diff(old: &str, new: &str) -> Diff {
         }
     }
     out
+}
+
+/// The ranges of ops each hunk shows: every change widened by the
+/// context, merged when two would touch.
+fn hunk_ranges(ops: &[Op]) -> Vec<(usize, usize)> {
+    let changed: Vec<usize> = ops
+        .iter()
+        .enumerate()
+        .filter(|(_, op)| !matches!(op, Op::Equal(..)))
+        .map(|(i, _)| i)
+        .collect();
+    let Some(&first) = changed.first() else {
+        return Vec::new();
+    };
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut start = first.saturating_sub(CONTEXT);
+    let mut end = (first + CONTEXT + 1).min(ops.len());
+    for &i in &changed[1..] {
+        if i.saturating_sub(CONTEXT) <= end {
+            end = (i + CONTEXT + 1).min(ops.len());
+        } else {
+            ranges.push((start, end));
+            start = i.saturating_sub(CONTEXT);
+            end = (i + CONTEXT + 1).min(ops.len());
+        }
+    }
+    ranges.push((start, end));
+    ranges
+}
+
+/// `old` with hunk `index` of `diff(old, new)` applied and every other
+/// change left out: keeping that hunk moves the baseline forward.
+pub fn keep_hunk(old: &str, new: &str, index: usize) -> Option<String> {
+    rebuild(old, new, index, true)
+}
+
+/// `new` with hunk `index` of `diff(old, new)` taken back and every other
+/// change left in: undoing that hunk alone.
+pub fn undo_hunk(old: &str, new: &str, index: usize) -> Option<String> {
+    rebuild(old, new, index, false)
+}
+
+/// One walk for both: a removed line survives where it is outside the hunk
+/// (keep) or inside it (undo), and an added line the other way round.
+fn rebuild(old: &str, new: &str, index: usize, keep: bool) -> Option<String> {
+    let a: Vec<&str> = old.split_inclusive('\n').collect();
+    let b: Vec<&str> = new.split_inclusive('\n').collect();
+    let ops = script(&a, &b);
+    let (start, end) = *hunk_ranges(&ops).get(index)?;
+    let mut out = String::with_capacity(old.len().max(new.len()));
+    for (n, op) in ops.iter().enumerate() {
+        let inside = (start..end).contains(&n);
+        match *op {
+            Op::Equal(i, _) => out.push_str(a[i]),
+            Op::Delete(i) if inside != keep => out.push_str(a[i]),
+            Op::Insert(j) if inside == keep => out.push_str(b[j]),
+            _ => {}
+        }
+    }
+    Some(out)
 }
 
 /// Pairs of (line in `old`, line in `new`) that the diff keeps unchanged,
@@ -337,5 +383,59 @@ mod tests {
         let new: String = (0..3000).map(|n| format!("x{n}\n")).collect();
         let d = diff(&format!("keep\n{old}end\n"), &format!("keep\n{new}end\n"));
         assert_eq!((d.added, d.removed), (3000, 3000));
+    }
+
+    const OLD: &str = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\n";
+    const NEW: &str = "a\nB\nc\nd\ne\nf\ng\nh\ni\nj\nk\nL\nm";
+
+    #[test]
+    fn hunks_are_numbered_for_a_review() {
+        let d = diff(OLD, NEW);
+        assert_eq!(d.hunks.len(), 2);
+        let headers: Vec<Option<usize>> = d
+            .lines
+            .iter()
+            .filter(|l| l.kind == DiffKind::Hunk)
+            .map(|l| l.hunk)
+            .collect();
+        assert_eq!(headers, vec![Some(0), Some(1)]);
+    }
+
+    #[test]
+    fn keeping_or_undoing_one_hunk_leaves_the_other() {
+        let kept = keep_hunk(OLD, NEW, 0).expect("hunk 0");
+        assert_eq!(kept, "a\nB\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\n");
+        assert_eq!(diff(&kept, NEW).hunks.len(), 1);
+
+        let undone = undo_hunk(OLD, NEW, 1).expect("hunk 1");
+        assert_eq!(undone, "a\nB\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\n");
+        assert_eq!(keep_hunk(OLD, NEW, 2), None);
+    }
+
+    #[test]
+    fn every_hunk_kept_is_the_new_text_and_every_hunk_undone_the_old() {
+        let cases = [
+            (OLD, NEW),
+            ("", "only\n"),
+            ("gone\n", ""),
+            ("x\r\ny\r\n", "x\r\nY\r\n"),
+            ("no newline", "no newline\nnow"),
+            (
+                "1\n2\n3\n4\n5\n6\n7\n8\n9\n",
+                "0\n1\n2\n3\n5\n6\n7\n8\n9\n10\n",
+            ),
+        ];
+        for (old, new) in cases {
+            let mut base = old.to_owned();
+            while !diff(&base, new).hunks.is_empty() {
+                base = keep_hunk(&base, new, 0).expect("keep");
+            }
+            assert_eq!(base, new, "keeping {old:?} -> {new:?}");
+            let mut now = new.to_owned();
+            while let Some(last) = diff(old, &now).hunks.len().checked_sub(1) {
+                now = undo_hunk(old, &now, last).expect("undo");
+            }
+            assert_eq!(now, old, "undoing {old:?} -> {new:?}");
+        }
     }
 }
