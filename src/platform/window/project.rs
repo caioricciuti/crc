@@ -77,6 +77,15 @@ impl EditorView {
         let Some(mut state) = self.state_mut() else {
             return;
         };
+        if state
+            .review_scan
+            .as_ref()
+            .is_some_and(|rx| !matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)))
+        {
+            state.review_scan = None;
+            super::review::refresh_review(&mut state);
+            self.ivars().needs_redraw.set(true);
+        }
         // While Git is busy the change waits: it may be someone else's,
         // arriving during the panel's own operation.
         if let Some(at) = state.watch.git_changed_at
@@ -95,6 +104,7 @@ impl EditorView {
             return;
         }
         state.watch.tree_changed_at = None;
+        super::review::note_unhooked_writes(&mut state);
         if state.review_page.open {
             super::review::refresh_review(&mut state);
         }

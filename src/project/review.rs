@@ -15,6 +15,10 @@
 //! - `files/<key>`: its text before that write, or `files/<key>.absent`
 //!   when it did not exist, or `files/<key>.large` when it was too big to
 //!   keep;
+//! - `files/<key>.unhooked`: for a file changed without the hook (a shell
+//!   command) while the session was working, Git's staged copy as the only
+//!   baseline, or `files/<key>.untracked` when Git has none. No copy from
+//!   before the change exists, so such a file can be kept, never undone;
 //! - `events`: one line per hook call, appended.
 
 use std::io::Write;
@@ -52,6 +56,16 @@ pub enum Checkpoint {
     Absent,
     /// Over [`MAX_CHECKPOINT`]: recorded, not copied.
     TooLarge,
+    /// Changed without the hook: Git's staged copy to compare with, when
+    /// there is one. Never undone, since it is not the file as it was.
+    Unhooked(Option<PathBuf>),
+}
+
+impl Checkpoint {
+    /// Whether Undo may put the file back from it.
+    pub fn undoable(&self) -> bool {
+        matches!(self, Checkpoint::Text(_) | Checkpoint::Absent)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -189,6 +203,41 @@ pub fn checkpoint(dir: &Path, path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Records `path` as changed without the hook, with Git's staged copy as
+/// its baseline (`None` for a file Git does not track). False when the
+/// session already has the file, hooked or not.
+pub fn note_unhooked(dir: &Path, path: &Path, staged: Option<&[u8]>) -> std::io::Result<bool> {
+    use std::os::unix::ffi::OsStrExt;
+    let files = dir.join("files");
+    std::fs::create_dir_all(&files)?;
+    let key = key(path);
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(files.join(format!("{key}.path")))
+    {
+        Ok(mut claim) => claim.write_all(path.as_os_str().as_bytes())?,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(e) => return Err(e),
+    }
+    match staged {
+        Some(bytes) => {
+            let partial = files.join(format!("{key}.partial"));
+            std::fs::write(&partial, bytes)?;
+            std::fs::rename(partial, files.join(format!("{key}.unhooked")))?;
+        }
+        None => std::fs::write(files.join(format!("{key}.untracked")), "")?,
+    }
+    Ok(true)
+}
+
+/// Whether the session has `path` at all.
+pub fn has(dir: &Path, path: &Path) -> bool {
+    dir.join("files")
+        .join(format!("{}.path", key(path)))
+        .exists()
+}
+
 /// Every file the session has a checkpoint for, in path order. A claim
 /// whose copy is not finished yet is left out until it is.
 pub fn files(dir: &Path) -> Vec<File> {
@@ -203,8 +252,13 @@ pub fn files(dir: &Path) -> Vec<File> {
             let key = name.strip_suffix(".path")?;
             let path = crate::platform::path_from_bytes(std::fs::read(entry.path()).ok()?);
             let text = files.join(key);
+            let unhooked = files.join(format!("{key}.unhooked"));
             let checkpoint = if text.is_file() {
                 Checkpoint::Text(text)
+            } else if unhooked.is_file() {
+                Checkpoint::Unhooked(Some(unhooked))
+            } else if files.join(format!("{key}.untracked")).exists() {
+                Checkpoint::Unhooked(None)
             } else if files.join(format!("{key}.absent")).exists() {
                 Checkpoint::Absent
             } else if files.join(format!("{key}.large")).exists() {
@@ -434,7 +488,9 @@ pub fn texts(file: &File) -> Result<(String, String), String> {
     let old = match &file.checkpoint {
         Checkpoint::Text(kept) => std::fs::read_to_string(kept)
             .map_err(|_| "not text: keep or undo the whole file".to_owned())?,
-        Checkpoint::Absent => String::new(),
+        Checkpoint::Absent | Checkpoint::Unhooked(None) => String::new(),
+        Checkpoint::Unhooked(Some(staged)) => std::fs::read_to_string(staged)
+            .map_err(|_| "not text: keep the whole file".to_owned())?,
         Checkpoint::TooLarge => {
             return Err("too large to review by change: keep it whole".into());
         }
@@ -469,6 +525,9 @@ fn current(file: &File, seen: u64) -> Result<(String, String), String> {
 /// Keeps one change: the checkpoint takes it, so it leaves the review.
 /// The last change kept takes the file out of the session.
 pub fn keep(dir: &Path, file: &File, hunk: usize, seen: u64) -> Result<(), String> {
+    if !file.checkpoint.undoable() {
+        return Err("this file can only be kept whole".into());
+    }
     let (old, new) = current(file, seen)?;
     let kept = crate::ide::diff::keep_hunk(&old, &new, hunk).ok_or("that change is gone")?;
     if kept == new {
@@ -481,6 +540,9 @@ pub fn keep(dir: &Path, file: &File, hunk: usize, seen: u64) -> Result<(), Strin
 /// through the open document when there is one, so it is one undo step,
 /// or with [`write_undone`] when there is not.
 pub fn undone(file: &File, hunk: usize, seen: u64) -> Result<String, String> {
+    if !file.checkpoint.undoable() {
+        return Err("no copy from before the change was kept to undo to".into());
+    }
     let (old, new) = current(file, seen)?;
     crate::ide::diff::undo_hunk(&old, &new, hunk).ok_or_else(|| "that change is gone".into())
 }
@@ -519,6 +581,9 @@ pub fn undo_all(dir: &Path, file: &File) -> Result<(), String> {
             _ => {}
         },
         Checkpoint::TooLarge => return Err("too large: no copy was kept to undo to".into()),
+        Checkpoint::Unhooked(_) => {
+            return Err("no copy from before the change was kept to undo to".into());
+        }
     }
     forget(dir, file)
 }
@@ -542,7 +607,15 @@ fn forget(dir: &Path, file: &File) -> Result<(), String> {
     let key = key(&file.path);
     // The claim goes last: until it does, the file still lists, never
     // half removed.
-    for suffix in ["", ".absent", ".large", ".partial", ".path"] {
+    for suffix in [
+        "",
+        ".absent",
+        ".large",
+        ".unhooked",
+        ".untracked",
+        ".partial",
+        ".path",
+    ] {
         match std::fs::remove_file(files.join(format!("{key}{suffix}"))) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
                 return Err(format!("forget {}: {e}", file.path.display()));
@@ -793,5 +866,38 @@ mod tests {
             ("\u{273b} Claude".into(), PathBuf::from("/work/garden-log"))
         );
         assert!(summary(&tree.0).is_empty(), "no files, nothing to list");
+    }
+
+    #[test]
+    fn a_file_changed_without_the_hook_can_only_be_kept() {
+        let tree = TempTree::new("review-unhooked", &[("f.txt", AFTER), ("n.txt", "new\n")]);
+        let dir = tree.0.join("session");
+        let f = crate::platform::canonical(&tree.0.join("f.txt"));
+        let n = crate::platform::canonical(&tree.0.join("n.txt"));
+        assert!(note_unhooked(&dir, &f, Some(BEFORE.as_bytes())).expect("note"));
+        assert!(note_unhooked(&dir, &n, None).expect("note"));
+        assert!(
+            !note_unhooked(&dir, &f, None).expect("note"),
+            "once per file"
+        );
+        // A hooked file is never noted over.
+        let h = tree.0.join("h.txt");
+        hook("pre", &pre(&h), &dir).expect("hook");
+        assert!(!note_unhooked(&dir, &resolve(&h), None).expect("note"));
+
+        let files = files(&dir);
+        let f = files.iter().find(|x| x.path == f).expect("f");
+        let (old, new) = texts(f).expect("texts");
+        assert_eq!((old.as_str(), new.as_str()), (BEFORE, AFTER));
+        assert!(!f.checkpoint.undoable());
+        assert!(undone(f, 0, fingerprint(AFTER)).is_err());
+        assert!(undo_all(&dir, f).is_err());
+        assert!(keep(&dir, f, 0, fingerprint(AFTER)).is_err());
+        assert_eq!(std::fs::read_to_string(&f.path).expect("read"), AFTER);
+        keep_all(&dir, f).expect("keep all");
+        let n = files.iter().find(|x| x.path == n).expect("n");
+        assert_eq!(n.checkpoint, Checkpoint::Unhooked(None));
+        keep_all(&dir, n).expect("keep all");
+        assert_eq!(super::files(&dir).len(), 1, "the hooked one is left");
     }
 }

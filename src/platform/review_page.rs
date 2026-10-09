@@ -368,6 +368,11 @@ pub fn draw(
                 &name,
                 theme.text,
             );
+            let folder = if e.file.checkpoint.undoable() {
+                folder
+            } else {
+                format!("by a command \u{b7} {folder}")
+            };
             text(out, atlas, x + 12.0, ly + 20.0, LIST - 24.0, &folder, dim);
             let counts = match &e.file.checkpoint {
                 review::Checkpoint::Absent => "new".to_owned(),
@@ -430,20 +435,18 @@ pub fn draw(
     } else {
         "Undo file"
     };
-    let undo_w = layout::ui_text_width(atlas, undo_label) + 28.0;
+    let undoable = e.file.checkpoint.undoable();
     let keep_w = layout::ui_text_width(atlas, "Keep file") + 28.0;
-    let undo = button(out, atlas, theme, right - undo_w, fy, undo_label, false);
-    let keep = button(
-        out,
-        atlas,
-        theme,
-        undo.x - 8.0 - keep_w,
-        fy,
-        "Keep file",
-        true,
-    );
+    let keep_x = if undoable {
+        let undo_w = layout::ui_text_width(atlas, undo_label) + 28.0;
+        let undo = button(out, atlas, theme, right - undo_w, fy, undo_label, false);
+        hits.push((undo, Action::UndoFile));
+        undo.x - 8.0 - keep_w
+    } else {
+        right - keep_w
+    };
+    let keep = button(out, atlas, theme, keep_x, fy, "Keep file", true);
     hits.push((keep, Action::KeepFile));
-    hits.push((undo, Action::UndoFile));
     text(
         out,
         atlas,
@@ -454,6 +457,22 @@ pub fn draw(
         theme.text,
     );
     fy += 34.0;
+    if !undoable && e.whole_only.is_none() {
+        // Said once, above the diff: what this file is, and why only Keep.
+        let note = match &e.file.checkpoint {
+            review::Checkpoint::Unhooked(Some(_)) => {
+                "Changed by a command while this session was working, not through the agent's file tools. No copy from before was kept, so it can only be kept. Compared with Git's staged copy."
+            }
+            _ => {
+                "Created by a command while this session was working, not through the agent's file tools. No copy from before was kept, so it can only be kept."
+            }
+        };
+        for line in layout::wrap_words(atlas, note, dw) {
+            text(out, atlas, dx, fy, dw, &line, dim);
+            fy += 20.0;
+        }
+        fy += 8.0;
+    }
     if let Some(why) = &e.whole_only {
         text(out, atlas, dx, fy, dw, why, dim);
         page.hits = hits;
@@ -475,8 +494,12 @@ pub fn draw(
         theme,
         out,
     );
-    // Keep and Undo on each hunk's rule.
-    let visible = (diff_rect.height / DIFF_LINE) as usize;
+    // Keep and Undo on each hunk's rule; a file with no copy is kept whole.
+    let visible = if undoable {
+        (diff_rect.height / DIFF_LINE) as usize
+    } else {
+        0
+    };
     for (row, line) in e
         .diff
         .lines

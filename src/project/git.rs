@@ -544,6 +544,44 @@ pub fn head_text(root: &Path, path: &Path) -> Result<Option<String>, String> {
     Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
 }
 
+/// What Git holds for a file in the index.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Indexed {
+    /// Its staged bytes.
+    Tracked(Vec<u8>),
+    /// Not in the index and not ignored: a new file.
+    Untracked,
+    /// Matched by a .gitignore: build output and the like.
+    Ignored,
+}
+
+/// The staged copy of `path`, or why there is none. `Err` outside a
+/// repository.
+pub fn index_bytes(path: &Path) -> Result<Indexed, String> {
+    let dir = path.parent().ok_or("no folder")?;
+    let root = crate::platform::canonical(&toplevel(dir)?);
+    let relative = path
+        .strip_prefix(&root)
+        .map_err(|_| "outside the repository".to_string())?;
+    let relative = relative.to_string_lossy();
+    let output = command(&root)
+        .args(["show", &format!(":{relative}")])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if output.status.success() {
+        return Ok(Indexed::Tracked(output.stdout));
+    }
+    let ignored = command(&root)
+        .args(["check-ignore", "-q", "--", &relative])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    Ok(if ignored {
+        Indexed::Ignored
+    } else {
+        Indexed::Untracked
+    })
+}
+
 /// What a gutter mark says about a line of the current text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MarkKind {

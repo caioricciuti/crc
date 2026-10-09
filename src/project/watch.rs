@@ -86,6 +86,10 @@ const RESCAN: u32 = 0x01 | 0x02 | 0x04 | 0x20;
 /// touching a thousand files becomes one callback.
 const LATENCY: f64 = 0.25;
 
+/// The most changed paths kept between two looks: enough for an agent's
+/// edits, not a checkout's.
+const MAX_FILES: usize = 200;
+
 /// Runs on the main thread with what changed since the last call.
 pub type OnChange = Box<dyn Fn(Change)>;
 
@@ -102,6 +106,9 @@ struct Shared {
     closed: AtomicBool,
     /// Tree and Git changes since the last delivery.
     pending: Mutex<(bool, bool)>,
+    /// Paths of tree changes since the last [`Watcher::take_files`],
+    /// at most [`MAX_FILES`].
+    files: Mutex<Vec<PathBuf>>,
     on_change: MainThreadOnly<OnChange>,
 }
 
@@ -137,6 +144,7 @@ impl Watcher {
             git_dirs,
             closed: AtomicBool::new(false),
             pending: Mutex::new((false, false)),
+            files: Mutex::new(Vec::new()),
             on_change: MainThreadOnly(on_change),
         }));
         let context = StreamContext {
@@ -187,6 +195,13 @@ impl Watcher {
         // The shared block is only freed never, see `Shared`.
         unsafe { &(*self.shared).root }
     }
+
+    /// The paths that changed in the tree since the last call, each once.
+    /// Empty after a rescan, which names no paths.
+    pub fn take_files(&self) -> Vec<PathBuf> {
+        let shared = unsafe { &*self.shared };
+        std::mem::take(&mut *shared.files.lock().unwrap_or_else(|e| e.into_inner()))
+    }
 }
 
 impl Drop for Watcher {
@@ -227,12 +242,16 @@ unsafe extern "C" fn on_events(
         }
         let path = unsafe { CStr::from_ptr(raw) }.to_string_lossy();
         match classify(&shared.root, &shared.git_dirs, Path::new(path.as_ref())) {
-            Some(Change::Tree) => tree = true,
+            Some(Change::Tree) => {
+                tree = true;
+                let mut files = shared.files.lock().unwrap_or_else(|e| e.into_inner());
+                let path = PathBuf::from(path.as_ref());
+                if files.len() < MAX_FILES && !files.contains(&path) {
+                    files.push(path);
+                }
+            }
             Some(Change::Git) => git = true,
             None => {}
-        }
-        if tree && git {
-            break;
         }
     }
     if !tree && !git {

@@ -33,6 +33,85 @@ pub(super) fn refresh_review(state: &mut State) {
     }
 }
 
+/// A terminal counts as working on a change for this long after it last
+/// printed: an agent prints while it edits.
+const WORKING: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Files the watcher saw change that no hook recorded: each one under a
+/// terminal that was working is noted in that terminal's session, with
+/// Git's staged copy to compare with. On a worker, since that asks Git.
+/// What the person saves from another editor meanwhile is noted as well;
+/// the page says such a file was changed without the hook.
+pub(super) fn note_unhooked_writes(state: &mut State) {
+    // One scan at a time; what changes meanwhile waits in the watcher.
+    if state.review_scan.is_some() {
+        return;
+    }
+    let Some(watcher) = &state.watch.watcher else {
+        return;
+    };
+    let changed = watcher.take_files();
+    if changed.is_empty() {
+        return;
+    }
+    let live: Vec<std::path::PathBuf> = state
+        .terminal
+        .tabs
+        .iter()
+        .map(|t| t.review.clone())
+        .collect();
+    let working: Vec<_> = state
+        .terminal
+        .tabs
+        .iter()
+        .filter(|t| t.last_output.is_some_and(|at| at.elapsed() < WORKING))
+        .map(|t| {
+            (
+                t.review.clone(),
+                t.base_name(),
+                crate::platform::canonical(&t.launch.cwd),
+                t.last_output,
+            )
+        })
+        .collect();
+    if working.is_empty() {
+        return;
+    }
+    let mut notes = Vec::new();
+    for path in changed {
+        if !path.is_file() || live.iter().any(|dir| review::has(dir, &path)) {
+            continue;
+        }
+        // The most recently busy terminal whose folder holds the file.
+        let Some((dir, title, cwd, _)) = working
+            .iter()
+            .filter(|(_, _, cwd, _)| path.starts_with(cwd))
+            .max_by_key(|(_, _, _, at)| *at)
+        else {
+            continue;
+        };
+        notes.push((dir.clone(), title.clone(), cwd.clone(), path));
+    }
+    if notes.is_empty() {
+        return;
+    }
+    let (tx, rx) = mpsc::channel();
+    state.review_scan = Some(rx);
+    std::thread::spawn(move || {
+        for (dir, title, cwd, path) in notes {
+            let staged = match crate::project::git::index_bytes(&path) {
+                Ok(crate::project::git::Indexed::Ignored) => continue,
+                Ok(crate::project::git::Indexed::Tracked(bytes)) => Some(bytes),
+                Ok(crate::project::git::Indexed::Untracked) | Err(_) => None,
+            };
+            if review::note_unhooked(&dir, &path, staged.as_deref()).is_ok() {
+                review::describe(&dir, &title, &cwd);
+            }
+        }
+        let _ = tx.send(());
+    });
+}
+
 impl EditorView {
     /// The Review page in the editor column, read fresh.
     pub(super) fn open_review(&self) {
@@ -161,22 +240,31 @@ impl EditorView {
                     return Ok(None);
                 };
                 let undo = matches!(action, Action::UndoSession(_));
-                if undo && let Some(e) = session.files.iter().find(|e| dirty(&e.file.path)) {
+                // Undo all leaves what has no copy to go back to.
+                let acted: Vec<_> = session
+                    .files
+                    .iter()
+                    .filter(|e| !undo || e.file.checkpoint.undoable())
+                    .collect();
+                if undo && let Some(e) = acted.iter().find(|e| dirty(&e.file.path)) {
                     return Err(refuse(&e.file));
                 }
-                for e in &session.files {
+                for e in &acted {
                     if undo {
                         review::undo_all(&session.dir, &e.file)?;
                     } else {
                         review::keep_all(&session.dir, &e.file)?;
                     }
                 }
-                let n = session.files.len();
+                let n = acted.len();
                 let files = if n == 1 { "file" } else { "files" };
-                Ok(Some(if undo {
-                    format!("Put {n} {files} back as they were")
-                } else {
-                    format!("Kept every change in {n} {files}")
+                let left = session.files.len() - n;
+                Ok(Some(match (undo, left) {
+                    (true, 0) => format!("Put {n} {files} back as they were"),
+                    (true, _) => format!(
+                        "Put {n} {files} back as they were; {left} changed by a command can only be kept"
+                    ),
+                    (false, _) => format!("Kept every change in {n} {files}"),
                 }))
             }
         }

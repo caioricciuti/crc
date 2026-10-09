@@ -122,8 +122,9 @@ the size and write it back.
   before its first edit: Keep a change and it leaves the review, Undo it
   and it comes out of the file, by hunk, by file or for a whole session.
   Undo is refused while the file has unsaved edits in crc; an open clean
-  file reloads, and `Cmd-Z` there brings the agent's version back. Edits
-  an agent makes through shell commands are not seen.
+  file reloads, and `Cmd-Z` there brings the agent's version back. Files
+  changed by shell commands while the terminal works are listed as well,
+  to keep only.
 - **Workspaces**: open a folder that holds several repositories and the
   notes about them, and Source Control shows one repository at a time
   with a menu to switch. Home becomes the workspace's front page: what
@@ -222,10 +223,13 @@ the size and write it back.
   changes; other change types use whole-file actions. Gutter marks compare
   with HEAD, not the index. Conflict markers must be Git's default seven
   characters.
-- **Agent review sees file tools only.** Claude's Write and Edit calls in
-  the Claude tab crc starts are kept; files an agent changes through shell
-  commands are not, and neither are agents without hooks. `claude` typed
-  in a crc shell gets the hooks only if you add them to its settings.
+- **Agent review keeps copies for file tools only.** Claude's Write and
+  Edit calls in the Claude tab crc starts are copied first and can be
+  undone. Files changed any other way while a terminal is busy (a shell
+  command, an agent without hooks, or you in another editor) are listed
+  too, compared with Git's staged copy, but can only be kept: no copy from
+  before exists. `claude` typed in a crc shell gets the hooks only if you
+  add them to its settings.
 - **No minimap.** Folding is by indentation, not by syntax.
 - **Markdown styling has edges.** Italic is not drawn on lines with
   non-ASCII text, and bold there is the regular face drawn twice; a line

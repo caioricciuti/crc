@@ -16,6 +16,7 @@ printf '{"cwd":"$T/reviewproj","tool_name":"Edit","tool_input":{"file_path":"not
 printf 'a\nB\nc\nd\ne\nf\ng\nh\ni\nj\nk\nL\n' > "$T/reviewproj/notes.txt"
 printf '{"cwd":"$T/reviewproj","tool_name":"Write","tool_input":{"file_path":"new.txt"}}' | "$hook_bin" --hook pre
 printf 'made by the agent\n' > "$T/reviewproj/new.txt"
+printf 'written by a shell command\n' > "$T/reviewproj/shell.txt"
 printf '{"message":"Claude is waiting for your input"}' | "$hook_bin" --hook notify
 printf 'done\n'
 sleep 30
@@ -46,25 +47,33 @@ wait 200
 dump $T/review-confirm.out
 click @review_page.undo_file
 wait 300
+dump $T/review-shell.out
+click @review_page.keep_file
+wait 300
 dump $T/review-empty.out
 quit
 SCRIPT
 CRC_TERMINAL_SHELL=/bin/sh CRC_CLAUDE_COMMAND="$T/review-agent.sh" \
     CRC_SELFTEST="$T/review.script" "$BIN" "$T/reviewproj" 2> "$T/review.err"
-expect "$T/review.out" terminals "waiting: Claude is waiting for your input review=2"
+expect "$T/review.out" terminals "waiting: Claude is waiting for your input review=3"
 # Home lists the session; its row opens the page, newest session first,
 # files in path order: new.txt, then notes.txt.
-expect "$T/review-open.out" review_page "open sessions=1 files=2 hunks=1 shown=new.txt confirm=false targets=9"
+expect "$T/review-open.out" review_page "open sessions=1 files=3 hunks=1 shown=new.txt confirm=false targets=10"
 # notes.txt has two changes: Keep the first, Undo the second. The file
 # keeps B and goes back to l, and with nothing left it leaves the review.
-expect "$T/review-kept.out" review_page "open sessions=1 files=2 hunks=1 shown=notes.txt confirm=false targets=9"
+expect "$T/review-kept.out" review_page "open sessions=1 files=3 hunks=1 shown=notes.txt confirm=false targets=10"
 grep -q '^message: Kept a change in notes.txt$' "$T/review-kept.out" \
     || failed "review-kept.out: $(grep '^message:' "$T/review-kept.out")"
-expect "$T/review-undone.out" review_page "open sessions=1 files=1 hunks=1 shown=new.txt confirm=false targets=8"
+expect "$T/review-undone.out" review_page "open sessions=1 files=2 hunks=1 shown=new.txt confirm=false targets=9"
 [ "$(cat "$T/reviewproj/notes.txt")" = "$(printf 'a\nB\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl')" ] \
     || failed "review: notes.txt after Keep and Undo: $(cat "$T/reviewproj/notes.txt")"
 # Undo file asks twice; for a file the agent created it removes it.
 grep -q '^review_page: .* confirm=true ' "$T/review-confirm.out" \
     || failed "review-confirm.out: $(grep '^review_page:' "$T/review-confirm.out")"
 [ -e "$T/reviewproj/new.txt" ] && failed "review: new.txt is still there after Undo file"
+# A file written by a plain shell command, not the hook, is listed too,
+# with no copy from before: Keep file only, no Undo and no hunk buttons.
+expect "$T/review-shell.out" review_page "open sessions=1 files=1 hunks=1 shown=shell.txt confirm=false targets=5"
+grep -q '^review_page: .*shown=shell.txt' "$T/review-shell.out" && [ "$(cat "$T/reviewproj/shell.txt")" = "written by a shell command" ] \
+    || failed "review: shell.txt changed"
 expect "$T/review-empty.out" review_page "open sessions=0 files=0 hunks=0 shown=none confirm=false targets=1"

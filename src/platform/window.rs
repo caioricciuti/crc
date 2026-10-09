@@ -644,6 +644,8 @@ struct State {
     settings_page: crate::platform::settings_page::Page,
     /// The Review page, and Home's list of what is waiting for review.
     review_page: crate::platform::review_page::Page,
+    /// Files changed while a terminal was working, being noted for review.
+    review_scan: Option<mpsc::Receiver<()>>,
     /// The call behind each MCP answer tab, so Cmd-Return there runs it
     /// again.
     mcp_calls: HashMap<u64, crate::mcp_client::call::Call>,
@@ -8149,6 +8151,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         home_since,
         mcp: Default::default(),
         settings_page: Default::default(),
+        review_scan: None,
         review_page: crate::platform::review_page::Page {
             summary: crate::project::review::root()
                 .map_or_else(Vec::new, |r| crate::project::review::summary(&r)),
