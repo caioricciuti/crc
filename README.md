@@ -239,10 +239,16 @@ the size and write it back.
   its own pair only and does not skip strings or comments.
 - **Text input is new.** Dead keys and IME go through macOS text input and
   need wider testing across layouts.
-- **Updates are announced, not installed.** Once a day crc asks GitHub for
-  the list of releases and says in the status line if a newer one exists;
-  Help > Check for Updates opens its page. `update_check = false` turns
-  the daily check off. Nothing is downloaded.
+- **Updates install when you ask, not before.** Once a day crc asks GitHub
+  for the list of releases and says in the status line if a newer one
+  exists; `update_check = false` turns that off, and it downloads nothing.
+  Help > Check for Updates downloads the release's DMG and checks it: its
+  SHA256SUMS, a signature from crc's developer with crc's bundle id,
+  Gatekeeper's notarization check, and a version newer than the running
+  one. Then Help > Restart to Update, or the row on Home, quits the way
+  Cmd-Q does (unsaved documents ask first), puts the new app where the old
+  one was and opens it. If that cannot be done (an app in a folder you
+  cannot write to), crc keeps running and the status line says why.
 - **macOS only, and deliberately so.**
 
 ## Keys

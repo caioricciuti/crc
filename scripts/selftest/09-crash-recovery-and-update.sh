@@ -70,6 +70,27 @@ mv "$T/update.out" "$T/update-none.out"
 grep -q '^message: crc .* is the latest release$' "$T/update-none.out" \
     || failed "update-none.out: $(grep '^message:' "$T/update-none.out")"
 
+# Asked, a release with a DMG is downloaded and checked before anything
+# else. This one is a real DMG holding an unsigned crc.app, so it is
+# refused at the signature; one whose SHA256SUMS disagrees is refused
+# before it is opened. Nothing replaces the "installed" app either way.
+mkdir -p "$T/upd/src/crc.app/Contents/MacOS" "$T/upd/installed/crc.app"
+printf '#!/bin/sh\n' > "$T/upd/src/crc.app/Contents/MacOS/crc"
+printf 'mine\n' > "$T/upd/installed/crc.app/marker"
+hdiutil create -quiet -fs HFS+ -volname crc -srcfolder "$T/upd/src" "$T/upd/crc.dmg"
+( cd "$T/upd" && shasum -a 256 crc.dmg > SHA256SUMS )
+printf '%064d  crc.dmg\n' 0 > "$T/upd/BADSUMS"
+for sums in SHA256SUMS BADSUMS; do
+    printf '[{"tag_name": "v999.0.0", "html_url": "https://github.com/caioricciuti/crc/releases/tag/v999.0.0", "assets": [{"name": "crc.dmg", "browser_download_url": "file://%s/upd/crc.dmg"}, {"name": "SHA256SUMS", "browser_download_url": "file://%s/upd/%s"}]}]' "$T" "$T" "$sums" > "$T/releases-$sums.json"
+    sed "s|dump .*|dump $T/install-$sums.out|; s|^wait 500$|wait 3000|" "$T/update.script" > "$T/install.script"
+    CRC_UPDATE_URL="file://$T/releases-$sums.json" CRC_UPDATE_APP="$T/upd/installed/crc.app" \
+        CRC_SELFTEST="$T/install.script" "$BIN" "$T/crashproj/notes.rs" 2> "$T/install-$sums.err"
+done
+grep -q "^message: could not install crc 999.0.0: not signed by crc's developer" "$T/install-SHA256SUMS.out" \
+    || failed "install-SHA256SUMS.out: $(grep '^message:' "$T/install-SHA256SUMS.out")"
+expect "$T/install-BADSUMS.out" message "could not install crc 999.0.0: the download does not match its SHA256SUMS"
+[ "$(cat "$T/upd/installed/crc.app/marker")" = mine ] || failed "install: the installed app was touched"
+
 CRC_SELFTEST="$T/crash.script" "$BIN" "$T/crashproj/notes.rs" 2> "$T/crash2.log" || true
 CRC_RESTORE_ANSWER=discard CRC_SELFTEST="$T/restored.script" "$BIN" "$T/crashproj/notes.rs" 2> "$T/discarded.log"
 mv "$T/restored.out" "$T/discarded.out"

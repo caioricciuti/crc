@@ -406,6 +406,8 @@ pub enum HomeAction {
     ShowTerminal(usize),
     /// Open the Review page.
     OpenReview,
+    /// Install the downloaded update: Help > Restart to Update.
+    RestartToUpdate,
 }
 
 /// A clickable row on the home screen.
@@ -432,6 +434,7 @@ pub fn build_home(
     summary: Option<&crate::project::workspace::Summary>,
     terminals: &[(String, String)],
     review: &[(String, usize, bool)],
+    update: Option<&str>,
     hits: &mut Vec<HomeHit>,
 ) {
     const ROW: f32 = 30.0;
@@ -468,6 +471,28 @@ pub fn build_home(
         *y += 22.0;
         push_rect(out, atlas, [x, *y - 4.0], [width, 1.0], theme.hairline);
     };
+
+    // A downloaded update waits for one click.
+    if let Some(version) = update
+        && y + 22.0 + ROW <= bottom
+    {
+        section(out, atlas, &mut y, "Update");
+        let rect = home_row(
+            out,
+            atlas,
+            theme,
+            (x, width),
+            y,
+            icons::REFRESH,
+            &format!("crc {version} is ready"),
+            "Restart to Update",
+        );
+        hits.push(HomeHit {
+            rect,
+            action: HomeAction::RestartToUpdate,
+        });
+        y += ROW + GAP;
+    }
 
     // What agents changed and nobody has looked at yet comes first.
     if !review.is_empty() && y + 22.0 + ROW <= bottom {
@@ -3208,6 +3233,7 @@ mod home_tests {
             None,
             &[],
             &[],
+            None,
             &mut hits,
         );
         let actions: Vec<&HomeAction> = hits.iter().map(|h| &h.action).collect();
@@ -3282,6 +3308,7 @@ mod home_tests {
             Some(&summary),
             &[("claude".into(), "waiting: Approve?".into())],
             &[],
+            None,
             &mut hits,
         );
         let actions: Vec<HomeAction> = hits.iter().map(|h| h.action.clone()).collect();
@@ -3324,6 +3351,7 @@ mod home_tests {
             None,
             &[],
             &[],
+            None,
             &mut hits,
         );
         assert!(hits.is_empty());

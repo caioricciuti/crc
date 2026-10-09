@@ -718,6 +718,15 @@ struct State {
     /// An update check in flight, and whether someone asked for it (which
     /// changes what an answer says and does).
     update: Option<(bool, mpsc::Receiver<crate::platform::update::Outcome>)>,
+    /// A newer release being downloaded and checked.
+    update_install: Option<(
+        String,
+        mpsc::Receiver<Result<crate::platform::update::Ready, String>>,
+    )>,
+    /// A checked release, waiting for Restart to Update.
+    update_ready: Option<crate::platform::update::Ready>,
+    /// Restart to Update asked to quit: the quit installs it.
+    update_on_quit: bool,
     /// The last key or click. The caret is solid for a blink phase after
     /// it, so it never vanishes under your typing.
     caret_since: Instant,
@@ -1979,6 +1988,9 @@ define_class!(
                             self.run_mcp_call();
                         }
                         layout::HomeAction::OpenReview => self.open_review(),
+                        layout::HomeAction::RestartToUpdate => {
+                            self.restart_to_update();
+                        }
                     }
                     self.request_redraw();
                     self.pump();
@@ -3424,6 +3436,11 @@ define_class!(
             self.pump();
         }
 
+        #[unsafe(method(restartToUpdate:))]
+        fn action_restart_to_update(&self, _sender: Option<&AnyObject>) {
+            self.restart_to_update();
+        }
+
         #[unsafe(method(checkForUpdates:))]
         fn action_check_for_updates(&self, _sender: Option<&AnyObject>) {
             self.start_update_check(true);
@@ -3869,6 +3886,8 @@ define_class!(
                 let active = state.docs.active();
                 active.path.is_some()
                     && (active.is_dirty() || active.disk_state() != DiskState::Unchanged)
+            } else if action == sel!(restartToUpdate:) {
+                state.update_ready.is_some()
             } else if action == sel!(switchRepository:) {
                 state.workspace.has_several()
             } else if action == sel!(paste:) {
@@ -4358,6 +4377,7 @@ impl EditorView {
     /// when there is something new; an asked one always answers, and opens
     /// the new release's page.
     fn poll_update(&self) {
+        self.poll_update_install();
         let (manual, outcome) = {
             let Some(mut state) = self.state_mut() else {
                 return;
@@ -4377,9 +4397,25 @@ impl EditorView {
         let current = env!("CARGO_PKG_VERSION");
         let note = match (outcome, manual) {
             (Ok(Some(release)), false) => Some(format!(
-                "crc {} is out: Help > Check for Updates opens its page",
+                "crc {} is out: Help > Check for Updates installs it",
                 release.version
             )),
+            // Asked, and it can be installed here: download and check it.
+            (Ok(Some(release)), true)
+                if release.dmg.is_some()
+                    && release.sums.is_some()
+                    && crate::platform::update::running_app().is_some() =>
+            {
+                let version = release.version.clone();
+                if let Some(mut state) = self.state_mut() {
+                    state.update_install = Some((
+                        version.clone(),
+                        crate::platform::update::spawn_install(release),
+                    ));
+                }
+                self.resume_display_link();
+                Some(format!("downloading crc {version}…"))
+            }
             (Ok(Some(release)), true) => Some(if self.ivars().testing {
                 format!("crc {} is out; would open {}", release.version, release.url)
             } else {
@@ -4400,6 +4436,57 @@ impl EditorView {
             self.request_redraw();
             self.pump();
         }
+    }
+
+    /// Quits to install the downloaded update. The ordinary quit: unsaved
+    /// documents ask first, and a cancel there cancels the update too.
+    fn restart_to_update(&self) {
+        let ready = self.state_mut().is_some_and(|mut state| {
+            state.update_on_quit = state.update_ready.is_some();
+            state.update_on_quit
+        });
+        if ready {
+            NSApplication::sharedApplication(MainThreadMarker::from(self)).terminate(None);
+        }
+    }
+
+    /// Takes a finished download's answer: ready for Restart to Update, or
+    /// why it was refused.
+    fn poll_update_install(&self) {
+        let said = {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            let Some((version, rx)) = &state.update_install else {
+                return;
+            };
+            let version = version.clone();
+            let result = match rx.try_recv() {
+                Ok(result) => result,
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Disconnected) => Err("the download stopped".to_owned()),
+            };
+            state.update_install = None;
+            match result {
+                Ok(ready) => {
+                    let said = format!(
+                        "crc {} is ready: Help > Restart to Update installs it",
+                        ready.version
+                    );
+                    state.update_ready = Some(ready);
+                    (layout::Feedback::Success, said)
+                }
+                Err(e) => (
+                    layout::Feedback::Failure,
+                    format!("could not install crc {version}: {e}"),
+                ),
+            }
+        };
+        if let Some(mut state) = self.state_mut() {
+            state.say(said.0, said.1);
+        }
+        self.request_redraw();
+        self.pump();
     }
 
     /// Whether the caret is blinking now: the setting allows it, the window
@@ -5065,7 +5152,37 @@ define_class!(
         fn should_terminate(&self, _app: &NSApplication) -> NSApplicationTerminateReply {
             let view = &self.ivars().view;
             if !view.confirm_discard_all() {
+                if let Some(mut state) = view.state_mut() {
+                    state.update_on_quit = false;
+                }
                 return NSApplicationTerminateReply::TerminateCancel;
+            }
+            // Restart to Update: the new app goes where this one is now,
+            // before anything is saved or shut down, so a failure keeps
+            // this one running with nothing lost.
+            let update = view.state_mut().and_then(|mut state| {
+                std::mem::take(&mut state.update_on_quit)
+                    .then(|| state.update_ready.clone())
+                    .flatten()
+            });
+            if let Some(ready) = update {
+                let installed = crate::platform::update::running_app()
+                    .ok_or_else(|| "crc is not running from an app".to_owned())
+                    .and_then(|app| {
+                        crate::platform::update::apply(&ready, &app)?;
+                        crate::platform::update::relaunch_after_exit(&app)
+                            .map_err(|e| format!("could not reopen crc: {e}"))
+                    });
+                if let Err(e) = installed {
+                    if let Some(mut state) = view.state_mut() {
+                        state.say(
+                            layout::Feedback::Failure,
+                            format!("could not install crc {}: {e}", ready.version),
+                        );
+                    }
+                    view.request_redraw();
+                    return NSApplicationTerminateReply::TerminateCancel;
+                }
             }
             // Written only once quitting is certain: recording a session for
             // a quit the user then cancelled would overwrite the real one.
@@ -6066,6 +6183,7 @@ fn draw_other_pane(
             None,
             &[],
             &[],
+            None,
             &mut hits,
         );
         return;
@@ -7782,6 +7900,12 @@ fn install_menu(mtm: MainThreadMarker, app: &NSApplication) {
         "",
         false,
     ));
+    help_menu.addItem(&item(
+        "Restart to Update",
+        sel!(restartToUpdate:),
+        "",
+        false,
+    ));
     help_menu.addItem(&item("Report a Problem…", sel!(reportProblem:), "", false));
     help_menu.addItem(&item("Show Crash Logs", sel!(showCrashLogs:), "", false));
     help_item.setSubmenu(Some(&help_menu));
@@ -8052,6 +8176,9 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         completion_generation: 0,
         completion_chips: Vec::new(),
         update: None,
+        update_install: None,
+        update_ready: None,
+        update_on_quit: false,
         reloads: Reloads {
             channel: mpsc::channel(),
             pending: HashSet::new(),

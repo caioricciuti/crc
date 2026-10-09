@@ -140,6 +140,11 @@ impl EditorView {
                             .iter()
                             .find(|h| h.action == layout::HomeAction::OpenReview)
                             .map(|h| h.rect),
+                        _ if name == "home.update" => state
+                            .home_hits
+                            .iter()
+                            .find(|h| h.action == layout::HomeAction::RestartToUpdate)
+                            .map(|h| h.rect),
                         _ => frame_of(&mut state).named(name),
                     }
                 };

@@ -78,6 +78,7 @@ impl EditorView {
             extensions,
             settings_page,
             review_page,
+            update_ready,
             blame: Blame { shown: blame, .. },
             renderer,
             glyphs,
@@ -302,6 +303,7 @@ impl EditorView {
                     .iter()
                     .map(|(dir, title, n)| (title.clone(), *n, review_page.running.contains(dir)))
                     .collect::<Vec<_>>(),
+                update_ready.as_ref().map(|r| r.version.as_str()),
                 home_hits,
             );
         } else {

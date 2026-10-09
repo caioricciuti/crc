@@ -184,6 +184,7 @@ impl State {
             && self.project_search.rx.is_none()
             && self.http.is_none()
             && self.update.is_none()
+            && self.update_install.is_none()
             && self.branch_rx.is_none()
             && self.home_rx.is_none()
             && !self.mcp.busy()
