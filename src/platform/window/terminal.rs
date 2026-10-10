@@ -234,43 +234,82 @@ impl EditorView {
             return;
         };
         let (cols, rows) = self.terminal_grid();
-        let args: Vec<&str> = launch.args.iter().map(String::as_str).collect();
-        let env: Vec<(&str, &str)> = launch
+        let title = if claude {
+            "✻ Claude".to_owned()
+        } else {
+            launch
+                .program
+                .file_name()
+                .map_or_else(|| "shell".into(), |n| n.to_string_lossy().into_owned())
+        };
+        let review = launch
             .env
             .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-        let unset: Vec<&str> = launch.unset.iter().map(String::as_str).collect();
-        let spawned = crate::term::pty::Session::spawn(
-            &launch.program,
-            &args,
-            &launch.cwd,
-            &env,
-            &unset,
+            .find(|(k, _)| k == crate::project::review::SESSION_VAR)
+            .map(|(_, v)| std::path::PathBuf::from(v))
+            .unwrap_or_default();
+        let project = self
+            .state()
+            .and_then(|state| state.tree.root().map(Path::to_path_buf))
+            .unwrap_or_default();
+        // A helper holds the program, so it outlives this window; without
+        // one (no binary to run it, a folder that cannot be written) the
+        // program runs here, as it always did, and the status line says so.
+        let spec = crate::term::hold::Spec {
+            program: launch.program.clone(),
+            args: launch.args.clone(),
+            cwd: launch.cwd.clone(),
+            env: launch.env.clone(),
+            unset: launch.unset.clone(),
             cols,
             rows,
-            self.terminal_wake(),
-        );
+            title: title.clone(),
+            claude,
+            review: review.clone(),
+            project,
+        };
+        let held = crate::term::hold::dir()
+            .ok_or_else(|| std::io::Error::other("no folder for session helpers"))
+            .and_then(|dir| {
+                let helper = std::env::current_exe()?;
+                crate::term::hold::start(&dir, &spec, &helper)
+            })
+            .and_then(|(id, socket)| {
+                crate::term::pty::Session::attach(socket, self.terminal_wake()).map(|s| (id, s))
+            });
+        let (spawned, held, said) = match held {
+            Ok((id, session)) => (Ok(session), Some(id), None),
+            Err(e) => {
+                let args: Vec<&str> = launch.args.iter().map(String::as_str).collect();
+                let env: Vec<(&str, &str)> = launch
+                    .env
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str()))
+                    .collect();
+                let unset: Vec<&str> = launch.unset.iter().map(String::as_str).collect();
+                let spawned = crate::term::pty::Session::spawn(
+                    &launch.program,
+                    &args,
+                    &launch.cwd,
+                    &env,
+                    &unset,
+                    cols,
+                    rows,
+                    self.terminal_wake(),
+                );
+                (
+                    spawned,
+                    None,
+                    Some(format!("Terminal: this session ends with the window: {e}")),
+                )
+            }
+        };
         let Some(mut state) = self.state_mut() else {
             return;
         };
         match spawned {
             Ok(session) => {
-                let title = if claude {
-                    "✻ Claude".to_owned()
-                } else {
-                    launch
-                        .program
-                        .file_name()
-                        .map_or_else(|| "shell".into(), |n| n.to_string_lossy().into_owned())
-                };
-                let review = launch
-                    .env
-                    .iter()
-                    .find(|(k, _)| k == crate::project::review::SESSION_VAR)
-                    .map(|(_, v)| std::path::PathBuf::from(v))
-                    .unwrap_or_default();
-                state.terminal.tabs.push(crate::platform::terminal::Tab {
+                let tab = crate::platform::terminal::Tab {
                     session,
                     title,
                     claude,
@@ -282,15 +321,14 @@ impl EditorView {
                     folder: crate::platform::canonical(&launch.cwd),
                     alive: std::sync::Arc::new(()),
                     launch,
-                });
-                let tab = state.terminal.tabs.last().expect("just pushed");
-                watch_events(
-                    tab.review.join("events"),
-                    std::sync::Arc::downgrade(&tab.alive),
-                    self.wake(EditorView::poll_agent_events),
-                );
+                    held,
+                };
+                self.add_terminal_tab(&mut state, tab);
                 state.terminal.active = state.terminal.tabs.len() - 1;
                 state.terminal.back = 0;
+                if let Some(said) = said {
+                    state.say(layout::Feedback::Failure, said);
+                }
             }
             Err(e) => {
                 state.message = Some((
@@ -299,6 +337,90 @@ impl EditorView {
                 ));
             }
         }
+        drop(state);
+        self.after_terminal_layout();
+    }
+
+    /// Adds a tab and starts watching its agent's hook events.
+    fn add_terminal_tab(&self, state: &mut State, tab: crate::platform::terminal::Tab) {
+        state.terminal.tabs.push(tab);
+        let tab = state.terminal.tabs.last().expect("just pushed");
+        watch_events(
+            tab.review.join("events"),
+            std::sync::Arc::downgrade(&tab.alive),
+            self.wake(EditorView::poll_agent_events),
+        );
+    }
+
+    /// Takes back the sessions helpers kept for this project from the
+    /// last window: their screens as the programs left them, the tab that
+    /// had the keyboard active again. At launch, before the first frame.
+    pub(super) fn reattach_held(&self) {
+        let Some(dir) = crate::term::hold::dir() else {
+            return;
+        };
+        // A window opened on one file keeps no session and lets nothing go
+        // at quit; it takes nothing back either.
+        let project = self.state().and_then(|state| {
+            (!state.ephemeral_session)
+                .then(|| state.tree.root().map(crate::platform::canonical))
+                .flatten()
+        });
+        let Some(project) = project else {
+            return;
+        };
+        let mut taken = Vec::new();
+        for (id, spec, left) in crate::term::hold::live(&dir) {
+            if crate::platform::canonical(&spec.project) != project {
+                continue;
+            }
+            let session = crate::term::hold::connect(&dir, &id)
+                .and_then(|socket| crate::term::pty::Session::attach(socket, self.terminal_wake()));
+            let Ok(session) = session else {
+                continue;
+            };
+            let launch = crate::platform::terminal::Launch {
+                program: spec.program,
+                args: spec.args,
+                cwd: spec.cwd,
+                env: spec.env,
+                unset: spec.unset,
+            };
+            taken.push((
+                crate::platform::terminal::Tab {
+                    session,
+                    title: spec.title,
+                    claude: spec.claude,
+                    attention: None,
+                    last_output: None,
+                    review: spec.review,
+                    events_read: left.events_read,
+                    review_files: 0,
+                    folder: crate::platform::canonical(&launch.cwd),
+                    alive: std::sync::Arc::new(()),
+                    launch,
+                    held: Some(id),
+                },
+                left.active,
+            ));
+        }
+        if taken.is_empty() {
+            return;
+        }
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
+        let mut active = None;
+        for (tab, was_active) in taken {
+            self.add_terminal_tab(&mut state, tab);
+            if was_active {
+                active = Some(state.terminal.tabs.len() - 1);
+            }
+        }
+        state.terminal.active = active.unwrap_or(state.terminal.tabs.len() - 1);
+        state.terminal.open = true;
+        state.terminal.back = 0;
+        super::review::refresh_review(&mut state);
         drop(state);
         self.after_terminal_layout();
     }

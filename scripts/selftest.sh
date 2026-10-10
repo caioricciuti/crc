@@ -40,7 +40,9 @@ else
     BIN=target/release/crc
 fi
 T=$(mktemp -d)
-trap 'result=$?; if [ "$result" -eq 0 ]; then rm -rf "$T"; else echo "Self-test failure artifacts: $T (what failed: $T/selftest.log)"; fi' EXIT
+# Terminals run in helper processes that outlive each app launch (see
+# src/term/hold.rs); the run's are ended with it.
+trap 'result=$?; pkill -f -- "--hold $T/home/" 2>/dev/null; if [ "$result" -eq 0 ]; then rm -rf "$T"; else echo "Self-test failure artifacts: $T (what failed: $T/selftest.log)"; fi' EXIT
 # Everything said from here is also kept with the artifacts, so a failure
 # seen once can still be named after the terminal has scrolled past it.
 exec > >(tee "$T/selftest.log") 2>&1

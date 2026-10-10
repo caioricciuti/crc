@@ -57,6 +57,9 @@ pub struct Tab {
     /// Held while the tab lives: the thread that watches its agent's hook
     /// events stops when this goes.
     pub alive: std::sync::Arc<()>,
+    /// The `crc --hold` helper running it, when one does (see
+    /// [`crate::term::hold`]): the program outlives the window.
+    pub held: Option<String>,
 }
 
 /// What a session is doing, as the Agents sidebar shows it.

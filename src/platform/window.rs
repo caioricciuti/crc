@@ -5294,6 +5294,32 @@ define_class!(
             if !ephemeral && let Some(session) = session {
                 session.save();
             }
+            // Sessions a helper holds outlive this window when the session
+            // is kept, each with what the next window needs to show it;
+            // otherwise they end with it, as the others do.
+            if let Some(mut state) = view.state_mut() {
+                let active = state.terminal.active;
+                let dir = crate::term::hold::dir();
+                for (index, tab) in state.terminal.tabs.iter_mut().enumerate() {
+                    let Some(id) = &tab.held else {
+                        continue;
+                    };
+                    match &dir {
+                        Some(dir) if !ephemeral => {
+                            crate::term::hold::leave(
+                                dir,
+                                id,
+                                &crate::term::hold::Left {
+                                    events_read: tab.events_read,
+                                    active: index == active,
+                                },
+                            );
+                            tab.session.detach();
+                        }
+                        _ => tab.session.end(),
+                    }
+                }
+            }
             if let Some(mut state) = view.state_mut() {
                 for server in state.lsp.servers.values_mut() {
                     server.shutdown();
@@ -8419,6 +8445,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
     let content = NSRect::new(NSPoint::new(0.0, 0.0), frame.size);
     let view = EditorView::new(mtm, state, content);
     view.watch_project();
+    view.reattach_held();
     view.apply_theme();
     view.lsp_sync_open();
     view.rebuild_extension_menu();

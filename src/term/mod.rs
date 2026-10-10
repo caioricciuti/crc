@@ -12,6 +12,7 @@
 //! reporting is recorded but not generated yet. There is no reflow on
 //! resize; programs redraw on SIGWINCH.
 
+pub mod hold;
 pub mod keys;
 mod parser;
 pub mod pty;

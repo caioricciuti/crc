@@ -13,6 +13,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -71,17 +72,99 @@ fn set_size(fd: i32, cols: usize, rows: usize) {
 /// Called from the reader thread when there is something new to draw.
 pub use crate::platform::dispatch::Wake;
 
+/// A new terminal pair of `cols` by `rows`: the master, and the slave side
+/// opened for the program.
+pub(crate) fn open_pair(cols: usize, rows: usize) -> std::io::Result<(OwnedFd, File)> {
+    let master = check(unsafe { posix_openpt(O_RDWR | O_NOCTTY) }, "posix_openpt")?;
+    // Owned at once, so every early return closes it.
+    let master = unsafe { OwnedFd::from_raw_fd(master) };
+    let fd = master.as_raw_fd();
+    check(unsafe { fcntl(fd, F_SETFD, FD_CLOEXEC) }, "fcntl")?;
+    check(unsafe { grantpt(fd) }, "grantpt")?;
+    check(unsafe { unlockpt(fd) }, "unlockpt")?;
+    let mut name = [0 as std::ffi::c_char; 128];
+    check(
+        unsafe { ptsname_r(fd, name.as_mut_ptr(), name.len()) },
+        "ptsname",
+    )?;
+    let name = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
+        .to_string_lossy()
+        .into_owned();
+    let slave = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(O_NOCTTY)
+        .open(&name)?;
+    // On the slave: set on the master before the slave is open, the
+    // size does not stick on macOS and the program reads 0 by 0.
+    set_size(slave.as_raw_fd(), cols, rows);
+    Ok((master, slave))
+}
+
+/// Starts `program args` in `cwd` on `slave`, as its controlling terminal,
+/// with `env` added to this process's environment and `unset` taken out.
+pub(crate) fn start_on(
+    slave: File,
+    program: &Path,
+    args: &[&str],
+    cwd: &Path,
+    env: &[(&str, &str)],
+    unset: &[&str],
+) -> std::io::Result<std::process::Child> {
+    let mut command = Command::new(program);
+    for name in unset {
+        command.env_remove(name);
+    }
+    command
+        .args(args)
+        .current_dir(cwd)
+        .envs(env.iter().copied())
+        .stdin(Stdio::from(slave.try_clone()?))
+        .stdout(Stdio::from(slave.try_clone()?))
+        .stderr(Stdio::from(slave));
+    // In the child, between fork and exec: a session of its own, with
+    // the terminal on fd 0 as its controlling terminal, which is what
+    // makes Ctrl-C a signal and job control work.
+    unsafe {
+        command.pre_exec(|| {
+            if setsid() < 0 || ioctl(0, TIOCSCTTY, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command.spawn()
+}
+
+/// Sets the window size of a terminal by its master.
+pub(crate) fn resize_master(master: &File, cols: usize, rows: usize) {
+    set_size(master.as_raw_fd(), cols, rows);
+}
+
 /// A running program and its screen.
 pub struct Session {
     pub term: Arc<Mutex<Term>>,
     /// Input for the writer thread: a program that stops reading (a paste
     /// into one that is busy) blocks that thread, never the editor.
     input: std::sync::mpsc::Sender<Vec<u8>>,
-    /// The master, for the window-size ioctl.
-    control: File,
-    pid: i32,
+    /// The program's side: the terminal here, or a helper holding it.
+    control: Control,
     /// What the reader and wait threads have seen.
     status: Arc<Status>,
+}
+
+/// Who holds the terminal.
+enum Control {
+    /// This process: the master, for the window-size ioctl, and the
+    /// program's pid.
+    Pty { master: File, pid: i32 },
+    /// A `crc --hold` helper (see [`super::hold`]): frames go over its
+    /// socket, under one lock so they never interleave. `detached` once the
+    /// window has let go of it without ending it.
+    Held {
+        socket: Arc<Mutex<UnixStream>>,
+        detached: bool,
+    },
 }
 
 /// Set by the reader thread and the wait thread, read by the session.
@@ -124,53 +207,8 @@ impl Session {
         rows: usize,
         wake: Wake,
     ) -> std::io::Result<Session> {
-        let master = check(unsafe { posix_openpt(O_RDWR | O_NOCTTY) }, "posix_openpt")?;
-        // Owned at once, so every early return closes it.
-        let master = unsafe { OwnedFd::from_raw_fd(master) };
-        let fd = master.as_raw_fd();
-        check(unsafe { fcntl(fd, F_SETFD, FD_CLOEXEC) }, "fcntl")?;
-        check(unsafe { grantpt(fd) }, "grantpt")?;
-        check(unsafe { unlockpt(fd) }, "unlockpt")?;
-        let mut name = [0 as std::ffi::c_char; 128];
-        check(
-            unsafe { ptsname_r(fd, name.as_mut_ptr(), name.len()) },
-            "ptsname",
-        )?;
-        let name = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
-            .to_string_lossy()
-            .into_owned();
-        let slave = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(O_NOCTTY)
-            .open(&name)?;
-        // On the slave: set on the master before the slave is open, the
-        // size does not stick on macOS and the program reads 0 by 0.
-        set_size(slave.as_raw_fd(), cols, rows);
-
-        let mut command = Command::new(program);
-        for name in unset {
-            command.env_remove(name);
-        }
-        command
-            .args(args)
-            .current_dir(cwd)
-            .envs(env.iter().copied())
-            .stdin(Stdio::from(slave.try_clone()?))
-            .stdout(Stdio::from(slave.try_clone()?))
-            .stderr(Stdio::from(slave));
-        // In the child, between fork and exec: a session of its own, with
-        // the terminal on fd 0 as its controlling terminal, which is what
-        // makes Ctrl-C a signal and job control work.
-        unsafe {
-            command.pre_exec(|| {
-                if setsid() < 0 || ioctl(0, TIOCSCTTY, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let child = command.spawn()?;
+        let (master, slave) = open_pair(cols, rows)?;
+        let child = start_on(slave, program, args, cwd, env, unset)?;
         let pid = child.id() as i32;
         let wake: Arc<dyn Fn() + Send + Sync> = Arc::from(wake);
         let status = Arc::new(Status::default());
@@ -232,8 +270,84 @@ impl Session {
         Ok(Session {
             term,
             input,
-            control,
-            pid,
+            control: Control::Pty {
+                master: control,
+                pid,
+            },
+            status,
+        })
+    }
+
+    /// A program a `crc --hold` helper runs, over its socket: the screen is
+    /// rebuilt from the output the helper kept, at the size it has there.
+    /// The window resizes it to its grid as it does any session.
+    pub fn attach(mut socket: UnixStream, wake: Wake) -> std::io::Result<Session> {
+        use super::hold::{self, Frame};
+        // The helper says its size first, before any output.
+        let (cols, rows) = match hold::receive(&mut socket)? {
+            Frame::Size(cols, rows) => (cols, rows),
+            _ => {
+                return Err(std::io::Error::other(
+                    "the session helper did not say its size",
+                ));
+            }
+        };
+        let wake: Arc<dyn Fn() + Send + Sync> = Arc::from(wake);
+        let status = Arc::new(Status::default());
+        let term = Arc::new(Mutex::new(Term::new(cols, rows)));
+        let mut reader = socket.try_clone()?;
+        let socket = Arc::new(Mutex::new(socket));
+        let (input, typed) = std::sync::mpsc::channel::<Vec<u8>>();
+        {
+            let socket = socket.clone();
+            std::thread::spawn(move || {
+                for bytes in typed {
+                    let mut socket = socket.lock().unwrap_or_else(|e| e.into_inner());
+                    if hold::send(&mut *socket, &Frame::Input(bytes)).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+        let (shared, seen, replies) = (term.clone(), status.clone(), input.clone());
+        std::thread::spawn(move || {
+            loop {
+                match hold::receive(&mut reader) {
+                    Ok(Frame::Output(bytes)) => {
+                        let reply = {
+                            let mut term = shared.lock().unwrap_or_else(|e| e.into_inner());
+                            term.advance(&bytes);
+                            term.take_replies()
+                        };
+                        if !reply.is_empty() {
+                            let _ = replies.send(reply);
+                        }
+                        if seen.queue_wake() {
+                            wake();
+                        }
+                    }
+                    Ok(Frame::Exited(code)) => {
+                        seen.code.store(code, Ordering::Release);
+                        seen.reaped.store(true, Ordering::Release);
+                        break;
+                    }
+                    // Size changes come only on attach; anything else, or
+                    // a helper gone, ends the session.
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+            seen.exited.store(true, Ordering::Release);
+            seen.woken.store(true, Ordering::Release);
+            wake();
+        });
+        Ok(Session {
+            term,
+            input,
+            control: Control::Held {
+                socket,
+                detached: false,
+            },
             status,
         })
     }
@@ -248,7 +362,42 @@ impl Session {
         let mut term = self.term.lock().unwrap_or_else(|e| e.into_inner());
         if (term.cols(), term.rows()) != (cols.max(2), rows.max(1)) {
             term.resize(cols, rows);
-            set_size(self.control.as_raw_fd(), cols, rows);
+            match &self.control {
+                Control::Pty { master, .. } => set_size(master.as_raw_fd(), cols, rows),
+                Control::Held { socket, .. } => {
+                    let mut socket = socket.lock().unwrap_or_else(|e| e.into_inner());
+                    let _ =
+                        super::hold::send(&mut *socket, &super::hold::Frame::Resize(cols, rows));
+                }
+            }
+        }
+    }
+
+    /// Whether a helper holds the program, so it can outlive the window.
+    pub fn is_held(&self) -> bool {
+        matches!(self.control, Control::Held { .. })
+    }
+
+    /// Lets go of a held program without ending it: the helper keeps it
+    /// for the next window. Nothing for a program run here.
+    pub fn detach(&mut self) {
+        if let Control::Held { detached, .. } = &mut self.control {
+            *detached = true;
+        }
+    }
+
+    /// Ends the program now, as closing its tab does, whoever holds it.
+    pub fn end(&self) {
+        match &self.control {
+            Control::Pty { pid, .. } => {
+                if !self.status.reaped.load(Ordering::Acquire) {
+                    crate::platform::send_signal(-pid, SIGHUP);
+                }
+            }
+            Control::Held { socket, .. } => {
+                let mut socket = socket.lock().unwrap_or_else(|e| e.into_inner());
+                let _ = super::hold::send(&mut *socket, &super::hold::Frame::Kill);
+            }
         }
     }
 
@@ -276,9 +425,11 @@ impl Drop for Session {
         // The whole process group, as closing a terminal window does; not
         // once the program is gone, since its pid may have been reused. A
         // background job it left behind keeps the terminal until it closes.
-        if !self.status.reaped.load(Ordering::Acquire) {
-            crate::platform::send_signal(-self.pid, SIGHUP);
+        // A held program the window let go of stays with its helper.
+        if let Control::Held { detached: true, .. } = self.control {
+            return;
         }
+        self.end();
     }
 }
 

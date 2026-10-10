@@ -167,8 +167,12 @@ the size and write it back.
 - **Terminal panel** (`` Ctrl-` `` or `Cmd-J`): sessions under the editor
   running your login shell in the project folder, on an xterm-compatible
   emulator of our own with 24-bit colour, scroll regions, alternate screen
-  and bracketed paste. `Cmd`-click a path such as `src/main.rs:42:7` in the
-  output to open it at that line. A session that sends a notification
+  and bracketed paste. Each session runs in a small helper process of its
+  own, so quitting crc (or a crash, or Restart to Update) leaves it
+  running: the next crc on the same project takes its sessions back with
+  what they printed, agents included; closing a tab ends its session.
+  `Cmd`-click a path such as `src/main.rs:42:7` in the output to open it
+  at that line. A session that sends a notification
   (OSC 9, 777 or 99) or rings the bell gets a dot and a line in the status
   bar saying what it asked, until you type into it; Home lists the
   waiting ones first.
@@ -243,9 +247,11 @@ the size and write it back.
   too, compared with Git's staged copy, but can only be kept: no copy from
   before exists. `claude` typed in a crc shell gets the hooks only if you
   add them to its settings.
-- **Agents mode is local and lives with crc.** A task's sessions end when
-  crc quits, the pull request row is read when the list loads, not kept
-  current, and tasks run on this Mac only.
+- **Agents mode is local.** A task's sessions outlive crc but not a
+  reboot, a session taken back after a restart has lost its link to the
+  editor (`/ide` in Claude Code reconnects it), the pull request row is
+  read when the list loads, not kept current, and tasks run on this Mac
+  only.
 - **No minimap.** Folding is by indentation, not by syntax.
 - **Markdown styling has edges.** Italic is not drawn on lines with
   non-ASCII text, and bold there is the regular face drawn twice; a line

@@ -17,6 +17,14 @@ fn main() {
         crc::project::review::run_hook(args.get(1).map_or("", String::as_str));
         return;
     }
+    // A terminal held for the window: see `crc::term::hold`. No window.
+    if args.first().is_some_and(|a| a == "--hold") {
+        let (Some(dir), Some(id)) = (args.get(1), args.get(2)) else {
+            eprintln!("crc: --hold needs a folder and an id");
+            std::process::exit(2);
+        };
+        crc::term::hold::run(std::path::Path::new(dir), id);
+    }
     // An MCP server for agents, on stdio, for the folder given or the
     // current one. No window.
     if args.first().is_some_and(|a| a == "--mcp") {

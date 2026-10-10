@@ -2,6 +2,15 @@
 
 One entry per tag, written for people who use the editor.
 
+## Unreleased
+
+- Terminal sessions outlive the window. Each one runs in a helper process
+  of its own (`crc --hold`), so quitting crc, a crash or Restart to Update
+  leaves the shell or agent running; the next crc opened on the same
+  project takes the sessions back, screens and history included, with the
+  tab that had the keyboard active again. Closing a tab still ends its
+  session, and a window opened on a single file keeps nothing, as before.
+
 ## v0.2.0-alpha.17, 2026-10-10
 
 Agents mode: run several agents at once, each on a branch of its own.
