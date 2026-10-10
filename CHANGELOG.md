@@ -2,7 +2,10 @@
 
 One entry per tag, written for people who use the editor.
 
-## Unreleased
+## v0.2.0-alpha.18, 2026-10-10
+
+Sessions that outlive the window, drop and paste for agents, and the
+agent's own word on its state.
 
 - Terminal sessions outlive the window. Each one runs in a helper process
   of its own (`crc --hold`), so quitting crc, a crash or Restart to Update
