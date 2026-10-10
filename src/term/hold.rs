@@ -63,6 +63,8 @@ pub struct Spec {
     pub review: PathBuf,
     /// The project the window had open: it comes back with that one.
     pub project: PathBuf,
+    /// The workspace it was started in (Agents mode), or empty.
+    pub workspace: String,
 }
 
 /// What the window wrote about the tab when it let go: read back when it
@@ -128,6 +130,7 @@ impl Spec {
         put("claude", if self.claude { "1" } else { "0" });
         put("review", &self.review.to_string_lossy());
         put("project", &self.project.to_string_lossy());
+        put("workspace", &self.workspace);
         out
     }
 
@@ -150,6 +153,7 @@ impl Spec {
                 "claude" => spec.claude = value == "1",
                 "review" => spec.review = value.into(),
                 "project" => spec.project = value.into(),
+                "workspace" => spec.workspace = value,
                 _ => {}
             }
         }
@@ -655,6 +659,7 @@ mod tests {
             claude: true,
             review: "/tmp/sessions/abc".into(),
             project: "/tmp/proj".into(),
+            workspace: "folder:notes".into(),
         };
         assert_eq!(Spec::parse(&spec.to_text()), spec);
         let left = Left {

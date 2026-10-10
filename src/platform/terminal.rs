@@ -52,8 +52,11 @@ pub struct Tab {
     pub events_read: u64,
     /// Files the session has checkpoints for.
     pub review_files: usize,
-    /// Its folder, resolved, for the task it belongs to.
+    /// Its folder, resolved, for the workspace it belongs to when it was
+    /// not started in one.
     pub folder: PathBuf,
+    /// The workspace it was started in, by [`crate::platform::agents::Workspace::id`].
+    pub workspace: Option<String>,
     /// Held while the tab lives: the thread that watches its agent's hook
     /// events stops when this goes.
     pub alive: std::sync::Arc<()>,
@@ -144,6 +147,9 @@ pub struct Panel {
     pub selection: Option<((u64, usize), (u64, usize))>,
     /// A press in the screen is being dragged.
     pub selecting: bool,
+    /// Where the drag last was, for scrolling the history under a pointer
+    /// held past the screen's edge.
+    pub drag_point: Option<(f32, f32)>,
     /// The tabs the header lists, when not all: in Agents mode, the
     /// selected task's.
     pub shown: Option<Vec<usize>>,
@@ -163,6 +169,7 @@ impl Default for Panel {
             back: 0,
             selection: None,
             selecting: false,
+            drag_point: None,
             shown: None,
             pair: None,
         }

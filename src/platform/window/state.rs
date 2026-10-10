@@ -181,6 +181,7 @@ impl State {
             && self.message.is_none()
             && !self.git.busy()
             && !matches!(self.drag, Some(Drag::Select { point: Some(_), .. }))
+            && !(self.terminal.selecting && self.terminal.drag_point.is_some())
             && self.project_search.rx.is_none()
             && self.http.is_none()
             && self.update.is_none()

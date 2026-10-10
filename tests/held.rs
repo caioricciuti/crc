@@ -28,6 +28,7 @@ fn shell_spec(dir: &Path) -> Spec {
         claude: false,
         review: dir.join("review"),
         project: dir.to_path_buf(),
+        workspace: String::new(),
     }
 }
 

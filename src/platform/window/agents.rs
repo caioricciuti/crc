@@ -1,5 +1,6 @@
-//! Agents mode in the window: the switch, the task list's clicks and menu,
-//! and the work on tasks (new worktree, merge, push, remove) on workers.
+//! Agents mode in the window: the switch, the workspace list's clicks and
+//! menus, and the work on tasks (new worktree, merge, push, remove) on
+//! workers.
 
 use super::*;
 use crate::platform::agents::{Action, Done, task_of};
@@ -37,12 +38,13 @@ impl EditorView {
                 if let Some(dir) = &dir {
                     state.agents.refresh(dir);
                 }
-                if state.agents.selected.is_none() {
+                if state.agents.selected_index().is_none() {
+                    let tasks = &state.agents.tasks;
                     state.agents.selected = state
                         .terminal
                         .active_tab()
-                        .map(|t| t.folder.clone())
-                        .or(dir.as_ref().map(|d| crate::platform::canonical(d)));
+                        .and_then(|t| task_of(tasks, t))
+                        .map(|i| tasks[i].id());
                 }
                 state.terminal.tabs.is_empty()
             } else {
@@ -75,16 +77,15 @@ impl EditorView {
         };
         let mut changed = state.agents.poll();
         if changed && state.agents.selected_index().is_none() {
-            // The selection is a folder; once the list is in, it is the
-            // task that holds it.
+            // Nothing selected that the list knows: the workspace of the
+            // session showing, else the first.
             let tasks = state.agents.tasks.clone();
             state.agents.selected = state
-                .agents
-                .selected
-                .as_deref()
-                .and_then(|folder| task_of(&tasks, folder))
+                .terminal
+                .active_tab()
+                .and_then(|t| task_of(&tasks, t))
                 .or((!tasks.is_empty()).then_some(0))
-                .map(|i| tasks[i].path.clone());
+                .map(|i| tasks[i].id());
         }
         let done = state.agents.take_done();
         let mut start_in = None;
@@ -112,8 +113,14 @@ impl EditorView {
         }
         drop(state);
         if let Some(dir) = start_in {
+            // A worktree's id is its path: selectable before the list
+            // comes back with it.
             if let Some(mut state) = self.state_mut() {
-                state.agents.selected = Some(crate::platform::canonical(&dir));
+                state.agents.selected = Some(
+                    crate::platform::canonical(&dir)
+                        .to_string_lossy()
+                        .into_owned(),
+                );
             }
             self.spawn_terminal_in(true, Some(&dir));
         }
@@ -147,7 +154,7 @@ impl EditorView {
                     return;
                 };
                 if let Some(mut state) = self.state_mut() {
-                    state.agents.selected = Some(dir.clone());
+                    state.agents.select(index);
                 }
                 self.spawn_terminal_in(true, Some(&dir));
             }
@@ -180,10 +187,10 @@ impl EditorView {
                 return;
             };
             let path = task.path.clone();
-            state.agents.selected = Some(path.clone());
+            state.agents.select(index);
             let tasks = state.agents.tasks.clone();
             let mine: Vec<usize> = (0..state.terminal.tabs.len())
-                .filter(|i| task_of(&tasks, &state.terminal.tabs[*i].folder) == Some(index))
+                .filter(|i| task_of(&tasks, &state.terminal.tabs[*i]) == Some(index))
                 .collect();
             let pick = mine
                 .iter()
@@ -212,10 +219,9 @@ impl EditorView {
                 return;
             }
             state.terminal.show(tab);
-            let folder = state.terminal.tabs[tab].folder.clone();
             let tasks = state.agents.tasks.clone();
-            if let Some(task) = task_of(&tasks, &folder) {
-                state.agents.selected = Some(tasks[task].path.clone());
+            if let Some(task) = task_of(&tasks, &state.terminal.tabs[tab]) {
+                state.agents.select(task);
             }
         }
         self.set_agents_mode(true);
@@ -253,29 +259,210 @@ impl EditorView {
         }
     }
 
-    /// The palette, taking a new task's name.
+    /// The palette, taking a new workspace's name: a folder workspace on
+    /// the open folder, or (in a repository) a task on a new branch.
     pub(super) fn new_task_prompt(&self) {
-        let has_repo = {
-            let Some(state) = self.state() else {
-                return;
-            };
-            state.agents.repo.is_some() || state.tree.root().is_some()
-        };
-        if !has_repo {
-            if let Some(mut state) = self.state_mut() {
-                state.say(
-                    layout::Feedback::Failure,
-                    "Open a Git repository first: a task is a branch of it",
-                );
-            }
-            self.request_redraw();
-            return;
-        }
         self.open_palette_with("");
         if let Some(mut state) = self.state_mut() {
             state.task_prompt = true;
+            state.agents.renaming = None;
         }
         self.request_redraw();
+    }
+
+    /// The folder a new workspace is made on: the repository's main
+    /// checkout, else the open folder, else the session showing's.
+    fn workspace_folder(&self) -> Option<std::path::PathBuf> {
+        let state = self.state()?;
+        state
+            .agents
+            .repo
+            .clone()
+            .or_else(|| state.tree.root().map(Path::to_path_buf))
+            .or_else(|| state.terminal.active_tab().map(|t| t.folder.clone()))
+    }
+
+    /// The palette's answer for a folder workspace: made (or, while
+    /// renaming, renamed) and selected, then Claude in it.
+    pub(super) fn create_workspace(&self, name: String) {
+        let renaming = self.state().and_then(|state| state.agents.renaming.clone());
+        if let Some(id) = renaming {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            state.agents.renaming = None;
+            match state.agents.rename_folder(&id, &name) {
+                Some(new_id) => {
+                    for tab in &mut state.terminal.tabs {
+                        if tab.workspace.as_deref() == Some(id.as_str()) {
+                            tab.workspace = Some(new_id.clone());
+                        }
+                    }
+                    if state.agents.selected.as_deref() == Some(id.as_str()) {
+                        state.agents.selected = Some(new_id);
+                    }
+                }
+                None => state.say(
+                    layout::Feedback::Failure,
+                    format!("A workspace is already called {}", name.trim()),
+                ),
+            }
+            drop(state);
+            self.request_redraw();
+            return;
+        }
+        let Some(dir) = self.workspace_folder() else {
+            return;
+        };
+        {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            state.agents.on = true;
+            let id = state.agents.add_folder(&name, dir.clone());
+            state.agents.selected = Some(id);
+        }
+        self.set_agents_mode(true);
+        self.spawn_terminal_in(true, Some(&dir));
+    }
+
+    /// The context menu for a point in the Agents sidebar: the session's,
+    /// the workspace's, or the list's.
+    pub(super) fn agents_context_menu(&self, x: f32, y: f32) -> Retained<NSMenu> {
+        let mtm = MainThreadMarker::from(self);
+        let hit = self.state().and_then(|state| state.agents.hit(x, y));
+        match hit {
+            Some(Action::Session(tab)) => {
+                if let Some(mut state) = self.state_mut() {
+                    state.agents.menu_session = Some(tab);
+                }
+                let menu = context_menu_new(mtm);
+                let add = |title: &str, action: Sel| menu.addItem(&menu_item(mtm, title, action));
+                add("New Claude Session Here", sel!(agentSessionNewClaude:));
+                add("New Shell Here", sel!(agentSessionNewShell:));
+                menu.addItem(&NSMenuItem::separatorItem(mtm));
+                add("Close Session", sel!(agentCloseSession:));
+                menu
+            }
+            Some(Action::Select(index) | Action::NewClaude(index) | Action::Menu(index)) => {
+                if let Some(mut state) = self.state_mut() {
+                    state.agents.menu_task = Some(index);
+                }
+                self.task_menu(index)
+            }
+            _ => {
+                let menu = context_menu_new(mtm);
+                let add = |title: &str, action: Sel| menu.addItem(&menu_item(mtm, title, action));
+                add("New Workspace\u{2026}", sel!(newTask:));
+                add("Refresh", sel!(refreshAgents:));
+                menu
+            }
+        }
+    }
+
+    /// A session's menu: a new session beside it, in its workspace.
+    pub(super) fn agent_session_new(&self, claude: bool) {
+        let Some(tab) = self.state().and_then(|state| state.agents.menu_session) else {
+            return;
+        };
+        let dir = {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            if tab >= state.terminal.tabs.len() {
+                return;
+            }
+            let tasks = state.agents.tasks.clone();
+            match task_of(&tasks, &state.terminal.tabs[tab]) {
+                Some(index) => {
+                    state.agents.select(index);
+                    tasks[index].path.clone()
+                }
+                None => state.terminal.tabs[tab].folder.clone(),
+            }
+        };
+        self.set_agents_mode(true);
+        self.spawn_terminal_in(claude, Some(&dir));
+    }
+
+    pub(super) fn agent_close_session(&self) {
+        let Some(tab) = self.state().and_then(|state| state.agents.menu_session) else {
+            return;
+        };
+        if let Some(mut state) = self.state_mut()
+            && tab < state.terminal.tabs.len()
+        {
+            state.terminal.close_tab(tab);
+        }
+        self.after_terminal_layout();
+    }
+
+    pub(super) fn refresh_agents(&self) {
+        if let Some(mut state) = self.state_mut()
+            && let Some(dir) = state
+                .agents
+                .repo
+                .clone()
+                .or_else(|| state.tree.root().map(Path::to_path_buf))
+        {
+            state.agents.refresh(&dir);
+        }
+        self.resume_display_link();
+    }
+
+    /// The palette, taking the folder workspace's new name.
+    pub(super) fn agent_rename_workspace(&self) {
+        let Some(task) = self.menu_task().filter(|t| t.folder) else {
+            return;
+        };
+        self.open_palette_with(&task.name);
+        if let Some(mut state) = self.state_mut() {
+            state.task_prompt = true;
+            state.agents.renaming = Some(task.id());
+        }
+        self.request_redraw();
+    }
+
+    /// Forgets a folder workspace once asked; its sessions close. Nothing
+    /// on disk changes.
+    pub(super) fn agent_remove_workspace(&self) {
+        let Some(index) = self.state().and_then(|state| state.agents.menu_task) else {
+            return;
+        };
+        let Some(task) = self.menu_task().filter(|t| t.folder) else {
+            return;
+        };
+        let sessions: Vec<usize> = self.state().map_or_else(Vec::new, |state| {
+            let tasks = &state.agents.tasks;
+            (0..state.terminal.tabs.len())
+                .filter(|i| task_of(tasks, &state.terminal.tabs[*i]) == Some(index))
+                .collect()
+        });
+        let detail = match sessions.len() {
+            0 => "The folder and its files stay as they are.".to_owned(),
+            1 => "Its session is closed. The folder and its files stay as they are.".to_owned(),
+            n => format!("Its {n} sessions are closed. The folder and its files stay as they are."),
+        };
+        let yes = std::env::var_os("CRC_SELFTEST").is_some()
+            || ask(
+                MainThreadMarker::from(self),
+                &format!("Remove the workspace {}?", task.name()),
+                &detail,
+                &["Remove", "Cancel"],
+            ) == 0;
+        if !yes {
+            return;
+        }
+        if let Some(mut state) = self.state_mut() {
+            for index in sessions.into_iter().rev() {
+                state.terminal.close_tab(index);
+            }
+            state.agents.remove_folder(&task.id());
+            if state.agents.selected_index().is_none() {
+                state.agents.select(0);
+            }
+        }
+        self.after_terminal_layout();
     }
 
     /// The palette's answer: a worktree on a new branch, then Claude in it.
@@ -314,26 +501,34 @@ impl EditorView {
     fn task_menu(&self, index: usize) -> Retained<NSMenu> {
         let mtm = MainThreadMarker::from(self);
         let menu = context_menu_new(mtm);
-        let (main, branch, base, pr) = self.state().map_or((true, None, None, None), |state| {
-            let task = state.agents.tasks.get(index);
-            (
-                task.is_none_or(|t| t.main),
-                task.and_then(|t| t.branch.clone()),
-                state
-                    .agents
-                    .tasks
-                    .iter()
-                    .find(|t| t.main)
-                    .and_then(|t| t.branch.clone()),
-                task.and_then(|t| state.agents.info.get(&t.path))
-                    .and_then(|info| info.pull_request.as_ref())
-                    .map(|pr| pr.number),
-            )
-        });
+        let (main, folder, branch, base, pr) =
+            self.state()
+                .map_or((true, false, None, None, None), |state| {
+                    let task = state.agents.tasks.get(index);
+                    (
+                        task.is_none_or(|t| t.main),
+                        task.is_some_and(|t| t.folder),
+                        task.and_then(|t| t.branch.clone()),
+                        state
+                            .agents
+                            .tasks
+                            .iter()
+                            .find(|t| t.main)
+                            .and_then(|t| t.branch.clone()),
+                        task.and_then(|t| state.agents.info.get(&t.path))
+                            .and_then(|info| info.pull_request.as_ref())
+                            .map(|pr| pr.number),
+                    )
+                });
         let add = |title: &str, action: Sel| menu.addItem(&menu_item(mtm, title, action));
         add("New Claude Session", sel!(agentNewClaude:));
         add("New Shell", sel!(agentNewShell:));
         add("Open in Editor", sel!(agentOpenInEditor:));
+        if folder {
+            menu.addItem(&NSMenuItem::separatorItem(mtm));
+            add("Rename Workspace\u{2026}", sel!(agentRenameWorkspace:));
+            add("Remove Workspace\u{2026}", sel!(agentRemoveWorkspace:));
+        }
         if !main && let Some(branch) = branch {
             menu.addItem(&NSMenuItem::separatorItem(mtm));
             let into = base.unwrap_or_else(|| "the main checkout".into());
@@ -354,8 +549,8 @@ impl EditorView {
         menu
     }
 
-    /// The task the menu was opened on.
-    fn menu_task(&self) -> Option<crate::project::worktree::Worktree> {
+    /// The workspace the menu was opened on.
+    fn menu_task(&self) -> Option<crate::platform::agents::Workspace> {
         let state = self.state()?;
         state.agents.tasks.get(state.agents.menu_task?).cloned()
     }
@@ -365,7 +560,7 @@ impl EditorView {
             return;
         };
         if let Some(mut state) = self.state_mut() {
-            state.agents.selected = Some(task.path.clone());
+            state.agents.selected = Some(task.id());
         }
         self.set_agents_mode(true);
         self.spawn_terminal_in(claude, Some(&task.path));
@@ -446,7 +641,7 @@ impl EditorView {
                 .is_some_and(|info| info.pull_request.is_some())
         });
         if let Some(mut state) = self.state_mut() {
-            state.agents.selected = Some(task.path.clone());
+            state.agents.selected = Some(task.id());
         }
         self.set_agents_mode(true);
         self.spawn_terminal_in(false, Some(&task.path));
@@ -465,12 +660,20 @@ impl EditorView {
     /// refuses while it has uncommitted changes, and an unmerged branch is
     /// kept.
     pub(super) fn agent_remove(&self) {
-        let Some(task) = self.menu_task() else {
+        let Some(index) = self.state().and_then(|state| state.agents.menu_task) else {
             return;
         };
+        let Some(worktree) = self.menu_task().and_then(|t| t.worktree()) else {
+            return;
+        };
+        let task = worktree;
         let sessions: Vec<usize> = self.state().map_or_else(Vec::new, |state| {
+            let tasks = &state.agents.tasks;
             (0..state.terminal.tabs.len())
-                .filter(|i| state.terminal.tabs[*i].folder.starts_with(&task.path))
+                .filter(|i| {
+                    task_of(tasks, &state.terminal.tabs[*i]) == Some(index)
+                        || state.terminal.tabs[*i].folder.starts_with(&task.path)
+                })
                 .collect()
         });
         let detail = match sessions.len() {
@@ -522,8 +725,8 @@ impl EditorView {
         for index in sessions.into_iter().rev() {
             state.terminal.close_tab(index);
         }
-        if state.agents.selected.as_deref() == Some(task.path.as_path()) {
-            state.agents.selected = Some(main.clone());
+        if state.agents.selected_index().is_some_and(|i| i == index) {
+            state.agents.selected = Some(main.to_string_lossy().into_owned());
         }
         let name = task.name();
         state

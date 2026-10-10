@@ -1,7 +1,9 @@
 //! Agents mode: the terminal takes the editor column and the sidebar lists
-//! tasks, each a worktree of the open repository with the sessions running
-//! in it. The toolbar's Editor / Agents switch (Cmd-Shift-A) flips between the
-//! two; nothing stops when it does.
+//! workspaces, each with the sessions running in it: one per worktree of the
+//! open repository, read from Git, and the ones added by hand on any folder.
+//! The toolbar's Editor / Agents switch (Cmd-Shift-A) flips between the two;
+//! nothing stops when it does. The code calls a workspace a task where it
+//! grew up as one.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -21,7 +23,7 @@ const INDENT: f32 = 22.0;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
-    /// The header's New Task.
+    /// The header's New Workspace.
     NewTask,
     Refresh,
     /// A task's row: shows its newest session, or starts Claude in it.
@@ -37,6 +39,86 @@ pub enum Action {
 /// Worktrees read on a worker: the main checkout they are for, and the list
 /// with every path resolved.
 type Listing = (PathBuf, Result<Vec<Worktree>, String>);
+
+/// A place to work: a folder, and the sessions started in it. A worktree
+/// of the open repository is one (named by its branch), and any folder
+/// can be made one by hand (named by whoever made it).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Workspace {
+    pub name: String,
+    pub path: PathBuf,
+    /// The branch checked out, for a worktree; `None` for a folder
+    /// workspace or a detached HEAD.
+    pub branch: Option<String>,
+    /// The repository's own checkout.
+    pub main: bool,
+    /// Made by hand on a folder: nothing in Git behind it.
+    pub folder: bool,
+}
+
+impl Workspace {
+    fn of(worktree: Worktree) -> Workspace {
+        Workspace {
+            name: worktree.name(),
+            path: worktree.path,
+            branch: worktree.branch,
+            main: worktree.main,
+            folder: false,
+        }
+    }
+
+    pub fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    /// What sessions and the selection hold on to: a folder workspace by
+    /// its name (two can share a folder), a worktree by its path.
+    pub fn id(&self) -> String {
+        if self.folder {
+            format!("folder:{}", self.name)
+        } else {
+            self.path.to_string_lossy().into_owned()
+        }
+    }
+
+    /// The worktree behind it, for the Git operations.
+    pub fn worktree(&self) -> Option<Worktree> {
+        (!self.folder).then(|| Worktree {
+            path: self.path.clone(),
+            branch: self.branch.clone(),
+            main: self.main,
+        })
+    }
+}
+
+/// Where a project's folder workspaces are kept, by its root.
+fn folders_file(root: &Path) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let key = crate::platform::fnv1a(root.as_os_str().as_bytes());
+    Some(crate::platform::app_support()?.join(format!("agents/{key:016x}.workspaces")))
+}
+
+/// One per line: the name, a tab, the folder.
+fn parse_folders(text: &str) -> Vec<Workspace> {
+    text.lines()
+        .filter_map(|line| line.split_once('\t'))
+        .filter(|(name, path)| !name.is_empty() && !path.is_empty())
+        .map(|(name, path)| Workspace {
+            name: name.to_owned(),
+            path: PathBuf::from(path),
+            branch: None,
+            main: false,
+            folder: true,
+        })
+        .collect()
+}
+
+fn folders_text(folders: &[Workspace]) -> String {
+    folders
+        .iter()
+        .map(|w| format!("{}\t{}\n", w.name, w.path.display()))
+        .collect()
+}
 
 /// What a task's row says besides its name, read after the list: commits
 /// ahead of the main checkout, and its pull request.
@@ -119,11 +201,21 @@ impl Team {
 pub struct Panel {
     /// Agents mode is on: the terminal has the column, this the sidebar.
     pub on: bool,
-    /// The main checkout the tasks belong to.
+    /// The main checkout the worktrees belong to.
     pub repo: Option<PathBuf>,
-    pub tasks: Vec<Worktree>,
-    /// The task whose sessions the terminal shows, by path.
-    pub selected: Option<PathBuf>,
+    /// The project root the folder workspaces are kept for.
+    root: Option<PathBuf>,
+    /// Every workspace, worktrees first, then the folder ones.
+    pub tasks: Vec<Workspace>,
+    worktrees: Vec<Workspace>,
+    pub folders: Vec<Workspace>,
+    /// The workspace whose sessions the terminal shows, by
+    /// [`Workspace::id`].
+    pub selected: Option<String>,
+    /// The session a context menu was opened on.
+    pub menu_session: Option<usize>,
+    /// The folder workspace the palette is renaming, by id.
+    pub renaming: Option<String>,
     /// A failed read or operation, said under the header.
     pub note: Option<String>,
     rx: Option<mpsc::Receiver<Listing>>,
@@ -187,20 +279,42 @@ enum Line {
     Note(String),
 }
 
-/// The task a folder belongs to: the deepest worktree holding it, so a
-/// worktree inside the main checkout is not taken for the main one.
-pub fn task_of(tasks: &[Worktree], folder: &Path) -> Option<usize> {
+/// The workspace a session belongs to: the one it was started in, when
+/// that still exists, else the one holding its folder.
+pub fn task_of(tasks: &[Workspace], tab: &Tab) -> Option<usize> {
+    if let Some(id) = &tab.workspace
+        && let Some(i) = tasks.iter().position(|t| t.id() == *id)
+    {
+        return Some(i);
+    }
+    folder_task(tasks, &tab.folder)
+}
+
+/// The workspace holding a folder: the deepest one, so a worktree inside
+/// the main checkout is not taken for the main one; a worktree before a
+/// folder workspace on the same folder.
+pub fn folder_task(tasks: &[Workspace], folder: &Path) -> Option<usize> {
     tasks
         .iter()
         .enumerate()
         .filter(|(_, t)| folder.starts_with(&t.path))
-        .max_by_key(|(_, t)| t.path.components().count())
+        .max_by_key(|(_, t)| (t.path.components().count(), !t.folder))
         .map(|(i, _)| i)
 }
 
 impl Panel {
-    /// Reads the worktrees of the repository `dir` is in, on a worker.
+    /// Reads the worktrees of the repository `dir` is in, on a worker, and
+    /// the folder workspaces kept for it.
     pub fn refresh(&mut self, dir: &Path) {
+        let root = crate::platform::canonical(dir);
+        if self.root.as_deref() != Some(root.as_path()) {
+            self.folders = folders_file(&root)
+                .and_then(|file| std::fs::read_to_string(file).ok())
+                .map(|text| parse_folders(&text))
+                .unwrap_or_default();
+            self.root = Some(root);
+            self.rebuild();
+        }
         let (tx, rx) = mpsc::channel();
         let (info_tx, info_rx) = mpsc::channel();
         let dir = dir.to_path_buf();
@@ -276,7 +390,7 @@ impl Panel {
         match listing {
             Ok(tasks) => {
                 self.repo = Some(main);
-                self.tasks = tasks;
+                self.worktrees = tasks.into_iter().map(Workspace::of).collect();
                 if self
                     .note
                     .as_deref()
@@ -287,11 +401,75 @@ impl Panel {
             }
             Err(_) => {
                 self.repo = None;
-                self.tasks.clear();
+                self.worktrees.clear();
                 self.note = Some("No Git repository here: sessions run in the open folder".into());
             }
         }
+        self.rebuild();
         true
+    }
+
+    fn rebuild(&mut self) {
+        self.tasks = self
+            .worktrees
+            .iter()
+            .chain(self.folders.iter())
+            .cloned()
+            .collect();
+    }
+
+    fn save_folders(&self) {
+        let Some(file) = self.root.as_deref().and_then(folders_file) else {
+            return;
+        };
+        if let Some(dir) = file.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = crate::platform::write_atomically(&file, folders_text(&self.folders).as_bytes());
+    }
+
+    /// Adds a folder workspace, its name made unique, and returns its id.
+    pub fn add_folder(&mut self, name: &str, path: PathBuf) -> String {
+        let base = name.trim();
+        let base = if base.is_empty() { "workspace" } else { base };
+        let mut name = base.to_owned();
+        let mut n = 1;
+        while self.tasks.iter().any(|t| t.folder && t.name == name) {
+            n += 1;
+            name = format!("{base} {n}");
+        }
+        let made = Workspace {
+            name,
+            path: crate::platform::canonical(&path),
+            branch: None,
+            main: false,
+            folder: true,
+        };
+        let id = made.id();
+        self.folders.push(made);
+        self.rebuild();
+        self.save_folders();
+        id
+    }
+
+    /// Renames a folder workspace and returns its new id.
+    pub fn rename_folder(&mut self, id: &str, name: &str) -> Option<String> {
+        let name = name.trim();
+        if name.is_empty() || self.folders.iter().any(|t| t.name == name && t.id() != id) {
+            return None;
+        }
+        let space = self.folders.iter_mut().find(|t| t.id() == id)?;
+        space.name = name.to_owned();
+        let new_id = space.id();
+        self.rebuild();
+        self.save_folders();
+        Some(new_id)
+    }
+
+    pub fn remove_folder(&mut self, id: &str) {
+        self.folders.retain(|t| t.id() != id);
+        self.rebuild();
+        self.save_folders();
     }
 
     /// A read or an operation is in flight.
@@ -301,7 +479,12 @@ impl Panel {
 
     pub fn selected_index(&self) -> Option<usize> {
         let selected = self.selected.as_deref()?;
-        self.tasks.iter().position(|t| t.path == selected)
+        self.tasks.iter().position(|t| t.id() == selected)
+    }
+
+    /// Selects a workspace by index.
+    pub fn select(&mut self, index: usize) {
+        self.selected = self.tasks.get(index).map(Workspace::id);
     }
 
     /// A session's row, then its team's tasks: the open ones, and the
@@ -323,10 +506,7 @@ impl Panel {
         if let Some(note) = &self.note {
             lines.push(Line::Note(note.clone()));
         }
-        let owner: Vec<Option<usize>> = tabs
-            .iter()
-            .map(|t| task_of(&self.tasks, &t.folder))
-            .collect();
+        let owner: Vec<Option<usize>> = tabs.iter().map(|t| task_of(&self.tasks, t)).collect();
         for task in 0..self.tasks.len() {
             lines.push(Line::Task(task));
             for (tab, _) in owner.iter().enumerate().filter(|(_, o)| **o == Some(task)) {
@@ -344,7 +524,8 @@ impl Panel {
         }
         if tabs.is_empty() && self.tasks.len() <= 1 {
             lines.push(Line::Note(
-                "New Task (\u{21e7}\u{2318}N) starts an agent on a branch of its own".into(),
+                "New Workspace (\u{21e7}\u{2318}N) starts an agent in a folder or on a branch"
+                    .into(),
             ));
         }
         lines
@@ -371,14 +552,14 @@ impl Panel {
             if self.on { "on" } else { "off" },
             self.tasks
                 .iter()
-                .map(Worktree::name)
+                .map(Workspace::name)
                 .collect::<Vec<_>>()
                 .join(","),
             name(self.selected_index()),
             tabs.iter()
                 .enumerate()
                 .map(|(i, t)| {
-                    let task = name(task_of(&self.tasks, &t.folder));
+                    let task = name(task_of(&self.tasks, t));
                     if i == active {
                         format!("*{task}")
                     } else {
@@ -470,10 +651,15 @@ impl Panel {
             (
                 new,
                 icons::ADD,
-                "New Task  \u{21e7}\u{2318}N",
+                "New Workspace  \u{21e7}\u{2318}N",
                 Action::NewTask,
             ),
-            (refresh, icons::REFRESH, "Refresh Tasks", Action::Refresh),
+            (
+                refresh,
+                icons::REFRESH,
+                "Refresh Workspaces",
+                Action::Refresh,
+            ),
         ] {
             layout::Button::new(rect)
                 .icon(icon)
@@ -533,6 +719,8 @@ impl Panel {
                         },
                         if task.main {
                             icons::HOME
+                        } else if task.folder {
+                            icons::FOLDER
                         } else {
                             icons::GIT_BRANCH
                         },
@@ -544,7 +732,7 @@ impl Panel {
                     );
                     let mine: Vec<&Tab> = tabs
                         .iter()
-                        .filter(|t| task_of(&self.tasks, &t.folder) == Some(*index))
+                        .filter(|t| task_of(&self.tasks, t) == Some(*index))
                         .collect();
                     let waiting = mine
                         .iter()
@@ -553,13 +741,28 @@ impl Panel {
                     let working = mine.iter().any(|t| t.activity() == Activity::Working);
                     // Hover trades the summary for the row's two buttons.
                     let buttons = 2.0 * (layout::UI_CONTROL_SM + 2.0);
+                    let name = task.name();
                     layout::push_ui_text(
                         out,
                         atlas,
                         text_rect(24.0, buttons + 4.0),
-                        &task.name(),
+                        &name,
                         theme.text,
                     );
+                    // A folder workspace says which folder, after its name.
+                    let folder_name = task
+                        .path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .filter(|_| task.folder)
+                        .filter(|n| *n != name);
+                    if let Some(folder_name) = folder_name {
+                        let from = 24.0 + layout::ui_text_width(atlas, &name) + 8.0;
+                        let rect = text_rect(from, buttons + 4.0);
+                        if rect.width > 30.0 {
+                            layout::push_ui_text(out, atlas, rect, &folder_name, theme.gutter_text);
+                        }
+                    }
                     let right = row.x + row.width - 4.0;
                     if over {
                         let menu = Viewport {
@@ -874,26 +1077,76 @@ fn summary(info: &Info, theme: &Theme) -> Option<(String, [f32; 4])> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_folder_belongs_to_its_deepest_task() {
-        let tree = |path: &str, main: bool| Worktree {
+    fn tree(path: &str, main: bool) -> Workspace {
+        Workspace::of(Worktree {
             path: PathBuf::from(path),
             branch: None,
             main,
-        };
+        })
+    }
+
+    fn folder(name: &str, path: &str) -> Workspace {
+        Workspace {
+            name: name.into(),
+            path: PathBuf::from(path),
+            branch: None,
+            main: false,
+            folder: true,
+        }
+    }
+
+    #[test]
+    fn a_folder_belongs_to_its_deepest_task() {
         let tasks = vec![
             tree("/r", true),
             tree("/r/.claude/worktrees/x", false),
             tree("/w/y", false),
         ];
-        assert_eq!(task_of(&tasks, Path::new("/r/src")), Some(0));
+        assert_eq!(folder_task(&tasks, Path::new("/r/src")), Some(0));
         assert_eq!(
-            task_of(&tasks, Path::new("/r/.claude/worktrees/x/src")),
+            folder_task(&tasks, Path::new("/r/.claude/worktrees/x/src")),
             Some(1)
         );
-        assert_eq!(task_of(&tasks, Path::new("/w/y")), Some(2));
-        assert_eq!(task_of(&tasks, Path::new("/elsewhere")), None);
+        assert_eq!(folder_task(&tasks, Path::new("/w/y")), Some(2));
+        assert_eq!(folder_task(&tasks, Path::new("/elsewhere")), None);
         // A sibling whose name starts the same is not inside.
-        assert_eq!(task_of(&tasks, Path::new("/rr")), None);
+        assert_eq!(folder_task(&tasks, Path::new("/rr")), None);
+    }
+
+    #[test]
+    fn a_worktree_wins_a_folder_workspace_on_the_same_folder() {
+        let tasks = vec![folder("notes", "/r"), tree("/r", true)];
+        assert_eq!(folder_task(&tasks, Path::new("/r/src")), Some(1));
+        let tasks = vec![folder("notes", "/r/docs"), tree("/r", true)];
+        assert_eq!(folder_task(&tasks, Path::new("/r/docs/a")), Some(0));
+    }
+
+    #[test]
+    fn folder_workspaces_survive_their_file_and_keep_names_apart() {
+        // No root: nothing is written; the text form is checked directly.
+        let mut panel = Panel {
+            worktrees: vec![tree("/r", true)],
+            ..Panel::default()
+        };
+        let dir = PathBuf::from("/tmp/crc-agents-test");
+        let a = panel.add_folder("notes", dir.clone());
+        let b = panel.add_folder("notes", dir);
+        assert_eq!(a, "folder:notes");
+        assert_eq!(b, "folder:notes 2");
+        assert_eq!(panel.tasks.len(), 3);
+        assert_eq!(panel.tasks[0].id(), "/r");
+        let text = folders_text(&panel.folders);
+        let back = parse_folders(&text);
+        assert_eq!(back, panel.folders);
+        assert_eq!(panel.rename_folder(&b, "notes"), None);
+        assert_eq!(
+            panel.rename_folder(&b, "ideas"),
+            Some("folder:ideas".into())
+        );
+        panel.remove_folder(&a);
+        assert_eq!(
+            panel.tasks.iter().map(Workspace::id).collect::<Vec<_>>(),
+            vec!["/r".to_owned(), "folder:ideas".to_owned()]
+        );
     }
 }

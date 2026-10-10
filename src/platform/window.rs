@@ -1737,7 +1737,8 @@ define_class!(
                     return;
                 }
                 Some(Hit::TerminalNew) => {
-                    self.spawn_terminal(false);
+                    let agents = self.state().is_some_and(|state| state.agents.on);
+                    self.spawn_terminal(agents);
                     return;
                 }
                 Some(Hit::TerminalHide) if self.state().is_some_and(|state| state.agents.on) => {
@@ -2181,6 +2182,7 @@ define_class!(
                 {
                     state.terminal.selection = None;
                 }
+                state.terminal.drag_point = None;
                 state.autoscroll_carry = 0.0;
                 match state.drag.take() {
                     Some(Drag::Tree(drag)) if drag.active && drag.valid => Some(drag),
@@ -2597,7 +2599,7 @@ define_class!(
             }
             // A pointer held still past the edge of the text sends no events,
             // so this is what keeps the view moving under it.
-            if self.drag_select() {
+            if self.drag_select() || self.terminal_autoscroll() {
                 self.request_redraw();
             }
             if self.ivars().needs_redraw.get() {
@@ -3057,6 +3059,12 @@ define_class!(
 
         #[unsafe(method(goToProjectSymbol:))]
         fn action_go_to_project_symbol(&self, _sender: Option<&AnyObject>) {
+            // Cmd-T in Agents mode is a new session in the selected
+            // workspace, as the tab bar's + is.
+            if self.state().is_some_and(|state| state.agents.on) {
+                self.spawn_terminal(true);
+                return;
+            }
             self.open_palette_with("#");
         }
 
@@ -3674,6 +3682,36 @@ define_class!(
             self.agent_menu_new_session(true);
         }
 
+        #[unsafe(method(agentSessionNewClaude:))]
+        fn action_agent_session_new_claude(&self, _sender: Option<&AnyObject>) {
+            self.agent_session_new(true);
+        }
+
+        #[unsafe(method(agentSessionNewShell:))]
+        fn action_agent_session_new_shell(&self, _sender: Option<&AnyObject>) {
+            self.agent_session_new(false);
+        }
+
+        #[unsafe(method(agentCloseSession:))]
+        fn action_agent_close_session(&self, _sender: Option<&AnyObject>) {
+            self.agent_close_session();
+        }
+
+        #[unsafe(method(refreshAgents:))]
+        fn action_refresh_agents(&self, _sender: Option<&AnyObject>) {
+            self.refresh_agents();
+        }
+
+        #[unsafe(method(agentRenameWorkspace:))]
+        fn action_agent_rename_workspace(&self, _sender: Option<&AnyObject>) {
+            self.agent_rename_workspace();
+        }
+
+        #[unsafe(method(agentRemoveWorkspace:))]
+        fn action_agent_remove_workspace(&self, _sender: Option<&AnyObject>) {
+            self.agent_remove_workspace();
+        }
+
         #[unsafe(method(agentNewShell:))]
         fn action_agent_new_shell(&self, _sender: Option<&AnyObject>) {
             self.agent_menu_new_session(false);
@@ -3877,6 +3915,7 @@ define_class!(
         #[unsafe(method(selectAll:))]
         fn action_select_all(&self, _sender: Option<&AnyObject>) {
             if self.terminal_has_keys() {
+                self.terminal_select_all();
                 return;
             }
             let ((), focus) = self.edit_focused(|b, _| b.select_all());
@@ -4367,6 +4406,10 @@ impl EditorView {
         if in_sidebar && git_showing {
             let rect = sidebar.expect("in_sidebar implies a sidebar rectangle");
             return Some(self.git_context_menu(rect, x, y));
+        }
+        // Agents mode: the sidebar is the workspace list, with its own.
+        if in_sidebar && self.state().is_some_and(|state| state.agents.on) {
+            return Some(self.agents_context_menu(x, y));
         }
         // Extensions and MCP Servers fill it the same way, each with its own.
         let (extensions, mcp) = self.state().map_or((false, false), |state| {
@@ -6476,6 +6519,7 @@ fn frame_of(state: &mut State) -> Frame {
     for (index, item) in layout::activity_items(chrome.activity)
         .into_iter()
         .enumerate()
+        .filter(|_| chrome.activity.width > 0.0)
     {
         if item.y + item.height <= chrome.activity.y + chrome.activity.height {
             frame.push(Hit::Activity(index), item);
@@ -6903,25 +6947,62 @@ enum Pick {
     Action(Language, crate::lsp::CodeAction),
     /// A Streamable HTTP MCP server to add, by its URL.
     McpUrl(String),
-    /// A task to start, by what was typed.
+    /// A task to start on a new branch, by what was typed.
     NewTask(String),
+    /// A folder workspace to make (or rename to), by what was typed.
+    NewWorkspace(String),
 }
 
-/// The New Task prompt's one row: the branch the name becomes.
-fn task_rows(query: &str) -> Vec<(layout::PaletteRow, Pick)> {
-    let branch = crate::project::worktree::branch_name(query);
-    if branch.is_empty() {
+/// The New Workspace prompt's rows: a folder workspace on `folder` (or,
+/// while renaming one, its new name), and in a repository a task on a
+/// new branch.
+fn task_rows(
+    query: &str,
+    folder: Option<&Path>,
+    repo: bool,
+    renaming: Option<&str>,
+) -> Vec<(layout::PaletteRow, Pick)> {
+    let name = query.trim();
+    if name.is_empty() {
         return Vec::new();
     }
-    vec![(
+    let in_folder = folder.and_then(Path::file_name).map_or_else(
+        || "the open folder".to_owned(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    if let Some(old) = renaming {
+        return vec![(
+            layout::PaletteRow {
+                icon: Some(crate::project::icons::FOLDER),
+                title: format!("Rename \u{201c}{old}\u{201d} to \u{201c}{name}\u{201d}"),
+                detail: "its sessions keep running".into(),
+                shortcut: String::new(),
+            },
+            Pick::NewWorkspace(name.to_owned()),
+        )];
+    }
+    let mut rows = vec![(
         layout::PaletteRow {
-            icon: Some(crate::project::icons::GIT_BRANCH),
-            title: format!("Start \u{201c}{branch}\u{201d}"),
-            detail: "a new branch from HEAD, in its own worktree, with Claude".into(),
+            icon: Some(crate::project::icons::FOLDER),
+            title: format!("New workspace \u{201c}{name}\u{201d}"),
+            detail: format!("in {in_folder}, with Claude"),
             shortcut: String::new(),
         },
-        Pick::NewTask(query.trim().to_owned()),
-    )]
+        Pick::NewWorkspace(name.to_owned()),
+    )];
+    let branch = crate::project::worktree::branch_name(query);
+    if repo && !branch.is_empty() {
+        rows.push((
+            layout::PaletteRow {
+                icon: Some(crate::project::icons::GIT_BRANCH),
+                title: format!("Start \u{201c}{branch}\u{201d} on a new branch"),
+                detail: "from HEAD, in its own worktree, with Claude".into(),
+                shortcut: String::new(),
+            },
+            Pick::NewTask(name.to_owned()),
+        ));
+    }
+    rows
 }
 
 /// The code action picker's rows: the actions whose titles match, in the
@@ -7147,8 +7228,14 @@ struct PaletteSources<'a> {
     repos: Option<&'a [RepoRow]>,
     /// Set while taking a URL for a new MCP server.
     mcp_url: bool,
-    /// Set while taking a new task's name.
+    /// Set while taking a new workspace's name.
     task: bool,
+    /// The folder a new workspace is made on, and whether it is a
+    /// repository (a task on a branch is offered too).
+    task_folder: Option<&'a Path>,
+    task_repo: bool,
+    /// The folder workspace being renamed, by name.
+    task_rename: Option<&'a str>,
 }
 
 /// The rows of the open palette for its query; none when it is closed.
@@ -7169,6 +7256,13 @@ fn palette_sources(state: &State) -> PaletteSources<'_> {
         repos: state.repo_list.as_deref(),
         mcp_url: state.mcp_url_prompt,
         task: state.task_prompt,
+        task_folder: state.agents.repo.as_deref().or(state.tree.root()),
+        task_repo: state.agents.repo.is_some(),
+        task_rename: state
+            .agents
+            .renaming
+            .as_deref()
+            .and_then(|id| id.strip_prefix("folder:")),
     }
 }
 
@@ -7259,12 +7353,15 @@ fn palette_rows(sources: &PaletteSources<'_>, query: &str) -> Vec<(layout::Palet
         repos,
         mcp_url,
         task,
+        task_folder,
+        task_repo,
+        task_rename,
     } = *sources;
     if mcp_url {
         return mcp_url_rows(query);
     }
     if task {
-        return task_rows(query);
+        return task_rows(query, task_folder, task_repo, task_rename);
     }
     if let Some(repos) = repos {
         return repo_rows(repos, query);
@@ -7922,7 +8019,7 @@ fn install_menu(mtm: MainThreadMarker, app: &NSApplication) {
     view_menu.addItem(&previous_pane);
     view_menu.addItem(&NSMenuItem::separatorItem(mtm));
     view_menu.addItem(&item("Agents", sel!(toggleAgents:), "a", true));
-    view_menu.addItem(&item("New Task\u{2026}", sel!(newTask:), "n", true));
+    view_menu.addItem(&item("New Workspace\u{2026}", sel!(newTask:), "n", true));
     view_menu.addItem(&item(
         "Next Waiting Agent",
         sel!(nextWaitingAgent:),

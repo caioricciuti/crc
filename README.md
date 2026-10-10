@@ -117,18 +117,22 @@ the size and write it back.
   `~/Library/Application Support/crc/sessions/` for 14 days, and Claude's
   questions mark its tab. `agent_review = false` turns them off.
 - **Agents mode** (`Cmd-Shift-A`, or the Editor / Agents switch in the
-  toolbar): the terminal takes the editor column and the sidebar lists
-  tasks, each a Git worktree of the open repository with its own
-  sessions, marked waiting, working or idle. New Task (`Cmd-Shift-N`)
-  makes a branch in a worktree under
-  `~/Library/Application Support/crc/worktrees/` and starts Claude there;
-  `Ctrl-1..9` show a task and `Cmd-Shift-U` the next session waiting on
-  you, which the Dock icon counts. A task's menu opens it in the editor,
-  merges its branch into the main checkout, pushes it and opens a pull
-  request with `gh`, or removes it (refused while it has uncommitted
-  changes). Each row says how far the branch is ahead, or its pull
+  toolbar): the terminal takes the editor column, the activity bar goes,
+  and the sidebar lists workspaces, each with its own sessions, marked
+  waiting, working or idle. Every Git worktree of the open repository is
+  one, and New Workspace (`Cmd-Shift-N`) adds one on any folder, or, in
+  a repository, a task on a new branch in a worktree under
+  `~/Library/Application Support/crc/worktrees/`; both start Claude.
+  `Cmd-T` (or the tab bar's +) starts another session in the selected
+  workspace; `Ctrl-1..9` show a workspace and `Cmd-Shift-U` the next
+  session waiting on you, which the Dock icon counts. A right-click on a
+  workspace opens it in the editor, merges its branch into the main
+  checkout, pushes it and opens a pull request with `gh`, removes it
+  (refused while it has uncommitted changes), or renames and forgets a
+  folder workspace; on a session it offers another session beside it, or
+  closes it. Each row says how far the branch is ahead, or its pull
   request and checks when `gh` is installed. `Cmd-\` shows two of a
-  task's sessions side by side. A session's state comes from the
+  workspace's sessions side by side. A session's state comes from the
   agent itself when it reports it (Claude Code 2.1.295 and later speak
   the Program Status Protocol, OSC 7501): working, waiting on a
   permission, a question or a login, finished, or failed, with its
@@ -184,7 +188,9 @@ the size and write it back.
   running: the next crc on the same project takes its sessions back with
   what they printed, agents included; closing a tab ends its session.
   `Cmd`-click a path such as `src/main.rs:42:7` in the output to open it
-  at that line. A session that sends a notification
+  at that line. Drag to select (past the top or bottom scrolls the
+  history under the pointer), `Cmd-A` selects everything the session
+  printed, `Cmd-C` copies, `Cmd-V` pastes. A session that sends a notification
   (OSC 9, 777 or 99) or rings the bell gets a dot and a line in the status
   bar saying what it asked, until you type into it; Home lists the
   waiting ones first.
@@ -259,7 +265,7 @@ the size and write it back.
   too, compared with Git's staged copy, but can only be kept: no copy from
   before exists. `claude` typed in a crc shell gets the hooks only if you
   add them to its settings.
-- **Agents mode is local.** A task's sessions outlive crc but not a
+- **Agents mode is local.** A workspace's sessions outlive crc but not a
   reboot, a session taken back after a restart has lost its link to the
   editor (`/ide` in Claude Code reconnects it), the pull request row is
   read when the list loads, not kept current, and tasks run on this Mac
@@ -326,8 +332,9 @@ the size and write it back.
 | `Cmd-=` / `Cmd--` / `Cmd-0` | zoom the code font in, out, back to 13 |
 | `Cmd-Shift-C` | Claude Code tab |
 | `Cmd-Shift-A` | Editor / Agents |
-| `Cmd-Shift-N` | new task: a branch in its own worktree, with Claude |
-| `Ctrl-1..9`, `Cmd-Shift-U` | show a task / the next agent waiting on you |
+| `Cmd-Shift-N` | new workspace: a folder, or a branch in its own worktree, with Claude |
+| `Cmd-T` (Agents mode) | another session in the selected workspace |
+| `Ctrl-1..9`, `Cmd-Shift-U` | show a workspace / the next agent waiting on you |
 | `` Ctrl-` `` / `Cmd-J` | terminal panel |
 | `>` in `Cmd-P` | run a menu command |
 | `Cmd-N` | new file: a name field in the sidebar |

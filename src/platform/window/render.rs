@@ -662,31 +662,33 @@ impl EditorView {
             draw_find_bar(glyphs, renderer, theme, rect, bar, found, tree);
         }
 
-        layout::push_activity(
-            glyphs,
-            &mut renderer.atlas,
-            activity_rect,
-            theme,
-            sidebar_rect.filter(|_| !agents.on).map(|_| {
-                if mcp.open {
-                    3
-                } else if extensions.is_some() {
-                    2
-                } else if *git_open {
-                    1
-                } else {
-                    0
-                }
-            }),
-            git.snapshot.as_ref().map_or(0, |s| s.changes.len()),
-        );
+        if activity_rect.width > 0.0 {
+            layout::push_activity(
+                glyphs,
+                &mut renderer.atlas,
+                activity_rect,
+                theme,
+                sidebar_rect.filter(|_| !agents.on).map(|_| {
+                    if mcp.open {
+                        3
+                    } else if extensions.is_some() {
+                        2
+                    } else if *git_open {
+                        1
+                    } else {
+                        0
+                    }
+                }),
+                git.snapshot.as_ref().map_or(0, |s| s.changes.len()),
+            );
+        }
         terminal_panel.shown = agents.on.then(|| {
             let tasks = &agents.tasks;
             let selected = agents.selected_index();
             (0..terminal_panel.tabs.len())
                 .filter(|i| {
                     tasks.is_empty()
-                        || crate::platform::agents::task_of(tasks, &terminal_panel.tabs[*i].folder)
+                        || crate::platform::agents::task_of(tasks, &terminal_panel.tabs[*i])
                             == selected
                 })
                 .collect()
@@ -942,6 +944,12 @@ impl EditorView {
                 repos: repo_list.as_deref(),
                 mcp_url: *mcp_url_prompt,
                 task: *task_prompt,
+                task_folder: agents.repo.as_deref().or(tree.root()),
+                task_repo: agents.repo.is_some(),
+                task_rename: agents
+                    .renaming
+                    .as_deref()
+                    .and_then(|id| id.strip_prefix("folder:")),
             };
             let mode = PaletteMode::of(&sources);
             let intent = sources.branches.map(|pick| &pick.intent);

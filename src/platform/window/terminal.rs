@@ -213,26 +213,37 @@ impl EditorView {
     }
 
     /// A new session in the open folder, or in Agents mode in the selected
-    /// task's folder.
+    /// workspace's folder.
     pub(super) fn spawn_terminal(&self, claude: bool) {
         let task = self.state().and_then(|state| {
             state
                 .agents
                 .on
-                .then(|| state.agents.selected.clone())
+                .then(|| state.agents.selected_index())
                 .flatten()
+                .map(|i| state.agents.tasks[i].path.clone())
         });
         self.spawn_terminal_in(claude, task.as_deref());
     }
 
     pub(super) fn spawn_terminal_in(&self, claude: bool, cwd: Option<&Path>) {
-        {
+        // In Agents mode a session started in the selected workspace's
+        // folder (or in no particular one) belongs to that workspace.
+        let workspace = {
             let Some(mut state) = self.state_mut() else {
                 return;
             };
             state.terminal.open = true;
             state.terminal.focus = true;
-        }
+            state
+                .agents
+                .on
+                .then(|| state.agents.selected_index())
+                .flatten()
+                .map(|i| &state.agents.tasks[i])
+                .filter(|t| cwd.is_none_or(|dir| crate::platform::canonical(dir) == t.path))
+                .map(|t| t.id())
+        };
         let Some(launch) = self.terminal_launch(claude, cwd) else {
             return;
         };
@@ -270,6 +281,7 @@ impl EditorView {
             claude,
             review: review.clone(),
             project,
+            workspace: workspace.clone().unwrap_or_default(),
         };
         let held = crate::term::hold::dir()
             .ok_or_else(|| std::io::Error::other("no folder for session helpers"))
@@ -322,6 +334,7 @@ impl EditorView {
                     events_read: 0,
                     review_files: 0,
                     folder: crate::platform::canonical(&launch.cwd),
+                    workspace,
                     alive: std::sync::Arc::new(()),
                     launch,
                     held,
@@ -401,6 +414,7 @@ impl EditorView {
                     events_read: left.events_read,
                     review_files: 0,
                     folder: crate::platform::canonical(&launch.cwd),
+                    workspace: (!spec.workspace.is_empty()).then(|| spec.workspace.clone()),
                     alive: std::sync::Arc::new(()),
                     status: None,
                     launch,
@@ -481,11 +495,10 @@ impl EditorView {
                 return;
             };
             let tasks = state.agents.tasks.clone();
-            let task = crate::platform::agents::task_of(&tasks, &folder);
+            let task = crate::platform::agents::task_of(&tasks, &state.terminal.tabs[active]);
             let other = (0..state.terminal.tabs.len()).find(|i| {
                 *i != active
-                    && crate::platform::agents::task_of(&tasks, &state.terminal.tabs[*i].folder)
-                        == task
+                    && crate::platform::agents::task_of(&tasks, &state.terminal.tabs[*i]) == task
             });
             match other {
                 Some(other) => {
@@ -763,6 +776,10 @@ impl EditorView {
             let Some(mut state) = self.state_mut() else {
                 return;
             };
+            state.terminal.drag_point = Some((x, y));
+            // Pulled inside the screen first: above it selects up to the
+            // top row, not a row computed from a negative distance.
+            let y = y.clamp(screen.y, screen.y + (screen.height - 1.0).max(0.0));
             let (row, boundary, _) =
                 crate::platform::terminal::point(&state.renderer.atlas, screen, x, y, cols, rows);
             let back = state.terminal.back;
@@ -777,6 +794,74 @@ impl EditorView {
                 *head = (line, boundary);
             }
         }
+        self.request_redraw();
+        self.pump();
+    }
+
+    /// A drag held past the top or bottom of the screen scrolls the
+    /// history under it, by the frame, and the selection follows. Returns
+    /// whether it scrolled, which is to say whether to ask again next frame.
+    pub(super) fn terminal_autoscroll(&self) -> bool {
+        let Some((screen, _, _)) = self.terminal_screen() else {
+            return false;
+        };
+        let moved = {
+            let Some(mut state) = self.state_mut() else {
+                return false;
+            };
+            if !state.terminal.selecting {
+                return false;
+            }
+            let Some((x, y)) = state.terminal.drag_point else {
+                return false;
+            };
+            let past = if y < screen.y {
+                y - screen.y
+            } else if y > screen.y + screen.height {
+                y - (screen.y + screen.height)
+            } else {
+                0.0
+            };
+            if past == 0.0 {
+                state.autoscroll_carry = 0.0;
+                return false;
+            }
+            let speed = past.signum() * (8.0 + past.abs() * 1.5).min(240.0);
+            state.autoscroll_carry += speed * state.frame_interval.as_secs_f32();
+            let lines = state.autoscroll_carry.trunc();
+            state.autoscroll_carry -= lines;
+            let history = state.terminal.active_tab().map_or(0, |tab| {
+                tab.session
+                    .term
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .scrollback_len()
+            });
+            // Up is into history: a negative distance raises `back`.
+            let back = state.terminal.back as isize - lines as isize;
+            state.terminal.back = back.clamp(0, history as isize) as usize;
+            (x, y)
+        };
+        self.terminal_drag(moved.0, moved.1);
+        true
+    }
+
+    /// Everything the session has: its history and its screen.
+    pub(super) fn terminal_select_all(&self) {
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
+        let Some(tab) = state.terminal.active_tab() else {
+            return;
+        };
+        let term = tab.session.term.lock().unwrap_or_else(|e| e.into_inner());
+        let first = term.view_line(0, term.scrollback_len());
+        let last = term.view_line(term.rows().saturating_sub(1), 0);
+        let cols = term.cols();
+        drop(term);
+        state.terminal.selection = Some(((first, 0), (last, cols)));
+        state.terminal.selecting = false;
+        drop(state);
         self.request_redraw();
         self.pump();
     }

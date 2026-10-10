@@ -1,13 +1,15 @@
 # Sourced by scripts/selftest.sh, which sets up $T, $BIN, $fail and the
 # expect helpers; run it alone with scripts/selftest.sh agents.
 
-# ---- Agents mode: tasks are worktrees, each with its own sessions -----------
-# Cmd-Shift-A gives the terminal the editor column and the sidebar to the tasks,
-# starting Claude in the repository when nothing runs. New Task makes a
-# branch in a worktree of its own (under CRC_WORKTREES here) and starts
-# Claude there. The stand-in agent ends its turn with the Stop hook, which
-# marks its session as waiting. Control-2 shows the second task; Cmd-Shift-A
-# again gives the column back to the editor.
+# ---- Agents mode: workspaces, each with its own sessions --------------------
+# Cmd-Shift-A gives the terminal the editor column and the sidebar to the
+# workspaces, starting Claude in the repository when nothing runs. New
+# Workspace offers a folder workspace first and, in a repository, a task on
+# a branch in a worktree of its own (under CRC_WORKTREES here) second; both
+# start Claude. The stand-in agent ends its turn with the Stop hook, which
+# marks its session as waiting. Control-2 shows the second workspace; Cmd-T
+# starts a session in the selected one; Cmd-Shift-A again gives the column
+# back to the editor.
 case "$BIN" in /*) hook_bin=$BIN ;; *) hook_bin=$PWD/$BIN ;; esac
 mkdir -p "$T/agentsproj"
 printf 'one\n' > "$T/agentsproj/a.txt"
@@ -36,6 +38,7 @@ dump $T/agents-on.out
 key 45 cmd,shift N
 wait 200
 text try-it
+key 125
 key 36
 wait 700
 wait 700
@@ -58,6 +61,16 @@ dump $T/agents-other.out
 key 13 cmd,opt w
 wait 200
 dump $T/agents-unsplit.out
+key 45 cmd,shift N
+wait 200
+text notes
+key 36
+wait 700
+wait 700
+dump $T/agents-folder.out
+key 17 cmd t
+wait 700
+dump $T/agents-cmdt.out
 key 0 cmd,shift A
 wait 400
 dump $T/agents-off.out
@@ -84,8 +97,15 @@ expect "$T/agents-jump.out" agents "on tasks=main,try-it selected=try-it session
 expect "$T/agents-split.out" agents "on tasks=main,try-it selected=try-it sessions=main,try-it,*try-it pair=1+2 op=-"
 expect "$T/agents-other.out" agents "on tasks=main,try-it selected=try-it sessions=main,*try-it,try-it pair=1+2 op=-"
 expect "$T/agents-unsplit.out" agents "on tasks=main,try-it selected=try-it sessions=main,*try-it,try-it pair=- op=-"
+# A folder workspace on the repository's own folder, with Claude in it;
+# Cmd-T adds a session to it. It is kept for the project.
+expect "$T/agents-folder.out" agents "on tasks=main,try-it,notes selected=notes sessions=main,try-it,try-it,*notes pair=- op=-"
+expect_terminal "$T/agents-folder.out" "agent ready in agentsproj"
+expect "$T/agents-cmdt.out" agents "on tasks=main,try-it,notes selected=notes sessions=main,try-it,try-it,notes,*notes pair=- op=-"
+grep -q "^notes	" "$T"/home/Library/Application\ Support/crc/agents/*.workspaces 2>/dev/null \
+    || failed "agents: the notes workspace was not kept under Application Support/crc/agents"
 # Back in the editor, the sessions keep running.
-expect "$T/agents-off.out" agents "off tasks=main,try-it selected=try-it sessions=main,*try-it,try-it pair=- op=-"
+expect "$T/agents-off.out" agents "off tasks=main,try-it,notes selected=notes sessions=main,try-it,try-it,notes,*notes pair=- op=-"
 grep -q '^terminals: waiting: finished|waiting: finished|' "$T/agents-off.out" \
     || failed "agents-off.out: $(grep '^terminals:' "$T/agents-off.out")"
 testgit "$T/agentsproj" worktree remove --force "$(ls -d "$T"/worktrees/agentsproj-*/try-it)" 2>/dev/null || true

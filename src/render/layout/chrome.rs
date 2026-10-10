@@ -382,10 +382,18 @@ impl Chrome {
         self.preview = Some(preview);
     }
 
-    /// Agents mode: the terminal takes the editor column whole. The
-    /// editor's rectangles are left with no height at the column's top, so
-    /// nothing draws or answers a click there.
+    /// Agents mode: the terminal takes the editor column whole, and the
+    /// activity strip goes, so the sidebar starts at the window's edge.
+    /// The editor's rectangles are left with no height at the column's
+    /// top, so nothing draws or answers a click there.
     pub fn terminal_only(mut self) -> Chrome {
+        let strip = self.activity.width;
+        self.activity.width = 0.0;
+        if let Some(sidebar) = &mut self.sidebar {
+            sidebar.x -= strip;
+        }
+        self.tabs.x -= strip;
+        self.tabs.width += strip;
         let column = Viewport {
             height: self.status.y - self.tabs.y,
             ..self.tabs

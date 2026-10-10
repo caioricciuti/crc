@@ -2,6 +2,24 @@
 
 One entry per tag, written for people who use the editor.
 
+## Unreleased
+
+- Agents mode lists workspaces, cmux style: every worktree of the open
+  repository as before, plus workspaces made by hand on any folder
+  (`Cmd-Shift-N` offers the folder first and, in a repository, a task
+  on a new branch second). Sessions remember the workspace they were
+  started in, through a quit and reopen too. Folder workspaces are
+  kept per project under `~/Library/Application Support/crc/agents/`.
+- Agents mode: `Cmd-T` and the tab bar's + start a Claude session in
+  the selected workspace; the activity bar is hidden so the list starts
+  at the window's edge; a right-click in the sidebar gives the Agents
+  menu (session: new session beside it, close; workspace: the task menu,
+  plus rename and remove for a folder workspace; the list: new
+  workspace, refresh) instead of the file tree's.
+- Terminal: `Cmd-A` selects everything the session printed, and a drag
+  held past the top or bottom of the screen scrolls the history under
+  the pointer while the selection follows.
+
 ## v0.2.0-alpha.18, 2026-10-10
 
 Sessions that outlive the window, drop and paste for agents, and the

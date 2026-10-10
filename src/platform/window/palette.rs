@@ -188,6 +188,7 @@ impl EditorView {
             Pick::RenameBranchTo(old, new) => self.rename_branch(old, new),
             Pick::McpUrl(url) => self.add_mcp_url(url),
             Pick::NewTask(name) => self.create_task(name),
+            Pick::NewWorkspace(name) => self.create_workspace(name),
             Pick::Repo(path) => self.select_repo(&path),
             Pick::Symbol(path, line) => self.go_to_symbol(path, line),
             Pick::Command(at, tag) => self.run_command(at, tag),
