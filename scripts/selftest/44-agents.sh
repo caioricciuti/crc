@@ -43,6 +43,16 @@ dump $T/agents-main.out
 key 19 ctrl 2
 wait 400
 dump $T/agents-jump.out
+key 42 cmd \\
+wait 700
+wait 300
+dump $T/agents-split.out
+key 30 cmd,opt ]
+wait 200
+dump $T/agents-other.out
+key 13 cmd,opt w
+wait 200
+dump $T/agents-unsplit.out
 key 0 cmd,shift A
 wait 400
 dump $T/agents-off.out
@@ -51,18 +61,25 @@ SCRIPT
 CRC_TERMINAL_SHELL=/bin/sh CRC_CLAUDE_COMMAND="$T/agents-agent.sh" \
     CRC_WORKTREES="$T/worktrees" \
     CRC_SELFTEST="$T/agents.script" "$BIN" "$T/agentsproj" 2> "$T/agents.err"
-expect "$T/agents-on.out" agents "on tasks=main selected=main sessions=*main op=-"
+expect "$T/agents-on.out" agents "on tasks=main selected=main sessions=*main pair=- op=-"
 expect "$T/agents-on.out" terminals "waiting: finished"
-expect "$T/agents-task.out" agents "on tasks=main,try-it selected=try-it sessions=main,*try-it op=-"
+expect "$T/agents-task.out" agents "on tasks=main,try-it selected=try-it sessions=main,*try-it pair=- op=-"
 ls -d "$T"/worktrees/agentsproj-*/try-it >/dev/null 2>&1 \
     || failed "agents: no worktree for try-it under $T/worktrees"
 testgit "$T/agentsproj" rev-parse -q --verify refs/heads/try-it >/dev/null \
     || failed "agents: no try-it branch: $(testgit "$T/agentsproj" branch)"
 expect_terminal "$T/agents-task.out" "agent ready in try-it"
 # A task's row shows its waiting session, with the keyboard.
-expect "$T/agents-main.out" agents "on tasks=main,try-it selected=main sessions=*main,try-it op=-"
-expect "$T/agents-jump.out" agents "on tasks=main,try-it selected=try-it sessions=main,*try-it op=-"
+expect "$T/agents-main.out" agents "on tasks=main,try-it selected=main sessions=*main,try-it pair=- op=-"
+expect "$T/agents-jump.out" agents "on tasks=main,try-it selected=try-it sessions=main,*try-it pair=- op=-"
+# Cmd-\ puts a new shell in the task beside its agent; Cmd-Option-]
+# moves the keyboard across; Cmd-Option-W goes back to one, and the shell
+# keeps its tab.
+expect "$T/agents-split.out" agents "on tasks=main,try-it selected=try-it sessions=main,try-it,*try-it pair=1+2 op=-"
+expect "$T/agents-other.out" agents "on tasks=main,try-it selected=try-it sessions=main,*try-it,try-it pair=1+2 op=-"
+expect "$T/agents-unsplit.out" agents "on tasks=main,try-it selected=try-it sessions=main,*try-it,try-it pair=- op=-"
 # Back in the editor, the sessions keep running.
-expect "$T/agents-off.out" agents "off tasks=main,try-it selected=try-it sessions=main,*try-it op=-"
-expect "$T/agents-off.out" terminals "waiting: finished|waiting: finished"
+expect "$T/agents-off.out" agents "off tasks=main,try-it selected=try-it sessions=main,*try-it,try-it pair=- op=-"
+grep -q '^terminals: waiting: finished|waiting: finished|' "$T/agents-off.out" \
+    || failed "agents-off.out: $(grep '^terminals:' "$T/agents-off.out")"
 testgit "$T/agentsproj" worktree remove --force "$(ls -d "$T"/worktrees/agentsproj-*/try-it)" 2>/dev/null || true

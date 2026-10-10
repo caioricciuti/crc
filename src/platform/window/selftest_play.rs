@@ -609,7 +609,11 @@ impl EditorView {
                         })
                         .collect::<Vec<_>>()
                         .join("|"),
-                    state.agents.report(&state.terminal.tabs, state.terminal.active),
+                    state.agents.report(
+                        &state.terminal.tabs,
+                        state.terminal.active,
+                        state.terminal.shown_pair(),
+                    ),
                     active_conflicts(&state).map_or("none".to_string(), |v| format!(
                         "{} side={} unmerged={} resolvable={} scroll={}",
                         v.conflicts.len(),

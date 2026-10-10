@@ -211,9 +211,7 @@ impl EditorView {
             if tab >= state.terminal.tabs.len() {
                 return;
             }
-            state.terminal.active = tab;
-            state.terminal.back = 0;
-            state.terminal.selection = None;
+            state.terminal.show(tab);
             let folder = state.terminal.tabs[tab].folder.clone();
             let tasks = state.agents.tasks.clone();
             if let Some(task) = task_of(&tasks, &folder) {
@@ -316,7 +314,7 @@ impl EditorView {
     fn task_menu(&self, index: usize) -> Retained<NSMenu> {
         let mtm = MainThreadMarker::from(self);
         let menu = context_menu_new(mtm);
-        let (main, branch, base) = self.state().map_or((true, None, None), |state| {
+        let (main, branch, base, pr) = self.state().map_or((true, None, None, None), |state| {
             let task = state.agents.tasks.get(index);
             (
                 task.is_none_or(|t| t.main),
@@ -327,6 +325,9 @@ impl EditorView {
                     .iter()
                     .find(|t| t.main)
                     .and_then(|t| t.branch.clone()),
+                task.and_then(|t| state.agents.info.get(&t.path))
+                    .and_then(|info| info.pull_request.as_ref())
+                    .map(|pr| pr.number),
             )
         });
         let add = |title: &str, action: Sel| menu.addItem(&menu_item(mtm, title, action));
@@ -337,7 +338,16 @@ impl EditorView {
             menu.addItem(&NSMenuItem::separatorItem(mtm));
             let into = base.unwrap_or_else(|| "the main checkout".into());
             add(&format!("Merge {branch} into {into}"), sel!(agentMerge:));
-            add("Push and Open Pull Request", sel!(agentPushPullRequest:));
+            match pr {
+                Some(number) => {
+                    add(
+                        &format!("Open Pull Request #{number}"),
+                        sel!(agentOpenPullRequest:),
+                    );
+                    add("Push", sel!(agentPushPullRequest:));
+                }
+                None => add("Push and Open Pull Request", sel!(agentPushPullRequest:)),
+            }
             menu.addItem(&NSMenuItem::separatorItem(mtm));
             add("Remove Task\u{2026}", sel!(agentRemove:));
         }
@@ -403,12 +413,38 @@ impl EditorView {
         self.request_redraw();
     }
 
-    /// Pushes the task's branch and opens a pull request with `gh`, typed
-    /// into a shell of its own so sign-in prompts and answers show.
+    /// The task's pull request, in the browser.
+    pub(super) fn agent_open_pull_request(&self) {
+        let url = self.menu_task().and_then(|task| {
+            let state = self.state()?;
+            let pr = state.agents.info.get(&task.path)?.pull_request.as_ref()?;
+            Some(pr.url.clone())
+        });
+        if let Some(url) = url.filter(|u| u.starts_with("https://"))
+            && let Err(e) = self.open(false, std::ffi::OsStr::new(&url))
+            && let Some(mut state) = self.state_mut()
+        {
+            state.say(
+                layout::Feedback::Failure,
+                format!("Could not open {url}: {e}"),
+            );
+        }
+    }
+
+    /// Pushes the task's branch, and opens a pull request with `gh` when it
+    /// has none, typed into a shell of its own so sign-in prompts and
+    /// answers show.
     pub(super) fn agent_push_pull_request(&self) {
         let Some(task) = self.menu_task() else {
             return;
         };
+        let has_pr = self.state().is_some_and(|state| {
+            state
+                .agents
+                .info
+                .get(&task.path)
+                .is_some_and(|info| info.pull_request.is_some())
+        });
         if let Some(mut state) = self.state_mut() {
             state.agents.selected = Some(task.path.clone());
         }
@@ -417,8 +453,11 @@ impl EditorView {
         if let Some(mut state) = self.state_mut()
             && let Some(tab) = state.terminal.active_tab_mut()
         {
-            tab.session
-                .write(b"git push -u origin HEAD && gh pr create --fill\n");
+            tab.session.write(if has_pr {
+                b"git push -u origin HEAD\n"
+            } else {
+                b"git push -u origin HEAD && gh pr create --fill\n"
+            });
         }
     }
 

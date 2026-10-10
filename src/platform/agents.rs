@@ -38,6 +38,14 @@ pub enum Action {
 /// with every path resolved.
 type Listing = (PathBuf, Result<Vec<Worktree>, String>);
 
+/// What a task's row says besides its name, read after the list: commits
+/// ahead of the main checkout, and its pull request.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Info {
+    pub ahead: usize,
+    pub pull_request: Option<crate::project::worktree::PullRequest>,
+}
+
 #[derive(Default)]
 pub struct Panel {
     /// Agents mode is on: the terminal has the column, this the sidebar.
@@ -50,6 +58,9 @@ pub struct Panel {
     /// A failed read or operation, said under the header.
     pub note: Option<String>,
     rx: Option<mpsc::Receiver<Listing>>,
+    /// Per task path, once read.
+    pub info: std::collections::HashMap<PathBuf, Info>,
+    info_rx: Option<mpsc::Receiver<(PathBuf, Info)>>,
     /// An operation on a task running on a worker, and what it says.
     pub op: Option<(String, mpsc::Receiver<Result<Done, String>>)>,
     /// The task a menu was opened on.
@@ -118,6 +129,7 @@ impl Panel {
     /// Reads the worktrees of the repository `dir` is in, on a worker.
     pub fn refresh(&mut self, dir: &Path) {
         let (tx, rx) = mpsc::channel();
+        let (info_tx, info_rx) = mpsc::channel();
         let dir = dir.to_path_buf();
         std::thread::spawn(move || {
             let listing = crate::project::worktree::list(&dir).map(|list| {
@@ -135,13 +147,52 @@ impl Panel {
                     .map_or_else(|| dir.clone(), |w| w.path.clone()),
                 Err(_) => dir,
             };
-            let _ = tx.send((main, listing));
+            let tasks = listing.as_ref().map_or_else(|_| Vec::new(), Clone::clone);
+            let _ = tx.send((main.clone(), listing));
+            // Then what each row says, slower: `gh` asks GitHub. A test
+            // instance does not.
+            let ask_github = std::env::var_os("CRC_SELFTEST").is_none();
+            for task in tasks.into_iter().filter(|t| !t.main) {
+                let Some(branch) = &task.branch else {
+                    continue;
+                };
+                let info = Info {
+                    ahead: crate::project::worktree::ahead(&main, branch).unwrap_or(0),
+                    pull_request: ask_github
+                        .then(|| crate::project::worktree::pull_request(&task.path, branch))
+                        .flatten(),
+                };
+                if info_tx.send((task.path, info)).is_err() {
+                    return;
+                }
+            }
         });
         self.rx = Some(rx);
+        self.info_rx = Some(info_rx);
     }
 
     /// Takes a finished read. Returns whether anything changed.
     pub fn poll(&mut self) -> bool {
+        let mut changed = false;
+        if let Some(rx) = &self.info_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok((path, info)) => {
+                        self.info.insert(path, info);
+                        changed = true;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        self.info_rx = None;
+                        break;
+                    }
+                }
+            }
+        }
+        changed | self.poll_list()
+    }
+
+    fn poll_list(&mut self) -> bool {
         let Some(rx) = &self.rx else {
             return false;
         };
@@ -172,7 +223,7 @@ impl Panel {
 
     /// A read or an operation is in flight.
     pub fn busy(&self) -> bool {
-        self.rx.is_some() || self.op.is_some()
+        self.rx.is_some() || self.op.is_some() || self.info_rx.is_some()
     }
 
     pub fn selected_index(&self) -> Option<usize> {
@@ -224,10 +275,10 @@ impl Panel {
 
     /// For the self-test: the mode, the tasks by name, the selected one,
     /// and each session's task (`-` for none), the active one starred.
-    pub fn report(&self, tabs: &[Tab], active: usize) -> String {
+    pub fn report(&self, tabs: &[Tab], active: usize, pair: Option<(usize, usize)>) -> String {
         let name = |i: Option<usize>| i.map_or("-".to_owned(), |i| self.tasks[i].name());
         format!(
-            "{} tasks={} selected={} sessions={} op={}",
+            "{} tasks={} selected={} sessions={} pair={} op={}",
             if self.on { "on" } else { "off" },
             self.tasks
                 .iter()
@@ -247,6 +298,7 @@ impl Panel {
                 })
                 .collect::<Vec<_>>()
                 .join(","),
+            pair.map_or("-".to_owned(), |(l, r)| format!("{l}+{r}")),
             self.op.as_ref().map_or("-", |(said, _)| said.as_str()),
         )
     }
@@ -439,6 +491,24 @@ impl Panel {
                         );
                     } else if working {
                         layout::push_spinner(out, right - 22.0, row, theme.accent);
+                    } else if let Some((said, colour)) = self
+                        .info
+                        .get(&task.path)
+                        .and_then(|info| summary(info, theme))
+                    {
+                        let w = layout::ui_text_width(atlas, &said) + 4.0;
+                        layout::push_ui_text(
+                            out,
+                            atlas,
+                            Viewport {
+                                x: right - w,
+                                y: y + 4.0,
+                                width: w,
+                                height: 20.0,
+                            },
+                            &said,
+                            colour,
+                        );
                     } else if *index < 9 {
                         let hint = format!("\u{2303}{}", index + 1);
                         let w = layout::ui_text_width(atlas, &hint) + 4.0;
@@ -561,6 +631,24 @@ impl Panel {
             );
         }
     }
+}
+
+/// A task row's note: its pull request and checks, or how many commits it
+/// has that the main checkout does not.
+fn summary(info: &Info, theme: &Theme) -> Option<(String, [f32; 4])> {
+    use crate::project::worktree::Checks;
+    if let Some(pr) = &info.pull_request {
+        let (word, colour) = match (pr.state.as_str(), pr.checks) {
+            ("MERGED", _) => ("merged", theme.accent),
+            ("CLOSED", _) => ("closed", theme.gutter_text),
+            (_, Checks::Failing) => ("checks failing", theme.diff_removed),
+            (_, Checks::Running) => ("checks running", theme.status_text),
+            (_, Checks::Passing) => ("checks pass", theme.diff_added),
+            (_, Checks::None) => ("open", theme.status_text),
+        };
+        return Some((format!("#{} {word}", pr.number), colour));
+    }
+    (info.ahead > 0).then(|| (format!("{} ahead", info.ahead), theme.gutter_text))
 }
 
 #[cfg(test)]

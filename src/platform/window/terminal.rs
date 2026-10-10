@@ -325,10 +325,69 @@ impl EditorView {
             return;
         };
         let (_, screen) = crate::platform::terminal::split(rect);
-        let (cols, rows) = crate::platform::terminal::grid_size(&state.renderer.atlas, screen);
-        for tab in &state.terminal.tabs {
-            tab.session.resize(cols, rows);
+        let atlas = &state.renderer.atlas;
+        let (cols, rows) = crate::platform::terminal::grid_size(atlas, screen);
+        let pair = state.terminal.shown_pair();
+        let (half, _) = crate::platform::terminal::halves(screen);
+        let (half_cols, half_rows) = crate::platform::terminal::grid_size(atlas, half);
+        for (index, tab) in state.terminal.tabs.iter().enumerate() {
+            if pair.is_some_and(|(l, r)| index == l || index == r) {
+                tab.session.resize(half_cols, half_rows);
+            } else {
+                tab.session.resize(cols, rows);
+            }
         }
+    }
+
+    /// Agents mode's Cmd-\: the session showing and another of its task
+    /// side by side, a new shell in its folder when it has no other.
+    pub(super) fn split_terminal(&self) {
+        let start_in = {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            if state.terminal.shown_pair().is_some() {
+                return;
+            }
+            let active = state.terminal.active;
+            let Some(folder) = state.terminal.active_tab().map(|t| t.folder.clone()) else {
+                return;
+            };
+            let tasks = state.agents.tasks.clone();
+            let task = crate::platform::agents::task_of(&tasks, &folder);
+            let other = (0..state.terminal.tabs.len()).find(|i| {
+                *i != active
+                    && crate::platform::agents::task_of(&tasks, &state.terminal.tabs[*i].folder)
+                        == task
+            });
+            match other {
+                Some(other) => {
+                    state.terminal.pair = Some((active, other));
+                    state.terminal.show(other);
+                    None
+                }
+                None => Some((active, task.map_or(folder, |t| tasks[t].path.clone()))),
+            }
+        };
+        if let Some((left, dir)) = start_in {
+            self.spawn_terminal_in(false, Some(&dir));
+            if let Some(mut state) = self.state_mut() {
+                let right = state.terminal.active;
+                if right != left {
+                    state.terminal.pair = Some((left, right));
+                }
+            }
+        }
+        self.after_terminal_layout();
+    }
+
+    /// Agents mode's Close Pane: the pair goes, the session with the
+    /// keyboard stays, and the other keeps running in its tab.
+    pub(super) fn unsplit_terminal(&self) {
+        if let Some(mut state) = self.state_mut() {
+            state.terminal.pair = None;
+        }
+        self.after_terminal_layout();
     }
 
     /// Clears the active session's screen the way Control-L does in a
@@ -435,6 +494,13 @@ impl EditorView {
         let rect = self.chrome().terminal?;
         let (_, screen) = crate::platform::terminal::split(rect);
         let state = self.state()?;
+        let active = state.terminal.active;
+        let screen = state
+            .terminal
+            .screens(screen)
+            .into_iter()
+            .find(|(tab, _)| *tab == active)
+            .map_or(screen, |(_, s)| s);
         let tab = state.terminal.active_tab()?;
         let term = tab.session.term.lock().unwrap_or_else(|e| e.into_inner());
         Some((screen, term.cols(), term.rows()))
@@ -444,6 +510,18 @@ impl EditorView {
     /// or path on a double click and the line on a triple, and with Command
     /// opens the file reference under the pointer.
     pub(super) fn terminal_press(&self, event: &NSEvent, x: f32, y: f32) {
+        // A press in the other pane of a pair gives it the keyboard first.
+        if let Some(rect) = self.chrome().terminal
+            && let Some(mut state) = self.state_mut()
+            && state.terminal.shown_pair().is_some()
+        {
+            let (_, screen) = crate::platform::terminal::split(rect);
+            let tab = state.terminal.screen_at(screen, x);
+            if tab != state.terminal.active {
+                state.terminal.show(tab);
+            }
+            state.terminal.focus = true;
+        }
         let Some((screen, cols, rows)) = self.terminal_screen() else {
             return;
         };

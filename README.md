@@ -126,7 +126,9 @@ the size and write it back.
   you, which the Dock icon counts. A task's menu opens it in the editor,
   merges its branch into the main checkout, pushes it and opens a pull
   request with `gh`, or removes it (refused while it has uncommitted
-  changes).
+  changes). Each row says how far the branch is ahead, or its pull
+  request and checks when `gh` is installed. `Cmd-\` shows two of a
+  task's sessions side by side.
 - **Review agent changes**: Home lists each session that changed files,
   and the tab says how many are waiting. Git > Review Agent Changes (also
   in the palette) shows every file a session changed against the copy kept

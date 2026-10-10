@@ -123,6 +123,9 @@ pub struct Panel {
     /// The tabs the header lists, when not all: in Agents mode, the
     /// selected task's.
     pub shown: Option<Vec<usize>>,
+    /// Two sessions side by side, left and right, in Agents mode. The
+    /// active one is the pane with the keyboard.
+    pub pair: Option<(usize, usize)>,
 }
 
 impl Default for Panel {
@@ -137,6 +140,7 @@ impl Default for Panel {
             selection: None,
             selecting: false,
             shown: None,
+            pair: None,
         }
     }
 }
@@ -155,7 +159,67 @@ impl Panel {
         self.open && self.focus && !self.tabs.is_empty()
     }
 
+    /// The pair, while both its tabs exist and one of them is active.
+    pub fn shown_pair(&self) -> Option<(usize, usize)> {
+        self.pair.filter(|(l, r)| {
+            l != r
+                && *l < self.tabs.len()
+                && *r < self.tabs.len()
+                && (self.active == *l || self.active == *r)
+        })
+    }
+
+    /// Each session on screen and where its screen is: the active one, or
+    /// both of a pair.
+    pub fn screens(&self, screen: Viewport) -> Vec<(usize, Viewport)> {
+        match self.shown_pair() {
+            Some((left, right)) => {
+                let (a, b) = halves(screen);
+                vec![(left, a), (right, b)]
+            }
+            None => vec![(self.active, screen)],
+        }
+    }
+
+    /// Shows `tab` with the keyboard: in a pair, the pane it is in, or in
+    /// place of the session in the pane that has the keyboard.
+    pub fn show(&mut self, tab: usize) {
+        if tab >= self.tabs.len() {
+            return;
+        }
+        if let Some((left, right)) = self.shown_pair()
+            && tab != left
+            && tab != right
+        {
+            self.pair = Some(if self.active == left {
+                (tab, right)
+            } else {
+                (left, tab)
+            });
+        }
+        self.active = tab;
+        self.back = 0;
+        self.selection = None;
+    }
+
+    /// The other pane of the pair gets the keyboard.
+    pub fn focus_other(&mut self) {
+        if let Some((left, right)) = self.shown_pair() {
+            self.show(if self.active == left { right } else { left });
+        }
+    }
+
+    /// The session whose screen is under the point, in a pair.
+    pub fn screen_at(&self, screen: Viewport, x: f32) -> usize {
+        self.screens(screen)
+            .into_iter()
+            .find(|(_, s)| x < s.x + s.width + PAIR_GAP * 0.5)
+            .map_or(self.active, |(tab, _)| tab)
+    }
+
     pub fn close_tab(&mut self, index: usize) {
+        // Indices after it move down; a pair is not worth renumbering.
+        self.pair = None;
         if index < self.tabs.len() {
             // Dropping the session hangs up on its program.
             self.tabs.remove(index);
@@ -202,6 +266,25 @@ pub fn split(rect: Viewport) -> (Viewport, Viewport) {
         height: (rest.height - PAD).max(0.0),
     };
     (header, screen)
+}
+
+/// Between the two screens of a pair.
+const PAIR_GAP: f32 = PAD * 2.0 + 1.0;
+
+/// A screen cut in two, side by side, each on a whole point.
+pub fn halves(screen: Viewport) -> (Viewport, Viewport) {
+    let half = ((screen.width - PAIR_GAP) / 2.0).floor().max(0.0);
+    (
+        Viewport {
+            width: half,
+            ..screen
+        },
+        Viewport {
+            x: screen.x + half + PAIR_GAP,
+            width: (screen.width - half - PAIR_GAP).max(0.0),
+            ..screen
+        },
+    )
 }
 
 /// The height of one terminal row.
@@ -456,9 +539,54 @@ pub fn draw(
         .tip("Hide Panel  \u{2303}`")
         .draw(out, atlas, theme);
 
-    let Some(tab) = panel.active_tab() else {
+    let screens = panel.screens(screen);
+    if let [(_, left), (_, right)] = screens.as_slice() {
+        let x = ((left.x + left.width + right.x) * 0.5).floor();
+        layout::push_rect(
+            out,
+            atlas,
+            [x, screen.y - PAD * 0.5],
+            [1.0, screen.height + PAD],
+            theme.hairline,
+        );
+        // The pane with the keyboard: a line over its screen.
+        let focused = if panel.active == screens[0].0 {
+            left
+        } else {
+            right
+        };
+        layout::push_rect(
+            out,
+            atlas,
+            [focused.x, screen.y - PAD * 0.5],
+            [focused.width, 2.0],
+            if panel.focus {
+                theme.accent
+            } else {
+                theme.hairline
+            },
+        );
+    }
+    for (index, screen) in screens {
+        draw_screen(panel, index, screen, atlas, theme, background, out);
+    }
+}
+
+/// One session's screen: its cells, the selection and the cursor when it
+/// is the active one, and how far back it is scrolled.
+fn draw_screen(
+    panel: &Panel,
+    index: usize,
+    screen: Viewport,
+    atlas: &mut Atlas,
+    theme: &Theme,
+    background: [f32; 4],
+    out: &mut Vec<GlyphInstance>,
+) {
+    let Some(tab) = panel.tabs.get(index) else {
         return;
     };
+    let active = index == panel.active;
     let m = atlas.metrics;
     let advance = m.advance;
     let row_h = row_height(atlas);
@@ -481,7 +609,11 @@ pub fn draw(
             ],
         );
         let rows = term.rows().min((screen.height / row_h).floor() as usize);
-        let back = panel.back.min(term.scrollback_len());
+        let back = if active {
+            panel.back.min(term.scrollback_len())
+        } else {
+            0
+        };
         let visible: Vec<(Vec<crate::term::Cell>, u64)> = (0..rows)
             .map(|row| {
                 (
@@ -524,7 +656,7 @@ pub fn draw(
             }
         }
         // The selection, over the backgrounds and under the text.
-        if let Some((a, b)) = panel.selection {
+        if let Some((a, b)) = panel.selection.filter(|_| active) {
             let (start, end) = if a <= b { (a, b) } else { (b, a) };
             if (start.0..=end.0).contains(&line) {
                 let from = if line == start.0 { start.1 } else { 0 };
@@ -583,7 +715,7 @@ pub fn draw(
     if back == 0 && cursor_visible && row < rows && !tab.session.has_exited() {
         let x = screen.x + col as f32 * advance;
         let y = screen.y + row as f32 * row_h;
-        if panel.focus {
+        if panel.focus && active {
             layout::push_rect(out, atlas, [x, y], [2.0, row_h], theme.cursor);
         } else {
             let c = theme.cursor;

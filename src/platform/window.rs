@@ -1720,9 +1720,7 @@ define_class!(
                     let Some(mut state) = self.state_mut() else {
                         return;
                     };
-                    state.terminal.active = index;
-                    state.terminal.back = 0;
-                    state.terminal.selection = None;
+                    state.terminal.show(index);
                     drop(state);
                     self.request_redraw();
                     self.pump();
@@ -3583,7 +3581,11 @@ define_class!(
 
         #[unsafe(method(splitEditor:))]
         fn action_split_editor(&self, _sender: Option<&AnyObject>) {
-            self.split_pane();
+            if self.state().is_some_and(|state| state.agents.on) {
+                self.split_terminal();
+            } else {
+                self.split_pane();
+            }
         }
 
         #[unsafe(method(goToDefinition:))]
@@ -3608,6 +3610,10 @@ define_class!(
 
         #[unsafe(method(closePane:))]
         fn action_close_pane(&self, _sender: Option<&AnyObject>) {
+            if self.state().is_some_and(|state| state.agents.on) {
+                self.unsplit_terminal();
+                return;
+            }
             let Some(focused) = self.state().map(|state| state.focused_pane) else {
                 return;
             };
@@ -3616,11 +3622,25 @@ define_class!(
 
         #[unsafe(method(focusNextPane:))]
         fn action_focus_next_pane(&self, _sender: Option<&AnyObject>) {
+            if self.state().is_some_and(|state| state.agents.on) {
+                if let Some(mut state) = self.state_mut() {
+                    state.terminal.focus_other();
+                }
+                self.after_terminal_layout();
+                return;
+            }
             self.cycle_pane(1);
         }
 
         #[unsafe(method(focusPreviousPane:))]
         fn action_focus_previous_pane(&self, _sender: Option<&AnyObject>) {
+            if self.state().is_some_and(|state| state.agents.on) {
+                if let Some(mut state) = self.state_mut() {
+                    state.terminal.focus_other();
+                }
+                self.after_terminal_layout();
+                return;
+            }
             self.cycle_pane(-1);
         }
 
@@ -3669,6 +3689,11 @@ define_class!(
         #[unsafe(method(agentPushPullRequest:))]
         fn action_agent_push_pull_request(&self, _sender: Option<&AnyObject>) {
             self.agent_push_pull_request();
+        }
+
+        #[unsafe(method(agentOpenPullRequest:))]
+        fn action_agent_open_pull_request(&self, _sender: Option<&AnyObject>) {
+            self.agent_open_pull_request();
         }
 
         #[unsafe(method(agentRemove:))]
@@ -3983,7 +4008,11 @@ define_class!(
                 || action == sel!(focusNextPane:)
                 || action == sel!(focusPreviousPane:)
             {
-                pane_count(&state) > 1
+                if state.agents.on {
+                    state.terminal.shown_pair().is_some()
+                } else {
+                    pane_count(&state) > 1
+                }
             } else if action == sel!(nextConflict:)
                 || action == sel!(previousConflict:)
                 || action == sel!(acceptCurrent:)

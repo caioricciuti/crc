@@ -210,8 +210,122 @@ pub fn ahead(main: &Path, branch: &str) -> Result<usize, String> {
         .unwrap_or(0))
 }
 
+/// A task branch's pull request on GitHub, as `gh` reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PullRequest {
+    pub number: u64,
+    /// `OPEN`, `MERGED` or `CLOSED`.
+    pub state: String,
+    pub url: String,
+    pub checks: Checks,
+}
+
+/// Its checks, rolled up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Checks {
+    None,
+    Running,
+    Passing,
+    Failing,
+}
+
+/// `gh`, where a GUI app can find it: not from the shell's PATH.
+fn gh() -> Option<PathBuf> {
+    crate::lsp::servers::search_dirs()
+        .into_iter()
+        .map(|dir| dir.join("gh"))
+        .find(|path| path.is_file())
+}
+
+/// The pull request for `branch`, asked of `gh` in `dir`. `None` without
+/// `gh`, without a pull request, or offline: the list just says less.
+pub fn pull_request(dir: &Path, branch: &str) -> Option<PullRequest> {
+    let output = Command::new(gh()?)
+        .current_dir(dir)
+        .args([
+            "pr",
+            "view",
+            branch,
+            "--json",
+            "number,state,url,statusCheckRollup",
+        ])
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("NO_COLOR", "1")
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| parse_pull_request(&String::from_utf8_lossy(&output.stdout)))
+        .flatten()
+}
+
+pub fn parse_pull_request(text: &str) -> Option<PullRequest> {
+    let value = crate::json::parse(text).ok()?;
+    let checks = value
+        .get("statusCheckRollup")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&[]);
+    let word = |v: &crate::json::Value, key: &str| {
+        v.get(key)
+            .and_then(|w| w.as_str())
+            .unwrap_or("")
+            .to_ascii_uppercase()
+    };
+    let failed = checks.iter().any(|c| {
+        matches!(
+            word(c, "conclusion").as_str(),
+            "FAILURE" | "CANCELLED" | "TIMED_OUT" | "ACTION_REQUIRED" | "STARTUP_FAILURE"
+        ) || matches!(word(c, "state").as_str(), "FAILURE" | "ERROR")
+    });
+    let running = checks.iter().any(|c| {
+        let status = word(c, "status");
+        (!status.is_empty() && status != "COMPLETED") || word(c, "state") == "PENDING"
+    });
+    Some(PullRequest {
+        number: value.get("number")?.as_u64()?,
+        state: word(&value, "state"),
+        url: value
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned(),
+        checks: if checks.is_empty() {
+            Checks::None
+        } else if failed {
+            Checks::Failing
+        } else if running {
+            Checks::Running
+        } else {
+            Checks::Passing
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reads_a_pull_request_and_its_checks() {
+        let pr = parse_pull_request(
+            r#"{"number":12,"state":"OPEN","url":"https://github.com/o/r/pull/12","statusCheckRollup":[{"status":"COMPLETED","conclusion":"SUCCESS"},{"status":"IN_PROGRESS","conclusion":""}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            (pr.number, pr.state.as_str(), pr.checks),
+            (12, "OPEN", Checks::Running)
+        );
+        let failing = parse_pull_request(
+            r#"{"number":3,"state":"OPEN","url":"u","statusCheckRollup":[{"status":"COMPLETED","conclusion":"FAILURE"},{"status":"IN_PROGRESS"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(failing.checks, Checks::Failing);
+        let none =
+            parse_pull_request(r#"{"number":4,"state":"MERGED","url":"u","statusCheckRollup":[]}"#)
+                .unwrap();
+        assert_eq!((none.state.as_str(), none.checks), ("MERGED", Checks::None));
+        assert_eq!(parse_pull_request("not json"), None);
+    }
+
     use super::*;
 
     #[test]
@@ -244,6 +358,8 @@ mod tests {
         let repo = &tree.0;
         let ok = |args: &[&str]| assert!(git(repo).args(args).output().unwrap().status.success());
         ok(&["init", "-q", "-b", "main"]);
+        // The person's own config may sign commits, which waits on them.
+        ok(&["config", "commit.gpgsign", "false"]);
         ok(&["-c", "user.name=t", "-c", "user.email=t@t", "add", "a.txt"]);
         ok(&[
             "-c",

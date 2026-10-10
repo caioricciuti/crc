@@ -24,6 +24,12 @@ Agents mode: run several agents at once, each on a branch of its own.
   main checkout, pushes it and opens a pull request with `gh` in a shell
   of its own, or removes it. Removing refuses while the worktree has
   uncommitted changes and keeps a branch with unmerged commits.
+- `Cmd-\` in Agents mode puts two of a task's sessions side by side (a
+  new shell when it has only one); `Cmd-Option-]` moves the keyboard
+  across and `Cmd-Option-W` goes back to one.
+- A task's row says how many commits it has that the main checkout does
+  not, or, with `gh` installed, its pull request and whether its checks
+  pass; the menu then opens the pull request.
 - Cmd-click on a path an agent printed opens it in the editor.
 
 ## v0.2.0-alpha.16, 2026-10-10
