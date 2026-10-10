@@ -2,7 +2,7 @@
 
 One entry per tag, written for people who use the editor.
 
-## Unreleased
+## v0.2.0-alpha.19, 2026-10-11
 
 - Agents mode lists workspaces, cmux style: every worktree of the open
   repository as before, plus workspaces made by hand on any folder
