@@ -19,9 +19,9 @@ use objc2::{
 use objc2_app_kit::{
     NSAlert, NSAlertStyle, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
     NSApplicationTerminateReply, NSBackingStoreType, NSCursor, NSEvent, NSEventModifierFlags,
-    NSEventType, NSMenu, NSMenuItem, NSOpenPanel, NSSavePanel, NSScreen, NSTextInputClient,
-    NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindow, NSWindowCollectionBehavior,
-    NSWindowDelegate, NSWindowStyleMask, NSWindowTitleVisibility,
+    NSEventType, NSMenu, NSMenuItem, NSOpenPanel, NSRequestUserAttentionType, NSSavePanel,
+    NSScreen, NSTextInputClient, NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindow,
+    NSWindowCollectionBehavior, NSWindowDelegate, NSWindowStyleMask, NSWindowTitleVisibility,
 };
 use objc2_foundation::{
     NSArray, NSAttributedString, NSAttributedStringKey, NSFileManager, NSNotFound, NSNotification,
@@ -48,6 +48,7 @@ use crate::syntax::{Language, Span, SyntaxStore};
 use crate::text::buffer::{Buffer, DiskState, Motion};
 use crate::text::documents::Documents;
 
+mod agents;
 mod appearance;
 mod claude;
 mod completion;
@@ -678,6 +679,8 @@ struct State {
     repo_list: Option<Vec<RepoRow>>,
     /// Set while the palette takes a URL for a new MCP server.
     mcp_url_prompt: bool,
+    /// The palette is taking a new task's name.
+    task_prompt: bool,
     /// The branch picker's list, being read by a worker.
     branch_rx: Option<mpsc::Receiver<Result<BranchPick, String>>>,
     /// `organize_imports_on_save` from the settings.
@@ -856,6 +859,8 @@ struct State {
     sidebar_keys: bool,
     /// Terminal sessions under the editor, Claude Code among them.
     terminal: crate::platform::terminal::Panel,
+    /// Agents mode and its task list.
+    agents: crate::platform::agents::Panel,
     /// Claude Code's way into this window, while a project is open.
     claude: Option<crate::platform::claude::Bridge>,
     /// The root a bridge was last started for, so a failure is reported
@@ -1701,6 +1706,10 @@ define_class!(
                     let _: () = unsafe { msg_send![self, toggleTerminal: None::<&AnyObject>] };
                     return;
                 }
+                Some(Hit::ToolbarMode(agents)) => {
+                    self.set_agents_mode(agents);
+                    return;
+                }
                 Some(Hit::TerminalDivider) => {
                     if let Some(mut state) = self.state_mut() {
                         state.drag = Some(Drag::Terminal);
@@ -1728,6 +1737,10 @@ define_class!(
                 }
                 Some(Hit::TerminalNew) => {
                     self.spawn_terminal(false);
+                    return;
+                }
+                Some(Hit::TerminalHide) if self.state().is_some_and(|state| state.agents.on) => {
+                    self.set_agents_mode(false);
                     return;
                 }
                 Some(Hit::TerminalHide) => {
@@ -1896,6 +1909,10 @@ define_class!(
             if let Some(rect) = chrome.sidebar
                 && rect.contains(x, y)
             {
+                if self.state().is_some_and(|state| state.agents.on) {
+                    self.agents_click(event, x, y);
+                    return;
+                }
                 if self.state().is_some_and(|state| state.git_open) {
                     self.git_click(rect, x, y);
                     return;
@@ -2526,6 +2543,7 @@ define_class!(
             self.poll_branches();
             self.poll_home();
             self.poll_mcp();
+            self.poll_agents();
             self.poll_reloads();
             if self
                 .state_mut().is_some_and(|mut state| state.symbols.poll())
@@ -3609,6 +3627,53 @@ define_class!(
         #[unsafe(method(openClaude:))]
         fn action_open_claude(&self, _sender: Option<&AnyObject>) {
             self.open_terminal(true);
+        }
+
+        /// The toolbar's Editor / Agents switch, from the keyboard.
+        #[unsafe(method(toggleAgents:))]
+        fn action_toggle_agents(&self, _sender: Option<&AnyObject>) {
+            let on = self.state().is_some_and(|state| state.agents.on);
+            self.set_agents_mode(!on);
+        }
+
+        #[unsafe(method(newTask:))]
+        fn action_new_task(&self, _sender: Option<&AnyObject>) {
+            self.new_task_prompt();
+        }
+
+        #[unsafe(method(nextWaitingAgent:))]
+        fn action_next_waiting_agent(&self, _sender: Option<&AnyObject>) {
+            self.next_waiting_agent();
+        }
+
+        #[unsafe(method(agentNewClaude:))]
+        fn action_agent_new_claude(&self, _sender: Option<&AnyObject>) {
+            self.agent_menu_new_session(true);
+        }
+
+        #[unsafe(method(agentNewShell:))]
+        fn action_agent_new_shell(&self, _sender: Option<&AnyObject>) {
+            self.agent_menu_new_session(false);
+        }
+
+        #[unsafe(method(agentOpenInEditor:))]
+        fn action_agent_open_in_editor(&self, _sender: Option<&AnyObject>) {
+            self.agent_open_in_editor();
+        }
+
+        #[unsafe(method(agentMerge:))]
+        fn action_agent_merge(&self, _sender: Option<&AnyObject>) {
+            self.agent_merge();
+        }
+
+        #[unsafe(method(agentPushPullRequest:))]
+        fn action_agent_push_pull_request(&self, _sender: Option<&AnyObject>) {
+            self.agent_push_pull_request();
+        }
+
+        #[unsafe(method(agentRemove:))]
+        fn action_agent_remove(&self, _sender: Option<&AnyObject>) {
+            self.agent_remove();
         }
 
         /// Shows the terminal with the keyboard, or hides it when it has
@@ -4856,6 +4921,11 @@ impl EditorView {
         if std::path::Path::new(path).is_dir() {
             self.load_folder_path(path);
             return true;
+        }
+        // A file is for the editor: Cmd-click on a path an agent printed
+        // goes there.
+        if self.state().is_some_and(|state| state.agents.on) {
+            self.set_agents_mode(false);
         }
         // Finder and `open -a` deliver documents after launch, by which
         // point the argv path has already decided there is no project. Adopt
@@ -6307,6 +6377,7 @@ fn frame_of(state: &mut State) -> Frame {
         sidebar_edit,
         extensions,
         diff_tab,
+        agents,
         ..
     } = state;
     for (index, item) in layout::activity_items(chrome.activity)
@@ -6323,12 +6394,18 @@ fn frame_of(state: &mut State) -> Frame {
         layout::toolbar_project(tree, &mut renderer.atlas, chrome.toolbar),
     );
     frame.push(Hit::ToolbarSearch, layout::toolbar_search(chrome.toolbar));
+    if layout::toolbar_mode(chrome.toolbar).width > 0.0 {
+        let [editor, agents_half] = layout::toolbar_mode_segments(chrome.toolbar);
+        frame.push(Hit::ToolbarMode(false), editor);
+        frame.push(Hit::ToolbarMode(true), agents_half);
+    }
     let terminal_button = layout::toolbar_terminal(chrome.toolbar);
-    if terminal_button.width > 0.0 {
+    if terminal_button.width > 0.0 && !agents.on {
         frame.push(Hit::ToolbarTerminal, terminal_button);
     }
-    // Before the editor's regions, which the band overlaps by half.
-    if let Some(rect) = chrome.terminal {
+    // Before the editor's regions, which the band overlaps by half. In
+    // Agents mode the terminal has the column and nothing to drag.
+    if let Some(rect) = chrome.terminal.filter(|_| !agents.on) {
         frame.push(
             Hit::TerminalDivider,
             Viewport {
@@ -6358,7 +6435,7 @@ fn frame_of(state: &mut State) -> Frame {
                 height: rect.height,
             },
         );
-        if *git_open && extensions.is_none() {
+        if *git_open && extensions.is_none() && !agents.on {
             let g = crate::platform::git_panel::Sidebar::new(rect);
             frame.push(Hit::GitBranch, g.branch);
             if git.repo.is_some() {
@@ -6384,7 +6461,7 @@ fn frame_of(state: &mut State) -> Frame {
                 frame.push(Hit::GitRow(i), rect);
             }
         }
-        if !*git_open && extensions.is_none() && !mcp.open {
+        if !*git_open && extensions.is_none() && !mcp.open && !agents.on {
             let (_, actions) = layout::sidebar_actions(rect);
             for (index, action) in actions.into_iter().enumerate() {
                 frame.push(Hit::SidebarAction(index), action);
@@ -6550,6 +6627,16 @@ fn ns_rect(r: Viewport) -> NSRect {
 
 /// Shared layout for rendering and interaction.
 fn chrome_of(state: &State) -> Chrome {
+    if state.agents.on {
+        let sidebar = state.sidebar.then(|| {
+            state
+                .renderer
+                .atlas
+                .metrics
+                .snap(state.sidebar_width.clamp(SIDEBAR_MIN, SIDEBAR_MAX))
+        });
+        return Chrome::with_panes(state.viewport, sidebar, 0, false, 1, 0, None).terminal_only();
+    }
     // On a whole device pixel. The divider is dragged to wherever the pointer
     // is, and everything right of it is positioned from it, so a width of
     // 240.37 would put every glyph in the editor between two pixels.
@@ -6723,6 +6810,25 @@ enum Pick {
     Action(Language, crate::lsp::CodeAction),
     /// A Streamable HTTP MCP server to add, by its URL.
     McpUrl(String),
+    /// A task to start, by what was typed.
+    NewTask(String),
+}
+
+/// The New Task prompt's one row: the branch the name becomes.
+fn task_rows(query: &str) -> Vec<(layout::PaletteRow, Pick)> {
+    let branch = crate::project::worktree::branch_name(query);
+    if branch.is_empty() {
+        return Vec::new();
+    }
+    vec![(
+        layout::PaletteRow {
+            icon: Some(crate::project::icons::GIT_BRANCH),
+            title: format!("Start \u{201c}{branch}\u{201d}"),
+            detail: "a new branch from HEAD, in its own worktree, with Claude".into(),
+            shortcut: String::new(),
+        },
+        Pick::NewTask(query.trim().to_owned()),
+    )]
 }
 
 /// The code action picker's rows: the actions whose titles match, in the
@@ -6948,6 +7054,8 @@ struct PaletteSources<'a> {
     repos: Option<&'a [RepoRow]>,
     /// Set while taking a URL for a new MCP server.
     mcp_url: bool,
+    /// Set while taking a new task's name.
+    task: bool,
 }
 
 /// The rows of the open palette for its query; none when it is closed.
@@ -6967,6 +7075,7 @@ fn palette_sources(state: &State) -> PaletteSources<'_> {
         actions: state.lsp.action_list.as_ref(),
         repos: state.repo_list.as_deref(),
         mcp_url: state.mcp_url_prompt,
+        task: state.task_prompt,
     }
 }
 
@@ -6980,12 +7089,16 @@ enum PaletteMode {
     Repo,
     /// A URL for a new MCP server.
     McpUrl,
+    /// A new task's name.
+    TaskName,
 }
 
 impl PaletteMode {
     fn of(sources: &PaletteSources<'_>) -> PaletteMode {
         if sources.mcp_url {
             PaletteMode::McpUrl
+        } else if sources.task {
+            PaletteMode::TaskName
         } else if sources.repos.is_some() {
             PaletteMode::Repo
         } else if sources.branches.is_some() {
@@ -7023,6 +7136,12 @@ fn palette_heading(
                 "Type the server's http:// or https:// address",
             );
         }
+        PaletteMode::TaskName => {
+            return (
+                "New task: a branch and worktree of its own, with Claude in it",
+                "Type a name with a letter or digit in it",
+            );
+        }
         PaletteMode::Open => {}
     }
     match symbols::query(query) {
@@ -7046,9 +7165,13 @@ fn palette_rows(sources: &PaletteSources<'_>, query: &str) -> Vec<(layout::Palet
         actions,
         repos,
         mcp_url,
+        task,
     } = *sources;
     if mcp_url {
         return mcp_url_rows(query);
+    }
+    if task {
+        return task_rows(query);
     }
     if let Some(repos) = repos {
         return repo_rows(repos, query);
@@ -7705,6 +7828,14 @@ fn install_menu(mtm: MainThreadMarker, app: &NSApplication) {
         .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
     view_menu.addItem(&previous_pane);
     view_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    view_menu.addItem(&item("Agents", sel!(toggleAgents:), "a", true));
+    view_menu.addItem(&item("New Task\u{2026}", sel!(newTask:), "n", true));
+    view_menu.addItem(&item(
+        "Next Waiting Agent",
+        sel!(nextWaitingAgent:),
+        "u",
+        true,
+    ));
     view_menu.addItem(&item("Claude Code", sel!(openClaude:), "c", true));
     let terminal = item("Terminal", sel!(toggleTerminal:), "`", false);
     terminal.setKeyEquivalentModifierMask(NSEventModifierFlags::Control);
@@ -8136,6 +8267,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         claude_tried: None,
         sidebar_keys: false,
         terminal: crate::platform::terminal::Panel::default(),
+        agents: crate::platform::agents::Panel::default(),
         sidebar_edit: None,
         rename: None,
         format_on_save: settings.format_on_save,
@@ -8145,6 +8277,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         branch_list: None,
         repo_list: None,
         mcp_url_prompt: false,
+        task_prompt: false,
         workspace,
         home: None,
         home_rx,

@@ -69,6 +69,11 @@ pub const HISTORY: char = '\u{ea82}'; // cod-history
 pub const FILE: char = '\u{ea7b}'; // cod-file
 pub const FOLDER_OUTLINE: char = '\u{ea83}'; // cod-folder
 pub const TERMINAL: char = '\u{ea85}'; // cod-terminal
+pub const GIT_BRANCH: char = '\u{ea68}'; // cod-git_branch
+pub const GIT_MERGE: char = '\u{eafe}'; // cod-git_merge
+pub const PULL_REQUEST: char = '\u{ea64}'; // cod-git_pull_request
+pub const CODE: char = '\u{eac4}'; // cod-code
+pub const AGENT: char = '\u{eb99}'; // cod-hubot
 
 /// The icons an extension may name in its manifest (`"icon": "wand"`).
 /// A name, never an image: crc does not decode files from extensions, and

@@ -281,6 +281,21 @@ impl EditorView {
             let _: () = unsafe { msg_send![self, toggleTerminal: None::<&AnyObject>] };
             return true;
         }
+        // Control-1 to 9: the task in that place, from anywhere.
+        if flags.contains(NSEventModifierFlags::Control)
+            && !flags.intersects(
+                NSEventModifierFlags::Command
+                    | NSEventModifierFlags::Option
+                    | NSEventModifierFlags::Shift,
+            )
+            && let Some(number) = task_digit(event.keyCode())
+            && self
+                .state()
+                .is_some_and(|state| !state.agents.tasks.is_empty())
+        {
+            self.jump_to_task(number);
+            return true;
+        }
         if self.terminal_has_keys() {
             return self.terminal_key(event);
         }
@@ -1028,4 +1043,11 @@ impl EditorView {
             y,
         )
     }
+}
+
+/// The digit 1 to 9 on the key with this code, on the main row: virtual
+/// key codes, so the same keys on every layout.
+fn task_digit(code: u16) -> Option<usize> {
+    const KEYS: [u16; 9] = [18, 19, 20, 21, 23, 22, 26, 28, 25];
+    KEYS.iter().position(|k| *k == code).map(|i| i + 1)
 }

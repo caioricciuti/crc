@@ -2,6 +2,30 @@
 
 One entry per tag, written for people who use the editor.
 
+## Unreleased
+
+Agents mode: run several agents at once, each on a branch of its own.
+
+- The Editor / Agents switch in the toolbar (`Cmd-Shift-A`) gives the
+  terminal the whole editor column and turns the sidebar into a list of
+  tasks. A task is a Git worktree of the open repository: the repository
+  itself, plus one per task, so agents never edit the same files. Under
+  each task are its sessions, marked waiting, working or idle; the
+  terminal's tabs are that task's. Nothing stops when you switch back.
+- New Task (`Cmd-Shift-N`, or + in the list) takes a name, makes a branch
+  of that name from HEAD in a worktree under
+  `~/Library/Application Support/crc/worktrees/`, and starts Claude in it.
+- An agent that finishes its turn, asks a question or rings the bell
+  shows as waiting, with a count on the Dock icon and a bounce when crc
+  is in the background. `Ctrl-1` to `9` show a task, `Cmd-Shift-U` the
+  next session waiting on you.
+- A task's menu (the ... on its row) opens it in the editor, starts
+  another Claude session or a shell in it, merges its branch into the
+  main checkout, pushes it and opens a pull request with `gh` in a shell
+  of its own, or removes it. Removing refuses while the worktree has
+  uncommitted changes and keeps a branch with unmerged commits.
+- Cmd-click on a path an agent printed opens it in the editor.
+
 ## v0.2.0-alpha.16, 2026-10-10
 
 crc installs its own updates now, and agent review also lists files an

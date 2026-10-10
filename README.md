@@ -116,6 +116,17 @@ the size and write it back.
   was before Claude's first edit to it, in
   `~/Library/Application Support/crc/sessions/` for 14 days, and Claude's
   questions mark its tab. `agent_review = false` turns them off.
+- **Agents mode** (`Cmd-Shift-A`, or the Editor / Agents switch in the
+  toolbar): the terminal takes the editor column and the sidebar lists
+  tasks, each a Git worktree of the open repository with its own
+  sessions, marked waiting, working or idle. New Task (`Cmd-Shift-N`)
+  makes a branch in a worktree under
+  `~/Library/Application Support/crc/worktrees/` and starts Claude there;
+  `Ctrl-1..9` show a task and `Cmd-Shift-U` the next session waiting on
+  you, which the Dock icon counts. A task's menu opens it in the editor,
+  merges its branch into the main checkout, pushes it and opens a pull
+  request with `gh`, or removes it (refused while it has uncommitted
+  changes).
 - **Review agent changes**: Home lists each session that changed files,
   and the tab says how many are waiting. Git > Review Agent Changes (also
   in the palette) shows every file a session changed against the copy kept
@@ -291,6 +302,9 @@ the size and write it back.
 | `Cmd-,` | Settings page |
 | `Cmd-=` / `Cmd--` / `Cmd-0` | zoom the code font in, out, back to 13 |
 | `Cmd-Shift-C` | Claude Code tab |
+| `Cmd-Shift-A` | Editor / Agents |
+| `Cmd-Shift-N` | new task: a branch in its own worktree, with Claude |
+| `Ctrl-1..9`, `Cmd-Shift-U` | show a task / the next agent waiting on you |
 | `` Ctrl-` `` / `Cmd-J` | terminal panel |
 | `>` in `Cmd-P` | run a menu command |
 | `Cmd-N` | new file: a name field in the sidebar |

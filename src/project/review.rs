@@ -118,6 +118,7 @@ pub fn hook(kind: &str, input: &str, dir: &Path) -> Result<Event, String> {
                 .unwrap_or("")
                 .to_owned(),
         ),
+        "stop" => Event::Asked("finished".into()),
         other => return Err(format!("unknown hook {other:?}")),
     };
     append(dir, &event).map_err(|e| format!("events: {e}"))?;
@@ -398,6 +399,12 @@ pub fn claude_settings(exe: &Path) -> String {
             (
                 "Notification",
                 Value::Array(vec![object([("hooks", command("notify"))])]),
+            ),
+            // The end of a turn is the agent waiting on the person too: the
+            // Agents sidebar marks it until someone types.
+            (
+                "Stop",
+                Value::Array(vec![object([("hooks", command("stop"))])]),
             ),
         ]),
     )]);

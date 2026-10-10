@@ -339,6 +339,7 @@ fn main() -> std::io::Result<()> {
     );
     layout::build_toolbar(
         &tree,
+        false,
         &mut renderer.atlas,
         chrome.toolbar,
         &theme,
@@ -381,6 +382,7 @@ fn main() -> std::io::Result<()> {
         println!("markdown    {} blocks, {drawn} drawn", blocks.len());
         layout::build_toolbar(
             &tree,
+            false,
             &mut renderer.atlas,
             chrome.toolbar,
             &theme,
@@ -632,6 +634,7 @@ fn main() -> std::io::Result<()> {
         panel.draw_diff(&mut renderer.atlas, viewport, &theme, &mut glyphs);
         layout::build_toolbar(
             &tree,
+            false,
             &mut renderer.atlas,
             chrome.toolbar,
             &theme,

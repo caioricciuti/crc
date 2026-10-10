@@ -87,6 +87,7 @@ objc2-app-kit = { version = "=0.3.2", default-features = false, features = [
     "NSGraphicsContext",   # gates the NSEvent constructors the self-test uses
     "NSRunningApplication",
     "NSTrackingArea",      # hover: the close button on the tab under the pointer
+    "NSDockTile",          # the count of agents waiting, on the Dock icon
 ] }
 
 objc2-quartz-core = { version = "=0.3.2", default-features = false, features = [

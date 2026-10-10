@@ -52,21 +52,45 @@ pub struct Tab {
     pub events_read: u64,
     /// Files the session has checkpoints for.
     pub review_files: usize,
+    /// Its folder, resolved, for the task it belongs to.
+    pub folder: PathBuf,
+    /// Held while the tab lives: the thread that watches its agent's hook
+    /// events stops when this goes.
+    pub alive: std::sync::Arc<()>,
+}
+
+/// What a session is doing, as the Agents sidebar shows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Activity {
+    /// It asked for something (a notification, the bell, an agent that
+    /// finished its turn) and nobody has typed into it since.
+    Waiting,
+    /// It printed in the last few seconds.
+    Working,
+    Idle,
 }
 
 impl Tab {
+    pub fn activity(&self) -> Activity {
+        if self.attention.is_some() {
+            Activity::Waiting
+        } else if self
+            .last_output
+            .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(3))
+        {
+            Activity::Working
+        } else {
+            Activity::Idle
+        }
+    }
+
     /// How Home and the status line say what the tab is doing.
     pub fn state(&self) -> String {
-        match &self.attention {
-            Some(text) if text.is_empty() => "waiting: rang the bell".into(),
-            Some(text) => format!("waiting: {text}"),
-            None if self
-                .last_output
-                .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(3)) =>
-            {
-                "working".into()
-            }
-            None => "idle".into(),
+        match (&self.attention, self.activity()) {
+            (Some(text), _) if text.is_empty() => "waiting: rang the bell".into(),
+            (Some(text), _) => format!("waiting: {text}"),
+            (None, Activity::Working) => "working".into(),
+            (None, _) => "idle".into(),
         }
     }
 
@@ -96,6 +120,9 @@ pub struct Panel {
     pub selection: Option<((u64, usize), (u64, usize))>,
     /// A press in the screen is being dragged.
     pub selecting: bool,
+    /// The tabs the header lists, when not all: in Agents mode, the
+    /// selected task's.
+    pub shown: Option<Vec<usize>>,
 }
 
 impl Default for Panel {
@@ -109,6 +136,7 @@ impl Default for Panel {
             back: 0,
             selection: None,
             selecting: false,
+            shown: None,
         }
     }
 }
@@ -197,7 +225,24 @@ pub fn header_hits(
 ) -> (Vec<(Viewport, Viewport)>, Viewport) {
     let mut x = header.x + 8.0;
     let mut tabs = Vec::new();
-    for tab in &panel.tabs {
+    for (index, tab) in panel.tabs.iter().enumerate() {
+        if panel
+            .shown
+            .as_ref()
+            .is_some_and(|shown| !shown.contains(&index))
+        {
+            tabs.push((
+                Viewport {
+                    width: 0.0,
+                    ..header
+                },
+                Viewport {
+                    width: 0.0,
+                    ..header
+                },
+            ));
+            continue;
+        }
         let dot = if tab.attention.is_some() { 5.0 } else { 0.0 };
         let width = layout::ui_text_width(atlas, &label(tab)) + 44.0 + dot;
         let rect = Viewport {
@@ -342,6 +387,9 @@ pub fn draw(
 
     let (tabs, new) = header_hits(panel, atlas, header);
     for (index, (tab, (rect, close))) in panel.tabs.iter().zip(tabs).enumerate() {
+        if rect.width <= 0.0 {
+            continue;
+        }
         let active = index == panel.active;
         if active {
             layout::push_rounded_rect(out, rect, layout::UI_RADIUS_SM, theme.tab_hover);

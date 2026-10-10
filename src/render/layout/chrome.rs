@@ -382,6 +382,30 @@ impl Chrome {
         self.preview = Some(preview);
     }
 
+    /// Agents mode: the terminal takes the editor column whole. The
+    /// editor's rectangles are left with no height at the column's top, so
+    /// nothing draws or answers a click there.
+    pub fn terminal_only(mut self) -> Chrome {
+        let column = Viewport {
+            height: self.status.y - self.tabs.y,
+            ..self.tabs
+        };
+        let empty = Viewport {
+            height: 0.0,
+            ..self.tabs
+        };
+        self.tabs = empty;
+        self.breadcrumbs = empty;
+        self.text = empty;
+        self.find = None;
+        self.response = None;
+        self.preview = None;
+        self.others.clear();
+        self.panes = 1;
+        self.terminal = Some(column);
+        self
+    }
+
     /// A point in the window, as a point relative to the text area, which is
     /// what [`offset_at_point`] takes.
     pub fn to_text(&self, x: f32, y: f32) -> (f32, f32) {
@@ -1346,7 +1370,7 @@ pub(super) fn middle_ellipsis(chars: &[char], head: usize, tail: usize) -> Strin
 /// and cursor shape. Its width follows the measured system-font label.
 pub fn toolbar_project(tree: &Tree, atlas: &mut Atlas, rect: Viewport) -> Viewport {
     let x = toolbar_sidebar(rect).x + UI_CONTROL + UI_GAP;
-    let right = toolbar_terminal(rect).x;
+    let right = toolbar_mode(rect).x;
     let available = (right - x - 12.0).max(0.0);
     let width = if available >= 42.0 {
         (ui_text_width(atlas, &project_name(tree)) + PROJECT_CHROME)
@@ -1379,6 +1403,41 @@ pub fn toolbar_terminal(rect: Viewport) -> Viewport {
     }
 }
 
+/// The Editor / Agents switch, left of the Terminal button: icons and
+/// labels when the toolbar has room, icons alone when it narrows, gone
+/// before the project name is (Cmd-Shift-A stays).
+pub fn toolbar_mode(rect: Viewport) -> Viewport {
+    let terminal = toolbar_terminal(rect);
+    let width = if rect.width >= 900.0 {
+        MODE_WIDE
+    } else if rect.width >= 600.0 {
+        2.0 * UI_CONTROL + 4.0
+    } else {
+        0.0
+    };
+    Viewport {
+        x: terminal.x - width - if width > 0.0 { UI_GAP } else { 0.0 },
+        y: toolbar_control_y(rect),
+        width,
+        height: UI_CONTROL,
+    }
+}
+
+const MODE_WIDE: f32 = 172.0;
+
+/// The switch's two halves: Editor, then Agents.
+pub fn toolbar_mode_segments(rect: Viewport) -> [Viewport; 2] {
+    let switch = toolbar_mode(rect);
+    let half = ((switch.width - 4.0) / 2.0).max(0.0);
+    let segment = |i: f32| Viewport {
+        x: switch.x + 2.0 + i * half,
+        y: switch.y + 2.0,
+        width: half,
+        height: (switch.height - 4.0).max(0.0),
+    };
+    [segment(0.0), segment(1.0)]
+}
+
 pub fn toolbar_search(rect: Viewport) -> Viewport {
     // Keep the project switcher reachable when the window narrows. The full
     // finder label and shortcut need room; a compact Find button does not.
@@ -1400,6 +1459,7 @@ pub fn toolbar_search(rect: Viewport) -> Viewport {
 
 pub fn build_toolbar(
     tree: &Tree,
+    agents: bool,
     atlas: &mut Atlas,
     rect: Viewport,
     theme: &Theme,
@@ -1465,8 +1525,42 @@ pub fn build_toolbar(
             theme.status_text,
         );
     }
+    let switch = toolbar_mode(rect);
+    if switch.width > 0.0 {
+        push_rounded_rect(out, switch, UI_RADIUS, theme.tab_active);
+        let wide = switch.width >= MODE_WIDE;
+        let [editor, agents_rect] = toolbar_mode_segments(rect);
+        for (segment, icon, label, tip, on) in [
+            (
+                editor,
+                icons::CODE,
+                "Editor",
+                "Editor  \u{21e7}\u{2318}A",
+                !agents,
+            ),
+            (
+                agents_rect,
+                icons::AGENT,
+                "Agents",
+                "Agents  \u{21e7}\u{2318}A",
+                agents,
+            ),
+        ] {
+            let button = Button::new(segment)
+                .icon(icon)
+                .tone(Tone::Ghost)
+                .radius(UI_RADIUS_SM)
+                .on(on)
+                .tip(tip);
+            if wide {
+                button.label(label).draw(out, atlas, theme);
+            } else {
+                button.draw(out, atlas, theme);
+            }
+        }
+    }
     let terminal = toolbar_terminal(rect);
-    if terminal.width > 0.0 {
+    if terminal.width > 0.0 && !agents {
         Button::new(terminal)
             .icon(icons::TERMINAL)
             .tone(Tone::Ghost)
@@ -2764,6 +2858,8 @@ pub enum Hit {
     ToolbarSearch,
     /// Shows or hides the terminal panel.
     ToolbarTerminal,
+    /// The Editor (`false`) or Agents (`true`) half of the mode switch.
+    ToolbarMode(bool),
     /// The grab band on the terminal panel's top edge.
     TerminalDivider,
     /// A session tab in the terminal panel's header, its close button, and
@@ -2835,6 +2931,12 @@ impl Hit {
             Hit::ToolbarProject => "toolbar.project".into(),
             Hit::ToolbarSearch => "toolbar.search".into(),
             Hit::ToolbarTerminal => "toolbar.terminal".into(),
+            Hit::ToolbarMode(agents) => if *agents {
+                "toolbar.agents"
+            } else {
+                "toolbar.editor"
+            }
+            .into(),
             Hit::TerminalDivider => "terminal.divider".into(),
             Hit::TerminalTab(i) => format!("terminal.tab.{i}"),
             Hit::TerminalClose(i) => format!("terminal.close.{i}"),

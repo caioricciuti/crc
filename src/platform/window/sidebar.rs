@@ -494,6 +494,10 @@ impl EditorView {
         state.lsp.servers.clear();
         state.lsp.unavailable.clear();
         state.completion = None;
+        if state.agents.on {
+            state.agents.refresh(Path::new(path));
+            state.agents.selected = Some(crate::platform::canonical(Path::new(path)));
+        }
         drop(state);
         self.watch_project();
         self.lsp_sync_open();

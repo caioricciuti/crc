@@ -34,7 +34,7 @@ impl EditorView {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .take_notices();
-                noticed.push((index, notices.into_iter().last()));
+                noticed.push((index, notices.into_iter().last(), true));
             }
         }
         drop(state);
@@ -125,13 +125,17 @@ impl EditorView {
     pub(super) fn terminal_launch(
         &self,
         claude: bool,
+        cwd: Option<&Path>,
     ) -> Option<crate::platform::terminal::Launch> {
         let state = self.state()?;
         let shell = std::env::var("CRC_TERMINAL_SHELL")
             .or_else(|_| std::env::var("SHELL"))
             .unwrap_or_else(|_| "/bin/zsh".into());
         let home = std::env::var_os("HOME").map_or_else(|| "/".into(), std::path::PathBuf::from);
-        let cwd = state.tree.root().map_or(home, Path::to_path_buf);
+        let cwd = match cwd {
+            Some(dir) => dir.to_path_buf(),
+            None => state.tree.root().map_or(home, Path::to_path_buf),
+        };
         let mut env = vec![
             ("TERM".to_owned(), "xterm-256color".to_owned()),
             ("COLORTERM".to_owned(), "truecolor".to_owned()),
@@ -205,7 +209,20 @@ impl EditorView {
         })
     }
 
+    /// A new session in the open folder, or in Agents mode in the selected
+    /// task's folder.
     pub(super) fn spawn_terminal(&self, claude: bool) {
+        let task = self.state().and_then(|state| {
+            state
+                .agents
+                .on
+                .then(|| state.agents.selected.clone())
+                .flatten()
+        });
+        self.spawn_terminal_in(claude, task.as_deref());
+    }
+
+    pub(super) fn spawn_terminal_in(&self, claude: bool, cwd: Option<&Path>) {
         {
             let Some(mut state) = self.state_mut() else {
                 return;
@@ -213,7 +230,7 @@ impl EditorView {
             state.terminal.open = true;
             state.terminal.focus = true;
         }
-        let Some(launch) = self.terminal_launch(claude) else {
+        let Some(launch) = self.terminal_launch(claude, cwd) else {
             return;
         };
         let (cols, rows) = self.terminal_grid();
@@ -257,13 +274,21 @@ impl EditorView {
                     session,
                     title,
                     claude,
-                    launch,
                     attention: None,
                     last_output: None,
                     review,
                     events_read: 0,
                     review_files: 0,
+                    folder: crate::platform::canonical(&launch.cwd),
+                    alive: std::sync::Arc::new(()),
+                    launch,
                 });
+                let tab = state.terminal.tabs.last().expect("just pushed");
+                watch_events(
+                    tab.review.join("events"),
+                    std::sync::Arc::downgrade(&tab.alive),
+                    self.wake(EditorView::poll_agent_events),
+                );
                 state.terminal.active = state.terminal.tabs.len() - 1;
                 state.terminal.back = 0;
             }
@@ -319,17 +344,30 @@ impl EditorView {
         };
         state.terminal.back = 0;
         state.terminal.selection = None;
+        let mut answered = false;
         if let Some(tab) = state.terminal.active_tab_mut() {
             // Typing into it is the answer to what it asked.
-            tab.attention = None;
+            answered = tab.attention.take().is_some();
             tab.session.write(bytes);
+        }
+        if answered {
+            super::agents::sync_dock_badge(&state, MainThreadMarker::from(self));
         }
     }
 
-    /// Output arrived in these tabs, with the newest notification each
-    /// carried. A notification marks its tab; the status line says it
-    /// when the tab is not the one being typed into.
-    fn take_notices(&self, noticed: Vec<(usize, Option<String>)>) {
+    /// An agent's hook wrote an event while its terminal was quiet: an
+    /// agent that ends its turn need not print anything after.
+    pub(super) fn poll_agent_events(&self) {
+        let count = self.state().map_or(0, |state| state.terminal.tabs.len());
+        self.take_notices((0..count).map(|i| (i, None, false)).collect());
+        self.request_redraw();
+        self.pump();
+    }
+
+    /// Output arrived in these tabs (`true`), or their hooks wrote, with the
+    /// newest notification each carried. A notification marks its tab; the
+    /// status line says it when the tab is not the one being typed into.
+    fn take_notices(&self, noticed: Vec<(usize, Option<String>, bool)>) {
         let Some(mut state) = self.state_mut() else {
             return;
         };
@@ -338,11 +376,14 @@ impl EditorView {
         let watching = state.terminal.has_keys();
         let active = state.terminal.active;
         let mut wrote = false;
-        for (index, mut notice) in noticed {
+        let mut asked = false;
+        for (index, mut notice, printed) in noticed {
             let Some(tab) = state.terminal.tabs.get_mut(index) else {
                 continue;
             };
-            tab.last_output = Some(now);
+            if printed {
+                tab.last_output = Some(now);
+            }
             // What its agent's hooks wrote since the last look: an agent
             // writes files and asks questions while it prints.
             let (events, read) = crate::project::review::read_events(&tab.review, tab.events_read);
@@ -364,6 +405,7 @@ impl EditorView {
                 }
             }
             if let Some(text) = notice {
+                asked |= tab.attention.is_none();
                 tab.attention = Some(text);
                 if !(watching && index == active) {
                     said = Some(format!("{}: {}", tab.name(), tab.state()));
@@ -375,6 +417,16 @@ impl EditorView {
         }
         if let Some(said) = said {
             state.message = Some((said, now));
+        }
+        if asked {
+            let mtm = MainThreadMarker::from(self);
+            super::agents::sync_dock_badge(&state, mtm);
+            // Somewhere else: a bounce of the Dock icon says an agent
+            // waits, once, as Mail does for a message.
+            let app = NSApplication::sharedApplication(mtm);
+            if !app.isActive() && std::env::var_os("CRC_SELFTEST").is_none() {
+                app.requestUserAttention(NSRequestUserAttentionType::InformationalRequest);
+            }
         }
     }
 
@@ -522,4 +574,24 @@ impl EditorView {
         }
         true
     }
+}
+
+/// Watches a session's hook events file and wakes the window when it
+/// grows, until the tab is gone. Once a second: a stat, nothing more.
+fn watch_events(
+    events: std::path::PathBuf,
+    alive: std::sync::Weak<()>,
+    wake: crate::platform::dispatch::Wake,
+) {
+    std::thread::spawn(move || {
+        let mut seen = 0;
+        while alive.strong_count() > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let len = std::fs::metadata(&events).map_or(0, |m| m.len());
+            if len != seen {
+                seen = len;
+                wake();
+            }
+        }
+    });
 }

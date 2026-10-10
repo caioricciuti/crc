@@ -75,6 +75,7 @@ impl EditorView {
             branch_list,
             repo_list,
             mcp_url_prompt,
+            task_prompt,
             extensions,
             settings_page,
             review_page,
@@ -108,6 +109,7 @@ impl EditorView {
             completion,
             claude,
             terminal: terminal_panel,
+            agents,
             gutter: Gutter { docs: gutter, .. },
             home_hits,
             recent_projects,
@@ -160,7 +162,7 @@ impl EditorView {
         // is blank rows under the last line, which reads as having scrolled
         // past the end. Re-clamped here, every frame, against the rows this
         // frame really has.
-        {
+        if !agents.on {
             let m = renderer.atlas.metrics;
             let gutter = layout::gutter_width(docs.active(), &renderer.atlas);
             let (rows, cols) = (
@@ -193,7 +195,10 @@ impl EditorView {
             .and_then(|c| c.reviews.get(&buffer.id()))
             .filter(|_| column == Column::Review);
 
-        if column == Column::Settings {
+        if agents.on {
+            // The terminal covers the column; drawn with the sidebar below.
+            glyphs.clear();
+        } else if column == Column::Settings {
             glyphs.clear();
             crate::platform::settings_page::draw(
                 settings_page,
@@ -529,15 +534,23 @@ impl EditorView {
                 store, rects, tree, syntax, responses, gutter, renderer, theme, glyphs, *word_wrap,
             );
         }
-        layout::build_toolbar(tree, &mut renderer.atlas, toolbar_rect, theme, glyphs);
+        layout::build_toolbar(
+            tree,
+            agents.on,
+            &mut renderer.atlas,
+            toolbar_rect,
+            theme,
+            glyphs,
+        );
 
         // Under the Extensions details the tabs are still laid out, so
         // their hit list stays true, but drawn into nothing.
         let mut hidden = Vec::new();
-        let details = matches!(
-            column,
-            Column::Extensions | Column::Mcp | Column::Settings | Column::AgentReview
-        );
+        let details = agents.on
+            || matches!(
+                column,
+                Column::Extensions | Column::Mcp | Column::Settings | Column::AgentReview
+            );
         layout::build_tab_bar(
             docs,
             *tab_scroll,
@@ -549,10 +562,7 @@ impl EditorView {
             tab_hits,
         );
 
-        if matches!(
-            column,
-            Column::Extensions | Column::Mcp | Column::Settings | Column::AgentReview
-        ) {
+        if details {
             // The Extensions, MCP and Settings pages cover this row; a document's
             // path here would label them as something they are not.
         } else if diffing {
@@ -657,7 +667,7 @@ impl EditorView {
             &mut renderer.atlas,
             activity_rect,
             theme,
-            sidebar_rect.map(|_| {
+            sidebar_rect.filter(|_| !agents.on).map(|_| {
                 if mcp.open {
                     3
                 } else if extensions.is_some() {
@@ -670,7 +680,30 @@ impl EditorView {
             }),
             git.snapshot.as_ref().map_or(0, |s| s.changes.len()),
         );
+        terminal_panel.shown = agents.on.then(|| {
+            let tasks = &agents.tasks;
+            let selected = agents.selected_index();
+            (0..terminal_panel.tabs.len())
+                .filter(|i| {
+                    tasks.is_empty()
+                        || crate::platform::agents::task_of(tasks, &terminal_panel.tabs[*i].folder)
+                            == selected
+                })
+                .collect()
+        });
         if let Some(rect) = sidebar_rect
+            && agents.on
+        {
+            let active = terminal_panel.active_tab().map(|_| terminal_panel.active);
+            agents.draw(
+                &terminal_panel.tabs,
+                active,
+                &mut renderer.atlas,
+                rect,
+                theme,
+                glyphs,
+            );
+        } else if let Some(rect) = sidebar_rect
             && let Some(page) = extensions.as_mut()
         {
             layout::push_rect(
@@ -908,6 +941,7 @@ impl EditorView {
                 actions: action_list.as_ref(),
                 repos: repo_list.as_deref(),
                 mcp_url: *mcp_url_prompt,
+                task: *task_prompt,
             };
             let mode = PaletteMode::of(&sources);
             let intent = sources.branches.map(|pick| &pick.intent);
@@ -934,6 +968,7 @@ impl EditorView {
                         PaletteMode::Action => "Filter actions",
                         PaletteMode::Repo => "Repository name",
                         PaletteMode::McpUrl => "https://host/mcp",
+                        PaletteMode::TaskName => "What the agent should work on",
                         PaletteMode::Open => {
                             "Find a file  ·  > commands  ·  @ symbols  ·  # in project"
                         }
@@ -946,6 +981,8 @@ impl EditorView {
                         }
                     } else if mode == PaletteMode::McpUrl {
                         "Add"
+                    } else if mode == PaletteMode::TaskName {
+                        "Start"
                     } else if mode == PaletteMode::Action || commands::query(&text).is_some() {
                         "Run"
                     } else {

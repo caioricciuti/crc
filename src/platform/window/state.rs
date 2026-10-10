@@ -189,6 +189,7 @@ impl State {
             && self.branch_rx.is_none()
             && self.home_rx.is_none()
             && !self.mcp.busy()
+            && !self.agents.busy()
             && self.reloads.pending.is_empty()
             && !self.symbols.pending()
             && self

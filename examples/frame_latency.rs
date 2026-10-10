@@ -47,7 +47,7 @@ impl ChromeFrame {
         theme: &Theme,
         out: &mut Vec<GlyphInstance>,
     ) {
-        layout::build_toolbar(&self.tree, atlas, self.rects.toolbar, theme, out);
+        layout::build_toolbar(&self.tree, false, atlas, self.rects.toolbar, theme, out);
         layout::build_sidebar(
             &self.tree,
             false,
