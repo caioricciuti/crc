@@ -19,6 +19,11 @@ One entry per tag, written for people who use the editor.
 - Terminal: `Cmd-A` selects everything the session printed, and a drag
   held past the top or bottom of the screen scrolls the history under
   the pointer while the selection follows.
+- The microphone works for programs in a terminal session (Claude
+  Code's voice mode): the app now carries the audio-input entitlement
+  and a microphone usage description, so macOS asks once for crc and
+  then lets them record. Before, it refused silently ("No audio
+  detected from microphone").
 
 ## v0.2.0-alpha.18, 2026-10-10
 

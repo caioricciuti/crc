@@ -76,6 +76,9 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>NSHighResolutionCapable</key>       <true/>
 
     <key>LSMinimumSystemVersion</key>        <string>14.0</string>
+    <!-- Programs in a terminal session (Claude Code's voice mode, say)
+         ask for the microphone; macOS asks the app they run under. -->
+    <key>NSMicrophoneUsageDescription</key>  <string>A program running in a terminal session wants to use the microphone.</string>
     <key>NSSupportsAutomaticTermination</key> <false/>
     <key>NSSupportsSuddenTermination</key>   <false/>
 
@@ -141,6 +144,21 @@ NOTARY_PROFILE="crc-notary"
 # than the login one; the workflow says where.
 NOTARY_KEYCHAIN="${CRC_NOTARY_KEYCHAIN:+--keychain $CRC_NOTARY_KEYCHAIN}"
 
+# The hardened runtime shuts the microphone unless the app says it may
+# use it; programs in its terminal sessions (Claude Code's voice mode)
+# inherit that answer. Nothing else is asked for: git, shells, language
+# servers and the Metal compiler need no entitlement.
+ENTITLEMENTS="target/${APP_NAME}.entitlements"
+cat > "$ENTITLEMENTS" <<ENT
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.device.audio-input</key> <true/>
+</dict>
+</plist>
+ENT
+
 # The identity is looked up, not configured: there is exactly one
 # Developer ID Application certificate on the release machine, and a
 # second one would be a question to answer, not a choice to make here.
@@ -157,12 +175,11 @@ if [ "$MODE" = "--release" ]; then
     echo "==> signing as $IDENTITY"
     # Inside-out, never --deep: the executable first, then the bundle that
     # contains it. Hardened runtime and a secure timestamp are what
-    # notarization requires. The app spawns git, shells and language servers
-    # and compiles its Metal shader through the system compiler; none of
-    # that needs an entitlement.
-    codesign --force --options runtime --timestamp --sign "$IDENTITY" \
-        "$APP/Contents/MacOS/${APP_NAME}"
-    codesign --force --options runtime --timestamp --sign "$IDENTITY" "$APP"
+    # notarization requires.
+    codesign --force --options runtime --timestamp --entitlements "$ENTITLEMENTS" \
+        --sign "$IDENTITY" "$APP/Contents/MacOS/${APP_NAME}"
+    codesign --force --options runtime --timestamp --entitlements "$ENTITLEMENTS" \
+        --sign "$IDENTITY" "$APP"
     codesign --verify --deep --strict --verbose=2 "$APP" 2>&1 | sed 's/^/    /'
 
     echo "==> notarizing the app"
@@ -197,9 +214,10 @@ elif [ "$MODE" = "--install" ] && [ "$IDENTITY_COUNT" -eq 1 ]; then
     # release, without the timestamp server: an install works offline and
     # is never notarized.
     echo "==> signing as $IDENTITY (not notarized)"
-    codesign --force --options runtime --timestamp=none --sign "$IDENTITY" \
-        "$APP/Contents/MacOS/${APP_NAME}"
-    codesign --force --options runtime --timestamp=none --sign "$IDENTITY" "$APP"
+    codesign --force --options runtime --timestamp=none --entitlements "$ENTITLEMENTS" \
+        --sign "$IDENTITY" "$APP/Contents/MacOS/${APP_NAME}"
+    codesign --force --options runtime --timestamp=none --entitlements "$ENTITLEMENTS" \
+        --sign "$IDENTITY" "$APP"
     codesign --verify --deep --strict --verbose=2 "$APP" 2>&1 | sed 's/^/    /'
 else
     # An unsigned bundle gets quarantined and Gatekeeper-blocked on first
