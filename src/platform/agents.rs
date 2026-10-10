@@ -46,6 +46,75 @@ pub struct Info {
     pub pull_request: Option<crate::project::worktree::PullRequest>,
 }
 
+/// A task on a session's shared list, as Claude Code's agent teams keep
+/// one: the lead and its teammates claim and finish them, and the hooks
+/// TaskCreated and TaskCompleted tell the sidebar.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TeamTask {
+    pub id: String,
+    pub subject: String,
+    pub done: bool,
+    /// Who made or finished it, when the hook named one.
+    pub teammate: Option<String>,
+}
+
+/// What a session's hooks have said about its team: the tasks in the
+/// order they were made, and the teammates with nothing left to do.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Team {
+    pub tasks: Vec<TeamTask>,
+    pub idle: std::collections::BTreeSet<String>,
+}
+
+impl Team {
+    /// Takes in what a hook wrote; `false` for an event that is not
+    /// about the team.
+    pub fn apply(&mut self, event: &crate::project::review::Event) -> bool {
+        use crate::project::review::Event;
+        match event {
+            Event::Task {
+                id,
+                subject,
+                done,
+                teammate,
+            } => {
+                if let Some(who) = teammate {
+                    self.idle.remove(who);
+                }
+                match self.tasks.iter_mut().find(|t| t.id == *id) {
+                    Some(task) => {
+                        task.done = *done;
+                        if !subject.is_empty() {
+                            task.subject = subject.clone();
+                        }
+                        if teammate.is_some() {
+                            task.teammate = teammate.clone();
+                        }
+                    }
+                    None => self.tasks.push(TeamTask {
+                        id: id.clone(),
+                        subject: subject.clone(),
+                        done: *done,
+                        teammate: teammate.clone(),
+                    }),
+                }
+                true
+            }
+            Event::TeammateIdle(name) => {
+                if !name.is_empty() {
+                    self.idle.insert(name.clone());
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn open(&self) -> usize {
+        self.tasks.iter().filter(|t| !t.done).count()
+    }
+}
+
 #[derive(Default)]
 pub struct Panel {
     /// Agents mode is on: the terminal has the column, this the sidebar.
@@ -61,6 +130,8 @@ pub struct Panel {
     /// Per task path, once read.
     pub info: std::collections::HashMap<PathBuf, Info>,
     info_rx: Option<mpsc::Receiver<(PathBuf, Info)>>,
+    /// Per session (by its review folder), what its team hooks said.
+    pub teams: std::collections::HashMap<PathBuf, Team>,
     /// An operation on a task running on a worker, and what it says.
     pub op: Option<(String, mpsc::Receiver<Result<Done, String>>)>,
     /// The task a menu was opened on.
@@ -110,6 +181,8 @@ impl Panel {
 enum Line {
     Task(usize),
     Session(usize),
+    /// A task on the team list of the session at the first index.
+    TeamTask(usize, usize),
     Heading(&'static str),
     Note(String),
 }
@@ -231,6 +304,20 @@ impl Panel {
         self.tasks.iter().position(|t| t.path == selected)
     }
 
+    /// A session's row, then its team's tasks: the open ones, and the
+    /// finished ones while anything is still open, so a list in progress
+    /// reads whole and a finished one folds away.
+    fn session_lines(&self, tabs: &[Tab], tab: usize, lines: &mut Vec<Line>) {
+        lines.push(Line::Session(tab));
+        let Some(team) = self.teams.get(&tabs[tab].review) else {
+            return;
+        };
+        if team.open() == 0 {
+            return;
+        }
+        lines.extend((0..team.tasks.len()).map(|i| Line::TeamTask(tab, i)));
+    }
+
     fn lines(&self, tabs: &[Tab]) -> Vec<Line> {
         let mut lines = Vec::new();
         if let Some(note) = &self.note {
@@ -243,7 +330,7 @@ impl Panel {
         for task in 0..self.tasks.len() {
             lines.push(Line::Task(task));
             for (tab, _) in owner.iter().enumerate().filter(|(_, o)| **o == Some(task)) {
-                lines.push(Line::Session(tab));
+                self.session_lines(tabs, tab, &mut lines);
             }
         }
         let loose: Vec<usize> = (0..tabs.len()).filter(|i| owner[*i].is_none()).collect();
@@ -251,7 +338,9 @@ impl Panel {
             if !self.tasks.is_empty() {
                 lines.push(Line::Heading("Other folders"));
             }
-            lines.extend(loose.into_iter().map(Line::Session));
+            for tab in loose {
+                self.session_lines(tabs, tab, &mut lines);
+            }
         }
         if tabs.is_empty() && self.tasks.len() <= 1 {
             lines.push(Line::Note(
@@ -301,6 +390,31 @@ impl Panel {
             pair.map_or("-".to_owned(), |(l, r)| format!("{l}+{r}")),
             self.op.as_ref().map_or("-", |(said, _)| said.as_str()),
         )
+    }
+
+    /// The teams, for the self-test: per session with one, its tasks as
+    /// `[x] subject (teammate)` and the idle teammates.
+    pub fn report_teams(&self, tabs: &[Tab]) -> String {
+        tabs.iter()
+            .enumerate()
+            .filter_map(|(i, tab)| {
+                let team = self.teams.get(&tab.review)?;
+                let tasks: Vec<String> = team
+                    .tasks
+                    .iter()
+                    .map(|t| {
+                        let mut s = format!("[{}] {}", if t.done { "x" } else { " " }, t.subject);
+                        if let Some(who) = &t.teammate {
+                            s.push_str(&format!(" ({who})"));
+                        }
+                        s
+                    })
+                    .collect();
+                let idle: Vec<&str> = team.idle.iter().map(String::as_str).collect();
+                Some(format!("{i}: {} idle={}", tasks.join("; "), idle.join(",")))
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
     }
 
     /// A region by the name a self-test script uses: `agents.new`,
@@ -599,6 +713,111 @@ impl Panel {
                         },
                     );
                     self.hits.push((row, Action::Session(*index)));
+                }
+                Line::TeamTask(tab, i) => {
+                    let Some(task) = self
+                        .teams
+                        .get(&tabs[*tab].review)
+                        .and_then(|t| t.tasks.get(*i))
+                    else {
+                        continue;
+                    };
+                    let indent = if self.tasks.is_empty() {
+                        INDENT
+                    } else {
+                        2.0 * INDENT
+                    };
+                    let row = Viewport {
+                        x: row.x + indent,
+                        width: (row.width - indent).max(0.0),
+                        ..row
+                    };
+                    if layout::hovered(row) {
+                        layout::push_row_hover(out, row, theme);
+                    }
+                    let tone = if task.done {
+                        theme.gutter_text
+                    } else {
+                        theme.status_text
+                    };
+                    // Done: a check. Open: a ring, filled while a teammate is on it.
+                    if task.done {
+                        layout::push_icon_centered(
+                            out,
+                            atlas,
+                            Viewport {
+                                x: row.x + 4.0,
+                                width: 16.0,
+                                ..row
+                            },
+                            icons::CHECK,
+                            theme.accent,
+                        );
+                    } else {
+                        let busy = task
+                            .teammate
+                            .as_ref()
+                            .is_some_and(|who| !self.teams[&tabs[*tab].review].idle.contains(who));
+                        let dot = Viewport {
+                            x: row.x + 8.0,
+                            y: y + 9.0,
+                            width: 8.0,
+                            height: 8.0,
+                        };
+                        layout::push_rounded_rect(out, dot, 4.0, tone);
+                        if !busy {
+                            layout::push_rounded_rect(
+                                out,
+                                Viewport {
+                                    x: dot.x + 2.0,
+                                    y: dot.y + 2.0,
+                                    width: 4.0,
+                                    height: 4.0,
+                                },
+                                2.0,
+                                theme.sidebar_background,
+                            );
+                        }
+                    }
+                    let who = match &task.teammate {
+                        Some(who) if self.teams[&tabs[*tab].review].idle.contains(who) => {
+                            format!("{who} idle")
+                        }
+                        Some(who) => who.clone(),
+                        None => String::new(),
+                    };
+                    let who_w = if who.is_empty() {
+                        0.0
+                    } else {
+                        layout::ui_text_width(atlas, &who) + 4.0
+                    };
+                    layout::push_ui_text(
+                        out,
+                        atlas,
+                        Viewport {
+                            x: row.x + 26.0,
+                            y: y + 4.0,
+                            width: (row.width - 26.0 - who_w - 8.0).max(0.0),
+                            height: 20.0,
+                        },
+                        &task.subject,
+                        tone,
+                    );
+                    if !who.is_empty() {
+                        layout::push_ui_text(
+                            out,
+                            atlas,
+                            Viewport {
+                                x: row.x + row.width - who_w - 4.0,
+                                y: y + 4.0,
+                                width: who_w,
+                                height: 20.0,
+                            },
+                            &who,
+                            theme.gutter_text,
+                        );
+                    }
+                    self.hits.push((row, Action::Session(*tab)));
                 }
             }
         }

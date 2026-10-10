@@ -60,6 +60,10 @@ pub struct Tab {
     /// The `crc --hold` helper running it, when one does (see
     /// [`crate::term::hold`]): the program outlives the window.
     pub held: Option<String>,
+    /// What its program says it is doing (OSC 7501, which Claude Code
+    /// speaks), copied from the terminal as output arrives. Outranks
+    /// the guesses from output and hooks while it is there.
+    pub status: Option<crate::term::status::Status>,
 }
 
 /// What a session is doing, as the Agents sidebar shows it.
@@ -75,6 +79,12 @@ pub enum Activity {
 
 impl Tab {
     pub fn activity(&self) -> Activity {
+        use crate::term::status::State;
+        match self.status.as_ref().map(|s| s.state) {
+            Some(State::Working) => return Activity::Working,
+            Some(State::Blocked | State::Done | State::Error) => return Activity::Waiting,
+            Some(State::Idle) | None => {}
+        }
         if self.attention.is_some() {
             Activity::Waiting
         } else if self
@@ -89,6 +99,17 @@ impl Tab {
 
     /// How Home and the status line say what the tab is doing.
     pub fn state(&self) -> String {
+        use crate::term::status::State;
+        if let Some(status) = &self.status {
+            match status.state {
+                State::Working => return "working".into(),
+                State::Blocked | State::Done => {
+                    return format!("waiting: {}", status.text());
+                }
+                State::Error => return format!("waiting: failed: {}", status.text()),
+                State::Idle => {}
+            }
+        }
         match (&self.attention, self.activity()) {
             (Some(text), _) if text.is_empty() => "waiting: rang the bell".into(),
             (Some(text), _) => format!("waiting: {text}"),

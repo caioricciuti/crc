@@ -128,7 +128,19 @@ the size and write it back.
   request with `gh`, or removes it (refused while it has uncommitted
   changes). Each row says how far the branch is ahead, or its pull
   request and checks when `gh` is installed. `Cmd-\` shows two of a
-  task's sessions side by side.
+  task's sessions side by side. A session's state comes from the
+  agent itself when it reports it (Claude Code 2.1.295 and later speak
+  the Program Status Protocol, OSC 7501): working, waiting on a
+  permission, a question or a login, finished, or failed, with its
+  message. With agent teams on in Claude Code, the session's task list
+  shows under it, each task with its teammate and a check when done.
+- **Drop files and images** anywhere on the window. On the terminal
+  the paths are typed into the session, quoted, which is how an agent
+  gets a screenshot; on the editor the files open. An image with no
+  file (dragged from a browser) is saved as a PNG under
+  `~/Library/Application Support/crc/drops/` for a week. `Cmd-V` with
+  an image on the clipboard in a terminal tab works the same way; a
+  Claude tab takes it from the clipboard directly.
 - **Review agent changes**: Home lists each session that changed files,
   and the tab says how many are waiting. Git > Review Agent Changes (also
   in the palette) shows every file a session changed against the copy kept

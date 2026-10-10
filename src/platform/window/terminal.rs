@@ -28,13 +28,16 @@ impl EditorView {
         for (index, tab) in state.terminal.tabs.iter().enumerate() {
             if tab.session.drain_wake() {
                 changed = true;
-                let notices = tab
-                    .session
-                    .term
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .take_notices();
-                noticed.push((index, notices.into_iter().last(), true));
+                let (notices, status) = {
+                    let mut term = tab.session.term.lock().unwrap_or_else(|e| e.into_inner());
+                    (term.take_notices(), term.status.root().cloned())
+                };
+                noticed.push(Noticed {
+                    index,
+                    notice: notices.into_iter().last(),
+                    printed: true,
+                    status,
+                });
             }
         }
         drop(state);
@@ -322,6 +325,7 @@ impl EditorView {
                     alive: std::sync::Arc::new(()),
                     launch,
                     held,
+                    status: None,
                 };
                 self.add_terminal_tab(&mut state, tab);
                 state.terminal.active = state.terminal.tabs.len() - 1;
@@ -398,6 +402,7 @@ impl EditorView {
                     review_files: 0,
                     folder: crate::platform::canonical(&launch.cwd),
                     alive: std::sync::Arc::new(()),
+                    status: None,
                     launch,
                     held: Some(id),
                 },
@@ -527,8 +532,20 @@ impl EditorView {
         state.terminal.selection = None;
         let mut answered = false;
         if let Some(tab) = state.terminal.active_tab_mut() {
-            // Typing into it is the answer to what it asked.
+            // Typing into it is the answer to what it asked. A result
+            // it reported is seen now; a block stays until it says so.
             answered = tab.attention.take().is_some();
+            if tab
+                .session
+                .term
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .status
+                .acknowledge()
+            {
+                tab.status = None;
+                answered = true;
+            }
             tab.session.write(bytes);
         }
         if answered {
@@ -540,15 +557,26 @@ impl EditorView {
     /// agent that ends its turn need not print anything after.
     pub(super) fn poll_agent_events(&self) {
         let count = self.state().map_or(0, |state| state.terminal.tabs.len());
-        self.take_notices((0..count).map(|i| (i, None, false)).collect());
+        self.take_notices(
+            (0..count)
+                .map(|index| Noticed {
+                    index,
+                    notice: None,
+                    printed: false,
+                    status: None,
+                })
+                .collect(),
+        );
         self.request_redraw();
         self.pump();
     }
 
-    /// Output arrived in these tabs (`true`), or their hooks wrote, with the
-    /// newest notification each carried. A notification marks its tab; the
-    /// status line says it when the tab is not the one being typed into.
-    fn take_notices(&self, noticed: Vec<(usize, Option<String>, bool)>) {
+    /// Output arrived in these tabs, or their hooks wrote, with the newest
+    /// notification each carried and what the program says of itself. A
+    /// notification or a block marks its tab; the status line says it when
+    /// the tab is not the one being typed into.
+    fn take_notices(&self, noticed: Vec<Noticed>) {
+        use crate::term::status::State;
         let Some(mut state) = self.state_mut() else {
             return;
         };
@@ -558,12 +586,41 @@ impl EditorView {
         let active = state.terminal.active;
         let mut wrote = false;
         let mut asked = false;
-        for (index, mut notice, printed) in noticed {
+        let mut team_events = Vec::new();
+        for Noticed {
+            index,
+            mut notice,
+            printed,
+            status,
+        } in noticed
+        {
             let Some(tab) = state.terminal.tabs.get_mut(index) else {
                 continue;
             };
             if printed {
                 tab.last_output = Some(now);
+                // Its own word: a new block, result or failure is an ask;
+                // back at work, nothing of the old ask is left to answer.
+                let was = tab.status.as_ref().map(|s| s.state);
+                let is = status.as_ref().map(|s| s.state);
+                if is != was {
+                    match is {
+                        Some(State::Blocked | State::Done | State::Error) => {
+                            asked = true;
+                            tab.status = status;
+                            if !(watching && index == active) {
+                                said = Some(format!("{}: {}", tab.name(), tab.state()));
+                            }
+                        }
+                        Some(State::Working) => {
+                            tab.attention = None;
+                            tab.status = status;
+                        }
+                        Some(State::Idle) | None => tab.status = status,
+                    }
+                } else {
+                    tab.status = status;
+                }
             }
             // What its agent's hooks wrote since the last look: an agent
             // writes files and asks questions while it prints.
@@ -583,6 +640,10 @@ impl EditorView {
                     crate::project::review::Event::Failed(text) => {
                         said = Some(format!("{}: review hook: {text}", tab.name()));
                     }
+                    event @ (crate::project::review::Event::Task { .. }
+                    | crate::project::review::Event::TeammateIdle(_)) => {
+                        team_events.push((tab.review.clone(), event));
+                    }
                 }
             }
             if let Some(text) = notice {
@@ -592,6 +653,9 @@ impl EditorView {
                     said = Some(format!("{}: {}", tab.name(), tab.state()));
                 }
             }
+        }
+        for (review, event) in team_events {
+            state.agents.teams.entry(review).or_default().apply(&event);
         }
         if wrote {
             super::review::refresh_review(&mut state);
@@ -774,6 +838,15 @@ impl EditorView {
         }
         true
     }
+}
+
+/// What a look at a tab found: its newest notification, whether it
+/// printed, and the program's own word on its state when it did.
+struct Noticed {
+    index: usize,
+    notice: Option<String>,
+    printed: bool,
+    status: Option<crate::term::status::Status>,
 }
 
 /// Watches a session's hook events file and wakes the window when it

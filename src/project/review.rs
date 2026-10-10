@@ -83,6 +83,16 @@ pub enum Event {
     Asked(String),
     /// The hook could not do its job; said, never passed to the agent.
     Failed(String),
+    /// A task on the session's shared list (agent teams), made or
+    /// finished, with the teammate that did it when one is named.
+    Task {
+        id: String,
+        subject: String,
+        done: bool,
+        teammate: Option<String>,
+    },
+    /// A teammate has nothing left to do.
+    TeammateIdle(String),
 }
 
 /// What `crc --hook <kind>` does with the hook's JSON on stdin, for the
@@ -119,6 +129,29 @@ pub fn hook(kind: &str, input: &str, dir: &Path) -> Result<Event, String> {
                 .to_owned(),
         ),
         "stop" => Event::Asked("finished".into()),
+        "task-created" | "task-completed" => {
+            let text = |name: &str| {
+                value
+                    .get(name)
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+            };
+            Event::Task {
+                id: text("task_id").ok_or("no task_id in the hook input")?,
+                subject: text("task_subject").unwrap_or_default(),
+                done: kind == "task-completed",
+                teammate: text("teammate_name"),
+            }
+        }
+        "teammate-idle" => Event::TeammateIdle(
+            value
+                .get("teammate_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned(),
+        ),
         other => return Err(format!("unknown hook {other:?}")),
     };
     append(dir, &event).map_err(|e| format!("events: {e}"))?;
@@ -288,6 +321,19 @@ fn append(dir: &Path, event: &Event) -> std::io::Result<()> {
         }
         Event::Asked(text) => format!("asked\t{}\n", clean(text)),
         Event::Failed(text) => format!("failed\t{}\n", clean(text)),
+        Event::Task {
+            id,
+            subject,
+            done,
+            teammate,
+        } => format!(
+            "task\t{}\t{}\t{}\t{}\n",
+            clean(id),
+            if *done { "done" } else { "open" },
+            clean(teammate.as_deref().unwrap_or("")),
+            clean(subject)
+        ),
+        Event::TeammateIdle(name) => format!("idle\t{}\n", clean(name)),
     };
     std::fs::create_dir_all(dir)?;
     // One write of a short line with O_APPEND: hooks running at once do
@@ -333,6 +379,20 @@ pub fn read_events(dir: &Path, from: u64) -> (Vec<Event>, u64) {
                 }
                 "asked" => Event::Asked(rest.to_owned()),
                 "failed" => Event::Failed(rest.to_owned()),
+                "task" => {
+                    let mut parts = rest.splitn(4, '\t');
+                    let id = parts.next()?.to_owned();
+                    let done = parts.next()? == "done";
+                    let teammate = parts.next().filter(|t| !t.is_empty()).map(str::to_owned);
+                    let subject = parts.next().unwrap_or("").to_owned();
+                    Event::Task {
+                        id,
+                        subject,
+                        done,
+                        teammate,
+                    }
+                }
+                "idle" => Event::TeammateIdle(rest.to_owned()),
                 _ => return None,
             })
         })
@@ -405,6 +465,20 @@ pub fn claude_settings(exe: &Path) -> String {
             (
                 "Stop",
                 Value::Array(vec![object([("hooks", command("stop"))])]),
+            ),
+            // Agent teams (CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS): the
+            // lead's task list and its teammates, for the Agents sidebar.
+            (
+                "TaskCreated",
+                Value::Array(vec![object([("hooks", command("task-created"))])]),
+            ),
+            (
+                "TaskCompleted",
+                Value::Array(vec![object([("hooks", command("task-completed"))])]),
+            ),
+            (
+                "TeammateIdle",
+                Value::Array(vec![object([("hooks", command("teammate-idle"))])]),
             ),
         ]),
     )]);
@@ -739,6 +813,45 @@ mod tests {
     }
 
     #[test]
+    fn team_hooks_record_tasks_and_idle_teammates() {
+        let tree = TempTree::new("review-team", &[]);
+        let dir = tree.0.join("session");
+        hook(
+            "task-created",
+            r#"{"task_id":"1","task_subject":"Add\tlogin","teammate_name":"impl"}"#,
+            &dir,
+        )
+        .expect("hook");
+        hook(
+            "task-completed",
+            r#"{"task_id":"1","task_subject":"Add login"}"#,
+            &dir,
+        )
+        .expect("hook");
+        hook("teammate-idle", r#"{"teammate_name":"impl"}"#, &dir).expect("hook");
+        assert!(hook("task-created", r#"{"task_subject":"no id"}"#, &dir).is_err());
+        let (events, _) = read_events(&dir, 0);
+        assert_eq!(
+            events,
+            vec![
+                Event::Task {
+                    id: "1".into(),
+                    subject: "Add login".into(),
+                    done: false,
+                    teammate: Some("impl".into()),
+                },
+                Event::Task {
+                    id: "1".into(),
+                    subject: "Add login".into(),
+                    done: true,
+                    teammate: None,
+                },
+                Event::TeammateIdle("impl".into()),
+            ]
+        );
+    }
+
+    #[test]
     fn a_bad_input_is_an_error_not_a_checkpoint() {
         let tree = TempTree::new("review-bad", &[]);
         let dir = tree.0.join("session");
@@ -771,6 +884,28 @@ mod tests {
             .and_then(|v| v.as_str())
             .expect("command");
         assert_eq!(command, r"'/Applications/crc'\''s.app/crc' --hook pre");
+        for (event, kind) in [
+            ("Notification", "notify"),
+            ("Stop", "stop"),
+            ("TaskCreated", "task-created"),
+            ("TaskCompleted", "task-completed"),
+            ("TeammateIdle", "teammate-idle"),
+        ] {
+            let command = value
+                .path(&format!("hooks.{event}"))
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .and_then(|m| m.path("hooks"))
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .and_then(|h| h.get("command"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| panic!("{event}"));
+            assert!(
+                command.ends_with(&format!(" --hook {kind}")),
+                "{event}: {command}"
+            );
+        }
     }
 
     /// A session holding `name` as `before`, with the agent's `after` on

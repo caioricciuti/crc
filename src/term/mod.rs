@@ -16,6 +16,7 @@ pub mod hold;
 pub mod keys;
 mod parser;
 pub mod pty;
+pub mod status;
 mod text;
 pub use text::*;
 
@@ -172,6 +173,9 @@ pub struct Term {
     /// the text of an OSC 9, 777 or 99 notification, or an empty string
     /// for the bell.
     notices: Vec<String>,
+    /// What the program says it is doing, through OSC 7501 (Claude
+    /// Code does): the root record is its own state, the rest its tasks.
+    pub status: status::Records,
     state: State,
     params: Vec<Vec<u16>>,
     private: Option<u8>,
@@ -215,6 +219,7 @@ impl Term {
             colors: ([0xdd, 0xe1, 0xe1], [0x1c, 0x1e, 0x1f]),
             replies: Vec::new(),
             notices: Vec::new(),
+            status: status::Records::default(),
             state: State::Ground,
             params: Vec::new(),
             private: None,
@@ -944,6 +949,40 @@ mod tests {
             t.advance(b"\x07");
         }
         assert_eq!(t.take_notices().len(), 8);
+    }
+
+    #[test]
+    fn program_status_is_answered_and_kept() {
+        use status::{Kind, State};
+        let mut t = Term::new(40, 5);
+        // The probe gets the same body back, and nothing else ever does.
+        t.advance(b"\x1b]7501;?\x1b\\");
+        assert_eq!(t.take_replies(), b"\x1b]7501;?\x1b\\");
+        t.advance(b"\x1b]7501;state=working:app=claude-code\x07");
+        assert_eq!(t.status.root().map(|s| s.state), Some(State::Working));
+        assert!(t.take_replies().is_empty());
+        let msg = crate::base64::encode(b"Run cargo test?");
+        t.advance(format!("\x1b]7501;state=blocked:kind=permission:msg={msg}\x1b\\").as_bytes());
+        let root = t.status.root().expect("root");
+        assert_eq!(
+            (root.state, root.kind),
+            (State::Blocked, Some(Kind::Permission))
+        );
+        assert_eq!(root.text(), "Run cargo test?");
+        // A task of its own, by id; the shell prompt ends what runs.
+        t.advance(b"\x1b]7501;state=working:id=bg1\x1b\\");
+        assert_eq!(t.status.len(), 2);
+        t.advance(b"\x1b]7501;state=done\x1b\\");
+        t.advance(b"\x1b]133;A\x1b\\");
+        assert_eq!(t.status.root().map(|s| s.state), Some(State::Done));
+        assert!(t.status.get("bg1").is_none());
+        // A bad report changes nothing; a full reset drops the records.
+        t.advance(b"\x1b]7501;state=odd\x1b\\");
+        assert_eq!(t.status.root().map(|s| s.state), Some(State::Done));
+        t.advance(b"\x1bc");
+        assert!(t.status.is_empty());
+        // Nothing of it reaches the notices.
+        assert!(t.take_notices().is_empty());
     }
 
     fn term(input: &str) -> Term {

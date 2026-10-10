@@ -18,6 +18,11 @@ cat > "$T/agents-agent.sh" <<AGENT
 #!/bin/sh
 printf 'agent ready in %s\n' "\$(basename "\$PWD")"
 printf '{}' | "$hook_bin" --hook stop
+# Its team: two tasks made, one finished, one teammate idle after.
+printf '{"task_id":"1","task_subject":"Write tests","teammate_name":"tester"}' | "$hook_bin" --hook task-created
+printf '{"task_id":"2","task_subject":"Fix login","teammate_name":"fixer"}' | "$hook_bin" --hook task-created
+printf '{"task_id":"1","task_subject":"Write tests","teammate_name":"tester"}' | "$hook_bin" --hook task-completed
+printf '{"teammate_name":"tester"}' | "$hook_bin" --hook teammate-idle
 sleep 30
 AGENT
 chmod +x "$T/agents-agent.sh"
@@ -63,6 +68,7 @@ CRC_TERMINAL_SHELL=/bin/sh CRC_CLAUDE_COMMAND="$T/agents-agent.sh" \
     CRC_SELFTEST="$T/agents.script" "$BIN" "$T/agentsproj" 2> "$T/agents.err"
 expect "$T/agents-on.out" agents "on tasks=main selected=main sessions=*main pair=- op=-"
 expect "$T/agents-on.out" terminals "waiting: finished"
+expect "$T/agents-on.out" teams "0: [x] Write tests (tester); [ ] Fix login (fixer) idle=tester"
 expect "$T/agents-task.out" agents "on tasks=main,try-it selected=try-it sessions=main,*try-it pair=- op=-"
 ls -d "$T"/worktrees/agentsproj-*/try-it >/dev/null 2>&1 \
     || failed "agents: no worktree for try-it under $T/worktrees"

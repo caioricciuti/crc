@@ -10,6 +10,27 @@ One entry per tag, written for people who use the editor.
   project takes the sessions back, screens and history included, with the
   tab that had the keyboard active again. Closing a tab still ends its
   session, and a window opened on a single file keeps nothing, as before.
+- Files and images can be dropped on the window. Dropped on the
+  terminal, their paths are typed into the session, quoted, so an
+  agent can read a screenshot; dropped on the editor, they open. An
+  image with no file behind it (dragged from a browser) is saved as a
+  PNG under `~/Library/Application Support/crc/drops/` first, kept a
+  week. `Cmd-V` with an image on the clipboard does the same in a
+  terminal tab: a Claude tab takes it straight from the clipboard, any
+  other gets the saved PNG's path.
+- The terminal speaks the Program Status Protocol (OSC 7501), which
+  Claude Code 2.1.295 and later report through: a session is marked
+  working, waiting (a permission, a question, a login, a finished
+  turn) or failed from the agent's own word, the moment it changes,
+  with the agent's message on the row and in the status line. The
+  hooks and the output timer stay as the fallback for programs that
+  do not report.
+- Agent teams (Claude Code's `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`):
+  the Agents sidebar lists a session's shared task list under it, each
+  task with the teammate on it, checked when finished, and says which
+  teammates have gone idle. The list folds away once every task is
+  done. Read from the TaskCreated, TaskCompleted and TeammateIdle
+  hooks crc passes to Claude.
 
 ## v0.2.0-alpha.17, 2026-10-10
 

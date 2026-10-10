@@ -241,6 +241,23 @@ impl Term {
                             self.notice(payload.to_owned());
                         }
                     }
+                    // The Program Status Protocol: the probe is echoed, a
+                    // report kept, anything malformed dropped whole.
+                    ("7501", body) => match status::parse(body) {
+                        Some(status::Report::Query) => {
+                            self.replies.extend_from_slice(b"\x1b]7501;?\x1b\\");
+                        }
+                        Some(report) => {
+                            self.status.apply(report);
+                        }
+                        None => {}
+                    },
+                    // A new shell prompt (semantic prompt marks, as the
+                    // shell integrations send them): the last command is
+                    // over, with whatever it had in flight.
+                    ("133", rest) if rest.starts_with('A') => {
+                        self.status.end_of_command();
+                    }
                     // A query: answered, or the program waits out its timeout.
                     ("10" | "11", "?") => {
                         let [r, g, b] = if kind == "10" {

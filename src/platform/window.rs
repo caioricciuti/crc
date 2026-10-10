@@ -18,10 +18,12 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSAlert, NSAlertStyle, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
-    NSApplicationTerminateReply, NSBackingStoreType, NSCursor, NSEvent, NSEventModifierFlags,
-    NSEventType, NSMenu, NSMenuItem, NSOpenPanel, NSRequestUserAttentionType, NSSavePanel,
-    NSScreen, NSTextInputClient, NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindow,
-    NSWindowCollectionBehavior, NSWindowDelegate, NSWindowStyleMask, NSWindowTitleVisibility,
+    NSApplicationTerminateReply, NSBackingStoreType, NSCursor, NSDragOperation,
+    NSDraggingDestination, NSDraggingInfo, NSEvent, NSEventModifierFlags, NSEventType, NSMenu,
+    NSMenuItem, NSOpenPanel, NSPasteboardTypeFileURL, NSPasteboardTypePNG, NSPasteboardTypeTIFF,
+    NSRequestUserAttentionType, NSSavePanel, NSScreen, NSTextInputClient, NSTrackingArea,
+    NSTrackingAreaOptions, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowDelegate,
+    NSWindowStyleMask, NSWindowTitleVisibility,
 };
 use objc2_foundation::{
     NSArray, NSAttributedString, NSAttributedStringKey, NSFileManager, NSNotFound, NSNotification,
@@ -53,6 +55,7 @@ mod appearance;
 mod claude;
 mod completion;
 mod conflicts;
+mod dropped;
 mod extensions;
 mod files;
 mod find;
@@ -3920,6 +3923,11 @@ define_class!(
         #[unsafe(method(paste:))]
         fn action_paste(&self, _sender: Option<&AnyObject>) {
             let Some(text) = clipboard::read_text() else {
+                // An image and no text: into a terminal it goes as a
+                // file (or straight to a Claude tab), as in iTerm.
+                if self.terminal_has_keys() {
+                    self.paste_image_into_terminal();
+                }
                 return;
             };
             if self.terminal_has_keys() {
@@ -4079,6 +4087,30 @@ define_class!(
     }
 
     unsafe impl NSObjectProtocol for EditorView {}
+
+    // Files and images dropped on the window: see `dropped`.
+    unsafe impl NSDraggingDestination for EditorView {
+        #[unsafe(method(draggingEntered:))]
+        fn dragging_entered(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> NSDragOperation {
+            self.drag_operation(&sender.draggingPasteboard())
+        }
+
+        #[unsafe(method(draggingUpdated:))]
+        fn dragging_updated(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> NSDragOperation {
+            self.drag_operation(&sender.draggingPasteboard())
+        }
+
+        #[unsafe(method(prepareForDragOperation:))]
+        fn prepare_for_drag_operation(&self, _sender: &ProtocolObject<dyn NSDraggingInfo>) -> bool {
+            true
+        }
+
+        #[unsafe(method(performDragOperation:))]
+        fn perform_drag_operation(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> bool {
+            let point = self.convertPoint_fromView(sender.draggingLocation(), None);
+            self.drop_pasteboard(&sender.draggingPasteboard(), point.x as f32, point.y as f32)
+        }
+    }
 
     // Text input. With this the view is a text field as far as macOS is
     // concerned, and everything that types into text fields works: dead
@@ -4450,6 +4482,12 @@ impl EditorView {
         let base: &CALayer = &layer;
         this.setLayer(Some(base));
         this.setWantsLayer(true);
+        // Files and images may be dropped anywhere on the window.
+        this.registerForDraggedTypes(&NSArray::from_slice(&[
+            unsafe { NSPasteboardTypeFileURL },
+            unsafe { NSPasteboardTypePNG },
+            unsafe { NSPasteboardTypeTIFF },
+        ]));
         this.resize(frame.size);
         this
     }

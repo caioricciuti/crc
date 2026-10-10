@@ -88,6 +88,10 @@ objc2-app-kit = { version = "=0.3.2", default-features = false, features = [
     "NSRunningApplication",
     "NSTrackingArea",      # hover: the close button on the tab under the pointer
     "NSDockTile",          # the count of agents waiting, on the Dock icon
+    "NSDragging",          # files and images dropped on the window
+    "NSPasteboardItem",    # each dropped file's URL
+    "NSImageRep",          # NSBitmapImageRep -> NSImageRep
+    "NSBitmapImageRep",    # a pasted TIFF (a screenshot) as PNG for an agent
 ] }
 
 objc2-quartz-core = { version = "=0.3.2", default-features = false, features = [
