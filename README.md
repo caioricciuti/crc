@@ -243,6 +243,9 @@ the size and write it back.
   too, compared with Git's staged copy, but can only be kept: no copy from
   before exists. `claude` typed in a crc shell gets the hooks only if you
   add them to its settings.
+- **Agents mode is local and lives with crc.** A task's sessions end when
+  crc quits, the pull request row is read when the list loads, not kept
+  current, and tasks run on this Mac only.
 - **No minimap.** Folding is by indentation, not by syntax.
 - **Markdown styling has edges.** Italic is not drawn on lines with
   non-ASCII text, and bold there is the regular face drawn twice; a line

@@ -2,7 +2,7 @@
 
 One entry per tag, written for people who use the editor.
 
-## Unreleased
+## v0.2.0-alpha.17, 2026-10-10
 
 Agents mode: run several agents at once, each on a branch of its own.
 
