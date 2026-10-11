@@ -215,6 +215,9 @@ impl EditorView {
     /// A new session in the open folder, or in Agents mode in the selected
     /// workspace's folder.
     pub(super) fn spawn_terminal(&self, claude: bool) {
+        if self.state().is_some_and(|state| state.agents.on) {
+            self.ensure_workspace();
+        }
         let task = self.state().and_then(|state| {
             state
                 .agents

@@ -1737,8 +1737,7 @@ define_class!(
                     return;
                 }
                 Some(Hit::TerminalNew) => {
-                    let agents = self.state().is_some_and(|state| state.agents.on);
-                    self.spawn_terminal(agents);
+                    self.spawn_terminal(false);
                     return;
                 }
                 Some(Hit::TerminalHide) if self.state().is_some_and(|state| state.agents.on) => {
@@ -3059,10 +3058,10 @@ define_class!(
 
         #[unsafe(method(goToProjectSymbol:))]
         fn action_go_to_project_symbol(&self, _sender: Option<&AnyObject>) {
-            // Cmd-T in Agents mode is a new session in the selected
+            // Cmd-T in Agents mode is a new terminal in the selected
             // workspace, as the tab bar's + is.
             if self.state().is_some_and(|state| state.agents.on) {
-                self.spawn_terminal(true);
+                self.spawn_terminal(false);
                 return;
             }
             self.open_palette_with("#");

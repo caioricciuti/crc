@@ -122,9 +122,12 @@ the size and write it back.
   waiting, working or idle. Every Git worktree of the open repository is
   one, and New Workspace (`Cmd-Shift-N`) adds one on any folder, or, in
   a repository, a task on a new branch in a worktree under
-  `~/Library/Application Support/crc/worktrees/`; both start Claude.
-  `Cmd-T` (or the tab bar's +) starts another session in the selected
-  workspace; `Ctrl-1..9` show a workspace and `Cmd-Shift-U` the next
+  `~/Library/Application Support/crc/worktrees/`; both open a terminal
+  in it. Every terminal belongs to a workspace: outside a repository the
+  open folder becomes one, named after it, and a click on the empty part
+  of the list makes another with a terminal. Terminals run your login
+  shell; type `claude` to start Claude Code. `Cmd-T` (or the tab bar's
+  +) opens another terminal in the selected workspace; `Ctrl-1..9` show a workspace and `Cmd-Shift-U` the next
   session waiting on you, which the Dock icon counts. A right-click on a
   workspace opens it in the editor, merges its branch into the main
   checkout, pushes it and opens a pull request with `gh`, removes it
@@ -332,8 +335,8 @@ the size and write it back.
 | `Cmd-=` / `Cmd--` / `Cmd-0` | zoom the code font in, out, back to 13 |
 | `Cmd-Shift-C` | Claude Code tab |
 | `Cmd-Shift-A` | Editor / Agents |
-| `Cmd-Shift-N` | new workspace: a folder, or a branch in its own worktree, with Claude |
-| `Cmd-T` (Agents mode) | another session in the selected workspace |
+| `Cmd-Shift-N` | new workspace: a folder, or a branch in its own worktree, with a terminal |
+| `Cmd-T` (Agents mode) | another terminal in the selected workspace |
 | `Ctrl-1..9`, `Cmd-Shift-U` | show a workspace / the next agent waiting on you |
 | `` Ctrl-` `` / `Cmd-J` | terminal panel |
 | `>` in `Cmd-P` | run a menu command |

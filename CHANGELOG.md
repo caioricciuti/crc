@@ -2,6 +2,18 @@
 
 One entry per tag, written for people who use the editor.
 
+## Unreleased
+
+- Agents mode opens terminals, not Claude: `Cmd-T`, the tab bar's +, a
+  workspace's +, a new workspace and switching to Agents mode all start
+  your login shell in the workspace, and `claude` typed there starts
+  Claude Code as usual. The workspace and session menus still offer a
+  Claude session directly.
+- Every terminal in Agents mode belongs to a workspace. In a folder
+  outside Git the folder becomes a workspace, named after it, the first
+  time a terminal needs one, and a click on the empty part of the
+  workspace list makes a new workspace with a terminal in it.
+
 ## v0.2.0-alpha.19, 2026-10-11
 
 - Agents mode lists workspaces, cmux style: every worktree of the open

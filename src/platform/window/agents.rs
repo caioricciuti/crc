@@ -8,8 +8,8 @@ use crate::platform::terminal::Activity;
 
 impl EditorView {
     /// Editor or Agents. Agents gives the terminal the column and the
-    /// sidebar to the tasks, starting Claude when nothing runs yet; the
-    /// editor gets back its panel as it was.
+    /// sidebar to the workspaces, starting a shell when nothing runs yet;
+    /// the editor gets back its panel as it was.
     pub(super) fn set_agents_mode(&self, on: bool) {
         let start = {
             let Some(mut state) = self.state_mut() else {
@@ -55,7 +55,7 @@ impl EditorView {
             }
         };
         if start {
-            self.spawn_terminal(true);
+            self.spawn_terminal(false);
         }
         self.after_terminal_layout();
         self.resume_display_link();
@@ -87,6 +87,7 @@ impl EditorView {
                 .or((!tasks.is_empty()).then_some(0))
                 .map(|i| tasks[i].id());
         }
+        let ensure = changed && state.agents.on;
         let done = state.agents.take_done();
         let mut start_in = None;
         if let Some(done) = done {
@@ -112,6 +113,9 @@ impl EditorView {
             state.git.refresh();
         }
         drop(state);
+        if ensure {
+            self.ensure_workspace();
+        }
         if let Some(dir) = start_in {
             // A worktree's id is its path: selectable before the list
             // comes back with it.
@@ -122,11 +126,73 @@ impl EditorView {
                         .into_owned(),
                 );
             }
-            self.spawn_terminal_in(true, Some(&dir));
+            self.spawn_terminal_in(false, Some(&dir));
         }
         if changed {
             self.request_redraw();
         }
+    }
+
+    /// Every terminal lives in a workspace. Once the list is known, the
+    /// selection is the workspace holding the open folder, and with none
+    /// (a folder outside Git, nothing made yet) one is made on the folder,
+    /// named after it. Returns whether a workspace is selected.
+    pub(super) fn ensure_workspace(&self) -> bool {
+        let folder = self.workspace_folder();
+        let Some(mut state) = self.state_mut() else {
+            return false;
+        };
+        if !state.agents.listed() {
+            return false;
+        }
+        if state.agents.selected_index().is_some() {
+            return true;
+        }
+        let Some(folder) = folder else {
+            return false;
+        };
+        let folder = crate::platform::canonical(&folder);
+        let tasks = state.agents.tasks.clone();
+        let found = state
+            .terminal
+            .active_tab()
+            .and_then(|t| task_of(&tasks, t))
+            .or_else(|| crate::platform::agents::folder_task(&tasks, &folder));
+        let id = match found {
+            Some(i) => tasks[i].id(),
+            None => {
+                let name = folder
+                    .file_name()
+                    .map_or_else(|| "workspace".into(), |n| n.to_string_lossy().into_owned());
+                let id = state.agents.add_folder(&name, folder);
+                // The sessions already running in the folder are its own.
+                for tab in &mut state.terminal.tabs {
+                    if tab.workspace.is_none() {
+                        tab.workspace = Some(id.clone());
+                    }
+                }
+                id
+            }
+        };
+        state.agents.selected = Some(id);
+        true
+    }
+
+    /// The click on the empty part of the list: a new folder workspace on
+    /// the open folder, named after it, with a terminal in it.
+    fn new_blank_workspace(&self) {
+        let Some(folder) = self.workspace_folder() else {
+            return;
+        };
+        let folder = crate::platform::canonical(&folder);
+        let name = folder
+            .file_name()
+            .map_or_else(|| "workspace".into(), |n| n.to_string_lossy().into_owned());
+        if let Some(mut state) = self.state_mut() {
+            let id = state.agents.add_folder(&name, folder.clone());
+            state.agents.selected = Some(id);
+        }
+        self.spawn_terminal_in(false, Some(&folder));
     }
 
     pub(super) fn agents_click(&self, event: &NSEvent, x: f32, y: f32) {
@@ -149,15 +215,16 @@ impl EditorView {
             }
             Action::Select(index) => self.select_task(index),
             Action::Session(tab) => self.show_session(tab),
-            Action::NewClaude(index) => {
+            Action::NewSession(index) => {
                 let Some(dir) = self.task_path(index) else {
                     return;
                 };
                 if let Some(mut state) = self.state_mut() {
                     state.agents.select(index);
                 }
-                self.spawn_terminal_in(true, Some(&dir));
+                self.spawn_terminal_in(false, Some(&dir));
             }
+            Action::Blank => self.new_blank_workspace(),
             Action::Menu(index) => {
                 if let Some(mut state) = self.state_mut() {
                     state.agents.menu_task = Some(index);
@@ -177,7 +244,7 @@ impl EditorView {
     }
 
     /// Shows a task: its waiting session first, else the newest one it
-    /// has, else a new Claude session in its folder.
+    /// has, else a new shell in its folder.
     pub(super) fn select_task(&self, index: usize) {
         let found = {
             let Some(mut state) = self.state_mut() else {
@@ -207,7 +274,7 @@ impl EditorView {
             (Some(tab), _) => self.show_session(tab),
             (None, path) => {
                 self.set_agents_mode(true);
-                self.spawn_terminal_in(true, Some(&path));
+                self.spawn_terminal_in(false, Some(&path));
             }
         }
     }
@@ -283,7 +350,7 @@ impl EditorView {
     }
 
     /// The palette's answer for a folder workspace: made (or, while
-    /// renaming, renamed) and selected, then Claude in it.
+    /// renaming, renamed) and selected, then a terminal in it.
     pub(super) fn create_workspace(&self, name: String) {
         let renaming = self.state().and_then(|state| state.agents.renaming.clone());
         if let Some(id) = renaming {
@@ -323,7 +390,7 @@ impl EditorView {
             state.agents.selected = Some(id);
         }
         self.set_agents_mode(true);
-        self.spawn_terminal_in(true, Some(&dir));
+        self.spawn_terminal_in(false, Some(&dir));
     }
 
     /// The context menu for a point in the Agents sidebar: the session's,
@@ -338,13 +405,13 @@ impl EditorView {
                 }
                 let menu = context_menu_new(mtm);
                 let add = |title: &str, action: Sel| menu.addItem(&menu_item(mtm, title, action));
+                add("New Terminal Here", sel!(agentSessionNewShell:));
                 add("New Claude Session Here", sel!(agentSessionNewClaude:));
-                add("New Shell Here", sel!(agentSessionNewShell:));
                 menu.addItem(&NSMenuItem::separatorItem(mtm));
                 add("Close Session", sel!(agentCloseSession:));
                 menu
             }
-            Some(Action::Select(index) | Action::NewClaude(index) | Action::Menu(index)) => {
+            Some(Action::Select(index) | Action::NewSession(index) | Action::Menu(index)) => {
                 if let Some(mut state) = self.state_mut() {
                     state.agents.menu_task = Some(index);
                 }
@@ -521,8 +588,8 @@ impl EditorView {
                     )
                 });
         let add = |title: &str, action: Sel| menu.addItem(&menu_item(mtm, title, action));
+        add("New Terminal", sel!(agentNewShell:));
         add("New Claude Session", sel!(agentNewClaude:));
-        add("New Shell", sel!(agentNewShell:));
         add("Open in Editor", sel!(agentOpenInEditor:));
         if folder {
             menu.addItem(&NSMenuItem::separatorItem(mtm));

@@ -26,12 +26,14 @@ pub enum Action {
     /// The header's New Workspace.
     NewTask,
     Refresh,
-    /// A task's row: shows its newest session, or starts Claude in it.
+    /// A task's row: shows its newest session, or starts a shell in it.
     Select(usize),
     /// A session's row, by terminal tab.
     Session(usize),
-    /// A new Claude session in a task.
-    NewClaude(usize),
+    /// A new terminal (the login shell) in a task.
+    NewSession(usize),
+    /// The empty space under the list: a new workspace with a terminal.
+    Blank,
     /// The task's menu: open in the editor, merge, push, remove.
     Menu(usize),
 }
@@ -402,7 +404,7 @@ impl Panel {
             Err(_) => {
                 self.repo = None;
                 self.worktrees.clear();
-                self.note = Some("No Git repository here: sessions run in the open folder".into());
+                self.note = Some("No Git repository here: workspaces are folders".into());
             }
         }
         self.rebuild();
@@ -472,6 +474,12 @@ impl Panel {
         self.save_folders();
     }
 
+    /// The workspaces are known: the worktree read for the open folder
+    /// has answered, so an empty list means there are none.
+    pub fn listed(&self) -> bool {
+        self.root.is_some() && self.rx.is_none()
+    }
+
     /// A read or an operation is in flight.
     pub fn busy(&self) -> bool {
         self.rx.is_some() || self.op.is_some() || self.info_rx.is_some()
@@ -524,8 +532,7 @@ impl Panel {
         }
         if tabs.is_empty() && self.tasks.len() <= 1 {
             lines.push(Line::Note(
-                "New Workspace (\u{21e7}\u{2318}N) starts an agent in a folder or on a branch"
-                    .into(),
+                "Click below or \u{21e7}\u{2318}N for a new workspace".into(),
             ));
         }
         lines
@@ -548,7 +555,7 @@ impl Panel {
     pub fn report(&self, tabs: &[Tab], active: usize, pair: Option<(usize, usize)>) -> String {
         let name = |i: Option<usize>| i.map_or("-".to_owned(), |i| self.tasks[i].name());
         format!(
-            "{} tasks={} selected={} sessions={} pair={} op={}",
+            "{} tasks={} selected={} sessions={} claude={} pair={} op={}",
             if self.on { "on" } else { "off" },
             self.tasks
                 .iter()
@@ -568,6 +575,7 @@ impl Panel {
                 })
                 .collect::<Vec<_>>()
                 .join(","),
+            tabs.iter().filter(|t| t.claude).count(),
             pair.map_or("-".to_owned(), |(l, r)| format!("{l}+{r}")),
             self.op.as_ref().map_or("-", |(said, _)| said.as_str()),
         )
@@ -600,7 +608,7 @@ impl Panel {
 
     /// A region by the name a self-test script uses: `agents.new`,
     /// `agents.refresh`, `agents.task.0`, `agents.session.1`,
-    /// `agents.claude.0`, `agents.menu.0`. As last drawn.
+    /// `agents.add.0`, `agents.menu.0`, `agents.blank`. As last drawn.
     pub fn named(&self, name: &str) -> Option<Viewport> {
         let rest = name.strip_prefix("agents.")?;
         let (kind, n) = rest.split_once('.').unwrap_or((rest, ""));
@@ -610,7 +618,8 @@ impl Panel {
             "refresh" => Action::Refresh,
             "task" => Action::Select(n),
             "session" => Action::Session(n),
-            "claude" => Action::NewClaude(n),
+            "add" => Action::NewSession(n),
+            "blank" => Action::Blank,
             "menu" => Action::Menu(n),
             _ => return None,
         };
@@ -675,6 +684,20 @@ impl Panel {
         let rows = Panel::visible(column);
         self.scroll = self.scroll.min(lines.len().saturating_sub(rows));
         let selected = self.selected_index();
+        let shown = lines.len().saturating_sub(self.scroll).min(rows);
+        let blank_top = top + shown as f32 * ROW;
+        let blank_bottom = column.y + column.height - if self.op.is_some() { ROW } else { 0.0 };
+        if blank_bottom - blank_top >= ROW {
+            self.hits.push((
+                Viewport {
+                    x: column.x,
+                    y: blank_top,
+                    width: column.width,
+                    height: blank_bottom - blank_top,
+                },
+                Action::Blank,
+            ));
+        }
         for (n, line) in lines.iter().skip(self.scroll).take(rows).enumerate() {
             let y = top + n as f32 * ROW;
             let row = Viewport {
@@ -778,14 +801,14 @@ impl Panel {
                         layout::Button::new(add)
                             .icon(icons::ADD)
                             .tone(layout::Tone::Ghost)
-                            .tip("New Claude Session Here")
+                            .tip("New Terminal Here")
                             .draw(out, atlas, theme);
                         layout::Button::new(menu)
                             .icon(icons::ELLIPSIS)
                             .tone(layout::Tone::Ghost)
                             .tip("Open, Merge, Push or Remove")
                             .draw(out, atlas, theme);
-                        self.hits.push((add, Action::NewClaude(*index)));
+                        self.hits.push((add, Action::NewSession(*index)));
                         self.hits.push((menu, Action::Menu(*index)));
                     } else if waiting > 0 {
                         let label = if waiting == 1 {
