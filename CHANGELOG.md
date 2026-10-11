@@ -2,7 +2,7 @@
 
 One entry per tag, written for people who use the editor.
 
-## Unreleased
+## v0.2.0-alpha.21, 2026-10-12
 
 - The Agents sidebar is one row per workspace, as in cmux and
   supacode: its name, and under it what a session waiting on you asks,
@@ -26,6 +26,10 @@ One entry per tag, written for people who use the editor.
   are started again at the next launch, in the same folder and
   workspace, and where Claude Code was running `claude --continue` is
   typed in, which resumes the latest conversation in that folder.
+- Two terminal sessions started in the same microsecond no longer get
+  the same id. They could, and then the second took over the first's
+  connection, leaving the first blank; starting terminals again after a
+  reboot starts several at once.
 
 ## v0.2.0-alpha.20, 2026-10-11
 
