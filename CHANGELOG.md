@@ -13,8 +13,19 @@ One entry per tag, written for people who use the editor.
   repeat in the sidebar. A spinner means an agent said it is working,
   not that a terminal printed something.
 - A single click on the empty part of the list does nothing; a
-  double-click makes a workspace. A double-click on a folder workspace
-  renames it. The list no longer reorders while the pointer is over it.
+  double-click makes a workspace. The list no longer reorders while the
+  pointer is over it.
+- Drag a workspace to put it where you want; Pin to Top (its menu) keeps
+  it under the main checkout. A double-click on a workspace, or Rename in
+  its menu, edits its name in the row: a folder workspace takes the
+  name, a worktree keeps its branch and shows your name over it. The
+  order, pins and names are kept per project. `Cmd-N` in Agents mode is
+  New Workspace.
+- Terminals come back after a reboot. Sessions already outlived quitting
+  crc; now the ones whose helper ended (a restart of the Mac, a crash)
+  are started again at the next launch, in the same folder and
+  workspace, and where Claude Code was running `claude --continue` is
+  typed in, which resumes the latest conversation in that folder.
 
 ## v0.2.0-alpha.20, 2026-10-11
 

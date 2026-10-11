@@ -96,6 +96,7 @@ impl EditorView {
             marked_caret,
             responses,
             sidebar_edit,
+            agents_edit,
             panes,
             focused_pane,
             lsp:
@@ -699,6 +700,13 @@ impl EditorView {
             && agents.on
         {
             let active = terminal_panel.active_tab().map(|_| terminal_panel.active);
+            agents.inline = agents_edit.as_ref().map(|(id, field)| {
+                let text = field.rope.to_string();
+                let caret = text
+                    .get(..field.cursor().min(text.len()))
+                    .map_or(0, |t| t.chars().count());
+                (id.clone(), text, caret)
+            });
             agents.draw(
                 &terminal_panel.tabs,
                 active,

@@ -130,25 +130,7 @@ impl EditorView {
                     let Some(mut state) = self.state_mut() else {
                         return;
                     };
-                    match state.extensions.as_ref() {
-                        Some(page) if name.starts_with("extensions.") => page.named(name),
-                        _ if name.starts_with("mcp.") => state.mcp.named(name),
-                        _ if name.starts_with("settings.") => state.settings_page.named(name),
-                        _ if name.starts_with("review_page.") => state.review_page.named(name),
-                        _ if name.starts_with("agents.") => state.agents.named(name),
-                        _ if name.starts_with("inspector.") => state.agents.inspector.named(name),
-                        _ if name == "home.review" => state
-                            .home_hits
-                            .iter()
-                            .find(|h| h.action == layout::HomeAction::OpenReview)
-                            .map(|h| h.rect),
-                        _ if name == "home.update" => state
-                            .home_hits
-                            .iter()
-                            .find(|h| h.action == layout::HomeAction::RestartToUpdate)
-                            .map(|h| h.rect),
-                        _ => frame_of(&mut state).named(name),
-                    }
+                    region_named(&mut state, name)
                 };
                 let Some(rect) = target else {
                     eprintln!("selftest: no region named {name} in this frame");
@@ -166,7 +148,7 @@ impl EditorView {
                     let Some(mut state) = self.state_mut() else {
                         return;
                     };
-                    frame_of(&mut state).named(name)
+                    region_named(&mut state, name)
                 };
                 let Some(rect) = target else {
                     eprintln!("selftest: no region named {name} in this frame");
@@ -752,4 +734,28 @@ fn modifier_flags(mods: &crate::platform::selftest::Mods) -> NSEventModifierFlag
         }
     }
     flags
+}
+
+/// A region by the name a script gives it: a page's or panel's own names
+/// first, then the window frame's.
+fn region_named(state: &mut State, name: &str) -> Option<Viewport> {
+    match state.extensions.as_ref() {
+        Some(page) if name.starts_with("extensions.") => page.named(name),
+        _ if name.starts_with("mcp.") => state.mcp.named(name),
+        _ if name.starts_with("settings.") => state.settings_page.named(name),
+        _ if name.starts_with("review_page.") => state.review_page.named(name),
+        _ if name.starts_with("agents.") => state.agents.named(name),
+        _ if name.starts_with("inspector.") => state.agents.inspector.named(name),
+        _ if name == "home.review" => state
+            .home_hits
+            .iter()
+            .find(|h| h.action == layout::HomeAction::OpenReview)
+            .map(|h| h.rect),
+        _ if name == "home.update" => state
+            .home_hits
+            .iter()
+            .find(|h| h.action == layout::HomeAction::RestartToUpdate)
+            .map(|h| h.rect),
+        _ => frame_of(state).named(name),
+    }
 }

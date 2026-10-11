@@ -442,6 +442,12 @@ impl EditorView {
         {
             return self.handle_sidebar_edit_key(event);
         }
+        if self
+            .state()
+            .is_some_and(|state| state.agents_edit.is_some())
+        {
+            return self.handle_agents_edit_key(event);
+        }
         // Source Control claims its own keys (Escape, Cmd-Return, the
         // message field once clicked); everything else falls through to the
         // document beside it.
@@ -881,6 +887,7 @@ impl EditorView {
             goto,
             git,
             sidebar_edit,
+            agents_edit,
             rename,
             ..
         } = &mut *state;
@@ -888,6 +895,7 @@ impl EditorView {
             Keys::SidebarEdit => sidebar_edit
                 .as_mut()
                 .map(|edit| (&mut edit.field, Focus::Field)),
+            Keys::AgentsEdit => agents_edit.as_mut().map(|(_, field)| (field, Focus::Field)),
             Keys::Rename => rename
                 .as_mut()
                 .map(|rename| (&mut rename.field, Focus::Field)),

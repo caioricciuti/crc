@@ -741,6 +741,9 @@ struct State {
     update_on_quit: bool,
     /// Said once that crc was reinstalled under this running copy.
     replaced_said: bool,
+    /// What launching found to say (terminals started again), shown when
+    /// the folder has opened instead of "Folder opened".
+    restore_note: Option<String>,
     /// The last key or click. The caret is solid for a blink phase after
     /// it, so it never vanishes under your typing.
     caret_since: Instant,
@@ -751,6 +754,9 @@ struct State {
     /// A name being typed into the tree, for a file or folder about to be
     /// created or an item being renamed. The way VS Code does it: no panel.
     sidebar_edit: Option<SidebarEdit>,
+    /// A workspace's name being edited in its Agents row: its id, and the
+    /// field.
+    agents_edit: Option<(String, Buffer)>,
     /// Every open document of the focused pane. There is always at least
     /// one. The other panes keep theirs in `panes`, and focusing a pane
     /// swaps its documents in here, so everything that edits, saves, finds
@@ -1649,6 +1655,12 @@ define_class!(
                     return;
                 }
             }
+            if self.state().is_some_and(|state| state.agents_edit.is_some()) {
+                self.finish_agents_edit(true);
+                if chrome.sidebar.is_some_and(|rect| rect.contains(x, y)) {
+                    return;
+                }
+            }
             let hit = {
                 let Some(mut state) = self.state_mut() else {
                     return;
@@ -2047,6 +2059,16 @@ define_class!(
             let point = self.convertPoint_fromView(event.locationInWindow(), None);
             layout::set_pointer(Some((point.x as f32, point.y as f32)));
 
+            if let Some(mut state) = self.state_mut()
+                && let Some(drag) = &mut state.agents.drag
+            {
+                drag.y = point.y as f32;
+                drag.active |= (drag.y - drag.start_y).abs() > 4.0;
+                drop(state);
+                self.request_redraw();
+                self.pump();
+                return;
+            }
             let moved = {
                 let Some(mut state) = self.state_mut() else {
                     return;
@@ -2184,6 +2206,20 @@ define_class!(
             if self.ivars().testing && _event.timestamp() != 0.0 { return; }
             layout::set_pressed(None);
             self.request_redraw();
+            if let Some(mut state) = self.state_mut()
+                && let Some(drag) = state.agents.drag.take()
+                && drag.active
+            {
+                let before = state.agents.drop_before(drag.y);
+                if before.as_deref() != Some(drag.id.as_str()) {
+                    state.agents.move_before(&drag.id, before.as_deref());
+                }
+                // Your move shows now, though the pointer is still over
+                // the list (which otherwise holds the order still).
+                let state = &mut *state;
+                state.agents.arrange(&state.terminal.tabs);
+                return;
+            }
             let drop = {
                 let Some(mut state) = self.state_mut() else {
                     return;
@@ -2682,6 +2718,10 @@ define_class!(
 
         #[unsafe(method(newDocument:))]
         fn action_new_file(&self, _sender: Option<&AnyObject>) {
+            if self.state().is_some_and(|state| state.agents.on) {
+                self.new_task_prompt();
+                return;
+            }
             if self.new_file() {
                 self.request_redraw();
                 self.pump();
@@ -3777,6 +3817,25 @@ define_class!(
         #[unsafe(method(agentMergeRebase:))]
         fn action_agent_merge_rebase(&self, _sender: Option<&AnyObject>) {
             self.agent_merge_pull_request(crate::project::worktree::MergeStrategy::Rebase);
+        }
+
+        #[unsafe(method(agentTogglePin:))]
+        fn action_agent_toggle_pin(&self, _sender: Option<&AnyObject>) {
+            if let Some(task) = self.menu_task()
+                && let Some(mut state) = self.state_mut()
+            {
+                state.agents.toggle_pin(&task.id());
+                let state = &mut *state;
+                state.agents.arrange(&state.terminal.tabs);
+            }
+            self.request_redraw();
+        }
+
+        #[unsafe(method(agentRenameInPlace:))]
+        fn action_agent_rename_in_place(&self, _sender: Option<&AnyObject>) {
+            if let Some(task) = self.menu_task() {
+                self.start_agents_edit(&task.id());
+            }
         }
 
         #[unsafe(method(toggleInspector:))]
@@ -5489,6 +5548,11 @@ define_class!(
                                 &crate::term::hold::Left {
                                     events_read: tab.events_read,
                                     active: index == active,
+                                    agent: tab.claude
+                                        || tab.status.as_ref().is_some_and(|s| {
+                                            s.app.as_deref().is_some_and(|a| a.contains("claude"))
+                                        }),
+                                    workspace: tab.workspace.clone().unwrap_or_default(),
                                 },
                             );
                             tab.session.detach();
@@ -6280,6 +6344,7 @@ impl crate::ide::mcp::Host for ClaudeHost<'_> {
 /// bar stays; the others sit ahead of it.
 fn close_fields(state: &mut State) {
     state.sidebar_edit = None;
+    state.agents_edit = None;
     state.rename = None;
     state.palette = None;
     state.goto = None;
@@ -6352,6 +6417,7 @@ fn place_field_caret(atlas: &mut crate::render::font::Atlas, field: &mut Buffer,
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Keys {
     SidebarEdit,
+    AgentsEdit,
     Rename,
     /// The commit message, once it has been clicked.
     GitMessage,
@@ -6369,6 +6435,8 @@ enum Keys {
 fn keys(state: &State) -> Keys {
     if state.sidebar_edit.is_some() {
         Keys::SidebarEdit
+    } else if state.agents_edit.is_some() {
+        Keys::AgentsEdit
     } else if state.rename.is_some() {
         Keys::Rename
     } else if state.git_open && state.git_focus {
@@ -6408,6 +6476,7 @@ fn field_has_keys(state: &State) -> bool {
 fn focused_buffer(state: &State) -> &Buffer {
     let field = match keys(state) {
         Keys::SidebarEdit => state.sidebar_edit.as_ref().map(|edit| &edit.field),
+        Keys::AgentsEdit => state.agents_edit.as_ref().map(|(_, field)| field),
         Keys::Rename => state.rename.as_ref().map(|rename| &rename.field),
         Keys::GitMessage => Some(&state.git.message),
         Keys::Goto => state.goto.as_ref(),
@@ -8599,6 +8668,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         terminal: crate::platform::terminal::Panel::default(),
         agents: crate::platform::agents::Panel::default(),
         sidebar_edit: None,
+        agents_edit: None,
         rename: None,
         format_on_save: settings.format_on_save,
         saving_formatted: false,
@@ -8646,6 +8716,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         update_install: None,
         update_ready: None,
         replaced_said: false,
+        restore_note: None,
         update_on_quit: false,
         reloads: Reloads {
             channel: mpsc::channel(),

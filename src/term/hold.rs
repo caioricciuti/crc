@@ -75,6 +75,12 @@ pub struct Left {
     pub events_read: u64,
     /// It was the tab with the keyboard.
     pub active: bool,
+    /// An agent (Claude Code) was running in it: brought back after a
+    /// reboot, the conversation is continued.
+    pub agent: bool,
+    /// The workspace it was in when the window let go, which a rename or
+    /// an adoption may have changed since it started; empty for none.
+    pub workspace: String,
 }
 
 fn escape(value: &str) -> String {
@@ -164,9 +170,11 @@ impl Spec {
 impl Left {
     pub fn to_text(&self) -> String {
         format!(
-            "events_read={}\nactive={}\n",
+            "events_read={}\nactive={}\nagent={}\nworkspace={}\n",
             self.events_read,
-            if self.active { "1" } else { "0" }
+            if self.active { "1" } else { "0" },
+            if self.agent { "1" } else { "0" },
+            escape(&self.workspace)
         )
     }
 
@@ -176,6 +184,8 @@ impl Left {
             match key {
                 "events_read" => left.events_read = value.parse().unwrap_or(0),
                 "active" => left.active = value == "1",
+                "agent" => left.agent = value == "1",
+                "workspace" => left.workspace = value,
                 _ => {}
             }
         }
@@ -378,6 +388,84 @@ pub fn start(dir: &Path, spec: &Spec, helper: &Path) -> std::io::Result<(String,
 /// Connects to the helper `id` in `dir`.
 pub fn connect(_dir: &Path, id: &str) -> std::io::Result<UnixStream> {
     UnixStream::connect(socket_path(id)?)
+}
+
+/// Writes the workspace a session belongs to now into its record, so a
+/// session started again after a crash or a reboot comes back in it.
+pub fn set_workspace(dir: &Path, id: &str, workspace: &str) {
+    let path = spec_path(dir, id);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let mut spec = Spec::parse(&text);
+    if spec.workspace == workspace {
+        return;
+    }
+    spec.workspace = workspace.to_owned();
+    let _ = crate::platform::write_atomically(&path, spec.to_text().as_bytes());
+}
+
+/// A session's files, gone: its helper is not coming back.
+pub fn forget(dir: &Path, id: &str) {
+    remove_all(dir, id);
+}
+
+/// How long a lost session of a project that is not opened again is kept.
+const LOST_KEPT: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 3600);
+
+/// A session found on disk: its id, what it runs, what the window left.
+pub type Found = (String, Spec, Left);
+
+/// The sessions of `project`: the helpers still running, and the ones
+/// whose helper is gone (a reboot, a crash), oldest first, to be started
+/// again. A lost session's files go once returned; another project's stay
+/// for when it is opened, for a month.
+pub fn scan(dir: &Path, project: &Path) -> (Vec<Found>, Vec<Found>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut ids: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            name.strip_suffix(".spec").map(str::to_owned)
+        })
+        .collect();
+    ids.sort();
+    let (mut live, mut lost) = (Vec::new(), Vec::new());
+    for id in ids {
+        let Ok(text) = std::fs::read_to_string(spec_path(dir, &id)) else {
+            continue;
+        };
+        let spec = Spec::parse(&text);
+        let left = std::fs::read_to_string(left_path(dir, &id))
+            .map(|text| Left::parse(&text))
+            .unwrap_or_default();
+        let alive = std::fs::read_to_string(pid_path(dir, &id))
+            .ok()
+            .and_then(|text| text.trim().parse::<i32>().ok())
+            .is_some_and(|pid| pid > 0 && crate::platform::send_signal(pid, 0))
+            && socket_path(&id).is_ok_and(|socket| socket.exists());
+        let ours = crate::platform::canonical(&spec.project) == project;
+        if alive {
+            if ours {
+                live.push((id, spec, left));
+            }
+        } else if ours {
+            remove_all(dir, &id);
+            lost.push((id, spec, left));
+        } else {
+            let old = std::fs::metadata(spec_path(dir, &id))
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|at| at.elapsed().ok())
+                .is_some_and(|age| age > LOST_KEPT);
+            if old {
+                remove_all(dir, &id);
+            }
+        }
+    }
+    (live, lost)
 }
 
 /// Every helper in `dir` still running, oldest first, with what it runs
@@ -665,6 +753,8 @@ mod tests {
         let left = Left {
             events_read: 1234,
             active: true,
+            agent: true,
+            workspace: "folder:notes".into(),
         };
         assert_eq!(Left::parse(&left.to_text()), left);
     }

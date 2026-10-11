@@ -128,8 +128,11 @@ the size and write it back.
   `~/Library/Application Support/crc/worktrees/`; both open a terminal
   in it. Every terminal belongs to a workspace: outside a repository the
   open folder becomes one, named after it, and a double-click on the
-  empty part of the list makes another with a terminal; a double-click
-  on a folder workspace renames it. Terminals run your login
+  empty part of the list makes another with a terminal. Drag a
+  workspace to reorder the list, pin one to keep it on top, and
+  double-click one to rename it in place (a worktree keeps its branch);
+  the order, pins and names are kept per project. `Cmd-N` in Agents
+  mode is New Workspace. Terminals run your login
   shell; type `claude` to start Claude Code. `Cmd-T` (or the tab bar's
   +) opens another terminal in the selected workspace; `Ctrl-1..9` show
   a workspace and `Cmd-Shift-U` the next session waiting on you, which
@@ -285,8 +288,11 @@ the size and write it back.
   too, compared with Git's staged copy, but can only be kept: no copy from
   before exists. `claude` typed in a crc shell gets the hooks only if you
   add them to its settings.
-- **Agents mode is local.** A workspace's sessions outlive crc but not a
-  reboot, a session taken back after a restart has lost its link to the
+- **Agents mode is local.** A workspace's sessions outlive crc; after a
+  reboot they are started again (a new shell in the same folder, and
+  `claude --continue`, which picks the folder's latest conversation, so
+  two Claude sessions in one folder both resume the same one; the
+  scrollback is gone). A session taken back after a restart has lost its link to the
   editor (`/ide` in Claude Code reconnects it), pull requests and checks
   are read again every minute rather than live, and tasks run on this
   Mac only.

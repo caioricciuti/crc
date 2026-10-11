@@ -103,6 +103,8 @@ fn a_held_program_outlives_its_window() {
         &hold::Left {
             events_read: 7,
             active: true,
+            agent: false,
+            workspace: String::new(),
         },
     );
     assert_eq!(hold::live(&dir)[0].2.events_read, 7);

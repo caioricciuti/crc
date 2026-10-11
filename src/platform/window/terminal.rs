@@ -230,6 +230,17 @@ impl EditorView {
     }
 
     pub(super) fn spawn_terminal_in(&self, claude: bool, cwd: Option<&Path>) {
+        self.spawn_terminal_into(claude, cwd, None);
+    }
+
+    /// As [`Self::spawn_terminal_in`], in workspace `into` when given
+    /// rather than the selected one.
+    pub(super) fn spawn_terminal_into(
+        &self,
+        claude: bool,
+        cwd: Option<&Path>,
+        into: Option<String>,
+    ) {
         self.say_if_replaced();
         // In Agents mode a session started in the selected workspace's
         // folder (or in no particular one) belongs to that workspace.
@@ -239,14 +250,16 @@ impl EditorView {
             };
             state.terminal.open = true;
             state.terminal.focus = true;
-            state
-                .agents
-                .on
-                .then(|| state.agents.selected_index())
-                .flatten()
-                .map(|i| &state.agents.tasks[i])
-                .filter(|t| cwd.is_none_or(|dir| crate::platform::canonical(dir) == t.path))
-                .map(|t| t.id())
+            into.or_else(|| {
+                state
+                    .agents
+                    .on
+                    .then(|| state.agents.selected_index())
+                    .flatten()
+                    .map(|i| &state.agents.tasks[i])
+                    .filter(|t| cwd.is_none_or(|dir| crate::platform::canonical(dir) == t.path))
+                    .map(|t| t.id())
+            })
         };
         let Some(launch) = self.terminal_launch(claude, cwd) else {
             return;
@@ -373,6 +386,43 @@ impl EditorView {
         );
     }
 
+    /// Starts again the sessions lost since crc last ran (a reboot ends
+    /// their helpers): a shell in the same folder and workspace, and where
+    /// an agent ran, `claude --continue` typed into it, so the conversation
+    /// in that folder carries on in plain sight.
+    fn restore_lost(&self, lost: Vec<crate::term::hold::Found>) {
+        let mut restored = 0;
+        for (_, spec, left) in lost {
+            if !spec.cwd.is_dir() {
+                continue;
+            }
+            let workspace = [&left.workspace, &spec.workspace]
+                .into_iter()
+                .find(|w| !w.is_empty())
+                .cloned();
+            self.spawn_terminal_into(false, Some(&spec.cwd), workspace);
+            restored += 1;
+            // A Claude tab crc started counts even when crc never got to
+            // write down what ran (a crash, a forced quit).
+            if (left.agent || spec.claude)
+                && let Some(mut state) = self.state_mut()
+                && let Some(tab) = state.terminal.tabs.last_mut()
+            {
+                tab.session.write(b"claude --continue\n");
+            }
+        }
+        if restored > 0
+            && let Some(mut state) = self.state_mut()
+        {
+            let said = match restored {
+                1 => "Started again 1 terminal that ended with the last run".to_owned(),
+                n => format!("Started again {n} terminals that ended with the last run"),
+            };
+            state.say(layout::Feedback::Info, said.clone());
+            state.restore_note = Some(said);
+        }
+    }
+
     /// Takes back the sessions helpers kept for this project from the
     /// last window: their screens as the programs left them, the tab that
     /// had the keyboard active again. At launch, before the first frame.
@@ -391,13 +441,15 @@ impl EditorView {
             return;
         };
         let mut taken = Vec::new();
-        for (id, spec, left) in crate::term::hold::live(&dir) {
-            if crate::platform::canonical(&spec.project) != project {
-                continue;
-            }
+        let (live, mut lost) = crate::term::hold::scan(&dir, &project);
+        for (id, spec, left) in live {
             let session = crate::term::hold::connect(&dir, &id)
                 .and_then(|socket| crate::term::pty::Session::attach(socket, self.terminal_wake()));
             let Ok(session) = session else {
+                // A pid taken by another process after a reboot, and a
+                // socket left in /tmp: as lost as a helper that is gone.
+                crate::term::hold::forget(&dir, &id);
+                lost.push((id, spec, left));
                 continue;
             };
             let launch = crate::platform::terminal::Launch {
@@ -418,7 +470,10 @@ impl EditorView {
                     events_read: left.events_read,
                     review_files: 0,
                     folder: crate::platform::canonical(&launch.cwd),
-                    workspace: (!spec.workspace.is_empty()).then(|| spec.workspace.clone()),
+                    workspace: [&left.workspace, &spec.workspace]
+                        .into_iter()
+                        .find(|w| !w.is_empty())
+                        .cloned(),
                     alive: std::sync::Arc::new(()),
                     status: None,
                     launch,
@@ -427,6 +482,8 @@ impl EditorView {
                 left.active,
             ));
         }
+        lost.sort_by(|a, b| a.0.cmp(&b.0));
+        self.restore_lost(lost);
         if taken.is_empty() {
             return;
         }

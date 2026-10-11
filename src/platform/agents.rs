@@ -102,6 +102,109 @@ fn folders_file(root: &Path) -> Option<PathBuf> {
     Some(crate::platform::app_support()?.join(format!("agents/{key:016x}.workspaces")))
 }
 
+/// Where a project's arrangement is kept: the order you dragged the
+/// workspaces into, which are pinned, and their own names.
+fn order_file(root: &Path) -> Option<PathBuf> {
+    folders_file(root).map(|f| f.with_extension("order"))
+}
+
+/// What the list keeps of your arrangement, per workspace id.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Arrangement {
+    /// Ids in the order you put them; ids not here follow, in Git's order.
+    pub order: Vec<String>,
+    pub pinned: std::collections::HashSet<String>,
+    /// A name of your own for a workspace, shown instead of its branch.
+    pub titles: std::collections::HashMap<String, String>,
+}
+
+impl Arrangement {
+    /// One per line: `pin` or `-`, a tab, the id, a tab, the name (maybe
+    /// empty).
+    pub fn parse(text: &str) -> Arrangement {
+        let mut out = Arrangement::default();
+        for line in text.lines() {
+            let mut parts = line.splitn(3, '\t');
+            let (Some(flag), Some(id)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            if id.is_empty() {
+                continue;
+            }
+            out.order.push(id.to_owned());
+            if flag == "pin" {
+                out.pinned.insert(id.to_owned());
+            }
+            if let Some(title) = parts.next().filter(|t| !t.is_empty()) {
+                out.titles.insert(id.to_owned(), title.to_owned());
+            }
+        }
+        out
+    }
+
+    pub fn text(&self) -> String {
+        self.order
+            .iter()
+            .map(|id| {
+                format!(
+                    "{}\t{id}\t{}\n",
+                    if self.pinned.contains(id) { "pin" } else { "-" },
+                    self.titles.get(id).map_or("", String::as_str)
+                )
+            })
+            .collect()
+    }
+
+    /// Where `id` stands in your order; unknown ids after every known one.
+    fn position(&self, id: &str) -> usize {
+        self.order
+            .iter()
+            .position(|o| o == id)
+            .unwrap_or(usize::MAX)
+    }
+
+    /// Moves `id` to just before `before`, or to the end.
+    pub fn move_before(&mut self, id: &str, before: Option<&str>, all: &[String]) {
+        // Every workspace takes a place, so the move is exact.
+        for known in all {
+            if !self.order.contains(known) {
+                self.order.push(known.clone());
+            }
+        }
+        self.order.retain(|o| o != id);
+        let at = before
+            .and_then(|b| self.order.iter().position(|o| o == b))
+            .unwrap_or(self.order.len());
+        self.order.insert(at, id.to_owned());
+    }
+
+    /// Carries what was kept for `old` over to `new` (a renamed folder
+    /// workspace's id changes).
+    pub fn rename_id(&mut self, old: &str, new: &str) {
+        for o in &mut self.order {
+            if o == old {
+                *o = new.to_owned();
+            }
+        }
+        if self.pinned.remove(old) {
+            self.pinned.insert(new.to_owned());
+        }
+        if let Some(title) = self.titles.remove(old) {
+            self.titles.insert(new.to_owned(), title);
+        }
+    }
+}
+
+/// A workspace row being dragged to a new place in the list.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RowDrag {
+    pub id: String,
+    pub start_y: f32,
+    pub y: f32,
+    /// Moved far enough to be a drag, not a click.
+    pub active: bool,
+}
+
 /// One per line: the name, a tab, the folder.
 fn parse_folders(text: &str) -> Vec<Workspace> {
     text.lines()
@@ -241,6 +344,14 @@ pub struct Panel {
     pub github: Option<bool>,
     /// The periodic refresh is scheduled.
     pub ticking: bool,
+    /// Your order, pins and names, kept for the project.
+    pub arrangement: Arrangement,
+    /// A row being dragged.
+    pub drag: Option<RowDrag>,
+    /// The workspace whose name is being edited in its row, by id, with
+    /// the text so far and the caret's character index; set by the window
+    /// from its field before each draw.
+    pub inline: Option<(String, String, usize)>,
     /// Whether the terminal panel was open in the editor before Agents
     /// mode took the column, to put it back as it was.
     pub editor_terminal: bool,
@@ -329,6 +440,10 @@ impl Panel {
             self.folders = folders_file(&root)
                 .and_then(|file| std::fs::read_to_string(file).ok())
                 .map(|text| parse_folders(&text))
+                .unwrap_or_default();
+            self.arrangement = order_file(&root)
+                .and_then(|file| std::fs::read_to_string(file).ok())
+                .map(|text| Arrangement::parse(&text))
                 .unwrap_or_default();
             self.root = Some(root);
             self.rebuild();
@@ -427,13 +542,24 @@ impl Panel {
         true
     }
 
+    /// The list from Git and the folder workspaces, in your order with the
+    /// pinned on top; what needs you moves up when it is next drawn.
     fn rebuild(&mut self) {
-        self.tasks = self
+        let mut tasks: Vec<Workspace> = self
             .worktrees
             .iter()
             .chain(self.folders.iter())
             .cloned()
             .collect();
+        tasks.sort_by_key(|t| {
+            let id = t.id();
+            (
+                !t.main,
+                !self.arrangement.pinned.contains(&id),
+                self.arrangement.position(&id),
+            )
+        });
+        self.tasks = tasks;
     }
 
     fn save_folders(&self) {
@@ -481,7 +607,79 @@ impl Panel {
         let new_id = space.id();
         self.rebuild();
         self.save_folders();
+        self.arrangement.rename_id(id, &new_id);
+        self.save_arrangement();
         Some(new_id)
+    }
+
+    fn save_arrangement(&self) {
+        let Some(file) = self.root.as_deref().and_then(order_file) else {
+            return;
+        };
+        if let Some(dir) = file.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = crate::platform::write_atomically(&file, self.arrangement.text().as_bytes());
+    }
+
+    /// The workspace a dragged row lands before, by the cards last drawn:
+    /// the first whose middle is under `y`; `None` is the end.
+    pub fn drop_before(&self, y: f32) -> Option<String> {
+        self.hits
+            .iter()
+            .filter_map(|(rect, action)| match action {
+                Action::Select(i) => Some((*rect, *i)),
+                _ => None,
+            })
+            .find(|(rect, _)| rect.y + rect.height * 0.5 > y)
+            .and_then(|(_, i)| self.tasks.get(i).map(Workspace::id))
+    }
+
+    /// What a workspace's row calls it: your name for it, else its own.
+    pub fn title(&self, workspace: &Workspace) -> String {
+        self.arrangement
+            .titles
+            .get(&workspace.id())
+            .cloned()
+            .unwrap_or_else(|| workspace.name())
+    }
+
+    /// Names a workspace yourself; an empty name gives it back its own.
+    pub fn set_title(&mut self, id: &str, title: &str) {
+        let title = title.trim();
+        if title.is_empty() {
+            self.arrangement.titles.remove(id);
+        } else {
+            if !self.arrangement.order.iter().any(|o| o == id) {
+                self.arrangement.order.push(id.to_owned());
+            }
+            self.arrangement
+                .titles
+                .insert(id.to_owned(), title.to_owned());
+        }
+        self.save_arrangement();
+    }
+
+    pub fn is_pinned(&self, id: &str) -> bool {
+        self.arrangement.pinned.contains(id)
+    }
+
+    /// Pins a workspace to the top of the list, or lets it go.
+    pub fn toggle_pin(&mut self, id: &str) {
+        if !self.arrangement.pinned.remove(id) {
+            if !self.arrangement.order.iter().any(|o| o == id) {
+                self.arrangement.order.push(id.to_owned());
+            }
+            self.arrangement.pinned.insert(id.to_owned());
+        }
+        self.save_arrangement();
+    }
+
+    /// Puts `id` before `before` (or last) in your order.
+    pub fn move_before(&mut self, id: &str, before: Option<&str>) {
+        let all: Vec<String> = self.tasks.iter().map(Workspace::id).collect();
+        self.arrangement.move_before(id, before, &all);
+        self.save_arrangement();
     }
 
     pub fn remove_folder(&mut self, id: &str) {
@@ -541,18 +739,21 @@ impl Panel {
                 .filter(|pr| pr.state == "OPEN");
             if canon[i].main {
                 0
-            } else if has(i, Activity::Waiting) {
+            } else if self.arrangement.pinned.contains(&canon[i].id()) {
                 1
-            } else if pr.is_some_and(|pr| pr.checks == Checks::Failing) {
+            } else if has(i, Activity::Waiting) {
                 2
-            } else if pr.is_some_and(|pr| pr.checks == Checks::Passing && !pr.draft) {
+            } else if pr.is_some_and(|pr| pr.checks == Checks::Failing) {
                 3
-            } else {
+            } else if pr.is_some_and(|pr| pr.checks == Checks::Passing && !pr.draft) {
                 4
+            } else {
+                5
             }
         };
         let mut order: Vec<usize> = (0..canon.len()).collect();
-        order.sort_by_key(|i| rank(*i));
+        // Within a group, your order, then Git's (the sort is stable).
+        order.sort_by_key(|i| (rank(*i), self.arrangement.position(&canon[*i].id())));
         let arranged: Vec<Workspace> = order.into_iter().map(|i| canon[i].clone()).collect();
         if arranged == self.tasks {
             return false;
@@ -652,13 +853,13 @@ impl Panel {
     /// For the self-test: the mode, the tasks by name, the selected one,
     /// and each session's task (`-` for none), the active one starred.
     pub fn report(&self, tabs: &[Tab], active: usize, pair: Option<(usize, usize)>) -> String {
-        let name = |i: Option<usize>| i.map_or("-".to_owned(), |i| self.tasks[i].name());
+        let name = |i: Option<usize>| i.map_or("-".to_owned(), |i| self.title(&self.tasks[i]));
         format!(
             "{} tasks={} selected={} sessions={} claude={} pair={} op={}",
             if self.on { "on" } else { "off" },
             self.tasks
                 .iter()
-                .map(Workspace::name)
+                .map(|t| self.title(t))
                 .collect::<Vec<_>>()
                 .join(","),
             name(self.selected_index()),
@@ -749,7 +950,7 @@ impl Panel {
         // Ordered here, so the rows and their hits agree until the next
         // frame whatever changed in between; never under the pointer, so a
         // row does not move away from a click (cmux defers the same way).
-        if !layout::hovered(column) {
+        if !layout::hovered(column) && self.drag.is_none() {
             self.arrange(tabs);
         }
         layout::push_rect(
@@ -800,6 +1001,27 @@ impl Panel {
             used += h;
         }
         let blank_top = top + used;
+        if let Some(drag) = self.drag.as_ref().filter(|d| d.active) {
+            let cards: Vec<f32> = placed
+                .iter()
+                .filter(|(_, line)| matches!(line, Line::Task(_)))
+                .map(|(y, _)| *y)
+                .collect();
+            let at = cards
+                .iter()
+                .copied()
+                .find(|y| y + CARD * 0.5 > drag.y)
+                .or_else(|| cards.last().map(|y| y + CARD));
+            if let Some(at) = at {
+                layout::push_rect(
+                    out,
+                    atlas,
+                    [column.x + 8.0, at - 1.0],
+                    [column.width - 16.0, 2.0],
+                    theme.accent,
+                );
+            }
+        }
         let blank_bottom = column.y + column.height - if self.op.is_some() { ROW } else { 0.0 };
         if blank_bottom - blank_top >= ROW {
             self.hits.push((
@@ -1194,18 +1416,54 @@ impl Panel {
             }
         }
         let name_x = left + 22.0;
-        let name = task.name();
-        layout::push_ui_text(
-            out,
-            atlas,
-            Viewport {
-                x: name_x,
-                width: (strip_x - name_x).max(0.0),
-                ..line1
-            },
-            &name,
-            theme.text,
-        );
+        let name = self.title(&task);
+        let editing = self
+            .inline
+            .as_ref()
+            .filter(|(id, _, _)| *id == task.id())
+            .map(|(_, text, caret)| (text.clone(), *caret));
+        if let Some((text, caret)) = editing {
+            // The name, editable in place: a field over the name's line.
+            let field = Viewport {
+                x: name_x - 4.0,
+                y: line1.y - 1.0,
+                width: (card.x + card.width - 8.0 - name_x + 4.0).max(0.0),
+                height: 22.0,
+            };
+            layout::push_rounded_rect(out, field, layout::UI_RADIUS_SM, theme.find_background);
+            let prefix: String = text.chars().take(caret).collect();
+            let caret_x = name_x + layout::ui_text_width(atlas, &prefix);
+            layout::push_ui_text(
+                out,
+                atlas,
+                Viewport {
+                    x: name_x,
+                    width: (field.x + field.width - name_x - 4.0).max(0.0),
+                    ..line1
+                },
+                &text,
+                theme.text,
+            );
+            layout::push_rect(
+                out,
+                atlas,
+                [caret_x, field.y + 3.0],
+                [1.5, field.height - 6.0],
+                theme.cursor,
+            );
+        } else {
+            layout::push_ui_text(
+                out,
+                atlas,
+                Viewport {
+                    x: name_x,
+                    width: (strip_x - name_x).max(0.0),
+                    ..line1
+                },
+                &name,
+                theme.text,
+            );
+        }
         // The line under the name.
         let (said, colour) = if let Some(tab) = waiting.first() {
             (tab.state(), theme.diff_modified)
@@ -1231,6 +1489,9 @@ impl Panel {
             )
         } else {
             let mut parts = Vec::new();
+            if self.is_pinned(&task.id()) {
+                parts.push("pinned".to_owned());
+            }
             match mine.len() {
                 0 => parts.push("no terminal".to_owned()),
                 1 => parts.push("1 terminal".to_owned()),
@@ -1244,12 +1505,16 @@ impl Panel {
             {
                 parts.push(format!("{ahead} ahead"));
             }
-            // A folder workspace says which folder, unless its name does.
+            // A folder workspace says which folder, unless its name does; a
+            // workspace you named says its branch.
             let folder = task
                 .path
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .filter(|n| task.folder && *n != name);
+            if !task.folder && name != task.name() {
+                parts.push(task.name());
+            }
             if let Some(folder) = folder {
                 parts.push(folder);
             }
@@ -1290,6 +1555,49 @@ mod tests {
             main: false,
             folder: true,
         }
+    }
+
+    #[test]
+    fn an_arrangement_keeps_order_pins_and_names_through_its_file() {
+        let mut a = Arrangement::default();
+        let all: Vec<String> = ["/r", "/w/a", "/w/b", "folder:notes"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        a.move_before("folder:notes", Some("/w/a"), &all);
+        assert_eq!(a.order, ["/r", "folder:notes", "/w/a", "/w/b"]);
+        a.move_before("/r", None, &all);
+        assert_eq!(a.order, ["folder:notes", "/w/a", "/w/b", "/r"]);
+        a.pinned.insert("/w/b".into());
+        a.titles.insert("/w/a".into(), "login fix".into());
+        let back = Arrangement::parse(&a.text());
+        assert_eq!(back, a);
+        a.rename_id("folder:notes", "folder:ideas");
+        assert_eq!(a.order[0], "folder:ideas");
+    }
+
+    #[test]
+    fn pinned_workspaces_follow_main_and_your_order_holds_within() {
+        let mut panel = Panel {
+            worktrees: vec![tree("/r", true), tree("/w/a", false), tree("/w/b", false)],
+            folders: vec![folder("notes", "/r")],
+            ..Panel::default()
+        };
+        panel.rebuild();
+        panel.arrange(&[]);
+        let ids = |p: &Panel| p.tasks.iter().map(Workspace::id).collect::<Vec<_>>();
+        assert_eq!(ids(&panel), ["/r", "/w/a", "/w/b", "folder:notes"]);
+        // Pinned goes up, under main; dragged order holds for the rest.
+        panel.arrangement.pinned.insert("folder:notes".into());
+        let all = ids(&panel);
+        panel.arrangement.move_before("/w/b", Some("/w/a"), &all);
+        panel.arrange(&[]);
+        assert_eq!(ids(&panel), ["/r", "folder:notes", "/w/b", "/w/a"]);
+        // Main stays first even dragged last.
+        let all = ids(&panel);
+        panel.arrangement.move_before("/r", None, &all);
+        panel.arrange(&[]);
+        assert_eq!(ids(&panel)[0], "/r");
     }
 
     #[test]

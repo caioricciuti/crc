@@ -173,6 +173,9 @@ impl EditorView {
                 for tab in &mut state.terminal.tabs {
                     if tab.workspace.is_none() {
                         tab.workspace = Some(id.clone());
+                        if let (Some(dir), Some(held)) = (crate::term::hold::dir(), &tab.held) {
+                            crate::term::hold::set_workspace(&dir, held, &id);
+                        }
                     }
                 }
                 id
@@ -217,19 +220,29 @@ impl EditorView {
                 }
                 self.resume_display_link();
             }
-            // A double-click on a folder workspace renames it.
+            // A double-click names a workspace in its row.
             Action::Select(index) if event.clickCount() >= 2 => {
-                let folder = self
+                let id = self
                     .state()
-                    .is_some_and(|state| state.agents.tasks.get(index).is_some_and(|t| t.folder));
-                if folder {
-                    if let Some(mut state) = self.state_mut() {
-                        state.agents.menu_task = state.agents.tasks.get(index).map(|t| t.id());
-                    }
-                    self.agent_rename_workspace();
+                    .and_then(|state| state.agents.tasks.get(index).map(|t| t.id()));
+                if let Some(id) = id {
+                    self.start_agents_edit(&id);
                 }
             }
-            Action::Select(index) => self.select_task(index),
+            Action::Select(index) => {
+                // The press may become a drag to a new place in the list.
+                if let Some(mut state) = self.state_mut()
+                    && let Some(id) = state.agents.tasks.get(index).map(|t| t.id())
+                {
+                    state.agents.drag = Some(crate::platform::agents::RowDrag {
+                        id,
+                        start_y: y,
+                        y,
+                        active: false,
+                    });
+                }
+                self.select_task(index);
+            }
             Action::Session(tab) => self.show_session(tab),
             Action::NewSession(index) => {
                 let Some(dir) = self.task_path(index) else {
@@ -382,6 +395,9 @@ impl EditorView {
                     for tab in &mut state.terminal.tabs {
                         if tab.workspace.as_deref() == Some(id.as_str()) {
                             tab.workspace = Some(new_id.clone());
+                            if let (Some(dir), Some(held)) = (crate::term::hold::dir(), &tab.held) {
+                                crate::term::hold::set_workspace(&dir, held, &new_id);
+                            }
                         }
                     }
                     if state.agents.selected.as_deref() == Some(id.as_str()) {
@@ -496,6 +512,104 @@ impl EditorView {
         self.resume_display_link();
     }
 
+    /// Opens the name field in a workspace's row, its name selected.
+    pub(super) fn start_agents_edit(&self, id: &str) {
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
+        let Some(task) = state
+            .agents
+            .by_id(id)
+            .map(|i| state.agents.tasks[i].clone())
+        else {
+            return;
+        };
+        close_fields(&mut state);
+        state.palette = None;
+        let mut field = Buffer::from_text(&state.agents.title(&task));
+        field.select_all();
+        state.agents_edit = Some((id.to_owned(), field));
+        drop(state);
+        self.request_redraw();
+        self.pump();
+    }
+
+    /// Keys while a workspace's name is being edited in its row.
+    pub(super) fn handle_agents_edit_key(&self, event: &NSEvent) -> bool {
+        const ESCAPE: u16 = 53;
+        let flags = event.modifierFlags();
+        if flags.contains(NSEventModifierFlags::Command) {
+            return false;
+        }
+        let motion = if flags.contains(NSEventModifierFlags::Shift) {
+            Motion::Extend
+        } else {
+            Motion::Move
+        };
+        let code = match event.keyCode() {
+            key::KEYPAD_ENTER => key::RETURN,
+            code => code,
+        };
+        match code {
+            ESCAPE => self.finish_agents_edit(false),
+            key::RETURN => self.finish_agents_edit(true),
+            key::TAB | key::UP | key::DOWN => return true,
+            key::DELETE | key::LEFT | key::RIGHT | key::HOME | key::END => {
+                let Some(mut state) = self.state_mut() else {
+                    return false;
+                };
+                if let Some((_, field)) = &mut state.agents_edit {
+                    match code {
+                        key::DELETE if flags.contains(NSEventModifierFlags::Option) => {
+                            field.delete_word_backward();
+                        }
+                        key::DELETE => field.backspace(),
+                        key::LEFT => field.move_left(motion),
+                        key::RIGHT => field.move_right(motion),
+                        key::HOME => field.move_line_start(motion),
+                        _ => field.move_line_end(motion),
+                    }
+                }
+            }
+            _ => return self.interpret(event),
+        }
+        self.request_redraw();
+        self.pump();
+        true
+    }
+
+    /// Ends the row's name field. A folder workspace takes the name as its
+    /// own; any other keeps its branch and shows the name instead of it.
+    /// An empty name gives a workspace back its own.
+    pub(super) fn finish_agents_edit(&self, commit: bool) {
+        let Some((id, field)) = self
+            .state_mut()
+            .and_then(|mut state| state.agents_edit.take())
+        else {
+            return;
+        };
+        let name = field.rope.to_string();
+        let name = name.trim().to_owned();
+        if commit {
+            let folder = self.state().is_some_and(|state| {
+                state
+                    .agents
+                    .by_id(&id)
+                    .is_some_and(|i| state.agents.tasks[i].folder)
+            });
+            if folder && !name.is_empty() {
+                if let Some(mut state) = self.state_mut() {
+                    state.agents.renaming = Some(id);
+                }
+                self.create_workspace(name);
+            } else if let Some(mut state) = self.state_mut() {
+                state.agents.set_title(&id, &name);
+            }
+        }
+        self.request_redraw();
+        self.pump();
+    }
+
     /// The palette, taking the folder workspace's new name.
     pub(super) fn agent_rename_workspace(&self) {
         let Some(task) = self.menu_task().filter(|t| t.folder) else {
@@ -607,13 +721,24 @@ impl EditorView {
                             .map(|pr| pr.number),
                     )
                 });
+        let pinned = self.state().is_some_and(|state| {
+            state
+                .agents
+                .tasks
+                .get(index)
+                .is_some_and(|t| state.agents.is_pinned(&t.id()))
+        });
         let add = |title: &str, action: Sel| menu.addItem(&menu_item(mtm, title, action));
         add("New Terminal", sel!(agentNewShell:));
         add("New Claude Session", sel!(agentNewClaude:));
         add("Open in Editor", sel!(agentOpenInEditor:));
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+        add(
+            if pinned { "Unpin" } else { "Pin to Top" },
+            sel!(agentTogglePin:),
+        );
+        add("Rename", sel!(agentRenameInPlace:));
         if folder {
-            menu.addItem(&NSMenuItem::separatorItem(mtm));
-            add("Rename Workspace\u{2026}", sel!(agentRenameWorkspace:));
             add("Remove Workspace\u{2026}", sel!(agentRemoveWorkspace:));
         }
         if !folder {

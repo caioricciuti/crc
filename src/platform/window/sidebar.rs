@@ -490,7 +490,11 @@ impl EditorView {
         state.sidebar = true;
         // A project is open now, which is worth coming back to.
         state.ephemeral_session = false;
-        state.message = Some(("Folder opened".to_string(), Instant::now()));
+        let said = state
+            .restore_note
+            .take()
+            .unwrap_or_else(|| "Folder opened".to_string());
+        state.message = Some((said, Instant::now()));
         state.lsp.servers.clear();
         state.lsp.unavailable.clear();
         state.completion = None;
