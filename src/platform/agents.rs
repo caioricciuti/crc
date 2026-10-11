@@ -228,8 +228,17 @@ pub struct Panel {
     pub teams: std::collections::HashMap<PathBuf, Team>,
     /// An operation on a task running on a worker, and what it says.
     pub op: Option<(String, mpsc::Receiver<Result<Done, String>>)>,
-    /// The task a menu was opened on.
-    pub menu_task: Option<usize>,
+    /// The workspace a menu was opened on, by [`Workspace::id`]: the list
+    /// can reorder while the menu is up.
+    pub menu_task: Option<String>,
+    /// The column at the right: the selected workspace's Git state.
+    pub inspector: crate::platform::inspector::Inspector,
+    /// When the worktrees and pull requests were last read.
+    pub refreshed_at: Option<std::time::Instant>,
+    /// Whether `gh` is installed, looked up once.
+    pub github: Option<bool>,
+    /// The periodic refresh is scheduled.
+    pub ticking: bool,
     /// Whether the terminal panel was open in the editor before Agents
     /// mode took the column, to put it back as it was.
     pub editor_terminal: bool,
@@ -308,6 +317,11 @@ impl Panel {
     /// Reads the worktrees of the repository `dir` is in, on a worker, and
     /// the folder workspaces kept for it.
     pub fn refresh(&mut self, dir: &Path) {
+        self.refreshed_at = Some(std::time::Instant::now());
+        self.inspector.invalidate();
+        if self.github.is_none() {
+            self.github = Some(crate::project::worktree::has_gh());
+        }
         let root = crate::platform::canonical(dir);
         if self.root.as_deref() != Some(root.as_path()) {
             self.folders = folders_file(&root)
@@ -378,7 +392,7 @@ impl Panel {
                 }
             }
         }
-        changed | self.poll_list()
+        changed | self.poll_list() | self.inspector.poll()
     }
 
     fn poll_list(&mut self) -> bool {
@@ -482,7 +496,67 @@ impl Panel {
 
     /// A read or an operation is in flight.
     pub fn busy(&self) -> bool {
-        self.rx.is_some() || self.op.is_some() || self.info_rx.is_some()
+        self.rx.is_some() || self.op.is_some() || self.info_rx.is_some() || self.inspector.busy()
+    }
+
+    /// The workspace by id.
+    pub fn by_id(&self, id: &str) -> Option<usize> {
+        self.tasks.iter().position(|t| t.id() == id)
+    }
+
+    /// The main checkout's branch: what other branches are compared with.
+    pub fn base_branch(&self) -> Option<String> {
+        self.tasks
+            .iter()
+            .find(|t| t.main)
+            .and_then(|t| t.branch.clone())
+    }
+
+    /// Orders the list by what needs you, the main checkout first: a
+    /// session waiting on you, then failing checks, then a pull request
+    /// ready to merge, then the rest, each group in Git's order. Output
+    /// alone does not move a row: a prompt or an echo would make the list
+    /// jump while you type. Returns whether the order changed.
+    pub fn arrange(&mut self, tabs: &[Tab]) -> bool {
+        use crate::project::worktree::Checks;
+        let canon: Vec<Workspace> = self
+            .worktrees
+            .iter()
+            .chain(self.folders.iter())
+            .cloned()
+            .collect();
+        let owner: Vec<Option<usize>> = tabs.iter().map(|t| task_of(&canon, t)).collect();
+        let has = |i: usize, activity: Activity| {
+            tabs.iter()
+                .zip(&owner)
+                .any(|(t, o)| *o == Some(i) && t.activity() == activity)
+        };
+        let rank = |i: usize| -> u8 {
+            let pr = self
+                .info
+                .get(&canon[i].path)
+                .and_then(|info| info.pull_request.as_ref())
+                .filter(|pr| pr.state == "OPEN");
+            if canon[i].main {
+                0
+            } else if has(i, Activity::Waiting) {
+                1
+            } else if pr.is_some_and(|pr| pr.checks == Checks::Failing) {
+                2
+            } else if pr.is_some_and(|pr| pr.checks == Checks::Passing && !pr.draft) {
+                3
+            } else {
+                4
+            }
+        };
+        let mut order: Vec<usize> = (0..canon.len()).collect();
+        order.sort_by_key(|i| rank(*i));
+        let arranged: Vec<Workspace> = order.into_iter().map(|i| canon[i].clone()).collect();
+        if arranged == self.tasks {
+            return false;
+        }
+        self.tasks = arranged;
+        true
     }
 
     pub fn selected_index(&self) -> Option<usize> {
@@ -647,6 +721,9 @@ impl Panel {
         out: &mut Vec<GlyphInstance>,
     ) {
         self.hits.clear();
+        // Ordered here, so the rows and their hits agree until the next
+        // frame whatever changed in between.
+        self.arrange(tabs);
         layout::push_rect(
             out,
             atlas,

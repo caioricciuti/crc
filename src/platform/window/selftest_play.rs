@@ -136,6 +136,7 @@ impl EditorView {
                         _ if name.starts_with("settings.") => state.settings_page.named(name),
                         _ if name.starts_with("review_page.") => state.review_page.named(name),
                         _ if name.starts_with("agents.") => state.agents.named(name),
+                        _ if name.starts_with("inspector.") => state.agents.inspector.named(name),
                         _ if name == "home.review" => state
                             .home_hits
                             .iter()
@@ -510,7 +511,7 @@ impl EditorView {
                 };
                 let report = format!(
                     // First: the report ends with the document's text.
-                    "message: {}\npreview: {}\nmd: {md}\nactivity: {}\npointer_targets: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nrepo: {}\ngit_note: {}\nhome: {}\nmcp: {}\nmcp_page: {}\nsettings_page: {}\nreview_page: {}\nterminals: {}\nagents: {}\nteams: {}\nconflicts: {}\ngit_conflicts: {}\nblame: {}\nfind_results: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\n{report}",
+                    "message: {}\npreview: {}\nmd: {md}\nactivity: {}\npointer_targets: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nrepo: {}\ngit_note: {}\nhome: {}\nmcp: {}\nmcp_page: {}\nsettings_page: {}\nreview_page: {}\nterminals: {}\nagents: {}\ninspector: {}\nteams: {}\nconflicts: {}\ngit_conflicts: {}\nblame: {}\nfind_results: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\n{report}",
                     state.message.as_ref().map_or("", |(text, _)| text.as_str()),
                     state.html_preview.as_ref().map_or("closed".to_string(), |p| format!(
                         "open ext={} view={} probe={}",
@@ -613,6 +614,12 @@ impl EditorView {
                         &state.terminal.tabs,
                         state.terminal.active,
                         state.terminal.shown_pair(),
+                    ),
+                    state.agents.inspector.report(
+                        state
+                            .agents
+                            .selected_index()
+                            .map(|i| state.agents.tasks[i].path.as_path()),
                     ),
                     state.agents.report_teams(&state.terminal.tabs),
                     active_conflicts(&state).map_or("none".to_string(), |v| format!(

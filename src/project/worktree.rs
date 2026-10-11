@@ -211,18 +211,60 @@ pub fn ahead(main: &Path, branch: &str) -> Result<usize, String> {
 }
 
 /// A task branch's pull request on GitHub, as `gh` reports it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PullRequest {
     pub number: u64,
     /// `OPEN`, `MERGED` or `CLOSED`.
     pub state: String,
     pub url: String,
     pub checks: Checks,
+    pub title: String,
+    /// The author's login.
+    pub author: String,
+    pub commits: usize,
+    pub additions: u64,
+    pub deletions: u64,
+    /// The branch it merges into, and the one it merges.
+    pub base: String,
+    pub head: String,
+    pub draft: bool,
+    /// `MERGEABLE`, `CONFLICTING` or `UNKNOWN`.
+    pub mergeable: String,
+    /// Each check, as GitHub names it.
+    pub list: Vec<Check>,
+}
+
+/// One check on a pull request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Check {
+    pub name: String,
+    pub state: CheckState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckState {
+    Passed,
+    Failed,
+    Running,
+    /// Skipped or neutral: it ran and does not count either way.
+    Skipped,
+}
+
+impl CheckState {
+    pub fn label(self) -> &'static str {
+        match self {
+            CheckState::Passed => "Success",
+            CheckState::Failed => "Failed",
+            CheckState::Running => "Running",
+            CheckState::Skipped => "Skipped",
+        }
+    }
 }
 
 /// Its checks, rolled up.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Checks {
+    #[default]
     None,
     Running,
     Passing,
@@ -247,7 +289,8 @@ pub fn pull_request(dir: &Path, branch: &str) -> Option<PullRequest> {
             "view",
             branch,
             "--json",
-            "number,state,url,statusCheckRollup",
+            "number,state,url,statusCheckRollup,title,author,commits,additions,deletions,\
+             baseRefName,headRefName,isDraft,mergeable",
         ])
         .env("GH_PROMPT_DISABLED", "1")
         .env("NO_COLOR", "1")
@@ -272,25 +315,45 @@ pub fn parse_pull_request(text: &str) -> Option<PullRequest> {
             .unwrap_or("")
             .to_ascii_uppercase()
     };
-    let failed = checks.iter().any(|c| {
-        matches!(
-            word(c, "conclusion").as_str(),
-            "FAILURE" | "CANCELLED" | "TIMED_OUT" | "ACTION_REQUIRED" | "STARTUP_FAILURE"
-        ) || matches!(word(c, "state").as_str(), "FAILURE" | "ERROR")
-    });
-    let running = checks.iter().any(|c| {
-        let status = word(c, "status");
-        (!status.is_empty() && status != "COMPLETED") || word(c, "state") == "PENDING"
-    });
+    let text = |v: &crate::json::Value, key: &str| {
+        v.get(key).and_then(|w| w.as_str()).unwrap_or("").to_owned()
+    };
+    // A check run says status and conclusion; a commit status says state.
+    let list: Vec<Check> = checks
+        .iter()
+        .map(|c| {
+            let conclusion = word(c, "conclusion");
+            let status = word(c, "status");
+            let state = word(c, "state");
+            let check = if matches!(
+                conclusion.as_str(),
+                "FAILURE" | "CANCELLED" | "TIMED_OUT" | "ACTION_REQUIRED" | "STARTUP_FAILURE"
+            ) || matches!(state.as_str(), "FAILURE" | "ERROR")
+            {
+                CheckState::Failed
+            } else if (!status.is_empty() && status != "COMPLETED")
+                || matches!(state.as_str(), "PENDING" | "EXPECTED")
+            {
+                CheckState::Running
+            } else if matches!(conclusion.as_str(), "SKIPPED" | "NEUTRAL" | "STALE") {
+                CheckState::Skipped
+            } else {
+                CheckState::Passed
+            };
+            let name = Some(text(c, "name"))
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| text(c, "context"));
+            Check { name, state: check }
+        })
+        .collect();
+    let failed = list.iter().any(|c| c.state == CheckState::Failed);
+    let running = list.iter().any(|c| c.state == CheckState::Running);
+    let number = |key: &str| value.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
     Some(PullRequest {
         number: value.get("number")?.as_u64()?,
         state: word(&value, "state"),
-        url: value
-            .get("url")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_owned(),
-        checks: if checks.is_empty() {
+        url: text(&value, "url"),
+        checks: if list.is_empty() {
             Checks::None
         } else if failed {
             Checks::Failing
@@ -299,11 +362,295 @@ pub fn parse_pull_request(text: &str) -> Option<PullRequest> {
         } else {
             Checks::Passing
         },
+        title: text(&value, "title"),
+        author: value
+            .get("author")
+            .map(|a| text(a, "login"))
+            .unwrap_or_default(),
+        commits: value
+            .get("commits")
+            .and_then(|v| v.as_array())
+            .map_or(0, <[_]>::len),
+        additions: number("additions"),
+        deletions: number("deletions"),
+        base: text(&value, "baseRefName"),
+        head: text(&value, "headRefName"),
+        draft: value
+            .get("isDraft")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        mergeable: word(&value, "mergeable"),
+        list,
     })
+}
+
+/// Where a workspace's checkout stands: against the branch it came from,
+/// against its upstream, and its own uncommitted work. Read for the
+/// inspector, on a worker.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Status {
+    pub branch: Option<String>,
+    /// The branch it is compared with: the main checkout's.
+    pub base: Option<String>,
+    /// Commits it has that the base does not, and the other way round.
+    pub ahead: usize,
+    pub behind: usize,
+    /// The files it changes from where it left the base, and the lines.
+    pub files: usize,
+    pub added: u64,
+    pub removed: u64,
+    pub upstream: Option<String>,
+    pub to_push: usize,
+    pub to_pull: usize,
+    /// Uncommitted: files touched (untracked included) and their lines.
+    pub dirty: usize,
+    pub dirty_added: u64,
+    pub dirty_removed: u64,
+    /// The newest tag reachable from HEAD and the commits since it; read
+    /// for the main checkout only.
+    pub tag: Option<(String, usize)>,
+}
+
+/// `git rev-list --left-right --count A...B`: the commits only on A, then
+/// only on B.
+pub fn parse_left_right(text: &str) -> (usize, usize) {
+    let mut words = text.split_whitespace().map(|w| w.parse().unwrap_or(0));
+    (words.next().unwrap_or(0), words.next().unwrap_or(0))
+}
+
+/// `git diff --numstat`: files, lines added, lines removed. A binary file
+/// counts as a file with no lines.
+pub fn parse_numstat(text: &str) -> (usize, u64, u64) {
+    text.lines().filter(|l| !l.trim().is_empty()).fold(
+        (0, 0, 0),
+        |(files, added, removed), line| {
+            let mut words = line.split('\t');
+            let a = words.next().and_then(|w| w.parse().ok()).unwrap_or(0);
+            let r = words.next().and_then(|w| w.parse().ok()).unwrap_or(0);
+            (files + 1, added + a, removed + r)
+        },
+    )
+}
+
+/// Reads `dir`'s status, comparing with `base` when it is another branch.
+pub fn status(dir: &Path, base: Option<&str>, tags: bool) -> Result<Status, String> {
+    run(dir, &["rev-parse", "--git-dir"])?;
+    let branch = run(dir, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .ok()
+        .map(|b| b.trim().to_owned())
+        .filter(|b| !b.is_empty());
+    let mut out = Status {
+        branch: branch.clone(),
+        ..Status::default()
+    };
+    if let Some(base) = base.filter(|b| branch.as_deref() != Some(*b)) {
+        let range = format!("{base}...HEAD");
+        if let Ok(counts) = run(dir, &["rev-list", "--left-right", "--count", &range]) {
+            (out.behind, out.ahead) = parse_left_right(&counts);
+            out.base = Some(base.to_owned());
+            if let Ok(stat) = run(dir, &["diff", "--numstat", &range]) {
+                (out.files, out.added, out.removed) = parse_numstat(&stat);
+            }
+        }
+    }
+    if let Ok(upstream) = run(
+        dir,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    ) {
+        out.upstream = Some(upstream.trim().to_owned());
+        if let Ok(counts) = run(dir, &["rev-list", "--left-right", "--count", "@{u}...HEAD"]) {
+            (out.to_pull, out.to_push) = parse_left_right(&counts);
+        }
+    }
+    out.dirty = run(dir, &["status", "--porcelain"])
+        .map(|s| s.lines().filter(|l| !l.is_empty()).count())
+        .unwrap_or(0);
+    if out.dirty > 0
+        && let Ok(stat) = run(dir, &["diff", "HEAD", "--numstat"])
+    {
+        let (_, a, r) = parse_numstat(&stat);
+        (out.dirty_added, out.dirty_removed) = (a, r);
+    }
+    if tags && let Ok(tag) = run(dir, &["describe", "--tags", "--abbrev=0"]) {
+        let tag = tag.trim().to_owned();
+        let since = run(dir, &["rev-list", "--count", &format!("{tag}..HEAD")])
+            .ok()
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or(0);
+        out.tag = Some((tag, since));
+    }
+    Ok(out)
+}
+
+/// Merges `base` into the workspace's branch: the way to take main's new
+/// commits without rewriting the branch. Refused with uncommitted changes;
+/// on a conflict the merge is undone, so nothing is left half done.
+pub fn update_from(dir: &Path, base: &str) -> Result<String, String> {
+    if is_dirty(dir)? {
+        return Err("Commit or stash the uncommitted changes first".into());
+    }
+    let branch = run(dir, &["branch", "--show-current"])?.trim().to_owned();
+    match run(dir, &["merge", "--no-edit", base]) {
+        Ok(said) if said.contains("Already up to date") => {
+            Ok(format!("{branch} already has everything on {base}"))
+        }
+        Ok(_) => Ok(format!("Merged {base} into {branch}")),
+        Err(e) => {
+            let conflicted = run(dir, &["diff", "--name-only", "--diff-filter=U"])
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            if conflicted.is_empty() {
+                return Err(e);
+            }
+            let _ = run(dir, &["merge", "--abort"]);
+            Err(format!(
+                "{base} conflicts with {branch} in {}; nothing changed. Merge it in a terminal there to resolve them",
+                conflicted.join(", ")
+            ))
+        }
+    }
+}
+
+/// Stages everything in the workspace, untracked files too, and commits
+/// it with `message`.
+pub fn commit_all(dir: &Path, message: &str) -> Result<String, String> {
+    if message.trim().is_empty() {
+        return Err("Write a commit message first".into());
+    }
+    let files = run(dir, &["status", "--porcelain"])?
+        .lines()
+        .filter(|l| !l.is_empty())
+        .count();
+    if files == 0 {
+        return Err("Nothing to commit".into());
+    }
+    run(dir, &["add", "--all"])?;
+    crate::project::git::commit(dir, message)?;
+    Ok(match files {
+        1 => "Committed 1 file".to_owned(),
+        n => format!("Committed {n} files"),
+    })
+}
+
+/// `gh` in `dir`, never asking anything: what it printed, or its error.
+fn run_gh(dir: &Path, args: &[&str]) -> Result<String, String> {
+    let gh = gh().ok_or("GitHub's gh is not installed")?;
+    let output = Command::new(gh)
+        .current_dir(dir)
+        .args(args)
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("NO_COLOR", "1")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| e.to_string())?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    } else {
+        let said = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        Err(said.lines().last().unwrap_or("gh failed").to_owned())
+    }
+}
+
+/// Whether `gh` is there to ask about pull requests.
+pub fn has_gh() -> bool {
+    gh().is_some()
+}
+
+/// Opens a pull request for the workspace's branch, its title and body
+/// from the commits. The branch must be pushed first.
+pub fn create_pull_request(dir: &Path) -> Result<String, String> {
+    let url = run_gh(dir, &["pr", "create", "--fill"])?;
+    Ok(format!(
+        "Opened {}",
+        url.lines().last().unwrap_or("the pull request")
+    ))
+}
+
+/// How a pull request is merged on GitHub.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MergeStrategy {
+    Squash,
+    Merge,
+    Rebase,
+}
+
+impl MergeStrategy {
+    fn flag(self) -> &'static str {
+        match self {
+            MergeStrategy::Squash => "--squash",
+            MergeStrategy::Merge => "--merge",
+            MergeStrategy::Rebase => "--rebase",
+        }
+    }
+}
+
+/// Merges pull request `number` on GitHub. The branch and its worktree
+/// stay; removing them is the task menu's.
+pub fn merge_pull_request(
+    dir: &Path,
+    number: u64,
+    strategy: MergeStrategy,
+) -> Result<String, String> {
+    let n = number.to_string();
+    run_gh(dir, &["pr", "merge", &n, strategy.flag()])?;
+    Ok(format!("Merged pull request #{number}"))
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reads_a_pull_requests_details_and_each_check() {
+        let pr = parse_pull_request(
+            r#"{"number":648,"state":"OPEN","url":"u","title":"Kill the session","author":{"login":"sam"},"commits":[{},{},{},{}],"additions":423,"deletions":42,"baseRefName":"main","headRefName":"fix/close","isDraft":false,"mergeable":"MERGEABLE","statusCheckRollup":[{"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"SUCCESS"},{"__typename":"CheckRun","name":"lint","status":"COMPLETED","conclusion":"SKIPPED"},{"__typename":"StatusContext","context":"ci/policy","state":"PENDING"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                pr.title.as_str(),
+                pr.author.as_str(),
+                pr.commits,
+                pr.additions,
+                pr.deletions,
+                pr.base.as_str(),
+                pr.head.as_str(),
+                pr.mergeable.as_str(),
+            ),
+            (
+                "Kill the session",
+                "sam",
+                4,
+                423,
+                42,
+                "main",
+                "fix/close",
+                "MERGEABLE"
+            )
+        );
+        let names: Vec<(&str, CheckState)> =
+            pr.list.iter().map(|c| (c.name.as_str(), c.state)).collect();
+        assert_eq!(
+            names,
+            [
+                ("build", CheckState::Passed),
+                ("lint", CheckState::Skipped),
+                ("ci/policy", CheckState::Running)
+            ]
+        );
+        assert_eq!(pr.checks, Checks::Running);
+    }
+
+    #[test]
+    fn reads_counts_and_numstat() {
+        assert_eq!(parse_left_right("3\t5\n"), (3, 5));
+        assert_eq!(parse_left_right(""), (0, 0));
+        assert_eq!(
+            parse_numstat("10\t2\tsrc/a.rs\n-\t-\tlogo.png\n1\t0\tb.md\n"),
+            (3, 11, 2)
+        );
+    }
+
     #[test]
     fn reads_a_pull_request_and_its_checks() {
         let pr = parse_pull_request(

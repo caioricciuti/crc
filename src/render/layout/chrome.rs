@@ -193,6 +193,8 @@ pub struct Chrome {
     pub response: Option<Viewport>,
     /// The terminal panel under the editor column, spanning every pane.
     pub terminal: Option<Viewport>,
+    /// Agents mode's workspace inspector, at the right of the terminal.
+    pub inspector: Option<Viewport>,
     /// The text itself: line numbers and lines, nothing else.
     pub text: Viewport,
     /// Across the bottom of the whole window.
@@ -349,6 +351,7 @@ impl Chrome {
             find,
             response,
             terminal,
+            inspector: None,
             text,
             status,
             preview: None,
@@ -385,8 +388,10 @@ impl Chrome {
     /// Agents mode: the terminal takes the editor column whole, and the
     /// activity strip goes, so the sidebar starts at the window's edge.
     /// The editor's rectangles are left with no height at the column's
-    /// top, so nothing draws or answers a click there.
-    pub fn terminal_only(mut self) -> Chrome {
+    /// top, so nothing draws or answers a click there. `inspector` is the
+    /// workspace inspector's width, taken from the column's right when the
+    /// terminal keeps `terminal_min` beside it.
+    pub fn terminal_only(mut self, inspector: Option<f32>, terminal_min: f32) -> Chrome {
         let strip = self.activity.width;
         self.activity.width = 0.0;
         if let Some(sidebar) = &mut self.sidebar {
@@ -410,6 +415,15 @@ impl Chrome {
         self.preview = None;
         self.others.clear();
         self.panes = 1;
+        let mut column = column;
+        if let Some(width) = inspector.filter(|w| column.width - w >= terminal_min) {
+            column.width -= width;
+            self.inspector = Some(Viewport {
+                x: column.x + column.width,
+                width,
+                ..column
+            });
+        }
         self.terminal = Some(column);
         self
     }

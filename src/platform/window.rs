@@ -62,6 +62,7 @@ mod find;
 mod git_menu;
 mod http;
 mod input;
+mod inspector;
 mod lsp;
 mod lsp_features;
 mod mcp;
@@ -684,6 +685,9 @@ struct State {
     mcp_url_prompt: bool,
     /// The palette is taking a new task's name.
     task_prompt: bool,
+    /// The palette is taking a commit message for everything in this
+    /// workspace, by name.
+    commit_prompt: Option<String>,
     /// The branch picker's list, being read by a worker.
     branch_rx: Option<mpsc::Receiver<Result<BranchPick, String>>>,
     /// `organize_imports_on_save` from the settings.
@@ -1903,6 +1907,13 @@ define_class!(
                 if x > 120.0 && let Some(window) = self.window() {
                     window.performWindowDragWithEvent(event);
                 }
+                return;
+            }
+
+            if let Some(rect) = chrome.inspector
+                && rect.contains(x, y)
+            {
+                self.inspector_click(event, x, y);
                 return;
             }
 
@@ -3726,9 +3737,54 @@ define_class!(
             self.agent_merge();
         }
 
-        #[unsafe(method(agentPushPullRequest:))]
-        fn action_agent_push_pull_request(&self, _sender: Option<&AnyObject>) {
-            self.agent_push_pull_request();
+        #[unsafe(method(agentCommitAll:))]
+        fn action_agent_commit_all(&self, _sender: Option<&AnyObject>) {
+            self.agent_commit_prompt();
+        }
+
+        #[unsafe(method(agentPull:))]
+        fn action_agent_pull(&self, _sender: Option<&AnyObject>) {
+            self.agent_remote(crate::project::git::Remote::Pull);
+        }
+
+        #[unsafe(method(agentPush:))]
+        fn action_agent_push(&self, _sender: Option<&AnyObject>) {
+            self.agent_remote(crate::project::git::Remote::Push);
+        }
+
+        #[unsafe(method(agentUpdateFromBase:))]
+        fn action_agent_update_from_base(&self, _sender: Option<&AnyObject>) {
+            self.agent_update_from_base();
+        }
+
+        #[unsafe(method(agentCreatePullRequest:))]
+        fn action_agent_create_pull_request(&self, _sender: Option<&AnyObject>) {
+            self.agent_create_pull_request();
+        }
+
+        #[unsafe(method(agentMergeSquash:))]
+        fn action_agent_merge_squash(&self, _sender: Option<&AnyObject>) {
+            self.agent_merge_pull_request(crate::project::worktree::MergeStrategy::Squash);
+        }
+
+        #[unsafe(method(agentMergeCommit:))]
+        fn action_agent_merge_commit(&self, _sender: Option<&AnyObject>) {
+            self.agent_merge_pull_request(crate::project::worktree::MergeStrategy::Merge);
+        }
+
+        #[unsafe(method(agentMergeRebase:))]
+        fn action_agent_merge_rebase(&self, _sender: Option<&AnyObject>) {
+            self.agent_merge_pull_request(crate::project::worktree::MergeStrategy::Rebase);
+        }
+
+        #[unsafe(method(toggleInspector:))]
+        fn action_toggle_inspector(&self, _sender: Option<&AnyObject>) {
+            self.toggle_inspector();
+        }
+
+        #[unsafe(method(agentsTick:))]
+        fn action_agents_tick(&self, _sender: Option<&AnyObject>) {
+            self.agents_tick();
         }
 
         #[unsafe(method(agentOpenPullRequest:))]
@@ -6771,7 +6827,15 @@ fn chrome_of(state: &State) -> Chrome {
                 .metrics
                 .snap(state.sidebar_width.clamp(SIDEBAR_MIN, SIDEBAR_MAX))
         });
-        return Chrome::with_panes(state.viewport, sidebar, 0, false, 1, 0, None).terminal_only();
+        let inspector = (!state.agents.inspector.hidden).then(|| {
+            state
+                .renderer
+                .atlas
+                .metrics
+                .snap(crate::platform::inspector::WIDTH)
+        });
+        return Chrome::with_panes(state.viewport, sidebar, 0, false, 1, 0, None)
+            .terminal_only(inspector, crate::platform::inspector::TERMINAL_MIN);
     }
     // On a whole device pixel. The divider is dragged to wherever the pointer
     // is, and everything right of it is positioned from it, so a width of
@@ -6950,6 +7014,9 @@ enum Pick {
     NewTask(String),
     /// A folder workspace to make (or rename to), by what was typed.
     NewWorkspace(String),
+    /// Commit everything in the workspace being asked about, with this
+    /// message.
+    CommitAll(String),
 }
 
 /// The New Workspace prompt's rows: a folder workspace on `folder` (or,
@@ -6984,7 +7051,7 @@ fn task_rows(
         layout::PaletteRow {
             icon: Some(crate::project::icons::FOLDER),
             title: format!("New workspace \u{201c}{name}\u{201d}"),
-            detail: format!("in {in_folder}, with Claude"),
+            detail: format!("in {in_folder}, with a terminal"),
             shortcut: String::new(),
         },
         Pick::NewWorkspace(name.to_owned()),
@@ -6995,7 +7062,7 @@ fn task_rows(
             layout::PaletteRow {
                 icon: Some(crate::project::icons::GIT_BRANCH),
                 title: format!("Start \u{201c}{branch}\u{201d} on a new branch"),
-                detail: "from HEAD, in its own worktree, with Claude".into(),
+                detail: "from HEAD, in its own worktree, with a terminal".into(),
                 shortcut: String::new(),
             },
             Pick::NewTask(name.to_owned()),
@@ -7235,6 +7302,8 @@ struct PaletteSources<'a> {
     task_repo: bool,
     /// The folder workspace being renamed, by name.
     task_rename: Option<&'a str>,
+    /// Set while taking a commit message, the workspace's name.
+    commit: Option<&'a str>,
 }
 
 /// The rows of the open palette for its query; none when it is closed.
@@ -7262,6 +7331,7 @@ fn palette_sources(state: &State) -> PaletteSources<'_> {
             .renaming
             .as_deref()
             .and_then(|id| id.strip_prefix("folder:")),
+        commit: state.commit_prompt.as_deref(),
     }
 }
 
@@ -7277,11 +7347,15 @@ enum PaletteMode {
     McpUrl,
     /// A new task's name.
     TaskName,
+    /// A commit message.
+    CommitMessage,
 }
 
 impl PaletteMode {
     fn of(sources: &PaletteSources<'_>) -> PaletteMode {
-        if sources.mcp_url {
+        if sources.commit.is_some() {
+            PaletteMode::CommitMessage
+        } else if sources.mcp_url {
             PaletteMode::McpUrl
         } else if sources.task {
             PaletteMode::TaskName
@@ -7324,8 +7398,14 @@ fn palette_heading(
         }
         PaletteMode::TaskName => {
             return (
-                "New task: a branch and worktree of its own, with Claude in it",
+                "New workspace: on the folder, or on a branch in a worktree of its own",
                 "Type a name with a letter or digit in it",
+            );
+        }
+        PaletteMode::CommitMessage => {
+            return (
+                "Commit every change in the workspace: type the message",
+                "Type a commit message",
             );
         }
         PaletteMode::Open => {}
@@ -7355,7 +7435,23 @@ fn palette_rows(sources: &PaletteSources<'_>, query: &str) -> Vec<(layout::Palet
         task_folder,
         task_repo,
         task_rename,
+        commit,
     } = *sources;
+    if let Some(workspace) = commit {
+        let message = query.trim();
+        if message.is_empty() {
+            return Vec::new();
+        }
+        return vec![(
+            layout::PaletteRow {
+                icon: Some(crate::project::icons::GIT_COMMIT),
+                title: format!("Commit \u{201c}{message}\u{201d}"),
+                detail: format!("every change in {workspace}, new files too"),
+                shortcut: String::new(),
+            },
+            Pick::CommitAll(message.to_owned()),
+        )];
+    }
     if mcp_url {
         return mcp_url_rows(query);
     }
@@ -8019,6 +8115,10 @@ fn install_menu(mtm: MainThreadMarker, app: &NSApplication) {
     view_menu.addItem(&NSMenuItem::separatorItem(mtm));
     view_menu.addItem(&item("Agents", sel!(toggleAgents:), "a", true));
     view_menu.addItem(&item("New Workspace\u{2026}", sel!(newTask:), "n", true));
+    let inspector = item("Workspace Inspector", sel!(toggleInspector:), "i", false);
+    inspector
+        .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
+    view_menu.addItem(&inspector);
     view_menu.addItem(&item(
         "Next Waiting Agent",
         sel!(nextWaitingAgent:),
@@ -8467,6 +8567,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         repo_list: None,
         mcp_url_prompt: false,
         task_prompt: false,
+        commit_prompt: None,
         workspace,
         home: None,
         home_rx,

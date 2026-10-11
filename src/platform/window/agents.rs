@@ -57,6 +57,9 @@ impl EditorView {
         if start {
             self.spawn_terminal(false);
         }
+        if on {
+            self.arm_agents_tick();
+        }
         self.after_terminal_layout();
         self.resume_display_link();
     }
@@ -116,6 +119,7 @@ impl EditorView {
         if ensure {
             self.ensure_workspace();
         }
+        self.want_inspector();
         if let Some(dir) = start_in {
             // A worktree's id is its path: selectable before the list
             // comes back with it.
@@ -227,7 +231,7 @@ impl EditorView {
             Action::Blank => self.new_blank_workspace(),
             Action::Menu(index) => {
                 if let Some(mut state) = self.state_mut() {
-                    state.agents.menu_task = Some(index);
+                    state.agents.menu_task = state.agents.tasks.get(index).map(|t| t.id());
                 }
                 let menu = self.task_menu(index);
                 layout::set_pressed(None);
@@ -413,7 +417,7 @@ impl EditorView {
             }
             Some(Action::Select(index) | Action::NewSession(index) | Action::Menu(index)) => {
                 if let Some(mut state) = self.state_mut() {
-                    state.agents.menu_task = Some(index);
+                    state.agents.menu_task = state.agents.tasks.get(index).map(|t| t.id());
                 }
                 self.task_menu(index)
             }
@@ -493,16 +497,17 @@ impl EditorView {
     /// Forgets a folder workspace once asked; its sessions close. Nothing
     /// on disk changes.
     pub(super) fn agent_remove_workspace(&self) {
-        let Some(index) = self.state().and_then(|state| state.agents.menu_task) else {
-            return;
-        };
         let Some(task) = self.menu_task().filter(|t| t.folder) else {
             return;
         };
+        let id = task.id();
         let sessions: Vec<usize> = self.state().map_or_else(Vec::new, |state| {
             let tasks = &state.agents.tasks;
             (0..state.terminal.tabs.len())
-                .filter(|i| task_of(tasks, &state.terminal.tabs[*i]) == Some(index))
+                .filter(|i| {
+                    task_of(tasks, &state.terminal.tabs[*i]).map(|t| tasks[t].id())
+                        == Some(id.clone())
+                })
                 .collect()
         });
         let detail = match sessions.len() {
@@ -596,9 +601,16 @@ impl EditorView {
             add("Rename Workspace\u{2026}", sel!(agentRenameWorkspace:));
             add("Remove Workspace\u{2026}", sel!(agentRemoveWorkspace:));
         }
-        if !main && let Some(branch) = branch {
+        if !folder {
             menu.addItem(&NSMenuItem::separatorItem(mtm));
+            add("Commit All\u{2026}", sel!(agentCommitAll:));
+            add("Pull", sel!(agentPull:));
+            add("Push", sel!(agentPush:));
+        }
+        if !main && let Some(branch) = branch {
             let into = base.unwrap_or_else(|| "the main checkout".into());
+            add(&format!("Merge {into} In"), sel!(agentUpdateFromBase:));
+            menu.addItem(&NSMenuItem::separatorItem(mtm));
             add(&format!("Merge {branch} into {into}"), sel!(agentMerge:));
             match pr {
                 Some(number) => {
@@ -606,9 +618,15 @@ impl EditorView {
                         &format!("Open Pull Request #{number}"),
                         sel!(agentOpenPullRequest:),
                     );
-                    add("Push", sel!(agentPushPullRequest:));
+                    let merge = menu_item(
+                        mtm,
+                        &format!("Merge Pull Request #{number}"),
+                        sel!(agentMergeSquash:),
+                    );
+                    merge.setSubmenu(Some(&self.merge_strategy_menu()));
+                    menu.addItem(&merge);
                 }
-                None => add("Push and Open Pull Request", sel!(agentPushPullRequest:)),
+                None => add("Create Pull Request", sel!(agentCreatePullRequest:)),
             }
             menu.addItem(&NSMenuItem::separatorItem(mtm));
             add("Remove Task\u{2026}", sel!(agentRemove:));
@@ -617,9 +635,10 @@ impl EditorView {
     }
 
     /// The workspace the menu was opened on.
-    fn menu_task(&self) -> Option<crate::platform::agents::Workspace> {
+    pub(super) fn menu_task(&self) -> Option<crate::platform::agents::Workspace> {
         let state = self.state()?;
-        state.agents.tasks.get(state.agents.menu_task?).cloned()
+        let id = state.agents.menu_task.as_deref()?;
+        state.agents.tasks.iter().find(|t| t.id() == id).cloned()
     }
 
     pub(super) fn agent_menu_new_session(&self, claude: bool) {
@@ -693,41 +712,11 @@ impl EditorView {
         }
     }
 
-    /// Pushes the task's branch, and opens a pull request with `gh` when it
-    /// has none, typed into a shell of its own so sign-in prompts and
-    /// answers show.
-    pub(super) fn agent_push_pull_request(&self) {
-        let Some(task) = self.menu_task() else {
-            return;
-        };
-        let has_pr = self.state().is_some_and(|state| {
-            state
-                .agents
-                .info
-                .get(&task.path)
-                .is_some_and(|info| info.pull_request.is_some())
-        });
-        if let Some(mut state) = self.state_mut() {
-            state.agents.selected = Some(task.id());
-        }
-        self.set_agents_mode(true);
-        self.spawn_terminal_in(false, Some(&task.path));
-        if let Some(mut state) = self.state_mut()
-            && let Some(tab) = state.terminal.active_tab_mut()
-        {
-            tab.session.write(if has_pr {
-                b"git push -u origin HEAD\n"
-            } else {
-                b"git push -u origin HEAD && gh pr create --fill\n"
-            });
-        }
-    }
-
     /// Removes the task's worktree once asked: its sessions close, Git
     /// refuses while it has uncommitted changes, and an unmerged branch is
     /// kept.
     pub(super) fn agent_remove(&self) {
-        let Some(index) = self.state().and_then(|state| state.agents.menu_task) else {
+        let Some(id) = self.menu_task().map(|t| t.id()) else {
             return;
         };
         let Some(worktree) = self.menu_task().and_then(|t| t.worktree()) else {
@@ -738,7 +727,8 @@ impl EditorView {
             let tasks = &state.agents.tasks;
             (0..state.terminal.tabs.len())
                 .filter(|i| {
-                    task_of(tasks, &state.terminal.tabs[*i]) == Some(index)
+                    task_of(tasks, &state.terminal.tabs[*i]).map(|t| tasks[t].id())
+                        == Some(id.clone())
                         || state.terminal.tabs[*i].folder.starts_with(&task.path)
                 })
                 .collect()
@@ -792,7 +782,7 @@ impl EditorView {
         for index in sessions.into_iter().rev() {
             state.terminal.close_tab(index);
         }
-        if state.agents.selected_index().is_some_and(|i| i == index) {
+        if state.agents.selected.as_deref() == Some(id.as_str()) {
             state.agents.selected = Some(main.to_string_lossy().into_owned());
         }
         let name = task.name();

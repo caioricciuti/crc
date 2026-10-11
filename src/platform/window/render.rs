@@ -76,6 +76,7 @@ impl EditorView {
             repo_list,
             mcp_url_prompt,
             task_prompt,
+            commit_prompt,
             extensions,
             settings_page,
             review_page,
@@ -149,6 +150,7 @@ impl EditorView {
             find: find_rect,
             response: response_rect,
             terminal: terminal_rect,
+            inspector: inspector_rect,
             text: editor_rect,
             status: status_rect,
             preview: _,
@@ -705,6 +707,25 @@ impl EditorView {
                 theme,
                 glyphs,
             );
+            if let Some(rect) = inspector_rect {
+                let selected = agents.selected_index().map(|i| agents.tasks[i].clone());
+                // A pull request is a worktree branch's, once its row is read.
+                let pull_request = selected
+                    .as_ref()
+                    .filter(|w| !w.main && !w.folder && w.branch.is_some())
+                    .and_then(|w| agents.info.get(&w.path))
+                    .map(|info| info.pull_request.clone());
+                let github = agents.github.unwrap_or(false);
+                agents.inspector.draw(
+                    selected.as_ref(),
+                    pull_request.as_ref().map(Option::as_ref),
+                    github,
+                    &mut renderer.atlas,
+                    rect,
+                    theme,
+                    glyphs,
+                );
+            }
         } else if let Some(rect) = sidebar_rect
             && let Some(page) = extensions.as_mut()
         {
@@ -950,6 +971,7 @@ impl EditorView {
                     .renaming
                     .as_deref()
                     .and_then(|id| id.strip_prefix("folder:")),
+                commit: commit_prompt.as_deref(),
             };
             let mode = PaletteMode::of(&sources);
             let intent = sources.branches.map(|pick| &pick.intent);
@@ -976,7 +998,8 @@ impl EditorView {
                         PaletteMode::Action => "Filter actions",
                         PaletteMode::Repo => "Repository name",
                         PaletteMode::McpUrl => "https://host/mcp",
-                        PaletteMode::TaskName => "What the agent should work on",
+                        PaletteMode::TaskName => "Workspace name",
+                        PaletteMode::CommitMessage => "Commit message",
                         PaletteMode::Open => {
                             "Find a file  ·  > commands  ·  @ symbols  ·  # in project"
                         }
@@ -991,6 +1014,8 @@ impl EditorView {
                         "Add"
                     } else if mode == PaletteMode::TaskName {
                         "Start"
+                    } else if mode == PaletteMode::CommitMessage {
+                        "Commit"
                     } else if mode == PaletteMode::Action || commands::query(&text).is_some() {
                         "Run"
                     } else {

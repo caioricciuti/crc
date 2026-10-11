@@ -13,6 +13,18 @@ One entry per tag, written for people who use the editor.
   outside Git the folder becomes a workspace, named after it, the first
   time a terminal needs one, and a click on the empty part of the
   workspace list makes a new workspace with a terminal in it.
+- The workspace inspector, at the right of Agents mode (`Cmd-Option-I`
+  hides it): the selected branch against main (ahead, behind, lines
+  changed), its upstream (to push, to pull), its uncommitted files, and
+  for the main checkout the latest tag. Buttons commit everything with
+  a message typed in the palette, merge main in (never a rebase; a
+  conflict leaves nothing changed), pull and push. With `gh` it shows
+  the pull request with its author, commits, lines and every check, and
+  opens or merges it (squash, merge commit or rebase, asked each time
+  and confirmed). The workspace menu has the same operations.
+- The workspace list puts what needs you first after the main checkout
+  (a session waiting on you, failing checks, a pull request ready to
+  merge) and is read again every minute while Agents mode is on.
 
 ## v0.2.0-alpha.19, 2026-10-11
 

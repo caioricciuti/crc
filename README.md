@@ -127,14 +127,27 @@ the size and write it back.
   open folder becomes one, named after it, and a click on the empty part
   of the list makes another with a terminal. Terminals run your login
   shell; type `claude` to start Claude Code. `Cmd-T` (or the tab bar's
-  +) opens another terminal in the selected workspace; `Ctrl-1..9` show a workspace and `Cmd-Shift-U` the next
-  session waiting on you, which the Dock icon counts. A right-click on a
-  workspace opens it in the editor, merges its branch into the main
-  checkout, pushes it and opens a pull request with `gh`, removes it
-  (refused while it has uncommitted changes), or renames and forgets a
-  folder workspace; on a session it offers another session beside it, or
-  closes it. Each row says how far the branch is ahead, or its pull
-  request and checks when `gh` is installed. `Cmd-\` shows two of a
+  +) opens another terminal in the selected workspace; `Ctrl-1..9` show
+  a workspace and `Cmd-Shift-U` the next session waiting on you, which
+  the Dock icon counts. The list puts what needs you first, after the
+  main checkout: a session waiting on you, then failing checks, then a
+  pull request ready to merge; it is read again every minute.
+- **The workspace inspector** (right of the terminal in Agents mode,
+  `Cmd-Option-I` to hide or show it) says where the selected
+  workspace's branch stands: commits ahead of and behind main, the lines
+  it changes, what is left to push or pull, and its uncommitted files;
+  for the main checkout, the latest tag and the commits since. Its
+  buttons commit everything (the message is typed in the palette),
+  merge main into the branch (a merge, never a rebase; on a conflict
+  nothing changes), pull (fast-forward only) and push. With `gh`
+  installed it shows the branch's pull request (title, author, commits,
+  lines, each check) and opens one, or merges it on GitHub: squash,
+  merge commit or rebase, chosen each time and confirmed. The same
+  operations are on a workspace's right-click menu, with opening it in
+  the editor, merging its branch into the main checkout, removing it
+  (refused while it has uncommitted changes), and renaming or forgetting
+  a folder workspace; on a session the menu offers another session
+  beside it, or closes it. Releases stay outside crc. `Cmd-\` shows two of a
   workspace's sessions side by side. A session's state comes from the
   agent itself when it reports it (Claude Code 2.1.295 and later speak
   the Program Status Protocol, OSC 7501): working, waiting on a
@@ -338,6 +351,7 @@ the size and write it back.
 | `Cmd-Shift-N` | new workspace: a folder, or a branch in its own worktree, with a terminal |
 | `Cmd-T` (Agents mode) | another terminal in the selected workspace |
 | `Ctrl-1..9`, `Cmd-Shift-U` | show a workspace / the next agent waiting on you |
+| `Cmd-Option-I` (Agents mode) | hide or show the workspace inspector |
 | `` Ctrl-` `` / `Cmd-J` | terminal panel |
 | `>` in `Cmd-P` | run a menu command |
 | `Cmd-N` | new file: a name field in the sidebar |

@@ -122,6 +122,7 @@ impl EditorView {
             state.lsp.action_list = None;
             state.mcp_url_prompt = false;
             state.task_prompt = false;
+            state.commit_prompt = None;
             let mut query = Buffer::new();
             if !prefix.is_empty() {
                 query.insert(prefix);
@@ -189,6 +190,7 @@ impl EditorView {
             Pick::McpUrl(url) => self.add_mcp_url(url),
             Pick::NewTask(name) => self.create_task(name),
             Pick::NewWorkspace(name) => self.create_workspace(name),
+            Pick::CommitAll(message) => self.agent_commit_all(message),
             Pick::Repo(path) => self.select_repo(&path),
             Pick::Symbol(path, line) => self.go_to_symbol(path, line),
             Pick::Command(at, tag) => self.run_command(at, tag),
@@ -276,6 +278,7 @@ impl EditorView {
             state.lsp.action_list = None;
             state.mcp_url_prompt = false;
             state.task_prompt = false;
+            state.commit_prompt = None;
         }
         self.request_redraw();
         self.pump();
