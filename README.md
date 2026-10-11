@@ -283,9 +283,9 @@ the size and write it back.
   add them to its settings.
 - **Agents mode is local.** A workspace's sessions outlive crc but not a
   reboot, a session taken back after a restart has lost its link to the
-  editor (`/ide` in Claude Code reconnects it), the pull request row is
-  read when the list loads, not kept current, and tasks run on this Mac
-  only.
+  editor (`/ide` in Claude Code reconnects it), pull requests and checks
+  are read again every minute rather than live, and tasks run on this
+  Mac only.
 - **No minimap.** Folding is by indentation, not by syntax.
 - **Markdown styling has edges.** Italic is not drawn on lines with
   non-ASCII text, and bold there is the regular face drawn twice; a line
