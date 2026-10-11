@@ -118,14 +118,18 @@ the size and write it back.
   questions mark its tab. `agent_review = false` turns them off.
 - **Agents mode** (`Cmd-Shift-A`, or the Editor / Agents switch in the
   toolbar): the terminal takes the editor column, the activity bar goes,
-  and the sidebar lists workspaces, each with its own sessions, marked
-  waiting, working or idle. Every Git worktree of the open repository is
+  and the sidebar lists workspaces, one row each: its name, and under it
+  what a session waiting on you asks, what a working agent says, or its
+  terminals and branch; at the right how many wait on you and its pull
+  request, coloured by its checks. The terminal's tabs are the selected
+  workspace's sessions. Every Git worktree of the open repository is
   one, and New Workspace (`Cmd-Shift-N`) adds one on any folder, or, in
   a repository, a task on a new branch in a worktree under
   `~/Library/Application Support/crc/worktrees/`; both open a terminal
   in it. Every terminal belongs to a workspace: outside a repository the
-  open folder becomes one, named after it, and a click on the empty part
-  of the list makes another with a terminal. Terminals run your login
+  open folder becomes one, named after it, and a double-click on the
+  empty part of the list makes another with a terminal; a double-click
+  on a folder workspace renames it. Terminals run your login
   shell; type `claude` to start Claude Code. `Cmd-T` (or the tab bar's
   +) opens another terminal in the selected workspace; `Ctrl-1..9` show
   a workspace and `Cmd-Shift-U` the next session waiting on you, which

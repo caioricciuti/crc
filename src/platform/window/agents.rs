@@ -182,8 +182,8 @@ impl EditorView {
         true
     }
 
-    /// The click on the empty part of the list: a new folder workspace on
-    /// the open folder, named after it, with a terminal in it.
+    /// A double-click on the empty part of the list: a new folder workspace
+    /// on the open folder, named after it, with a terminal in it.
     fn new_blank_workspace(&self) {
         let Some(folder) = self.workspace_folder() else {
             return;
@@ -217,6 +217,18 @@ impl EditorView {
                 }
                 self.resume_display_link();
             }
+            // A double-click on a folder workspace renames it.
+            Action::Select(index) if event.clickCount() >= 2 => {
+                let folder = self
+                    .state()
+                    .is_some_and(|state| state.agents.tasks.get(index).is_some_and(|t| t.folder));
+                if folder {
+                    if let Some(mut state) = self.state_mut() {
+                        state.agents.menu_task = state.agents.tasks.get(index).map(|t| t.id());
+                    }
+                    self.agent_rename_workspace();
+                }
+            }
             Action::Select(index) => self.select_task(index),
             Action::Session(tab) => self.show_session(tab),
             Action::NewSession(index) => {
@@ -228,7 +240,10 @@ impl EditorView {
                 }
                 self.spawn_terminal_in(false, Some(&dir));
             }
-            Action::Blank => self.new_blank_workspace(),
+            // Only a double-click makes something: a stray click on the
+            // empty part of the list does nothing.
+            Action::Blank if event.clickCount() >= 2 => self.new_blank_workspace(),
+            Action::Blank => {}
             Action::Menu(index) => {
                 if let Some(mut state) = self.state_mut() {
                     state.agents.menu_task = state.agents.tasks.get(index).map(|t| t.id());

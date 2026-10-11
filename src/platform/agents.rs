@@ -20,6 +20,8 @@ use crate::render::{
 pub const ROW: f32 = 26.0;
 /// Under a task, its sessions start this far in.
 const INDENT: f32 = 22.0;
+/// A workspace's row: its name, and a line under it.
+pub const CARD: f32 = 46.0;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -569,11 +571,10 @@ impl Panel {
         self.selected = self.tasks.get(index).map(Workspace::id);
     }
 
-    /// A session's row, then its team's tasks: the open ones, and the
-    /// finished ones while anything is still open, so a list in progress
-    /// reads whole and a finished one folds away.
-    fn session_lines(&self, tabs: &[Tab], tab: usize, lines: &mut Vec<Line>) {
-        lines.push(Line::Session(tab));
+    /// A session's team tasks: the open ones, and the finished ones while
+    /// anything is still open, so a list in progress reads whole and a
+    /// finished one folds away.
+    fn team_lines(&self, tabs: &[Tab], tab: usize, lines: &mut Vec<Line>) {
         let Some(team) = self.teams.get(&tabs[tab].review) else {
             return;
         };
@@ -583,16 +584,22 @@ impl Panel {
         lines.extend((0..team.tasks.len()).map(|i| Line::TeamTask(tab, i)));
     }
 
+    /// One row per workspace, as cmux and supacode have it: its sessions
+    /// are the terminal's tabs, not rows here. The selected workspace's
+    /// team tasks follow it; a session no workspace holds gets a row.
     fn lines(&self, tabs: &[Tab]) -> Vec<Line> {
         let mut lines = Vec::new();
         if let Some(note) = &self.note {
             lines.push(Line::Note(note.clone()));
         }
         let owner: Vec<Option<usize>> = tabs.iter().map(|t| task_of(&self.tasks, t)).collect();
+        let selected = self.selected_index();
         for task in 0..self.tasks.len() {
             lines.push(Line::Task(task));
-            for (tab, _) in owner.iter().enumerate().filter(|(_, o)| **o == Some(task)) {
-                self.session_lines(tabs, tab, &mut lines);
+            if selected == Some(task) {
+                for (tab, _) in owner.iter().enumerate().filter(|(_, o)| **o == Some(task)) {
+                    self.team_lines(tabs, tab, &mut lines);
+                }
             }
         }
         let loose: Vec<usize> = (0..tabs.len()).filter(|i| owner[*i].is_none()).collect();
@@ -601,26 +608,44 @@ impl Panel {
                 lines.push(Line::Heading("Other folders"));
             }
             for tab in loose {
-                self.session_lines(tabs, tab, &mut lines);
+                lines.push(Line::Session(tab));
+                self.team_lines(tabs, tab, &mut lines);
             }
         }
-        if tabs.is_empty() && self.tasks.len() <= 1 {
+        if self.tasks.is_empty() {
             lines.push(Line::Note(
-                "Click below or \u{21e7}\u{2318}N for a new workspace".into(),
+                "Double-click below, or \u{21e7}\u{2318}N, for a workspace".into(),
             ));
         }
         lines
     }
 
-    fn visible(column: Viewport) -> usize {
-        ((column.height - layout::SIDEBAR_HEADER_HEIGHT).max(0.0) / ROW).floor() as usize
+    fn height(line: &Line) -> f32 {
+        match line {
+            Line::Task(_) => CARD,
+            _ => ROW,
+        }
+    }
+
+    /// The first line that can be at the top: the list's end stays at the
+    /// bottom of `room`, not above it.
+    fn max_scroll(lines: &[Line], room: f32) -> usize {
+        let mut used = 0.0;
+        for (n, line) in lines.iter().enumerate().rev() {
+            used += Panel::height(line);
+            if used > room {
+                return n + 1;
+            }
+        }
+        0
+    }
+
+    fn room(column: Viewport) -> f32 {
+        (column.height - layout::SIDEBAR_HEADER_HEIGHT).max(0.0)
     }
 
     pub fn scroll_by(&mut self, lines: isize, column: Viewport, tabs: &[Tab]) {
-        let max = self
-            .lines(tabs)
-            .len()
-            .saturating_sub(Panel::visible(column));
+        let max = Panel::max_scroll(&self.lines(tabs), Panel::room(column));
         self.scroll = (self.scroll as isize + lines).clamp(0, max as isize) as usize;
     }
 
@@ -722,8 +747,11 @@ impl Panel {
     ) {
         self.hits.clear();
         // Ordered here, so the rows and their hits agree until the next
-        // frame whatever changed in between.
-        self.arrange(tabs);
+        // frame whatever changed in between; never under the pointer, so a
+        // row does not move away from a click (cmux defers the same way).
+        if !layout::hovered(column) {
+            self.arrange(tabs);
+        }
         layout::push_rect(
             out,
             atlas,
@@ -758,11 +786,20 @@ impl Panel {
         let x = column.x + 10.0;
         let width = (column.width - 20.0).max(0.0);
         let lines = self.lines(tabs);
-        let rows = Panel::visible(column);
-        self.scroll = self.scroll.min(lines.len().saturating_sub(rows));
+        let room = Panel::room(column);
+        self.scroll = self.scroll.min(Panel::max_scroll(&lines, room));
         let selected = self.selected_index();
-        let shown = lines.len().saturating_sub(self.scroll).min(rows);
-        let blank_top = top + shown as f32 * ROW;
+        let mut placed = Vec::new();
+        let mut used = 0.0;
+        for line in lines.iter().skip(self.scroll) {
+            let h = Panel::height(line);
+            if used + h > room {
+                break;
+            }
+            placed.push((top + used, line));
+            used += h;
+        }
+        let blank_top = top + used;
         let blank_bottom = column.y + column.height - if self.op.is_some() { ROW } else { 0.0 };
         if blank_bottom - blank_top >= ROW {
             self.hits.push((
@@ -775,8 +812,7 @@ impl Panel {
                 Action::Blank,
             ));
         }
-        for (n, line) in lines.iter().skip(self.scroll).take(rows).enumerate() {
-            let y = top + n as f32 * ROW;
+        for (y, line) in placed {
             let row = Viewport {
                 x: column.x + 4.0,
                 y,
@@ -797,161 +833,10 @@ impl Panel {
                     layout::push_ui_text(out, atlas, text_rect(2.0, 0.0), text, theme.status_text);
                 }
                 Line::Task(index) => {
-                    let task = &self.tasks[*index];
-                    let over = layout::hovered(row);
-                    if selected == Some(*index) {
-                        layout::push_rounded_rect(
-                            out,
-                            row,
-                            layout::UI_RADIUS_SM,
-                            theme.sidebar_selected,
-                        );
-                    } else if over {
-                        layout::push_row_hover(out, row, theme);
-                    }
-                    layout::push_icon_centered(
-                        out,
-                        atlas,
-                        Viewport {
-                            x,
-                            width: 18.0,
-                            ..row
-                        },
-                        if task.main {
-                            icons::HOME
-                        } else if task.folder {
-                            icons::FOLDER
-                        } else {
-                            icons::GIT_BRANCH
-                        },
-                        if selected == Some(*index) {
-                            theme.accent
-                        } else {
-                            theme.status_text
-                        },
-                    );
-                    let mine: Vec<&Tab> = tabs
-                        .iter()
-                        .filter(|t| task_of(&self.tasks, t) == Some(*index))
-                        .collect();
-                    let waiting = mine
-                        .iter()
-                        .filter(|t| t.activity() == Activity::Waiting)
-                        .count();
-                    let working = mine.iter().any(|t| t.activity() == Activity::Working);
-                    // Hover trades the summary for the row's two buttons.
-                    let buttons = 2.0 * (layout::UI_CONTROL_SM + 2.0);
-                    let name = task.name();
-                    layout::push_ui_text(
-                        out,
-                        atlas,
-                        text_rect(24.0, buttons + 4.0),
-                        &name,
-                        theme.text,
-                    );
-                    // A folder workspace says which folder, after its name.
-                    let folder_name = task
-                        .path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .filter(|_| task.folder)
-                        .filter(|n| *n != name);
-                    if let Some(folder_name) = folder_name {
-                        let from = 24.0 + layout::ui_text_width(atlas, &name) + 8.0;
-                        let rect = text_rect(from, buttons + 4.0);
-                        if rect.width > 30.0 {
-                            layout::push_ui_text(out, atlas, rect, &folder_name, theme.gutter_text);
-                        }
-                    }
-                    let right = row.x + row.width - 4.0;
-                    if over {
-                        let menu = Viewport {
-                            x: right - layout::UI_CONTROL_SM,
-                            y: y + (ROW - layout::UI_CONTROL_SM) * 0.5,
-                            width: layout::UI_CONTROL_SM,
-                            height: layout::UI_CONTROL_SM,
-                        };
-                        let add = Viewport {
-                            x: menu.x - layout::UI_CONTROL_SM - 2.0,
-                            ..menu
-                        };
-                        layout::Button::new(add)
-                            .icon(icons::ADD)
-                            .tone(layout::Tone::Ghost)
-                            .tip("New Terminal Here")
-                            .draw(out, atlas, theme);
-                        layout::Button::new(menu)
-                            .icon(icons::ELLIPSIS)
-                            .tone(layout::Tone::Ghost)
-                            .tip("Open, Merge, Push or Remove")
-                            .draw(out, atlas, theme);
-                        self.hits.push((add, Action::NewSession(*index)));
-                        self.hits.push((menu, Action::Menu(*index)));
-                    } else if waiting > 0 {
-                        let label = if waiting == 1 {
-                            "waiting".to_owned()
-                        } else {
-                            format!("{waiting} waiting")
-                        };
-                        let w = layout::ui_text_width(atlas, &label) + 4.0;
-                        layout::push_ui_text(
-                            out,
-                            atlas,
-                            Viewport {
-                                x: right - w,
-                                y: y + 4.0,
-                                width: w,
-                                height: 20.0,
-                            },
-                            &label,
-                            theme.diff_modified,
-                        );
-                    } else if working {
-                        layout::push_spinner(out, right - 22.0, row, theme.accent);
-                    } else if let Some((said, colour)) = self
-                        .info
-                        .get(&task.path)
-                        .and_then(|info| summary(info, theme))
-                    {
-                        let w = layout::ui_text_width(atlas, &said) + 4.0;
-                        layout::push_ui_text(
-                            out,
-                            atlas,
-                            Viewport {
-                                x: right - w,
-                                y: y + 4.0,
-                                width: w,
-                                height: 20.0,
-                            },
-                            &said,
-                            colour,
-                        );
-                    } else if *index < 9 {
-                        let hint = format!("\u{2303}{}", index + 1);
-                        let w = layout::ui_text_width(atlas, &hint) + 4.0;
-                        layout::push_ui_text(
-                            out,
-                            atlas,
-                            Viewport {
-                                x: right - w,
-                                y: y + 4.0,
-                                width: w,
-                                height: 20.0,
-                            },
-                            &hint,
-                            theme.gutter_text,
-                        );
-                    }
-                    self.hits.push((row, Action::Select(*index)));
+                    self.draw_card(*index, tabs, y, column, selected, atlas, theme, out);
                 }
                 Line::Session(index) => {
                     let tab = &tabs[*index];
-                    let indent = if self.tasks.is_empty() { 0.0 } else { INDENT };
-                    let row = Viewport {
-                        x: row.x + indent,
-                        width: (row.width - indent).max(0.0),
-                        ..row
-                    };
                     if active_tab == Some(*index) {
                         layout::push_rounded_rect(out, row, layout::UI_RADIUS_SM, theme.row_hover);
                     } else if layout::hovered(row) {
@@ -1025,11 +910,7 @@ impl Panel {
                     else {
                         continue;
                     };
-                    let indent = if self.tasks.is_empty() {
-                        INDENT
-                    } else {
-                        2.0 * INDENT
-                    };
+                    let indent = INDENT;
                     let row = Viewport {
                         x: row.x + indent,
                         width: (row.width - indent).max(0.0),
@@ -1155,22 +1036,238 @@ impl Panel {
     }
 }
 
-/// A task row's note: its pull request and checks, or how many commits it
-/// has that the main checkout does not.
-fn summary(info: &Info, theme: &Theme) -> Option<(String, [f32; 4])> {
+/// A pull request's badge colour: its checks while open, else its state.
+fn pr_colour(pr: &crate::project::worktree::PullRequest, theme: &Theme) -> [f32; 4] {
     use crate::project::worktree::Checks;
-    if let Some(pr) = &info.pull_request {
-        let (word, colour) = match (pr.state.as_str(), pr.checks) {
-            ("MERGED", _) => ("merged", theme.accent),
-            ("CLOSED", _) => ("closed", theme.gutter_text),
-            (_, Checks::Failing) => ("checks failing", theme.diff_removed),
-            (_, Checks::Running) => ("checks running", theme.status_text),
-            (_, Checks::Passing) => ("checks pass", theme.diff_added),
-            (_, Checks::None) => ("open", theme.status_text),
-        };
-        return Some((format!("#{} {word}", pr.number), colour));
+    match (pr.state.as_str(), pr.checks) {
+        ("MERGED", _) => theme.accent,
+        ("CLOSED", _) => theme.gutter_text,
+        (_, Checks::Failing) => theme.diff_removed,
+        (_, Checks::Running) => theme.diff_modified,
+        (_, Checks::Passing) => theme.diff_added,
+        (_, Checks::None) => theme.status_text,
     }
-    (info.ahead > 0).then(|| (format!("{} ahead", info.ahead), theme.gutter_text))
+}
+
+impl Panel {
+    /// A workspace's row: its icon (a spinner while an agent in it says it
+    /// is working), its name, and under it the most useful line there is:
+    /// what a session waiting on you asks, what a working agent says, its
+    /// team, else its terminals and where it is. At the right a steady
+    /// strip: how many wait on you, and the pull request coloured by its
+    /// checks; hover trades the strip for the menu button.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_card(
+        &mut self,
+        index: usize,
+        tabs: &[Tab],
+        y: f32,
+        column: Viewport,
+        selected: Option<usize>,
+        atlas: &mut Atlas,
+        theme: &Theme,
+        out: &mut Vec<GlyphInstance>,
+    ) {
+        use crate::term::status::State;
+        let task = self.tasks[index].clone();
+        let card = Viewport {
+            x: column.x + 6.0,
+            y: y + 1.0,
+            width: (column.width - 12.0).max(0.0),
+            height: CARD - 2.0,
+        };
+        let is_selected = selected == Some(index);
+        let over = layout::hovered(card);
+        if is_selected {
+            layout::push_rounded_rect(out, card, layout::UI_RADIUS, theme.sidebar_selected);
+        } else if over {
+            layout::push_rounded_rect(out, card, layout::UI_RADIUS, theme.row_hover);
+        }
+        let mine: Vec<&Tab> = tabs
+            .iter()
+            .filter(|t| task_of(&self.tasks, t) == Some(index))
+            .collect();
+        let waiting: Vec<&&Tab> = mine
+            .iter()
+            .filter(|t| t.activity() == Activity::Waiting)
+            .collect();
+        // Working is what an agent says of itself, not output: a prompt or
+        // an echo would make the row flicker while you type.
+        let working = mine
+            .iter()
+            .find(|t| t.status.as_ref().is_some_and(|s| s.state == State::Working));
+        let left = card.x + 10.0;
+        let line1 = Viewport {
+            x: left,
+            y: card.y + 4.0,
+            width: card.width - 20.0,
+            height: 20.0,
+        };
+        let line2 = Viewport {
+            y: card.y + 22.0,
+            ..line1
+        };
+        // A point lower than the name's box: the glyph sits on its baseline.
+        let icon_box = Viewport {
+            x: left,
+            y: line1.y + 1.0,
+            width: 16.0,
+            ..line1
+        };
+        if working.is_some() {
+            layout::push_spinner(out, left, line1, theme.accent);
+        } else {
+            layout::push_icon_centered(
+                out,
+                atlas,
+                icon_box,
+                if task.main {
+                    icons::HOME
+                } else if task.folder {
+                    icons::FOLDER
+                } else {
+                    icons::GIT_BRANCH
+                },
+                if is_selected {
+                    theme.text
+                } else {
+                    theme.status_text
+                },
+            );
+        }
+        // The strip, right to left: the pull request, then the waiting count.
+        let right = card.x + card.width - 8.0;
+        let mut strip_x = right;
+        if over {
+            let menu = Viewport {
+                x: right - layout::UI_CONTROL_SM + 2.0,
+                y: card.y + (card.height - layout::UI_CONTROL_SM) * 0.5,
+                width: layout::UI_CONTROL_SM,
+                height: layout::UI_CONTROL_SM,
+            };
+            layout::Button::new(menu)
+                .icon(icons::ELLIPSIS)
+                .tone(layout::Tone::Ghost)
+                .tip("Workspace menu: Git, pull request, rename, remove")
+                .draw(out, atlas, theme);
+            self.hits.push((menu, Action::Menu(index)));
+            strip_x = menu.x - 4.0;
+        } else {
+            let pr = self
+                .info
+                .get(&task.path)
+                .and_then(|info| info.pull_request.as_ref());
+            if let Some(pr) = pr {
+                let label = format!("#{}", pr.number);
+                let w = layout::ui_text_width(atlas, &label) + 2.0;
+                strip_x -= w;
+                layout::push_ui_text(
+                    out,
+                    atlas,
+                    Viewport {
+                        x: strip_x,
+                        width: w,
+                        ..line1
+                    },
+                    &label,
+                    pr_colour(pr, theme),
+                );
+                strip_x -= 6.0;
+            }
+            if !waiting.is_empty() {
+                let label = waiting.len().to_string();
+                let w = (layout::ui_text_width(atlas, &label) + 10.0).max(18.0);
+                let pill = Viewport {
+                    x: strip_x - w,
+                    y: line1.y + 2.0,
+                    width: w,
+                    height: 16.0,
+                };
+                layout::push_rounded_rect(out, pill, 8.0, theme.diff_modified);
+                let ink = if theme.is_dark() {
+                    [0.063, 0.086, 0.078, 1.0]
+                } else {
+                    [1.0, 1.0, 1.0, 1.0]
+                };
+                layout::push_ui_text_centered(out, atlas, pill, &label, ink);
+                strip_x = pill.x - 6.0;
+            }
+        }
+        let name_x = left + 22.0;
+        let name = task.name();
+        layout::push_ui_text(
+            out,
+            atlas,
+            Viewport {
+                x: name_x,
+                width: (strip_x - name_x).max(0.0),
+                ..line1
+            },
+            &name,
+            theme.text,
+        );
+        // The line under the name.
+        let (said, colour) = if let Some(tab) = waiting.first() {
+            (tab.state(), theme.diff_modified)
+        } else if let Some(tab) = working {
+            let text = tab.status.as_ref().map(|s| s.text()).unwrap_or_default();
+            (
+                if text.is_empty() {
+                    "working".into()
+                } else {
+                    text
+                },
+                theme.status_text,
+            )
+        } else if let Some(open) = mine
+            .iter()
+            .filter_map(|t| self.teams.get(&t.review))
+            .map(Team::open)
+            .find(|n| *n > 0)
+        {
+            (
+                format!("{open} team task{} open", if open == 1 { "" } else { "s" }),
+                theme.status_text,
+            )
+        } else {
+            let mut parts = Vec::new();
+            match mine.len() {
+                0 => parts.push("no terminal".to_owned()),
+                1 => parts.push("1 terminal".to_owned()),
+                n => parts.push(format!("{n} terminals")),
+            }
+            if let Some(ahead) = self
+                .info
+                .get(&task.path)
+                .map(|i| i.ahead)
+                .filter(|a| *a > 0)
+            {
+                parts.push(format!("{ahead} ahead"));
+            }
+            // A folder workspace says which folder, unless its name does.
+            let folder = task
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .filter(|n| task.folder && *n != name);
+            if let Some(folder) = folder {
+                parts.push(folder);
+            }
+            (parts.join(" \u{b7} "), theme.gutter_text)
+        };
+        layout::push_ui_text(
+            out,
+            atlas,
+            Viewport {
+                x: name_x,
+                width: (line2.x + line2.width - name_x).max(0.0),
+                ..line2
+            },
+            &said,
+            colour,
+        );
+        self.hits.push((card, Action::Select(index)));
+    }
 }
 
 #[cfg(test)]

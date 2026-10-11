@@ -9,7 +9,7 @@
 # start a shell. The agent is typed into the shell, as `claude` would be:
 # here a stand-in on PATH that ends its turn with the Stop hook, which
 # marks its session as waiting. Control-2 shows the second workspace; Cmd-T
-# starts a shell in the selected one; a click under the list makes a
+# starts a shell in the selected one; a double-click under the list makes a
 # workspace with a shell; Cmd-Shift-A again gives the column back to the
 # editor. No session ever runs Claude on its own (claude=0).
 case "$BIN" in /*) hook_bin=$BIN ;; *) hook_bin=$PWD/$BIN ;; esac
@@ -83,6 +83,9 @@ key 17 cmd t
 wait 700
 dump $T/agents-cmdt.out
 click @agents.blank
+wait 500
+dump $T/agents-single.out
+click @agents.blank 2
 wait 700
 dump $T/agents-blank.out
 key 0 cmd,shift A
@@ -118,7 +121,9 @@ expect_terminal "$T/agents-folder.out" "agent ready in agentsproj"
 expect "$T/agents-cmdt.out" agents "on tasks=main,try-it,notes selected=notes sessions=main,try-it,try-it,notes,*notes claude=0 pair=- op=-"
 grep -q "^notes	" "$T"/home/Library/Application\ Support/crc/agents/*.workspaces 2>/dev/null \
     || failed "agents: the notes workspace was not kept under Application Support/crc/agents"
-# A click under the list: a workspace named after the folder, with a shell.
+# One click under the list does nothing; a double-click makes a workspace
+# named after the folder, with a shell.
+expect "$T/agents-single.out" agents "on tasks=main,try-it,notes selected=notes sessions=main,try-it,try-it,notes,*notes claude=0 pair=- op=-"
 expect "$T/agents-blank.out" agents "on tasks=main,try-it,notes,agentsproj selected=agentsproj sessions=main,try-it,try-it,notes,notes,*agentsproj claude=0 pair=- op=-"
 # Back in the editor, the sessions keep running.
 expect "$T/agents-off.out" agents "off tasks=main,try-it,notes,agentsproj selected=agentsproj sessions=main,try-it,try-it,notes,notes,*agentsproj claude=0 pair=- op=-"

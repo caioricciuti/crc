@@ -2,6 +2,20 @@
 
 One entry per tag, written for people who use the editor.
 
+## Unreleased
+
+- The Agents sidebar is one row per workspace, as in cmux and
+  supacode: its name, and under it what a session waiting on you asks,
+  what a working agent says, its team's open tasks, or its terminals,
+  commits ahead and folder. At the right, a count of sessions waiting
+  on you and the pull request number coloured by its checks; hover
+  shows the menu button. Sessions are the terminal's tabs and no longer
+  repeat in the sidebar. A spinner means an agent said it is working,
+  not that a terminal printed something.
+- A single click on the empty part of the list does nothing; a
+  double-click makes a workspace. A double-click on a folder workspace
+  renames it. The list no longer reorders while the pointer is over it.
+
 ## v0.2.0-alpha.20, 2026-10-11
 
 - Agents mode opens terminals, not Claude: `Cmd-T`, the tab bar's +, a
