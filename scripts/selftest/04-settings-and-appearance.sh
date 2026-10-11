@@ -9,7 +9,7 @@
 mkdir -p "$T/settingshome"
 printf 'plain\n' > "$T/settings.txt"
 cat > "$T/settings.script" <<SCRIPT
-resize 1100 1700
+resize 1100 1000
 wait 100
 key 43 cmd ,
 wait 100
@@ -32,11 +32,13 @@ dump $T/settings-saved.out
 quit
 SCRIPT
 HOME="$T/settingshome" CRC_SELFTEST="$T/settings.script" "$BIN" "$T/settings.txt" 2> "$T/settings.err"
-# Three buttons and two targets (Edit, the row) per setting, all on
-# screen in a window this tall.
-expect "$T/settings-page.out" settings_page "open changed=0 problems=0 targets=23"
+# Three buttons and two targets (Edit, the row) per setting on screen.
+# The window is 1000 pt tall, so it is that tall on any display (a taller
+# one was cut to the screen, and the count followed whichever display the
+# window opened on): the last setting is below the fold, scrolled to.
+expect "$T/settings-page.out" settings_page "open changed=0 problems=0 targets=21"
 expect "$T/settings-page.out" tabs "settings.txt"
-expect "$T/settings-escaped.out" settings_page "closed changed=0 problems=0 targets=23"
+expect "$T/settings-escaped.out" settings_page "closed changed=0 problems=0 targets=21"
 if ! grep -q '^tabs: .*config.toml' "$T/settings-open.out"; then
     failed "settings-open.out: $(grep -m1 '^tabs' "$T/settings-open.out"), expected a config.toml tab"
 fi

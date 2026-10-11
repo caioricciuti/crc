@@ -82,7 +82,10 @@ hdiutil create -quiet -fs HFS+ -volname crc -srcfolder "$T/upd/src" "$T/upd/crc.
 printf '%064d  crc.dmg\n' 0 > "$T/upd/BADSUMS"
 for sums in SHA256SUMS BADSUMS; do
     printf '[{"tag_name": "v999.0.0", "html_url": "https://github.com/caioricciuti/crc/releases/tag/v999.0.0", "assets": [{"name": "crc.dmg", "browser_download_url": "file://%s/upd/crc.dmg"}, {"name": "SHA256SUMS", "browser_download_url": "file://%s/upd/%s"}]}]' "$T" "$T" "$sums" > "$T/releases-$sums.json"
-    sed "s|dump .*|dump $T/install-$sums.out|; s|^wait 500$|wait 3000|" "$T/update.script" > "$T/install.script"
+    # Mounting the image and checking its signature took over 3 s on a
+    # busy machine once. The answer is a failure message, shown for 8 s:
+    # a dump at 6 s sees it whether the check took 1 s or 6.
+    sed "s|dump .*|dump $T/install-$sums.out|; s|^wait 500$|wait 6000|" "$T/update.script" > "$T/install.script"
     CRC_UPDATE_URL="file://$T/releases-$sums.json" CRC_UPDATE_APP="$T/upd/installed/crc.app" \
         CRC_SELFTEST="$T/install.script" "$BIN" "$T/crashproj/notes.rs" 2> "$T/install-$sums.err"
 done
