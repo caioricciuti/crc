@@ -22,6 +22,12 @@ One entry per tag, written for people who use the editor.
   the pull request with its author, commits, lines and every check, and
   opens or merges it (squash, merge commit or rebase, asked each time
   and confirmed). The workspace menu has the same operations.
+- crc notices when it is installed again while open. macOS then stops
+  giving the running copy crc's permissions (the microphone, other
+  apps' data such as an SSH agent's keys, so signed commits fail in its
+  terminals), so the status line says so and Help > Restart to Update
+  reopens crc, sessions kept. `scripts/bundle.sh --install` says the
+  same when crc is open.
 - The workspace list puts what needs you first after the main checkout
   (a session waiting on you, failing checks, a pull request ready to
   merge) and is read again every minute while Agents mode is on.

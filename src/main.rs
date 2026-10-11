@@ -40,6 +40,9 @@ fn main() {
         return;
     }
 
+    // What this window runs from, to notice an install over it.
+    crc::platform::update::note_launch();
+
     let folder = args
         .first()
         .filter(|path| std::path::Path::new(path).is_dir())

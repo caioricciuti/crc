@@ -262,6 +262,12 @@ if [ "$MODE" = "--install" ]; then
         echo "error: the installed app is not the one just built" >&2
         exit 1
     fi
+    # A crc already open keeps running the old files, and macOS refuses it
+    # crc's permissions (microphone, other apps' data) from now on.
+    if pgrep -afl /Applications/crc.app/Contents/MacOS/crc 2>/dev/null \
+        | grep -qv -e ' --hold ' -e ' --hook ' -e ' --mcp'; then
+        echo "note: crc is open: Help > Restart to Update loads this build"
+    fi
 fi
 
 echo

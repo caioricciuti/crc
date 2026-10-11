@@ -739,6 +739,8 @@ struct State {
     update_ready: Option<crate::platform::update::Ready>,
     /// Restart to Update asked to quit: the quit installs it.
     update_on_quit: bool,
+    /// Said once that crc was reinstalled under this running copy.
+    replaced_said: bool,
     /// The last key or click. The caret is solid for a blink phase after
     /// it, so it never vanishes under your typing.
     caret_since: Instant,
@@ -4081,7 +4083,7 @@ define_class!(
                 active.path.is_some()
                     && (active.is_dirty() || active.disk_state() != DiskState::Unchanged)
             } else if action == sel!(restartToUpdate:) {
-                state.update_ready.is_some()
+                state.update_ready.is_some() || crate::platform::update::replaced()
             } else if action == sel!(switchRepository:) {
                 state.workspace.has_several()
             } else if action == sel!(paste:) {
@@ -4390,6 +4392,7 @@ define_class!(
         #[unsafe(method(windowDidBecomeKey:))]
         fn window_did_become_key(&self, _notification: &NSNotification) {
             self.check_open_files();
+            self.say_if_replaced();
             if let Some(mut state) = self.state_mut() {
                 state.caret_since = Instant::now();
             }
@@ -4670,11 +4673,32 @@ impl EditorView {
         }
     }
 
+    /// Says, once, that crc was installed again under this running copy,
+    /// and how to get its permissions back. Returns whether it was.
+    pub(super) fn say_if_replaced(&self) -> bool {
+        if !crate::platform::update::replaced() {
+            return false;
+        }
+        if let Some(mut state) = self.state_mut()
+            && !state.replaced_said
+        {
+            state.replaced_said = true;
+            state.say(
+                layout::Feedback::Failure,
+                "crc was reinstalled while open: until Help > Restart to Update, macOS withholds its \
+                 permissions (microphone, SSH keys) from new terminals",
+            );
+        }
+        self.request_redraw();
+        true
+    }
+
     /// Quits to install the downloaded update. The ordinary quit: unsaved
     /// documents ask first, and a cancel there cancels the update too.
     fn restart_to_update(&self) {
         let ready = self.state_mut().is_some_and(|mut state| {
-            state.update_on_quit = state.update_ready.is_some();
+            state.update_on_quit =
+                state.update_ready.is_some() || crate::platform::update::replaced();
             state.update_on_quit
         });
         if ready {
@@ -5397,11 +5421,28 @@ define_class!(
             // Restart to Update: the new app goes where this one is now,
             // before anything is saved or shut down, so a failure keeps
             // this one running with nothing lost.
-            let update = view.state_mut().and_then(|mut state| {
-                std::mem::take(&mut state.update_on_quit)
-                    .then(|| state.update_ready.clone())
-                    .flatten()
+            let (restart, update) = view.state_mut().map_or((false, None), |mut state| {
+                let restart = std::mem::take(&mut state.update_on_quit);
+                (
+                    restart,
+                    restart.then(|| state.update_ready.clone()).flatten(),
+                )
             });
+            // Reinstalled under us, nothing downloaded: only reopen.
+            if restart
+                && update.is_none()
+                && let Some(app) = crate::platform::update::running_app()
+                && let Err(e) = crate::platform::update::relaunch_after_exit(&app)
+            {
+                if let Some(mut state) = view.state_mut() {
+                    state.say(
+                        layout::Feedback::Failure,
+                        format!("could not reopen crc: {e}"),
+                    );
+                }
+                view.request_redraw();
+                return NSApplicationTerminateReply::TerminateCancel;
+            }
             if let Some(ready) = update {
                 let installed = crate::platform::update::running_app()
                     .ok_or_else(|| "crc is not running from an app".to_owned())
@@ -8604,6 +8645,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         update: None,
         update_install: None,
         update_ready: None,
+        replaced_said: false,
         update_on_quit: false,
         reloads: Reloads {
             channel: mpsc::channel(),

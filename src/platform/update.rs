@@ -397,6 +397,46 @@ pub fn apply(ready: &Ready, app: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Inode, size, and modification time in seconds and nanoseconds.
+pub type Identity = (u64, u64, i64, i64);
+
+/// A file's identity on disk. A copy put over it, or a new file renamed
+/// into its place, changes it.
+pub fn identity(path: &std::path::Path) -> Option<Identity> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.ino(), m.len(), m.mtime(), m.mtime_nsec()))
+}
+
+/// The executable this process started from, inside an app bundle, and its
+/// identity then.
+static LAUNCHED: std::sync::OnceLock<Option<(PathBuf, Identity)>> = std::sync::OnceLock::new();
+
+/// Remembers what this process was started from. Called once at launch.
+pub fn note_launch() {
+    LAUNCHED.get_or_init(|| {
+        let exe = std::env::current_exe().ok()?;
+        let app = exe.parent()?.parent()?.parent()?;
+        if app.extension()? != "app" {
+            return None;
+        }
+        let id = identity(&exe)?;
+        Some((exe, id))
+    });
+}
+
+/// Whether the app this process runs from was replaced on disk since it
+/// started: an install over a running crc. macOS then no longer matches
+/// this process to the app's signature, so the permissions given to crc
+/// (the microphone, other apps' data such as an SSH agent's keys) are
+/// refused to it and to every terminal it starts, until it is reopened.
+pub fn replaced() -> bool {
+    LAUNCHED
+        .get()
+        .and_then(Option::as_ref)
+        .is_some_and(|(exe, id)| identity(exe).as_ref() != Some(id))
+}
+
 /// Opens `app` once this process has exited.
 pub fn relaunch_after_exit(app: &std::path::Path) -> std::io::Result<()> {
     // A test instance must not open a real crc on someone's screen.
@@ -419,6 +459,21 @@ pub fn relaunch_after_exit(app: &std::path::Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_file_put_in_place_of_another_has_another_identity() {
+        let dir = std::env::temp_dir().join(format!("crc-identity-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("crc");
+        std::fs::write(&exe, "one").unwrap();
+        let before = identity(&exe).unwrap();
+        assert_eq!(identity(&exe), Some(before));
+        let new = dir.join("crc.new");
+        std::fs::write(&new, "one").unwrap();
+        std::fs::rename(&new, &exe).unwrap();
+        assert_ne!(identity(&exe), Some(before));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_release_carries_its_own_downloads_only() {

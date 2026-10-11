@@ -230,6 +230,7 @@ impl EditorView {
     }
 
     pub(super) fn spawn_terminal_in(&self, claude: bool, cwd: Option<&Path>) {
+        self.say_if_replaced();
         // In Agents mode a session started in the selected workspace's
         // folder (or in no particular one) belongs to that workspace.
         let workspace = {
