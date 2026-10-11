@@ -41,10 +41,16 @@ pub fn root() -> Option<PathBuf> {
 
 /// A folder name no other terminal, in this run or an earlier one, has.
 pub fn new_id() -> String {
+    // The clock reads in whole microseconds here, so two ids made in the
+    // same one (two sessions started together, two tests in parallel)
+    // were the same id, and the second session's helper took the first's
+    // socket. A count in this process tells them apart.
+    static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
-    format!("{nanos:x}-{}", std::process::id())
+    format!("{nanos:x}-{}-{n}", std::process::id())
 }
 
 /// What a session kept of a file from before the agent changed it.
@@ -710,6 +716,21 @@ fn forget(dir: &Path, file: &File) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ids_made_at_once_differ() {
+        let ids: Vec<String> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..4)
+                .map(|_| scope.spawn(|| (0..500).map(|_| new_id()).collect::<Vec<_>>()))
+                .collect();
+            workers
+                .into_iter()
+                .flat_map(|w| w.join().unwrap())
+                .collect()
+        });
+        let unique: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len());
+    }
     use crate::project::TempTree;
 
     fn pre(path: &Path) -> String {
