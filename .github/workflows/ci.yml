@@ -85,6 +85,7 @@ jobs:
         run: cargo clippy --all-targets --locked --offline -- -D warnings
 
       - name: Test
+        timeout-minutes: 20
         run: cargo test --all-targets --locked --offline
 
       # The renderer needs a GPU. GitHub's macOS runners have one, but not a

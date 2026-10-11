@@ -53,7 +53,9 @@ jobs:
         run: ./scripts/vendor.sh
 
       # Offline from here: everything builds from vendor/.
+      # A hung test fails the run instead of holding it for six hours.
       - name: Tests
+        timeout-minutes: 20
         env:
           CARGO_NET_OFFLINE: true
         run: cargo test --release --locked --offline

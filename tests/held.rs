@@ -46,6 +46,18 @@ fn read_until(socket: &mut UnixStream, text: &str) -> String {
     seen
 }
 
+/// A read that waits this long fails the test instead of hanging it: a
+/// helper that stopped answering on a CI runner once held a release run
+/// for two hours.
+const READ_LIMIT: Duration = Duration::from_secs(20);
+
+fn limited(socket: UnixStream) -> UnixStream {
+    socket
+        .set_read_timeout(Some(READ_LIMIT))
+        .expect("a read timeout");
+    socket
+}
+
 fn wait_until(what: impl Fn() -> bool) -> bool {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
@@ -62,7 +74,8 @@ fn a_held_program_outlives_its_window() {
     let dir = scratch("socket");
     let spec = shell_spec(&dir);
     let helper = Path::new(env!("CARGO_BIN_EXE_crc"));
-    let (id, mut socket) = hold::start(&dir, &spec, helper).expect("the helper starts");
+    let (id, socket) = hold::start(&dir, &spec, helper).expect("the helper starts");
+    let mut socket = limited(socket);
     assert_eq!(hold::receive(&mut socket).unwrap(), Frame::Size(40, 6));
     // Then what it printed so far: nothing, or already the prompt.
     assert!(matches!(
@@ -95,7 +108,7 @@ fn a_held_program_outlives_its_window() {
     assert_eq!(hold::live(&dir)[0].2.events_read, 7);
 
     // The next window gets the output back, then runs it as before.
-    let mut socket = hold::connect(&dir, &id).expect("connects again");
+    let mut socket = limited(hold::connect(&dir, &id).expect("connects again"));
     assert_eq!(hold::receive(&mut socket).unwrap(), Frame::Size(40, 6));
     let replay = match hold::receive(&mut socket).unwrap() {
         Frame::Output(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
