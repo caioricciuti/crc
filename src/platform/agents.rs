@@ -58,6 +58,9 @@ pub struct Workspace {
     pub main: bool,
     /// Made by hand on a folder: nothing in Git behind it.
     pub folder: bool,
+    /// A folder workspace's own id, made once and kept through renames, so
+    /// a new workspace never takes a removed one's name, pin or sessions.
+    pub key: String,
 }
 
 impl Workspace {
@@ -68,6 +71,7 @@ impl Workspace {
             branch: worktree.branch,
             main: worktree.main,
             folder: false,
+            key: String::new(),
         }
     }
 
@@ -76,10 +80,10 @@ impl Workspace {
     }
 
     /// What sessions and the selection hold on to: a folder workspace by
-    /// its name (two can share a folder), a worktree by its path.
+    /// its key (two can share a folder), a worktree by its path.
     pub fn id(&self) -> String {
         if self.folder {
-            format!("folder:{}", self.name)
+            self.key.clone()
         } else {
             self.path.to_string_lossy().into_owned()
         }
@@ -205,17 +209,28 @@ pub struct RowDrag {
     pub active: bool,
 }
 
-/// One per line: the name, a tab, the folder.
+/// One per line: the name, a tab, the folder, a tab, the key. A line
+/// written before keys existed keeps the id it had, `folder:` and its name,
+/// so the sessions holding it stay in it.
 fn parse_folders(text: &str) -> Vec<Workspace> {
     text.lines()
-        .filter_map(|line| line.split_once('\t'))
-        .filter(|(name, path)| !name.is_empty() && !path.is_empty())
-        .map(|(name, path)| Workspace {
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, '\t');
+            let (name, path) = (parts.next()?, parts.next()?);
+            let key = parts
+                .next()
+                .filter(|k| !k.is_empty())
+                .map_or_else(|| format!("folder:{name}"), str::to_owned);
+            Some((name, path, key))
+        })
+        .filter(|(name, path, _)| !name.is_empty() && !path.is_empty())
+        .map(|(name, path, key)| Workspace {
             name: name.to_owned(),
             path: PathBuf::from(path),
             branch: None,
             main: false,
             folder: true,
+            key,
         })
         .collect()
 }
@@ -223,8 +238,29 @@ fn parse_folders(text: &str) -> Vec<Workspace> {
 fn folders_text(folders: &[Workspace]) -> String {
     folders
         .iter()
-        .map(|w| format!("{}\t{}\n", w.name, w.path.display()))
+        .map(|w| format!("{}\t{}\t{}\n", w.name, w.path.display(), w.key))
         .collect()
+}
+
+/// A key no workspace has had: the time and a count, so two made in the
+/// same instant differ too.
+fn new_key(taken: &[Workspace]) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    (0u32..)
+        .map(|n| {
+            format!(
+                "ws:{now:x}{}",
+                if n == 0 {
+                    String::new()
+                } else {
+                    format!("-{n}")
+                }
+            )
+        })
+        .find(|key| !taken.iter().any(|w| w.key == *key))
+        .expect("an unused key")
 }
 
 /// What a task's row says besides its name, read after the list: commits
@@ -416,13 +452,21 @@ pub fn task_of(tasks: &[Workspace], tab: &Tab) -> Option<usize> {
 
 /// The workspace holding a folder: the deepest one, so a worktree inside
 /// the main checkout is not taken for the main one; a worktree before a
-/// folder workspace on the same folder.
+/// folder workspace on the same folder; of folder workspaces on one
+/// folder, the first in the list, so a new one never takes the sessions of
+/// the others.
 pub fn folder_task(tasks: &[Workspace], folder: &Path) -> Option<usize> {
     tasks
         .iter()
         .enumerate()
         .filter(|(_, t)| folder.starts_with(&t.path))
-        .max_by_key(|(_, t)| (t.path.components().count(), !t.folder))
+        .max_by_key(|(i, t)| {
+            (
+                t.path.components().count(),
+                !t.folder,
+                std::cmp::Reverse(*i),
+            )
+        })
         .map(|(i, _)| i)
 }
 
@@ -588,6 +632,7 @@ impl Panel {
             branch: None,
             main: false,
             folder: true,
+            key: new_key(&self.folders),
         };
         let id = made.id();
         self.folders.push(made);
@@ -682,10 +727,24 @@ impl Panel {
         self.save_arrangement();
     }
 
+    /// Forgets a folder workspace, and its place, pin and name with it.
     pub fn remove_folder(&mut self, id: &str) {
         self.folders.retain(|t| t.id() != id);
+        self.arrangement.order.retain(|o| o != id);
+        self.arrangement.pinned.remove(id);
+        self.arrangement.titles.remove(id);
         self.rebuild();
         self.save_folders();
+        self.save_arrangement();
+    }
+
+    /// The name of the folder workspace being renamed, for the palette.
+    pub fn renaming_name(&self) -> Option<&str> {
+        let id = self.renaming.as_deref()?;
+        self.folders
+            .iter()
+            .find(|t| t.id() == id)
+            .map(|t| t.name.as_str())
     }
 
     /// The workspaces are known: the worktree read for the open folder
@@ -1554,6 +1613,7 @@ mod tests {
             branch: None,
             main: false,
             folder: true,
+            key: format!("folder:{name}"),
         }
     }
 
@@ -1636,22 +1696,53 @@ mod tests {
         let dir = PathBuf::from("/tmp/crc-agents-test");
         let a = panel.add_folder("notes", dir.clone());
         let b = panel.add_folder("notes", dir);
-        assert_eq!(a, "folder:notes");
-        assert_eq!(b, "folder:notes 2");
+        assert_ne!(a, b);
         assert_eq!(panel.tasks.len(), 3);
         assert_eq!(panel.tasks[0].id(), "/r");
+        assert_eq!(panel.tasks[2].name, "notes 2");
         let text = folders_text(&panel.folders);
         let back = parse_folders(&text);
         assert_eq!(back, panel.folders);
         assert_eq!(panel.rename_folder(&b, "notes"), None);
-        assert_eq!(
-            panel.rename_folder(&b, "ideas"),
-            Some("folder:ideas".into())
-        );
+        // A rename keeps the id: the sessions and the pin stay with it.
+        assert_eq!(panel.rename_folder(&b, "ideas"), Some(b.clone()));
+        panel.renaming = Some(b.clone());
+        assert_eq!(panel.renaming_name(), Some("ideas"));
         panel.remove_folder(&a);
         assert_eq!(
             panel.tasks.iter().map(Workspace::id).collect::<Vec<_>>(),
-            vec!["/r".to_owned(), "folder:ideas".to_owned()]
+            vec!["/r".to_owned(), b]
         );
+    }
+
+    #[test]
+    fn a_line_from_before_keys_keeps_its_old_id() {
+        let old = parse_folders("notes\t/r\n");
+        assert_eq!(old[0].id(), "folder:notes");
+        let new = parse_folders("notes\t/r\tws:1\n");
+        assert_eq!(new[0].id(), "ws:1");
+    }
+
+    #[test]
+    fn a_new_workspace_starts_empty() {
+        // A removed workspace's name, pin and sessions do not come back
+        // on a new one with the same name.
+        let mut panel = Panel::default();
+        let dir = PathBuf::from("/tmp/crc-agents-test");
+        let old = panel.add_folder("crc", dir.clone());
+        panel.set_title(&old, "Mine");
+        panel.toggle_pin(&old);
+        panel.remove_folder(&old);
+        let new = panel.add_folder("crc", dir.clone());
+        assert_ne!(old, new);
+        let task = panel.tasks[panel.by_id(&new).unwrap()].clone();
+        assert_eq!(panel.title(&task), "crc");
+        assert!(!panel.is_pinned(&new));
+        // A session whose workspace is gone stays with the first one on
+        // its folder, not the newest.
+        let first = panel.tasks[panel.by_id(&new).unwrap()].clone();
+        panel.add_folder("crc", dir.clone());
+        let at = folder_task(&panel.tasks, &first.path.join("src"));
+        assert_eq!(at.map(|i| panel.tasks[i].id()), Some(new));
     }
 }

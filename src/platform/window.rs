@@ -7436,11 +7436,7 @@ fn palette_sources(state: &State) -> PaletteSources<'_> {
         task: state.task_prompt,
         task_folder: state.agents.repo.as_deref().or(state.tree.root()),
         task_repo: state.agents.repo.is_some(),
-        task_rename: state
-            .agents
-            .renaming
-            .as_deref()
-            .and_then(|id| id.strip_prefix("folder:")),
+        task_rename: state.agents.renaming_name(),
         commit: state.commit_prompt.as_deref(),
     }
 }

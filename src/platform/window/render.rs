@@ -975,10 +975,7 @@ impl EditorView {
                 task: *task_prompt,
                 task_folder: agents.repo.as_deref().or(tree.root()),
                 task_repo: agents.repo.is_some(),
-                task_rename: agents
-                    .renaming
-                    .as_deref()
-                    .and_then(|id| id.strip_prefix("folder:")),
+                task_rename: agents.renaming_name(),
                 commit: commit_prompt.as_deref(),
             };
             let mode = PaletteMode::of(&sources);

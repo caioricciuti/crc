@@ -2,6 +2,13 @@
 
 One entry per tag, written for people who use the editor.
 
+## Unreleased
+
+- A new workspace in Agents mode starts with its own terminal and
+  nothing else. It could take the name, pin or terminals of a workspace
+  removed earlier under the same name, and terminals left without a
+  workspace moved into whichever one was made last.
+
 ## v0.2.0-alpha.21, 2026-10-12
 
 - The Agents sidebar is one row per workspace, as in cmux and
