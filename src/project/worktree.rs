@@ -61,7 +61,32 @@ fn run(dir: &Path, args: &[&str]) -> Result<String, String> {
 /// Every worktree of the repository `dir` is in, its own checkout first.
 /// Prunable ones (their folder is gone) are left out.
 pub fn list(dir: &Path) -> Result<Vec<Worktree>, String> {
-    Ok(parse_list(&run(dir, &["worktree", "list", "--porcelain"])?))
+    Ok(list_all(dir)?.0)
+}
+
+/// [`list`], and how many worktrees Git still records whose folder is
+/// gone: what [`prune`] would clear.
+pub fn list_all(dir: &Path) -> Result<(Vec<Worktree>, usize), String> {
+    let text = run(dir, &["worktree", "list", "--porcelain"])?;
+    Ok((parse_list(&text), parse_prunable(&text)))
+}
+
+/// The prunable blocks in `git worktree list --porcelain`.
+pub fn parse_prunable(text: &str) -> usize {
+    text.split("\n\n")
+        .filter(|block| block.lines().any(|l| l.starts_with("prunable")))
+        .count()
+}
+
+/// Forgets the worktrees of the repository at `main` whose folder is gone.
+pub fn prune(main: &Path) -> Result<String, String> {
+    let before = list_all(main)?.1;
+    run(main, &["worktree", "prune"])?;
+    let pruned = before.saturating_sub(list_all(main)?.1);
+    Ok(match pruned {
+        1 => "Pruned 1 missing worktree".to_owned(),
+        n => format!("Pruned {n} missing worktrees"),
+    })
 }
 
 /// `git worktree list --porcelain`: blocks separated by blank lines, the
@@ -160,9 +185,17 @@ pub fn is_dirty(dir: &Path) -> Result<bool, String> {
 }
 
 /// Removes a task's worktree, refused while it has changes. The branch is
-/// deleted too when it is merged into the main checkout's HEAD; an
-/// unmerged one is kept, and the answer says so.
-pub fn remove(main: &Path, tree: &Worktree) -> Result<String, String> {
+/// deleted too when it is merged: into `base` (the default branch), or,
+/// for a squash merge Git cannot see, when it is still at the head of its
+/// merged pull request (`merged_pr_head`). Otherwise `branch -d` decides,
+/// as Git does, from the main checkout's HEAD; an unmerged branch is kept,
+/// and the answer says so.
+pub fn remove(
+    main: &Path,
+    tree: &Worktree,
+    base: Option<&str>,
+    merged_pr_head: Option<&str>,
+) -> Result<String, String> {
     if tree.main {
         return Err("The repository's own checkout is not a task".into());
     }
@@ -177,10 +210,67 @@ pub fn remove(main: &Path, tree: &Worktree) -> Result<String, String> {
     let Some(branch) = &tree.branch else {
         return Ok(format!("Removed {}", tree.name()));
     };
+    // Checked now, not from what the list last read: -D deletes whatever
+    // the branch holds.
+    let in_base = base.filter(|b| *b != branch).is_some_and(|b| {
+        git(main)
+            .args(["merge-base", "--is-ancestor", branch, b])
+            .output()
+            .is_ok_and(|o| o.status.success())
+    });
+    if in_base {
+        run(main, &["branch", "-D", branch])?;
+        return Ok(format!("Removed {branch} and its branch"));
+    }
+    if let Some(head) = merged_pr_head.filter(|h| !h.is_empty()) {
+        let tip = run(main, &["rev-parse", "--verify", "--quiet", branch])
+            .map(|t| t.trim().to_owned())
+            .unwrap_or_default();
+        if tip == head {
+            run(main, &["branch", "-D", branch])?;
+            return Ok(format!(
+                "Removed {branch} and its branch (its pull request was merged)"
+            ));
+        }
+        return Ok(format!(
+            "Removed {branch}; the branch has commits its merged pull request does not, so it was kept"
+        ));
+    }
     Ok(match run(main, &["branch", "-d", branch]) {
         Ok(_) => format!("Removed {branch} and its branch"),
         Err(_) => format!("Removed {branch}; the branch has unmerged commits and was kept"),
     })
+}
+
+/// The local branches of the repository at `main` whose commits are all on
+/// `base`. A branch made and never committed to is on it too; see
+/// [`has_own_commits`].
+pub fn merged(main: &Path, base: &str) -> Vec<String> {
+    let flag = format!("--merged={base}");
+    run(
+        main,
+        &[
+            "for-each-ref",
+            &flag,
+            "refs/heads",
+            "--format=%(refname:short)",
+        ],
+    )
+    .map(|text| {
+        text.lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_owned)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// Whether `branch` was ever committed to: its reflog has more than the
+/// line for its creation. Read from the file, without asking Git; no
+/// reflog counts as no.
+pub fn has_own_commits(main: &Path, branch: &str) -> bool {
+    std::fs::read(main.join(".git/logs/refs/heads").join(branch))
+        .is_ok_and(|log| log.split(|b| *b == b'\n').filter(|l| !l.is_empty()).count() > 1)
 }
 
 /// Merges a task's branch into whatever the main checkout has out.
@@ -309,6 +399,8 @@ pub struct PullRequest {
     pub draft: bool,
     /// `MERGEABLE`, `CONFLICTING` or `UNKNOWN`.
     pub mergeable: String,
+    /// The commit its branch was at, last GitHub saw it.
+    pub head_oid: String,
     /// Each check, as GitHub names it.
     pub list: Vec<Check>,
 }
@@ -369,7 +461,7 @@ pub fn pull_request(dir: &Path, branch: &str) -> Option<PullRequest> {
             branch,
             "--json",
             "number,state,url,statusCheckRollup,title,author,commits,additions,deletions,\
-             baseRefName,headRefName,isDraft,mergeable",
+             baseRefName,headRefName,headRefOid,isDraft,mergeable",
         ])
         .env("GH_PROMPT_DISABLED", "1")
         .env("NO_COLOR", "1")
@@ -459,6 +551,7 @@ pub fn parse_pull_request(text: &str) -> Option<PullRequest> {
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
         mergeable: word(&value, "mergeable"),
+        head_oid: text(&value, "headRefOid"),
         list,
     })
 }
@@ -682,7 +775,7 @@ mod tests {
     #[test]
     fn reads_a_pull_requests_details_and_each_check() {
         let pr = parse_pull_request(
-            r#"{"number":648,"state":"OPEN","url":"u","title":"Kill the session","author":{"login":"sam"},"commits":[{},{},{},{}],"additions":423,"deletions":42,"baseRefName":"main","headRefName":"fix/close","isDraft":false,"mergeable":"MERGEABLE","statusCheckRollup":[{"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"SUCCESS"},{"__typename":"CheckRun","name":"lint","status":"COMPLETED","conclusion":"SKIPPED"},{"__typename":"StatusContext","context":"ci/policy","state":"PENDING"}]}"#,
+            r#"{"number":648,"state":"OPEN","url":"u","title":"Kill the session","author":{"login":"sam"},"commits":[{},{},{},{}],"additions":423,"deletions":42,"baseRefName":"main","headRefName":"fix/close","headRefOid":"abc123","isDraft":false,"mergeable":"MERGEABLE","statusCheckRollup":[{"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"SUCCESS"},{"__typename":"CheckRun","name":"lint","status":"COMPLETED","conclusion":"SKIPPED"},{"__typename":"StatusContext","context":"ci/policy","state":"PENDING"}]}"#,
         )
         .unwrap();
         assert_eq!(
@@ -718,6 +811,7 @@ mod tests {
             ]
         );
         assert_eq!(pr.checks, Checks::Running);
+        assert_eq!(pr.head_oid, "abc123");
     }
 
     #[test]
@@ -768,6 +862,11 @@ mod tests {
         assert!(!list[1].main);
         assert_eq!(list[2].branch, None);
         assert_eq!(list[2].name(), "detached");
+        assert_eq!(parse_prunable(text), 1);
+        assert_eq!(
+            parse_prunable("worktree /r/crc\nHEAD 1\nbranch refs/heads/main\n"),
+            0
+        );
     }
 
     #[test]
@@ -913,7 +1012,7 @@ mod tests {
 
         std::fs::write(dir.join("b.txt"), "two\n").unwrap();
         assert!(is_dirty(&dir).unwrap());
-        assert!(remove(repo, &task).is_err());
+        assert!(remove(repo, &task, Some("main"), None).is_err());
         let commit = |args: &[&str]| {
             assert!(git(&dir).args(args).output().unwrap().status.success());
         };
@@ -932,10 +1031,126 @@ mod tests {
         assert_eq!(merge(repo, "try-it").unwrap(), "Merged try-it into main");
         assert!(repo.join("b.txt").is_file());
         assert_eq!(
-            remove(repo, &task).unwrap(),
+            remove(repo, &task, Some("main"), None).unwrap(),
             "Removed try-it and its branch"
         );
         assert!(!dir.exists());
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Runs git in `dir` with a test identity, asserting it worked.
+    fn ok_in(dir: &Path, args: &[&str]) {
+        let out = git(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A linked worktree of `repo` on a new branch `branch`, in its own
+    /// temporary folder.
+    fn linked(repo: &Path, branch: &str) -> (PathBuf, Worktree) {
+        let dir = repo.with_extension(branch.replace('/', "-"));
+        let _ = std::fs::remove_dir_all(&dir);
+        ok_in(
+            repo,
+            &["worktree", "add", "-q", "-b", branch, dir.to_str().unwrap()],
+        );
+        let tree = Worktree {
+            path: dir.clone(),
+            branch: Some(branch.to_owned()),
+            main: false,
+        };
+        (dir, tree)
+    }
+
+    #[test]
+    fn merged_needs_own_commits() {
+        let tree = fixture("merged-own", "main", &[]);
+        let repo = &tree.0;
+        let (fresh_dir, _) = linked(repo, "fresh");
+        let (done_dir, _) = linked(repo, "done");
+        std::fs::write(done_dir.join("b.txt"), "two\n").unwrap();
+        ok_in(&done_dir, &["add", "b.txt"]);
+        ok_in(&done_dir, &["commit", "-qm", "two"]);
+        // main moves on: both branches are behind it, so both "merged".
+        ok_in(repo, &["merge", "-q", "--ff-only", "done"]);
+        std::fs::write(repo.join("c.txt"), "three\n").unwrap();
+        ok_in(repo, &["add", "c.txt"]);
+        ok_in(repo, &["commit", "-qm", "three"]);
+        let merged = merged(repo, "main");
+        assert!(merged.contains(&"fresh".to_owned()) && merged.contains(&"done".to_owned()));
+        assert!(!has_own_commits(repo, "fresh"));
+        assert!(has_own_commits(repo, "done"));
+        assert!(!has_own_commits(repo, "no-such"));
+        let _ = std::fs::remove_dir_all(&fresh_dir);
+        let _ = std::fs::remove_dir_all(&done_dir);
+    }
+
+    #[test]
+    fn remove_deletes_a_branch_merged_into_the_default_branch() {
+        // The main checkout has another branch out, so plain -d, which
+        // looks at its HEAD, would refuse.
+        let tree = fixture("merged-default", "main", &["elsewhere"]);
+        let repo = &tree.0;
+        let (dir, task) = linked(repo, "fix/seed");
+        std::fs::write(dir.join("b.txt"), "two\n").unwrap();
+        ok_in(&dir, &["add", "b.txt"]);
+        ok_in(&dir, &["commit", "-qm", "two"]);
+        ok_in(repo, &["merge", "-q", "--ff-only", "fix/seed"]);
+        ok_in(repo, &["switch", "-q", "elsewhere"]);
+        assert_eq!(
+            remove(repo, &task, Some("main"), None).unwrap(),
+            "Removed fix/seed and its branch"
+        );
+        assert!(!dir.exists());
+        assert!(run(repo, &["rev-parse", "--verify", "--quiet", "fix/seed"]).is_err());
+    }
+
+    #[test]
+    fn squash_merged_branch_is_deleted_only_at_the_pr_head() {
+        let tree = fixture("merged-squash", "main", &[]);
+        let repo = &tree.0;
+        let commit_in = |dir: &Path, name: &str| {
+            std::fs::write(dir.join(name), "x\n").unwrap();
+            ok_in(dir, &["add", name]);
+            ok_in(dir, &["commit", "-qm", name]);
+        };
+        // At the head GitHub merged: deleted though Git sees it unmerged.
+        let (dir, task) = linked(repo, "squashed");
+        commit_in(&dir, "b.txt");
+        let head = run(repo, &["rev-parse", "squashed"]).unwrap();
+        assert_eq!(
+            remove(repo, &task, Some("main"), Some(head.trim())).unwrap(),
+            "Removed squashed and its branch (its pull request was merged)"
+        );
+        assert!(run(repo, &["rev-parse", "--verify", "--quiet", "squashed"]).is_err());
+        // A commit after the merge: kept.
+        let (dir, task) = linked(repo, "later");
+        commit_in(&dir, "c.txt");
+        let head = run(repo, &["rev-parse", "later"]).unwrap();
+        commit_in(&dir, "d.txt");
+        assert_eq!(
+            remove(repo, &task, Some("main"), Some(head.trim())).unwrap(),
+            "Removed later; the branch has commits its merged pull request does not, so it was kept"
+        );
+        assert!(run(repo, &["rev-parse", "--verify", "--quiet", "later"]).is_ok());
+    }
+
+    #[test]
+    fn prunes_a_missing_worktree() {
+        let tree = fixture("prune", "main", &[]);
+        let repo = &tree.0;
+        let (dir, _) = linked(repo, "gone");
+        std::fs::remove_dir_all(&dir).unwrap();
+        let (listed, prunable) = list_all(repo).unwrap();
+        assert_eq!((listed.len(), prunable), (1, 1));
+        assert_eq!(prune(repo).unwrap(), "Pruned 1 missing worktree");
+        assert_eq!(list_all(repo).unwrap().1, 0);
     }
 }

@@ -486,10 +486,6 @@ pub fn toplevel(directory: &Path) -> Result<PathBuf, String> {
     Ok(path_from_bytes(root))
 }
 
-/// The text of `path` as of HEAD, or `None` when HEAD has no such file:
-/// a new file, or a repository with no commits yet. Line endings are
-/// normalised to what the editor keeps in its rope, so a CRLF file does
-/// not read as changed on every line.
 /// The Git directories of the repository `directory` is in: its own and,
 /// for a linked worktree, the common one. Empty outside a repository.
 pub fn git_dirs(directory: &Path) -> Vec<PathBuf> {
@@ -511,21 +507,32 @@ pub fn git_dirs(directory: &Path) -> Vec<PathBuf> {
     dirs
 }
 
+/// The text of `path` as of HEAD, or `None` when HEAD has no such file:
+/// a new file, or a repository with no commits yet. Line endings are
+/// normalised to what the editor keeps in its rope, so a CRLF file does
+/// not read as changed on every line.
 pub fn head_text(root: &Path, path: &Path) -> Result<Option<String>, String> {
     let relative = path
         .strip_prefix(root)
         .map_err(|_| "outside the repository".to_string())?;
-    let spec = format!("HEAD:{}", relative.to_string_lossy());
+    Ok(rev_bytes(root, "HEAD", relative)?.map(|bytes| {
+        // Line breaks as the buffer has them: CRLF and a lone CR are LF.
+        let text = String::from_utf8_lossy(&bytes);
+        crate::text::buffer::normalize_newlines(&text).into_owned()
+    }))
+}
+
+/// The bytes of `relative` as of `rev`, or `None` when that commit has no
+/// such file or there is no such commit (a repository with no commits yet
+/// included).
+pub fn rev_bytes(root: &Path, rev: &str, relative: &Path) -> Result<Option<Vec<u8>>, String> {
+    let spec = format!("{rev}:{}", relative.to_string_lossy());
     let output = command(root)
         .args(["show", &spec])
         .output()
         .map_err(|e| e.to_string())?;
     if output.status.success() {
-        // Line breaks as the buffer has them: CRLF and a lone CR are LF.
-        let text = String::from_utf8_lossy(&output.stdout);
-        return Ok(Some(
-            crate::text::buffer::normalize_newlines(&text).into_owned(),
-        ));
+        return Ok(Some(output.stdout));
     }
     // Why it failed, from exit statuses rather than from git's wording,
     // which changes between versions and languages. No commit yet, or no
@@ -536,12 +543,94 @@ pub fn head_text(root: &Path, path: &Path) -> Result<Option<String>, String> {
             .output()
             .is_ok_and(|o| o.status.success())
     };
-    if !succeeds(&["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
-        || !succeeds(&["cat-file", "-e", &spec])
+    if !succeeds(&[
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        &format!("{rev}^{{commit}}"),
+    ]) || !succeeds(&["cat-file", "-e", &spec])
     {
         return Ok(None);
     }
     Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+}
+
+/// The commit `tree`'s HEAD and `base` last had in common.
+pub fn merge_base(tree: &Path, base: &str) -> Result<String, String> {
+    let out = run(tree, &["merge-base", base, "HEAD"])?;
+    let id = String::from_utf8_lossy(&out).trim().to_owned();
+    if id.is_empty() {
+        return Err(format!("no commit in common with {base}"));
+    }
+    Ok(id)
+}
+
+/// A file that differs from a commit, as `git diff --name-status` says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Changed {
+    /// Relative to the repository.
+    pub path: PathBuf,
+    /// `A`, `M`, `D`, `R`, `C`, `T`, or `?` for a file Git does not track.
+    pub kind: char,
+    /// Where a renamed or copied file came from.
+    pub from: Option<PathBuf>,
+}
+
+/// Every file in `tree` that differs from `rev`: what is committed since,
+/// staged, and not staged yet, and the files Git does not track. Sorted
+/// by path.
+pub fn changed_since(tree: &Path, rev: &str) -> Result<Vec<Changed>, String> {
+    let tracked = run(
+        tree,
+        &["diff", "--name-status", "-z", "-M", "--no-ext-diff", rev],
+    )?;
+    let mut changed = parse_name_status(&tracked);
+    let untracked = run(tree, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+    changed.extend(
+        untracked
+            .split(|b| *b == 0)
+            .filter(|r| !r.is_empty())
+            .map(|r| Changed {
+                path: path_from_bytes(r),
+                kind: '?',
+                from: None,
+            }),
+    );
+    changed.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(changed)
+}
+
+/// `git diff --name-status -z` output: `X\0path\0`, and for a rename or
+/// copy `R087\0old\0new\0`.
+pub fn parse_name_status(bytes: &[u8]) -> Vec<Changed> {
+    let mut fields = bytes.split(|b| *b == 0);
+    let mut changed = Vec::new();
+    while let Some(status) = fields.next() {
+        let Some(&kind) = status.first() else {
+            continue;
+        };
+        let kind = kind as char;
+        let Some(first) = fields.next() else {
+            break;
+        };
+        if matches!(kind, 'R' | 'C') {
+            let Some(second) = fields.next() else {
+                break;
+            };
+            changed.push(Changed {
+                path: path_from_bytes(second),
+                kind,
+                from: Some(path_from_bytes(first)),
+            });
+        } else {
+            changed.push(Changed {
+                path: path_from_bytes(first),
+                kind,
+                from: None,
+            });
+        }
+    }
+    changed
 }
 
 /// What Git holds for a file in the index.
@@ -1815,6 +1904,86 @@ mod tests {
         let root = repo.path().to_path_buf();
         std::fs::write(root.join("a.txt"), "one\n").unwrap();
         assert_eq!(head_text(&root, &root.join("a.txt")), Ok(None));
+    }
+
+    #[test]
+    fn parses_name_status_with_renames() {
+        let raw = b"M\0src/a.rs\0A\0new.txt\0D\0gone.txt\0R087\0old.md\0moved.md\0T\0link\0";
+        let got = parse_name_status(raw);
+        let short: Vec<(char, &str, Option<&str>)> = got
+            .iter()
+            .map(|c| {
+                (
+                    c.kind,
+                    c.path.to_str().unwrap(),
+                    c.from.as_deref().and_then(Path::to_str),
+                )
+            })
+            .collect();
+        assert_eq!(
+            short,
+            [
+                ('M', "src/a.rs", None),
+                ('A', "new.txt", None),
+                ('D', "gone.txt", None),
+                ('R', "moved.md", Some("old.md")),
+                ('T', "link", None),
+            ]
+        );
+        assert!(parse_name_status(b"").is_empty());
+    }
+
+    #[test]
+    fn rev_bytes_reads_any_rev() {
+        let repo = TempRepo::new("rev-bytes");
+        let root = repo.path().to_path_buf();
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        run(&root, &["add", "a.txt"]).unwrap();
+        run(&root, &["commit", "-q", "-m", "one"]).unwrap();
+        std::fs::write(root.join("a.txt"), "two\n").unwrap();
+        run(&root, &["commit", "-q", "-am", "two"]).unwrap();
+        let a = Path::new("a.txt");
+        assert_eq!(rev_bytes(&root, "HEAD~1", a), Ok(Some(b"one\n".to_vec())));
+        assert_eq!(rev_bytes(&root, "HEAD", a), Ok(Some(b"two\n".to_vec())));
+        assert_eq!(rev_bytes(&root, "HEAD", Path::new("b.txt")), Ok(None));
+        assert_eq!(rev_bytes(&root, "no-such-branch", a), Ok(None));
+    }
+
+    #[test]
+    fn changed_since_the_merge_base_includes_uncommitted() {
+        let repo = TempRepo::new("changed-since");
+        let root = repo.path().to_path_buf();
+        let body = "a line long enough that a rename is found\n".repeat(8);
+        for name in ["kept.txt", "edited.txt", "staged-gone.txt", "old-name.txt"] {
+            std::fs::write(root.join(name), &body).unwrap();
+        }
+        run(&root, &["add", "."]).unwrap();
+        run(&root, &["commit", "-q", "-m", "base"]).unwrap();
+        run(&root, &["branch", "-q", "-M", "main"]).unwrap();
+        run(&root, &["switch", "-q", "-c", "topic"]).unwrap();
+        std::fs::write(root.join("added.txt"), "new\n").unwrap();
+        run(&root, &["add", "added.txt"]).unwrap();
+        run(&root, &["mv", "old-name.txt", "new-name.txt"]).unwrap();
+        run(&root, &["commit", "-q", "-m", "topic"]).unwrap();
+        std::fs::write(root.join("edited.txt"), "changed\n").unwrap();
+        run(&root, &["rm", "-q", "staged-gone.txt"]).unwrap();
+        std::fs::write(root.join("loose.txt"), "untracked\n").unwrap();
+        let base = merge_base(&root, "main").unwrap();
+        let got: Vec<(char, String)> = changed_since(&root, &base)
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.kind, c.path.to_string_lossy().into_owned()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ('A', "added.txt".into()),
+                ('M', "edited.txt".into()),
+                ('?', "loose.txt".into()),
+                ('R', "new-name.txt".into()),
+                ('D', "staged-gone.txt".into()),
+            ]
+        );
     }
 
     #[test]

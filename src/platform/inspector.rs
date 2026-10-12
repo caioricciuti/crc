@@ -43,10 +43,16 @@ pub enum Action {
     CreatePullRequest,
     MergePullRequest,
     OpenPullRequest,
-    /// A worktree strip's Open: that workspace, selected.
+    /// A worktree strip's branch name: that workspace, selected.
     OpenWorktree,
     /// A worktree strip's Terminal: a new shell in it.
     WorktreeTerminal,
+    /// A worktree strip's Review: its branch against the base, on the
+    /// Review page.
+    ReviewWorktree,
+    /// A merged worktree strip's Clean up: the worktree and its branch
+    /// removed.
+    CleanUpWorktree,
 }
 
 impl Action {
@@ -63,6 +69,8 @@ impl Action {
             Action::OpenPullRequest => "open",
             Action::OpenWorktree => "worktree_open",
             Action::WorktreeTerminal => "worktree_terminal",
+            Action::ReviewWorktree => "worktree_review",
+            Action::CleanUpWorktree => "worktree_cleanup",
         }
     }
 }
@@ -99,9 +107,9 @@ pub struct Inspector {
     max_scroll: f32,
     /// The ssh session shown last frame, for the self-test.
     shown_remote: Option<String>,
-    /// The worktree strips shown last frame, per repository, for the
-    /// self-test.
-    shown_worktrees: Vec<(PathBuf, PathBuf, String)>,
+    /// The worktree strips shown last frame, per repository, and whether
+    /// each was merged, for the self-test.
+    shown_worktrees: Vec<(PathBuf, PathBuf, String, bool)>,
 }
 
 impl Inspector {
@@ -248,13 +256,20 @@ impl Inspector {
                 .shown_worktrees
                 .iter()
                 .filter(|(repo, ..)| repo == path)
-                .map(|(_, tree, name)| match self.status_of(tree) {
-                    Some(Ok(s)) => format!(
-                        "{name}:ahead={}:+{}-{}:files={}",
-                        s.ahead, s.added, s.removed, s.files
-                    ),
-                    Some(Err(_)) => format!("{name}:error"),
-                    None => format!("{name}:reading"),
+                .map(|(_, tree, name, merged)| {
+                    let state = match self.status_of(tree) {
+                        Some(Ok(s)) => format!(
+                            "{name}:ahead={}:+{}-{}:files={}",
+                            s.ahead, s.added, s.removed, s.files
+                        ),
+                        Some(Err(_)) => format!("{name}:error"),
+                        None => format!("{name}:reading"),
+                    };
+                    if *merged {
+                        format!("{state}:merged")
+                    } else {
+                        state
+                    }
                 })
                 .collect();
             if strips.is_empty() {
@@ -284,13 +299,14 @@ impl Inspector {
     }
 
     /// `worktrees`: for a folder workspace, the worktrees of its
-    /// repositories, each with the name its row has.
+    /// repositories, each with the name its row has, what it has been
+    /// doing, and whether it is merged.
     #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &mut self,
         workspace: Option<&Workspace>,
         repos: Option<&[PathBuf]>,
-        worktrees: &[(Workspace, String, Pace)],
+        worktrees: &[(Workspace, String, Pace, bool)],
         remote: Option<&crate::platform::remote::Remote>,
         pull_request: Option<Option<&PullRequest>>,
         github: bool,
@@ -392,7 +408,7 @@ impl Inspector {
         &mut self,
         workspace: Option<&Workspace>,
         repos: Option<&[PathBuf]>,
-        worktrees: &[(Workspace, String, Pace)],
+        worktrees: &[(Workspace, String, Pace, bool)],
         remote: Option<&crate::platform::remote::Remote>,
         pull_request: Option<Option<&PullRequest>>,
         github: bool,
@@ -520,7 +536,7 @@ impl Inspector {
                     single = Some(status);
                 }
             }
-            let mine: Vec<&(Workspace, String, Pace)> = worktrees
+            let mine: Vec<&(Workspace, String, Pace, bool)> = worktrees
                 .iter()
                 .filter(|(w, ..)| w.repo.as_deref() == Some(repo.as_path()))
                 .collect();
@@ -732,14 +748,15 @@ impl Inspector {
 }
 
 impl Inspector {
-    /// A repository's worktrees, a strip each in one card: the branch and,
-    /// under it, how far ahead of the base and the change from where it
-    /// left it; at the right, Open and Terminal. Returns the y under it.
+    /// A repository's worktrees, a strip each in one card: the branch (a
+    /// click opens it) and, under it, how far ahead of the base and the
+    /// change from where it left it; at the right, Review and Terminal, or
+    /// Clean up once it is merged. Returns the y under it.
     #[allow(clippy::too_many_arguments)]
     fn worktree_strips(
         &mut self,
         repo: &Path,
-        worktrees: &[&(Workspace, String, Pace)],
+        worktrees: &[&(Workspace, String, Pace, bool)],
         x: f32,
         y: f32,
         width: f32,
@@ -769,9 +786,14 @@ impl Inspector {
             },
             theme,
         );
-        for (n, (tree, name, pace)) in worktrees.iter().enumerate() {
-            self.shown_worktrees
-                .push((repo.to_path_buf(), tree.path.clone(), name.clone()));
+        for (n, (tree, name, pace, merged)) in worktrees.iter().enumerate() {
+            let merged = *merged;
+            self.shown_worktrees.push((
+                repo.to_path_buf(),
+                tree.path.clone(),
+                name.clone(),
+                merged,
+            ));
             let top = y + n as f32 * STRIP;
             if n > 0 {
                 layout::push_rect(
@@ -786,18 +808,24 @@ impl Inspector {
             // it has the whole width.
             let mut right = x + width - 6.0;
             let by = top + 4.0;
-            for (label, action, tip) in [
+            let review_tip = match &tree.base {
+                Some(base) => format!("Changes on this branch since {base}, uncommitted included"),
+                None => "Changes on this branch, uncommitted included".to_owned(),
+            };
+            let first = if merged {
+                (
+                    "Clean up",
+                    Action::CleanUpWorktree,
+                    "Remove this merged worktree and its branch".to_owned(),
+                )
+            } else {
                 (
                     "Terminal",
                     Action::WorktreeTerminal,
-                    "Start a shell in this worktree",
-                ),
-                (
-                    "Open",
-                    Action::OpenWorktree,
-                    "Show this worktree's workspace",
-                ),
-            ] {
+                    "Start a shell in this worktree".to_owned(),
+                )
+            };
+            for (label, action, tip) in [first, ("Review", Action::ReviewWorktree, review_tip)] {
                 let probe = layout::Button::new(Viewport {
                     x: 0.0,
                     y: 0.0,
@@ -825,13 +853,30 @@ impl Inspector {
                     theme.control_hover,
                 );
                 layout::Button { rect: b, ..probe }
-                    .tip(tip)
+                    .tip(&tip)
                     .draw(out, atlas, theme);
                 self.hits.push((b, action, Some(tree.path.clone())));
                 right = b.x - layout::UI_GAP;
             }
+            // The branch name opens the workspace: it lights up under the
+            // pointer like a link.
             let name_room = (right - 4.0 - (x + 10.0)).max(0.0);
             let shown = fit(atlas, name, name_room);
+            let name_rect = Viewport {
+                x: x + 4.0,
+                y: by,
+                width: (layout::ui_text_width(atlas, &shown) + 12.0).min(name_room + 6.0),
+                height: layout::UI_CONTROL_SM,
+            };
+            let over = layout::hovered(name_rect);
+            if over {
+                layout::push_rounded_rect(out, name_rect, layout::UI_RADIUS_SM, theme.row_hover);
+            }
+            layout::hotspot(
+                name_rect,
+                layout::Cursor::Pointing,
+                Some("Show this worktree's workspace"),
+            );
             text(
                 out,
                 atlas,
@@ -839,8 +884,10 @@ impl Inspector {
                 top + 5.0,
                 name_room,
                 &shown,
-                theme.text,
+                if over { theme.accent } else { theme.text },
             );
+            self.hits
+                .push((name_rect, Action::OpenWorktree, Some(tree.path.clone())));
             let room = (width - 20.0).max(0.0);
             let line2 = top + 24.0;
             match self.status_of(&tree.path) {
@@ -871,6 +918,7 @@ impl Inspector {
                 Some(Ok(status)) => {
                     let mut parts: Vec<(String, [f32; 4])> = Vec::new();
                     match (status.base.as_ref(), status.ahead) {
+                        _ if merged => parts.push(("merged".into(), theme.diff_added)),
                         (None, _) => parts.push(("no base".into(), theme.gutter_text)),
                         (Some(_), 0) => parts.push(("even".into(), theme.gutter_text)),
                         (Some(_), a) => parts.push((format!("{a} ahead"), theme.status_text)),
@@ -883,6 +931,7 @@ impl Inspector {
                     // What it has been doing, as its row says it.
                     match pace {
                         Pace::Writing => parts.push(("\u{b7} writing".into(), theme.accent)),
+                        Pace::Quiet(_) if merged => {}
                         Pace::Quiet(d) => parts.push((
                             format!("\u{b7} quiet {}", crate::platform::agents::span(*d)),
                             theme.gutter_text,
@@ -1170,7 +1219,7 @@ fn plural(n: usize, word: &str) -> String {
 /// `s`, cut with an ellipsis to fit `width`. Half a point of slack: a
 /// value right-aligned into exactly its own width comes back a rounding
 /// error short of it.
-fn fit(atlas: &mut Atlas, s: &str, width: f32) -> String {
+pub(crate) fn fit(atlas: &mut Atlas, s: &str, width: f32) -> String {
     let width = width + 0.5;
     if layout::ui_text_width(atlas, s) <= width {
         return s.to_owned();

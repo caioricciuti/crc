@@ -1,5 +1,6 @@
-//! The Review page in the window: opening it, what its buttons do, and
-//! keeping Home's counts current as agents write.
+//! The Review page in the window: opening it, on agents' sessions or on a
+//! worktree's branch, what its buttons do, and keeping Home's counts
+//! current as agents write.
 
 use super::*;
 use crate::platform::review_page::Action;
@@ -117,6 +118,9 @@ impl EditorView {
     pub(super) fn open_review(&self) {
         if let Some(mut state) = self.state_mut() {
             state.review_page.open = true;
+            // Agents' sessions, not a branch reviewed before.
+            state.review_page.loading = None;
+            state.review_page.sessions.clear();
             refresh_review(&mut state);
             state.review_page.diff_scroll = 0;
             if let Some(page) = &mut state.extensions {
@@ -131,8 +135,116 @@ impl EditorView {
         self.pump();
     }
 
+    /// The Review page on a worktree's branch: what it changes since it
+    /// left the default branch, uncommitted work included, read only. Read
+    /// on a worker; the page shows its loading state meanwhile. Agents
+    /// mode is left, as Open in Editor does, since the page has the
+    /// editor column.
+    pub(super) fn review_worktree(&self, path: &std::path::Path) {
+        let found = self.state().and_then(|state| {
+            let index = state.agents.by_id(&path.to_string_lossy())?;
+            let task = &state.agents.tasks[index];
+            Some((
+                task.path.clone(),
+                task.base.clone(),
+                state.agents.title(task),
+            ))
+        });
+        let Some((tree, base, title)) = found else {
+            return;
+        };
+        let Some(base) = base else {
+            if let Some(mut state) = self.state_mut() {
+                state.say(
+                    layout::Feedback::Failure,
+                    format!("{title} has no default branch to compare with"),
+                );
+            }
+            self.request_redraw();
+            return;
+        };
+        self.set_agents_mode(false);
+        if let Some(mut state) = self.state_mut() {
+            let (tx, rx) = mpsc::channel();
+            let (worker_base, worker_title) = (base.clone(), title.clone());
+            std::thread::spawn(move || {
+                let _ = tx.send(crate::platform::review_page::load_branch(
+                    &tree,
+                    &worker_base,
+                    &worker_title,
+                ));
+            });
+            let page = &mut state.review_page;
+            page.open = true;
+            page.sessions.clear();
+            page.selected = (0, 0);
+            page.diff_scroll = 0;
+            page.list_scroll = 0.0;
+            page.confirm = None;
+            page.loading = Some(crate::platform::review_page::Loading { title, base, rx });
+            if let Some(page) = &mut state.extensions {
+                page.details = false;
+            }
+            state.mcp.details = false;
+            state.settings_page.open = false;
+            state.palette = None;
+            state.completion = None;
+        }
+        self.resume_display_link();
+        self.request_redraw();
+        self.pump();
+    }
+
+    /// A branch read for the Review page, once it is in.
+    pub(super) fn poll_review(&self) {
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
+        let Some(loading) = &state.review_page.loading else {
+            return;
+        };
+        let answer = match loading.rx.try_recv() {
+            Ok(answer) => Some(answer),
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => None,
+        };
+        let title = loading.title.clone();
+        state.review_page.loading = None;
+        match answer {
+            Some(Ok(session)) => {
+                state.review_page.sessions = vec![session];
+                state.review_page.selected = (0, 0);
+                state.review_page.diff_scroll = 0;
+            }
+            Some(Err(e)) => {
+                state.review_page.open = false;
+                state.say(
+                    layout::Feedback::Failure,
+                    format!("Could not read {title}: {e}"),
+                );
+            }
+            None => {}
+        }
+        drop(state);
+        self.request_redraw();
+    }
+
     /// What a click on the Review page does.
     pub(super) fn review_action(&self, action: Action) {
+        // The file shown, in the editor: the page gives the column back.
+        if action == Action::OpenFile {
+            let path = self.state_mut().and_then(|mut state| {
+                let path = state.review_page.selected_entry()?.file.path.clone();
+                state.review_page.open = false;
+                Some(path)
+            });
+            if let Some(path) = path {
+                self.run_pick(Pick::File(path));
+            }
+            self.request_redraw();
+            self.pump();
+            return;
+        }
         let said = self.review_do(action);
         let reload = matches!(
             action,
@@ -160,6 +272,15 @@ impl EditorView {
         let Some(mut state) = self.state_mut() else {
             return Ok(None);
         };
+        // A branch is reviewed read only: nothing to keep or undo.
+        let read_only = state
+            .review_page
+            .sessions
+            .first()
+            .is_some_and(crate::platform::review_page::Session::read_only);
+        if read_only && !matches!(action, Action::Close | Action::Select(..)) {
+            return Ok(None);
+        }
         // A destructive action asks for a second click; anything else
         // clicked in between cancels it.
         let destructive = matches!(action, Action::UndoFile | Action::UndoSession(_));
@@ -193,6 +314,7 @@ impl EditorView {
         match action {
             Action::Close => {
                 state.review_page.open = false;
+                state.review_page.loading = None;
                 Ok(None)
             }
             Action::Select(s, f) => {
@@ -267,6 +389,7 @@ impl EditorView {
                     (false, _) => format!("Kept every change in {n} {files}"),
                 }))
             }
+            Action::OpenFile => Ok(None),
         }
     }
 }

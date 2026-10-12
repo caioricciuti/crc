@@ -2623,6 +2623,7 @@ define_class!(
             self.poll_home();
             self.poll_mcp();
             self.poll_agents();
+            self.poll_review();
             self.poll_reloads();
             if self
                 .state_mut().is_some_and(|mut state| state.symbols.poll())
@@ -3889,6 +3890,18 @@ define_class!(
         #[unsafe(method(agentRemove:))]
         fn action_agent_remove(&self, _sender: Option<&AnyObject>) {
             self.agent_remove();
+        }
+
+        #[unsafe(method(agentReview:))]
+        fn action_agent_review(&self, _sender: Option<&AnyObject>) {
+            if let Some(task) = self.menu_task() {
+                self.review_worktree(&task.path);
+            }
+        }
+
+        #[unsafe(method(agentPrune:))]
+        fn action_agent_prune(&self, _sender: Option<&AnyObject>) {
+            self.agent_prune();
         }
 
         /// Shows the terminal with the keyboard, or hides it when it has

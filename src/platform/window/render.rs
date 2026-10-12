@@ -734,7 +734,8 @@ impl EditorView {
                         .map(|t| {
                             let title = agents.title(&t);
                             let pace = agents.pace(&t);
-                            (t, title, pace)
+                            let merged = agents.is_merged(&t);
+                            (t, title, pace, merged)
                         })
                         .collect(),
                     _ => Vec::new(),

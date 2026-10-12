@@ -53,6 +53,8 @@ pub enum Action {
 struct Listing {
     repos: Vec<(String, Vec<PathBuf>)>,
     worktrees: Vec<Workspace>,
+    /// Per main checkout, the worktrees Git records whose folder is gone.
+    prunable: std::collections::HashMap<PathBuf, usize>,
 }
 
 /// A place to work: a folder, and the sessions started in it. A worktree
@@ -81,6 +83,10 @@ pub struct Workspace {
     /// A worktree branch's last commit: when, in Unix seconds, and its
     /// subject.
     pub commit: Option<(u64, String)>,
+    /// A worktree branch that was committed to and is all on the default
+    /// branch now: done, and safe to clean up. A squash merge Git cannot
+    /// see is told by its pull request instead ([`Panel::is_merged`]).
+    pub merged: bool,
 }
 
 impl Workspace {
@@ -95,6 +101,7 @@ impl Workspace {
             repo,
             base,
             commit: None,
+            merged: false,
         }
     }
 
@@ -219,13 +226,14 @@ fn scan(folders: &[(String, PathBuf)]) -> Listing {
     let mut repos = Vec::new();
     let mut worktrees: Vec<Workspace> = Vec::new();
     let mut mains: Vec<PathBuf> = Vec::new();
+    let mut prunable = std::collections::HashMap::new();
     for (id, dir) in folders {
         let found: Vec<PathBuf> = discover(dir)
             .iter()
             .map(|p| crate::platform::canonical(p))
             .collect();
         for repo in &found {
-            let Ok(list) = crate::project::worktree::list(repo) else {
+            let Ok((list, missing)) = crate::project::worktree::list_all(repo) else {
                 continue;
             };
             let list: Vec<Worktree> = list
@@ -242,11 +250,19 @@ fn scan(folders: &[(String, PathBuf)]) -> Listing {
                 continue;
             }
             mains.push(main.path.clone());
-            // Once per repository: every branch's last commit, and the
-            // default branch the worktrees are compared with.
+            if missing > 0 {
+                prunable.insert(main.path.clone(), missing);
+            }
+            // Once per repository: every branch's last commit, the default
+            // branch the worktrees are compared with, and the branches all
+            // on it.
             let tips = crate::project::worktree::tips(&main.path).unwrap_or_default();
             let base =
                 crate::project::worktree::default_branch(&main.path, &tips, main.branch.as_deref());
+            let merged = base
+                .as_deref()
+                .map(|b| crate::project::worktree::merged(&main.path, b))
+                .unwrap_or_default();
             for w in list.into_iter().filter(|w| !w.main) {
                 if !worktrees.iter().any(|t| t.path == w.path) {
                     let commit = w.branch.as_ref().and_then(|b| {
@@ -254,15 +270,27 @@ fn scan(folders: &[(String, PathBuf)]) -> Listing {
                             .find(|t| t.branch == *b)
                             .map(|t| (t.time, t.subject.clone()))
                     });
+                    // On the default branch is not enough: a branch made and
+                    // never committed to is there from the start.
+                    let done = w.branch.as_ref().is_some_and(|b| {
+                        merged.contains(b)
+                            && base.as_deref() != Some(b.as_str())
+                            && crate::project::worktree::has_own_commits(&main.path, b)
+                    });
                     let mut workspace = Workspace::of(w, Some(main.path.clone()), base.clone());
                     workspace.commit = commit;
+                    workspace.merged = done;
                     worktrees.push(workspace);
                 }
             }
         }
         repos.push((id.clone(), found));
     }
-    Listing { repos, worktrees }
+    Listing {
+        repos,
+        worktrees,
+        prunable,
+    }
 }
 
 /// What the list keeps of your arrangement, per workspace id.
@@ -406,6 +434,7 @@ fn parse_folders(text: &str) -> Vec<Workspace> {
             repo: None,
             base: None,
             commit: None,
+            merged: false,
         })
         .collect()
 }
@@ -524,17 +553,24 @@ pub fn span(d: std::time::Duration) -> String {
 }
 
 /// The line under a worktree's name when no session in it is waiting,
-/// working or in ssh: what it has been doing, its terminals (none is not
-/// said: a background agent may be writing in it), and how far ahead of
-/// the default branch it is.
-pub fn worktree_line(pace: Pace, terminals: usize, ahead: usize) -> Vec<String> {
-    let mut parts: Vec<String> = pace.label().into_iter().collect();
+/// working or in ssh: whether it is merged, what it has been doing, its
+/// terminals (none is not said: a background agent may be writing in
+/// it), and how far ahead of the default branch it is.
+pub fn worktree_line(pace: Pace, terminals: usize, ahead: usize, merged: bool) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
+    // Merged is what matters then; how long it has been quiet does not.
+    if merged {
+        parts.push("merged".into());
+    }
+    if !merged || matches!(pace, Pace::Writing) {
+        parts.extend(pace.label());
+    }
     match terminals {
         0 => {}
         1 => parts.push("1 terminal".into()),
         n => parts.push(format!("{n} terminals")),
     }
-    if ahead > 0 {
+    if ahead > 0 && !merged {
         parts.push(format!("{ahead} ahead"));
     }
     parts
@@ -636,6 +672,8 @@ pub struct Panel {
     rx: Option<mpsc::Receiver<Listing>>,
     /// Per task path, once read.
     pub info: std::collections::HashMap<PathBuf, Info>,
+    /// Per main checkout, the worktrees Git records whose folder is gone.
+    pub prunable: std::collections::HashMap<PathBuf, usize>,
     info_rx: Option<mpsc::Receiver<(PathBuf, Info)>>,
     /// Per session (by its review folder), what its team hooks said.
     pub teams: std::collections::HashMap<PathBuf, Team>,
@@ -854,6 +892,17 @@ impl Panel {
         self.rebuild();
     }
 
+    /// Whether a worktree's work is done: its branch is on the default
+    /// branch, or its pull request was merged.
+    pub fn is_merged(&self, task: &Workspace) -> bool {
+        task.merged
+            || self
+                .info
+                .get(&task.path)
+                .and_then(|i| i.pull_request.as_ref())
+                .is_some_and(|pr| pr.state == "MERGED")
+    }
+
     /// Takes a finished read. Returns whether anything changed.
     pub fn poll(&mut self) -> bool {
         let mut changed = false;
@@ -885,10 +934,12 @@ impl Panel {
             Err(mpsc::TryRecvError::Disconnected) => Listing {
                 repos: Vec::new(),
                 worktrees: self.worktrees.clone(),
+                prunable: self.prunable.clone(),
             },
         };
         self.rx = None;
         self.worktrees = listing.worktrees;
+        self.prunable = listing.prunable;
         self.repos = listing.repos.into_iter().collect();
         self.rebuild();
         true
@@ -1056,6 +1107,7 @@ impl Panel {
             repo: None,
             base: None,
             commit: None,
+            merged: false,
         };
         let id = made.id();
         self.folders.push(made);
@@ -2066,6 +2118,8 @@ impl Panel {
                     icons::HOME
                 } else if task.folder {
                     icons::FOLDER
+                } else if self.is_merged(&task) {
+                    icons::CHECK
                 } else {
                     icons::GIT_BRANCH
                 },
@@ -2218,7 +2272,12 @@ impl Panel {
             }
             let ahead = self.info.get(&task.path).map_or(0, |i| i.ahead);
             match pace {
-                Some(pace) => parts.extend(worktree_line(pace, mine.len(), ahead)),
+                Some(pace) => parts.extend(worktree_line(
+                    pace,
+                    mine.len(),
+                    ahead,
+                    self.is_merged(&task),
+                )),
                 None => {
                     match mine.len() {
                         0 => parts.push("no terminal".to_owned()),
@@ -2248,7 +2307,16 @@ impl Panel {
             } else {
                 theme.gutter_text
             };
-            (parts.join(" \u{b7} "), colour)
+            // Too long for the row: the last facts go whole before
+            // anything is cut, and a cut ends with an ellipsis.
+            let room = (line2_end - name_x).max(0.0);
+            while parts.len() > 1
+                && layout::ui_text_width(atlas, &parts.join(" \u{b7} ")) > room + 0.5
+            {
+                parts.pop();
+            }
+            let said = crate::platform::inspector::fit(atlas, &parts.join(" \u{b7} "), room);
+            (said, colour)
         };
         layout::push_ui_text(
             out,
@@ -2292,6 +2360,7 @@ mod tests {
             repo: None,
             base: None,
             commit: None,
+            merged: false,
         }
     }
 
@@ -2626,7 +2695,8 @@ mod tests {
     #[test]
     fn a_worktree_row_says_what_it_has_been_doing() {
         let secs = std::time::Duration::from_secs;
-        let line = |pace, terminals, ahead| worktree_line(pace, terminals, ahead).join(" \u{b7} ");
+        let line =
+            |pace, terminals, ahead| worktree_line(pace, terminals, ahead, false).join(" \u{b7} ");
         // Written in just now: writing, whatever the last commit.
         let writing = Pace::of(Some(secs(3)), Some(secs(7200)));
         assert_eq!(writing, Pace::Writing);
@@ -2656,6 +2726,16 @@ mod tests {
         // Nothing known, no terminal: never "no terminal".
         assert_eq!(line(Pace::of(None, None), 0, 1), "1 ahead");
         assert_eq!(line(Pace::Unknown, 0, 0), "");
+        // Merged: said first, no longer "ahead" of anything, and quiet
+        // time left out; still writing is still said.
+        assert_eq!(
+            worktree_line(Pace::of(None, Some(secs(7200))), 1, 1, true).join(" \u{b7} "),
+            "merged \u{b7} 1 terminal"
+        );
+        assert_eq!(
+            worktree_line(Pace::Writing, 0, 1, true).join(" \u{b7} "),
+            "merged \u{b7} writing"
+        );
     }
 
     #[test]

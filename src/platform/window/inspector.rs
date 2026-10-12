@@ -26,11 +26,19 @@ impl EditorView {
         };
         let (action, repo) = action;
         // A worktree strip's buttons act on that worktree's workspace.
-        if let (Action::OpenWorktree | Action::WorktreeTerminal, Some(path)) = (action, &repo) {
-            if action == Action::OpenWorktree {
-                self.open_worktree(path);
-            } else {
-                self.worktree_terminal(path);
+        if let (
+            Action::OpenWorktree
+            | Action::WorktreeTerminal
+            | Action::ReviewWorktree
+            | Action::CleanUpWorktree,
+            Some(path),
+        ) = (action, &repo)
+        {
+            match action {
+                Action::OpenWorktree => self.open_worktree(path),
+                Action::ReviewWorktree => self.review_worktree(path),
+                Action::CleanUpWorktree => self.clean_up_worktree(path),
+                _ => self.worktree_terminal(path),
             }
             self.request_redraw();
             self.pump();
@@ -56,7 +64,10 @@ impl EditorView {
                 NSMenu::popUpContextMenu_withEvent_forView(&menu, event, self);
             }
             Action::OpenPullRequest => self.agent_open_pull_request(),
-            Action::OpenWorktree | Action::WorktreeTerminal => {}
+            Action::OpenWorktree
+            | Action::WorktreeTerminal
+            | Action::ReviewWorktree
+            | Action::CleanUpWorktree => {}
         }
         self.request_redraw();
         self.pump();

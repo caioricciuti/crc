@@ -918,10 +918,21 @@ impl EditorView {
     fn task_menu(&self, index: usize) -> Retained<NSMenu> {
         let mtm = MainThreadMarker::from(self);
         let menu = context_menu_new(mtm);
-        let (main, folder, branch, base, pr) =
+        let (main, folder, branch, base, pr, merged, prunable) =
             self.state()
-                .map_or((true, false, None, None, None), |state| {
+                .map_or((true, false, None, None, None, false, 0), |state| {
                     let task = state.agents.tasks.get(index);
+                    // Worktrees Git still records whose folder is gone, in the
+                    // repositories a folder workspace holds.
+                    let prunable = task
+                        .filter(|t| t.folder)
+                        .and_then(|t| state.agents.repos_of(t))
+                        .map_or(0, |repos| {
+                            repos
+                                .iter()
+                                .filter_map(|r| state.agents.prunable.get(r))
+                                .sum()
+                        });
                     (
                         task.is_none_or(|t| t.main),
                         task.is_some_and(|t| t.folder),
@@ -930,6 +941,8 @@ impl EditorView {
                         task.and_then(|t| state.agents.info.get(&t.path))
                             .and_then(|info| info.pull_request.as_ref())
                             .map(|pr| pr.number),
+                        task.is_some_and(|t| state.agents.is_merged(t)),
+                        prunable,
                     )
                 });
         let pinned = self.state().is_some_and(|state| {
@@ -943,6 +956,12 @@ impl EditorView {
         add("New Terminal", sel!(agentNewShell:));
         add("New Claude Session", sel!(agentNewClaude:));
         add("Open in Editor", sel!(agentOpenInEditor:));
+        if !folder
+            && !main
+            && let Some(base) = &base
+        {
+            add(&format!("Review Changes vs {base}"), sel!(agentReview:));
+        }
         menu.addItem(&NSMenuItem::separatorItem(mtm));
         add(
             if pinned { "Unpin" } else { "Pin to Top" },
@@ -950,6 +969,15 @@ impl EditorView {
         );
         add("Rename", sel!(agentRenameInPlace:));
         if folder {
+            if prunable > 0 {
+                add(
+                    &match prunable {
+                        1 => "Prune 1 Missing Worktree".to_owned(),
+                        n => format!("Prune {n} Missing Worktrees"),
+                    },
+                    sel!(agentPrune:),
+                );
+            }
             add("Remove Workspace\u{2026}", sel!(agentRemoveWorkspace:));
         }
         if !folder {
@@ -980,7 +1008,14 @@ impl EditorView {
                 None => add("Create Pull Request", sel!(agentCreatePullRequest:)),
             }
             menu.addItem(&NSMenuItem::separatorItem(mtm));
-            add("Remove Task\u{2026}", sel!(agentRemove:));
+            add(
+                if merged {
+                    "Clean Up\u{2026}"
+                } else {
+                    "Remove Task\u{2026}"
+                },
+                sel!(agentRemove:),
+            );
         }
         menu
     }
@@ -1063,9 +1098,51 @@ impl EditorView {
         }
     }
 
+    /// The inspector's Clean up on a merged worktree: Remove Task on it.
+    pub(super) fn clean_up_worktree(&self, path: &Path) {
+        if let Some(mut state) = self.state_mut() {
+            state.agents.menu_task = Some(path.to_string_lossy().into_owned());
+        }
+        self.agent_remove();
+    }
+
+    /// A folder workspace's Prune: Git forgets the worktrees of its
+    /// repositories whose folder is gone.
+    pub(super) fn agent_prune(&self) {
+        let Some(task) = self.menu_task() else {
+            return;
+        };
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
+        let mains: Vec<std::path::PathBuf> = state
+            .agents
+            .repos_of(&task)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| state.agents.prunable.contains_key(r))
+            .collect();
+        if mains.is_empty() {
+            return;
+        }
+        state.agents.start("Pruning\u{2026}", move || {
+            let said: Vec<String> = mains
+                .iter()
+                .map(|main| crate::project::worktree::prune(main))
+                .collect::<Result<_, _>>()?;
+            Ok(Done {
+                said: said.join("; "),
+                start_in: None,
+            })
+        });
+        drop(state);
+        self.resume_display_link();
+        self.request_redraw();
+    }
+
     /// Removes the task's worktree once asked: its sessions close, Git
     /// refuses while it has uncommitted changes, and an unmerged branch is
-    /// kept.
+    /// kept. A merged one's branch goes too (Clean up).
     pub(super) fn agent_remove(&self) {
         let Some(id) = self.menu_task().map(|t| t.id()) else {
             return;
@@ -1084,19 +1161,44 @@ impl EditorView {
                 })
                 .collect()
         });
-        let detail = match sessions.len() {
-            0 => "Its folder is deleted. Git refuses if it has uncommitted changes; an unmerged branch is kept.".to_owned(),
-            1 => "Its session is closed and its folder deleted. Git refuses if it has uncommitted changes; an unmerged branch is kept.".to_owned(),
-            n => format!("Its {n} sessions are closed and its folder deleted. Git refuses if it has uncommitted changes; an unmerged branch is kept."),
+        // Merged: the default branch to check it against again, and the
+        // head of its merged pull request, read now.
+        let (merged, base, pr_head) = self
+            .menu_task()
+            .and_then(|t| {
+                let state = self.state()?;
+                let pr_head = state
+                    .agents
+                    .info
+                    .get(&t.path)
+                    .and_then(|i| i.pull_request.as_ref())
+                    .filter(|pr| pr.state == "MERGED")
+                    .map(|pr| pr.head_oid.clone());
+                Some((state.agents.is_merged(&t), t.base, pr_head))
+            })
+            .unwrap_or_default();
+        let detail = if merged {
+            "Its folder is deleted and, since it is merged, its branch too. Git refuses if it has uncommitted changes.".to_owned()
+        } else {
+            match sessions.len() {
+                0 => "Its folder is deleted. Git refuses if it has uncommitted changes; an unmerged branch is kept.".to_owned(),
+                1 => "Its session is closed and its folder deleted. Git refuses if it has uncommitted changes; an unmerged branch is kept.".to_owned(),
+                n => format!("Its {n} sessions are closed and its folder deleted. Git refuses if it has uncommitted changes; an unmerged branch is kept."),
+            }
+        };
+        let (title, button) = if merged {
+            (format!("Clean up {}?", task.name()), "Clean Up")
+        } else {
+            (format!("Remove the task {}?", task.name()), "Remove")
         };
         let yes = if std::env::var_os("CRC_SELFTEST").is_some() {
             true
         } else {
             ask(
                 MainThreadMarker::from(self),
-                &format!("Remove the task {}?", task.name()),
+                &title,
                 &detail,
-                &["Remove", "Cancel"],
+                &[button, "Cancel"],
             ) == 0
         };
         if !yes {
@@ -1151,7 +1253,12 @@ impl EditorView {
             .agents
             .start(&format!("Removing {name}\u{2026}"), move || {
                 Ok(Done {
-                    said: crate::project::worktree::remove(&main, &task)?,
+                    said: crate::project::worktree::remove(
+                        &main,
+                        &task,
+                        base.as_deref(),
+                        pr_head.as_deref(),
+                    )?,
                     start_in: None,
                 })
             });

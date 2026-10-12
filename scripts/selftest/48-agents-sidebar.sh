@@ -124,8 +124,10 @@ grep -q "^message: Started again 4 terminals" "$T/side-other.out" \
 # (the worktree beside it is not taken for a second repository) with a
 # strip per worktree. Terminal on a strip starts a shell there; the chevron
 # folds the worktrees away, which Control-1 to 9 then skip, and the fold
-# is kept; Open selects a worktree. A file written in a worktree from a
-# shell turns its row to writing. SELFTEST_FRAMES, when set, is a folder
+# is kept; the branch name selects a worktree. A file written in a worktree
+# from a shell turns its row to writing. Review shows the branch against
+# main; once main takes it, the strip says merged and Clean up removes it
+# (refused while it has uncommitted work) with its branch. SELFTEST_FRAMES, when set, is a folder
 # to keep the frames in.
 GD="$T/garden"
 GL="$GD/garden-log"
@@ -175,6 +177,33 @@ click @inspector.worktree_open.0
 wait 500
 dump $T/garden-open.out
 key 18 ctrl 1
+wait 400
+click @inspector.worktree_review.0
+wait 1200
+dump $T/garden-review.out
+frame $T/garden-review.bmp
+key 0 cmd,shift A
+wait 700
+text git -C $GL merge -q --ff-only fix/seed-dates
+key 36
+wait 700
+click @inspector.refresh
+wait 1200
+dump $T/garden-merged.out
+frame $T/garden-merged.bmp
+click @inspector.worktree_cleanup.0
+wait 500
+dump $T/garden-dirty.out
+key 18 ctrl 1
+wait 300
+text rm $T/garden-wt/seed-dates/notes.txt
+key 36
+wait 500
+click @inspector.worktree_cleanup.0
+wait 1500
+wait 1500
+dump $T/garden-cleaned.out
+key 18 ctrl 1
 wait 300
 click @agents.fold.0
 wait 300
@@ -183,7 +212,8 @@ SCRIPT
 mkdir -p "$T/home/garden"
 HOME="$T/home/garden" CRC_TERMINAL_SHELL=/bin/sh CRC_SELFTEST="$T/garden.script" \
     "$BIN" "$GD" 2> "$T/garden.err"
-[ -z "${SELFTEST_FRAMES:-}" ] || cp -f "$T/garden-frame.bmp" "$T/garden-writing.bmp" "$SELFTEST_FRAMES/"
+[ -z "${SELFTEST_FRAMES:-}" ] || cp -f "$T/garden-frame.bmp" "$T/garden-writing.bmp" \
+    "$T/garden-review.bmp" "$T/garden-merged.bmp" "$SELFTEST_FRAMES/"
 expect "$T/garden.out" agents_tree "garden,>fix/seed-dates,>feat/compost-log"
 expect "$T/garden.out" inspector "branch=main base=- ahead=0 behind=0 upstream=- push=0 pull=0 dirty=0 changes=+0-0 tag=- buttons=push worktrees=fix/seed-dates:ahead=1:+3-0:files=1,feat/compost-log:ahead=0:+0-0:files=0"
 expect "$T/garden-terminal.out" agents "on tasks=garden,fix/seed-dates,feat/compost-log selected=feat/compost-log sessions=garden,*feat/compost-log claude=0 pair=- op=-"
@@ -204,5 +234,24 @@ case "$(grep '^agents:' "$T/garden-open.out")" in
 *" selected=fix/seed-dates "*) ;;
 *) failed "garden: Open did not select the worktree: $(grep '^agents:' "$T/garden-open.out")" ;;
 esac
+# Review on a strip: the branch against main, read only, the committed
+# file and the one written from a shell (not yet committed) both there.
+expect "$T/garden-review.out" review_page "open sessions=1 files=2 hunks=1 shown=dates.txt confirm=false targets=4 base=main"
+# main takes the branch: it is merged now. The other worktree, never
+# committed to, is on main too but not done.
+case "$(grep '^inspector:' "$T/garden-merged.out")" in
+*"worktrees=fix/seed-dates:ahead=0:+0-0:files=0:merged,feat/compost-log:ahead=0:+0-0:files=0") ;;
+*) failed "garden: merged strips are $(grep '^inspector:' "$T/garden-merged.out")" ;;
+esac
+# Clean up refuses while the worktree has a file Git would lose.
+grep -q "^message: fix/seed-dates has uncommitted changes; commit or discard them first" "$T/garden-dirty.out" \
+    || failed "garden: clean up of a dirty worktree: $(grep '^message:' "$T/garden-dirty.out")"
+# Then it removes the worktree and, merged, its branch.
+expect "$T/garden-cleaned.out" agents_tree "garden,>feat/compost-log"
+grep -q "^message: Removed fix/seed-dates and its branch" "$T/garden-cleaned.out" \
+    || failed "garden: clean up said $(grep '^message:' "$T/garden-cleaned.out")"
+[ ! -e "$T/garden-wt/seed-dates" ] || failed "garden: the cleaned up worktree's folder is still there"
+testgit "$GL" rev-parse --verify --quiet fix/seed-dates >/dev/null 2>&1 \
+    && failed "garden: the merged branch was kept"
 testgit "$GL" worktree remove --force "$T/garden-wt/seed-dates" 2>/dev/null || true
 testgit "$GL" worktree remove --force "$GD/garden-log-compost" 2>/dev/null || true
