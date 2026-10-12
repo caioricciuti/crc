@@ -307,6 +307,17 @@ fn socket_path(id: &str) -> std::io::Result<PathBuf> {
     Ok(socket_dir()?.join(format!("{id}.sock")))
 }
 
+/// The program a helper holds: the helper's own child, found by the pid
+/// the helper wrote down.
+pub fn program_pid(dir: &Path, id: &str) -> Option<i32> {
+    let helper: i32 = std::fs::read_to_string(pid_path(dir, id))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    crate::platform::child_pids(helper).first().copied()
+}
+
 fn pid_path(dir: &Path, id: &str) -> PathBuf {
     dir.join(format!("{id}.pid"))
 }

@@ -79,6 +79,54 @@ fn home() -> Option<std::path::PathBuf> {
 
 unsafe extern "C" {
     fn kill(pid: i32, signal: i32) -> i32;
+    fn proc_pidinfo(pid: i32, flavor: i32, arg: u64, buffer: *mut u8, size: i32) -> i32;
+    fn proc_listchildpids(pid: i32, buffer: *mut i32, size: i32) -> i32;
+}
+
+/// The working directory of process `pid`, as the kernel has it: where a
+/// shell is after its last `cd`. `None` for a process gone or not ours.
+pub fn process_cwd(pid: i32) -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    // `struct proc_vnodepathinfo`: the current directory's `vnode_info`
+    // (152 bytes) and its path (MAXPATHLEN), then the same for the root.
+    const VNODE_INFO: usize = 152;
+    const MAX_PATH: usize = 1024;
+    const PROC_PIDVNODEPATHINFO: i32 = 9;
+    let mut info = vec![0u8; 2 * (VNODE_INFO + MAX_PATH)];
+    // SAFETY: the buffer is as large as the size passed, and the kernel
+    // writes no more than that.
+    let written = unsafe {
+        proc_pidinfo(
+            pid,
+            PROC_PIDVNODEPATHINFO,
+            0,
+            info.as_mut_ptr(),
+            info.len() as i32,
+        )
+    };
+    if written as usize != info.len() {
+        return None;
+    }
+    let path = &info[VNODE_INFO..VNODE_INFO + MAX_PATH];
+    let end = path.iter().position(|b| *b == 0)?;
+    (end > 0).then(|| std::ffi::OsStr::from_bytes(&path[..end]).into())
+}
+
+/// The processes `pid` started that are still running.
+pub fn child_pids(pid: i32) -> Vec<i32> {
+    let mut pids = vec![0i32; 64];
+    // SAFETY: the size passed is the buffer's in bytes; the call returns
+    // how many pids it wrote.
+    let count = unsafe {
+        proc_listchildpids(
+            pid,
+            pids.as_mut_ptr(),
+            (pids.len() * std::mem::size_of::<i32>()) as i32,
+        )
+    };
+    pids.truncate(count.max(0) as usize);
+    pids.retain(|p| *p > 0);
+    pids
 }
 
 /// Sends `signal` to `pid`, or to the process group `-pid`. Whether it was
@@ -150,4 +198,25 @@ pub fn write_atomically_with(
         let _ = std::fs::remove_file(&tmp);
     }
     result
+}
+
+#[cfg(test)]
+mod process_tests {
+    #[test]
+    fn a_childs_working_directory_is_read_from_the_kernel() {
+        let dir = std::env::temp_dir().join(format!("crc-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("5")
+            .current_dir(&dir)
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        assert!(super::child_pids(std::process::id() as i32).contains(&pid));
+        let read = super::process_cwd(pid).map(|p| super::canonical(&p));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(read, Some(super::canonical(&dir)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

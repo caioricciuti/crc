@@ -41,8 +41,24 @@ impl EditorView {
             }
         }
         drop(state);
+        let printed: Vec<usize> = noticed.iter().map(|n| n.index).collect();
         if !noticed.is_empty() {
             self.take_notices(noticed);
+        }
+        // A prompt after a `cd`: where the terminal showing is now. Read on
+        // every burst it prints, so the prompt right after the `cd` is
+        // never missed.
+        let moved = self.state_mut().is_some_and(|mut state| {
+            let active = state.terminal.active;
+            printed.contains(&active)
+                && state
+                    .terminal
+                    .tabs
+                    .get_mut(active)
+                    .is_some_and(|tab| tab.read_cwd())
+        });
+        if moved {
+            self.follow_cwd();
         }
         let Some(state) = self.state() else {
             return;
@@ -353,6 +369,8 @@ impl EditorView {
                     folder: crate::platform::canonical(&launch.cwd),
                     workspace,
                     alive: std::sync::Arc::new(()),
+                    cwd: crate::platform::canonical(&launch.cwd),
+                    program_pid: None,
                     launch,
                     held,
                     status: None,
@@ -476,6 +494,8 @@ impl EditorView {
                         .cloned(),
                     alive: std::sync::Arc::new(()),
                     status: None,
+                    cwd: crate::platform::canonical(&launch.cwd),
+                    program_pid: None,
                     launch,
                     held: Some(id),
                 },

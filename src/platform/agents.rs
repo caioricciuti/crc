@@ -171,12 +171,13 @@ fn merge_arrangements(texts: &[String]) -> Arrangement {
     out
 }
 
-/// The Git repositories a folder holds: itself, then its direct children
-/// by name. Hidden folders are skipped.
+/// The Git repositories a folder holds: the one it is in (itself, or the
+/// nearest folder above it with a `.git`), then its direct children by
+/// name. Hidden folders are skipped.
 pub fn discover(dir: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
-    if dir.join(".git").exists() {
-        found.push(dir.to_path_buf());
+    if let Some(repo) = dir.ancestors().find(|d| d.join(".git").exists()) {
+        found.push(repo.to_path_buf());
     }
     let mut children: Vec<PathBuf> = std::fs::read_dir(dir)
         .into_iter()
@@ -365,6 +366,19 @@ fn folders_text(folders: &[Workspace]) -> String {
         .iter()
         .map(|w| format!("{}\t{}\t{}\n", w.name, w.path.display(), w.key))
         .collect()
+}
+
+/// Whether a workspace's name is the one crc gave it: its folder's, or
+/// that with a number after it to tell two apart.
+fn named_after(name: &str, path: &Path) -> bool {
+    let Some(base) = path.file_name().map(|n| n.to_string_lossy()) else {
+        return false;
+    };
+    name == base
+        || name
+            .strip_prefix(&*base)
+            .and_then(|rest| rest.strip_prefix(' '))
+            .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
 }
 
 /// A key no workspace has had: the time and a count, so two made in the
@@ -848,6 +862,35 @@ impl Panel {
         let all: Vec<String> = self.tasks.iter().map(Workspace::id).collect();
         self.arrangement.move_before(id, before, &all);
         self.save_arrangement();
+    }
+
+    /// Moves a folder workspace to `path`, where its terminal went. One
+    /// named after its folder takes the new folder's name; one you named
+    /// keeps yours. Its id stays, and with it its sessions and pin.
+    pub fn move_folder(&mut self, id: &str, path: &Path) {
+        let path = crate::platform::canonical(path);
+        let Some(at) = self.folders.iter().position(|t| t.id() == id) else {
+            return;
+        };
+        let old = &self.folders[at];
+        if old.path == path {
+            return;
+        }
+        let rename = named_after(&old.name, &old.path)
+            .then(|| path.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .flatten();
+        if let Some(base) = rename {
+            let mut name = base.clone();
+            let mut n = 1;
+            while self.folders.iter().any(|t| t.name == name && t.id() != id) {
+                n += 1;
+                name = format!("{base} {n}");
+            }
+            self.folders[at].name = name;
+        }
+        self.folders[at].path = path;
+        self.rebuild();
+        self.save_folders();
     }
 
     /// Forgets a folder workspace, and its place, pin and name with it.
@@ -1895,6 +1938,32 @@ mod tests {
         );
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         assert_eq!(discover(&dir)[0], dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_workspace_follows_its_terminal_and_keeps_a_name_you_gave_it() {
+        let mut panel = Panel::default();
+        let auto = panel.add_folder("ch-ui", PathBuf::from("/tmp/crc-move/ch-ui"));
+        let mine = panel.add_folder("CRC", PathBuf::from("/tmp/crc-move/ch-ui"));
+        panel.move_folder(&auto, Path::new("/tmp/crc-move/duck-ui"));
+        panel.move_folder(&mine, Path::new("/tmp/crc-move/duck-ui"));
+        let by = |id: &str| panel.tasks[panel.by_id(id).unwrap()].clone();
+        assert_eq!(by(&auto).name, "duck-ui");
+        assert_eq!(by(&auto).path, PathBuf::from("/tmp/crc-move/duck-ui"));
+        assert_eq!(by(&mine).name, "CRC");
+        assert_eq!(by(&mine).path, PathBuf::from("/tmp/crc-move/duck-ui"));
+        assert!(named_after("crc 2", Path::new("/a/crc")));
+        assert!(!named_after("crc two", Path::new("/a/crc")));
+    }
+
+    #[test]
+    fn a_folder_inside_a_repository_finds_that_repository() {
+        let dir = std::env::temp_dir().join(format!("crc-enclosing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::create_dir_all(dir.join("src/deep")).unwrap();
+        assert_eq!(discover(&dir.join("src/deep")), vec![dir.clone()]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

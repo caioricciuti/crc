@@ -4,6 +4,12 @@ One entry per tag, written for people who use the editor.
 
 ## Unreleased
 
+- In Agents mode the workspace follows the terminal showing: `cd`
+  somewhere else and the workspace is that folder now (named after it,
+  unless you named it yourself), the inspector shows the Git repository
+  you are in, and the status line shows the folder and its branch. The
+  editor's project menu and the document's position leave the toolbar
+  and status line while Agents mode is on.
 - Problems in the editor are marked with a smooth wave under the text,
   which no longer covers underscores; it used to be a row of broken
   dashes. Underlined and struck-through text in the terminal uses the

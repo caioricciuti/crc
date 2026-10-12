@@ -347,16 +347,15 @@ impl Inspector {
                 return;
             }
             if named {
-                let label = repo.strip_prefix(&workspace.path).map_or_else(
-                    |_| repo.display().to_string(),
-                    |rest| {
-                        if rest.as_os_str().is_empty() {
-                            workspace.name()
-                        } else {
-                            rest.display().to_string()
-                        }
-                    },
-                );
+                // Under the folder: the path from it; the folder itself, or
+                // the repository it is inside: that one's name.
+                let label = match repo.strip_prefix(&workspace.path) {
+                    Ok(rest) if !rest.as_os_str().is_empty() => rest.display().to_string(),
+                    _ => repo.file_name().map_or_else(
+                        || repo.display().to_string(),
+                        |n| n.to_string_lossy().into_owned(),
+                    ),
+                };
                 let label = fit(atlas, &label, width);
                 layout::push_title(out, atlas, x, y + 4.0, 13.0, &label, theme.text, width);
                 y += ROW;

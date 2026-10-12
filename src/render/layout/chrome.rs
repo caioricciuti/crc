@@ -1504,7 +1504,8 @@ pub fn build_toolbar(
     let search = toolbar_search(rect);
     let project = project_name(tree);
     let project_rect = toolbar_project(tree, atlas, rect);
-    if project_rect.width > 0.0 {
+    // The editor's project is no business of Agents mode.
+    if project_rect.width > 0.0 && !agents {
         // The folder, its name and a chevron on one control, so it reads
         // as the menu it is.
         Button::new(project_rect)

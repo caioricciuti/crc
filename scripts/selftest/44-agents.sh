@@ -141,6 +141,13 @@ testgit "$T/agentsproj" worktree remove --force "$(ls -d "$T"/worktrees/agentspr
 # the folder, named after it; Cmd-T adds a shell to it.
 mkdir -p "$T/plainproj"
 printf 'x\n' > "$T/plainproj/x.txt"
+# A repository beside it, for the shell to cd into: the workspace and the
+# inspector follow the terminal showing.
+mkdir -p "$T/movedrepo"
+printf 'x\n' > "$T/movedrepo/x.txt"
+testgit "$T/movedrepo" init -q -b main
+testgit "$T/movedrepo" add x.txt
+testgit "$T/movedrepo" commit -qm one
 cat > "$T/agents-plain.script" <<SCRIPT
 wait 500
 key 0 cmd,shift A
@@ -150,9 +157,20 @@ dump $T/agents-plain.out
 key 17 cmd t
 wait 700
 dump $T/agents-plain-cmdt.out
+text cd ../movedrepo
+key 36
+wait 700
+wait 700
+wait 500
+dump $T/agents-moved.out
 quit
 SCRIPT
 HOME="$T/home/agents-plain" CRC_TERMINAL_SHELL=/bin/sh CRC_SELFTEST="$T/agents-plain.script" "$BIN" "$T/plainproj" \
     2> "$T/agents-plain.err"
 expect "$T/agents-plain.out" agents "on tasks=plainproj selected=plainproj sessions=*plainproj claude=0 pair=- op=-"
 expect "$T/agents-plain-cmdt.out" agents "on tasks=plainproj selected=plainproj sessions=plainproj,*plainproj claude=0 pair=- op=-"
+# After `cd ../movedrepo` in the second shell, the workspace (named by crc
+# after its folder) is that folder now, and the inspector reads its Git.
+expect "$T/agents-moved.out" agents "on tasks=movedrepo selected=movedrepo sessions=movedrepo,*movedrepo claude=0 pair=- op=-"
+grep -q '^inspector: branch=main base=- ahead=0 behind=0 upstream=-' "$T/agents-moved.out" \
+    || failed "agents-moved.out: $(grep '^inspector:' "$T/agents-moved.out")"

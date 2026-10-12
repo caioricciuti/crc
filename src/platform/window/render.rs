@@ -848,6 +848,7 @@ impl EditorView {
                         .and_then(|s| s.diagnostics.get(path))
                 });
         let (line, _) = buffer.cursor_position();
+        let agents_note = note.clone();
         let (status, detail) = status_texts(&StatusParts {
             buffer,
             note,
@@ -869,6 +870,36 @@ impl EditorView {
                     crate::lsp::client::Phase::Starting => None,
                 }),
         });
+        // Agents mode: where the terminal showing is and its branch; the
+        // document's name, position and branch are the editor's.
+        let (status, detail) = if agents.on {
+            let cwd = terminal_panel.active_tab().map(|t| t.cwd.clone());
+            let left =
+                agents_note.unwrap_or_else(|| cwd.as_deref().map(shown_path).unwrap_or_default());
+            let branch = cwd.as_deref().and_then(|cwd| {
+                agents
+                    .inspector
+                    .status
+                    .iter()
+                    .filter(|(repo, _)| cwd.starts_with(repo))
+                    .max_by_key(|(repo, _)| repo.components().count())
+                    .and_then(|(_, s)| s.as_ref().ok()?.branch.clone())
+            });
+            let claude = if claude.as_ref().is_some_and(|c| c.is_connected()) {
+                "\u{273b} Claude     "
+            } else {
+                ""
+            };
+            (
+                left,
+                format!(
+                    "{claude}{}",
+                    branch.map(|b| format!("{b}     ")).unwrap_or_default()
+                ),
+            )
+        } else {
+            (status, detail)
+        };
         let detail = if std::env::var_os("CRC_SHOW_LATENCY").is_some() {
             format!("{}  {:?}", latency.summary(), worst)
         } else {

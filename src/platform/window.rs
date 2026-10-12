@@ -4569,8 +4569,15 @@ impl EditorView {
         let in_tab_bar = chrome.tabs.contains(x, y);
         let in_project = chrome.toolbar.contains(x, y)
             && self.state_mut().is_some_and(|mut state| {
-                let State { tree, renderer, .. } = &mut *state;
-                layout::toolbar_project(tree, &mut renderer.atlas, chrome.toolbar).contains(x, y)
+                let State {
+                    tree,
+                    renderer,
+                    agents,
+                    ..
+                } = &mut *state;
+                !agents.on
+                    && layout::toolbar_project(tree, &mut renderer.atlas, chrome.toolbar)
+                        .contains(x, y)
             });
 
         // A right-click in a panel should also select what is under the
@@ -6714,10 +6721,12 @@ fn frame_of(state: &mut State) -> Frame {
         }
     }
     frame.push(Hit::ToolbarSidebar, layout::toolbar_sidebar(chrome.toolbar));
-    frame.push(
-        Hit::ToolbarProject,
-        layout::toolbar_project(tree, &mut renderer.atlas, chrome.toolbar),
-    );
+    if !agents.on {
+        frame.push(
+            Hit::ToolbarProject,
+            layout::toolbar_project(tree, &mut renderer.atlas, chrome.toolbar),
+        );
+    }
     frame.push(Hit::ToolbarSearch, layout::toolbar_search(chrome.toolbar));
     if layout::toolbar_mode(chrome.toolbar).width > 0.0 {
         let [editor, agents_half] = layout::toolbar_mode_segments(chrome.toolbar);

@@ -52,6 +52,13 @@ impl EditorView {
         }
         if on {
             self.arm_agents_tick();
+            if let Some(mut state) = self.state_mut() {
+                let active = state.terminal.active;
+                if let Some(tab) = state.terminal.tabs.get_mut(active) {
+                    tab.read_cwd();
+                }
+            }
+            self.follow_cwd();
         }
         self.after_terminal_layout();
         self.resume_display_link();
@@ -121,6 +128,37 @@ impl EditorView {
         if changed {
             self.request_redraw();
         }
+    }
+
+    /// The selected workspace follows the directory of the terminal
+    /// showing: a folder workspace moves there, and the inspector reads the
+    /// repositories it is in and under. A worktree stays where Git has it.
+    pub(super) fn follow_cwd(&self) {
+        {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            if !state.agents.on {
+                return;
+            }
+            let Some(tab) = state.terminal.active_tab() else {
+                return;
+            };
+            let cwd = tab.cwd.clone();
+            let tasks = state.agents.tasks.clone();
+            let Some(index) = task_of(&tasks, tab) else {
+                return;
+            };
+            let task = &tasks[index];
+            if !task.folder || task.path == cwd {
+                return;
+            }
+            state.agents.move_folder(&task.id(), &cwd);
+            state.agents.refresh();
+        }
+        self.want_inspector();
+        self.resume_display_link();
+        self.request_redraw();
     }
 
     /// Every terminal lives in a workspace. Once the list is known, the
@@ -324,6 +362,13 @@ impl EditorView {
         }
         self.set_agents_mode(true);
         self.focus_agent_terminal();
+        if let Some(mut state) = self.state_mut() {
+            let active = state.terminal.active;
+            if let Some(tab) = state.terminal.tabs.get_mut(active) {
+                tab.read_cwd();
+            }
+        }
+        self.follow_cwd();
     }
 
     /// Control-1 to 9: the task in that place.

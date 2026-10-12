@@ -67,6 +67,12 @@ pub struct Tab {
     /// speaks), copied from the terminal as output arrives. Outranks
     /// the guesses from output and hooks while it is there.
     pub status: Option<crate::term::status::Status>,
+    /// Where its program is now, resolved: the shell's working directory
+    /// after its last `cd`, read by [`Tab::read_cwd`]; where it started
+    /// until then.
+    pub cwd: PathBuf,
+    /// Its program's pid, once found.
+    pub program_pid: Option<i32>,
 }
 
 /// What a session is doing, as the Agents sidebar shows it.
@@ -81,6 +87,29 @@ pub enum Activity {
 }
 
 impl Tab {
+    /// Reads where its program is now: one call into the kernel. Returns
+    /// whether it moved.
+    pub fn read_cwd(&mut self) -> bool {
+        if self.program_pid.is_none() {
+            self.program_pid = self.session.program_pid().or_else(|| {
+                let dir = crate::term::hold::dir()?;
+                crate::term::hold::program_pid(&dir, self.held.as_deref()?)
+            });
+        }
+        let Some(now) = self
+            .program_pid
+            .and_then(crate::platform::process_cwd)
+            .map(|p| crate::platform::canonical(&p))
+        else {
+            return false;
+        };
+        if now == self.cwd {
+            return false;
+        }
+        self.cwd = now;
+        true
+    }
+
     pub fn activity(&self) -> Activity {
         use crate::term::status::State;
         match self.status.as_ref().map(|s| s.state) {

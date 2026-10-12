@@ -129,7 +129,9 @@ the size and write it back.
   `~/Library/Application Support/crc/worktrees/`; each opens a terminal
   in it. A workspace holds the Git repositories in its folder (the
   folder itself and the folders directly in it), and their worktrees
-  are listed too. Every terminal belongs to a workspace: the first time,
+  are listed too. A folder workspace follows the terminal showing: after
+  a `cd` it is that folder, and the inspector and status line follow.
+  Every terminal belongs to a workspace: the first time,
   the open folder becomes one, named after it, and a double-click on
   the empty part of the list makes another with a terminal. Drag a
   workspace to reorder the list, pin one to keep it on top, and

@@ -405,6 +405,16 @@ impl Session {
         self.status.exited.load(Ordering::Acquire)
     }
 
+    /// The program's pid when this process runs it and it has not been
+    /// reaped; a held session's is the helper's child (see
+    /// [`super::hold::program_pid`]).
+    pub fn program_pid(&self) -> Option<i32> {
+        match &self.control {
+            Control::Pty { pid, .. } if !self.status.reaped.load(Ordering::Acquire) => Some(*pid),
+            _ => None,
+        }
+    }
+
     /// How the program ended, once it has been reaped: its exit code, or
     /// `None` when a signal ended it or it is still running.
     pub fn exit_code(&self) -> Option<i32> {
