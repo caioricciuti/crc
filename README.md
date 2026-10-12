@@ -301,7 +301,10 @@ the size and write it back.
   scrollback is gone). A session taken back after a restart has lost its link to the
   editor (`/ide` in Claude Code reconnects it), pull requests and checks
   are read again every minute rather than live, and tasks run on this
-  Mac only.
+  Mac only. Only the terminals of the folder open in the editor come
+  back after a reboot. An ssh session is shown from its command line
+  and `~/.ssh/config` alone: nothing about the server itself (load,
+  disk, its Git) is read.
 - **No minimap.** Folding is by indentation, not by syntax.
 - **Markdown styling has edges.** Italic is not drawn on lines with
   non-ASCII text, and bold there is the regular face drawn twice; a line

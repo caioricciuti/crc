@@ -2,7 +2,7 @@
 
 One entry per tag, written for people who use the editor.
 
-## Unreleased
+## v0.2.0-alpha.22, 2026-10-12
 
 - A terminal inside `ssh` says so: its tab is titled `ssh <host>`, its
   workspace row shows a server icon and `ssh user@host · 5 min`, the
