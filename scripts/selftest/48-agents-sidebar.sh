@@ -116,3 +116,82 @@ case "$(grep '^agents:' "$T/side-other.out")" in
 esac
 grep -q "^message: Started again 4 terminals" "$T/side-other.out" \
     || failed "sidebar: from another folder: $(grep '^message:' "$T/side-other.out")"
+
+# ---- Worktrees under the workspace holding their repository ---------------
+# A folder holding a repository (garden-log) and, beside it, one of its
+# worktrees; another worktree lives elsewhere. Both rows sit under the
+# folder's workspace, and the inspector has one card for the repository
+# (the worktree beside it is not taken for a second repository) with a
+# strip per worktree. Terminal on a strip starts a shell there; the chevron
+# folds the worktrees away, which Control-1 to 9 then skip, and the fold
+# is kept; Open selects a worktree. SELFTEST_FRAMES, when set, is a folder
+# to keep the frame in.
+GD="$T/garden"
+GL="$GD/garden-log"
+mkdir -p "$GL" "$T/garden-wt"
+printf 'beds\n' > "$GL/beds.txt"
+testgit "$GL" init -q -b main
+testgit "$GL" add beds.txt
+testgit "$GL" commit -qm beds
+testgit "$GL" worktree add -q -b fix/seed-dates "$T/garden-wt/seed-dates"
+printf 'march\napril\nmay\n' > "$T/garden-wt/seed-dates/dates.txt"
+testgit "$T/garden-wt/seed-dates" add dates.txt
+testgit "$T/garden-wt/seed-dates" commit -qm dates
+testgit "$GL" worktree add -q -b feat/compost-log "$GD/garden-log-compost"
+cat > "$T/garden.script" <<SCRIPT
+wait 500
+key 0 cmd,shift A
+wait 900
+wait 700
+wait 700
+dump $T/garden.out
+frame $T/garden-frame.bmp
+click @inspector.worktree_terminal.1
+wait 700
+wait 300
+dump $T/garden-terminal.out
+key 18 ctrl 1
+wait 400
+click @agents.fold.0
+wait 300
+dump $T/garden-folded.out
+key 19 ctrl 2
+wait 300
+dump $T/garden-ctrl2.out
+click @agents.fold.0
+wait 300
+key 20 ctrl 3
+wait 500
+dump $T/garden-ctrl3.out
+key 18 ctrl 1
+wait 700
+click @inspector.worktree_open.0
+wait 500
+dump $T/garden-open.out
+key 18 ctrl 1
+wait 300
+click @agents.fold.0
+wait 300
+quit
+SCRIPT
+mkdir -p "$T/home/garden"
+HOME="$T/home/garden" CRC_TERMINAL_SHELL=/bin/sh CRC_SELFTEST="$T/garden.script" \
+    "$BIN" "$GD" 2> "$T/garden.err"
+[ -z "${SELFTEST_FRAMES:-}" ] || cp -f "$T/garden-frame.bmp" "$SELFTEST_FRAMES/"
+expect "$T/garden.out" agents_tree "garden,>fix/seed-dates,>feat/compost-log"
+expect "$T/garden.out" inspector "branch=main base=- ahead=0 behind=0 upstream=- push=0 pull=0 dirty=0 changes=+0-0 tag=- buttons=push worktrees=fix/seed-dates:ahead=1:+3-0:files=1,feat/compost-log:ahead=0:+0-0:files=0"
+expect "$T/garden-terminal.out" agents "on tasks=garden,fix/seed-dates,feat/compost-log selected=feat/compost-log sessions=garden,*feat/compost-log claude=0 pair=- op=-"
+expect "$T/garden-folded.out" agents_tree "garden(+2)"
+# The fold at the end is kept for the next launch.
+grep -q "^fold	" "$T/home/garden/Library/Application Support/crc/agents/order" 2>/dev/null \
+    || failed "garden: the fold was not kept: $(cat "$T/home/garden/Library/Application Support/crc/agents/order" 2>/dev/null)"
+# Folded, there is no second row for Control-2 to pick.
+expect "$T/garden-ctrl2.out" agents "on tasks=garden,fix/seed-dates,feat/compost-log selected=garden sessions=*garden,feat/compost-log claude=0 pair=- op=-"
+expect "$T/garden-ctrl3.out" agents_tree "garden,>fix/seed-dates,>feat/compost-log"
+expect "$T/garden-ctrl3.out" agents "on tasks=garden,fix/seed-dates,feat/compost-log selected=feat/compost-log sessions=garden,*feat/compost-log claude=0 pair=- op=-"
+case "$(grep '^agents:' "$T/garden-open.out")" in
+*" selected=fix/seed-dates "*) ;;
+*) failed "garden: Open did not select the worktree: $(grep '^agents:' "$T/garden-open.out")" ;;
+esac
+testgit "$GL" worktree remove --force "$T/garden-wt/seed-dates" 2>/dev/null || true
+testgit "$GL" worktree remove --force "$GD/garden-log-compost" 2>/dev/null || true

@@ -24,6 +24,9 @@ pub const ROW: f32 = 26.0;
 const INDENT: f32 = 22.0;
 /// A workspace's row: its name, and a line under it.
 pub const CARD: f32 = 46.0;
+/// A worktree's row under the folder workspace holding its repository:
+/// the same two lines, closer together.
+pub const CHILD: f32 = 40.0;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -40,6 +43,8 @@ pub enum Action {
     Blank,
     /// The task's menu: open in the editor, merge, push, remove.
     Menu(usize),
+    /// A folder workspace's chevron: shows or hides the worktrees under it.
+    Fold(usize),
 }
 
 /// What a worker read of the folder workspaces: per folder workspace (by
@@ -173,7 +178,8 @@ fn merge_arrangements(texts: &[String]) -> Arrangement {
 
 /// The Git repositories a folder holds: the one it is in (itself, or the
 /// nearest folder above it with a `.git`), then its direct children by
-/// name. Hidden folders are skipped.
+/// name. Hidden folders are skipped, and so is a child whose `.git` is a
+/// file: a linked worktree, which its repository's own list brings in.
 pub fn discover(dir: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     if let Some(repo) = dir.ancestors().find(|d| d.join(".git").exists()) {
@@ -185,11 +191,21 @@ pub fn discover(dir: &Path) -> Vec<PathBuf> {
         .flatten()
         .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
         .map(|e| e.path())
-        .filter(|p| p.is_dir() && p.join(".git").exists())
+        .filter(|p| p.is_dir() && p.join(".git").exists() && !linked_worktree(p))
         .collect();
     children.sort();
     found.extend(children);
     found
+}
+
+/// Whether `dir` is a linked worktree: its `.git` a file pointing into a
+/// repository's `worktrees` folder (a submodule's points elsewhere).
+fn linked_worktree(dir: &Path) -> bool {
+    std::fs::read_to_string(dir.join(".git")).is_ok_and(|text| {
+        text.strip_prefix("gitdir:")
+            .map(|to| to.trim().replace('\\', "/"))
+            .is_some_and(|to| to.contains("/worktrees/"))
+    })
 }
 
 /// Reads what the folder workspaces hold, on the calling thread: their
@@ -244,11 +260,14 @@ pub struct Arrangement {
     pub pinned: std::collections::HashSet<String>,
     /// A name of your own for a workspace, shown instead of its branch.
     pub titles: std::collections::HashMap<String, String>,
+    /// Folder workspaces whose worktrees are folded away under them.
+    pub collapsed: std::collections::HashSet<String>,
 }
 
 impl Arrangement {
-    /// One per line: `pin` or `-`, a tab, the id, a tab, the name (maybe
-    /// empty).
+    /// One per line: the flags (`pin`, `fold`, comma-separated) or `-`, a
+    /// tab, the id, a tab, the name (maybe empty). A file from before
+    /// folding has `pin` or `-` alone.
     pub fn parse(text: &str) -> Arrangement {
         let mut out = Arrangement::default();
         for line in text.lines() {
@@ -260,8 +279,16 @@ impl Arrangement {
                 continue;
             }
             out.order.push(id.to_owned());
-            if flag == "pin" {
-                out.pinned.insert(id.to_owned());
+            for flag in flag.split(',') {
+                match flag {
+                    "pin" => {
+                        out.pinned.insert(id.to_owned());
+                    }
+                    "fold" => {
+                        out.collapsed.insert(id.to_owned());
+                    }
+                    _ => {}
+                }
             }
             if let Some(title) = parts.next().filter(|t| !t.is_empty()) {
                 out.titles.insert(id.to_owned(), title.to_owned());
@@ -274,9 +301,14 @@ impl Arrangement {
         self.order
             .iter()
             .map(|id| {
+                let flags = match (self.pinned.contains(id), self.collapsed.contains(id)) {
+                    (true, true) => "pin,fold",
+                    (true, false) => "pin",
+                    (false, true) => "fold",
+                    (false, false) => "-",
+                };
                 format!(
-                    "{}\t{id}\t{}\n",
-                    if self.pinned.contains(id) { "pin" } else { "-" },
+                    "{flags}\t{id}\t{}\n",
                     self.titles.get(id).map_or("", String::as_str)
                 )
             })
@@ -319,6 +351,9 @@ impl Arrangement {
         }
         if let Some(title) = self.titles.remove(old) {
             self.titles.insert(new.to_owned(), title);
+        }
+        if self.collapsed.remove(old) {
+            self.collapsed.insert(new.to_owned());
         }
     }
 }
@@ -576,6 +611,8 @@ impl Panel {
 
 enum Line {
     Task(usize),
+    /// A worktree under the folder workspace holding its repository.
+    Child(usize),
     Session(usize),
     /// A task on the team list of the session at the first index.
     TeamTask(usize, usize),
@@ -758,21 +795,93 @@ impl Panel {
     /// The list from Git and the folder workspaces, in your order with the
     /// pinned on top.
     fn rebuild(&mut self) {
-        let mut tasks: Vec<Workspace> = self
-            .folders
-            .iter()
-            .chain(self.worktrees.iter())
-            .cloned()
-            .collect();
-        tasks.sort_by_key(|t| {
-            let id = t.id();
+        self.tasks = self.ordered();
+    }
+
+    /// Every workspace in your order: the pinned first, then the order you
+    /// dragged them into, then the rest as they were made; each worktree
+    /// whose repository a folder workspace holds right under that one, in
+    /// the same order among its siblings.
+    fn ordered(&self) -> Vec<Workspace> {
+        let canon: Vec<&Workspace> = self.folders.iter().chain(self.worktrees.iter()).collect();
+        let parents: Vec<Option<String>> = canon.iter().map(|w| self.parent_of(w)).collect();
+        let key = |i: &usize| {
+            let id = canon[*i].id();
             (
-                !t.main,
+                !canon[*i].main,
                 !self.arrangement.pinned.contains(&id),
                 self.arrangement.position(&id),
             )
-        });
-        self.tasks = tasks;
+        };
+        // The sorts are stable: unplaced ones keep the order they were made.
+        let mut top: Vec<usize> = (0..canon.len()).filter(|i| parents[*i].is_none()).collect();
+        top.sort_by_key(key);
+        let mut children: Vec<usize> = (0..canon.len()).filter(|i| parents[*i].is_some()).collect();
+        children.sort_by_key(key);
+        let mut out = Vec::with_capacity(canon.len());
+        for t in top {
+            let id = canon[t].id();
+            out.push(canon[t].clone());
+            out.extend(
+                children
+                    .iter()
+                    .filter(|c| parents[**c].as_deref() == Some(id.as_str()))
+                    .map(|c| canon[*c].clone()),
+            );
+        }
+        out
+    }
+
+    /// The folder workspace a worktree's row sits under, by id: of those
+    /// whose repositories include its main checkout, the one deepest in
+    /// the tree, then the first made. `None` for a folder workspace, or a
+    /// worktree no folder workspace holds the repository of.
+    pub fn parent_of(&self, workspace: &Workspace) -> Option<String> {
+        let repo = workspace.repo.as_ref().filter(|_| !workspace.folder)?;
+        self.folders
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| self.repos.get(&f.id()).is_some_and(|r| r.contains(repo)))
+            .max_by_key(|(i, f)| (f.path.components().count(), std::cmp::Reverse(*i)))
+            .map(|(_, f)| f.id())
+    }
+
+    /// How many worktrees sit under the workspace `id`.
+    pub fn children(&self, id: &str) -> usize {
+        self.tasks
+            .iter()
+            .filter(|t| self.parent_of(t).as_deref() == Some(id))
+            .count()
+    }
+
+    pub fn is_collapsed(&self, id: &str) -> bool {
+        self.arrangement.collapsed.contains(id)
+    }
+
+    /// Folds the worktrees under a folder workspace away, or shows them.
+    pub fn toggle_collapsed(&mut self, id: &str) {
+        if !self.arrangement.collapsed.remove(id) {
+            if !self.arrangement.order.iter().any(|o| o == id) {
+                self.arrangement.order.push(id.to_owned());
+            }
+            self.arrangement.collapsed.insert(id.to_owned());
+        }
+        self.save_arrangement();
+    }
+
+    /// The workspaces with a row, in the list's order: every one but the
+    /// worktrees folded under their folder workspace (the selected one
+    /// stays, so you see where you are). Control-1 to 9 count these.
+    pub fn visible(&self) -> Vec<usize> {
+        let selected = self.selected_index();
+        (0..self.tasks.len())
+            .filter(|i| {
+                selected == Some(*i)
+                    || self
+                        .parent_of(&self.tasks[*i])
+                        .is_none_or(|p| !self.is_collapsed(&p))
+            })
+            .collect()
     }
 
     fn save_folders(&self) {
@@ -838,17 +947,32 @@ impl Panel {
         let _ = crate::platform::write_atomically(&file, self.arrangement.text().as_bytes());
     }
 
-    /// The workspace a dragged row lands before, by the cards last drawn:
-    /// the first whose middle is under `y`; `None` is the end.
-    pub fn drop_before(&self, y: f32) -> Option<String> {
+    /// The workspace the row `id`, dragged, lands before, by the cards
+    /// last drawn: the first of its peers whose middle is under `y`;
+    /// `None` is the end. A worktree under a folder workspace moves among
+    /// its siblings only; any other row among the other top rows, its
+    /// worktrees going with it.
+    pub fn drop_before(&self, id: &str, y: f32) -> Option<String> {
         self.hits
             .iter()
             .filter_map(|(rect, action)| match action {
-                Action::Select(i) => Some((*rect, *i)),
+                Action::Select(i) if self.peers(id, *i) => Some((*rect, *i)),
                 _ => None,
             })
             .find(|(rect, _)| rect.y + rect.height * 0.5 > y)
             .and_then(|(_, i)| self.tasks.get(i).map(Workspace::id))
+    }
+
+    /// Whether the workspace at `index` sits beside the one `id`: under
+    /// the same folder workspace, or both at the top.
+    fn peers(&self, id: &str, index: usize) -> bool {
+        let parent = |w: &Workspace| self.parent_of(w);
+        let Some(dragged) = self.by_id(id) else {
+            return false;
+        };
+        self.tasks
+            .get(index)
+            .is_some_and(|t| parent(t) == parent(&self.tasks[dragged]))
     }
 
     /// What a workspace's row calls it: your name for it, else its own.
@@ -933,6 +1057,7 @@ impl Panel {
         self.arrangement.order.retain(|o| o != id);
         self.arrangement.pinned.remove(id);
         self.arrangement.titles.remove(id);
+        self.arrangement.collapsed.remove(id);
         self.rebuild();
         self.save_folders();
         self.save_arrangement();
@@ -974,6 +1099,15 @@ impl Panel {
         }
     }
 
+    /// The worktree workspaces of `repos`, in the list's order.
+    pub fn worktrees_of(&self, repos: &[PathBuf]) -> Vec<Workspace> {
+        self.tasks
+            .iter()
+            .filter(|t| !t.folder && t.repo.as_ref().is_some_and(|r| repos.contains(r)))
+            .cloned()
+            .collect()
+    }
+
     /// The folder a new workspace takes unless you choose one: the selected
     /// workspace's (a worktree's repository), else `fallback`, the editor's.
     pub fn new_folder(&self, fallback: Option<&Path>) -> Option<PathBuf> {
@@ -998,23 +1132,7 @@ impl Panel {
     /// made. Nothing that happens in a terminal moves a row. Returns
     /// whether the order changed.
     pub fn arrange(&mut self) -> bool {
-        let canon: Vec<Workspace> = self
-            .folders
-            .iter()
-            .chain(self.worktrees.iter())
-            .cloned()
-            .collect();
-        let mut order: Vec<usize> = (0..canon.len()).collect();
-        // The sort is stable: unplaced ones keep the order they were made.
-        order.sort_by_key(|i| {
-            let id = canon[*i].id();
-            (
-                !canon[*i].main,
-                !self.arrangement.pinned.contains(&id),
-                self.arrangement.position(&id),
-            )
-        });
-        let arranged: Vec<Workspace> = order.into_iter().map(|i| canon[i].clone()).collect();
+        let arranged = self.ordered();
         if arranged == self.tasks {
             return false;
         }
@@ -1052,8 +1170,12 @@ impl Panel {
         let mut lines = Vec::new();
         let owner: Vec<Option<usize>> = tabs.iter().map(|t| task_of(&self.tasks, t)).collect();
         let selected = self.selected_index();
-        for task in 0..self.tasks.len() {
-            lines.push(Line::Task(task));
+        for task in self.visible() {
+            lines.push(if self.parent_of(&self.tasks[task]).is_some() {
+                Line::Child(task)
+            } else {
+                Line::Task(task)
+            });
             if selected == Some(task) {
                 for (tab, _) in owner.iter().enumerate().filter(|(_, o)| **o == Some(task)) {
                     self.team_lines(tabs, tab, &mut lines);
@@ -1081,6 +1203,7 @@ impl Panel {
     fn height(line: &Line) -> f32 {
         match line {
             Line::Task(_) => CARD,
+            Line::Child(_) => CHILD,
             _ => ROW,
         }
     }
@@ -1138,6 +1261,38 @@ impl Panel {
         )
     }
 
+    /// The rows, for the self-test, in the order Control-1 to 9 count them:
+    /// a worktree under a folder workspace as `>name`, a folder workspace
+    /// with its worktrees folded away as `name(+2)`.
+    pub fn report_tree(&self) -> String {
+        self.visible()
+            .into_iter()
+            .map(|i| {
+                let task = &self.tasks[i];
+                let title = self.title(task);
+                if self.parent_of(task).is_some() {
+                    return format!(">{title}");
+                }
+                let id = task.id();
+                let hidden = self.children(&id) - self.shown_children(&id);
+                if self.is_collapsed(&id) && hidden > 0 {
+                    format!("{title}(+{hidden})")
+                } else {
+                    title
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// How many of the worktrees under `id` have a row.
+    fn shown_children(&self, id: &str) -> usize {
+        self.visible()
+            .into_iter()
+            .filter(|i| self.parent_of(&self.tasks[*i]).as_deref() == Some(id))
+            .count()
+    }
+
     /// The teams, for the self-test: per session with one, its tasks as
     /// `[x] subject (teammate)` and the idle teammates.
     pub fn report_teams(&self, tabs: &[Tab]) -> String {
@@ -1165,7 +1320,8 @@ impl Panel {
 
     /// A region by the name a self-test script uses: `agents.new`,
     /// `agents.refresh`, `agents.task.0`, `agents.session.1`,
-    /// `agents.add.0`, `agents.menu.0`, `agents.blank`. As last drawn.
+    /// `agents.add.0`, `agents.menu.0`, `agents.fold.0`, `agents.blank`.
+    /// As last drawn.
     pub fn named(&self, name: &str) -> Option<Viewport> {
         let rest = name.strip_prefix("agents.")?;
         let (kind, n) = rest.split_once('.').unwrap_or((rest, ""));
@@ -1178,6 +1334,7 @@ impl Panel {
             "add" => Action::NewSession(n),
             "blank" => Action::Blank,
             "menu" => Action::Menu(n),
+            "fold" => Action::Fold(n),
             _ => return None,
         };
         self.hits
@@ -1247,6 +1404,25 @@ impl Panel {
         let room = Panel::room(column);
         self.scroll = self.scroll.min(Panel::max_scroll(&lines, room));
         let selected = self.selected_index();
+        // The worktrees last under their folder workspace: the guide stops
+        // at their middle.
+        let parent_at = |line: &Line| match line {
+            Line::Child(i) => self.parent_of(&self.tasks[*i]),
+            _ => None,
+        };
+        let mut last_child = std::collections::HashSet::new();
+        for (n, line) in lines.iter().enumerate() {
+            if let Line::Child(i) = line {
+                let parent = parent_at(line);
+                let more = lines[n + 1..]
+                    .iter()
+                    .take_while(|l| !matches!(l, Line::Task(_)))
+                    .any(|l| matches!(l, Line::Child(_)) && parent_at(l) == parent);
+                if !more {
+                    last_child.insert(*i);
+                }
+            }
+        }
         let mut placed = Vec::new();
         let mut used = 0.0;
         for line in lines.iter().skip(self.scroll) {
@@ -1259,22 +1435,40 @@ impl Panel {
         }
         let blank_top = top + used;
         if let Some(drag) = self.drag.as_ref().filter(|d| d.active) {
-            let cards: Vec<f32> = placed
+            // Where it lands among its peers (see `drop_before`); after the
+            // last, under the last one's worktrees too.
+            let id = drag.id.clone();
+            let child = self
+                .by_id(&id)
+                .is_some_and(|i| self.parent_of(&self.tasks[i]).is_some());
+            let cards: Vec<(f32, f32, bool)> = placed
                 .iter()
-                .filter(|(_, line)| matches!(line, Line::Task(_)))
-                .map(|(y, _)| *y)
+                .filter_map(|(y, line)| match line {
+                    Line::Task(i) | Line::Child(i) => {
+                        Some((*y, Panel::height(line), self.peers(&id, *i)))
+                    }
+                    _ => None,
+                })
                 .collect();
+            let indent = if child { INDENT } else { 0.0 };
             let at = cards
                 .iter()
-                .copied()
-                .find(|y| y + CARD * 0.5 > drag.y)
-                .or_else(|| cards.last().map(|y| y + CARD));
+                .filter(|c| c.2)
+                .find(|(y, h, _)| y + h * 0.5 > drag.y)
+                .map(|c| c.0)
+                .or_else(|| {
+                    let last = cards.iter().rposition(|c| c.2)?;
+                    // A top row's worktrees follow it; a worktree's end is
+                    // its last sibling's.
+                    let end = if child { last } else { cards.len() - 1 };
+                    Some(cards[end].0 + cards[end].1)
+                });
             if let Some(at) = at {
                 layout::push_rect(
                     out,
                     atlas,
-                    [column.x + 8.0, at - 1.0],
-                    [column.width - 16.0, 2.0],
+                    [column.x + 8.0 + indent, at - 1.0],
+                    [column.width - 16.0 - indent, 2.0],
                     theme.accent,
                 );
             }
@@ -1312,7 +1506,21 @@ impl Panel {
                     layout::push_ui_text(out, atlas, text_rect(2.0, 0.0), text, theme.status_text);
                 }
                 Line::Task(index) => {
-                    self.draw_card(*index, tabs, y, column, selected, atlas, theme, out);
+                    self.draw_card(*index, tabs, y, column, selected, None, atlas, theme, out);
+                }
+                Line::Child(index) => {
+                    let last = last_child.contains(index);
+                    self.draw_card(
+                        *index,
+                        tabs,
+                        y,
+                        column,
+                        selected,
+                        Some(last),
+                        atlas,
+                        theme,
+                        out,
+                    );
                 }
                 Line::Session(index) => {
                     let tab = &tabs[*index];
@@ -1535,6 +1743,11 @@ impl Panel {
     /// team, else its terminals and where it is. At the right a steady
     /// strip: how many wait on you, and the pull request coloured by its
     /// checks; hover trades the strip for the menu button.
+    ///
+    /// A worktree under its folder workspace (`child`, with whether it is
+    /// the last there) is drawn in from it, smaller, on a guide line down
+    /// from the folder's chevron; a folder workspace with worktrees under
+    /// it has that chevron, and folded, their count.
     #[allow(clippy::too_many_arguments)]
     fn draw_card(
         &mut self,
@@ -1543,18 +1756,44 @@ impl Panel {
         y: f32,
         column: Viewport,
         selected: Option<usize>,
+        child: Option<bool>,
         atlas: &mut Atlas,
         theme: &Theme,
         out: &mut Vec<GlyphInstance>,
     ) {
         use crate::term::status::State;
         let task = self.tasks[index].clone();
-        let card = Viewport {
-            x: column.x + 6.0,
-            y: y + 1.0,
-            width: (column.width - 12.0).max(0.0),
-            height: CARD - 2.0,
+        let (indent, height, inset, gap) = match child {
+            Some(_) => (INDENT, CHILD, 2.0, 17.0),
+            None => (0.0, CARD, 4.0, 18.0),
         };
+        let card = Viewport {
+            x: column.x + 6.0 + indent,
+            y: y + 1.0,
+            width: (column.width - 12.0 - indent).max(0.0),
+            height: height - 2.0,
+        };
+        // The guide: under the parent's icon, as far as this row's middle
+        // when it is the last, with a tick across to it.
+        let guide_x = column.x + 6.0 + 10.0 + 8.0;
+        let guide = layout::faded(theme.gutter_text, 0.45);
+        if let Some(last) = child {
+            let mid = (y + height * 0.5).round();
+            layout::push_rect(
+                out,
+                atlas,
+                [guide_x - 0.5, y],
+                [1.0, if last { mid - y } else { height }],
+                guide,
+            );
+            layout::push_rect(
+                out,
+                atlas,
+                [guide_x - 0.5, mid],
+                [card.x + 2.0 - guide_x, 1.0],
+                guide,
+            );
+        }
         let is_selected = selected == Some(index);
         let over = layout::hovered(card);
         if is_selected {
@@ -1579,14 +1818,75 @@ impl Panel {
         let left = card.x + 10.0;
         let line1 = Viewport {
             x: left,
-            y: card.y + 4.0,
+            y: card.y + inset,
             width: card.width - 20.0,
             height: 20.0,
         };
         let line2 = Viewport {
-            y: card.y + 22.0,
+            y: line1.y + gap,
             ..line1
         };
+        // A folder workspace with worktrees under it: the chevron under its
+        // icon folds them; folded, their count ends the line under the name.
+        let id = task.id();
+        let children = if child.is_none() {
+            self.children(&id)
+        } else {
+            0
+        };
+        let folded = children > 0 && self.is_collapsed(&id);
+        let mut line2_end = line2.x + line2.width;
+        if children > 0 {
+            let chevron = Viewport {
+                x: left - 4.0,
+                y: line2.y,
+                width: 24.0,
+                height: 20.0,
+            };
+            let over = layout::hovered(chevron);
+            layout::push_icon_centered(
+                out,
+                atlas,
+                Viewport {
+                    x: left,
+                    y: line2.y + 1.0,
+                    width: 16.0,
+                    height: 20.0,
+                },
+                if folded {
+                    icons::CHEVRON_RIGHT
+                } else {
+                    icons::CHEVRON_DOWN
+                },
+                if over { theme.text } else { theme.gutter_text },
+            );
+            if !folded {
+                layout::push_rect(
+                    out,
+                    atlas,
+                    [guide_x - 0.5, line2.y + 19.0],
+                    [1.0, (y + height - line2.y - 19.0).max(0.0)],
+                    guide,
+                );
+            }
+            let tip = if folded {
+                format!(
+                    "Show {children} worktree{}",
+                    if children == 1 { "" } else { "s" }
+                )
+            } else {
+                "Hide the worktrees".to_owned()
+            };
+            layout::hotspot(chevron, layout::Cursor::Pointing, Some(&tip));
+            self.hits.push((chevron, Action::Fold(index)));
+            if folded {
+                let label = children.to_string();
+                let w = (layout::ui_text_width(atlas, &label) + 10.0).max(18.0);
+                let x = line2.x + line2.width - w;
+                layout::push_count(out, atlas, x, line2, children, theme);
+                line2_end = x - 6.0;
+            }
+        }
         // A point lower than the name's box: the glyph sits on its baseline.
         let icon_box = Viewport {
             x: left,
@@ -1790,7 +2090,7 @@ impl Panel {
             atlas,
             Viewport {
                 x: name_x,
-                width: (line2.x + line2.width - name_x).max(0.0),
+                width: (line2_end - name_x).max(0.0),
                 ..line2
             },
             &said,
@@ -1976,16 +2276,159 @@ mod tests {
         for sub in ["b/.git", "a/.git", ".hidden/.git", "plain", "c/d/.git"] {
             std::fs::create_dir_all(dir.join(sub)).unwrap();
         }
-        // A linked worktree's .git is a file.
+        // A linked worktree's .git is a file into its repository's
+        // worktrees: not a repository of the folder (its repository's list
+        // has it). A submodule's .git is a file too, and it is one.
         std::fs::create_dir_all(dir.join("w")).unwrap();
-        std::fs::write(dir.join("w/.git"), "gitdir: x\n").unwrap();
+        std::fs::write(dir.join("w/.git"), "gitdir: /r/.git/worktrees/w\n").unwrap();
+        std::fs::create_dir_all(dir.join("s")).unwrap();
+        std::fs::write(dir.join("s/.git"), "gitdir: ../.git/modules/s\n").unwrap();
         assert_eq!(
             discover(&dir),
-            vec![dir.join("a"), dir.join("b"), dir.join("w")]
+            vec![dir.join("a"), dir.join("b"), dir.join("s")]
         );
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         assert_eq!(discover(&dir)[0], dir);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A folder workspace on `/r` (holding the repository `/r`) and one on
+    /// `/n`, with `/r`'s worktrees `/w/a` and `/w/b` and a worktree of a
+    /// repository no workspace holds.
+    fn nested() -> Panel {
+        let wt = |path: &str, repo: &str| {
+            let mut w = tree(path, false);
+            w.repo = Some(PathBuf::from(repo));
+            w
+        };
+        let mut panel = Panel {
+            folders: vec![folder("garden-log", "/r"), folder("notes", "/n")],
+            worktrees: vec![wt("/w/a", "/r"), wt("/elsewhere/x", "/o"), wt("/w/b", "/r")],
+            ..Panel::default()
+        };
+        panel
+            .repos
+            .insert("folder:garden-log".into(), vec![PathBuf::from("/r")]);
+        panel.repos.insert("folder:notes".into(), Vec::new());
+        panel.rebuild();
+        panel
+    }
+
+    fn rows(panel: &Panel) -> Vec<String> {
+        panel
+            .lines(&[])
+            .iter()
+            .filter_map(|line| match line {
+                Line::Task(i) => Some(panel.tasks[*i].id()),
+                Line::Child(i) => Some(format!(">{}", panel.tasks[*i].id())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn worktrees_sit_under_the_folder_holding_their_repository() {
+        let mut panel = nested();
+        assert_eq!(
+            rows(&panel),
+            [
+                "folder:garden-log",
+                ">/w/a",
+                ">/w/b",
+                "folder:notes",
+                "/elsewhere/x"
+            ]
+        );
+        assert_eq!(panel.children("folder:garden-log"), 2);
+        assert_eq!(panel.visible(), [0, 1, 2, 3, 4]);
+        // Folded: the worktrees have no row and no number.
+        panel.toggle_collapsed("folder:garden-log");
+        assert_eq!(
+            rows(&panel),
+            ["folder:garden-log", "folder:notes", "/elsewhere/x"]
+        );
+        assert_eq!(panel.visible(), [0, 3, 4]);
+        assert_eq!(panel.report_tree(), "garden-log(+2),notes,x");
+        // The selected one keeps its row, under its folder.
+        panel.selected = Some("/w/b".into());
+        assert_eq!(
+            rows(&panel),
+            ["folder:garden-log", ">/w/b", "folder:notes", "/elsewhere/x"]
+        );
+        assert_eq!(panel.report_tree(), "garden-log(+1),>b,notes,x");
+        panel.toggle_collapsed("folder:garden-log");
+        assert_eq!(panel.report_tree(), "garden-log,>a,>b,notes,x");
+    }
+
+    #[test]
+    fn a_dragged_folder_takes_its_worktrees_and_a_worktree_stays_among_siblings() {
+        let mut panel = nested();
+        let ids = |p: &Panel| p.tasks.iter().map(Workspace::id).collect::<Vec<_>>();
+        // The folder last: its worktrees go with it.
+        panel.move_before("folder:garden-log", None);
+        panel.arrange();
+        assert_eq!(
+            ids(&panel),
+            [
+                "folder:notes",
+                "/elsewhere/x",
+                "folder:garden-log",
+                "/w/a",
+                "/w/b"
+            ]
+        );
+        // A worktree reorders among its siblings.
+        panel.move_before("/w/b", Some("/w/a"));
+        panel.arrange();
+        assert_eq!(&ids(&panel)[2..], ["folder:garden-log", "/w/b", "/w/a"]);
+        // Pinned, a worktree stays under its folder, first of its siblings.
+        panel.move_before("/w/b", None);
+        panel.toggle_pin("/w/b");
+        panel.arrange();
+        assert_eq!(&ids(&panel)[2..], ["folder:garden-log", "/w/b", "/w/a"]);
+        // Peers: the folder's are the top rows, a worktree's its siblings.
+        let at = |id: &str| panel.by_id(id).unwrap();
+        assert!(panel.peers("folder:garden-log", at("folder:notes")));
+        assert!(!panel.peers("folder:garden-log", at("/w/a")));
+        assert!(panel.peers("/w/b", at("/w/a")));
+        assert!(!panel.peers("/w/b", at("/elsewhere/x")));
+    }
+
+    #[test]
+    fn a_worktree_sits_under_the_deepest_folder_holding_its_repository() {
+        let mut panel = nested();
+        panel.folders.push(folder("code", "/"));
+        panel.folders.push(folder("garden-log 2", "/r"));
+        for id in ["folder:code", "folder:garden-log 2"] {
+            panel.repos.insert(id.into(), vec![PathBuf::from("/r")]);
+        }
+        panel.rebuild();
+        let a = panel.tasks[panel.by_id("/w/a").unwrap()].clone();
+        // Deeper than `/`; of the two on `/r`, the first made.
+        assert_eq!(panel.parent_of(&a).as_deref(), Some("folder:garden-log"));
+        assert_eq!(panel.parent_of(&panel.folders[0].clone()), None);
+    }
+
+    #[test]
+    fn folding_survives_the_arrangement_file_and_reads_old_ones() {
+        let mut a = Arrangement {
+            order: vec!["ws:1".into(), "ws:2".into(), "/w/a".into()],
+            ..Arrangement::default()
+        };
+        a.pinned.insert("ws:1".into());
+        a.collapsed.insert("ws:1".into());
+        a.collapsed.insert("ws:2".into());
+        a.titles.insert("/w/a".into(), "login fix".into());
+        let text = a.text();
+        assert!(text.starts_with("pin,fold\tws:1\t\nfold\tws:2\t\n-\t/w/a\tlogin fix\n"));
+        assert_eq!(Arrangement::parse(&text), a);
+        // A file from before folding.
+        let old = Arrangement::parse("pin\tws:1\t\n-\t/w/a\tmine\n");
+        assert!(old.pinned.contains("ws:1"));
+        assert!(old.collapsed.is_empty());
+        assert_eq!(old.titles["/w/a"], "mine");
+        a.rename_id("ws:2", "ws:3");
+        assert!(a.collapsed.contains("ws:3"));
     }
 
     #[test]

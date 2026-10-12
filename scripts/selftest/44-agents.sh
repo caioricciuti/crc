@@ -124,6 +124,8 @@ ls -d "$T"/worktrees/agentsproj-*/try-it >/dev/null 2>&1 \
 testgit "$T/agentsproj" rev-parse -q --verify refs/heads/try-it >/dev/null \
     || failed "agents: no try-it branch: $(testgit "$T/agentsproj" branch)"
 expect_terminal "$T/agents-task.out" "agent ready in try-it"
+# The worktree's row sits under the workspace holding its repository.
+expect "$T/agents-task.out" agents_tree "agentsproj,>try-it"
 # A task's row shows its waiting session, with the keyboard.
 expect "$T/agents-main.out" agents "on tasks=agentsproj,try-it selected=agentsproj sessions=*agentsproj,try-it claude=0 pair=- op=-"
 expect "$T/agents-jump.out" agents "on tasks=agentsproj,try-it selected=try-it sessions=agentsproj,*try-it claude=0 pair=- op=-"
@@ -136,23 +138,25 @@ expect "$T/agents-unsplit.out" agents "on tasks=agentsproj,try-it selected=try-i
 # The shell beside the agent cds out of the worktree to a folder nothing
 # holds: a workspace is made there and has it. Back in the worktree, it is
 # try-it's again, and the workspace it left empty goes.
-expect "$T/agents-left.out" agents "on tasks=agentsproj,elsewhere,try-it selected=elsewhere sessions=agentsproj,try-it,*elsewhere claude=0 pair=- op=-"
+expect "$T/agents-left.out" agents "on tasks=agentsproj,try-it,elsewhere selected=elsewhere sessions=agentsproj,try-it,*elsewhere claude=0 pair=- op=-"
 expect "$T/agents-back.out" agents "on tasks=agentsproj,try-it selected=try-it sessions=agentsproj,try-it,*try-it claude=0 pair=- op=-"
 grep -q '^inspector: branch=try-it ' "$T/agents-back.out" \
     || failed "agents-back.out: $(grep '^inspector:' "$T/agents-back.out")"
 # A folder workspace on the selected one's folder (try-it's repository),
 # with a shell in it; Cmd-T adds a shell to it. It is kept.
-expect "$T/agents-folder.out" agents "on tasks=agentsproj,notes,try-it selected=notes sessions=agentsproj,try-it,try-it,*notes claude=0 pair=- op=-"
+# Two workspaces on the repository: the worktree sits under the first.
+expect "$T/agents-folder.out" agents_tree "agentsproj,>try-it,notes"
+expect "$T/agents-folder.out" agents "on tasks=agentsproj,try-it,notes selected=notes sessions=agentsproj,try-it,try-it,*notes claude=0 pair=- op=-"
 expect_terminal "$T/agents-folder.out" "agent ready in agentsproj"
-expect "$T/agents-cmdt.out" agents "on tasks=agentsproj,notes,try-it selected=notes sessions=agentsproj,try-it,try-it,notes,*notes claude=0 pair=- op=-"
+expect "$T/agents-cmdt.out" agents "on tasks=agentsproj,try-it,notes selected=notes sessions=agentsproj,try-it,try-it,notes,*notes claude=0 pair=- op=-"
 grep -q "^notes	" "$T"/home/agents/Library/Application\ Support/crc/agents/workspaces 2>/dev/null \
     || failed "agents: the notes workspace was not kept under Application Support/crc/agents"
 # One click under the list does nothing; a double-click makes a workspace
 # on the selected one's folder, named after it, with a shell.
-expect "$T/agents-single.out" agents "on tasks=agentsproj,notes,try-it selected=notes sessions=agentsproj,try-it,try-it,notes,*notes claude=0 pair=- op=-"
-expect "$T/agents-blank.out" agents "on tasks=agentsproj,notes,agentsproj 2,try-it selected=agentsproj 2 sessions=agentsproj,try-it,try-it,notes,notes,*agentsproj 2 claude=0 pair=- op=-"
+expect "$T/agents-single.out" agents "on tasks=agentsproj,try-it,notes selected=notes sessions=agentsproj,try-it,try-it,notes,*notes claude=0 pair=- op=-"
+expect "$T/agents-blank.out" agents "on tasks=agentsproj,try-it,notes,agentsproj 2 selected=agentsproj 2 sessions=agentsproj,try-it,try-it,notes,notes,*agentsproj 2 claude=0 pair=- op=-"
 # Back in the editor, the sessions keep running.
-expect "$T/agents-off.out" agents "off tasks=agentsproj,notes,agentsproj 2,try-it selected=agentsproj 2 sessions=agentsproj,try-it,try-it,notes,notes,*agentsproj 2 claude=0 pair=- op=-"
+expect "$T/agents-off.out" agents "off tasks=agentsproj,try-it,notes,agentsproj 2 selected=agentsproj 2 sessions=agentsproj,try-it,try-it,notes,notes,*agentsproj 2 claude=0 pair=- op=-"
 grep -q '^terminals: waiting: finished|waiting: finished|' "$T/agents-off.out" \
     || failed "agents-off.out: $(grep '^terminals:' "$T/agents-off.out")"
 testgit "$T/agentsproj" worktree remove --force "$(ls -d "$T"/worktrees/agentsproj-*/try-it)" 2>/dev/null || true

@@ -2238,7 +2238,7 @@ define_class!(
                 && let Some(drag) = state.agents.drag.take()
                 && drag.active
             {
-                let before = state.agents.drop_before(drag.y);
+                let before = state.agents.drop_before(&drag.id, drag.y);
                 if before.as_deref() != Some(drag.id.as_str()) {
                     state.agents.move_before(&drag.id, before.as_deref());
                 }

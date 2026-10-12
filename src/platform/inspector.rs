@@ -4,8 +4,10 @@
 //! commit, pull, push and take main's new commits; for a worktree, its pull
 //! request with each check, and the buttons to open or merge it. A folder
 //! workspace shows every repository in it: the folder itself and its direct
-//! children. The Git status is read on a worker; the pull request comes
-//! with the workspace list's own read.
+//! children, each with a strip per worktree of it: where its branch stands
+//! against the base, and buttons to open it or start a shell in it. The Git
+//! status is read on a worker; the pull request comes with the workspace
+//! list's own read.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -41,6 +43,10 @@ pub enum Action {
     CreatePullRequest,
     MergePullRequest,
     OpenPullRequest,
+    /// A worktree strip's Open: that workspace, selected.
+    OpenWorktree,
+    /// A worktree strip's Terminal: a new shell in it.
+    WorktreeTerminal,
 }
 
 impl Action {
@@ -55,6 +61,8 @@ impl Action {
             Action::CreatePullRequest => "create_pr",
             Action::MergePullRequest => "merge",
             Action::OpenPullRequest => "open",
+            Action::OpenWorktree => "worktree_open",
+            Action::WorktreeTerminal => "worktree_terminal",
         }
     }
 }
@@ -67,6 +75,9 @@ pub type Want = (PathBuf, Option<String>, bool);
 
 /// A card row: its label, and its values with their colours.
 type Fact<'a> = (&'a str, Vec<(String, [f32; 4])>);
+
+/// A worktree strip's height.
+const STRIP: f32 = 46.0;
 
 #[derive(Default)]
 pub struct Inspector {
@@ -87,6 +98,9 @@ pub struct Inspector {
     max_scroll: f32,
     /// The ssh session shown last frame, for the self-test.
     shown_remote: Option<String>,
+    /// The worktree strips shown last frame, per repository, for the
+    /// self-test.
+    shown_worktrees: Vec<(PathBuf, PathBuf, String)>,
 }
 
 impl Inspector {
@@ -167,6 +181,15 @@ impl Inspector {
             Some((rest, n)) if n.parse::<usize>().is_ok() => (rest, n.parse().ok()),
             _ => (rest, None),
         };
+        // A worktree strip's button by the strip's place: `.1` the second.
+        if rest.starts_with("worktree_") {
+            return self
+                .hits
+                .iter()
+                .filter(|(_, a, _)| a.name() == rest)
+                .nth(n.unwrap_or(0))
+                .map(|(rect, ..)| *rect);
+        }
         let repo = n.and_then(|n: usize| self.read_for.get(n).cloned());
         self.hits
             .iter()
@@ -220,7 +243,28 @@ impl Inspector {
                 })
                 .map(|(_, a, _)| a.name())
                 .collect();
-            format!("{status} buttons={}", live.join(","))
+            let strips: Vec<String> = self
+                .shown_worktrees
+                .iter()
+                .filter(|(repo, ..)| repo == path)
+                .map(|(_, tree, name)| match self.status_of(tree) {
+                    Some(Ok(s)) => format!(
+                        "{name}:ahead={}:+{}-{}:files={}",
+                        s.ahead, s.added, s.removed, s.files
+                    ),
+                    Some(Err(_)) => format!("{name}:error"),
+                    None => format!("{name}:reading"),
+                })
+                .collect();
+            if strips.is_empty() {
+                format!("{status} buttons={}", live.join(","))
+            } else {
+                format!(
+                    "{status} buttons={} worktrees={}",
+                    live.join(","),
+                    strips.join(",")
+                )
+            }
         };
         if let [only] = repos {
             return one(only);
@@ -238,11 +282,14 @@ impl Inspector {
             .join(" | ")
     }
 
+    /// `worktrees`: for a folder workspace, the worktrees of its
+    /// repositories, each with the name its row has.
     #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &mut self,
         workspace: Option<&Workspace>,
         repos: Option<&[PathBuf]>,
+        worktrees: &[(Workspace, String)],
         remote: Option<&crate::platform::remote::Remote>,
         pull_request: Option<Option<&PullRequest>>,
         github: bool,
@@ -253,6 +300,7 @@ impl Inspector {
     ) {
         self.hits.clear();
         self.shown_remote = remote.map(|r| r.login());
+        self.shown_worktrees.clear();
         layout::push_rect(
             out,
             atlas,
@@ -294,6 +342,7 @@ impl Inspector {
         self.draw_body(
             workspace,
             repos,
+            worktrees,
             remote,
             pull_request,
             github,
@@ -342,6 +391,7 @@ impl Inspector {
         &mut self,
         workspace: Option<&Workspace>,
         repos: Option<&[PathBuf]>,
+        worktrees: &[(Workspace, String)],
         remote: Option<&crate::platform::remote::Remote>,
         pull_request: Option<Option<&PullRequest>>,
         github: bool,
@@ -468,6 +518,13 @@ impl Inspector {
                     y = self.repo_card(&status, repo, x, y, width, atlas, theme, out);
                     single = Some(status);
                 }
+            }
+            let mine: Vec<&(Workspace, String)> = worktrees
+                .iter()
+                .filter(|(w, _)| w.repo.as_deref() == Some(repo.as_path()))
+                .collect();
+            if !mine.is_empty() {
+                y = self.worktree_strips(repo, &mine, x, y, width, atlas, theme, out);
             }
         }
         let (Some(status), [_]) = (single, repos) else {
@@ -674,6 +731,170 @@ impl Inspector {
 }
 
 impl Inspector {
+    /// A repository's worktrees, a strip each in one card: the branch and,
+    /// under it, how far ahead of the base and the change from where it
+    /// left it; at the right, Open and Terminal. Returns the y under it.
+    #[allow(clippy::too_many_arguments)]
+    fn worktree_strips(
+        &mut self,
+        repo: &Path,
+        worktrees: &[&(Workspace, String)],
+        x: f32,
+        y: f32,
+        width: f32,
+        atlas: &mut Atlas,
+        theme: &Theme,
+        out: &mut Vec<GlyphInstance>,
+    ) -> f32 {
+        let mut y = y;
+        let heading = Viewport {
+            x,
+            y,
+            width,
+            height: 20.0,
+        };
+        text(out, atlas, x, y, width, "WORKTREES", theme.status_text);
+        let hw = layout::ui_text_width(atlas, "WORKTREES");
+        layout::push_count(out, atlas, x + hw + 8.0, heading, worktrees.len(), theme);
+        y += ROW;
+        let height = worktrees.len() as f32 * STRIP;
+        layout::push_card(
+            out,
+            Viewport {
+                x,
+                y,
+                width,
+                height,
+            },
+            theme,
+        );
+        for (n, (tree, name)) in worktrees.iter().enumerate() {
+            self.shown_worktrees
+                .push((repo.to_path_buf(), tree.path.clone(), name.clone()));
+            let top = y + n as f32 * STRIP;
+            if n > 0 {
+                layout::push_rect(
+                    out,
+                    atlas,
+                    [x + 10.0, top],
+                    [width - 20.0, 1.0],
+                    theme.hairline,
+                );
+            }
+            // The buttons, right to left, beside the branch: the line under
+            // it has the whole width.
+            let mut right = x + width - 6.0;
+            let by = top + 4.0;
+            for (label, action, tip) in [
+                (
+                    "Terminal",
+                    Action::WorktreeTerminal,
+                    "Start a shell in this worktree",
+                ),
+                (
+                    "Open",
+                    Action::OpenWorktree,
+                    "Show this worktree's workspace",
+                ),
+            ] {
+                let probe = layout::Button::new(Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 0.0,
+                    height: layout::UI_CONTROL_SM,
+                })
+                .label(label);
+                let w = probe.content_width(atlas, 8.0);
+                let b = Viewport {
+                    x: right - w,
+                    y: by,
+                    width: w,
+                    height: layout::UI_CONTROL_SM,
+                };
+                // A ring: on the card, a button's fill is the card's own colour.
+                layout::push_rounded_rect(
+                    out,
+                    Viewport {
+                        x: b.x - 1.0,
+                        y: b.y - 1.0,
+                        width: b.width + 2.0,
+                        height: b.height + 2.0,
+                    },
+                    layout::UI_RADIUS_SM + 1.0,
+                    theme.control_hover,
+                );
+                layout::Button { rect: b, ..probe }
+                    .tip(tip)
+                    .draw(out, atlas, theme);
+                self.hits.push((b, action, Some(tree.path.clone())));
+                right = b.x - layout::UI_GAP;
+            }
+            let name_room = (right - 4.0 - (x + 10.0)).max(0.0);
+            let shown = fit(atlas, name, name_room);
+            text(
+                out,
+                atlas,
+                x + 10.0,
+                top + 5.0,
+                name_room,
+                &shown,
+                theme.text,
+            );
+            let room = (width - 20.0).max(0.0);
+            let line2 = top + 24.0;
+            match self.status_of(&tree.path) {
+                None => layout::push_skeleton_row(
+                    out,
+                    Viewport {
+                        x: x + 10.0,
+                        y: line2,
+                        width: room,
+                        height: 18.0,
+                    },
+                    0.0,
+                    (0.7, 0.0),
+                    false,
+                    theme,
+                ),
+                Some(Err(_)) => {
+                    text(
+                        out,
+                        atlas,
+                        x + 10.0,
+                        line2,
+                        room,
+                        "not readable",
+                        theme.gutter_text,
+                    );
+                }
+                Some(Ok(status)) => {
+                    let mut parts: Vec<(String, [f32; 4])> = Vec::new();
+                    match (status.base.as_ref(), status.ahead) {
+                        (None, _) => parts.push(("no base".into(), theme.gutter_text)),
+                        (Some(_), 0) => parts.push(("even".into(), theme.gutter_text)),
+                        (Some(_), a) => parts.push((format!("{a} ahead"), theme.status_text)),
+                    }
+                    if status.files > 0 {
+                        parts.push((format!("+{}", status.added), theme.diff_added));
+                        parts.push((format!("\u{2212}{}", status.removed), theme.diff_removed));
+                        parts.push((plural(status.files, "file"), theme.gutter_text));
+                    }
+                    let mut vx = x + 10.0;
+                    for (part, colour) in parts {
+                        let left = (x + 10.0 + room - vx).max(0.0);
+                        if left <= 0.0 {
+                            break;
+                        }
+                        let part = fit(atlas, &part, left);
+                        text(out, atlas, vx, line2, left, &part, colour);
+                        vx += layout::ui_text_width(atlas, &part) + 6.0;
+                    }
+                }
+            }
+        }
+        y + height + 14.0
+    }
+
     /// One repository's facts and its buttons; returns the y under them.
     #[allow(clippy::too_many_arguments)]
     fn repo_card(

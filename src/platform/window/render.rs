@@ -726,6 +726,18 @@ impl EditorView {
                     .map(|info| info.pull_request.clone());
                 let github = agents.github.unwrap_or(false);
                 let repos = selected.as_ref().and_then(|w| agents.repos_of(w));
+                // A folder workspace's repositories' worktrees, a strip each.
+                let worktrees: Vec<_> = match (&selected, &repos) {
+                    (Some(w), Some(repos)) if w.folder => agents
+                        .worktrees_of(repos)
+                        .into_iter()
+                        .map(|t| {
+                            let title = agents.title(&t);
+                            (t, title)
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
                 // The terminal showing, when it is this workspace's and in ssh.
                 let remote = terminal_panel
                     .active_tab()
@@ -737,6 +749,7 @@ impl EditorView {
                 agents.inspector.draw(
                     selected.as_ref(),
                     repos.as_deref(),
+                    &worktrees,
                     remote.as_ref(),
                     pull_request.as_ref().map(Option::as_ref),
                     github,

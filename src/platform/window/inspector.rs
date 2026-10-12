@@ -25,6 +25,17 @@ impl EditorView {
             return;
         };
         let (action, repo) = action;
+        // A worktree strip's buttons act on that worktree's workspace.
+        if let (Action::OpenWorktree | Action::WorktreeTerminal, Some(path)) = (action, &repo) {
+            if action == Action::OpenWorktree {
+                self.open_worktree(path);
+            } else {
+                self.worktree_terminal(path);
+            }
+            self.request_redraw();
+            self.pump();
+            return;
+        }
         // The buttons act on the workspace shown, in the repository whose
         // card they are on.
         if let Some(mut state) = self.state_mut() {
@@ -45,6 +56,7 @@ impl EditorView {
                 NSMenu::popUpContextMenu_withEvent_forView(&menu, event, self);
             }
             Action::OpenPullRequest => self.agent_open_pull_request(),
+            Action::OpenWorktree | Action::WorktreeTerminal => {}
         }
         self.request_redraw();
         self.pump();
@@ -79,10 +91,22 @@ impl EditorView {
             return;
         };
         // A worktree is compared with its main checkout's branch; a folder's
-        // repositories are main checkouts, which show their latest tag.
+        // repositories are main checkouts, which show their latest tag, and
+        // after them their worktrees, for the strips under each.
+        let strips: Vec<_> = if task.folder {
+            state
+                .agents
+                .worktrees_of(&repos)
+                .into_iter()
+                .map(|w| (w.path, w.base, false))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let wanted: Vec<_> = repos
             .into_iter()
             .map(|path| (path, task.base.clone(), task.folder))
+            .chain(strips)
             .collect();
         state.agents.inspector.want(&wanted);
     }

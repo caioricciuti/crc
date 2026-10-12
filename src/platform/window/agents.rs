@@ -308,6 +308,13 @@ impl EditorView {
                 self.select_task(index);
             }
             Action::Session(tab) => self.show_session(tab),
+            Action::Fold(index) => {
+                if let Some(mut state) = self.state_mut()
+                    && let Some(id) = state.agents.tasks.get(index).map(|t| t.id())
+                {
+                    state.agents.toggle_collapsed(&id);
+                }
+            }
             Action::NewSession(index) => {
                 let Some(dir) = self.task_path(index) else {
                     return;
@@ -429,15 +436,41 @@ impl EditorView {
         }
     }
 
-    /// Control-1 to 9: the task in that place.
+    /// Control-1 to 9: the task in that place, as the list shows them
+    /// (a worktree folded under its folder workspace has no place).
     pub(super) fn jump_to_task(&self, number: usize) {
-        let known = self
+        let index = self.state().and_then(|state| {
+            number
+                .checked_sub(1)
+                .and_then(|n| state.agents.visible().get(n).copied())
+        });
+        match index {
+            Some(index) => self.select_task(index),
+            None => self.set_agents_mode(true),
+        }
+    }
+
+    /// The inspector's Open on a worktree: its row, as a click on it.
+    pub(super) fn open_worktree(&self, path: &Path) {
+        let index = self
             .state()
-            .is_some_and(|state| number >= 1 && number <= state.agents.tasks.len());
-        if known {
-            self.select_task(number - 1);
-        } else {
+            .and_then(|state| state.agents.by_id(&path.to_string_lossy()));
+        if let Some(index) = index {
+            self.select_task(index);
+        }
+    }
+
+    /// The inspector's Terminal on a worktree: a new shell in it, which
+    /// selects it, as Command-T does for the selected workspace.
+    pub(super) fn worktree_terminal(&self, path: &Path) {
+        let found = self.state_mut().and_then(|mut state| {
+            let index = state.agents.by_id(&path.to_string_lossy())?;
+            state.agents.select(index);
+            Some(state.agents.tasks[index].path.clone())
+        });
+        if let Some(dir) = found {
             self.set_agents_mode(true);
+            self.spawn_terminal_in(false, Some(&dir));
         }
     }
 
@@ -575,7 +608,12 @@ impl EditorView {
                 add("Close Session", sel!(agentCloseSession:));
                 menu
             }
-            Some(Action::Select(index) | Action::NewSession(index) | Action::Menu(index)) => {
+            Some(
+                Action::Select(index)
+                | Action::NewSession(index)
+                | Action::Menu(index)
+                | Action::Fold(index),
+            ) => {
                 if let Some(mut state) = self.state_mut() {
                     state.agents.menu_task = state.agents.tasks.get(index).map(|t| t.id());
                     state.agents.target = None;
