@@ -92,3 +92,27 @@ esac
 grep -q "^message: Started again 4 terminals" "$T/side-restored.out" \
     || failed "sidebar: $(grep '^message:' "$T/side-restored.out")"
 expect_terminal "$T/side-restored.out" "resumed --continue"
+
+# Another reboot, and crc opened on a folder none of them was started in:
+# the workspaces are the app's, so every one's terminals come back. (Not
+# `claude --continue` again: the stand-in tab started as a shell, and this
+# quit wrote nothing that says an agent ran in it.)
+pkill -f -- "--hold $T/home/" 2>/dev/null || true
+sleep 1
+mkdir -p "$T/sideother"
+printf 'y\n' > "$T/sideother/y.txt"
+cat > "$T/side-other.script" <<SCRIPT
+wait 500
+key 0 cmd,shift A
+wait 1500
+dump $T/side-other.out
+quit
+SCRIPT
+HOME="$T/home/sidebar" PATH="$T/sidebin:$PATH" CRC_TERMINAL_SHELL=/bin/sh CRC_SELFTEST="$T/side-other.script" \
+    "$BIN" "$T/sideother" 2> "$T/side-other.err"
+case "$(grep '^agents:' "$T/side-other.out")" in
+*"tasks=sideproj,gamma,notes "*"sessions=sideproj,notes,gamma,"*) ;;
+*) failed "sidebar: from another folder, sessions are $(grep '^agents:' "$T/side-other.out")" ;;
+esac
+grep -q "^message: Started again 4 terminals" "$T/side-other.out" \
+    || failed "sidebar: from another folder: $(grep '^message:' "$T/side-other.out")"

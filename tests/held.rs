@@ -174,3 +174,26 @@ fn a_session_attaches_to_a_held_program() {
     assert!(wait_until(|| hold::live(&dir).is_empty()));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_helper_of_another_project_is_live_everywhere() {
+    let dir = scratch("elsewhere");
+    let spec = Spec {
+        project: "/elsewhere".into(),
+        ..shell_spec(&dir)
+    };
+    let helper = Path::new(env!("CARGO_BIN_EXE_crc"));
+    let (id, socket) = hold::start(&dir, &spec, helper).expect("the helper starts");
+    let mut socket = limited(socket);
+    assert_eq!(hold::receive(&mut socket).unwrap(), Frame::Size(40, 6));
+    let (live, lost) = hold::scan(&dir);
+    assert!(lost.is_empty());
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].0, id);
+    assert_eq!(live[0].1.project, Path::new("/elsewhere"));
+
+    hold::send(&mut socket, &Frame::Kill).unwrap();
+    while !matches!(hold::receive(&mut socket), Ok(Frame::Exited(_)) | Err(_)) {}
+    assert!(wait_until(|| hold::live(&dir).is_empty()));
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -37,7 +37,7 @@ SCRIPT
 CRC_TERMINAL_SHELL=/bin/sh CRC_SELFTEST="$T/held-2.script" "$BIN" "$T/heldproj" 2> "$T/held-2.err"
 expect_terminal "$T/held-back.out" "held-ok"
 expect_terminal "$T/held-typed.out" "held-again"
-# Another project does not get it.
+# Another project gets it too: the sessions are the app's, not a folder's.
 mkdir -p "$T/heldother"
 cat > "$T/held-3.script" <<SCRIPT
 wait 700
@@ -45,5 +45,4 @@ dump $T/held-other.out
 quit
 SCRIPT
 CRC_TERMINAL_SHELL=/bin/sh CRC_SELFTEST="$T/held-3.script" "$BIN" "$T/heldother" 2> "$T/held-3.err"
-grep -q '^terminals: $' "$T/held-other.out" \
-    || failed "held: another project took the session: $(grep '^terminals:' "$T/held-other.out")"
+expect_terminal "$T/held-other.out" "held-again"

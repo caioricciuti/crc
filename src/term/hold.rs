@@ -61,7 +61,8 @@ pub struct Spec {
     pub claude: bool,
     /// Its agent review session's folder.
     pub review: PathBuf,
-    /// The project the window had open: it comes back with that one.
+    /// The project the window had open when it started. Informational:
+    /// every session comes back, whatever project the next window opens.
     pub project: PathBuf,
     /// The workspace it was started in (Agents mode), or empty.
     pub workspace: String,
@@ -421,17 +422,15 @@ pub fn forget(dir: &Path, id: &str) {
     remove_all(dir, id);
 }
 
-/// How long a lost session of a project that is not opened again is kept.
-const LOST_KEPT: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 3600);
-
 /// A session found on disk: its id, what it runs, what the window left.
 pub type Found = (String, Spec, Left);
 
-/// The sessions of `project`: the helpers still running, and the ones
-/// whose helper is gone (a reboot, a crash), oldest first, to be started
-/// again. A lost session's files go once returned; another project's stay
-/// for when it is opened, for a month.
-pub fn scan(dir: &Path, project: &Path) -> (Vec<Found>, Vec<Found>) {
+/// Every session in `dir`, whatever project it was started in, since the
+/// Agents workspaces are the app's and not one folder's: the helpers still
+/// running, and the ones whose helper is gone (a reboot, a crash), oldest
+/// first, to be started again. A lost session's files go as it is
+/// returned, so it is started again once.
+pub fn scan(dir: &Path) -> (Vec<Found>, Vec<Found>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return (Vec::new(), Vec::new());
     };
@@ -457,27 +456,35 @@ pub fn scan(dir: &Path, project: &Path) -> (Vec<Found>, Vec<Found>) {
             .and_then(|text| text.trim().parse::<i32>().ok())
             .is_some_and(|pid| pid > 0 && crate::platform::send_signal(pid, 0))
             && socket_path(&id).is_ok_and(|socket| socket.exists());
-        let ours = crate::platform::canonical(&spec.project) == project;
         if alive {
-            if ours {
-                live.push((id, spec, left));
-            }
-        } else if ours {
+            live.push((id, spec, left));
+        } else {
             remove_all(dir, &id);
             lost.push((id, spec, left));
-        } else {
-            let old = std::fs::metadata(spec_path(dir, &id))
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|at| at.elapsed().ok())
-                .is_some_and(|age| age > LOST_KEPT);
-            if old {
-                remove_all(dir, &id);
-            }
         }
     }
     (live, lost)
 }
+
+/// Takes the sessions in `dir` for this process: `None` while another crc
+/// holds them. A helper serves only the window that connected last, so a
+/// second crc that took them too would steal the first one's terminals.
+/// The lock lasts as long as the file is open, and ends with the process
+/// however it ends.
+pub fn claim(dir: &Path) -> Option<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    std::fs::create_dir_all(dir).ok()?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join("instance.lock"))
+        .ok()?;
+    (unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0).then_some(file)
+}
+
+const LOCK_EX: i32 = 2;
+const LOCK_NB: i32 = 4;
 
 /// Every helper in `dir` still running, oldest first, with what it runs
 /// and what the last window left about it. The files of helpers that are
@@ -519,6 +526,7 @@ pub fn live(dir: &Path) -> Vec<(String, Spec, Left)> {
 unsafe extern "C" {
     fn setsid() -> i32;
     fn getuid() -> u32;
+    fn flock(fd: i32, operation: i32) -> i32;
 }
 
 /// What the helper's threads share.
@@ -789,6 +797,54 @@ mod tests {
             assert_eq!(&receive(&mut from).unwrap(), frame);
         }
         assert!(receive(&mut from).is_err(), "EOF is an error");
+    }
+
+    #[test]
+    fn lost_sessions_of_every_project_come_back_once() {
+        let dir = std::env::temp_dir().join(format!("crc-hold-lost-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (id, project, workspace) in [("2", "/b", "ws:2"), ("1", "/a", "ws:1")] {
+            let spec = Spec {
+                program: "/bin/sh".into(),
+                project: project.into(),
+                workspace: workspace.into(),
+                ..Spec::default()
+            };
+            std::fs::write(spec_path(&dir, id), spec.to_text()).unwrap();
+            std::fs::write(pid_path(&dir, id), "0").unwrap();
+        }
+        let (live, lost) = scan(&dir);
+        assert!(live.is_empty());
+        let got: Vec<(&str, &str, &str)> = lost
+            .iter()
+            .map(|(id, spec, _)| {
+                (
+                    id.as_str(),
+                    spec.project.to_str().unwrap(),
+                    spec.workspace.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(got, [("1", "/a", "ws:1"), ("2", "/b", "ws:2")]);
+        for id in ["1", "2"] {
+            assert!(!spec_path(&dir, id).exists());
+            assert!(!pid_path(&dir, id).exists());
+        }
+        let (live, lost) = scan(&dir);
+        assert!(live.is_empty() && lost.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn one_process_claims_the_sessions_at_a_time() {
+        let dir = std::env::temp_dir().join(format!("crc-hold-claim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let first = claim(&dir).expect("a free folder is claimed");
+        assert!(claim(&dir).is_none(), "held by the first");
+        drop(first);
+        assert!(claim(&dir).is_some(), "free again once the first lets go");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

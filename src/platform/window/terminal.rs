@@ -322,8 +322,11 @@ impl EditorView {
             project,
             workspace: workspace.clone().unwrap_or_default(),
         };
-        let held = crate::term::hold::dir()
-            .ok_or_else(|| std::io::Error::other("no folder for session helpers"))
+        // A window opened on one file lets its sessions end at quit, so it
+        // runs them itself, as it always ended them, and says nothing.
+        let ephemeral = self.state().is_none_or(|state| state.ephemeral_session);
+        let held = self
+            .held_dir()
             .and_then(|dir| {
                 let helper = std::env::current_exe()?;
                 crate::term::hold::start(&dir, &spec, &helper)
@@ -354,7 +357,8 @@ impl EditorView {
                 (
                     spawned,
                     None,
-                    Some(format!("Terminal: this session ends with the window: {e}")),
+                    (!ephemeral)
+                        .then(|| format!("Terminal: this session ends with the window: {e}")),
                 )
             }
         };
@@ -448,25 +452,43 @@ impl EditorView {
         }
     }
 
-    /// Takes back the sessions helpers kept for this project from the
-    /// last window: their screens as the programs left them, the tab that
-    /// had the keyboard active again. At launch, before the first frame.
+    /// The folder of the session helpers, once this process holds them
+    /// ([`crate::term::hold::claim`]), claimed on first use. A window
+    /// opened on one file never claims them: a crc opened on the project
+    /// later must still get its sessions back.
+    fn held_dir(&self) -> std::io::Result<std::path::PathBuf> {
+        let dir = crate::term::hold::dir()
+            .ok_or_else(|| std::io::Error::other("no folder for session helpers"))?;
+        let mut state = self
+            .state_mut()
+            .ok_or_else(|| std::io::Error::other("the window is busy"))?;
+        if state.held_lock.is_none() && !state.ephemeral_session {
+            state.held_lock = crate::term::hold::claim(&dir);
+        }
+        if state.held_lock.is_none() {
+            return Err(std::io::Error::other(
+                "another crc running keeps the sessions",
+            ));
+        }
+        Ok(dir)
+    }
+
+    /// Takes back the sessions helpers kept from the last window, in every
+    /// workspace: their screens as the programs left them, the tab that had
+    /// the keyboard active again. At launch, before the first frame. Only
+    /// the crc that holds the helpers does: another one running at the same
+    /// time leaves them where they are.
     pub(super) fn reattach_held(&self) {
-        let Some(dir) = crate::term::hold::dir() else {
-            return;
-        };
         // A window opened on one file keeps no session and lets nothing go
         // at quit; it takes nothing back either.
-        let project = self.state().and_then(|state| {
-            (!state.ephemeral_session)
-                .then(|| state.tree.root().map(crate::platform::canonical))
-                .flatten()
-        });
-        let Some(project) = project else {
+        if self.state().is_none_or(|state| state.ephemeral_session) {
+            return;
+        }
+        let Ok(dir) = self.held_dir() else {
             return;
         };
         let mut taken = Vec::new();
-        let (live, mut lost) = crate::term::hold::scan(&dir, &project);
+        let (live, mut lost) = crate::term::hold::scan(&dir);
         for (id, spec, left) in live {
             let session = crate::term::hold::connect(&dir, &id)
                 .and_then(|socket| crate::term::pty::Session::attach(socket, self.terminal_wake()));

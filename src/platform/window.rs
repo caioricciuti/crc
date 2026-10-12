@@ -744,6 +744,11 @@ struct State {
     /// What launching found to say (terminals started again), shown when
     /// the folder has opened instead of "Folder opened".
     restore_note: Option<String>,
+    /// This process's claim on the session helpers
+    /// ([`crate::term::hold::claim`]), kept open for as long as it runs.
+    /// Without it another crc holds them: this one starts no helper and
+    /// takes none back, so its terminals end with it.
+    held_lock: Option<std::fs::File>,
     /// The last key or click. The caret is solid for a blink phase after
     /// it, so it never vanishes under your typing.
     caret_since: Instant,
@@ -8783,6 +8788,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         update_ready: None,
         replaced_said: false,
         restore_note: None,
+        held_lock: None,
         update_on_quit: false,
         reloads: Reloads {
             channel: mpsc::channel(),
