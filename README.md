@@ -141,9 +141,9 @@ the size and write it back.
   shell; type `claude` to start Claude Code. `Cmd-T` (or the tab bar's
   +) opens another terminal in the selected workspace; `Ctrl-1..9` show
   a workspace and `Cmd-Shift-U` the next session waiting on you, which
-  the Dock icon counts. The list puts what needs you first: a session
-  waiting on you, then failing checks, then a pull request ready to
-  merge; it is read again every minute.
+  the Dock icon counts. The list keeps your order (pinned, then dragged,
+  then as made); nothing a terminal does moves a row. It is read again
+  every minute.
 - **The workspace inspector** (right of the terminal in Agents mode,
   `Cmd-Option-I` to hide or show it) says where each repository of the
   selected workspace stands, one card each: commits ahead of and behind

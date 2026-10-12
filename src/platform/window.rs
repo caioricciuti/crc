@@ -2240,7 +2240,7 @@ define_class!(
                 // Your move shows now, though the pointer is still over
                 // the list (which otherwise holds the order still).
                 let state = &mut *state;
-                state.agents.arrange(&state.terminal.tabs);
+                state.agents.arrange();
                 return;
             }
             let drop = {
@@ -3849,7 +3849,7 @@ define_class!(
             {
                 state.agents.toggle_pin(&task.id());
                 let state = &mut *state;
-                state.agents.arrange(&state.terminal.tabs);
+                state.agents.arrange();
             }
             self.request_redraw();
         }
@@ -8938,6 +8938,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
     if !testing {
         app.activate();
     }
+    crate::platform::hang::watch();
     app.run();
     unreachable!("NSApplication::run does not return");
 }

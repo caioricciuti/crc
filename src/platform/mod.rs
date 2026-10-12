@@ -9,6 +9,7 @@ pub mod conflicts;
 pub mod dispatch;
 pub mod extensions;
 pub mod git_panel;
+pub mod hang;
 pub mod inspector;
 pub mod latency;
 pub mod mcp_page;

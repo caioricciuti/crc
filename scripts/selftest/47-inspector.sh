@@ -133,9 +133,9 @@ HOME="$T/home/inspector" PATH="$T/inspectbin:$PATH" CRC_TERMINAL_SHELL=/bin/sh C
 expect_prefix "$T/inspector-behind.out" inspector "branch=feat base=main ahead=3 behind=0 upstream=origin/feat push=0 pull=1"
 expect_prefix "$T/inspector-pulled.out" inspector "branch=feat base=main ahead=4 behind=0 upstream=origin/feat push=0 pull=0"
 [ -f "$F/t.txt" ] || failed "inspector: Pull did not bring t.txt"
-# Waiting on you sorts first, above the folder workspace too.
+# Waiting on you moves nothing: the list keeps your order.
 expect "$T/inspector-zz.out" agents "on tasks=inspectproj,feat,zz selected=zz sessions=inspectproj,feat,*zz claude=0 pair=- op=-"
-expect "$T/inspector-sorted.out" agents "on tasks=zz,inspectproj,feat selected=zz sessions=inspectproj,feat,*zz claude=0 pair=- op=-"
+expect "$T/inspector-sorted.out" agents "on tasks=inspectproj,feat,zz selected=zz sessions=inspectproj,feat,*zz claude=0 pair=- op=-"
 testgit "$P" worktree remove --force "$F" 2>/dev/null || true
 testgit "$P" worktree remove --force "$T/inspect-wt/zz" 2>/dev/null || true
 

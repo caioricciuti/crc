@@ -4,6 +4,12 @@ One entry per tag, written for people who use the editor.
 
 ## Unreleased
 
+- The Agents list keeps the order you give it: pinned first, then the
+  order you dragged, then the rest as they were made. A session waiting
+  on you or a pull request's checks no longer move a row.
+- When crc stops answering for more than a second and a half, it writes
+  where it was stuck to `~/Library/Logs/crc/hang-<time>.txt` (with
+  macOS's `sample`, at most once a minute), so a stall can be traced.
 - The workspace inspector scrolls, so a folder of ten repositories shows
   all of them.
 - Closing a workspace's last terminal (or typing `exit` in it) removes

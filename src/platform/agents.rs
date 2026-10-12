@@ -722,7 +722,7 @@ impl Panel {
     }
 
     /// The list from Git and the folder workspaces, in your order with the
-    /// pinned on top; what needs you moves up when it is next drawn.
+    /// pinned on top.
     fn rebuild(&mut self) {
         let mut tasks: Vec<Workspace> = self
             .folders
@@ -959,48 +959,27 @@ impl Panel {
         }
     }
 
-    /// Orders the list by what needs you, the main checkout first: a
-    /// session waiting on you, then failing checks, then a pull request
-    /// ready to merge, then the rest, each group in Git's order. Output
-    /// alone does not move a row: a prompt or an echo would make the list
-    /// jump while you type. Returns whether the order changed.
-    pub fn arrange(&mut self, tabs: &[Tab]) -> bool {
-        use crate::project::worktree::Checks;
+    /// Puts the list in your order and nothing else: the pinned first,
+    /// then the order you dragged them into, then the rest as they were
+    /// made. Nothing that happens in a terminal moves a row. Returns
+    /// whether the order changed.
+    pub fn arrange(&mut self) -> bool {
         let canon: Vec<Workspace> = self
             .folders
             .iter()
             .chain(self.worktrees.iter())
             .cloned()
             .collect();
-        let owner: Vec<Option<usize>> = tabs.iter().map(|t| task_of(&canon, t)).collect();
-        let has = |i: usize, activity: Activity| {
-            tabs.iter()
-                .zip(&owner)
-                .any(|(t, o)| *o == Some(i) && t.activity() == activity)
-        };
-        let rank = |i: usize| -> u8 {
-            let pr = self
-                .info
-                .get(&canon[i].path)
-                .and_then(|info| info.pull_request.as_ref())
-                .filter(|pr| pr.state == "OPEN");
-            if canon[i].main {
-                0
-            } else if self.arrangement.pinned.contains(&canon[i].id()) {
-                1
-            } else if has(i, Activity::Waiting) {
-                2
-            } else if pr.is_some_and(|pr| pr.checks == Checks::Failing) {
-                3
-            } else if pr.is_some_and(|pr| pr.checks == Checks::Passing && !pr.draft) {
-                4
-            } else {
-                5
-            }
-        };
         let mut order: Vec<usize> = (0..canon.len()).collect();
-        // Within a group, your order, then Git's (the sort is stable).
-        order.sort_by_key(|i| (rank(*i), self.arrangement.position(&canon[*i].id())));
+        // The sort is stable: unplaced ones keep the order they were made.
+        order.sort_by_key(|i| {
+            let id = canon[*i].id();
+            (
+                !canon[*i].main,
+                !self.arrangement.pinned.contains(&id),
+                self.arrangement.position(&id),
+            )
+        });
         let arranged: Vec<Workspace> = order.into_iter().map(|i| canon[i].clone()).collect();
         if arranged == self.tasks {
             return false;
@@ -1195,7 +1174,7 @@ impl Panel {
         // frame whatever changed in between; never under the pointer, so a
         // row does not move away from a click (cmux defers the same way).
         if !layout::hovered(column) && self.drag.is_none() {
-            self.arrange(tabs);
+            self.arrange();
         }
         layout::push_rect(
             out,
@@ -1835,19 +1814,19 @@ mod tests {
             ..Panel::default()
         };
         panel.rebuild();
-        panel.arrange(&[]);
+        panel.arrange();
         let ids = |p: &Panel| p.tasks.iter().map(Workspace::id).collect::<Vec<_>>();
         assert_eq!(ids(&panel), ["/r", "folder:notes", "/w/a", "/w/b"]);
         // Pinned goes up, under main; dragged order holds for the rest.
         panel.arrangement.pinned.insert("folder:notes".into());
         let all = ids(&panel);
         panel.arrangement.move_before("/w/b", Some("/w/a"), &all);
-        panel.arrange(&[]);
+        panel.arrange();
         assert_eq!(ids(&panel), ["/r", "folder:notes", "/w/b", "/w/a"]);
         // Main stays first even dragged last.
         let all = ids(&panel);
         panel.arrangement.move_before("/r", None, &all);
-        panel.arrange(&[]);
+        panel.arrange();
         assert_eq!(ids(&panel)[0], "/r");
     }
 
