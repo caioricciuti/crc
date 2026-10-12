@@ -6,9 +6,8 @@
 //!
 //! Run with: cargo run --offline --example atlas_dump
 
+use crc::render::bmp;
 use crc::render::font::Atlas;
-#[path = "common/bmp.rs"]
-mod bmp;
 
 fn main() -> std::io::Result<()> {
     let out = std::env::args()

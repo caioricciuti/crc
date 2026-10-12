@@ -4,6 +4,10 @@ One entry per tag, written for people who use the editor.
 
 ## Unreleased
 
+- Problems in the editor are marked with a smooth wave under the text,
+  which no longer covers underscores; it used to be a row of broken
+  dashes. Underlined and struck-through text in the terminal uses the
+  font's own underline position and a hairline stroke.
 - Agents mode keeps one list of workspaces for the whole app instead of
   following the folder open in the editor. Opening another folder in the
   editor no longer changes the list or what is selected. The workspaces

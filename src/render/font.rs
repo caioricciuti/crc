@@ -589,6 +589,10 @@ pub struct Metrics {
     pub ascent: f32,
     /// Baseline to cell bottom.
     pub descent: f32,
+    /// Baseline to the middle of the font's own underline, downwards.
+    pub underline_position: f32,
+    /// The font's own underline thickness, at least one device pixel.
+    pub underline_thickness: f32,
     /// Backing scale the atlas is rasterized at (2.0 on Retina).
     pub scale: f32,
 }
@@ -710,6 +714,12 @@ impl Atlas {
         let ascent_px = unsafe { font.ascent() } as f32;
         let descent_px = unsafe { font.descent() } as f32;
         let leading_px = unsafe { font.leading() } as f32;
+        // CoreText measures the underline up from the baseline: below it is
+        // negative.
+        let underline_px = -(unsafe { font.underline_position() } as f32);
+        let underline_thick_px = (unsafe { font.underline_thickness() } as f32)
+            .round()
+            .max(1.0);
 
         let stretch = grid_stretch(advance_px);
         let advance_px = advance_px.ceil();
@@ -734,6 +744,8 @@ impl Atlas {
                 cell_height: cell_px_h / scale,
                 ascent: ascent_px / scale,
                 descent: descent_px / scale,
+                underline_position: underline_px.clamp(1.0, descent_px.max(1.0)) / scale,
+                underline_thickness: underline_thick_px / scale,
                 scale,
             },
             stretch,

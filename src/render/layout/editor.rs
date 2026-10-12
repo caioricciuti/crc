@@ -958,11 +958,10 @@ pub fn bulb_at(buffer: &Buffer, atlas: &Atlas, x: f32, y: f32) -> bool {
         .any(|r| r.line == line && r.first && r.y <= y && y < r.y + m.line_height)
 }
 
-/// A line under `range` of `buffer`'s text, on every visible row it
-/// touches: how a diagnostic is shown.
-/// Squiggles under each of `marks`, a range and its colour: the visible
-/// rows are worked out once for all of them, and a range off screen costs
-/// two line lookups.
+/// Squiggles under each of `marks`, a range of `buffer`'s text and its
+/// colour, on every visible row the range touches: how a diagnostic is
+/// shown. The visible rows are worked out once for all of them, and a range
+/// off screen costs two line lookups.
 pub fn push_underlines(
     out: &mut Vec<GlyphInstance>,
     atlas: &Atlas,
@@ -1046,28 +1045,59 @@ pub(super) fn push_underline_on(
         if x1 <= x0 {
             continue;
         }
-        let y = row.y + m.line_height - 2.0;
-        if y < text.y || y + 1.5 > text.y + text.height {
+        // The wave runs under the glyph cell, in the row's own leading, so
+        // its crests clear an underscore (which sits lower than the font's
+        // underline); it never leaves the row.
+        let cell_bottom = row.y + m.glyph_dy(m.line_height) + m.ascent + m.descent;
+        let middle = (cell_bottom + 0.75)
+            .min(row.y + m.line_height - SQUIGGLE_AMPLITUDE - SQUIGGLE_THICKNESS * 0.5);
+        if middle - SQUIGGLE_AMPLITUDE - SQUIGGLE_THICKNESS < text.y
+            || middle + SQUIGGLE_AMPLITUDE + SQUIGGLE_THICKNESS > text.y + text.height
+        {
             continue;
         }
-        // A squiggle: short steps alternating up and down, which is what
-        // every editor draws for a problem and what a straight line (a link,
-        // a spelling underline) is not.
-        const STEP: f32 = 2.0;
-        let mut x = x0;
-        let mut up = false;
-        while x < x1 {
-            let width = STEP.min(x1 - x);
-            push_rect(
-                out,
-                atlas,
-                [x, if up { y - 1.2 } else { y }],
-                [width, 1.2],
-                color,
-            );
-            x += STEP;
-            up = !up;
-        }
+        push_squiggle(out, x0, x1, text_x - scroll_x, middle, color, m.scale);
+    }
+}
+
+/// How far a squiggle swings either side of its middle, its wavelength and
+/// its stroke, in points.
+const SQUIGGLE_AMPLITUDE: f32 = 0.85;
+const SQUIGGLE_WAVELENGTH: f32 = 4.0;
+const SQUIGGLE_THICKNESS: f32 = 1.0;
+
+/// A smooth wave from `x0` to `x1` around `middle`: what every editor draws
+/// for a problem, where a straight line is a link or an underline. Drawn
+/// as round-ended dabs a device pixel apart, which overlap into one
+/// anti-aliased stroke. Its phase counts from `origin` (the text's left
+/// edge), so the wave stays put as the line around it changes.
+pub(super) fn push_squiggle(
+    out: &mut Vec<GlyphInstance>,
+    x0: f32,
+    x1: f32,
+    origin: f32,
+    middle: f32,
+    color: [f32; 4],
+    scale: f32,
+) {
+    let step = 1.0 / scale.max(1.0);
+    let half = SQUIGGLE_THICKNESS * 0.5;
+    let mut x = x0;
+    while x < x1 {
+        let phase = (x - origin) / SQUIGGLE_WAVELENGTH * std::f32::consts::TAU;
+        let y = middle - SQUIGGLE_AMPLITUDE * phase.sin();
+        push_rounded_rect(
+            out,
+            Viewport {
+                x: x - half,
+                y: y - half,
+                width: (step + SQUIGGLE_THICKNESS).min(x1 - x + SQUIGGLE_THICKNESS),
+                height: SQUIGGLE_THICKNESS,
+            },
+            half,
+            color,
+        );
+        x += step;
     }
 }
 
@@ -2125,4 +2155,36 @@ pub fn bracket_match(buffer: &Buffer) -> Option<(usize, usize)> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_squiggle_is_one_unbroken_wave_inside_its_bounds() {
+        let mut out = Vec::new();
+        push_squiggle(&mut out, 10.0, 50.0, 10.0, 100.0, [1.0; 4], 2.0);
+        // A dab every device pixel, each overlapping the next.
+        assert_eq!(out.len(), 80);
+        for pair in out.windows(2) {
+            let (a, b) = (&pair[0], &pair[1]);
+            assert!(b.pos[0] < a.pos[0] + a.size[0], "a gap in the stroke");
+            assert!((b.pos[1] - a.pos[1]).abs() < SQUIGGLE_THICKNESS, "a step");
+        }
+        let top = out.iter().map(|g| g.pos[1]).fold(f32::MAX, f32::min);
+        let bottom = out
+            .iter()
+            .map(|g| g.pos[1] + g.size[1])
+            .fold(f32::MIN, f32::max);
+        let reach = SQUIGGLE_AMPLITUDE + SQUIGGLE_THICKNESS * 0.5;
+        assert!(top >= 100.0 - reach - 0.01 && bottom <= 100.0 + reach + 0.01);
+        // It swings: not a flat line.
+        assert!(bottom - top > SQUIGGLE_AMPLITUDE);
+        // Nothing past its end.
+        assert!(
+            out.iter()
+                .all(|g| g.pos[0] + g.size[0] <= 50.0 + SQUIGGLE_THICKNESS)
+        );
+    }
 }

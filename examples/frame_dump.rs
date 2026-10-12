@@ -11,6 +11,7 @@
 
 use crc::project::finder::Finder;
 use crc::project::tree::Tree;
+use crc::render::bmp;
 use crc::render::font::Atlas;
 use crc::render::layout::{self, Chrome, Theme, Viewport};
 use crc::render::metal::Renderer;
@@ -18,8 +19,6 @@ use crc::syntax::SyntaxStore;
 use crc::text::buffer::{Buffer, Motion};
 use crc::text::documents::Documents;
 use objc2_metal::MTLCreateSystemDefaultDevice;
-#[path = "common/bmp.rs"]
-mod bmp;
 
 const SAMPLE: &str = "\
 // Unicode check: everything below used to be silently dropped.

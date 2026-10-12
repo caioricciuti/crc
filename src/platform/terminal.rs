@@ -732,12 +732,19 @@ fn draw_screen(
                 layout::push_text(out, atlas, x, y + text_dy, &run, fg);
             }
             let width = (col - start) as f32 * advance;
-            let line = (1.0 / m.scale).max(1.0);
+            // The font's own underline, on whole device pixels, inside the
+            // row; a strike through the middle of the lower-case letters.
+            let line = m.underline_thickness;
+            let baseline = y + text_dy + m.glyph_dy(m.line_height) + m.ascent;
             if decoration & UNDERLINE != 0 {
-                layout::push_rect(out, atlas, [x, y + row_h - line * 2.0], [width, line], fg);
+                let under = m
+                    .snap(baseline + m.underline_position - line * 0.5)
+                    .min(y + row_h - line);
+                layout::push_rect(out, atlas, [x, under], [width, line], fg);
             }
             if decoration & STRIKE != 0 {
-                layout::push_rect(out, atlas, [x, y + row_h * 0.5], [width, line], fg);
+                let through = m.snap(baseline - m.ascent * 0.3 - line * 0.5);
+                layout::push_rect(out, atlas, [x, through], [width, line], fg);
             }
         }
     }

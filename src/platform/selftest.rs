@@ -108,6 +108,8 @@ pub enum Step {
         dy: f64,
     },
     Dump(String),
+    /// The window's frame, drawn again offscreen, as a BMP at this path.
+    Frame(String),
     /// A real panic, so the crash hook and recovery run end to end.
     Panic,
     Wait(u64),
@@ -320,6 +322,7 @@ pub fn parse(script: &str) -> Result<Vec<Step>, String> {
                 steps.push(Step::Write(file.to_string(), text.to_string()));
             }
             "dump" if !rest.is_empty() => steps.push(Step::Dump(rest.to_string())),
+            "frame" if !rest.is_empty() => steps.push(Step::Frame(rest.to_string())),
             "wait" => steps.push(Step::Wait(rest.parse().map_err(|_| bad())?)),
             "idle" => steps.push(Step::Idle(rest.parse().map_err(|_| bad())?)),
             "webjs" if !rest.is_empty() => steps.push(Step::WebJs(rest.to_string())),

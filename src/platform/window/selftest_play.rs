@@ -300,6 +300,33 @@ impl EditorView {
                     state.git.poll();
                 }
             }
+            Step::Frame(path) => {
+                // What is on screen, drawn again through the same renderer
+                // into a texture: no screen capture, which a test instance
+                // (and a shell without the permission) cannot rely on.
+                self.render();
+                let Some(mut state) = self.state_mut() else {
+                    return;
+                };
+                let state = &mut *state;
+                let scale = state.renderer.atlas.metrics.scale;
+                let (w, h) = (state.viewport.width, state.viewport.height);
+                let (pw, ph) = ((w * scale) as usize, (h * scale) as usize);
+                let bgra = state.renderer.render_offscreen(
+                    pw,
+                    ph,
+                    &state.glyphs,
+                    (w, h),
+                    state.theme.background,
+                );
+                let written = crate::render::bmp::write_bmp(path, pw, ph, |x, y| {
+                    let at = (y * pw + x) * 4;
+                    [bgra[at], bgra[at + 1], bgra[at + 2]]
+                });
+                if let Err(e) = written {
+                    eprintln!("selftest: frame {path}: {e}");
+                }
+            }
             Step::Dump(path) => {
                 if let Some(mut state) = self.state_mut() {
                     sync_conflicts(&mut state);

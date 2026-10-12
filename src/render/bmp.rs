@@ -1,5 +1,5 @@
-//! A 24-bit uncompressed BMP writer for the dump examples: no image crate,
-//! and any viewer opens it.
+//! A 24-bit uncompressed BMP writer for the frame dumps (the examples and
+//! the self-test's `frame` step): no image crate, and any viewer opens it.
 
 use std::io::Write;
 

@@ -1794,7 +1794,7 @@ mod tests {
         panel.rebuild();
         panel.arrange(&[]);
         let ids = |p: &Panel| p.tasks.iter().map(Workspace::id).collect::<Vec<_>>();
-        assert_eq!(ids(&panel), ["/r", "/w/a", "/w/b", "folder:notes"]);
+        assert_eq!(ids(&panel), ["/r", "folder:notes", "/w/a", "/w/b"]);
         // Pinned goes up, under main; dragged order holds for the rest.
         panel.arrangement.pinned.insert("folder:notes".into());
         let all = ids(&panel);
