@@ -7239,14 +7239,69 @@ fn task_rows(
     rows
 }
 
-/// A folder as the palette shows it: under the home folder as `~/...`.
-fn shown_path(path: &Path) -> String {
-    match std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .and_then(|home| path.strip_prefix(home).ok().map(Path::to_path_buf))
-    {
-        Some(rest) => format!("~/{}", rest.display()),
-        None => path.display().to_string(),
+/// A folder as the palette shows it: the home folder as `~`, under it as
+/// `~/...`, and `/tmp` and the like without the `/private` they resolve to.
+pub(crate) fn shown_path(path: &Path) -> String {
+    shown_in(path, &homes())
+}
+
+/// A folder as the Agents status line shows it: as [`shown_path`], and
+/// outside home cut to its last two folders when it is deeper than three.
+pub(super) fn short_path(path: &Path) -> String {
+    short_in(path, &homes())
+}
+
+/// The home folder as `HOME` names it and as it resolves, which differ
+/// when it is a symlink.
+fn homes() -> Vec<std::path::PathBuf> {
+    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+        return Vec::new();
+    };
+    let real = crate::platform::canonical(&home);
+    if real == home {
+        vec![home]
+    } else {
+        vec![home, real]
+    }
+}
+
+fn shown_in(path: &Path, homes: &[std::path::PathBuf]) -> String {
+    match outside_home(path, homes) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".into(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(path) => path.display().to_string(),
+    }
+}
+
+fn short_in(path: &Path, homes: &[std::path::PathBuf]) -> String {
+    let Err(path) = outside_home(path, homes) else {
+        return shown_in(path, homes);
+    };
+    let names: Vec<_> = path
+        .components()
+        .filter(|c| matches!(c, std::path::Component::Normal(_)))
+        .collect();
+    if names.len() <= 3 {
+        return path.display().to_string();
+    }
+    let last: std::path::PathBuf = names[names.len() - 2..].iter().collect();
+    format!("\u{2026}/{}", last.display())
+}
+
+/// `Ok` with the part under home, else `Err` with the path, `/private`
+/// taken off the folders macOS links there.
+fn outside_home(
+    path: &Path,
+    homes: &[std::path::PathBuf],
+) -> Result<std::path::PathBuf, std::path::PathBuf> {
+    if let Some(rest) = homes.iter().find_map(|h| path.strip_prefix(h).ok()) {
+        return Ok(rest.to_path_buf());
+    }
+    match path.strip_prefix("/private") {
+        Ok(rest) if ["tmp", "var", "etc"].iter().any(|d| rest.starts_with(d)) => {
+            Err(Path::new("/").join(rest))
+        }
+        _ => Err(path.to_path_buf()),
     }
 }
 
@@ -9064,6 +9119,32 @@ mod tests {
             "a\u{e9}\u{65e5}\u{1f600}"
         );
         assert_eq!(typed_text("\u{f6ff}\u{f900}"), "\u{f6ff}\u{f900}");
+    }
+
+    #[test]
+    fn the_status_line_path_is_short() {
+        use std::path::{Path, PathBuf};
+        // HOME a symlink: both what it names and where it resolves count.
+        let homes = [
+            PathBuf::from("/Users/me"),
+            PathBuf::from("/Volumes/Home/me"),
+        ];
+        let short = |p: &str| super::short_in(Path::new(p), &homes);
+        assert_eq!(short("/Users/me"), "~");
+        assert_eq!(short("/Volumes/Home/me"), "~");
+        assert_eq!(short("/Users/me/a"), "~/a");
+        assert_eq!(short("/Volumes/Home/me/a/b/c/d"), "~/a/b/c/d");
+        assert_eq!(short("/private/tmp/x"), "/tmp/x");
+        assert_eq!(short("/private/other/x"), "/private/other/x");
+        assert_eq!(short("/opt/homebrew/bin"), "/opt/homebrew/bin");
+        assert_eq!(short("/Volumes/Work/clients/acme/api"), "\u{2026}/acme/api");
+        assert_eq!(short("/"), "/");
+        // The palette keeps a long path whole.
+        assert_eq!(
+            super::shown_in(Path::new("/Volumes/Work/clients/acme/api"), &homes),
+            "/Volumes/Work/clients/acme/api"
+        );
+        assert_eq!(super::shown_in(Path::new("/Users/me"), &homes), "~");
     }
 
     #[test]

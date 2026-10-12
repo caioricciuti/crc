@@ -887,7 +887,7 @@ impl EditorView {
             let remote = terminal_panel.active_tab().and_then(|t| t.remote.clone());
             let left = agents_note.unwrap_or_else(|| match &remote {
                 Some(r) => format!("ssh {}   {}", r.login(), r.connected_for()),
-                None => cwd.as_deref().map(shown_path).unwrap_or_default(),
+                None => cwd.as_deref().map(short_path).unwrap_or_default(),
             });
             let branch = cwd.as_deref().and_then(|cwd| {
                 agents

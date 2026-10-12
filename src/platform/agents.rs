@@ -614,6 +614,38 @@ pub fn folder_task(tasks: &[Workspace], folder: &Path) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
+/// What a terminal's workspace does when its shell is now in `cwd`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Follow {
+    /// It is still where the workspace is.
+    Stay,
+    /// The folder workspace moves there with it.
+    Move,
+    /// The terminal goes to the workspace at this index, which holds `cwd`.
+    Join(usize),
+    /// Nothing holds `cwd`: a new folder workspace is made on it.
+    Make,
+}
+
+/// Where a terminal goes when it `cd`s, from the workspace `owner` that
+/// has it. Into another worktree (one inside the main checkout too), the
+/// terminal joins it; a worktree keeps the rest of its own folders; a
+/// folder workspace moves with it; else it joins whatever holds the folder,
+/// else a new one is made there.
+pub fn follow(tasks: &[Workspace], owner: usize, cwd: &Path) -> Follow {
+    let task = &tasks[owner];
+    if task.path == cwd {
+        return Follow::Stay;
+    }
+    match folder_task(tasks, cwd) {
+        Some(h) if h != owner && !tasks[h].folder => Follow::Join(h),
+        _ if !task.folder && cwd.starts_with(&task.path) => Follow::Stay,
+        _ if task.folder => Follow::Move,
+        Some(h) if h != owner => Follow::Join(h),
+        _ => Follow::Make,
+    }
+}
+
 impl Panel {
     /// Reads the kept workspaces once, then on a worker the repositories
     /// in each folder workspace and their worktrees.
@@ -1864,6 +1896,32 @@ mod tests {
         assert_eq!(folder_task(&tasks, Path::new("/r/src")), Some(1));
         let tasks = vec![folder("notes", "/r/docs"), tree("/r", true)];
         assert_eq!(folder_task(&tasks, Path::new("/r/docs/a")), Some(0));
+    }
+
+    #[test]
+    fn a_terminal_leaving_its_worktree_joins_where_it_went() {
+        let tasks = vec![
+            tree("/r", true),
+            tree("/r/.claude/worktrees/x", false),
+            folder("notes", "/n"),
+        ];
+        let at = |owner, cwd: &str| follow(&tasks, owner, Path::new(cwd));
+        // Inside its own worktree, a subfolder or a folder workspace under
+        // it: it stays.
+        assert_eq!(at(1, "/r/.claude/worktrees/x"), Follow::Stay);
+        assert_eq!(at(1, "/r/.claude/worktrees/x/src"), Follow::Stay);
+        // Out to the repository's checkout: it joins that.
+        assert_eq!(at(1, "/r/src"), Follow::Join(0));
+        // The main checkout into the worktree inside it.
+        assert_eq!(at(0, "/r/.claude/worktrees/x/src"), Follow::Join(1));
+        // Out to a folder workspace's folder, or somewhere nothing holds.
+        assert_eq!(at(1, "/n/a"), Follow::Join(2));
+        assert_eq!(at(1, "/elsewhere"), Follow::Make);
+        // A folder workspace moves with it, until it reaches a worktree.
+        assert_eq!(at(2, "/n"), Follow::Stay);
+        assert_eq!(at(2, "/elsewhere"), Follow::Move);
+        assert_eq!(at(2, "/n/a"), Follow::Move);
+        assert_eq!(at(2, "/r/.claude/worktrees/x"), Follow::Join(1));
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! workers.
 
 use super::*;
-use crate::platform::agents::{Action, Done, task_of};
+use crate::platform::agents::{Action, Done, Follow, follow, task_of};
 use crate::platform::terminal::Activity;
 
 impl EditorView {
@@ -132,8 +132,11 @@ impl EditorView {
     }
 
     /// The selected workspace follows the directory of the terminal
-    /// showing: a folder workspace moves there, and the inspector reads the
-    /// repositories it is in and under. A worktree stays where Git has it.
+    /// showing (see [`follow`]): a folder workspace moves there; out of a
+    /// worktree the terminal joins the workspace holding where it went, or
+    /// a new one made on that folder, and a folder workspace it leaves
+    /// empty goes. The inspector reads the repositories it is in and under.
+    /// A terminal running ssh stays where it is.
     pub(super) fn follow_cwd(&self) {
         {
             let Some(mut state) = self.state_mut() else {
@@ -142,20 +145,47 @@ impl EditorView {
             if !state.agents.on {
                 return;
             }
-            let Some(tab) = state.terminal.active_tab() else {
+            let active = state.terminal.active;
+            let Some(tab) = state.terminal.tabs.get(active) else {
                 return;
             };
+            if tab.remote.is_some() {
+                return;
+            }
             let cwd = tab.cwd.clone();
             let tasks = state.agents.tasks.clone();
             let Some(index) = task_of(&tasks, tab) else {
                 return;
             };
             let task = &tasks[index];
-            if !task.folder || task.path == cwd {
-                return;
+            let id = match follow(&tasks, index, &cwd) {
+                Follow::Stay => return,
+                Follow::Move => {
+                    state.agents.move_folder(&task.id(), &cwd);
+                    state.agents.refresh();
+                    None
+                }
+                Follow::Join(h) => Some(tasks[h].id()),
+                Follow::Make => {
+                    if too_broad_to_adopt(&cwd) {
+                        return;
+                    }
+                    let name = cwd
+                        .file_name()
+                        .map_or_else(|| "workspace".into(), |n| n.to_string_lossy().into_owned());
+                    let id = state.agents.add_folder(&name, cwd.clone());
+                    state.agents.refresh();
+                    Some(id)
+                }
+            };
+            if let Some(id) = id {
+                adopt(&mut state.terminal.tabs[active], &id);
+                state.agents.selected = Some(id);
+                if task.folder {
+                    state.terminal.closed_in.push(task.id());
+                    forget_emptied(&mut state);
+                }
             }
-            state.agents.move_folder(&task.id(), &cwd);
-            state.agents.refresh();
         }
         self.want_inspector();
         self.resume_display_link();
@@ -214,10 +244,7 @@ impl EditorView {
                     if task_of(&tasks, tab).is_none()
                         && crate::platform::canonical(&tab.folder).starts_with(&folder)
                     {
-                        tab.workspace = Some(id.clone());
-                        if let (Some(dir), Some(held)) = (crate::term::hold::dir(), &tab.held) {
-                            crate::term::hold::set_workspace(&dir, held, &id);
-                        }
+                        adopt(tab, &id);
                     }
                 }
                 id
@@ -491,10 +518,7 @@ impl EditorView {
                 Some(new_id) => {
                     for tab in &mut state.terminal.tabs {
                         if tab.workspace.as_deref() == Some(id.as_str()) {
-                            tab.workspace = Some(new_id.clone());
-                            if let (Some(dir), Some(held)) = (crate::term::hold::dir(), &tab.held) {
-                                crate::term::hold::set_workspace(&dir, held, &new_id);
-                            }
+                            adopt(tab, &new_id);
                         }
                     }
                     if state.agents.selected.as_deref() == Some(id.as_str()) {
@@ -1038,6 +1062,15 @@ impl EditorView {
         drop(state);
         self.after_terminal_layout();
         self.resume_display_link();
+    }
+}
+
+/// A terminal into the workspace `id`, its holder told too so a relaunch
+/// finds it there.
+fn adopt(tab: &mut crate::platform::terminal::Tab, id: &str) {
+    tab.workspace = Some(id.to_owned());
+    if let (Some(dir), Some(held)) = (crate::term::hold::dir(), &tab.held) {
+        crate::term::hold::set_workspace(&dir, held, id);
     }
 }
 

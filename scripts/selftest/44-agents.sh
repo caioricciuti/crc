@@ -74,6 +74,20 @@ dump $T/agents-other.out
 key 13 cmd,opt w
 wait 200
 dump $T/agents-unsplit.out
+key 19 cmd
+wait 300
+text cd $T/elsewhere
+key 36
+wait 700
+wait 700
+wait 500
+dump $T/agents-left.out
+text cd -
+key 36
+wait 700
+wait 700
+wait 500
+dump $T/agents-back.out
 key 45 cmd,shift N
 wait 200
 text notes
@@ -97,7 +111,7 @@ wait 400
 dump $T/agents-off.out
 quit
 SCRIPT
-mkdir -p "$T/home/agents" "$T/home/agents-plain"
+mkdir -p "$T/home/agents" "$T/home/agents-plain" "$T/elsewhere"
 HOME="$T/home/agents" PATH="$T/agentsbin:$PATH" CRC_TERMINAL_SHELL=/bin/sh \
     CRC_CLAUDE_COMMAND="$T/agents-agent.sh" CRC_WORKTREES="$T/worktrees" \
     CRC_SELFTEST="$T/agents.script" "$BIN" "$T/agentsproj" 2> "$T/agents.err"
@@ -119,6 +133,13 @@ expect "$T/agents-jump.out" agents "on tasks=agentsproj,try-it selected=try-it s
 expect "$T/agents-split.out" agents "on tasks=agentsproj,try-it selected=try-it sessions=agentsproj,try-it,*try-it claude=0 pair=1+2 op=-"
 expect "$T/agents-other.out" agents "on tasks=agentsproj,try-it selected=try-it sessions=agentsproj,*try-it,try-it claude=0 pair=1+2 op=-"
 expect "$T/agents-unsplit.out" agents "on tasks=agentsproj,try-it selected=try-it sessions=agentsproj,*try-it,try-it claude=0 pair=- op=-"
+# The shell beside the agent cds out of the worktree to a folder nothing
+# holds: a workspace is made there and has it. Back in the worktree, it is
+# try-it's again, and the workspace it left empty goes.
+expect "$T/agents-left.out" agents "on tasks=agentsproj,elsewhere,try-it selected=elsewhere sessions=agentsproj,try-it,*elsewhere claude=0 pair=- op=-"
+expect "$T/agents-back.out" agents "on tasks=agentsproj,try-it selected=try-it sessions=agentsproj,try-it,*try-it claude=0 pair=- op=-"
+grep -q '^inspector: branch=try-it ' "$T/agents-back.out" \
+    || failed "agents-back.out: $(grep '^inspector:' "$T/agents-back.out")"
 # A folder workspace on the selected one's folder (try-it's repository),
 # with a shell in it; Cmd-T adds a shell to it. It is kept.
 expect "$T/agents-folder.out" agents "on tasks=agentsproj,notes,try-it selected=notes sessions=agentsproj,try-it,try-it,*notes claude=0 pair=- op=-"

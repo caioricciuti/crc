@@ -364,14 +364,7 @@ impl Inspector {
         let name = fit(atlas, &name, width);
         layout::push_title(out, atlas, x, y, 15.0, &name, theme.text, width);
         y += 24.0;
-        let home = std::env::var_os("HOME").map(PathBuf::from);
-        let shown = match home
-            .as_deref()
-            .and_then(|h| workspace.path.strip_prefix(h).ok())
-        {
-            Some(rest) => format!("~/{}", rest.display()),
-            None => workspace.path.display().to_string(),
-        };
+        let shown = crate::platform::window::shown_path(&workspace.path);
         let shown = fit(atlas, &shown, width);
         text(out, atlas, x, y, width, &shown, theme.gutter_text);
         y += ROW;
