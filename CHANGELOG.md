@@ -2,6 +2,15 @@
 
 One entry per tag, written for people who use the editor.
 
+## Unreleased
+
+- Edit > Copy as One Line (`Cmd-Option-C`, also in the terminal's
+  right-click menu) copies a terminal selection as a single line: the
+  line breaks and indentation a program such as Claude Code puts in to
+  fit a long command to the width go, so the command pastes and runs
+  whole. A word split at the edge is joined back without a space.
+  Plain `Cmd-C` is unchanged.
+
 ## v0.2.0-alpha.22, 2026-10-12
 
 - A terminal inside `ssh` says so: its tab is titled `ssh <host>`, its

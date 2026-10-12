@@ -366,6 +366,7 @@ the size and write it back.
 | `Cmd-,` | Settings page |
 | `Cmd-=` / `Cmd--` / `Cmd-0` | zoom the code font in, out, back to 13 |
 | `Cmd-Shift-C` | Claude Code tab |
+| `Cmd-Option-C` in a terminal | copy the selection as one line, joining the rows a program broke a long command over |
 | `Cmd-Shift-A` | Editor / Agents |
 | `Cmd-Shift-N` | new workspace: a folder, or a branch in its own worktree, with a terminal |
 | `Cmd-T` (Agents mode) | another terminal in the selected workspace |

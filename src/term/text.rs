@@ -21,32 +21,63 @@ impl Term {
     /// boundary, in either order. Lines the terminal wrapped are joined;
     /// others end in a newline, without their trailing blanks.
     pub fn text_between(&self, start: (u64, usize), end: (u64, usize)) -> String {
+        let mut out = String::new();
+        for piece in self.pieces_between(start, end) {
+            if piece.last {
+                out.push_str(piece.text.trim_end());
+            } else if piece.wrapped {
+                out.push_str(&piece.text);
+            } else {
+                out.push_str(piece.text.trim_end());
+                out.push('\n');
+            }
+        }
+        out
+    }
+    /// The text from `start` to `end` as one line, for pasting a command a
+    /// program broke over several rows itself (Claude Code does, with hard
+    /// newlines and indentation): lines the terminal wrapped are joined
+    /// first, then [`join_rows`] joins the rest.
+    pub fn one_line_between(&self, start: (u64, usize), end: (u64, usize)) -> String {
+        let mut rows: Vec<(String, bool)> = Vec::new();
+        let mut open = false;
+        for piece in self.pieces_between(start, end) {
+            if !open {
+                rows.push((String::new(), false));
+            }
+            let row = rows.last_mut().expect("pushed above");
+            row.0.push_str(&piece.text);
+            row.1 = piece.full;
+            open = piece.wrapped && !piece.last;
+        }
+        join_rows(&rows, self.cols())
+    }
+    /// The selected part of each line from `start` to `end`, in order.
+    fn pieces_between(&self, start: (u64, usize), end: (u64, usize)) -> Vec<Piece> {
         let (start, end) = if start <= end {
             (start, end)
         } else {
             (end, start)
         };
-        let mut out = String::new();
+        let mut pieces = Vec::new();
         for number in start.0..=end.0 {
             let Some(cells) = self.line(number) else {
                 continue;
             };
             let from = if number == start.0 { start.1 } else { 0 };
             let to = if number == end.0 { end.1 } else { cells.len() };
-            let piece = cells_text(&cells[from.min(cells.len())..to.min(cells.len())]);
-            let wrapped = to >= cells.len() && cells.last().is_some_and(|c| c.flags & WRAPPED != 0);
-            if number == end.0 || wrapped {
-                out.push_str(if number == end.0 {
-                    piece.trim_end()
-                } else {
-                    &piece
-                });
-            } else {
-                out.push_str(piece.trim_end());
-                out.push('\n');
-            }
+            let to_end = to >= cells.len();
+            pieces.push(Piece {
+                text: cells_text(&cells[from.min(cells.len())..to.min(cells.len())]),
+                wrapped: to_end && cells.last().is_some_and(|c| c.flags & WRAPPED != 0),
+                full: to_end
+                    && cells
+                        .last()
+                        .is_some_and(|c| c.ch != ' ' || c.flags & WIDE_TAIL != 0),
+                last: number == end.0,
+            });
         }
-        out
+        pieces
     }
     /// The columns `[from, to)` of the word or path under column `col`, for
     /// a double click: letters, digits and the characters paths and
@@ -78,6 +109,48 @@ impl Term {
             })
             .unwrap_or_default()
     }
+}
+
+/// One line's part of a selection.
+struct Piece {
+    text: String,
+    /// The terminal wrapped it onto the next line.
+    wrapped: bool,
+    /// Its last column holds a character.
+    full: bool,
+    /// The selection's last line.
+    last: bool,
+}
+
+/// Rows of text as one line: each `(text, full)`, where `full` says the
+/// row's last column holds a character. Rows lose their indentation and
+/// trailing blanks, empty ones go, and the rest are joined with a space,
+/// except after a full row whose last word and the next row's first word
+/// would not have fitted on one line together: a word too long for a line,
+/// split at the edge, is glued back.
+pub fn join_rows(rows: &[(String, bool)], cols: usize) -> String {
+    let width = |s: &str| s.chars().map(display_width).sum::<usize>();
+    let mut out = String::new();
+    let mut last_full = false;
+    for (text, full) in rows {
+        let text = text.trim_end();
+        let trimmed = text.trim_start();
+        if trimmed.is_empty() {
+            last_full = false;
+            continue;
+        }
+        if !out.is_empty() {
+            let indent = width(&text[..text.len() - trimmed.len()]);
+            let before = out.rsplit(' ').next().map_or(0, width);
+            let after = trimmed.split(' ').next().map_or(0, width);
+            if !(last_full && before + after > cols.saturating_sub(indent)) {
+                out.push(' ');
+            }
+        }
+        out.push_str(trimmed);
+        last_full = *full;
+    }
+    out
 }
 
 /// The characters of `cells`, a wide character once.

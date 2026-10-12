@@ -992,16 +992,18 @@ impl EditorView {
         self.pump();
     }
 
-    pub(super) fn terminal_selected_text(&self) -> Option<String> {
+    /// The terminal's selection as text; with `one_line`, as one line
+    /// for Copy as One Line.
+    pub(super) fn terminal_selected_text(&self, one_line: bool) -> Option<String> {
         let state = self.state()?;
         let (a, b) = state.terminal.selection?;
         let tab = state.terminal.active_tab()?;
-        let text = tab
-            .session
-            .term
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .text_between(a, b);
+        let term = tab.session.term.lock().unwrap_or_else(|e| e.into_inner());
+        let text = if one_line {
+            term.one_line_between(a, b)
+        } else {
+            term.text_between(a, b)
+        };
         (!text.is_empty()).then_some(text)
     }
 

@@ -4082,13 +4082,25 @@ define_class!(
         fn action_copy(&self, _sender: Option<&AnyObject>) {
             // In the terminal, its own selection; never the document's.
             if self.terminal_has_keys() {
-                if let Some(text) = self.terminal_selected_text() {
+                if let Some(text) = self.terminal_selected_text(false) {
                     clipboard::write_text(&text);
                 }
                 return;
             }
             let (text, _) = self.edit_focused(|b, _| b.selected_text());
             if let Some(text) = text {
+                clipboard::write_text(&text);
+            }
+        }
+
+        /// The terminal's selection with the line breaks a program put in
+        /// to fit its output to the width taken out, so a command it
+        /// printed pastes as one.
+        #[unsafe(method(copyAsOneLine:))]
+        fn action_copy_as_one_line(&self, _sender: Option<&AnyObject>) {
+            if self.terminal_has_keys()
+                && let Some(text) = self.terminal_selected_text(true)
+            {
                 clipboard::write_text(&text);
             }
         }
@@ -4158,7 +4170,9 @@ define_class!(
                 return Bool::NO;
             };
             let terminal = state.terminal.has_keys() && !field_has_keys(&state);
-            let enabled = if terminal && action == sel!(copy:) {
+            let enabled = if action == sel!(copyAsOneLine:) {
+                terminal && state.terminal.selection.is_some()
+            } else if terminal && action == sel!(copy:) {
                 state.terminal.selection.is_some()
             } else if terminal && (action == sel!(cut:) || action == sel!(undo:) || action == sel!(redo:)) {
                 false
@@ -7870,6 +7884,13 @@ fn terminal_context_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
     let menu = context_menu_new(mtm);
     let cmd = NSEventModifierFlags::Command;
     menu.addItem(&hinted_menu_item(mtm, "Copy", sel!(copy:), "c", cmd));
+    menu.addItem(&hinted_menu_item(
+        mtm,
+        "Copy as One Line",
+        sel!(copyAsOneLine:),
+        "c",
+        cmd | NSEventModifierFlags::Option,
+    ));
     menu.addItem(&hinted_menu_item(mtm, "Paste", sel!(paste:), "v", cmd));
     menu.addItem(&hinted_menu_item(
         mtm,
@@ -8264,6 +8285,10 @@ fn install_menu(mtm: MainThreadMarker, app: &NSApplication) {
     edit_menu.addItem(&NSMenuItem::separatorItem(mtm));
     edit_menu.addItem(&item("Cut", sel!(cut:), "x", false));
     edit_menu.addItem(&item("Copy", sel!(copy:), "c", false));
+    let one_line = item("Copy as One Line", sel!(copyAsOneLine:), "c", false);
+    one_line
+        .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
+    edit_menu.addItem(&one_line);
     edit_menu.addItem(&item("Paste", sel!(paste:), "v", false));
     edit_menu.addItem(&NSMenuItem::separatorItem(mtm));
     edit_menu.addItem(&item("Select All", sel!(selectAll:), "a", false));

@@ -1224,6 +1224,73 @@ mod tests {
     }
 
     #[test]
+    fn rows_join_into_one_line() {
+        let rows = |r: &[(&str, bool)]| {
+            r.iter()
+                .map(|(s, full)| (s.to_string(), *full))
+                .collect::<Vec<_>>()
+        };
+        // A program broke the line between words: a space goes back.
+        assert_eq!(
+            join_rows(
+                &rows(&[("  run git commit", true), ("  -F /tmp/msg.txt", false)]),
+                16
+            ),
+            "run git commit -F /tmp/msg.txt"
+        );
+        // A word too long for a line was split at the edge: glued back.
+        assert_eq!(
+            join_rows(
+                &rows(&[("  -F /very/long/", true), ("  path/to/msg.txt", false)]),
+                16
+            ),
+            "-F /very/long/path/to/msg.txt"
+        );
+        // Only after a full row.
+        assert_eq!(
+            join_rows(
+                &rows(&[("  -F /very/", false), ("  path/to/msg.txt", false)]),
+                16
+            ),
+            "-F /very/ path/to/msg.txt"
+        );
+        // Blanks around rows go, and so do empty rows.
+        assert_eq!(
+            join_rows(
+                &rows(&[("   echo   ", false), ("    ", false), ("\thi  ", false)]),
+                16
+            ),
+            "echo hi"
+        );
+        assert_eq!(join_rows(&rows(&[("", false), ("  ", false)]), 16), "");
+    }
+
+    #[test]
+    fn one_line_copy_joins_rows_a_program_broke() {
+        let mut t = Term::new(16, 4);
+        t.advance(b"  run git commit\r\n  -F /tmp/msg.txt");
+        let first = t.view_line(0, 0);
+        // The second row is one column too long, so the terminal wraps it.
+        let end = (first + 2, 16);
+        assert_eq!(
+            t.text_between((first, 0), end),
+            "  run git commit\n  -F /tmp/msg.txt"
+        );
+        assert_eq!(
+            t.one_line_between((first, 0), end),
+            "run git commit -F /tmp/msg.txt"
+        );
+        // Lines the terminal wrapped join with nothing, as Copy does.
+        let mut t = Term::new(10, 2);
+        t.advance(b"abcdefghijklm");
+        let first = t.view_line(0, 0);
+        assert_eq!(
+            t.one_line_between((first, 0), (first + 1, 10)),
+            "abcdefghijklm"
+        );
+    }
+
+    #[test]
     fn line_numbers_survive_history_dropping_off() {
         let mut t = Term::new(4, 1);
         for n in 0..SCROLLBACK + 5 {
