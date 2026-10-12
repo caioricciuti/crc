@@ -193,6 +193,8 @@ impl EditorView {
         };
         if on {
             self.arm_agents_tick();
+            // The rows' relative times ("quiet · 5 min") move on.
+            self.request_redraw();
             self.resume_display_link();
         }
     }

@@ -75,8 +75,12 @@ pub struct Workspace {
     /// A worktree's repository: its main checkout, where branches are made,
     /// merged and removed.
     pub repo: Option<PathBuf>,
-    /// The main checkout's branch, which a worktree's is compared with.
+    /// The repository's default branch, which a worktree's is compared
+    /// with (see [`crate::project::worktree::default_branch`]).
     pub base: Option<String>,
+    /// A worktree branch's last commit: when, in Unix seconds, and its
+    /// subject.
+    pub commit: Option<(u64, String)>,
 }
 
 impl Workspace {
@@ -90,6 +94,7 @@ impl Workspace {
             key: String::new(),
             repo,
             base,
+            commit: None,
         }
     }
 
@@ -237,13 +242,21 @@ fn scan(folders: &[(String, PathBuf)]) -> Listing {
                 continue;
             }
             mains.push(main.path.clone());
+            // Once per repository: every branch's last commit, and the
+            // default branch the worktrees are compared with.
+            let tips = crate::project::worktree::tips(&main.path).unwrap_or_default();
+            let base =
+                crate::project::worktree::default_branch(&main.path, &tips, main.branch.as_deref());
             for w in list.into_iter().filter(|w| !w.main) {
                 if !worktrees.iter().any(|t| t.path == w.path) {
-                    worktrees.push(Workspace::of(
-                        w,
-                        Some(main.path.clone()),
-                        main.branch.clone(),
-                    ));
+                    let commit = w.branch.as_ref().and_then(|b| {
+                        tips.iter()
+                            .find(|t| t.branch == *b)
+                            .map(|t| (t.time, t.subject.clone()))
+                    });
+                    let mut workspace = Workspace::of(w, Some(main.path.clone()), base.clone());
+                    workspace.commit = commit;
+                    worktrees.push(workspace);
                 }
             }
         }
@@ -392,6 +405,7 @@ fn parse_folders(text: &str) -> Vec<Workspace> {
             key,
             repo: None,
             base: None,
+            commit: None,
         })
         .collect()
 }
@@ -438,11 +452,92 @@ fn new_key(taken: &[Workspace]) -> String {
 }
 
 /// What a task's row says besides its name, read after the list: commits
-/// ahead of the main checkout, and its pull request.
+/// ahead of the default branch, and its pull request.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Info {
     pub ahead: usize,
     pub pull_request: Option<crate::project::worktree::PullRequest>,
+}
+
+/// A write this recent counts as writing now.
+pub const WRITING: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// What a worktree has been doing, for its row: agents running from
+/// another session (a background agent) leave no terminal here, only
+/// their writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pace {
+    /// Something wrote in it within [`WRITING`].
+    Writing,
+    /// The last write seen this run, this long ago.
+    Quiet(std::time::Duration),
+    /// No write seen this run: its branch's last commit, this long ago.
+    Committed(std::time::Duration),
+    Unknown,
+}
+
+impl Pace {
+    /// From the time since the last write seen and since the branch's last
+    /// commit.
+    pub fn of(
+        since_write: Option<std::time::Duration>,
+        since_commit: Option<std::time::Duration>,
+    ) -> Pace {
+        match (since_write, since_commit) {
+            (Some(w), _) if w < WRITING => Pace::Writing,
+            (Some(w), _) => Pace::Quiet(w),
+            (None, Some(c)) => Pace::Committed(c),
+            (None, None) => Pace::Unknown,
+        }
+    }
+
+    /// What the row says: `writing`, `quiet · 5 min`, `commit 2 h ago`.
+    pub fn label(self) -> Option<String> {
+        match self {
+            Pace::Writing => Some("writing".into()),
+            Pace::Quiet(d) => Some(format!("quiet \u{b7} {}", span(d))),
+            Pace::Committed(d) => Some(format!("commit {} ago", span(d))),
+            Pace::Unknown => None,
+        }
+    }
+
+    /// For the self-test: `writing`, `quiet`, `commit` or `-`.
+    pub fn word(self) -> &'static str {
+        match self {
+            Pace::Writing => "writing",
+            Pace::Quiet(_) => "quiet",
+            Pace::Committed(_) => "commit",
+            Pace::Unknown => "-",
+        }
+    }
+}
+
+/// A time span the way a row says it: `<1 min`, `5 min`, `2 h`, `3 d`.
+pub fn span(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    match s {
+        0..60 => "<1 min".into(),
+        60..3600 => format!("{} min", s / 60),
+        3600..86400 => format!("{} h", s / 3600),
+        _ => format!("{} d", s / 86400),
+    }
+}
+
+/// The line under a worktree's name when no session in it is waiting,
+/// working or in ssh: what it has been doing, its terminals (none is not
+/// said: a background agent may be writing in it), and how far ahead of
+/// the default branch it is.
+pub fn worktree_line(pace: Pace, terminals: usize, ahead: usize) -> Vec<String> {
+    let mut parts: Vec<String> = pace.label().into_iter().collect();
+    match terminals {
+        0 => {}
+        1 => parts.push("1 terminal".into()),
+        n => parts.push(format!("{n} terminals")),
+    }
+    if ahead > 0 {
+        parts.push(format!("{ahead} ahead"));
+    }
+    parts
 }
 
 /// A task on a session's shared list, as Claude Code's agent teams keep
@@ -544,6 +639,12 @@ pub struct Panel {
     info_rx: Option<mpsc::Receiver<(PathBuf, Info)>>,
     /// Per session (by its review folder), what its team hooks said.
     pub teams: std::collections::HashMap<PathBuf, Team>,
+    /// Per worktree path, when a file in it was last written this run: by
+    /// a crc-launched agent's hook, or seen by the worktree's watcher.
+    pub wrote: std::collections::HashMap<PathBuf, std::time::Instant>,
+    /// A watcher per worktree in the list, and the paths they watch.
+    pub watchers: Vec<crate::project::watch::Watcher>,
+    pub watched: Vec<PathBuf>,
     /// An operation on a task running on a worker, and what it says.
     pub op: Option<(String, mpsc::Receiver<Result<Done, String>>)>,
     /// The workspace a menu was opened on, by [`Workspace::id`]: the list
@@ -714,7 +815,8 @@ impl Panel {
                     continue;
                 };
                 let info = Info {
-                    ahead: crate::project::worktree::ahead(main, branch).unwrap_or(0),
+                    ahead: crate::project::worktree::ahead(main, task.base.as_deref(), branch)
+                        .unwrap_or(0),
                     pull_request: ask_github
                         .then(|| crate::project::worktree::pull_request(&task.path, branch))
                         .flatten(),
@@ -846,6 +948,46 @@ impl Panel {
             .map(|(_, f)| f.id())
     }
 
+    /// The worktrees in the list, for their watchers.
+    pub fn worktree_paths(&self) -> Vec<PathBuf> {
+        self.worktrees.iter().map(|w| w.path.clone()).collect()
+    }
+
+    /// An agent's hook says it is writing `path`: now is the last write of
+    /// the worktree holding it.
+    pub fn note_write(&mut self, path: &Path) {
+        if let Some(i) = folder_task(&self.tasks, path).filter(|i| !self.tasks[*i].folder) {
+            let tree = self.tasks[i].path.clone();
+            self.touched(&tree);
+        }
+    }
+
+    /// Something was written in the worktree at `tree`, now.
+    pub fn touched(&mut self, tree: &Path) {
+        self.touched_at(tree, std::time::Instant::now());
+    }
+
+    /// Something was written in the worktree at `tree`, at `at`; an older
+    /// time than the one kept changes nothing.
+    pub fn touched_at(&mut self, tree: &Path, at: std::time::Instant) {
+        let kept = self.wrote.entry(tree.to_path_buf()).or_insert(at);
+        *kept = (*kept).max(at);
+    }
+
+    /// What a worktree has been doing: its last write this run, else its
+    /// branch's last commit.
+    pub fn pace(&self, workspace: &Workspace) -> Pace {
+        let since_commit = workspace.commit.as_ref().map(|(time, _)| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH + std::time::Duration::from_secs(*time))
+                .unwrap_or_default()
+        });
+        Pace::of(
+            self.wrote.get(&workspace.path).map(|at| at.elapsed()),
+            since_commit,
+        )
+    }
+
     /// How many worktrees sit under the workspace `id`.
     pub fn children(&self, id: &str) -> usize {
         self.tasks
@@ -913,6 +1055,7 @@ impl Panel {
             key: new_key(&self.folders),
             repo: None,
             base: None,
+            commit: None,
         };
         let id = made.id();
         self.folders.push(made);
@@ -1291,6 +1434,17 @@ impl Panel {
             .into_iter()
             .filter(|i| self.parent_of(&self.tasks[*i]).as_deref() == Some(id))
             .count()
+    }
+
+    /// The worktrees' activity, for the self-test: `title=writing`, `quiet`,
+    /// `commit` or `-`, in the list's order.
+    pub fn report_activity(&self) -> String {
+        self.tasks
+            .iter()
+            .filter(|t| !t.folder)
+            .map(|t| format!("{}={}", self.title(t), self.pace(t).word()))
+            .collect::<Vec<_>>()
+            .join(",")
     }
 
     /// The teams, for the self-test: per session with one, its tasks as
@@ -1740,7 +1894,8 @@ impl Panel {
     /// A workspace's row: its icon (a spinner while an agent in it says it
     /// is working), its name, and under it the most useful line there is:
     /// what a session waiting on you asks, what a working agent says, its
-    /// team, else its terminals and where it is. At the right a steady
+    /// team, else for a worktree what it has been doing (a write in it
+    /// spins its icon too) and for a folder its terminals and where it is. At the right a steady
     /// strip: how many wait on you, and the pull request coloured by its
     /// checks; hover trades the strip for the menu button.
     ///
@@ -1815,6 +1970,10 @@ impl Panel {
             .iter()
             .find(|t| t.status.as_ref().is_some_and(|s| s.state == State::Working));
         let remote = mine.iter().find_map(|t| t.remote.as_ref());
+        // A worktree being written in, by an agent here or one running
+        // from elsewhere, spins like a working one.
+        let pace = (!task.folder).then(|| self.pace(&task));
+        let writing = pace == Some(Pace::Writing) && waiting.is_empty();
         let left = card.x + 10.0;
         let line1 = Viewport {
             x: left,
@@ -1894,7 +2053,7 @@ impl Panel {
             width: 16.0,
             ..line1
         };
-        if working.is_some() {
+        if working.is_some() || writing {
             layout::push_spinner(out, left, line1, theme.accent);
         } else {
             layout::push_icon_centered(
@@ -2057,18 +2216,19 @@ impl Panel {
             if self.is_pinned(&task.id()) {
                 parts.push("pinned".to_owned());
             }
-            match mine.len() {
-                0 => parts.push("no terminal".to_owned()),
-                1 => parts.push("1 terminal".to_owned()),
-                n => parts.push(format!("{n} terminals")),
-            }
-            if let Some(ahead) = self
-                .info
-                .get(&task.path)
-                .map(|i| i.ahead)
-                .filter(|a| *a > 0)
-            {
-                parts.push(format!("{ahead} ahead"));
+            let ahead = self.info.get(&task.path).map_or(0, |i| i.ahead);
+            match pace {
+                Some(pace) => parts.extend(worktree_line(pace, mine.len(), ahead)),
+                None => {
+                    match mine.len() {
+                        0 => parts.push("no terminal".to_owned()),
+                        1 => parts.push("1 terminal".to_owned()),
+                        n => parts.push(format!("{n} terminals")),
+                    }
+                    if ahead > 0 {
+                        parts.push(format!("{ahead} ahead"));
+                    }
+                }
             }
             // A folder workspace says which folder, unless its name does; a
             // workspace you named says its branch.
@@ -2083,7 +2243,12 @@ impl Panel {
             if let Some(folder) = folder {
                 parts.push(folder);
             }
-            (parts.join(" \u{b7} "), theme.gutter_text)
+            let colour = if writing {
+                theme.status_text
+            } else {
+                theme.gutter_text
+            };
+            (parts.join(" \u{b7} "), colour)
         };
         layout::push_ui_text(
             out,
@@ -2126,6 +2291,7 @@ mod tests {
             key: format!("folder:{name}"),
             repo: None,
             base: None,
+            commit: None,
         }
     }
 
@@ -2455,6 +2621,51 @@ mod tests {
         std::fs::create_dir_all(dir.join("src/deep")).unwrap();
         assert_eq!(discover(&dir.join("src/deep")), vec![dir.clone()]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_worktree_row_says_what_it_has_been_doing() {
+        let secs = std::time::Duration::from_secs;
+        let line = |pace, terminals, ahead| worktree_line(pace, terminals, ahead).join(" \u{b7} ");
+        // Written in just now: writing, whatever the last commit.
+        let writing = Pace::of(Some(secs(3)), Some(secs(7200)));
+        assert_eq!(writing, Pace::Writing);
+        assert_eq!(line(writing, 0, 2), "writing \u{b7} 2 ahead");
+        // Quiet since, in minutes, then hours.
+        assert_eq!(
+            line(Pace::of(Some(secs(300)), None), 0, 0),
+            "quiet \u{b7} 5 min"
+        );
+        assert_eq!(
+            line(Pace::of(Some(secs(9)), None), 1, 0),
+            "quiet \u{b7} <1 min \u{b7} 1 terminal"
+        );
+        assert_eq!(
+            line(Pace::of(Some(secs(3 * 3600 + 59)), None), 2, 1),
+            "quiet \u{b7} 3 h \u{b7} 2 terminals \u{b7} 1 ahead"
+        );
+        // No write seen this run: the branch's last commit.
+        assert_eq!(
+            line(Pace::of(None, Some(secs(7200))), 0, 4),
+            "commit 2 h ago \u{b7} 4 ahead"
+        );
+        assert_eq!(
+            line(Pace::of(None, Some(secs(3 * 86400))), 0, 0),
+            "commit 3 d ago"
+        );
+        // Nothing known, no terminal: never "no terminal".
+        assert_eq!(line(Pace::of(None, None), 0, 1), "1 ahead");
+        assert_eq!(line(Pace::Unknown, 0, 0), "");
+    }
+
+    #[test]
+    fn a_hook_write_marks_the_worktree_holding_it() {
+        let mut panel = nested();
+        panel.note_write(Path::new("/w/a/src/beds.rs"));
+        // A folder workspace's file is not a worktree's.
+        panel.note_write(Path::new("/n/notes.md"));
+        assert_eq!(panel.report_activity(), "a=writing,b=-,x=-");
+        assert_eq!(panel.wrote.len(), 1);
     }
 
     #[test]

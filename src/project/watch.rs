@@ -109,6 +109,9 @@ struct Shared {
     /// Paths of tree changes since the last [`Watcher::take_files`],
     /// at most [`MAX_FILES`].
     files: Mutex<Vec<PathBuf>>,
+    /// When the last tree change happened, taken on the queue thread: the
+    /// main thread may hear of it late (a modal loop, a busy frame).
+    changed_at: Mutex<Option<std::time::Instant>>,
     on_change: MainThreadOnly<OnChange>,
 }
 
@@ -128,11 +131,25 @@ impl Watcher {
     /// Starts watching `root`. `on_change` runs on the main thread, at most
     /// once per batch of events, with the coarsest change in the batch.
     pub fn new(root: &Path, on_change: OnChange) -> Option<Self> {
+        Watcher::start(root, true, on_change)
+    }
+
+    /// Watches the files under `root` only, not its Git directories:
+    /// `on_change` hears [`Change::Tree`] alone.
+    pub fn tree(root: &Path, on_change: OnChange) -> Option<Self> {
+        Watcher::start(root, false, on_change)
+    }
+
+    fn start(root: &Path, git: bool, on_change: OnChange) -> Option<Self> {
         let root = crate::platform::canonical(root);
-        let git_dirs: Vec<PathBuf> = crate::project::git::git_dirs(&root)
-            .into_iter()
-            .map(|d| crate::platform::canonical(&d))
-            .collect();
+        let git_dirs: Vec<PathBuf> = if git {
+            crate::project::git::git_dirs(&root)
+                .into_iter()
+                .map(|d| crate::platform::canonical(&d))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut watched = vec![root.clone()];
         for dir in &git_dirs {
             if !dir.starts_with(&root) && !watched.contains(dir) {
@@ -145,6 +162,7 @@ impl Watcher {
             closed: AtomicBool::new(false),
             pending: Mutex::new((false, false)),
             files: Mutex::new(Vec::new()),
+            changed_at: Mutex::new(None),
             on_change: MainThreadOnly(on_change),
         }));
         let context = StreamContext {
@@ -194,6 +212,13 @@ impl Watcher {
     pub fn root(&self) -> &Path {
         // The shared block is only freed never, see `Shared`.
         unsafe { &(*self.shared).root }
+    }
+
+    /// When the tree last changed, as the events arrived, not as the main
+    /// thread heard of them.
+    pub fn changed_at(&self) -> Option<std::time::Instant> {
+        let shared = unsafe { &*self.shared };
+        *shared.changed_at.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// The paths that changed in the tree since the last call, each once.
@@ -256,6 +281,10 @@ unsafe extern "C" fn on_events(
     }
     if !tree && !git {
         return;
+    }
+    if tree {
+        *shared.changed_at.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(std::time::Instant::now());
     }
     let mut pending = shared.pending.lock().unwrap_or_else(|e| e.into_inner());
     let already_queued = pending.0 || pending.1;

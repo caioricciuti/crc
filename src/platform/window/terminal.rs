@@ -726,6 +726,7 @@ impl EditorView {
         let mut wrote = false;
         let mut asked = false;
         let mut team_events = Vec::new();
+        let mut written = Vec::new();
         for Noticed {
             index,
             mut notice,
@@ -767,13 +768,14 @@ impl EditorView {
             tab.events_read = read;
             for event in events {
                 match event {
-                    crate::project::review::Event::Wrote { .. } => {
+                    crate::project::review::Event::Wrote { path, .. } => {
                         crate::project::review::describe(
                             &tab.review,
                             &tab.base_name(),
                             &tab.launch.cwd,
                         );
                         wrote = true;
+                        written.push(path);
                     }
                     crate::project::review::Event::Asked(text) => notice = Some(text),
                     crate::project::review::Event::Failed(text) => {
@@ -795,6 +797,10 @@ impl EditorView {
         }
         for (review, event) in team_events {
             state.agents.teams.entry(review).or_default().apply(&event);
+        }
+        // A worktree an agent writes in says so in its row.
+        for path in written {
+            state.agents.note_write(&path);
         }
         if wrote {
             super::review::refresh_review(&mut state);

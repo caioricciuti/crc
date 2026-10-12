@@ -75,6 +75,61 @@ impl EditorView {
         self.after_terminal_layout();
     }
 
+    /// Watches every worktree in the list for writes, so one written in by
+    /// an agent crc did not start (a background one, run from another
+    /// session) still says so. Made again only when the worktrees change.
+    pub(super) fn watch_worktrees(&self) {
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
+        let paths = state.agents.worktree_paths();
+        if paths == state.agents.watched {
+            return;
+        }
+        // The view lives for the process; the handlers run on the main
+        // thread and only take the time.
+        let view = self as *const EditorView;
+        state.agents.watchers = paths
+            .iter()
+            .filter_map(|path| {
+                let tree = path.clone();
+                crate::project::watch::Watcher::tree(
+                    path,
+                    Box::new(move |_| {
+                        let view = unsafe { &*view };
+                        view.worktree_written(&tree);
+                    }),
+                )
+            })
+            .collect();
+        state.agents.watched = paths;
+    }
+
+    /// Main thread, from a worktree's watcher: a file in it changed.
+    fn worktree_written(&self, tree: &std::path::Path) {
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
+        let was = state.agents.wrote.get(tree).copied();
+        // When it happened, not when the main thread got to it.
+        let at = state
+            .agents
+            .watchers
+            .iter()
+            .find(|w| w.root() == tree)
+            .and_then(|w| w.changed_at())
+            .unwrap_or_else(std::time::Instant::now);
+        state.agents.touched_at(tree, at);
+        let on = state.agents.on;
+        drop(state);
+        // A repaint when the row turns to writing; the spinner keeps
+        // frames coming while it stays so.
+        if on && was.is_none_or(|at| at.elapsed() >= crate::platform::agents::WRITING) {
+            self.request_redraw();
+            self.resume_display_link();
+        }
+    }
+
     pub(super) fn poll_agents(&self) {
         let Some(mut state) = self.state_mut() else {
             return;
@@ -112,6 +167,9 @@ impl EditorView {
         drop(state);
         if ensure {
             self.ensure_workspace();
+        }
+        if changed {
+            self.watch_worktrees();
         }
         self.want_inspector();
         if let Some(dir) = start_in {

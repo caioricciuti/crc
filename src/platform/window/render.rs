@@ -733,7 +733,8 @@ impl EditorView {
                         .into_iter()
                         .map(|t| {
                             let title = agents.title(&t);
-                            (t, title)
+                            let pace = agents.pace(&t);
+                            (t, title, pace)
                         })
                         .collect(),
                     _ => Vec::new(),

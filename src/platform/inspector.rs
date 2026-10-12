@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use crate::platform::agents::Workspace;
+use crate::platform::agents::{Pace, Workspace};
 use crate::project::icons;
 use crate::project::worktree::{CheckState, PullRequest, Status};
 use crate::render::{
@@ -76,8 +76,9 @@ pub type Want = (PathBuf, Option<String>, bool);
 /// A card row: its label, and its values with their colours.
 type Fact<'a> = (&'a str, Vec<(String, [f32; 4])>);
 
-/// A worktree strip's height.
-const STRIP: f32 = 46.0;
+/// A worktree strip's height: its branch, where it stands, and its last
+/// commit.
+const STRIP: f32 = 64.0;
 
 #[derive(Default)]
 pub struct Inspector {
@@ -289,7 +290,7 @@ impl Inspector {
         &mut self,
         workspace: Option<&Workspace>,
         repos: Option<&[PathBuf]>,
-        worktrees: &[(Workspace, String)],
+        worktrees: &[(Workspace, String, Pace)],
         remote: Option<&crate::platform::remote::Remote>,
         pull_request: Option<Option<&PullRequest>>,
         github: bool,
@@ -391,7 +392,7 @@ impl Inspector {
         &mut self,
         workspace: Option<&Workspace>,
         repos: Option<&[PathBuf]>,
-        worktrees: &[(Workspace, String)],
+        worktrees: &[(Workspace, String, Pace)],
         remote: Option<&crate::platform::remote::Remote>,
         pull_request: Option<Option<&PullRequest>>,
         github: bool,
@@ -519,9 +520,9 @@ impl Inspector {
                     single = Some(status);
                 }
             }
-            let mine: Vec<&(Workspace, String)> = worktrees
+            let mine: Vec<&(Workspace, String, Pace)> = worktrees
                 .iter()
-                .filter(|(w, _)| w.repo.as_deref() == Some(repo.as_path()))
+                .filter(|(w, ..)| w.repo.as_deref() == Some(repo.as_path()))
                 .collect();
             if !mine.is_empty() {
                 y = self.worktree_strips(repo, &mine, x, y, width, atlas, theme, out);
@@ -738,7 +739,7 @@ impl Inspector {
     fn worktree_strips(
         &mut self,
         repo: &Path,
-        worktrees: &[&(Workspace, String)],
+        worktrees: &[&(Workspace, String, Pace)],
         x: f32,
         y: f32,
         width: f32,
@@ -768,7 +769,7 @@ impl Inspector {
             },
             theme,
         );
-        for (n, (tree, name)) in worktrees.iter().enumerate() {
+        for (n, (tree, name, pace)) in worktrees.iter().enumerate() {
             self.shown_worktrees
                 .push((repo.to_path_buf(), tree.path.clone(), name.clone()));
             let top = y + n as f32 * STRIP;
@@ -879,6 +880,15 @@ impl Inspector {
                         parts.push((format!("\u{2212}{}", status.removed), theme.diff_removed));
                         parts.push((plural(status.files, "file"), theme.gutter_text));
                     }
+                    // What it has been doing, as its row says it.
+                    match pace {
+                        Pace::Writing => parts.push(("\u{b7} writing".into(), theme.accent)),
+                        Pace::Quiet(d) => parts.push((
+                            format!("\u{b7} quiet {}", crate::platform::agents::span(*d)),
+                            theme.gutter_text,
+                        )),
+                        Pace::Committed(_) | Pace::Unknown => {}
+                    }
                     let mut vx = x + 10.0;
                     for (part, colour) in parts {
                         let left = (x + 10.0 + room - vx).max(0.0);
@@ -890,6 +900,35 @@ impl Inspector {
                         vx += layout::ui_text_width(atlas, &part) + 6.0;
                     }
                 }
+            }
+            // The branch's last commit: its subject, and how long ago.
+            if let Some((time, subject)) = &tree.commit {
+                let line3 = top + 42.0;
+                let ago = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH + Duration::from_secs(*time))
+                    .unwrap_or_default();
+                let ago = format!("{} ago", crate::platform::agents::span(ago));
+                let aw = layout::ui_text_width(atlas, &ago);
+                text(
+                    out,
+                    atlas,
+                    x + width - 10.0 - aw,
+                    line3,
+                    aw + 2.0,
+                    &ago,
+                    theme.gutter_text,
+                );
+                let room = (width - 20.0 - aw - 8.0).max(0.0);
+                let subject = fit(atlas, subject, room);
+                text(
+                    out,
+                    atlas,
+                    x + 10.0,
+                    line3,
+                    room,
+                    &subject,
+                    theme.status_text,
+                );
             }
         }
         y + height + 14.0

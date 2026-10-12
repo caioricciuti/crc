@@ -200,14 +200,93 @@ pub fn merge(main: &Path, branch: &str) -> Result<String, String> {
     }
 }
 
-/// How far the task's branch is from where it started: commits on it the
-/// main checkout's HEAD does not have.
-pub fn ahead(main: &Path, branch: &str) -> Result<usize, String> {
-    let range = format!("HEAD..{branch}");
+/// How far the task's branch is from `base` (the default branch; `None`
+/// is the main checkout's HEAD): commits on it the base does not have.
+pub fn ahead(main: &Path, base: Option<&str>, branch: &str) -> Result<usize, String> {
+    let range = format!("{}..{branch}", base.unwrap_or("HEAD"));
     Ok(run(main, &["rev-list", "--count", &range])?
         .trim()
         .parse()
         .unwrap_or(0))
+}
+
+/// A local branch and its last commit: when (Unix seconds, the committer's
+/// date) and its subject.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Tip {
+    pub branch: String,
+    pub time: u64,
+    pub subject: String,
+}
+
+/// Every local branch of the repository at `main` and its last commit, in
+/// one `for-each-ref`.
+pub fn tips(main: &Path) -> Result<Vec<Tip>, String> {
+    Ok(parse_tips(&run(
+        main,
+        &[
+            "for-each-ref",
+            "refs/heads",
+            "--format=%(refname:short)%09%(committerdate:unix)%09%(subject)",
+        ],
+    )?))
+}
+
+/// `for-each-ref` with the format [`tips`] asks for: branch, time and
+/// subject, tab-separated (a branch name has no tab; a subject may).
+pub fn parse_tips(text: &str) -> Vec<Tip> {
+    text.lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, '\t');
+            let branch = parts.next().filter(|b| !b.is_empty())?;
+            let time = parts.next()?.trim().parse().unwrap_or(0);
+            Some(Tip {
+                branch: branch.to_owned(),
+                time,
+                subject: parts.next().unwrap_or("").to_owned(),
+            })
+        })
+        .collect()
+}
+
+/// The repository's default branch, which its worktrees are compared
+/// with: what `origin/HEAD` points at (the local branch of that name when
+/// there is one, else the remote one), else `init.defaultBranch` when that
+/// branch exists, else `main` or `master`, else what the main checkout has
+/// out. `branches` are the local ones, from [`tips`].
+pub fn default_branch(main: &Path, branches: &[Tip], current: Option<&str>) -> Option<String> {
+    let origin = run(
+        main,
+        &[
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ],
+    )
+    .ok();
+    let init = run(main, &["config", "--get", "init.defaultBranch"]).ok();
+    pick_default(origin.as_deref(), init.as_deref(), branches, current)
+}
+
+/// [`default_branch`]'s choice from what Git said.
+pub fn pick_default(
+    origin_head: Option<&str>,
+    init_default: Option<&str>,
+    branches: &[Tip],
+    current: Option<&str>,
+) -> Option<String> {
+    let has = |name: &str| branches.iter().any(|t| t.branch == name);
+    if let Some(remote) = origin_head.map(str::trim).filter(|r| !r.is_empty()) {
+        let local = remote.strip_prefix("origin/").unwrap_or(remote);
+        return Some(if has(local) { local } else { remote }.to_owned());
+    }
+    init_default
+        .map(str::trim)
+        .filter(|b| !b.is_empty() && has(b))
+        .or_else(|| ["main", "master"].into_iter().find(|b| has(b)))
+        .or(current)
+        .map(str::to_owned)
 }
 
 /// A task branch's pull request on GitHub, as `gh` reports it.
@@ -390,7 +469,7 @@ pub fn parse_pull_request(text: &str) -> Option<PullRequest> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Status {
     pub branch: Option<String>,
-    /// The branch it is compared with: the main checkout's.
+    /// The branch it is compared with: the repository's default one.
     pub base: Option<String>,
     /// Commits it has that the base does not, and the other way round.
     pub ahead: usize,
@@ -692,6 +771,110 @@ mod tests {
     }
 
     #[test]
+    fn reads_branch_tips() {
+        let tips = parse_tips(
+            "main\t1760000000\tbeds\nfix/seed-dates\t1760003600\tdates:\tmarch\tapril\n\nodd\tx\t\n",
+        );
+        assert_eq!(
+            tips,
+            [
+                Tip {
+                    branch: "main".into(),
+                    time: 1_760_000_000,
+                    subject: "beds".into()
+                },
+                Tip {
+                    branch: "fix/seed-dates".into(),
+                    time: 1_760_003_600,
+                    subject: "dates:\tmarch\tapril".into()
+                },
+                Tip {
+                    branch: "odd".into(),
+                    time: 0,
+                    subject: String::new()
+                },
+            ]
+        );
+    }
+
+    /// A repository on `branch` with one commit, and `others` branched
+    /// from it.
+    fn fixture(name: &str, branch: &str, others: &[&str]) -> crate::project::TempTree {
+        let tree = crate::project::TempTree::new(name, &[("a.txt", "one\n")]);
+        let repo = &tree.0;
+        let ok = |args: &[&str]| assert!(git(repo).args(args).output().unwrap().status.success());
+        ok(&["init", "-q", "-b", branch]);
+        ok(&["config", "commit.gpgsign", "false"]);
+        ok(&["add", "a.txt"]);
+        ok(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "one",
+        ]);
+        for other in others {
+            ok(&["branch", other]);
+        }
+        tree
+    }
+
+    fn resolved(repo: &Path) -> Option<String> {
+        let tips = tips(repo).unwrap();
+        let current = run(repo, &["branch", "--show-current"]).unwrap();
+        default_branch(repo, &tips, Some(current.trim()))
+    }
+
+    #[test]
+    fn the_default_branch_is_origin_head_then_config_then_main_or_master() {
+        // origin/HEAD set: its branch, the local one when there is one,
+        // whatever is checked out.
+        let tree = fixture("default-origin", "work", &["trunk"]);
+        let repo = &tree.0;
+        let ok = |args: &[&str]| assert!(git(repo).args(args).output().unwrap().status.success());
+        ok(&["update-ref", "refs/remotes/origin/trunk", "HEAD"]);
+        ok(&[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/trunk",
+        ]);
+        assert_eq!(resolved(repo).as_deref(), Some("trunk"));
+        ok(&["branch", "-D", "trunk"]);
+        assert_eq!(resolved(repo).as_deref(), Some("origin/trunk"));
+
+        // Only init.defaultBranch, naming a branch that exists.
+        let tree = fixture("default-config", "work", &["stable", "main"]);
+        let repo = &tree.0;
+        assert!(
+            git(repo)
+                .args(["config", "init.defaultBranch", "stable"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(resolved(repo).as_deref(), Some("stable"));
+        // Naming one that does not: main.
+        assert!(
+            git(repo)
+                .args(["config", "init.defaultBranch", "gone"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(resolved(repo).as_deref(), Some("main"));
+
+        // Only master.
+        let tree = fixture("default-master", "work", &["master"]);
+        assert_eq!(resolved(&tree.0).as_deref(), Some("master"));
+
+        // None of them: what the main checkout has out.
+        let tree = fixture("default-none", "work", &["other"]);
+        assert_eq!(resolved(&tree.0).as_deref(), Some("work"));
+    }
+
+    #[test]
     fn branch_names_from_typing() {
         assert_eq!(branch_name("Fix the login bug!"), "fix-the-login-bug");
         assert_eq!(branch_name("  feat/Agents  mode "), "feat/agents-mode");
@@ -744,7 +927,8 @@ mod tests {
             "-qm",
             "two",
         ]);
-        assert_eq!(ahead(repo, "try-it").unwrap(), 1);
+        assert_eq!(ahead(repo, Some("main"), "try-it").unwrap(), 1);
+        assert_eq!(ahead(repo, None, "try-it").unwrap(), 1);
         assert_eq!(merge(repo, "try-it").unwrap(), "Merged try-it into main");
         assert!(repo.join("b.txt").is_file());
         assert_eq!(

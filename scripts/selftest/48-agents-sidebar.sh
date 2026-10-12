@@ -124,8 +124,9 @@ grep -q "^message: Started again 4 terminals" "$T/side-other.out" \
 # (the worktree beside it is not taken for a second repository) with a
 # strip per worktree. Terminal on a strip starts a shell there; the chevron
 # folds the worktrees away, which Control-1 to 9 then skip, and the fold
-# is kept; Open selects a worktree. SELFTEST_FRAMES, when set, is a folder
-# to keep the frame in.
+# is kept; Open selects a worktree. A file written in a worktree from a
+# shell turns its row to writing. SELFTEST_FRAMES, when set, is a folder
+# to keep the frames in.
 GD="$T/garden"
 GL="$GD/garden-log"
 mkdir -p "$GL" "$T/garden-wt"
@@ -150,6 +151,11 @@ click @inspector.worktree_terminal.1
 wait 700
 wait 300
 dump $T/garden-terminal.out
+text echo april > $T/garden-wt/seed-dates/notes.txt
+key 36
+wait 1200
+dump $T/garden-writing.out
+frame $T/garden-writing.bmp
 key 18 ctrl 1
 wait 400
 click @agents.fold.0
@@ -177,10 +183,15 @@ SCRIPT
 mkdir -p "$T/home/garden"
 HOME="$T/home/garden" CRC_TERMINAL_SHELL=/bin/sh CRC_SELFTEST="$T/garden.script" \
     "$BIN" "$GD" 2> "$T/garden.err"
-[ -z "${SELFTEST_FRAMES:-}" ] || cp -f "$T/garden-frame.bmp" "$SELFTEST_FRAMES/"
+[ -z "${SELFTEST_FRAMES:-}" ] || cp -f "$T/garden-frame.bmp" "$T/garden-writing.bmp" "$SELFTEST_FRAMES/"
 expect "$T/garden.out" agents_tree "garden,>fix/seed-dates,>feat/compost-log"
 expect "$T/garden.out" inspector "branch=main base=- ahead=0 behind=0 upstream=- push=0 pull=0 dirty=0 changes=+0-0 tag=- buttons=push worktrees=fix/seed-dates:ahead=1:+3-0:files=1,feat/compost-log:ahead=0:+0-0:files=0"
 expect "$T/garden-terminal.out" agents "on tasks=garden,fix/seed-dates,feat/compost-log selected=feat/compost-log sessions=garden,*feat/compost-log claude=0 pair=- op=-"
+# Nothing written yet: each says its branch's last commit.
+expect "$T/garden.out" agents_activity "fix/seed-dates=commit,feat/compost-log=commit"
+# A file written in a worktree from a shell elsewhere (as a background
+# agent run from another session would): its watcher sees it.
+expect "$T/garden-writing.out" agents_activity "fix/seed-dates=writing,feat/compost-log=commit"
 expect "$T/garden-folded.out" agents_tree "garden(+2)"
 # The fold at the end is kept for the next launch.
 grep -q "^fold	" "$T/home/garden/Library/Application Support/crc/agents/order" 2>/dev/null \
