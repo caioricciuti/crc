@@ -162,6 +162,12 @@ impl Tab {
 }
 
 pub struct Panel {
+    /// The workspaces of tabs closed since the window last looked: one
+    /// whose last terminal closed goes with it.
+    pub closed_in: Vec<String>,
+    /// The tab showing was closed: its workspace and its place, so the
+    /// next tab shown is that workspace's, not whichever slid into place.
+    pub closed_active: Option<(Option<String>, usize)>,
     pub open: bool,
     /// Whether typing goes to the terminal rather than the editor.
     pub focus: bool,
@@ -190,6 +196,8 @@ pub struct Panel {
 impl Default for Panel {
     fn default() -> Self {
         Panel {
+            closed_in: Vec::new(),
+            closed_active: None,
             open: false,
             focus: false,
             height: DEFAULT_HEIGHT,
@@ -282,7 +290,11 @@ impl Panel {
         self.pair = None;
         if index < self.tabs.len() {
             // Dropping the session hangs up on its program.
-            self.tabs.remove(index);
+            let tab = self.tabs.remove(index);
+            if index == self.active {
+                self.closed_active = Some((tab.workspace.clone(), index));
+            }
+            self.closed_in.extend(tab.workspace);
         }
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len().saturating_sub(1);

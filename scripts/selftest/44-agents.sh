@@ -163,6 +163,31 @@ wait 700
 wait 700
 wait 500
 dump $T/agents-moved.out
+key 45 cmd n
+wait 200
+text other
+key 36
+wait 700
+wait 300
+dump $T/agents-other-made.out
+key 18 ctrl
+wait 400
+key 18 cmd
+wait 300
+dump $T/agents-cmd1.out
+key 19 cmd
+wait 300
+dump $T/agents-cmd2.out
+text exit
+key 36
+wait 700
+wait 300
+dump $T/agents-one-left.out
+text exit
+key 36
+wait 700
+wait 300
+dump $T/agents-closed.out
 quit
 SCRIPT
 HOME="$T/home/agents-plain" CRC_TERMINAL_SHELL=/bin/sh CRC_SELFTEST="$T/agents-plain.script" "$BIN" "$T/plainproj" \
@@ -174,3 +199,14 @@ expect "$T/agents-plain-cmdt.out" agents "on tasks=plainproj selected=plainproj 
 expect "$T/agents-moved.out" agents "on tasks=movedrepo selected=movedrepo sessions=movedrepo,*movedrepo claude=0 pair=- op=-"
 grep -q '^inspector: branch=main base=- ahead=0 behind=0 upstream=-' "$T/agents-moved.out" \
     || failed "agents-moved.out: $(grep '^inspector:' "$T/agents-moved.out")"
+# A second workspace, then back to the first: Command-1 and 2 pick its
+# terminals. The one showing exits: the next shown is the first
+# workspace's other terminal, not the second workspace's that slid into
+# its place. The last one exits and its workspace goes with it.
+expect "$T/agents-other-made.out" agents "on tasks=movedrepo,other selected=other sessions=movedrepo,movedrepo,*other claude=0 pair=- op=-"
+# The first terminal never left plainproj: showing it, the workspace is there.
+expect "$T/agents-cmd1.out" agents "on tasks=plainproj,other selected=plainproj sessions=*plainproj,plainproj,other claude=0 pair=- op=-"
+expect "$T/agents-cmd2.out" agents "on tasks=movedrepo,other selected=movedrepo sessions=movedrepo,*movedrepo,other claude=0 pair=- op=-"
+# The one left is the plainproj shell: the workspace follows it there.
+expect "$T/agents-one-left.out" agents "on tasks=plainproj,other selected=plainproj sessions=*plainproj,other claude=0 pair=- op=-"
+expect "$T/agents-closed.out" agents "on tasks=other selected=other sessions=*other claude=0 pair=- op=-"

@@ -25,7 +25,7 @@ pub const WIDTH: f32 = 300.0;
 /// The terminal keeps at least this much beside it.
 pub const TERMINAL_MIN: f32 = 420.0;
 const PAD: f32 = 12.0;
-const ROW: f32 = 26.0;
+pub const ROW: f32 = 26.0;
 /// A status read this old is read again when the panel is drawn.
 const STALE: Duration = Duration::from_secs(15);
 
@@ -82,6 +82,9 @@ pub struct Inspector {
     reading: Option<Vec<PathBuf>>,
     /// Each button, with the repository it acts on.
     pub hits: Vec<(Viewport, Action, Option<PathBuf>)>,
+    /// How far the body is scrolled, and how far it can be, in points.
+    pub scroll: f32,
+    max_scroll: f32,
 }
 
 impl Inspector {
@@ -105,6 +108,9 @@ impl Inspector {
                 .collect();
             let _ = tx.send(read);
         });
+        if self.read_for != paths {
+            self.scroll = 0.0;
+        }
         self.rx = Some(rx);
         self.reading = Some(paths);
     }
@@ -272,10 +278,75 @@ impl Inspector {
                 .draw(out, atlas, theme);
             self.hits.push((button, action, None));
         }
+        // The body scrolls under the header: drawn moved up by `scroll`,
+        // then cut to the room under the header, its buttons with it.
+        let top = rect.y + layout::SIDEBAR_HEADER_HEIGHT;
+        let bottom = rect.y + rect.height;
+        let first_hit = self.hits.len();
+        let mut body = Vec::new();
+        self.draw_body(
+            workspace,
+            repos,
+            pull_request,
+            github,
+            atlas,
+            rect,
+            top - self.scroll,
+            theme,
+            &mut body,
+        );
+        let end = body
+            .iter()
+            .map(|q| q.pos[1] + q.size[1])
+            .fold(top - self.scroll, f32::max)
+            + self.scroll
+            + PAD;
+        self.max_scroll = (end - bottom).max(0.0);
+        let shift = self.scroll.min(self.max_scroll) - self.scroll;
+        self.scroll += shift;
+        for mut quad in body {
+            quad.pos[1] -= shift;
+            if quad.pos[1] >= bottom || quad.pos[1] + quad.size[1] <= top {
+                continue;
+            }
+            layout::clip_vertical(&mut quad, top, bottom);
+            out.push(quad);
+        }
+        let mut hits = self.hits.split_off(first_hit);
+        hits.retain_mut(|(b, ..)| {
+            b.y -= shift;
+            let (from, to) = (b.y.max(top), (b.y + b.height).min(bottom));
+            b.y = from;
+            b.height = to - from;
+            b.height > 0.0
+        });
+        self.hits.extend(hits);
+    }
+
+    /// Scrolls the body by `points`, down the content positive.
+    pub fn scroll_by(&mut self, points: f32) {
+        self.scroll = (self.scroll + points).clamp(0.0, self.max_scroll);
+    }
+
+    /// Everything under the header, from `y` down, unclipped.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_body(
+        &mut self,
+        workspace: Option<&Workspace>,
+        repos: Option<&[PathBuf]>,
+        pull_request: Option<Option<&PullRequest>>,
+        github: bool,
+        atlas: &mut Atlas,
+        rect: Viewport,
+        y: f32,
+        theme: &Theme,
+        out: &mut Vec<GlyphInstance>,
+    ) {
         let x = rect.x + PAD;
         let width = (rect.width - 2.0 * PAD).max(0.0);
-        let bottom = rect.y + rect.height - PAD;
-        let mut y = rect.y + layout::SIDEBAR_HEADER_HEIGHT;
+        // Nothing is left out for want of room: the body scrolls.
+        let bottom = f32::INFINITY;
+        let mut y = y;
         let Some(workspace) = workspace else {
             note(out, atlas, x, y, width, "Select a workspace", theme);
             return;

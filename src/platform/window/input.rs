@@ -11,6 +11,24 @@ impl EditorView {
         if dy.abs() < 0.01 && dx.abs() < 0.01 {
             return;
         }
+        // The workspace inspector scrolls its cards, in points.
+        let over_inspector = self.state().is_some_and(|state| {
+            chrome_of(&state)
+                .inspector
+                .is_some_and(|r| r.contains(x, y))
+        });
+        if over_inspector {
+            let points = if precise {
+                -dy as f32
+            } else {
+                -dy as f32 * 3.0 * crate::platform::inspector::ROW
+            };
+            if let Some(mut state) = self.state_mut() {
+                state.agents.inspector.scroll_by(points);
+            }
+            self.request_redraw();
+            return;
+        }
         // Scrolling another pane scrolls it, which means focusing it:
         // there is one scroll position per focused document here.
         let over_pane = {
@@ -294,6 +312,19 @@ impl EditorView {
                 .is_some_and(|state| !state.agents.tasks.is_empty())
         {
             self.jump_to_task(number);
+            return true;
+        }
+        // Command-1 to 9: that tab, 9 the last; in Agents mode, among the
+        // selected workspace's terminals.
+        if flags.contains(NSEventModifierFlags::Command)
+            && !flags.intersects(
+                NSEventModifierFlags::Control
+                    | NSEventModifierFlags::Option
+                    | NSEventModifierFlags::Shift,
+            )
+            && let Some(number) = task_digit(event.keyCode())
+        {
+            self.jump_to_tab(number);
             return true;
         }
         if self.terminal_has_keys() {

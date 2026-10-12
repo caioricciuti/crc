@@ -45,6 +45,7 @@ impl EditorView {
         let mut state = self.state_mut()?;
         layout::begin_frame();
         sync_conflicts(&mut state);
+        super::agents::forget_emptied(&mut state);
         let column = column_of(&state);
         let chrome = chrome_of(&state);
         let carets_on = !self.caret_blinks(&state) || caret_phase(state.caret_since.elapsed()).0;

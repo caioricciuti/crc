@@ -371,6 +371,36 @@ impl EditorView {
         self.follow_cwd();
     }
 
+    /// Command-1 to 9: the tab in that place, 9 the last. In Agents mode
+    /// the selected workspace's terminals, as its tab bar lists them;
+    /// in the editor its documents.
+    pub(super) fn jump_to_tab(&self, number: usize) {
+        let terminal = self.state().and_then(|state| {
+            if !state.agents.on {
+                return None;
+            }
+            let tasks = &state.agents.tasks;
+            let selected = state.agents.selected_index();
+            let mine: Vec<usize> = (0..state.terminal.tabs.len())
+                .filter(|i| {
+                    tasks.is_empty() || task_of(tasks, &state.terminal.tabs[*i]) == selected
+                })
+                .collect();
+            Some(pick_numbered(&mine, number))
+        });
+        match terminal {
+            Some(Some(tab)) => self.show_session(tab),
+            Some(None) => {}
+            None => {
+                let count = self.state().map_or(0, |state| state.docs.len());
+                let all: Vec<usize> = (0..count).collect();
+                if let Some(index) = pick_numbered(&all, number) {
+                    self.activate_tab(index);
+                }
+            }
+        }
+    }
+
     /// Control-1 to 9: the task in that place.
     pub(super) fn jump_to_task(&self, number: usize) {
         let known = self
@@ -1007,6 +1037,72 @@ impl EditorView {
         drop(state);
         self.after_terminal_layout();
         self.resume_display_link();
+    }
+}
+
+/// The `number`th of `items` (1 based), 9 the last, as browsers have it.
+fn pick_numbered(items: &[usize], number: usize) -> Option<usize> {
+    if number == 9 {
+        items.last().copied()
+    } else {
+        items.get(number.checked_sub(1)?).copied()
+    }
+}
+
+/// A folder workspace whose last terminal closed goes with it, as a tab
+/// group does. A worktree stays: forgetting it would mean removing it from
+/// Git, which its menu asks about first.
+pub(super) fn forget_emptied(state: &mut State) {
+    // The tab showing closed: the next one of its workspace shows, the one
+    // after it or else the one before.
+    if let Some((Some(id), at)) = state.terminal.closed_active.take()
+        && state.agents.on
+    {
+        let tasks = state.agents.tasks.clone();
+        if let Some(owner) = tasks.iter().position(|t| t.id() == id) {
+            let mine: Vec<usize> = (0..state.terminal.tabs.len())
+                .filter(|i| task_of(&tasks, &state.terminal.tabs[*i]) == Some(owner))
+                .collect();
+            if let Some(next) = mine
+                .iter()
+                .copied()
+                .find(|i| *i >= at)
+                .or_else(|| mine.last().copied())
+            {
+                state.terminal.active = next;
+                state.agents.selected = Some(id);
+            }
+        }
+    }
+    if state.terminal.closed_in.is_empty() {
+        return;
+    }
+    let closed = std::mem::take(&mut state.terminal.closed_in);
+    let tasks = state.agents.tasks.clone();
+    let mut gone = false;
+    for id in closed {
+        let Some(index) = tasks.iter().position(|t| t.id() == id && t.folder) else {
+            continue;
+        };
+        let held = state
+            .terminal
+            .tabs
+            .iter()
+            .any(|tab| task_of(&tasks, tab) == Some(index));
+        if !held {
+            state.agents.remove_folder(&id);
+            gone = true;
+        }
+    }
+    if gone && state.agents.selected_index().is_none() {
+        // The workspace of the terminal showing, else the first.
+        let tasks = state.agents.tasks.clone();
+        let next = state
+            .terminal
+            .active_tab()
+            .and_then(|t| task_of(&tasks, t))
+            .or((!tasks.is_empty()).then_some(0));
+        state.agents.selected = next.map(|i| tasks[i].id());
     }
 }
 

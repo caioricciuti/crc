@@ -528,6 +528,21 @@ impl EditorView {
     /// The panel appeared, went, or changed sessions: the editor column
     /// changed size, and so did the cursor rectangles.
     pub(super) fn after_terminal_layout(&self) {
+        let refocused = self.state_mut().is_some_and(|mut state| {
+            let refocused = state.terminal.closed_active.is_some();
+            super::agents::forget_emptied(&mut state);
+            refocused
+        });
+        // The terminal now showing may be elsewhere: the workspace follows.
+        if refocused {
+            if let Some(mut state) = self.state_mut() {
+                let active = state.terminal.active;
+                if let Some(tab) = state.terminal.tabs.get_mut(active) {
+                    tab.read_cwd();
+                }
+            }
+            self.follow_cwd();
+        }
         if let Some(window) = self.window() {
             window.invalidateCursorRectsForView(self);
         }

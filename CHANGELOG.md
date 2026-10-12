@@ -4,6 +4,13 @@ One entry per tag, written for people who use the editor.
 
 ## Unreleased
 
+- The workspace inspector scrolls, so a folder of ten repositories shows
+  all of them.
+- Closing a workspace's last terminal (or typing `exit` in it) removes
+  the workspace. When the terminal showing closes, the next one shown is
+  the same workspace's, not whichever slid into its place.
+- `Cmd-1` to `Cmd-9` show that tab, `Cmd-9` the last: in Agents mode the
+  selected workspace's terminals, in the editor its documents.
 - In Agents mode the workspace follows the terminal showing: `cd`
   somewhere else and the workspace is that folder now (named after it,
   unless you named it yourself), the inspector shows the Git repository
