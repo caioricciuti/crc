@@ -45,6 +45,9 @@ pub enum Action {
     Menu(usize),
     /// A folder workspace's chevron: shows or hides the worktrees under it.
     Fold(usize),
+    /// The line over a folder workspace's merged worktrees: shows or hides
+    /// them; its menu cleans them all up.
+    Merged(usize),
 }
 
 /// What a worker read of the folder workspaces: per folder workspace (by
@@ -303,12 +306,15 @@ pub struct Arrangement {
     pub titles: std::collections::HashMap<String, String>,
     /// Folder workspaces whose worktrees are folded away under them.
     pub collapsed: std::collections::HashSet<String>,
+    /// Folder workspaces whose merged worktrees are shown; folded is the
+    /// default.
+    pub merged_open: std::collections::HashSet<String>,
 }
 
 impl Arrangement {
-    /// One per line: the flags (`pin`, `fold`, comma-separated) or `-`, a
-    /// tab, the id, a tab, the name (maybe empty). A file from before
-    /// folding has `pin` or `-` alone.
+    /// One per line: the flags (`pin`, `fold`, `merged`, comma-separated)
+    /// or `-`, a tab, the id, a tab, the name (maybe empty). A file from
+    /// before folding has `pin` or `-` alone.
     pub fn parse(text: &str) -> Arrangement {
         let mut out = Arrangement::default();
         for line in text.lines() {
@@ -328,6 +334,9 @@ impl Arrangement {
                     "fold" => {
                         out.collapsed.insert(id.to_owned());
                     }
+                    "merged" => {
+                        out.merged_open.insert(id.to_owned());
+                    }
                     _ => {}
                 }
             }
@@ -342,11 +351,19 @@ impl Arrangement {
         self.order
             .iter()
             .map(|id| {
-                let flags = match (self.pinned.contains(id), self.collapsed.contains(id)) {
-                    (true, true) => "pin,fold",
-                    (true, false) => "pin",
-                    (false, true) => "fold",
-                    (false, false) => "-",
+                let flags: Vec<&str> = [
+                    (&self.pinned, "pin"),
+                    (&self.collapsed, "fold"),
+                    (&self.merged_open, "merged"),
+                ]
+                .into_iter()
+                .filter(|(set, _)| set.contains(id))
+                .map(|(_, flag)| flag)
+                .collect();
+                let flags = if flags.is_empty() {
+                    "-".to_owned()
+                } else {
+                    flags.join(",")
                 };
                 format!(
                     "{flags}\t{id}\t{}\n",
@@ -395,6 +412,9 @@ impl Arrangement {
         }
         if self.collapsed.remove(old) {
             self.collapsed.insert(new.to_owned());
+        }
+        if self.merged_open.remove(old) {
+            self.merged_open.insert(new.to_owned());
         }
     }
 }
@@ -702,6 +722,9 @@ pub struct Panel {
     pub arrangement: Arrangement,
     /// A row being dragged.
     pub drag: Option<RowDrag>,
+    /// The selected workspace its folded merged group was last opened for,
+    /// by id, so folding it again by hand sticks.
+    revealed: Option<String>,
     /// The workspace whose name is being edited in its row, by id, with
     /// the text so far and the caret's character index; set by the window
     /// from its field before each draw.
@@ -752,6 +775,9 @@ enum Line {
     Task(usize),
     /// A worktree under the folder workspace holding its repository.
     Child(usize),
+    /// The fold over the merged worktrees under the folder workspace at
+    /// this index.
+    Merged(usize),
     Session(usize),
     /// A task on the team list of the session at the first index.
     TeamTask(usize, usize),
@@ -903,6 +929,61 @@ impl Panel {
                 .is_some_and(|pr| pr.state == "MERGED")
     }
 
+    /// A merged worktree, not a repository's own checkout.
+    fn done(&self, task: &Workspace) -> bool {
+        !task.folder && !task.main && self.is_merged(task)
+    }
+
+    /// The folder workspace whose merged group a worktree's row is in, by
+    /// id: a merged one under a folder workspace.
+    fn merged_group(&self, task: &Workspace) -> Option<String> {
+        self.parent_of(task).filter(|_| self.done(task))
+    }
+
+    /// The merged worktrees under the folder workspace `id`, by index.
+    pub fn merged_under(&self, id: &str) -> Vec<usize> {
+        (0..self.tasks.len())
+            .filter(|i| self.merged_group(&self.tasks[*i]).as_deref() == Some(id))
+            .collect()
+    }
+
+    /// Whether the merged worktrees under the folder workspace `id` are
+    /// shown.
+    pub fn is_merged_open(&self, id: &str) -> bool {
+        self.arrangement.merged_open.contains(id)
+    }
+
+    /// Shows the merged worktrees under a folder workspace, or folds them
+    /// away.
+    pub fn toggle_merged(&mut self, id: &str) {
+        if !self.arrangement.merged_open.remove(id) {
+            if !self.arrangement.order.iter().any(|o| o == id) {
+                self.arrangement.order.push(id.to_owned());
+            }
+            self.arrangement.merged_open.insert(id.to_owned());
+        }
+        self.save_arrangement();
+    }
+
+    /// The selected workspace in a folded merged group (it merged, or a
+    /// terminal of it came to the front): the group opens once for it, so
+    /// the selection is in sight and not taken away.
+    fn reveal_selected(&mut self) {
+        let Some(i) = self.selected_index() else {
+            return;
+        };
+        let id = self.tasks[i].id();
+        if self.revealed.as_deref() == Some(id.as_str()) {
+            return;
+        }
+        if let Some(group) = self.merged_group(&self.tasks[i]) {
+            self.revealed = Some(id);
+            if !self.is_merged_open(&group) && !self.is_collapsed(&group) {
+                self.toggle_merged(&group);
+            }
+        }
+    }
+
     /// Takes a finished read. Returns whether anything changed.
     pub fn poll(&mut self) -> bool {
         let mut changed = false;
@@ -954,13 +1035,15 @@ impl Panel {
     /// Every workspace in your order: the pinned first, then the order you
     /// dragged them into, then the rest as they were made; each worktree
     /// whose repository a folder workspace holds right under that one, in
-    /// the same order among its siblings.
+    /// the same order among its siblings, the merged ones last (their
+    /// group).
     fn ordered(&self) -> Vec<Workspace> {
         let canon: Vec<&Workspace> = self.folders.iter().chain(self.worktrees.iter()).collect();
         let parents: Vec<Option<String>> = canon.iter().map(|w| self.parent_of(w)).collect();
         let key = |i: &usize| {
             let id = canon[*i].id();
             (
+                parents[*i].is_some() && self.done(canon[*i]),
                 !canon[*i].main,
                 !self.arrangement.pinned.contains(&id),
                 self.arrangement.position(&id),
@@ -1063,16 +1146,19 @@ impl Panel {
     }
 
     /// The workspaces with a row, in the list's order: every one but the
-    /// worktrees folded under their folder workspace (the selected one
-    /// stays, so you see where you are). Control-1 to 9 count these.
+    /// worktrees folded under their folder workspace, and the merged ones
+    /// in a folded group (the selected one stays, so you see where you
+    /// are). Control-1 to 9 count these.
     pub fn visible(&self) -> Vec<usize> {
         let selected = self.selected_index();
         (0..self.tasks.len())
             .filter(|i| {
+                let task = &self.tasks[*i];
                 selected == Some(*i)
-                    || self
-                        .parent_of(&self.tasks[*i])
-                        .is_none_or(|p| !self.is_collapsed(&p))
+                    || (self.parent_of(task).is_none_or(|p| !self.is_collapsed(&p))
+                        && self
+                            .merged_group(task)
+                            .is_none_or(|g| self.is_merged_open(&g)))
             })
             .collect()
     }
@@ -1253,6 +1339,7 @@ impl Panel {
         self.arrangement.pinned.remove(id);
         self.arrangement.titles.remove(id);
         self.arrangement.collapsed.remove(id);
+        self.arrangement.merged_open.remove(id);
         self.rebuild();
         self.save_folders();
         self.save_arrangement();
@@ -1324,15 +1411,15 @@ impl Panel {
 
     /// Puts the list in your order and nothing else: the pinned first,
     /// then the order you dragged them into, then the rest as they were
-    /// made. Nothing that happens in a terminal moves a row. Returns
+    /// made. Nothing that happens in a terminal moves a row; a worktree
+    /// that merged moves to its folder workspace's merged group. Returns
     /// whether the order changed.
     pub fn arrange(&mut self) -> bool {
         let arranged = self.ordered();
-        if arranged == self.tasks {
-            return false;
-        }
+        let changed = arranged != self.tasks;
         self.tasks = arranged;
-        true
+        self.reveal_selected();
+        changed
     }
 
     pub fn selected_index(&self) -> Option<usize> {
@@ -1358,14 +1445,38 @@ impl Panel {
         lines.extend((0..team.tasks.len()).map(|i| Line::TeamTask(tab, i)));
     }
 
+    /// The folder workspace whose merged group's line goes before the row
+    /// at `index`, by index: its first merged worktree's, while the folder
+    /// workspace is not folded itself.
+    fn group_starts_at(&self, index: usize) -> Option<usize> {
+        let group = self.merged_group(&self.tasks[index])?;
+        if self.is_collapsed(&group)
+            || index
+                .checked_sub(1)
+                .is_some_and(|before| self.merged_group(&self.tasks[before]) == Some(group.clone()))
+        {
+            return None;
+        }
+        self.by_id(&group)
+    }
+
     /// One row per workspace, as cmux and supacode have it: its sessions
     /// are the terminal's tabs, not rows here. The selected workspace's
-    /// team tasks follow it; a session no workspace holds gets a row.
+    /// team tasks follow it; a session no workspace holds gets a row. A
+    /// folder workspace's merged worktrees follow its active ones under a
+    /// line of their own, folded away until you open it.
     fn lines(&self, tabs: &[Tab]) -> Vec<Line> {
         let mut lines = Vec::new();
         let owner: Vec<Option<usize>> = tabs.iter().map(|t| task_of(&self.tasks, t)).collect();
         let selected = self.selected_index();
-        for task in self.visible() {
+        let visible = self.visible();
+        for task in 0..self.tasks.len() {
+            if let Some(group) = self.group_starts_at(task) {
+                lines.push(Line::Merged(group));
+            }
+            if !visible.contains(&task) {
+                continue;
+            }
             lines.push(if self.parent_of(&self.tasks[task]).is_some() {
                 Line::Child(task)
             } else {
@@ -1458,26 +1569,43 @@ impl Panel {
 
     /// The rows, for the self-test, in the order Control-1 to 9 count them:
     /// a worktree under a folder workspace as `>name`, a folder workspace
-    /// with its worktrees folded away as `name(+2)`.
+    /// with its worktrees folded away as `name(+2)`, and the line over its
+    /// merged worktrees as `~merged`, `~merged(+1)` while it hides one.
     pub fn report_tree(&self) -> String {
-        self.visible()
-            .into_iter()
-            .map(|i| {
-                let task = &self.tasks[i];
-                let title = self.title(task);
-                if self.parent_of(task).is_some() {
-                    return format!(">{title}");
-                }
-                let id = task.id();
-                let hidden = self.children(&id) - self.shown_children(&id);
-                if self.is_collapsed(&id) && hidden > 0 {
-                    format!("{title}(+{hidden})")
+        let visible = self.visible();
+        let mut out = Vec::new();
+        for i in 0..self.tasks.len() {
+            if let Some(group) = self.group_starts_at(i) {
+                let id = self.tasks[group].id();
+                let hidden = self
+                    .merged_under(&id)
+                    .iter()
+                    .filter(|m| !visible.contains(m))
+                    .count();
+                out.push(if hidden > 0 {
+                    format!("~merged(+{hidden})")
                 } else {
-                    title
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(",")
+                    "~merged".to_owned()
+                });
+            }
+            if !visible.contains(&i) {
+                continue;
+            }
+            let task = &self.tasks[i];
+            let title = self.title(task);
+            if self.parent_of(task).is_some() {
+                out.push(format!(">{title}"));
+                continue;
+            }
+            let id = task.id();
+            let hidden = self.children(&id) - self.shown_children(&id);
+            out.push(if self.is_collapsed(&id) && hidden > 0 {
+                format!("{title}(+{hidden})")
+            } else {
+                title
+            });
+        }
+        out.join(",")
     }
 
     /// How many of the worktrees under `id` have a row.
@@ -1526,8 +1654,8 @@ impl Panel {
 
     /// A region by the name a self-test script uses: `agents.new`,
     /// `agents.refresh`, `agents.task.0`, `agents.session.1`,
-    /// `agents.add.0`, `agents.menu.0`, `agents.fold.0`, `agents.blank`.
-    /// As last drawn.
+    /// `agents.add.0`, `agents.menu.0`, `agents.fold.0`, `agents.merged.0`
+    /// (by the folder workspace's index), `agents.blank`. As last drawn.
     pub fn named(&self, name: &str) -> Option<Viewport> {
         let rest = name.strip_prefix("agents.")?;
         let (kind, n) = rest.split_once('.').unwrap_or((rest, ""));
@@ -1541,6 +1669,7 @@ impl Panel {
             "blank" => Action::Blank,
             "menu" => Action::Menu(n),
             "fold" => Action::Fold(n),
+            "merged" => Action::Merged(n),
             _ => return None,
         };
         self.hits
@@ -1612,20 +1741,29 @@ impl Panel {
         let selected = self.selected_index();
         // The worktrees last under their folder workspace: the guide stops
         // at their middle.
+        // The merged group's line is on the guide too.
         let parent_at = |line: &Line| match line {
             Line::Child(i) => self.parent_of(&self.tasks[*i]),
+            Line::Merged(i) => Some(self.tasks[*i].id()),
             _ => None,
         };
         let mut last_child = std::collections::HashSet::new();
+        let mut last_group = std::collections::HashSet::new();
         for (n, line) in lines.iter().enumerate() {
-            if let Line::Child(i) = line {
+            if let Line::Child(i) | Line::Merged(i) = line {
                 let parent = parent_at(line);
                 let more = lines[n + 1..]
                     .iter()
                     .take_while(|l| !matches!(l, Line::Task(_)))
-                    .any(|l| matches!(l, Line::Child(_)) && parent_at(l) == parent);
+                    .any(|l| {
+                        matches!(l, Line::Child(_) | Line::Merged(_)) && parent_at(l) == parent
+                    });
                 if !more {
-                    last_child.insert(*i);
+                    if matches!(line, Line::Merged(_)) {
+                        last_group.insert(*i);
+                    } else {
+                        last_child.insert(*i);
+                    }
                 }
             }
         }
@@ -1727,6 +1865,10 @@ impl Panel {
                         theme,
                         out,
                     );
+                }
+                Line::Merged(index) => {
+                    let last = last_group.contains(index);
+                    self.draw_merged_line(*index, y, column, last, atlas, theme, out);
                 }
                 Line::Session(index) => {
                     let tab = &tabs[*index];
@@ -1943,6 +2085,97 @@ fn pr_colour(pr: &crate::project::worktree::PullRequest, theme: &Theme) -> [f32;
 }
 
 impl Panel {
+    /// The line over the merged worktrees under the folder workspace at
+    /// `index`, after its active ones: on their guide (`last` when nothing
+    /// under it has a row), a chevron like the folder's and `Merged · N`.
+    /// A click shows or hides them; its menu cleans them all up.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_merged_line(
+        &mut self,
+        index: usize,
+        y: f32,
+        column: Viewport,
+        last: bool,
+        atlas: &mut Atlas,
+        theme: &Theme,
+        out: &mut Vec<GlyphInstance>,
+    ) {
+        let id = self.tasks[index].id();
+        let count = self.merged_under(&id).len();
+        let open = self.is_merged_open(&id);
+        let row = Viewport {
+            x: column.x + 6.0 + INDENT,
+            y: y + 1.0,
+            width: (column.width - 12.0 - INDENT).max(0.0),
+            height: ROW - 2.0,
+        };
+        let guide_x = column.x + 6.0 + 10.0 + 8.0;
+        let guide = layout::faded(theme.gutter_text, 0.45);
+        let mid = (y + ROW * 0.5).round();
+        layout::push_rect(
+            out,
+            atlas,
+            [guide_x - 0.5, y],
+            [1.0, if last { mid - y } else { ROW }],
+            guide,
+        );
+        layout::push_rect(
+            out,
+            atlas,
+            [guide_x - 0.5, mid],
+            [row.x + 2.0 - guide_x, 1.0],
+            guide,
+        );
+        let over = layout::hovered(row);
+        if over {
+            layout::push_rounded_rect(out, row, layout::UI_RADIUS, theme.row_hover);
+        }
+        let left = row.x + 10.0;
+        let line = Viewport {
+            x: left,
+            y: row.y + 2.0,
+            width: (row.width - 20.0).max(0.0),
+            height: 20.0,
+        };
+        layout::push_icon_centered(
+            out,
+            atlas,
+            Viewport {
+                x: left,
+                y: line.y + 1.0,
+                width: 16.0,
+                height: 20.0,
+            },
+            if open {
+                icons::CHEVRON_DOWN
+            } else {
+                icons::CHEVRON_RIGHT
+            },
+            if over { theme.text } else { theme.gutter_text },
+        );
+        layout::push_ui_text(
+            out,
+            atlas,
+            Viewport {
+                x: left + 22.0,
+                width: (line.width - 22.0).max(0.0),
+                ..line
+            },
+            &format!("Merged \u{b7} {count}"),
+            if over { theme.text } else { theme.status_text },
+        );
+        let tip = if open {
+            "Hide the merged worktrees".to_owned()
+        } else {
+            format!(
+                "Show {count} merged worktree{}",
+                if count == 1 { "" } else { "s" }
+            )
+        };
+        layout::hotspot(row, layout::Cursor::Pointing, Some(&tip));
+        self.hits.push((row, Action::Merged(index)));
+    }
+
     /// A workspace's row: its icon (a spinner while an agent in it says it
     /// is working), its name, and under it the most useful line there is:
     /// what a session waiting on you asks, what a working agent says, its
@@ -2556,9 +2789,105 @@ mod tests {
             .filter_map(|line| match line {
                 Line::Task(i) => Some(panel.tasks[*i].id()),
                 Line::Child(i) => Some(format!(">{}", panel.tasks[*i].id())),
+                Line::Merged(i) => Some(format!("~{}", panel.tasks[*i].id())),
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn merged_worktrees_fold_into_a_group_after_the_active_ones() {
+        let mut panel = nested();
+        let ids = |p: &Panel| p.tasks.iter().map(Workspace::id).collect::<Vec<_>>();
+        let merge = |p: &mut Panel, path: &str| {
+            let w = p.worktrees.iter_mut().find(|w| w.path == Path::new(path));
+            w.unwrap().merged = true;
+        };
+        // /w/a is merged: it moves after its active sibling, into the
+        // group, folded; a merged worktree no folder holds stays a row.
+        merge(&mut panel, "/w/a");
+        merge(&mut panel, "/elsewhere/x");
+        assert!(panel.arrange());
+        assert_eq!(
+            ids(&panel),
+            [
+                "folder:garden-log",
+                "/w/b",
+                "/w/a",
+                "folder:notes",
+                "/elsewhere/x"
+            ]
+        );
+        assert_eq!(panel.merged_under("folder:garden-log"), [2]);
+        assert_eq!(
+            rows(&panel),
+            [
+                "folder:garden-log",
+                ">/w/b",
+                "~folder:garden-log",
+                "folder:notes",
+                "/elsewhere/x"
+            ]
+        );
+        // Folded: no row and no number for it.
+        assert_eq!(panel.visible(), [0, 1, 3, 4]);
+        assert_eq!(panel.report_tree(), "garden-log,>b,~merged(+1),notes,x");
+        panel.toggle_merged("folder:garden-log");
+        assert_eq!(panel.visible(), [0, 1, 2, 3, 4]);
+        assert_eq!(panel.report_tree(), "garden-log,>b,~merged,>a,notes,x");
+        panel.toggle_merged("folder:garden-log");
+        // The folder folded: no group line either.
+        panel.toggle_collapsed("folder:garden-log");
+        assert_eq!(
+            rows(&panel),
+            ["folder:garden-log", "folder:notes", "/elsewhere/x"]
+        );
+        panel.toggle_collapsed("folder:garden-log");
+
+        // The selected worktree merges: it stays selected, and the group
+        // opens so it is still in sight.
+        panel.selected = Some("/w/b".into());
+        panel.arrange();
+        merge(&mut panel, "/w/b");
+        panel.arrange();
+        assert_eq!(panel.selected.as_deref(), Some("/w/b"));
+        assert!(panel.is_merged_open("folder:garden-log"));
+        assert_eq!(panel.report_tree(), "garden-log,~merged,>a,>b,notes,x");
+        // Folded again by hand, it stays folded; the selected row keeps
+        // its place under the line.
+        panel.toggle_merged("folder:garden-log");
+        panel.arrange();
+        assert!(!panel.is_merged_open("folder:garden-log"));
+        assert_eq!(panel.report_tree(), "garden-log,~merged(+1),>b,notes,x");
+        // A pull request merged on GitHub counts too.
+        let mut fresh = nested();
+        fresh.info.insert(
+            PathBuf::from("/w/b"),
+            Info {
+                ahead: 0,
+                pull_request: Some(crate::project::worktree::PullRequest {
+                    state: "MERGED".into(),
+                    ..Default::default()
+                }),
+            },
+        );
+        fresh.arrange();
+        assert_eq!(fresh.report_tree(), "garden-log,>a,~merged(+1),notes,x");
+    }
+
+    #[test]
+    fn the_merged_fold_survives_the_arrangement_file() {
+        let mut a = Arrangement {
+            order: vec!["ws:1".into()],
+            ..Arrangement::default()
+        };
+        a.collapsed.insert("ws:1".into());
+        a.merged_open.insert("ws:1".into());
+        let text = a.text();
+        assert_eq!(text, "fold,merged\tws:1\t\n");
+        assert_eq!(Arrangement::parse(&text), a);
+        a.rename_id("ws:1", "ws:2");
+        assert!(a.merged_open.contains("ws:2"));
     }
 
     #[test]

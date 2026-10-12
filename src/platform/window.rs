@@ -3904,6 +3904,11 @@ define_class!(
             self.agent_prune();
         }
 
+        #[unsafe(method(agentCleanUpMerged:))]
+        fn action_agent_clean_up_merged(&self, _sender: Option<&AnyObject>) {
+            self.agent_clean_up_merged();
+        }
+
         /// Shows the terminal with the keyboard, or hides it when it has
         /// the keyboard already. Its sessions keep running while hidden.
         #[unsafe(method(toggleTerminal:))]

@@ -126,7 +126,8 @@ grep -q "^message: Started again 4 terminals" "$T/side-other.out" \
 # folds the worktrees away, which Control-1 to 9 then skip, and the fold
 # is kept; the branch name selects a worktree. A file written in a worktree
 # from a shell turns its row to writing. Review shows the branch against
-# main; once main takes it, the strip says merged and Clean up removes it
+# main; once main takes it, the strip says merged, its row folds away under
+# a Merged line that opens to show it, and Clean up removes it
 # (refused while it has uncommitted work) with its branch. SELFTEST_FRAMES, when set, is a folder
 # to keep the frames in.
 GD="$T/garden"
@@ -191,6 +192,10 @@ click @inspector.refresh
 wait 1200
 dump $T/garden-merged.out
 frame $T/garden-merged.bmp
+click @agents.merged.0
+wait 300
+dump $T/garden-merged-open.out
+frame $T/garden-merged-open.bmp
 click @inspector.worktree_cleanup.0
 wait 500
 dump $T/garden-dirty.out
@@ -213,7 +218,7 @@ mkdir -p "$T/home/garden"
 HOME="$T/home/garden" CRC_TERMINAL_SHELL=/bin/sh CRC_SELFTEST="$T/garden.script" \
     "$BIN" "$GD" 2> "$T/garden.err"
 [ -z "${SELFTEST_FRAMES:-}" ] || cp -f "$T/garden-frame.bmp" "$T/garden-writing.bmp" \
-    "$T/garden-review.bmp" "$T/garden-merged.bmp" "$SELFTEST_FRAMES/"
+    "$T/garden-review.bmp" "$T/garden-merged.bmp" "$T/garden-merged-open.bmp" "$SELFTEST_FRAMES/"
 expect "$T/garden.out" agents_tree "garden,>fix/seed-dates,>feat/compost-log"
 expect "$T/garden.out" inspector "branch=main base=- ahead=0 behind=0 upstream=- push=0 pull=0 dirty=0 changes=+0-0 tag=- buttons=push worktrees=fix/seed-dates:ahead=1:+3-0:files=1,feat/compost-log:ahead=0:+0-0:files=0"
 expect "$T/garden-terminal.out" agents "on tasks=garden,fix/seed-dates,feat/compost-log selected=feat/compost-log sessions=garden,*feat/compost-log claude=0 pair=- op=-"
@@ -223,8 +228,9 @@ expect "$T/garden.out" agents_activity "fix/seed-dates=commit,feat/compost-log=c
 # agent run from another session would): its watcher sees it.
 expect "$T/garden-writing.out" agents_activity "fix/seed-dates=writing,feat/compost-log=commit"
 expect "$T/garden-folded.out" agents_tree "garden(+2)"
-# The fold at the end is kept for the next launch.
-grep -q "^fold	" "$T/home/garden/Library/Application Support/crc/agents/order" 2>/dev/null \
+# The fold at the end is kept for the next launch (beside the merged
+# group's, opened above).
+grep -q "^fold[,	]" "$T/home/garden/Library/Application Support/crc/agents/order" 2>/dev/null \
     || failed "garden: the fold was not kept: $(cat "$T/home/garden/Library/Application Support/crc/agents/order" 2>/dev/null)"
 # Folded, there is no second row for Control-2 to pick.
 expect "$T/garden-ctrl2.out" agents "on tasks=garden,fix/seed-dates,feat/compost-log selected=garden sessions=*garden,feat/compost-log claude=0 pair=- op=-"
@@ -238,11 +244,16 @@ esac
 # file and the one written from a shell (not yet committed) both there.
 expect "$T/garden-review.out" review_page "open sessions=1 files=2 hunks=1 shown=dates.txt confirm=false targets=4 base=main"
 # main takes the branch: it is merged now. The other worktree, never
-# committed to, is on main too but not done.
+# committed to, is on main too but not done. The strips follow the list,
+# where the merged one has moved last.
 case "$(grep '^inspector:' "$T/garden-merged.out")" in
-*"worktrees=fix/seed-dates:ahead=0:+0-0:files=0:merged,feat/compost-log:ahead=0:+0-0:files=0") ;;
+*"worktrees=feat/compost-log:ahead=0:+0-0:files=0,fix/seed-dates:ahead=0:+0-0:files=0:merged") ;;
 *) failed "garden: merged strips are $(grep '^inspector:' "$T/garden-merged.out")" ;;
 esac
+# The merged one leaves the list for a folded line after the active ones;
+# the line opens to show it.
+expect "$T/garden-merged.out" agents_tree "garden,>feat/compost-log,~merged(+1)"
+expect "$T/garden-merged-open.out" agents_tree "garden,>feat/compost-log,~merged,>fix/seed-dates"
 # Clean up refuses while the worktree has a file Git would lose.
 grep -q "^message: fix/seed-dates has uncommitted changes; commit or discard them first" "$T/garden-dirty.out" \
     || failed "garden: clean up of a dirty worktree: $(grep '^message:' "$T/garden-dirty.out")"

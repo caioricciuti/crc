@@ -373,6 +373,13 @@ impl EditorView {
                     state.agents.toggle_collapsed(&id);
                 }
             }
+            Action::Merged(index) => {
+                if let Some(mut state) = self.state_mut()
+                    && let Some(id) = state.agents.tasks.get(index).map(|t| t.id())
+                {
+                    state.agents.toggle_merged(&id);
+                }
+            }
             Action::NewSession(index) => {
                 let Some(dir) = self.task_path(index) else {
                     return;
@@ -677,6 +684,19 @@ impl EditorView {
                     state.agents.target = None;
                 }
                 self.task_menu(index)
+            }
+            Some(Action::Merged(index)) => {
+                if let Some(mut state) = self.state_mut() {
+                    state.agents.menu_task = state.agents.tasks.get(index).map(|t| t.id());
+                    state.agents.target = None;
+                }
+                let menu = context_menu_new(mtm);
+                menu.addItem(&menu_item(
+                    mtm,
+                    "Clean Up All Merged\u{2026}",
+                    sel!(agentCleanUpMerged:),
+                ));
+                menu
             }
             _ => {
                 let menu = context_menu_new(mtm);
@@ -1104,6 +1124,144 @@ impl EditorView {
             state.agents.menu_task = Some(path.to_string_lossy().into_owned());
         }
         self.agent_remove();
+    }
+
+    /// The merged group's Clean Up All Merged: Clean up on each merged
+    /// worktree under the folder workspace, asked once. One with
+    /// uncommitted changes is skipped, as Clean up refuses it, and counted.
+    pub(super) fn agent_clean_up_merged(&self) {
+        let Some(parent) = self.menu_task() else {
+            return;
+        };
+        let found: Vec<_> = self.state().map_or_else(Vec::new, |state| {
+            let agents = &state.agents;
+            agents
+                .merged_under(&parent.id())
+                .into_iter()
+                .filter_map(|i| {
+                    let t = &agents.tasks[i];
+                    let pr_head = agents
+                        .info
+                        .get(&t.path)
+                        .and_then(|i| i.pull_request.as_ref())
+                        .filter(|pr| pr.state == "MERGED")
+                        .map(|pr| pr.head_oid.clone());
+                    Some((
+                        t.id(),
+                        t.worktree()?,
+                        t.repo.clone()?,
+                        t.base.clone(),
+                        pr_head,
+                    ))
+                })
+                .collect()
+        });
+        if found.is_empty() {
+            return;
+        }
+        let worktrees = |n: usize| {
+            if n == 1 {
+                "1 merged worktree".to_owned()
+            } else {
+                format!("{n} merged worktrees")
+            }
+        };
+        let yes = if std::env::var_os("CRC_SELFTEST").is_some() {
+            true
+        } else {
+            ask(
+                MainThreadMarker::from(self),
+                &format!("Clean up {}?", worktrees(found.len())),
+                "Their sessions are closed, and their folders and branches deleted. One with uncommitted changes is skipped.",
+                &["Clean Up", "Cancel"],
+            ) == 0
+        };
+        if !yes {
+            return;
+        }
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
+        // Dirty worktrees are skipped before anything closes.
+        let mut skipped = 0;
+        let mut clean = Vec::new();
+        for item in found {
+            match crate::project::worktree::is_dirty(&item.1.path) {
+                Ok(false) => clean.push(item),
+                Ok(true) | Err(_) => skipped += 1,
+            }
+        }
+        if clean.is_empty() {
+            state.say(
+                layout::Feedback::Failure,
+                format!(
+                    "Nothing cleaned up: {} uncommitted changes",
+                    if skipped == 1 {
+                        "1 merged worktree has".to_owned()
+                    } else {
+                        format!("{skipped} merged worktrees have")
+                    }
+                ),
+            );
+            drop(state);
+            self.request_redraw();
+            return;
+        }
+        let ids: Vec<String> = clean.iter().map(|c| c.0.clone()).collect();
+        let sessions: Vec<usize> = {
+            let tasks = &state.agents.tasks;
+            (0..state.terminal.tabs.len())
+                .filter(|i| {
+                    let tab = &state.terminal.tabs[*i];
+                    task_of(tasks, tab).is_some_and(|t| ids.contains(&tasks[t].id()))
+                        || clean.iter().any(|c| tab.folder.starts_with(&c.1.path))
+                })
+                .collect()
+        };
+        for index in sessions.into_iter().rev() {
+            state.terminal.close_tab(index);
+        }
+        if state
+            .agents
+            .selected
+            .as_ref()
+            .is_some_and(|s| ids.contains(s))
+        {
+            state.agents.selected = Some(parent.id());
+        }
+        let count = clean.len();
+        state.agents.start(
+            &format!("Cleaning up {}\u{2026}", worktrees(count)),
+            move || {
+                let failed: Vec<String> = clean
+                    .iter()
+                    .filter_map(|(_, tree, main, base, pr_head)| {
+                        crate::project::worktree::remove(
+                            main,
+                            tree,
+                            base.as_deref(),
+                            pr_head.as_deref(),
+                        )
+                        .err()
+                    })
+                    .collect();
+                let mut said = format!("Cleaned up {}", worktrees(count - failed.len()));
+                if skipped > 0 {
+                    said.push_str(&format!("; skipped {skipped} with uncommitted changes"));
+                }
+                if failed.is_empty() {
+                    Ok(Done {
+                        said,
+                        start_in: None,
+                    })
+                } else {
+                    Err(format!("{said}; {}", failed.join("; ")))
+                }
+            },
+        );
+        drop(state);
+        self.after_terminal_layout();
+        self.resume_display_link();
     }
 
     /// A folder workspace's Prune: Git forgets the worktrees of its
