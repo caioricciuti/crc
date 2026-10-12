@@ -65,7 +65,7 @@ struct Args {
 }
 
 impl Args {
-    const FLAGS: [&str; 7] = [
+    const FLAGS: [&str; 8] = [
         "--atlas-stress",
         "--tab-stress",
         "--reuse-edit",
@@ -73,6 +73,7 @@ impl Args {
         "--find",
         "--select-query",
         "--git",
+        "--diagnostics",
     ];
     const VALUES: [&str; 3] = ["--window-width", "--project-root", "--scroll"];
 
@@ -289,6 +290,31 @@ fn main() -> std::io::Result<()> {
                 &mut glyphs,
             );
         });
+    // Diagnostics as the editor marks them: an error and a warning under
+    // words of the sample, and a hint under one character.
+    if args.flag("--diagnostics") {
+        let active = docs.active();
+        let text = active.rope.to_string();
+        let mut marks = Vec::new();
+        for (word, color) in [
+            ("word_counts", theme.diff_removed),
+            ("HashMap::new()", theme.syn_constant),
+            ("take", theme.status_text),
+        ] {
+            if let Some(at) = text.find(word) {
+                marks.push((at..at + word.len(), color));
+            }
+        }
+        layout::push_underlines(
+            &mut glyphs,
+            &renderer.atlas,
+            active,
+            viewport,
+            &rows,
+            &marks,
+        );
+        println!("diagnostics {} squiggles", marks.len());
+    }
     // Export the first frame after an unrelated newline edit, proving that
     // the native paragraph survives a row shift without a fallback frame.
     if args.flag("--reuse-edit") {

@@ -724,8 +724,10 @@ impl EditorView {
                     .and_then(|w| agents.info.get(&w.path))
                     .map(|info| info.pull_request.clone());
                 let github = agents.github.unwrap_or(false);
+                let repos = selected.as_ref().and_then(|w| agents.repos_of(w));
                 agents.inspector.draw(
                     selected.as_ref(),
+                    repos.as_deref(),
                     pull_request.as_ref().map(Option::as_ref),
                     github,
                     &mut renderer.atlas,
@@ -973,8 +975,8 @@ impl EditorView {
                 repos: repo_list.as_deref(),
                 mcp_url: *mcp_url_prompt,
                 task: *task_prompt,
-                task_folder: agents.repo.as_deref().or(tree.root()),
-                task_repo: agents.repo.is_some(),
+                task_folder: agents.new_folder(tree.root()),
+                task_repo: agents.task_repo(),
                 task_rename: agents.renaming_name(),
                 commit: commit_prompt.as_deref(),
             };

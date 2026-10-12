@@ -122,28 +122,32 @@ the size and write it back.
   what a session waiting on you asks, what a working agent says, or its
   terminals and branch; at the right how many wait on you and its pull
   request, coloured by its checks. The terminal's tabs are the selected
-  workspace's sessions. Every Git worktree of the open repository is
-  one, and New Workspace (`Cmd-Shift-N`) adds one on any folder, or, in
-  a repository, a task on a new branch in a worktree under
-  `~/Library/Application Support/crc/worktrees/`; both open a terminal
-  in it. Every terminal belongs to a workspace: outside a repository the
-  open folder becomes one, named after it, and a double-click on the
-  empty part of the list makes another with a terminal. Drag a
+  workspace's sessions. The list is one for the whole app, not the
+  folder open in the editor. New Workspace (`Cmd-Shift-N`) adds one on
+  a folder you choose, or on the selected workspace's folder, or starts
+  a task on a new branch of its repository in a worktree under
+  `~/Library/Application Support/crc/worktrees/`; each opens a terminal
+  in it. A workspace holds the Git repositories in its folder (the
+  folder itself and the folders directly in it), and their worktrees
+  are listed too. Every terminal belongs to a workspace: the first time,
+  the open folder becomes one, named after it, and a double-click on
+  the empty part of the list makes another with a terminal. Drag a
   workspace to reorder the list, pin one to keep it on top, and
   double-click one to rename it in place (a worktree keeps its branch);
-  the order, pins and names are kept per project. `Cmd-N` in Agents
-  mode is New Workspace. Terminals run your login
+  the order, pins and names are kept. `Cmd-N` in Agents mode is New
+  Workspace. Terminals run your login
   shell; type `claude` to start Claude Code. `Cmd-T` (or the tab bar's
   +) opens another terminal in the selected workspace; `Ctrl-1..9` show
   a workspace and `Cmd-Shift-U` the next session waiting on you, which
-  the Dock icon counts. The list puts what needs you first, after the
-  main checkout: a session waiting on you, then failing checks, then a
-  pull request ready to merge; it is read again every minute.
+  the Dock icon counts. The list puts what needs you first: a session
+  waiting on you, then failing checks, then a pull request ready to
+  merge; it is read again every minute.
 - **The workspace inspector** (right of the terminal in Agents mode,
-  `Cmd-Option-I` to hide or show it) says where the selected
-  workspace's branch stands: commits ahead of and behind main, the lines
-  it changes, what is left to push or pull, and its uncommitted files;
-  for the main checkout, the latest tag and the commits since. Its
+  `Cmd-Option-I` to hide or show it) says where each repository of the
+  selected workspace stands, one card each: commits ahead of and behind
+  main, the lines it changes, what is left to push or pull, and its
+  uncommitted files; for a main checkout, the latest tag and the
+  commits since. Each card's buttons act on its own repository. The
   buttons commit everything (the message is typed in the palette),
   merge main into the branch (a merge, never a rebase; on a conflict
   nothing changes), pull (fast-forward only) and push. With `gh`

@@ -601,7 +601,8 @@ impl EditorView {
                         state
                             .agents
                             .selected_index()
-                            .map(|i| state.agents.tasks[i].path.as_path()),
+                            .and_then(|i| state.agents.repos_of(&state.agents.tasks[i]))
+                            .as_deref(),
                     ),
                     state.agents.report_teams(&state.terminal.tabs),
                     active_conflicts(&state).map_or("none".to_string(), |v| format!(

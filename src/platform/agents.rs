@@ -1,7 +1,9 @@
 //! Agents mode: the terminal takes the editor column and the sidebar lists
-//! workspaces, each with the sessions running in it: one per worktree of the
-//! open repository, read from Git, and the ones added by hand on any folder.
-//! The toolbar's Editor / Agents switch (Cmd-Shift-A) flips between the two;
+//! workspaces, each with the sessions running in it: the ones made by hand
+//! on a folder, and the worktrees of the Git repositories those folders
+//! hold (the folder itself and its direct children), read from Git. The
+//! list is one for the whole app, not the editor's open folder. The
+//! toolbar's Editor / Agents switch (Cmd-Shift-A) flips between the two;
 //! nothing stops when it does. The code calls a workspace a task where it
 //! grew up as one.
 
@@ -40,9 +42,13 @@ pub enum Action {
     Menu(usize),
 }
 
-/// Worktrees read on a worker: the main checkout they are for, and the list
-/// with every path resolved.
-type Listing = (PathBuf, Result<Vec<Worktree>, String>);
+/// What a worker read of the folder workspaces: per folder workspace (by
+/// id), the repositories in it; and the worktrees of those repositories
+/// other than their main checkouts, every path resolved.
+struct Listing {
+    repos: Vec<(String, Vec<PathBuf>)>,
+    worktrees: Vec<Workspace>,
+}
 
 /// A place to work: a folder, and the sessions started in it. A worktree
 /// of the open repository is one (named by its branch), and any folder
@@ -61,10 +67,15 @@ pub struct Workspace {
     /// A folder workspace's own id, made once and kept through renames, so
     /// a new workspace never takes a removed one's name, pin or sessions.
     pub key: String,
+    /// A worktree's repository: its main checkout, where branches are made,
+    /// merged and removed.
+    pub repo: Option<PathBuf>,
+    /// The main checkout's branch, which a worktree's is compared with.
+    pub base: Option<String>,
 }
 
 impl Workspace {
-    fn of(worktree: Worktree) -> Workspace {
+    fn of(worktree: Worktree, repo: Option<PathBuf>, base: Option<String>) -> Workspace {
         Workspace {
             name: worktree.name(),
             path: worktree.path,
@@ -72,6 +83,8 @@ impl Workspace {
             main: worktree.main,
             folder: false,
             key: String::new(),
+            repo,
+            base,
         }
     }
 
@@ -99,17 +112,127 @@ impl Workspace {
     }
 }
 
-/// Where a project's folder workspaces are kept, by its root.
-fn folders_file(root: &Path) -> Option<PathBuf> {
-    use std::os::unix::ffi::OsStrExt;
-    let key = crate::platform::fnv1a(root.as_os_str().as_bytes());
-    Some(crate::platform::app_support()?.join(format!("agents/{key:016x}.workspaces")))
+/// Where the folder workspaces are kept.
+fn folders_file() -> Option<PathBuf> {
+    Some(crate::platform::app_support()?.join("agents/workspaces"))
 }
 
-/// Where a project's arrangement is kept: the order you dragged the
-/// workspaces into, which are pinned, and their own names.
-fn order_file(root: &Path) -> Option<PathBuf> {
-    folders_file(root).map(|f| f.with_extension("order"))
+/// Where the arrangement is kept: the order you dragged the workspaces
+/// into, which are pinned, and their own names.
+fn order_file() -> Option<PathBuf> {
+    Some(crate::platform::app_support()?.join("agents/order"))
+}
+
+/// The per-project files kept before the list was one for the app, with
+/// `extension` (`workspaces` or `order`), by name. Read once, to carry
+/// them over; left in place.
+fn per_project_files(extension: &str) -> Vec<String> {
+    let Some(dir) = crate::platform::app_support().map(|d| d.join("agents")) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == extension))
+        .collect();
+    files.sort();
+    files
+        .iter()
+        .filter_map(|f| std::fs::read_to_string(f).ok())
+        .collect()
+}
+
+/// Every project's folder workspaces in one list. A key two projects both
+/// had (`folder:crc` from before keys) is kept by the first; the other gets
+/// its own, and its sessions find it by their folder.
+fn merge_folders(texts: &[String]) -> Vec<Workspace> {
+    let mut out: Vec<Workspace> = Vec::new();
+    for text in texts {
+        for mut w in parse_folders(text) {
+            if out.iter().any(|o| o.key == w.key && o.path == w.path) {
+                continue;
+            }
+            if out.iter().any(|o| o.key == w.key) {
+                w.key = new_key(&out);
+            }
+            out.push(w);
+        }
+    }
+    out
+}
+
+/// Every project's arrangement in one, the first place of an id kept.
+fn merge_arrangements(texts: &[String]) -> Arrangement {
+    let mut out = Arrangement::parse(&texts.concat());
+    let mut seen = std::collections::HashSet::new();
+    out.order.retain(|id| seen.insert(id.clone()));
+    out
+}
+
+/// The Git repositories a folder holds: itself, then its direct children
+/// by name. Hidden folders are skipped.
+pub fn discover(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    if dir.join(".git").exists() {
+        found.push(dir.to_path_buf());
+    }
+    let mut children: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+        .map(|e| e.path())
+        .filter(|p| p.is_dir() && p.join(".git").exists())
+        .collect();
+    children.sort();
+    found.extend(children);
+    found
+}
+
+/// Reads what the folder workspaces hold, on the calling thread: their
+/// repositories, and each repository's worktrees once.
+fn scan(folders: &[(String, PathBuf)]) -> Listing {
+    let mut repos = Vec::new();
+    let mut worktrees: Vec<Workspace> = Vec::new();
+    let mut mains: Vec<PathBuf> = Vec::new();
+    for (id, dir) in folders {
+        let found: Vec<PathBuf> = discover(dir)
+            .iter()
+            .map(|p| crate::platform::canonical(p))
+            .collect();
+        for repo in &found {
+            let Ok(list) = crate::project::worktree::list(repo) else {
+                continue;
+            };
+            let list: Vec<Worktree> = list
+                .into_iter()
+                .map(|mut w| {
+                    w.path = crate::platform::canonical(&w.path);
+                    w
+                })
+                .collect();
+            let Some(main) = list.iter().find(|w| w.main).cloned() else {
+                continue;
+            };
+            if mains.contains(&main.path) {
+                continue;
+            }
+            mains.push(main.path.clone());
+            for w in list.into_iter().filter(|w| !w.main) {
+                if !worktrees.iter().any(|t| t.path == w.path) {
+                    worktrees.push(Workspace::of(
+                        w,
+                        Some(main.path.clone()),
+                        main.branch.clone(),
+                    ));
+                }
+            }
+        }
+        repos.push((id.clone(), found));
+    }
+    Listing { repos, worktrees }
 }
 
 /// What the list keeps of your arrangement, per workspace id.
@@ -231,6 +354,8 @@ fn parse_folders(text: &str) -> Vec<Workspace> {
             main: false,
             folder: true,
             key,
+            repo: None,
+            base: None,
         })
         .collect()
 }
@@ -344,11 +469,13 @@ impl Team {
 pub struct Panel {
     /// Agents mode is on: the terminal has the column, this the sidebar.
     pub on: bool,
-    /// The main checkout the worktrees belong to.
-    pub repo: Option<PathBuf>,
-    /// The project root the folder workspaces are kept for.
-    root: Option<PathBuf>,
-    /// Every workspace, worktrees first, then the folder ones.
+    /// The kept workspaces were read; until then nothing is written over
+    /// them.
+    loaded: bool,
+    /// Per folder workspace (by id), the repositories found in it, once
+    /// read.
+    pub repos: std::collections::HashMap<String, Vec<PathBuf>>,
+    /// Every workspace, the folder ones first, then the worktrees in them.
     pub tasks: Vec<Workspace>,
     worktrees: Vec<Workspace>,
     pub folders: Vec<Workspace>,
@@ -359,8 +486,9 @@ pub struct Panel {
     pub menu_session: Option<usize>,
     /// The folder workspace the palette is renaming, by id.
     pub renaming: Option<String>,
-    /// A failed read or operation, said under the header.
-    pub note: Option<String>,
+    /// The repository an inspector button acts on, when the workspace has
+    /// several; taken by the operation.
+    pub target: Option<PathBuf>,
     rx: Option<mpsc::Receiver<Listing>>,
     /// Per task path, once read.
     pub info: std::collections::HashMap<PathBuf, Info>,
@@ -471,57 +599,37 @@ pub fn folder_task(tasks: &[Workspace], folder: &Path) -> Option<usize> {
 }
 
 impl Panel {
-    /// Reads the worktrees of the repository `dir` is in, on a worker, and
-    /// the folder workspaces kept for it.
-    pub fn refresh(&mut self, dir: &Path) {
+    /// Reads the kept workspaces once, then on a worker the repositories
+    /// in each folder workspace and their worktrees.
+    pub fn refresh(&mut self) {
         self.refreshed_at = Some(std::time::Instant::now());
         self.inspector.invalidate();
         if self.github.is_none() {
             self.github = Some(crate::project::worktree::has_gh());
         }
-        let root = crate::platform::canonical(dir);
-        if self.root.as_deref() != Some(root.as_path()) {
-            self.folders = folders_file(&root)
-                .and_then(|file| std::fs::read_to_string(file).ok())
-                .map(|text| parse_folders(&text))
-                .unwrap_or_default();
-            self.arrangement = order_file(&root)
-                .and_then(|file| std::fs::read_to_string(file).ok())
-                .map(|text| Arrangement::parse(&text))
-                .unwrap_or_default();
-            self.root = Some(root);
-            self.rebuild();
+        if !self.loaded {
+            self.load();
         }
+        let folders: Vec<(String, PathBuf)> = self
+            .folders
+            .iter()
+            .map(|f| (f.id(), f.path.clone()))
+            .collect();
         let (tx, rx) = mpsc::channel();
         let (info_tx, info_rx) = mpsc::channel();
-        let dir = dir.to_path_buf();
         std::thread::spawn(move || {
-            let listing = crate::project::worktree::list(&dir).map(|list| {
-                list.into_iter()
-                    .map(|mut w| {
-                        w.path = crate::platform::canonical(&w.path);
-                        w
-                    })
-                    .collect::<Vec<_>>()
-            });
-            let main = match &listing {
-                Ok(list) => list
-                    .iter()
-                    .find(|w| w.main)
-                    .map_or_else(|| dir.clone(), |w| w.path.clone()),
-                Err(_) => dir,
-            };
-            let tasks = listing.as_ref().map_or_else(|_| Vec::new(), Clone::clone);
-            let _ = tx.send((main.clone(), listing));
+            let listing = scan(&folders);
+            let tasks = listing.worktrees.clone();
+            let _ = tx.send(listing);
             // Then what each row says, slower: `gh` asks GitHub. A test
             // instance does not.
             let ask_github = std::env::var_os("CRC_SELFTEST").is_none();
-            for task in tasks.into_iter().filter(|t| !t.main) {
-                let Some(branch) = &task.branch else {
+            for task in tasks {
+                let (Some(branch), Some(main)) = (&task.branch, &task.repo) else {
                     continue;
                 };
                 let info = Info {
-                    ahead: crate::project::worktree::ahead(&main, branch).unwrap_or(0),
+                    ahead: crate::project::worktree::ahead(main, branch).unwrap_or(0),
                     pull_request: ask_github
                         .then(|| crate::project::worktree::pull_request(&task.path, branch))
                         .flatten(),
@@ -533,6 +641,30 @@ impl Panel {
         });
         self.rx = Some(rx);
         self.info_rx = Some(info_rx);
+    }
+
+    /// The kept workspaces and arrangement; the first time, every
+    /// project's from before the list was one, carried over.
+    fn load(&mut self) {
+        self.loaded = true;
+        match folders_file().and_then(|f| std::fs::read_to_string(f).ok()) {
+            Some(text) => {
+                self.folders = parse_folders(&text);
+                self.arrangement = order_file()
+                    .and_then(|f| std::fs::read_to_string(f).ok())
+                    .map(|text| Arrangement::parse(&text))
+                    .unwrap_or_default();
+            }
+            None => {
+                self.folders = merge_folders(&per_project_files("workspaces"));
+                self.arrangement = merge_arrangements(&per_project_files("order"));
+                if !self.folders.is_empty() {
+                    self.save_folders();
+                    self.save_arrangement();
+                }
+            }
+        }
+        self.rebuild();
     }
 
     /// Takes a finished read. Returns whether anything changed.
@@ -560,28 +692,17 @@ impl Panel {
         let Some(rx) = &self.rx else {
             return false;
         };
-        let Ok((main, listing)) = rx.try_recv() else {
-            return false;
+        let listing = match rx.try_recv() {
+            Ok(listing) => listing,
+            Err(mpsc::TryRecvError::Empty) => return false,
+            Err(mpsc::TryRecvError::Disconnected) => Listing {
+                repos: Vec::new(),
+                worktrees: self.worktrees.clone(),
+            },
         };
         self.rx = None;
-        match listing {
-            Ok(tasks) => {
-                self.repo = Some(main);
-                self.worktrees = tasks.into_iter().map(Workspace::of).collect();
-                if self
-                    .note
-                    .as_deref()
-                    .is_some_and(|n| n.starts_with("No Git"))
-                {
-                    self.note = None;
-                }
-            }
-            Err(_) => {
-                self.repo = None;
-                self.worktrees.clear();
-                self.note = Some("No Git repository here: workspaces are folders".into());
-            }
-        }
+        self.worktrees = listing.worktrees;
+        self.repos = listing.repos.into_iter().collect();
         self.rebuild();
         true
     }
@@ -590,9 +711,9 @@ impl Panel {
     /// pinned on top; what needs you moves up when it is next drawn.
     fn rebuild(&mut self) {
         let mut tasks: Vec<Workspace> = self
-            .worktrees
+            .folders
             .iter()
-            .chain(self.folders.iter())
+            .chain(self.worktrees.iter())
             .cloned()
             .collect();
         tasks.sort_by_key(|t| {
@@ -607,7 +728,7 @@ impl Panel {
     }
 
     fn save_folders(&self) {
-        let Some(file) = self.root.as_deref().and_then(folders_file) else {
+        let Some(file) = folders_file().filter(|_| self.loaded) else {
             return;
         };
         if let Some(dir) = file.parent() {
@@ -633,6 +754,8 @@ impl Panel {
             main: false,
             folder: true,
             key: new_key(&self.folders),
+            repo: None,
+            base: None,
         };
         let id = made.id();
         self.folders.push(made);
@@ -658,7 +781,7 @@ impl Panel {
     }
 
     fn save_arrangement(&self) {
-        let Some(file) = self.root.as_deref().and_then(order_file) else {
+        let Some(file) = order_file().filter(|_| self.loaded) else {
             return;
         };
         if let Some(dir) = file.parent() {
@@ -747,10 +870,11 @@ impl Panel {
             .map(|t| t.name.as_str())
     }
 
-    /// The workspaces are known: the worktree read for the open folder
-    /// has answered, so an empty list means there are none.
+    /// The workspaces are known: the kept ones are read and the read of
+    /// their repositories has answered, so an empty list means there are
+    /// none.
     pub fn listed(&self) -> bool {
-        self.root.is_some() && self.rx.is_none()
+        self.loaded && self.rx.is_none()
     }
 
     /// A read or an operation is in flight.
@@ -763,12 +887,33 @@ impl Panel {
         self.tasks.iter().position(|t| t.id() == id)
     }
 
-    /// The main checkout's branch: what other branches are compared with.
-    pub fn base_branch(&self) -> Option<String> {
-        self.tasks
-            .iter()
-            .find(|t| t.main)
-            .and_then(|t| t.branch.clone())
+    /// The repositories a workspace's inspector shows: a worktree's own
+    /// folder, or the ones found in a folder workspace (`None` until read).
+    pub fn repos_of(&self, workspace: &Workspace) -> Option<Vec<PathBuf>> {
+        if workspace.folder {
+            self.repos.get(&workspace.id()).cloned()
+        } else {
+            Some(vec![workspace.path.clone()])
+        }
+    }
+
+    /// The folder a new workspace takes unless you choose one: the selected
+    /// workspace's (a worktree's repository), else `fallback`, the editor's.
+    pub fn new_folder(&self, fallback: Option<&Path>) -> Option<PathBuf> {
+        self.selected_index()
+            .map(|i| &self.tasks[i])
+            .map(|t| t.repo.clone().unwrap_or_else(|| t.path.clone()))
+            .or_else(|| fallback.map(Path::to_path_buf))
+    }
+
+    /// The repository a new branch is made in: the selected worktree's, or
+    /// the first one in the selected folder workspace.
+    pub fn task_repo(&self) -> Option<PathBuf> {
+        let task = &self.tasks[self.selected_index()?];
+        match &task.repo {
+            Some(repo) => Some(repo.clone()),
+            None => self.repos_of(task)?.into_iter().next(),
+        }
     }
 
     /// Orders the list by what needs you, the main checkout first: a
@@ -779,9 +924,9 @@ impl Panel {
     pub fn arrange(&mut self, tabs: &[Tab]) -> bool {
         use crate::project::worktree::Checks;
         let canon: Vec<Workspace> = self
-            .worktrees
+            .folders
             .iter()
-            .chain(self.folders.iter())
+            .chain(self.worktrees.iter())
             .cloned()
             .collect();
         let owner: Vec<Option<usize>> = tabs.iter().map(|t| task_of(&canon, t)).collect();
@@ -849,9 +994,6 @@ impl Panel {
     /// team tasks follow it; a session no workspace holds gets a row.
     fn lines(&self, tabs: &[Tab]) -> Vec<Line> {
         let mut lines = Vec::new();
-        if let Some(note) = &self.note {
-            lines.push(Line::Note(note.clone()));
-        }
         let owner: Vec<Option<usize>> = tabs.iter().map(|t| task_of(&self.tasks, t)).collect();
         let selected = self.selected_index();
         for task in 0..self.tasks.len() {
@@ -1599,11 +1741,15 @@ mod tests {
     use super::*;
 
     fn tree(path: &str, main: bool) -> Workspace {
-        Workspace::of(Worktree {
-            path: PathBuf::from(path),
-            branch: None,
-            main,
-        })
+        Workspace::of(
+            Worktree {
+                path: PathBuf::from(path),
+                branch: None,
+                main,
+            },
+            None,
+            None,
+        )
     }
 
     fn folder(name: &str, path: &str) -> Workspace {
@@ -1614,6 +1760,8 @@ mod tests {
             main: false,
             folder: true,
             key: format!("folder:{name}"),
+            repo: None,
+            base: None,
         }
     }
 
@@ -1713,6 +1861,41 @@ mod tests {
             panel.tasks.iter().map(Workspace::id).collect::<Vec<_>>(),
             vec!["/r".to_owned(), b]
         );
+    }
+
+    #[test]
+    fn every_projects_workspaces_become_one_list() {
+        let a = "crc\t/a\nnotes\t/a/notes\tws:1\n".to_owned();
+        // `folder:crc` again on another folder, and ws:1 again on the same.
+        let b = "crc\t/b\nnotes\t/a/notes\tws:1\n".to_owned();
+        let all = merge_folders(&[a, b]);
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].id(), "folder:crc");
+        assert_eq!(all[1].id(), "ws:1");
+        assert_eq!(all[2].path, PathBuf::from("/b"));
+        assert!(all[2].id().starts_with("ws:"));
+        let order = merge_arrangements(&["pin\tws:1\t\n".into(), "-\tws:1\t\n-\t/w\t\n".into()]);
+        assert_eq!(order.order, ["ws:1", "/w"]);
+        assert!(order.pinned.contains("ws:1"));
+    }
+
+    #[test]
+    fn a_folder_holds_itself_and_its_children_as_repositories() {
+        let dir = std::env::temp_dir().join(format!("crc-discover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for sub in ["b/.git", "a/.git", ".hidden/.git", "plain", "c/d/.git"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        // A linked worktree's .git is a file.
+        std::fs::create_dir_all(dir.join("w")).unwrap();
+        std::fs::write(dir.join("w/.git"), "gitdir: x\n").unwrap();
+        assert_eq!(
+            discover(&dir),
+            vec![dir.join("a"), dir.join("b"), dir.join("w")]
+        );
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        assert_eq!(discover(&dir)[0], dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

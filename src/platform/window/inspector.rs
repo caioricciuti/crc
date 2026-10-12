@@ -22,9 +22,12 @@ impl EditorView {
         else {
             return;
         };
-        // The buttons act on the workspace shown.
+        let (action, repo) = action;
+        // The buttons act on the workspace shown, in the repository whose
+        // card they are on.
         if let Some(mut state) = self.state_mut() {
             state.agents.menu_task = state.agents.selected.clone();
+            state.agents.target = repo;
         }
         match action {
             Action::Close => self.toggle_inspector(),
@@ -70,8 +73,16 @@ impl EditorView {
         else {
             return;
         };
-        let base = state.agents.base_branch();
-        state.agents.inspector.want(&task.path, base, task.main);
+        let Some(repos) = state.agents.repos_of(&task) else {
+            return;
+        };
+        // A worktree is compared with its main checkout's branch; a folder's
+        // repositories are main checkouts, which show their latest tag.
+        let wanted: Vec<_> = repos
+            .into_iter()
+            .map(|path| (path, task.base.clone(), task.folder))
+            .collect();
+        state.agents.inspector.want(&wanted);
     }
 
     /// Schedules the periodic read of the list, once.
@@ -103,14 +114,7 @@ impl EditorView {
                 .refreshed_at
                 .is_none_or(|at| at.elapsed().as_secs_f64() >= REFRESH_EVERY - 1.0);
             if state.agents.on && due && !state.agents.busy() {
-                let dir = state
-                    .agents
-                    .repo
-                    .clone()
-                    .or_else(|| state.tree.root().map(Path::to_path_buf));
-                if let Some(dir) = dir {
-                    state.agents.refresh(&dir);
-                }
+                state.agents.refresh();
             }
             state.agents.on
         };
@@ -153,7 +157,15 @@ impl EditorView {
             self.request_redraw();
             return;
         }
-        let path = task.path.clone();
+        let path = state
+            .agents
+            .target
+            .take()
+            .unwrap_or_else(|| task.path.clone());
+        let task = crate::platform::agents::Workspace {
+            name: repo_label(&task, &path),
+            ..task
+        };
         state.agents.start(&doing(&task), move || {
             Ok(Done {
                 said: work(path)?,
@@ -176,7 +188,7 @@ impl EditorView {
 
     /// Merges the main checkout's branch into the workspace's.
     pub(super) fn agent_update_from_base(&self) {
-        let Some(base) = self.state().and_then(|state| state.agents.base_branch()) else {
+        let Some(base) = self.menu_task().and_then(|t| t.base) else {
             return;
         };
         let doing = format!("Merging {base}\u{2026}");
@@ -194,7 +206,12 @@ impl EditorView {
         };
         self.open_palette_with("");
         if let Some(mut state) = self.state_mut() {
-            state.commit_prompt = Some(task.name());
+            let label = state
+                .agents
+                .target
+                .as_deref()
+                .map_or_else(|| task.name(), |path| repo_label(&task, path));
+            state.commit_prompt = Some(label);
         }
         self.request_redraw();
     }
@@ -271,6 +288,18 @@ impl EditorView {
             |_| format!("Merging #{number}\u{2026}"),
             move |path| crate::project::worktree::merge_pull_request(&path, number, strategy),
         );
+    }
+}
+
+/// What an operation calls the repository at `path` in `workspace`: the
+/// workspace's name, or for a repository in a folder workspace other than
+/// the folder itself, the repository's folder name.
+fn repo_label(workspace: &crate::platform::agents::Workspace, path: &Path) -> String {
+    if path == workspace.path {
+        workspace.name()
+    } else {
+        path.file_name()
+            .map_or_else(|| workspace.name(), |n| n.to_string_lossy().into_owned())
     }
 }
 

@@ -1010,6 +1010,29 @@ fn choose_path(
     Some(panel.URL()?.path()?.to_string().into())
 }
 
+/// A folder chosen in an Open panel that starts in `start`; `None` when
+/// cancelled or AppKit gives no panel.
+fn choose_folder_from(
+    mtm: MainThreadMarker,
+    start: Option<&Path>,
+    message: &str,
+) -> Option<std::path::PathBuf> {
+    let panel = open_panel(mtm)?;
+    panel.setCanChooseFiles(false);
+    panel.setCanChooseDirectories(true);
+    panel.setAllowsMultipleSelection(false);
+    panel.setCanCreateDirectories(true);
+    panel.setMessage(Some(&NSString::from_str(message)));
+    if let Some(start) = start {
+        let url = NSURL::fileURLWithPath(&NSString::from_str(&start.to_string_lossy()));
+        panel.setDirectoryURL(Some(&url));
+    }
+    if panel.runModal() != MODAL_RESPONSE_OK {
+        return None;
+    }
+    Some(panel.URL()?.path()?.to_string().into())
+}
+
 /// Keeps the completion list on the word it was opened for: filtered by
 /// what has been typed since its anchor, closed once the caret is before
 /// the anchor, in another document, or past a space or a `/` (a path
@@ -7122,8 +7145,11 @@ enum Pick {
     McpUrl(String),
     /// A task to start on a new branch, by what was typed.
     NewTask(String),
-    /// A folder workspace to make (or rename to), by what was typed.
+    /// A folder workspace to make on the default folder (or rename to), by
+    /// what was typed.
     NewWorkspace(String),
+    /// A folder workspace to make on a folder chosen in a panel.
+    NewWorkspaceChosen(String),
     /// Commit everything in the workspace being asked about, with this
     /// message.
     CommitAll(String),
@@ -7135,17 +7161,14 @@ enum Pick {
 fn task_rows(
     query: &str,
     folder: Option<&Path>,
-    repo: bool,
+    repo: Option<&Path>,
     renaming: Option<&str>,
 ) -> Vec<(layout::PaletteRow, Pick)> {
     let name = query.trim();
     if name.is_empty() {
         return Vec::new();
     }
-    let in_folder = folder.and_then(Path::file_name).map_or_else(
-        || "the open folder".to_owned(),
-        |n| n.to_string_lossy().into_owned(),
-    );
+    let in_folder = folder.map_or_else(|| "the open folder".to_owned(), shown_path);
     if let Some(old) = renaming {
         return vec![(
             layout::PaletteRow {
@@ -7160,25 +7183,52 @@ fn task_rows(
     let mut rows = vec![(
         layout::PaletteRow {
             icon: Some(crate::project::icons::FOLDER),
-            title: format!("New workspace \u{201c}{name}\u{201d}"),
-            detail: format!("in {in_folder}, with a terminal"),
+            title: format!("New workspace \u{201c}{name}\u{201d} in a folder\u{2026}"),
+            detail: "choose its folder, then a terminal there".into(),
             shortcut: String::new(),
         },
-        Pick::NewWorkspace(name.to_owned()),
+        Pick::NewWorkspaceChosen(name.to_owned()),
     )];
+    if folder.is_some() {
+        rows.push((
+            layout::PaletteRow {
+                icon: Some(crate::project::icons::FOLDER),
+                title: format!("New workspace \u{201c}{name}\u{201d}"),
+                detail: format!("in {in_folder}, with a terminal"),
+                shortcut: String::new(),
+            },
+            Pick::NewWorkspace(name.to_owned()),
+        ));
+    }
     let branch = crate::project::worktree::branch_name(query);
-    if repo && !branch.is_empty() {
+    if let Some(repo) = repo
+        && !branch.is_empty()
+    {
         rows.push((
             layout::PaletteRow {
                 icon: Some(crate::project::icons::GIT_BRANCH),
                 title: format!("Start \u{201c}{branch}\u{201d} on a new branch"),
-                detail: "from HEAD, in its own worktree, with a terminal".into(),
+                detail: format!(
+                    "from HEAD of {}, in its own worktree, with a terminal",
+                    shown_path(repo)
+                ),
                 shortcut: String::new(),
             },
             Pick::NewTask(name.to_owned()),
         ));
     }
     rows
+}
+
+/// A folder as the palette shows it: under the home folder as `~/...`.
+fn shown_path(path: &Path) -> String {
+    match std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .and_then(|home| path.strip_prefix(home).ok().map(Path::to_path_buf))
+    {
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
 }
 
 /// The code action picker's rows: the actions whose titles match, in the
@@ -7406,10 +7456,10 @@ struct PaletteSources<'a> {
     mcp_url: bool,
     /// Set while taking a new workspace's name.
     task: bool,
-    /// The folder a new workspace is made on, and whether it is a
-    /// repository (a task on a branch is offered too).
-    task_folder: Option<&'a Path>,
-    task_repo: bool,
+    /// The folder a new workspace is made on unless you choose one, and
+    /// the repository a task on a new branch is made in, when there is one.
+    task_folder: Option<std::path::PathBuf>,
+    task_repo: Option<std::path::PathBuf>,
     /// The folder workspace being renamed, by name.
     task_rename: Option<&'a str>,
     /// Set while taking a commit message, the workspace's name.
@@ -7434,8 +7484,8 @@ fn palette_sources(state: &State) -> PaletteSources<'_> {
         repos: state.repo_list.as_deref(),
         mcp_url: state.mcp_url_prompt,
         task: state.task_prompt,
-        task_folder: state.agents.repo.as_deref().or(state.tree.root()),
-        task_repo: state.agents.repo.is_some(),
+        task_folder: state.agents.new_folder(state.tree.root()),
+        task_repo: state.agents.task_repo(),
         task_rename: state.agents.renaming_name(),
         commit: state.commit_prompt.as_deref(),
     }
@@ -7542,7 +7592,8 @@ fn palette_rows(sources: &PaletteSources<'_>, query: &str) -> Vec<(layout::Palet
         task_repo,
         task_rename,
         commit,
-    } = *sources;
+    } = sources;
+    let (mcp_url, task) = (*mcp_url, *task);
     if let Some(workspace) = commit {
         let message = query.trim();
         if message.is_empty() {
@@ -7562,7 +7613,12 @@ fn palette_rows(sources: &PaletteSources<'_>, query: &str) -> Vec<(layout::Palet
         return mcp_url_rows(query);
     }
     if task {
-        return task_rows(query, task_folder, task_repo, task_rename);
+        return task_rows(
+            query,
+            task_folder.as_deref(),
+            task_repo.as_deref(),
+            *task_rename,
+        );
     }
     if let Some(repos) = repos {
         return repo_rows(repos, query);
@@ -7582,7 +7638,7 @@ fn palette_rows(sources: &PaletteSources<'_>, query: &str) -> Vec<(layout::Palet
                     layout::PaletteRow {
                         icon: Some(crate::project::icons::for_kind(&hit.kind)),
                         title: hit.name.clone(),
-                        detail: symbols::detail(&hit, root),
+                        detail: symbols::detail(&hit, *root),
                         shortcut: String::new(),
                     },
                     Pick::Symbol(hit.path, hit.line),

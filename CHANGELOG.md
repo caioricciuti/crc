@@ -4,6 +4,19 @@ One entry per tag, written for people who use the editor.
 
 ## Unreleased
 
+- Agents mode keeps one list of workspaces for the whole app instead of
+  following the folder open in the editor. Opening another folder in the
+  editor no longer changes the list or what is selected. The workspaces
+  kept per project until now are carried over into the one list.
+- New Workspace (`Cmd-N` in Agents mode) asks for a folder first; the
+  other choices are the selected workspace's folder and a new branch of
+  its repository. A double-click under the list uses the selected
+  workspace's folder.
+- A workspace shows every Git repository in its folder: the folder
+  itself and the folders directly in it. The inspector has a card per
+  repository with its branch, remote and uncommitted work, and Commit
+  All, Pull and Push for that repository. The worktrees of those
+  repositories are listed under the folder workspaces.
 - A new workspace in Agents mode starts with its own terminal and
   nothing else. It could take the name, pin or terminals of a workspace
   removed earlier under the same name, and terminals left without a

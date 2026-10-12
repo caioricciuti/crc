@@ -52,14 +52,17 @@ wait 900
 dump $T/side-claude.out
 quit
 SCRIPT
-PATH="$T/sidebin:$PATH" CRC_TERMINAL_SHELL=/bin/sh CRC_CLAUDE_COMMAND="$T/side-agent.sh" \
+# The list is one for the app, kept under HOME: this scenario has its own.
+mkdir -p "$T/home/sidebar"
+HOME="$T/home/sidebar" PATH="$T/sidebin:$PATH" CRC_TERMINAL_SHELL=/bin/sh CRC_CLAUDE_COMMAND="$T/side-agent.sh" \
     CRC_SELFTEST="$T/side.script" "$BIN" "$S" 2> "$T/side.err"
 expect "$T/side-made.out" agents "on tasks=sideproj,beta,gamma selected=gamma sessions=sideproj,beta,*gamma claude=0 pair=- op=-"
 # gamma dragged above beta stays there.
 expect "$T/side-dragged.out" agents "on tasks=sideproj,gamma,beta selected=gamma sessions=sideproj,beta,*gamma claude=0 pair=- op=-"
 # The order file keeps ids: gamma's is its key in the workspaces file.
-gamma_key=$(awk -F'\t' '$1 == "gamma" { print $3 }' "$T"/home/Library/Application\ Support/crc/agents/*.workspaces 2>/dev/null)
-[ -n "$gamma_key" ] && grep -qF "$gamma_key" "$T"/home/Library/Application\ Support/crc/agents/*.order 2>/dev/null \
+side_kept="$T/home/sidebar/Library/Application Support/crc/agents"
+gamma_key=$(awk -F'\t' '$1 == "gamma" { print $3 }' "$side_kept/workspaces" 2>/dev/null)
+[ -n "$gamma_key" ] && grep -qF "$gamma_key" "$side_kept/order" 2>/dev/null \
     || failed "sidebar: the dragged order was not kept"
 # beta, now third, renamed in its row (a folder workspace takes the name).
 # (The script's double-click is one event, so it does not select first.)
@@ -77,7 +80,7 @@ wait 1500
 dump $T/side-restored.out
 quit
 SCRIPT
-PATH="$T/sidebin:$PATH" CRC_TERMINAL_SHELL=/bin/sh CRC_SELFTEST="$T/side-restore.script" \
+HOME="$T/home/sidebar" PATH="$T/sidebin:$PATH" CRC_TERMINAL_SHELL=/bin/sh CRC_SELFTEST="$T/side-restore.script" \
     "$BIN" "$S" 2> "$T/side-restore.err"
 grep -q '^agents: on tasks=sideproj,gamma,notes .*sessions=[^ ]*sideproj[^ ]*notes[^ ]*gamma[^ ]*claude=0' "$T/side-restored.out" 2>/dev/null \
     || grep -q '^agents: on tasks=sideproj,gamma,notes ' "$T/side-restored.out" \

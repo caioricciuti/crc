@@ -30,14 +30,7 @@ impl EditorView {
                 state.sidebar_keys = false;
                 state.palette = None;
                 state.completion = None;
-                let dir = state
-                    .tree
-                    .root()
-                    .map(Path::to_path_buf)
-                    .or_else(|| state.terminal.active_tab().map(|t| t.folder.clone()));
-                if let Some(dir) = &dir {
-                    state.agents.refresh(dir);
-                }
+                state.agents.refresh();
                 if state.agents.selected_index().is_none() {
                     let tasks = &state.agents.tasks;
                     state.agents.selected = state
@@ -105,14 +98,7 @@ impl EditorView {
                 }
                 Err(e) => state.say(layout::Feedback::Failure, e),
             }
-            if let Some(dir) = state
-                .agents
-                .repo
-                .clone()
-                .or_else(|| state.tree.root().map(Path::to_path_buf))
-            {
-                state.agents.refresh(&dir);
-            }
+            state.agents.refresh();
             state.git.refresh();
         }
         drop(state);
@@ -138,40 +124,57 @@ impl EditorView {
     }
 
     /// Every terminal lives in a workspace. Once the list is known, the
-    /// selection is the workspace holding the open folder, and with none
-    /// (a folder outside Git, nothing made yet) one is made on the folder,
-    /// named after it. Returns whether a workspace is selected.
+    /// selection is the workspace of the session showing, else the one
+    /// holding the open folder, else the first; with no workspace at all,
+    /// one is made on the open folder, named after it. Returns whether a
+    /// workspace is selected.
     pub(super) fn ensure_workspace(&self) -> bool {
-        let folder = self.workspace_folder();
+        let editor = self.workspace_folder();
         let Some(mut state) = self.state_mut() else {
             return false;
         };
         if !state.agents.listed() {
             return false;
         }
-        if state.agents.selected_index().is_some() {
+        let tasks = state.agents.tasks.clone();
+        // The terminal showing, when no workspace holds it, gets one on its
+        // own folder.
+        let loose = state
+            .terminal
+            .active_tab()
+            .filter(|t| task_of(&tasks, t).is_none())
+            .map(|t| t.folder.clone());
+        if loose.is_none() && state.agents.selected_index().is_some() {
             return true;
         }
-        let Some(folder) = folder else {
-            return false;
-        };
-        let folder = crate::platform::canonical(&folder);
-        let tasks = state.agents.tasks.clone();
         let found = state
             .terminal
             .active_tab()
             .and_then(|t| task_of(&tasks, t))
-            .or_else(|| crate::platform::agents::folder_task(&tasks, &folder));
-        let id = match found {
-            Some(i) => tasks[i].id(),
-            None => {
+            .or_else(|| {
+                editor.as_deref().and_then(|f| {
+                    crate::platform::agents::folder_task(&tasks, &crate::platform::canonical(f))
+                })
+            })
+            .or((!tasks.is_empty()).then_some(0));
+        let id = match (loose, found) {
+            (None, Some(i)) => tasks[i].id(),
+            (loose, _) => {
+                let Some(folder) = loose.or(editor) else {
+                    return false;
+                };
+                let folder = crate::platform::canonical(&folder);
                 let name = folder
                     .file_name()
                     .map_or_else(|| "workspace".into(), |n| n.to_string_lossy().into_owned());
-                let id = state.agents.add_folder(&name, folder);
-                // The sessions already running in the folder are its own.
+                let id = state.agents.add_folder(&name, folder.clone());
+                state.agents.refresh();
+                // The terminals in its folder that no workspace held are
+                // its own; the others stay where they are.
                 for tab in &mut state.terminal.tabs {
-                    if tab.workspace.is_none() {
+                    if task_of(&tasks, tab).is_none()
+                        && crate::platform::canonical(&tab.folder).starts_with(&folder)
+                    {
                         tab.workspace = Some(id.clone());
                         if let (Some(dir), Some(held)) = (crate::term::hold::dir(), &tab.held) {
                             crate::term::hold::set_workspace(&dir, held, &id);
@@ -186,7 +189,7 @@ impl EditorView {
     }
 
     /// A double-click on the empty part of the list: a new folder workspace
-    /// on the open folder, named after it, with a terminal in it.
+    /// on the selected one's folder, named after it, with a terminal in it.
     fn new_blank_workspace(&self) {
         let Some(folder) = self.workspace_folder() else {
             return;
@@ -198,6 +201,7 @@ impl EditorView {
         if let Some(mut state) = self.state_mut() {
             let id = state.agents.add_folder(&name, folder.clone());
             state.agents.selected = Some(id);
+            state.agents.refresh();
         }
         self.spawn_terminal_in(false, Some(&folder));
     }
@@ -209,14 +213,8 @@ impl EditorView {
         match action {
             Action::NewTask => self.new_task_prompt(),
             Action::Refresh => {
-                if let Some(mut state) = self.state_mut()
-                    && let Some(dir) = state
-                        .agents
-                        .repo
-                        .clone()
-                        .or_else(|| state.tree.root().map(Path::to_path_buf))
-                {
-                    state.agents.refresh(&dir);
+                if let Some(mut state) = self.state_mut() {
+                    state.agents.refresh();
                 }
                 self.resume_display_link();
             }
@@ -260,6 +258,7 @@ impl EditorView {
             Action::Menu(index) => {
                 if let Some(mut state) = self.state_mut() {
                     state.agents.menu_task = state.agents.tasks.get(index).map(|t| t.id());
+                    state.agents.target = None;
                 }
                 let menu = self.task_menu(index);
                 layout::set_pressed(None);
@@ -358,8 +357,9 @@ impl EditorView {
         }
     }
 
-    /// The palette, taking a new workspace's name: a folder workspace on
-    /// the open folder, or (in a repository) a task on a new branch.
+    /// The palette, taking a new workspace's name: a folder workspace on a
+    /// folder you choose or the selected one's, or a task on a new branch
+    /// of the selected workspace's repository.
     pub(super) fn new_task_prompt(&self) {
         self.open_palette_with("");
         if let Some(mut state) = self.state_mut() {
@@ -369,16 +369,37 @@ impl EditorView {
         self.request_redraw();
     }
 
-    /// The folder a new workspace is made on: the repository's main
-    /// checkout, else the open folder, else the session showing's.
+    /// The folder a new workspace is made on unless you choose one: the
+    /// selected workspace's, else the editor's open folder, else the
+    /// session showing's.
     fn workspace_folder(&self) -> Option<std::path::PathBuf> {
         let state = self.state()?;
         state
             .agents
-            .repo
-            .clone()
-            .or_else(|| state.tree.root().map(Path::to_path_buf))
+            .new_folder(state.tree.root())
             .or_else(|| state.terminal.active_tab().map(|t| t.folder.clone()))
+    }
+
+    /// The palette's answer when you choose the folder: a folder panel
+    /// opening on the selected workspace's, then the workspace. A test
+    /// instance takes the selected one's without a panel.
+    pub(super) fn create_workspace_chosen(&self, name: String) {
+        let start = self.workspace_folder();
+        let dir = if std::env::var_os("CRC_SELFTEST").is_some() {
+            start
+        } else {
+            choose_folder_from(
+                MainThreadMarker::from(self),
+                start.as_deref(),
+                &format!(
+                    "Choose the folder for the workspace \u{201c}{}\u{201d}",
+                    name.trim()
+                ),
+            )
+        };
+        if let Some(dir) = dir {
+            self.create_workspace_in(name, &dir);
+        }
     }
 
     /// The palette's answer for a folder workspace: made (or, while
@@ -416,6 +437,13 @@ impl EditorView {
         let Some(dir) = self.workspace_folder() else {
             return;
         };
+        self.create_workspace_in(name, &dir);
+    }
+
+    /// A folder workspace on `dir`, selected, its repositories read, and a
+    /// terminal in it.
+    fn create_workspace_in(&self, name: String, dir: &Path) {
+        let dir = crate::platform::canonical(dir);
         {
             let Some(mut state) = self.state_mut() else {
                 return;
@@ -423,6 +451,7 @@ impl EditorView {
             state.agents.on = true;
             let id = state.agents.add_folder(&name, dir.clone());
             state.agents.selected = Some(id);
+            state.agents.refresh();
         }
         self.set_agents_mode(true);
         self.spawn_terminal_in(false, Some(&dir));
@@ -449,6 +478,7 @@ impl EditorView {
             Some(Action::Select(index) | Action::NewSession(index) | Action::Menu(index)) => {
                 if let Some(mut state) = self.state_mut() {
                     state.agents.menu_task = state.agents.tasks.get(index).map(|t| t.id());
+                    state.agents.target = None;
                 }
                 self.task_menu(index)
             }
@@ -500,14 +530,8 @@ impl EditorView {
     }
 
     pub(super) fn refresh_agents(&self) {
-        if let Some(mut state) = self.state_mut()
-            && let Some(dir) = state
-                .agents
-                .repo
-                .clone()
-                .or_else(|| state.tree.root().map(Path::to_path_buf))
-        {
-            state.agents.refresh(&dir);
+        if let Some(mut state) = self.state_mut() {
+            state.agents.refresh();
         }
         self.resume_display_link();
     }
@@ -666,17 +690,13 @@ impl EditorView {
         self.after_terminal_layout();
     }
 
-    /// The palette's answer: a worktree on a new branch, then Claude in it.
+    /// The palette's answer: a worktree on a new branch of the selected
+    /// workspace's repository, then a terminal in it.
     pub(super) fn create_task(&self, name: String) {
         let Some(mut state) = self.state_mut() else {
             return;
         };
-        let Some(dir) = state
-            .agents
-            .repo
-            .clone()
-            .or_else(|| state.tree.root().map(Path::to_path_buf))
-        else {
+        let Some(dir) = state.agents.task_repo() else {
             return;
         };
         state.agents.on = true;
@@ -710,12 +730,7 @@ impl EditorView {
                         task.is_none_or(|t| t.main),
                         task.is_some_and(|t| t.folder),
                         task.and_then(|t| t.branch.clone()),
-                        state
-                            .agents
-                            .tasks
-                            .iter()
-                            .find(|t| t.main)
-                            .and_then(|t| t.branch.clone()),
+                        task.and_then(|t| t.base.clone()),
                         task.and_then(|t| state.agents.info.get(&t.path))
                             .and_then(|info| info.pull_request.as_ref())
                             .map(|pr| pr.number),
@@ -818,7 +833,7 @@ impl EditorView {
         let Some(mut state) = self.state_mut() else {
             return;
         };
-        let Some(main) = state.agents.repo.clone() else {
+        let Some(main) = task.repo.clone() else {
             return;
         };
         state
@@ -891,10 +906,11 @@ impl EditorView {
         if !yes {
             return;
         }
+        let repo = self.menu_task().and_then(|t| t.repo);
         let Some(mut state) = self.state_mut() else {
             return;
         };
-        let Some(main) = state.agents.repo.clone() else {
+        let Some(main) = repo else {
             return;
         };
         // Dirty worktrees are refused before anything closes.
@@ -923,7 +939,16 @@ impl EditorView {
             state.terminal.close_tab(index);
         }
         if state.agents.selected.as_deref() == Some(id.as_str()) {
-            state.agents.selected = Some(main.to_string_lossy().into_owned());
+            // The folder workspace holding its repository, if one does.
+            let folders: Vec<_> = state
+                .agents
+                .tasks
+                .iter()
+                .filter(|t| t.folder)
+                .cloned()
+                .collect();
+            state.agents.selected =
+                crate::platform::agents::folder_task(&folders, &main).map(|i| folders[i].id());
         }
         let name = task.name();
         state

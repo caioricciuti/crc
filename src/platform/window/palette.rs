@@ -190,6 +190,7 @@ impl EditorView {
             Pick::McpUrl(url) => self.add_mcp_url(url),
             Pick::NewTask(name) => self.create_task(name),
             Pick::NewWorkspace(name) => self.create_workspace(name),
+            Pick::NewWorkspaceChosen(name) => self.create_workspace_chosen(name),
             Pick::CommitAll(message) => self.agent_commit_all(message),
             Pick::Repo(path) => self.select_repo(&path),
             Pick::Symbol(path, line) => self.go_to_symbol(path, line),

@@ -60,8 +60,10 @@ wait 300
 dump $T/inspector-hidden.out
 quit
 SCRIPT
-CRC_TERMINAL_SHELL=/bin/sh CRC_SELFTEST="$T/inspector.script" "$BIN" "$P" 2> "$T/inspector.err"
-expect "$T/inspector-feat.out" agents "on tasks=main,feat selected=feat sessions=main,*feat claude=0 pair=- op=-"
+# The list is one for the app, kept under HOME: this scenario has its own.
+mkdir -p "$T/home/inspector"
+HOME="$T/home/inspector" CRC_TERMINAL_SHELL=/bin/sh CRC_SELFTEST="$T/inspector.script" "$BIN" "$P" 2> "$T/inspector.err"
+expect "$T/inspector-feat.out" agents "on tasks=inspectproj,feat selected=feat sessions=inspectproj,*feat claude=0 pair=- op=-"
 expect_prefix() {
     local got
     got=$(grep -m1 "^$2: " "$1" 2>/dev/null | sed "s/^$2: //" || true)
@@ -126,13 +128,57 @@ wait 700
 dump $T/inspector-sorted.out
 quit
 SCRIPT
-PATH="$T/inspectbin:$PATH" CRC_TERMINAL_SHELL=/bin/sh CRC_SELFTEST="$T/inspector-pull.script" \
+HOME="$T/home/inspector" PATH="$T/inspectbin:$PATH" CRC_TERMINAL_SHELL=/bin/sh CRC_SELFTEST="$T/inspector-pull.script" \
     "$BIN" "$P" 2> "$T/inspector-pull.err"
 expect_prefix "$T/inspector-behind.out" inspector "branch=feat base=main ahead=3 behind=0 upstream=origin/feat push=0 pull=1"
 expect_prefix "$T/inspector-pulled.out" inspector "branch=feat base=main ahead=4 behind=0 upstream=origin/feat push=0 pull=0"
 [ -f "$F/t.txt" ] || failed "inspector: Pull did not bring t.txt"
-# Waiting on you sorts first, after the main checkout.
-expect "$T/inspector-zz.out" agents "on tasks=main,feat,zz selected=zz sessions=main,feat,*zz claude=0 pair=- op=-"
-expect "$T/inspector-sorted.out" agents "on tasks=main,zz,feat selected=zz sessions=main,feat,*zz claude=0 pair=- op=-"
+# Waiting on you sorts first, above the folder workspace too.
+expect "$T/inspector-zz.out" agents "on tasks=inspectproj,feat,zz selected=zz sessions=inspectproj,feat,*zz claude=0 pair=- op=-"
+expect "$T/inspector-sorted.out" agents "on tasks=zz,inspectproj,feat selected=zz sessions=inspectproj,feat,*zz claude=0 pair=- op=-"
 testgit "$P" worktree remove --force "$F" 2>/dev/null || true
 testgit "$P" worktree remove --force "$T/inspect-wt/zz" 2>/dev/null || true
+
+# ---- A folder of repositories: the inspector shows each one -------------
+# A folder that is not a repository, holding two that are (and a plain
+# folder and a hidden repository, which are not shown). Its workspace's
+# inspector has a card per repository, with that one's buttons: Commit All
+# on the dirty one commits there and nowhere else.
+M="$T/inspect-many"
+mkdir -p "$M/plain" "$M/.hidden"
+for r in alpha beta .hidden; do
+    mkdir -p "$M/$r"
+    printf 'one\n' > "$M/$r/a.txt"
+    testgit "$M/$r" init -q -b main
+    testgit "$M/$r" config user.name Tester
+    testgit "$M/$r" config user.email t@example.com
+    testgit "$M/$r" config commit.gpgsign false
+    testgit "$M/$r" add a.txt
+    testgit "$M/$r" commit -qm one
+done
+printf 'two\n' >> "$M/beta/a.txt"
+cat > "$T/inspector-many.script" <<SCRIPT
+wait 500
+key 0 cmd,shift A
+wait 700
+wait 700
+wait 500
+dump $T/inspector-many.out
+click @inspector.commit.1
+wait 200
+text wip
+key 36
+wait 700
+wait 700
+dump $T/inspector-many-committed.out
+quit
+SCRIPT
+mkdir -p "$T/home/inspector-many"
+HOME="$T/home/inspector-many" CRC_TERMINAL_SHELL=/bin/sh CRC_SELFTEST="$T/inspector-many.script" \
+    "$BIN" "$M" 2> "$T/inspector-many.err"
+expect "$T/inspector-many.out" agents "on tasks=inspect-many selected=inspect-many sessions=*inspect-many claude=0 pair=- op=-"
+expect "$T/inspector-many.out" inspector "alpha: branch=main base=- ahead=0 behind=0 upstream=- push=0 pull=0 dirty=0 changes=+0-0 tag=- buttons=push | beta: branch=main base=- ahead=0 behind=0 upstream=- push=0 pull=0 dirty=1 changes=+0-0 tag=- buttons=commit,push"
+[ "$(testgit "$M/beta" log -1 --format=%s)" = wip ] \
+    || failed "inspector: Commit All in beta did not commit there: $(testgit "$M/beta" log -1 --format=%s)"
+[ "$(testgit "$M/alpha" log -1 --format=%s)" = one ] \
+    || failed "inspector: Commit All in beta committed in alpha"
