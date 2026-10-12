@@ -52,6 +52,7 @@ impl EditorView {
         }
         if on {
             self.arm_agents_tick();
+            self.arm_sessions_tick();
             if let Some(mut state) = self.state_mut() {
                 let active = state.terminal.active;
                 if let Some(tab) = state.terminal.tabs.get_mut(active) {

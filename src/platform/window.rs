@@ -3871,6 +3871,11 @@ define_class!(
             self.agents_tick();
         }
 
+        #[unsafe(method(sessionsTick:))]
+        fn action_sessions_tick(&self, _sender: Option<&AnyObject>) {
+            self.sessions_tick();
+        }
+
         #[unsafe(method(agentOpenPullRequest:))]
         fn action_agent_open_pull_request(&self, _sender: Option<&AnyObject>) {
             self.agent_open_pull_request();

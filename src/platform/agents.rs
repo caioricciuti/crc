@@ -522,6 +522,8 @@ pub struct Panel {
     pub github: Option<bool>,
     /// The periodic refresh is scheduled.
     pub ticking: bool,
+    /// The two-second look at the terminals (ssh in or out) is scheduled.
+    pub sessions_ticking: bool,
     /// Your order, pins and names, kept for the project.
     pub arrangement: Arrangement,
     /// A row being dragged.
@@ -1541,6 +1543,7 @@ impl Panel {
         let working = mine
             .iter()
             .find(|t| t.status.as_ref().is_some_and(|s| s.state == State::Working));
+        let remote = mine.iter().find_map(|t| t.remote.as_ref());
         let left = card.x + 10.0;
         let line1 = Viewport {
             x: left,
@@ -1566,7 +1569,9 @@ impl Panel {
                 out,
                 atlas,
                 icon_box,
-                if task.main {
+                if remote.is_some() {
+                    icons::SERVER
+                } else if task.main {
                     icons::HOME
                 } else if task.folder {
                     icons::FOLDER
@@ -1698,6 +1703,11 @@ impl Panel {
                 } else {
                     text
                 },
+                theme.status_text,
+            )
+        } else if let Some(remote) = remote {
+            (
+                format!("ssh {} \u{b7} {}", remote.login(), remote.connected_for()),
                 theme.status_text,
             )
         } else if let Some(open) = mine

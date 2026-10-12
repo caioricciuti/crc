@@ -85,6 +85,8 @@ pub struct Inspector {
     /// How far the body is scrolled, and how far it can be, in points.
     pub scroll: f32,
     max_scroll: f32,
+    /// The ssh session shown last frame, for the self-test.
+    shown_remote: Option<String>,
 }
 
 impl Inspector {
@@ -179,6 +181,9 @@ impl Inspector {
         if self.hidden {
             return "hidden".into();
         }
+        if let Some(login) = &self.shown_remote {
+            return format!("ssh={login}");
+        }
         let Some(repos) = repos else {
             return "-".into();
         };
@@ -238,6 +243,7 @@ impl Inspector {
         &mut self,
         workspace: Option<&Workspace>,
         repos: Option<&[PathBuf]>,
+        remote: Option<&crate::platform::remote::Remote>,
         pull_request: Option<Option<&PullRequest>>,
         github: bool,
         atlas: &mut Atlas,
@@ -246,6 +252,7 @@ impl Inspector {
         out: &mut Vec<GlyphInstance>,
     ) {
         self.hits.clear();
+        self.shown_remote = remote.map(|r| r.login());
         layout::push_rect(
             out,
             atlas,
@@ -287,6 +294,7 @@ impl Inspector {
         self.draw_body(
             workspace,
             repos,
+            remote,
             pull_request,
             github,
             atlas,
@@ -334,6 +342,7 @@ impl Inspector {
         &mut self,
         workspace: Option<&Workspace>,
         repos: Option<&[PathBuf]>,
+        remote: Option<&crate::platform::remote::Remote>,
         pull_request: Option<Option<&PullRequest>>,
         github: bool,
         atlas: &mut Atlas,
@@ -366,6 +375,27 @@ impl Inspector {
         let shown = fit(atlas, &shown, width);
         text(out, atlas, x, y, width, &shown, theme.gutter_text);
         y += ROW;
+        // The terminal showing is in ssh: where it is, not this Mac's Git.
+        if let Some(remote) = remote {
+            text(out, atlas, x, y, width, "SSH SESSION", theme.status_text);
+            y += ROW;
+            let mut facts: Vec<Fact> = vec![("Host", vec![(remote.host.clone(), theme.text)])];
+            if let Some(user) = &remote.user {
+                facts.push(("User", vec![(user.clone(), theme.text)]));
+            }
+            if let Some(port) = remote.port {
+                facts.push(("Port", vec![(port.to_string(), theme.text)]));
+            }
+            if remote.destination != remote.login() {
+                facts.push((
+                    "As typed",
+                    vec![(remote.destination.clone(), theme.gutter_text)],
+                ));
+            }
+            facts.push(("Connected", vec![(remote.connected_for(), theme.text)]));
+            card(out, atlas, x, y, width, &facts, theme);
+            return;
+        }
         let skeleton = |out: &mut Vec<GlyphInstance>, y: f32, rows: usize| {
             for n in 0..rows {
                 layout::push_skeleton_row(

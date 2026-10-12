@@ -13,6 +13,8 @@ use std::path::PathBuf;
 /// How often the workspace list and pull requests are read again while
 /// Agents mode is on.
 const REFRESH_EVERY: f64 = 60.0;
+/// How often the terminals are looked at for ssh, in Agents mode.
+const SESSIONS_EVERY: f64 = 2.0;
 
 impl EditorView {
     pub(super) fn inspector_click(&self, event: &NSEvent, x: f32, y: f32) {
@@ -83,6 +85,53 @@ impl EditorView {
             .map(|path| (path, task.base.clone(), task.folder))
             .collect();
         state.agents.inspector.want(&wanted);
+    }
+
+    /// Schedules the quick look at the terminals, once: a session that
+    /// went into ssh without printing anything after still gets its title.
+    pub(super) fn arm_sessions_tick(&self) {
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
+        if state.agents.sessions_ticking {
+            return;
+        }
+        state.agents.sessions_ticking = true;
+        drop(state);
+        let _: () = unsafe {
+            msg_send![self, performSelector: sel!(sessionsTick:),
+                withObject: None::<&AnyObject>, afterDelay: SESSIONS_EVERY]
+        };
+    }
+
+    /// Each terminal: into or out of ssh, and where the one showing is.
+    pub(super) fn sessions_tick(&self) {
+        let (on, changed, moved) = {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            state.agents.sessions_ticking = false;
+            let mut changed = false;
+            for tab in &mut state.terminal.tabs {
+                changed |= tab.read_remote();
+            }
+            let active = state.terminal.active;
+            let moved = state
+                .terminal
+                .tabs
+                .get_mut(active)
+                .is_some_and(|tab| tab.read_cwd());
+            (state.agents.on, changed, moved)
+        };
+        if moved {
+            self.follow_cwd();
+        }
+        if changed {
+            self.request_redraw();
+        }
+        if on {
+            self.arm_sessions_tick();
+        }
     }
 
     /// Schedules the periodic read of the list, once.

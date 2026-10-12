@@ -73,6 +73,8 @@ pub struct Tab {
     pub cwd: PathBuf,
     /// Its program's pid, once found.
     pub program_pid: Option<i32>,
+    /// The ssh session its shell is running, while it runs one.
+    pub remote: Option<crate::platform::remote::Remote>,
 }
 
 /// What a session is doing, as the Agents sidebar shows it.
@@ -87,17 +89,44 @@ pub enum Activity {
 }
 
 impl Tab {
-    /// Reads where its program is now: one call into the kernel. Returns
-    /// whether it moved.
-    pub fn read_cwd(&mut self) -> bool {
+    /// Reads whether its shell is running ssh now, and where to. Returns
+    /// whether that changed.
+    pub fn read_remote(&mut self) -> bool {
+        let Some(pid) = self.find_program_pid() else {
+            return false;
+        };
+        let target = crate::platform::remote::of_shell(pid);
+        let now = match (target, &self.remote) {
+            (Some(t), Some(r)) if t.destination == r.destination => return false,
+            (Some(t), _) => Some(crate::platform::remote::Remote {
+                destination: t.destination,
+                user: t.user,
+                host: t.host,
+                port: t.port,
+                since: std::time::Instant::now(),
+            }),
+            (None, None) => return false,
+            (None, Some(_)) => None,
+        };
+        self.remote = now;
+        true
+    }
+
+    fn find_program_pid(&mut self) -> Option<i32> {
         if self.program_pid.is_none() {
             self.program_pid = self.session.program_pid().or_else(|| {
                 let dir = crate::term::hold::dir()?;
                 crate::term::hold::program_pid(&dir, self.held.as_deref()?)
             });
         }
+        self.program_pid
+    }
+
+    /// Reads where its program is now: one call into the kernel. Returns
+    /// whether it moved.
+    pub fn read_cwd(&mut self) -> bool {
         let Some(now) = self
-            .program_pid
+            .find_program_pid()
             .and_then(crate::platform::process_cwd)
             .map(|p| crate::platform::canonical(&p))
         else {
@@ -437,9 +466,14 @@ pub fn header_hide(header: Viewport) -> Viewport {
 /// The title the program set, when it set one (`claude` does, and so do
 /// most shell prompts), otherwise the name the tab started with.
 fn label(tab: &Tab) -> String {
+    // Inside ssh the tab says where.
+    let title = match &tab.remote {
+        Some(remote) => format!("ssh {}", remote.destination),
+        None => title_of(tab),
+    };
     match tab.review_files {
-        0 => title_of(tab),
-        n => format!("{} \u{b7} {n} to review", title_of(tab)),
+        0 => title,
+        n => format!("{title} \u{b7} {n} to review"),
     }
 }
 

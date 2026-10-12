@@ -4,6 +4,11 @@ One entry per tag, written for people who use the editor.
 
 ## Unreleased
 
+- A terminal inside `ssh` says so: its tab is titled `ssh <host>`, its
+  workspace row shows a server icon and `ssh user@host · 5 min`, the
+  inspector shows the session (host, user, port, how long) instead of
+  this Mac's Git, and the status line names it. Read from the ssh
+  command line and `~/.ssh/config` only; nothing is asked of the server.
 - The Agents list keeps the order you give it: pinned first, then the
   order you dragged, then the rest as they were made. A session waiting
   on you or a pull request's checks no longer move a row.

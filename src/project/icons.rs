@@ -69,6 +69,7 @@ pub const HISTORY: char = '\u{ea82}'; // cod-history
 pub const FILE: char = '\u{ea7b}'; // cod-file
 pub const FOLDER_OUTLINE: char = '\u{ea83}'; // cod-folder
 pub const TERMINAL: char = '\u{ea85}'; // cod-terminal
+pub const SERVER: char = '\u{eb50}'; // cod-server
 pub const GIT_BRANCH: char = '\u{ea68}'; // cod-git_branch
 pub const GIT_MERGE: char = '\u{eafe}'; // cod-git_merge
 pub const PULL_REQUEST: char = '\u{ea64}'; // cod-git_pull_request

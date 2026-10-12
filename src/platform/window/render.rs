@@ -726,9 +726,18 @@ impl EditorView {
                     .map(|info| info.pull_request.clone());
                 let github = agents.github.unwrap_or(false);
                 let repos = selected.as_ref().and_then(|w| agents.repos_of(w));
+                // The terminal showing, when it is this workspace's and in ssh.
+                let remote = terminal_panel
+                    .active_tab()
+                    .filter(|t| {
+                        crate::platform::agents::task_of(&agents.tasks, t)
+                            == agents.selected_index()
+                    })
+                    .and_then(|t| t.remote.clone());
                 agents.inspector.draw(
                     selected.as_ref(),
                     repos.as_deref(),
+                    remote.as_ref(),
                     pull_request.as_ref().map(Option::as_ref),
                     github,
                     &mut renderer.atlas,
@@ -875,8 +884,11 @@ impl EditorView {
         // document's name, position and branch are the editor's.
         let (status, detail) = if agents.on {
             let cwd = terminal_panel.active_tab().map(|t| t.cwd.clone());
-            let left =
-                agents_note.unwrap_or_else(|| cwd.as_deref().map(shown_path).unwrap_or_default());
+            let remote = terminal_panel.active_tab().and_then(|t| t.remote.clone());
+            let left = agents_note.unwrap_or_else(|| match &remote {
+                Some(r) => format!("ssh {}   {}", r.login(), r.connected_for()),
+                None => cwd.as_deref().map(shown_path).unwrap_or_default(),
+            });
             let branch = cwd.as_deref().and_then(|cwd| {
                 agents
                     .inspector
@@ -886,6 +898,8 @@ impl EditorView {
                     .max_by_key(|(repo, _)| repo.components().count())
                     .and_then(|(_, s)| s.as_ref().ok()?.branch.clone())
             });
+            // This Mac's branch says nothing about the server's.
+            let branch = branch.filter(|_| remote.is_none());
             let claude = if claude.as_ref().is_some_and(|c| c.is_connected()) {
                 "\u{273b} Claude     "
             } else {

@@ -15,6 +15,7 @@ pub mod latency;
 pub mod mcp_page;
 pub mod mcp_panel;
 pub mod recovery;
+pub mod remote;
 pub mod report;
 pub mod review_page;
 pub mod search;
@@ -82,6 +83,49 @@ unsafe extern "C" {
     fn kill(pid: i32, signal: i32) -> i32;
     fn proc_pidinfo(pid: i32, flavor: i32, arg: u64, buffer: *mut u8, size: i32) -> i32;
     fn proc_listchildpids(pid: i32, buffer: *mut i32, size: i32) -> i32;
+    fn sysctl(
+        name: *mut i32,
+        count: u32,
+        old: *mut u8,
+        old_len: *mut usize,
+        new: *mut u8,
+        new_len: usize,
+    ) -> i32;
+}
+
+/// The command line of process `pid`, the program first, from the
+/// kernel (`KERN_PROCARGS2`). `None` for a process gone or not ours.
+pub fn process_args(pid: i32) -> Option<Vec<String>> {
+    const CTL_KERN: i32 = 1;
+    const KERN_PROCARGS2: i32 = 49;
+    let mut name = [CTL_KERN, KERN_PROCARGS2, pid];
+    let mut buffer = vec![0u8; 16 * 1024];
+    let mut len = buffer.len();
+    // SAFETY: `len` is the buffer's size, and the kernel writes no more
+    // than that and says how much it wrote.
+    let ok = unsafe {
+        sysctl(
+            name.as_mut_ptr(),
+            3,
+            buffer.as_mut_ptr(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    } == 0;
+    if !ok || len < 4 {
+        return None;
+    }
+    // An int for argc, the executable's path, padding, then argc strings.
+    let argc = i32::from_ne_bytes(buffer[..4].try_into().ok()?).max(0) as usize;
+    let mut rest = buffer[4..len].split(|b| *b == 0);
+    rest.next()?;
+    let args: Vec<String> = rest
+        .filter(|s| !s.is_empty())
+        .take(argc)
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect();
+    (!args.is_empty()).then_some(args)
 }
 
 /// The working directory of process `pid`, as the kernel has it: where a

@@ -49,6 +49,12 @@ impl EditorView {
         // every burst it prints, so the prompt right after the `cd` is
         // never missed.
         let moved = self.state_mut().is_some_and(|mut state| {
+            // Into or out of ssh, any tab: its row and title say so.
+            for index in &printed {
+                if let Some(tab) = state.terminal.tabs.get_mut(*index) {
+                    tab.read_remote();
+                }
+            }
             let active = state.terminal.active;
             printed.contains(&active)
                 && state
@@ -371,6 +377,7 @@ impl EditorView {
                     alive: std::sync::Arc::new(()),
                     cwd: crate::platform::canonical(&launch.cwd),
                     program_pid: None,
+                    remote: None,
                     launch,
                     held,
                     status: None,
@@ -496,6 +503,7 @@ impl EditorView {
                     status: None,
                     cwd: crate::platform::canonical(&launch.cwd),
                     program_pid: None,
+                    remote: None,
                     launch,
                     held: Some(id),
                 },
