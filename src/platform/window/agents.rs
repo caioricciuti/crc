@@ -50,6 +50,9 @@ impl EditorView {
         if start {
             self.spawn_terminal(false);
         }
+        if !on {
+            self.editor_follows_agents();
+        }
         if on {
             self.arm_agents_tick();
             self.arm_sessions_tick();
@@ -1070,13 +1073,25 @@ impl EditorView {
         let Some(task) = self.menu_task() else {
             return;
         };
+        if let Some(mut state) = self.state_mut() {
+            state.agents.selected = Some(task.id());
+        }
         self.set_agents_mode(false);
-        let same = self
-            .state()
-            .and_then(|state| state.tree.root().map(crate::platform::canonical))
-            .is_some_and(|root| root == task.path);
-        if !same {
-            self.load_folder_path(&task.path.to_string_lossy());
+    }
+
+    /// Agents leads: the editor opens on the selected workspace's folder,
+    /// so what it shows is what the agents are working in. A folder gone
+    /// from disk, or too broad to index, leaves the project as it was.
+    fn editor_follows_agents(&self) {
+        let path = self.state().and_then(|state| {
+            let task = &state.agents.tasks[state.agents.selected_index()?];
+            let path = crate::platform::canonical(&task.path);
+            let root = state.tree.root().map(crate::platform::canonical);
+            (root.as_deref() != Some(path.as_path()) && path.is_dir() && !too_broad_to_adopt(&path))
+                .then_some(path)
+        });
+        if let Some(path) = path {
+            self.load_folder_path(&path.to_string_lossy());
         }
     }
 

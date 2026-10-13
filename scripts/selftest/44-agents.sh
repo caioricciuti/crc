@@ -213,6 +213,9 @@ key 36
 wait 700
 wait 300
 dump $T/agents-closed.out
+key 0 cmd,shift A
+wait 700
+dump $T/agents-plain-off.out
 quit
 SCRIPT
 HOME="$T/home/agents-plain" CRC_TERMINAL_SHELL=/bin/sh CRC_SELFTEST="$T/agents-plain.script" "$BIN" "$T/plainproj" \
@@ -235,3 +238,7 @@ expect "$T/agents-cmd2.out" agents "on tasks=movedrepo,other selected=movedrepo 
 # The one left is the plainproj shell: the workspace follows it there.
 expect "$T/agents-one-left.out" agents "on tasks=plainproj,other selected=plainproj sessions=*plainproj,other claude=0 pair=- op=-"
 expect "$T/agents-closed.out" agents "on tasks=other selected=other sessions=*other claude=0 pair=- op=-"
+# Agents leads: back in the editor, the project is the selected
+# workspace's folder (movedrepo), not the one the editor opened on.
+grep -q '^home: .* repos=movedrepo:main:' "$T/agents-plain-off.out" \
+    || failed "agents-plain-off.out: $(grep '^home:' "$T/agents-plain-off.out")"
