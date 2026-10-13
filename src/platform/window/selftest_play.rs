@@ -520,7 +520,7 @@ impl EditorView {
                 };
                 let report = format!(
                     // First: the report ends with the document's text.
-                    "message: {}\npreview: {}\nmd: {md}\nactivity: {}\npointer_targets: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nrepo: {}\ngit_note: {}\nhome: {}\nmcp: {}\nmcp_page: {}\nsettings_page: {}\nreview_page: {}\nterminals: {}\nagents: {}\ninspector: {}\nteams: {}\nagents_tree: {}\nagents_activity: {}\nagents_prs: {}\nconflicts: {}\ngit_conflicts: {}\nblame: {}\nfind_results: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\npeek: {}\n{report}",
+                    "message: {}\npreview: {}\nmd: {md}\nactivity: {}\npointer_targets: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nrepo: {}\ngit_note: {}\nhome: {}\nmcp: {}\nmcp_page: {}\nsettings_page: {}\nreview_page: {}\nterminals: {}\nagents: {}\ninspector: {}\nteams: {}\nagents_tree: {}\nagents_activity: {}\nagents_prs: {}\nconflicts: {}\ngit_conflicts: {}\nblame: {}\nfind_results: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\npeek: {}\ngutter: {}\n{report}",
                     state.message.as_ref().map_or("", |(text, _)| text.as_str()),
                     state.html_preview.as_ref().map_or("closed".to_string(), |p| format!(
                         "open ext={} view={} probe={}",
@@ -710,6 +710,27 @@ impl EditorView {
                         p.change.new_end + 1,
                         p.hits.is_some()
                     )),
+                    // The marks drawn for the active document, and whether
+                    // Next Change has anything to act on.
+                    state.gutter.docs.get(&buffer.id()).map_or("none".to_string(), |entry| {
+                        let mut marks = entry
+                            .marks
+                            .iter()
+                            .map(|m| {
+                                let kind = match m.kind {
+                                    crate::project::git::MarkKind::Added => 'A',
+                                    crate::project::git::MarkKind::Modified => 'M',
+                                    crate::project::git::MarkKind::Removed => 'R',
+                                };
+                                format!("{}{kind}", m.line + 1)
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        if !super::changes::active_has_changes(&state) {
+                            marks.push_str(" inactive");
+                        }
+                        marks
+                    }),
                 );
                 if let Err(e) = std::fs::write(path, report) {
                     eprintln!("crc: selftest could not write {path}: {e}");

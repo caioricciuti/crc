@@ -13,6 +13,12 @@ pub(super) struct Gutter {
     pub(super) dirty: HashMap<u64, Instant>,
     /// Buffers whose HEAD text is being fetched on a worker.
     pub(super) pending: HashSet<u64>,
+    /// Buffers whose HEAD may have moved since it was read: their marks
+    /// stay drawn until the new HEAD text and its diff replace them.
+    pub(super) stale: HashSet<u64>,
+    /// Counts the times HEAD may have moved, so a read started before the
+    /// last one is not taken for the new HEAD.
+    pub(super) epoch: u64,
     pub(super) heads: (mpsc::Sender<HeadText>, mpsc::Receiver<HeadText>),
     /// Changes against HEAD computed on a worker: document, the text they
     /// are for, the changes.
@@ -138,6 +144,45 @@ impl Gutter {
     pub(super) fn idle(&self) -> bool {
         self.dirty.is_empty() && self.pending.is_empty() && self.diffing.is_empty()
     }
+
+    /// After Git changed something: every document's HEAD is read again
+    /// when it is next shown, and what it has stays drawn until then.
+    pub(super) fn mark_stale(&mut self) {
+        self.epoch += 1;
+        self.stale.extend(self.docs.keys().copied());
+    }
+
+    /// Takes the HEAD text read for `id`, the read started at `epoch`;
+    /// `true` when the document wants diffing against it. A read from
+    /// before HEAD last moved is dropped, and the next one asked for. A
+    /// HEAD that changed keeps the old marks drawn until its diff lands,
+    /// but drops the changes, which the Git commands act on.
+    pub(super) fn land_head(&mut self, id: u64, epoch: u64, head: Option<String>) -> bool {
+        if epoch != self.epoch && self.stale.contains(&id) {
+            return false;
+        }
+        self.stale.remove(&id);
+        if let (Some(entry), Some(head)) = (self.docs.get_mut(&id), head.as_ref()) {
+            if entry.head.as_deref() == Some(head) {
+                return false;
+            }
+            entry.head = Some(Arc::new(head.clone()));
+            entry.changes.clear();
+            entry.text = None;
+            return true;
+        }
+        let has_head = head.is_some();
+        self.docs.insert(
+            id,
+            GutterState {
+                head: head.map(Arc::new),
+                marks: Vec::new(),
+                changes: Vec::new(),
+                text: None,
+            },
+        );
+        has_head
+    }
 }
 
 impl Blame {
@@ -210,5 +255,92 @@ impl State {
         let text = text.into();
         self.message_kind = Some((text.clone(), kind));
         self.message = Some((text, Instant::now()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gutter() -> Gutter {
+        Gutter {
+            docs: HashMap::new(),
+            dirty: HashMap::new(),
+            pending: HashSet::new(),
+            stale: HashSet::new(),
+            epoch: 0,
+            heads: mpsc::channel(),
+            computed: mpsc::channel(),
+            diffing: HashSet::new(),
+        }
+    }
+
+    /// An entry diffed against `head`: one added last line.
+    fn diffed(gutter: &mut Gutter, head: &str) {
+        let text = format!("{head}added\n");
+        let changes = crate::ide::diff::changes(head, &text);
+        gutter.docs.insert(
+            1,
+            GutterState {
+                head: Some(Arc::new(head.to_string())),
+                marks: crate::project::git::marks(&changes),
+                changes,
+                text: Some(crate::text::rope::Rope::from_text(&text)),
+            },
+        );
+    }
+
+    #[test]
+    fn marks_stay_drawn_while_head_is_read_again() {
+        let mut gutter = gutter();
+        diffed(&mut gutter, "one\n");
+        gutter.mark_stale();
+        let entry = &gutter.docs[&1];
+        assert_eq!(entry.marks.len(), 1);
+        assert_eq!(entry.changes.len(), 1);
+        assert!(gutter.stale.contains(&1));
+        // The same HEAD: nothing to diff again, and the changes still hold.
+        assert!(!gutter.land_head(1, gutter.epoch, Some("one\n".into())));
+        assert!(!gutter.stale.contains(&1));
+        assert_eq!(gutter.docs[&1].changes.len(), 1);
+        assert!(gutter.docs[&1].text.is_some());
+    }
+
+    #[test]
+    fn a_moved_head_keeps_the_marks_until_its_diff_lands() {
+        let mut gutter = gutter();
+        diffed(&mut gutter, "one\n");
+        gutter.mark_stale();
+        assert!(gutter.land_head(1, gutter.epoch, Some("two\n".into())));
+        let entry = &gutter.docs[&1];
+        assert_eq!(entry.head.as_deref().map(String::as_str), Some("two\n"));
+        assert_eq!(entry.marks.len(), 1, "the old marks are still drawn");
+        assert!(entry.changes.is_empty(), "no command acts on the old HEAD");
+        assert!(entry.text.is_none());
+    }
+
+    #[test]
+    fn a_read_from_before_head_moved_is_dropped() {
+        let mut gutter = gutter();
+        diffed(&mut gutter, "one\n");
+        let before = gutter.epoch;
+        gutter.mark_stale();
+        assert!(!gutter.land_head(1, before, Some("old\n".into())));
+        assert!(gutter.stale.contains(&1), "still wants the new HEAD");
+        assert_eq!(
+            gutter.docs[&1].head.as_deref().map(String::as_str),
+            Some("one\n")
+        );
+    }
+
+    #[test]
+    fn a_file_that_left_the_repository_loses_its_marks() {
+        let mut gutter = gutter();
+        diffed(&mut gutter, "one\n");
+        gutter.mark_stale();
+        assert!(!gutter.land_head(1, gutter.epoch, None));
+        let entry = &gutter.docs[&1];
+        assert!(entry.head.is_none());
+        assert!(entry.marks.is_empty() && entry.changes.is_empty());
     }
 }

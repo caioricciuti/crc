@@ -132,13 +132,17 @@ impl EditorView {
             return;
         };
         // Marks worked out on a worker, for text that has not moved on.
-        while let Ok((id, text, changes)) = state.gutter.computed.1.try_recv() {
+        while let Ok((id, text, head, changes)) = state.gutter.computed.1.try_recv() {
             state.gutter.diffing.remove(&id);
             let current = all_docs(&state)
                 .flat_map(|d| d.iter())
                 .find(|b| b.id() == id)
                 .is_some_and(|b| b.rope.same_as(&text));
-            if current && let Some(entry) = state.gutter.docs.get_mut(&id) {
+            // Against a HEAD that has moved on since, they are dropped.
+            if current
+                && let Some(entry) = state.gutter.docs.get_mut(&id)
+                && entry.head.as_ref().is_some_and(|h| Arc::ptr_eq(h, &head))
+            {
                 entry.marks = crate::project::git::marks(&changes);
                 entry.changes = changes;
                 entry.text = Some(text);
@@ -146,46 +150,34 @@ impl EditorView {
             }
         }
         // Fetched HEAD texts landing.
-        while let Ok((id, head)) = state.gutter.heads.1.try_recv() {
+        while let Ok((id, epoch, head)) = state.gutter.heads.1.try_recv() {
             state.gutter.pending.remove(&id);
-            let has_head = head.is_some();
-            state.gutter.docs.insert(
-                id,
-                GutterState {
-                    head: head.map(std::sync::Arc::new),
-                    marks: Vec::new(),
-                    changes: Vec::new(),
-                    text: None,
-                },
-            );
-            if has_head {
+            if state.gutter.land_head(id, epoch, head) {
                 state.gutter.dirty.insert(id, overdue());
             }
             self.ivars().needs_redraw.set(true);
         }
-        // The active file, if it has never been looked at.
-        {
-            let active = state.docs.active();
-            let id = active.id();
-            if let Some(path) = active.path.clone()
-                && !active.is_preview_file()
-                && active.rope.len_bytes() <= GUTTER_MAX_BYTES
-                && !state.gutter.docs.contains_key(&id)
-                && !state.gutter.pending.contains(&id)
-            {
-                state.gutter.pending.insert(id);
-                let tx = state.gutter.heads.0.clone();
-                std::thread::spawn(move || {
-                    let head = path
-                        .parent()
-                        .ok_or_else(|| "no parent directory".to_string())
-                        .and_then(crate::project::git::toplevel)
-                        .and_then(|root| crate::project::git::head_text(&root, &path))
-                        .ok()
-                        .map(|text| text.unwrap_or_default());
-                    let _ = tx.send((id, head));
-                });
-            }
+        // The active file, if it has never been looked at, and the file each
+        // pane shows, if Git has changed something since it was. Other files
+        // are read again when they are next shown.
+        let shown = std::iter::once(state.docs.active())
+            .chain(state.panes.iter().map(|p| p.docs.active()))
+            .filter(|b| {
+                !state.gutter.pending.contains(&b.id())
+                    && (state.gutter.stale.contains(&b.id())
+                        || (b.id() == state.docs.active().id()
+                            && !state.gutter.docs.contains_key(&b.id())))
+            })
+            .filter(|b| !b.is_preview_file() && b.rope.len_bytes() <= GUTTER_MAX_BYTES)
+            .filter_map(|b| Some((b.id(), b.path.clone()?)))
+            .collect::<Vec<_>>();
+        for (id, path) in shown {
+            state.gutter.pending.insert(id);
+            let tx = state.gutter.heads.0.clone();
+            let epoch = state.gutter.epoch;
+            std::thread::spawn(move || {
+                let _ = tx.send((id, epoch, super::changes::read_head(&path)));
+            });
         }
         // Files edited a moment ago.
         let due = due(&state.gutter.dirty, PAUSE);
@@ -235,7 +227,7 @@ impl EditorView {
             std::thread::spawn(move || {
                 let text = snapshot.to_string();
                 let changes = crate::ide::diff::changes(&head, &text);
-                let _ = tx.send((id, snapshot, changes));
+                let _ = tx.send((id, snapshot, head, changes));
             });
         }
     }

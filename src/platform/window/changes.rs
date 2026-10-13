@@ -82,11 +82,28 @@ pub(super) fn check_peek(peek: &mut Option<Peek>, buffer: &Buffer) {
     }
 }
 
+/// The text of `path` as of HEAD, with a file HEAD lacks as the empty
+/// string, or `None` when it is not in a repository.
+pub(super) fn read_head(path: &Path) -> Option<String> {
+    path.parent()
+        .ok_or_else(|| "no parent directory".to_string())
+        .and_then(crate::project::git::toplevel)
+        .and_then(|root| crate::project::git::head_text(&root, path))
+        .ok()
+        .map(|text| text.unwrap_or_default())
+}
+
 /// The active document's HEAD text and its changes against it, current to
 /// the text in the buffer, or why there are none to act on. The gutter
 /// diffs a pause after typing; when it is behind, the diff runs now rather
-/// than acting on lines that have moved.
-fn active_changes(state: &mut State) -> Result<(Arc<String>, Vec<Change>), &'static str> {
+/// than acting on lines that have moved. With `fresh`, for what writes a
+/// HEAD text somewhere, a HEAD that may have moved is read now, rather
+/// than acting on the one the gutter still draws; stepping and peeking
+/// take that one while the new read is on its way.
+fn active_changes(
+    state: &mut State,
+    fresh: bool,
+) -> Result<(Arc<String>, Vec<Change>), &'static str> {
     let State { docs, gutter, .. } = state;
     let buffer = docs.active();
     if buffer.path.is_none() {
@@ -99,6 +116,13 @@ fn active_changes(state: &mut State) -> Result<(Arc<String>, Vec<Change>), &'sta
         return Err("no Git changes for files over 2 MB");
     }
     let id = buffer.id();
+    if fresh
+        && gutter.stale.contains(&id)
+        && let Some(path) = &buffer.path
+    {
+        let epoch = gutter.epoch;
+        gutter.land_head(id, epoch, read_head(path));
+    }
     let Some(entry) = gutter.docs.get_mut(&id) else {
         return Err("Git has not read this file yet");
     };
@@ -137,7 +161,7 @@ fn stage_job(
             "cannot stage one change of a file that is not plain UTF-8; {ELSEWHERE}"
         ));
     }
-    let (head, changes) = active_changes(state)?;
+    let (head, changes) = active_changes(state, true)?;
     let change = crate::ide::diff::change_at(&changes, line)
         .map(|index| changes[index])
         .ok_or("the caret is not on a change")?;
@@ -183,7 +207,7 @@ impl EditorView {
                 return;
             };
             let line = state.docs.active().cursor_position().0;
-            active_changes(&mut state).and_then(|(_, changes)| {
+            active_changes(&mut state, false).and_then(|(_, changes)| {
                 let index = crate::ide::diff::step_change(&changes, line, forward)
                     .ok_or("no changes since HEAD")?;
                 Ok((index, changes.len(), changes[index].new_start))
@@ -213,7 +237,7 @@ impl EditorView {
                 return;
             };
             let line = line.unwrap_or_else(|| state.docs.active().cursor_position().0);
-            let found = active_changes(&mut state).and_then(|(head, changes)| {
+            let found = active_changes(&mut state, false).and_then(|(head, changes)| {
                 crate::ide::diff::change_at(&changes, line)
                     .map(|index| (head, changes[index]))
                     .ok_or("the caret is not on a change")
@@ -327,7 +351,7 @@ impl EditorView {
                 return;
             };
             let line = state.docs.active().cursor_position().0;
-            let found = active_changes(&mut state).and_then(|(head, changes)| {
+            let found = active_changes(&mut state, true).and_then(|(head, changes)| {
                 let change = crate::ide::diff::change_at(&changes, line)
                     .map(|index| changes[index])
                     .ok_or("the caret is not on a change")?;

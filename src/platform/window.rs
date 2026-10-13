@@ -4616,9 +4616,10 @@ define_class!(
     }
 );
 
-/// A fetched HEAD text arriving from a worker: the buffer it is for, and
-/// the text, or none when the file is not in a repository.
-type HeadText = (u64, Option<String>);
+/// A fetched HEAD text arriving from a worker: the buffer it is for, the
+/// gutter's epoch when it was asked for, and the text, or none when the
+/// file is not in a repository.
+type HeadText = (u64, u64, Option<String>);
 
 /// What the gutter knows about one open file.
 struct GutterState {
@@ -6075,6 +6076,7 @@ fn forget_document(state: &mut State, id: u64) {
     state.gutter.docs.remove(&id);
     state.gutter.dirty.remove(&id);
     state.gutter.pending.remove(&id);
+    state.gutter.stale.remove(&id);
     state.lsp.dirty.remove(&id);
     state.conflict_scans.remove(&id);
 }
@@ -6172,9 +6174,14 @@ fn claude_selection(state: &State) -> Option<crate::ide::mcp::Selection> {
 
 /// A file read for a reload, by buffer id.
 type ReloadRead = (u64, std::io::Result<crate::text::buffer::DiskRead>);
-/// Gutter marks worked out on a worker: buffer id, the text they are for,
-/// the marks.
-type GutterMarks = (u64, crate::text::rope::Rope, Vec<crate::ide::diff::Change>);
+/// Gutter marks worked out on a worker: buffer id, the text and the HEAD
+/// text they are for, the marks.
+type GutterMarks = (
+    u64,
+    crate::text::rope::Rope,
+    Arc<String>,
+    Vec<crate::ide::diff::Change>,
+);
 
 /// Files changed on disk up to this size are reloaded at once; larger ones
 /// are read on a worker so the window stays responsive.
@@ -9042,6 +9049,8 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
             docs: HashMap::new(),
             dirty: HashMap::new(),
             pending: HashSet::new(),
+            stale: HashSet::new(),
+            epoch: 0,
             heads: mpsc::channel(),
             computed: mpsc::channel(),
             diffing: HashSet::new(),

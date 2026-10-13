@@ -93,7 +93,7 @@ impl EditorView {
             && !state.git.busy()
         {
             state.watch.git_changed_at = None;
-            state.gutter.docs.clear();
+            state.gutter.mark_stale();
             state.git.refresh();
             start_home_summary(&mut state);
         }

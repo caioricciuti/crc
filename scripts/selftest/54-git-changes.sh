@@ -79,12 +79,18 @@ expect_line "$T/changes-undo.out" 5 "six"
 # from the buffer; Option-F5 with the peek open moves it to the next change,
 # and Stage Change from the palette stages the caret's change. The file on
 # disk is never written. Staging writes the index, and the watcher has the
-# gutter read HEAD again; the waits after it let that settle first.
+# gutter read HEAD again: the marks stay drawn all the while, sampled every
+# few frames, and Next Change works at once, without waiting for it. Last,
+# HEAD moves to another branch behind the editor, and the marks follow it.
 mkdir -p "$T/peekproj"
 git init -q -b main "$T/peekproj"
 printf 'one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\n' > "$T/peekproj/notes.txt"
 git -C "$T/peekproj" add notes.txt
 testgit "$T/peekproj" commit -q -m notes
+git -C "$T/peekproj" checkout -q -b other
+printf 'one\nTWO\nthree\nfour\nsix\nseven\neight\n' > "$T/peekproj/notes.txt"
+testgit "$T/peekproj" commit -q -am other
+git -C "$T/peekproj" checkout -q main
 printf 'one\nTWO\nthree\nfour\nsix\nseven\neight\nnine\n' > "$T/peekproj/notes.txt"
 cat > "$T/peek.script" <<SCRIPT
 wait 800
@@ -100,10 +106,13 @@ dump $T/peek-closed.out
 click @change_bar.2
 wait 100
 click @peek.stage
-wait 1500
+wait 300
 dump $T/peek-staged.out
-wait 1500
-wait 1000
+SCRIPT
+for n in $(seq 1 30); do
+    printf 'wait 25\ndump %s\n' "$T/peek-settle-$n.out"
+done >> "$T/peek.script"
+cat >> "$T/peek.script" <<SCRIPT
 key 96 opt
 wait 100
 dump $T/peek-moved.out
@@ -115,17 +124,35 @@ text >stage change
 key 36
 wait 1500
 dump $T/peek-staged-two.out
+write $T/peekproj/.git/HEAD ref: refs/heads/other
+SCRIPT
+for n in $(seq 1 30); do
+    printf 'wait 25\ndump %s\n' "$T/peek-switch-$n.out"
+done >> "$T/peek.script"
+cat >> "$T/peek.script" <<SCRIPT
+key 96 opt
+wait 100
+dump $T/peek-branch.out
 quit
 SCRIPT
 CRC_SELFTEST="$T/peek.script" "$BIN" "$T/peekproj/notes.txt" 2> "$T/peek.err"
 expect "$T/peek-open.out" peek "Changed 1 line, 1 in HEAD 2..3 drawn=true"
 expect "$T/peek-open.out" cursor "2:1"
 expect "$T/peek-closed.out" peek "closed"
+for n in $(seq 1 30); do
+    expect "$T/peek-settle-$n.out" gutter "2M 5R 8A"
+    case "$(grep -m1 '^gutter: ' "$T/peek-switch-$n.out")" in
+        "gutter: 2M 5R 8A" | "gutter: 8A") ;;
+        *) failed "peek: the gutter while HEAD moved: $(grep -m1 '^gutter: ' "$T/peek-switch-$n.out")" ;;
+    esac
+done
 expect "$T/peek-staged.out" message "staged the change at line 2"
 expect "$T/peek-staged.out" peek "Changed 1 line, 1 in HEAD 2..3 drawn=true"
 expect "$T/peek-moved.out" peek "Removed 1 line 5..5 drawn=true"
 expect "$T/peek-moved.out" cursor "5:1"
 expect "$T/peek-staged-two.out" message "staged the change at line 8"
+expect "$T/peek-branch.out" gutter "8A"
+expect "$T/peek-branch.out" message "change 1 of 1"
 [ "$(git -C "$T/peekproj" show :notes.txt)" = "$(printf 'one\nTWO\nthree\nfour\nfive\nsix\nseven\neight\nnine')" ] \
     || failed "peek: the index has: $(git -C "$T/peekproj" show :notes.txt)"
 [ "$(cat "$T/peekproj/notes.txt")" = "$(printf 'one\nTWO\nthree\nfour\nsix\nseven\neight\nnine')" ] \
