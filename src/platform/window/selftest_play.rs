@@ -520,7 +520,7 @@ impl EditorView {
                 };
                 let report = format!(
                     // First: the report ends with the document's text.
-                    "message: {}\npreview: {}\nmd: {md}\nactivity: {}\npointer_targets: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nrepo: {}\ngit_note: {}\nhome: {}\nmcp: {}\nmcp_page: {}\nsettings_page: {}\nreview_page: {}\nterminals: {}\nagents: {}\ninspector: {}\nteams: {}\nagents_tree: {}\nagents_activity: {}\nagents_prs: {}\nconflicts: {}\ngit_conflicts: {}\nblame: {}\nfind_results: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\n{report}",
+                    "message: {}\npreview: {}\nmd: {md}\nactivity: {}\npointer_targets: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nrepo: {}\ngit_note: {}\nhome: {}\nmcp: {}\nmcp_page: {}\nsettings_page: {}\nreview_page: {}\nterminals: {}\nagents: {}\ninspector: {}\nteams: {}\nagents_tree: {}\nagents_activity: {}\nagents_prs: {}\nconflicts: {}\ngit_conflicts: {}\nblame: {}\nfind_results: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\npeek: {}\n{report}",
                     state.message.as_ref().map_or("", |(text, _)| text.as_str()),
                     state.html_preview.as_ref().map_or("closed".to_string(), |p| format!(
                         "open ext={} view={} probe={}",
@@ -703,6 +703,13 @@ impl EditorView {
                         .as_ref()
                         .and_then(|c| c.shown.get(c.selected))
                         .map_or("", |c| c.why.as_str()),
+                    state.peek.as_ref().map_or("closed".to_string(), |p| format!(
+                        "{} {}..{} drawn={}",
+                        p.content.title,
+                        p.change.new_start + 1,
+                        p.change.new_end + 1,
+                        p.hits.is_some()
+                    )),
                 );
                 if let Err(e) = std::fs::write(path, report) {
                     eprintln!("crc: selftest could not write {path}: {e}");
@@ -776,6 +783,34 @@ fn region_named(state: &mut State, name: &str) -> Option<Viewport> {
         _ if name.starts_with("settings.") => state.settings_page.named(name),
         _ if name.starts_with("review_page.") => state.review_page.named(name),
         _ if name.starts_with("agents.") => state.agents.named(name),
+        _ if name.starts_with("peek.") => {
+            let hits = state.peek.as_ref()?.hits?;
+            match name {
+                "peek.revert" => Some(hits.revert),
+                "peek.stage" => Some(hits.stage),
+                "peek.close" => Some(hits.close),
+                _ => Some(hits.panel),
+            }
+        }
+        // The mark beside a line, by its number: `change_bar.2`.
+        _ if name.starts_with("change_bar.") => {
+            let line = name["change_bar.".len()..]
+                .parse::<usize>()
+                .ok()?
+                .checked_sub(1)?;
+            let text = chrome_of(state).text;
+            let buffer = state.docs.active();
+            let m = state.renderer.atlas.metrics;
+            let row = layout::screen_rows(buffer, text, m.line_height)
+                .into_iter()
+                .find(|r| r.line == line && r.first)?;
+            Some(Viewport {
+                x: text.x,
+                y: row.y,
+                width: m.advance,
+                height: m.line_height,
+            })
+        }
         _ if name.starts_with("inspector.") => state.agents.inspector.named(name),
         _ if name == "home.review" => state
             .home_hits

@@ -9,6 +9,12 @@ One entry per tag, written for people who use the editor.
   ends, and say which change of how many it is on. Git > Revert Change
   puts the change at the caret back to its HEAD text in the editor, as
   one undoable edit; the file on disk is only written when you save.
+- Click a change mark in the gutter (or Git > Show Change) to see what
+  HEAD had there, in a card under the change with Revert and Stage
+  buttons; Next and Previous Change move the open card along. Git > Stage
+  Change stages just that change, unsaved lines included. It refuses, and
+  says so, for files with CRLF line endings and for files whose index
+  already differs from HEAD; stage those from Source Control.
 
 ## v0.2.0-alpha.23, 2026-10-13
 

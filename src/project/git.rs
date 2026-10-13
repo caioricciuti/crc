@@ -1021,6 +1021,142 @@ pub fn stage_hunk(root: &Path, change: &Change, hunk: &Hunk) -> Result<(), Strin
     apply_index_patch(root, &patch, hunk.staged, false)
 }
 
+/// Lines of context around a change staged from the editor, as `git diff`
+/// writes them.
+const TEXT_HUNK_CONTEXT: usize = 3;
+
+/// Stages one change the gutter marks: `change` from `head`, the file as of
+/// HEAD, to `text`, the editor's text of it, applied to the index alone.
+/// The patch is built from those two texts, so what stages is what the
+/// editor shows, unsaved lines included. The index must still have HEAD's
+/// lines around the change; when it does not, nothing is staged.
+pub fn stage_text_hunk(
+    root: &Path,
+    relative: &Path,
+    head: &str,
+    text: &str,
+    change: &crate::ide::diff::Change,
+) -> Result<(), String> {
+    const ELSEWHERE: &str = "stage from Source Control";
+    // The editor's texts have LF line breaks; the bytes in Git may not.
+    if rev_bytes(root, "HEAD", relative)?.is_some_and(|bytes| bytes.contains(&b'\r')) {
+        return Err(format!(
+            "cannot stage one change of a file with CRLF line breaks; {ELSEWHERE}"
+        ));
+    }
+    let path = relative
+        .to_str()
+        .ok_or("cannot stage a change in a file whose name is not UTF-8")?;
+    let patch = text_hunk_patch(path, head, text, change)
+        .ok_or("cannot stage: the change no longer fits the text")?;
+    if let Err(error) = apply_index_patch(root, patch.as_bytes(), false, true) {
+        // Why it does not apply, in words that say what to do instead.
+        let succeeds = |args: &[&str]| {
+            command(root)
+                .args(args)
+                .arg(relative)
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        if !succeeds(&["ls-files", "--error-unmatch", "--"]) {
+            return Err(format!(
+                "cannot stage: this file is not tracked; {ELSEWHERE}"
+            ));
+        }
+        if !succeeds(&["diff", "--cached", "--quiet", "--"]) {
+            return Err(format!(
+                "cannot stage: the index differs from HEAD for this file; {ELSEWHERE}"
+            ));
+        }
+        return Err(error);
+    }
+    apply_index_patch(root, patch.as_bytes(), false, false)
+}
+
+/// The patch [`stage_text_hunk`] applies: one hunk, with HEAD's lines as
+/// context, numbered for a file that has only this change. `None` when the
+/// change does not fit the texts.
+fn text_hunk_patch(
+    path: &str,
+    head: &str,
+    text: &str,
+    change: &crate::ide::diff::Change,
+) -> Option<String> {
+    let old: Vec<&str> = head.split_inclusive('\n').collect();
+    let new: Vec<&str> = text.split_inclusive('\n').collect();
+    if change.old_start > change.old_end
+        || change.old_end > old.len()
+        || change.new_start > change.new_end
+        || change.new_end > new.len()
+    {
+        return None;
+    }
+    let before = change.old_start.min(TEXT_HUNK_CONTEXT);
+    let after = (old.len() - change.old_end).min(TEXT_HUNK_CONTEXT);
+    let first = change.old_start - before;
+    let old_count = before + (change.old_end - change.old_start) + after;
+    let new_count = before + (change.new_end - change.new_start) + after;
+    // A side with no lines names the line before it, `0` at the top.
+    let range = |count: usize| match count {
+        0 => format!("{first},0"),
+        1 => format!("{}", first + 1),
+        n => format!("{},{n}", first + 1),
+    };
+    let (a, b) = (
+        quoted_path(&format!("a/{path}")),
+        quoted_path(&format!("b/{path}")),
+    );
+    let mut patch = format!(
+        "diff --git {a} {b}\n--- {a}\n+++ {b}\n@@ -{} +{} @@\n",
+        range(old_count),
+        range(new_count)
+    );
+    let mut push = |sign: char, line: &str| {
+        patch.push(sign);
+        patch.push_str(line);
+        if !line.ends_with('\n') {
+            patch.push_str("\n\\ No newline at end of file\n");
+        }
+    };
+    old[first..change.old_start]
+        .iter()
+        .for_each(|l| push(' ', l));
+    old[change.old_start..change.old_end]
+        .iter()
+        .for_each(|l| push('-', l));
+    new[change.new_start..change.new_end]
+        .iter()
+        .for_each(|l| push('+', l));
+    old[change.old_end..change.old_end + after]
+        .iter()
+        .for_each(|l| push(' ', l));
+    Some(patch)
+}
+
+/// A path as a patch header writes it: as is, or in double quotes with C
+/// escapes when it holds a quote, a backslash or a control character.
+fn quoted_path(path: &str) -> String {
+    if !path
+        .chars()
+        .any(|c| c == '"' || c == '\\' || c.is_ascii_control())
+    {
+        return path.to_owned();
+    }
+    let mut out = String::from("\"");
+    for c in path.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            c if c.is_ascii_control() => out.push_str(&format!("\\{:03o}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 pub fn stage(root: &Path, change: &Change, staged: bool) -> Result<(), String> {
     let mut cmd = command(root);
     if staged {
@@ -2288,5 +2424,118 @@ mod tests {
         stage_hunk(&root, &change, &preview.hunks[0]).unwrap();
         assert!(run(&root, &["diff"]).unwrap().is_empty());
         assert_eq!(std::fs::read(&path).unwrap(), b"alpha\nchanged");
+    }
+
+    /// A repository with `file` committed as `head`, and its root.
+    fn committed(name: &str, file: &str, head: &str) -> (TempRepo, PathBuf) {
+        let repo = TempRepo::new(name);
+        let root = repo.path().to_path_buf();
+        std::fs::write(root.join(file), head).unwrap();
+        run(&root, &["add", "--", file]).unwrap();
+        run(&root, &["commit", "--quiet", "-m", "Personal sample"]).unwrap();
+        (repo, root)
+    }
+
+    fn cached(root: &Path) -> String {
+        String::from_utf8(run(root, &["diff", "--cached"]).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn text_hunk_patches_count_lines_as_git_does() {
+        let changes = crate::ide::diff::changes;
+        // A modification with context on both sides.
+        let head = "a\nb\nc\nd\ne\nf\ng\nh\n";
+        let text = "a\nb\nc\nd\nE\nf\ng\nh\n";
+        let patch = text_hunk_patch("p.txt", head, text, &changes(head, text)[0]).unwrap();
+        assert_eq!(
+            patch,
+            "diff --git a/p.txt b/p.txt\n--- a/p.txt\n+++ b/p.txt\n\
+             @@ -2,7 +2,7 @@\n b\n c\n d\n-e\n+E\n f\n g\n h\n"
+        );
+        // Everything added to an empty file: the old side is `-0,0`.
+        let patch = text_hunk_patch("p.txt", "", "new\n", &changes("", "new\n")[0]).unwrap();
+        assert!(patch.ends_with("@@ -0,0 +1 @@\n+new\n"), "{patch}");
+        // Everything removed: the new side is `+0,0`.
+        let patch = text_hunk_patch("p.txt", "x\ny", "", &changes("x\ny", "")[0]).unwrap();
+        assert!(
+            patch.ends_with("@@ -1,2 +0,0 @@\n-x\n-y\n\\ No newline at end of file\n"),
+            "{patch}"
+        );
+        // A path git would quote.
+        let patch = text_hunk_patch("a\"b.txt", "x\n", "y\n", &changes("x\n", "y\n")[0]).unwrap();
+        assert!(patch.starts_with("diff --git \"a/a\\\"b.txt\" \"b/a\\\"b.txt\"\n"));
+        // A change that does not fit the texts.
+        let mut stale = changes(head, text)[0];
+        stale.new_end = 40;
+        assert_eq!(text_hunk_patch("p.txt", head, text, &stale), None);
+    }
+
+    #[test]
+    fn stages_one_change_of_the_buffer_text() {
+        let head: String = (1..=20).map(|n| format!("line {n}\n")).collect();
+        let (_repo, root) = committed("text-hunk", "notes.txt", &head);
+        let text = head
+            .replace("line 2\n", "first edit\n")
+            .replace("line 18\n", "second edit\n");
+        // On disk the file is unchanged: the buffer's text is what stages.
+        let changes = crate::ide::diff::changes(&head, &text);
+        assert_eq!(changes.len(), 2);
+        stage_text_hunk(&root, Path::new("notes.txt"), &head, &text, &changes[1]).unwrap();
+        let staged = cached(&root);
+        assert!(staged.contains("+second edit"), "{staged}");
+        assert!(!staged.contains("first edit"), "{staged}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("notes.txt")).unwrap(),
+            head
+        );
+    }
+
+    #[test]
+    fn stages_an_addition_at_the_end_without_a_final_newline() {
+        let (_repo, root) = committed("text-hunk-eof", "eof.txt", "alpha\nbeta");
+        let (head, text) = ("alpha\nbeta", "alpha\nbeta\ngamma");
+        let changes = crate::ide::diff::changes(head, text);
+        assert_eq!(changes.len(), 1);
+        stage_text_hunk(&root, Path::new("eof.txt"), head, text, &changes[0]).unwrap();
+        let index = run(&root, &["show", ":eof.txt"]).unwrap();
+        assert_eq!(index, b"alpha\nbeta\ngamma");
+    }
+
+    #[test]
+    fn stages_a_pure_deletion() {
+        let head = "one\ntwo\nthree\nfour\n";
+        let (_repo, root) = committed("text-hunk-del", "del.txt", head);
+        let text = "one\nfour\n";
+        let changes = crate::ide::diff::changes(head, text);
+        assert_eq!(changes[0].kind, MarkKind::Removed);
+        stage_text_hunk(&root, Path::new("del.txt"), head, text, &changes[0]).unwrap();
+        assert_eq!(run(&root, &["show", ":del.txt"]).unwrap(), text.as_bytes());
+    }
+
+    #[test]
+    fn refuses_when_the_index_differs_from_head() {
+        let head = "one\ntwo\nthree\n";
+        let (_repo, root) = committed("text-hunk-index", "idx.txt", head);
+        // Someone staged a different edit of the same line.
+        std::fs::write(root.join("idx.txt"), "one\nTWO staged\nthree\n").unwrap();
+        run(&root, &["add", "--", "idx.txt"]).unwrap();
+        let text = "one\nTWO typed\nthree\n";
+        let changes = crate::ide::diff::changes(head, text);
+        let error =
+            stage_text_hunk(&root, Path::new("idx.txt"), head, text, &changes[0]).unwrap_err();
+        assert!(error.contains("the index differs from HEAD"), "{error}");
+        assert!(cached(&root).contains("+TWO staged"));
+    }
+
+    #[test]
+    fn refuses_a_crlf_file() {
+        let (_repo, root) = committed("text-hunk-crlf", "crlf.txt", "one\r\ntwo\r\n");
+        run(&root, &["config", "core.autocrlf", "false"]).unwrap();
+        let (head, text) = ("one\ntwo\n", "one\nTWO\n");
+        let changes = crate::ide::diff::changes(head, text);
+        let error =
+            stage_text_hunk(&root, Path::new("crlf.txt"), head, text, &changes[0]).unwrap_err();
+        assert!(error.contains("CRLF"), "{error}");
+        assert!(cached(&root).is_empty());
     }
 }

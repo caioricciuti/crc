@@ -758,6 +758,8 @@ struct State {
     reloads: Reloads,
     /// The completion list, while one is open.
     completion: Option<CompletionPopup>,
+    /// The peek at one Git change of the active document, while it is open.
+    peek: Option<changes::Peek>,
     /// A name being typed into the tree, for a file or folder about to be
     /// created or an item being renamed. The way VS Code does it: no panel.
     sidebar_edit: Option<SidebarEdit>,
@@ -1523,6 +1525,22 @@ define_class!(
             if let Some(mut state) = self.state_mut() {
                 state.drag = None;
             }
+            // The peek at a Git change takes a click on it; a click anywhere
+            // else closes it and goes on as it would have.
+            let peek = {
+                let Some(mut state) = self.state_mut() else {
+                    return;
+                };
+                let click = changes::peek_click(&state, x, y);
+                if click.is_none() {
+                    state.peek = None;
+                }
+                click
+            };
+            if let Some(click) = peek {
+                self.peek_action(click);
+                return;
+            }
 
             // The Extensions page owns the editor column while it is open.
             let page_action = {
@@ -1717,6 +1735,17 @@ define_class!(
                 }
                 Some(Hit::ToolbarSearch) => {
                     self.open_palette();
+                    return;
+                }
+                // The divider's grab reaches into the text, over the first
+                // cell of the gutter: a change's mark there is clicked, as
+                // its pointer, drawn over the divider's, says.
+                Some(Hit::SidebarDivider)
+                    if let Some(line) = self
+                        .state()
+                        .and_then(|state| changes::change_bar_under(&state, event, x, y)) =>
+                {
+                    self.click_change_bar(line);
                     return;
                 }
                 // Grabbing the divider starts a resize rather than anything else.
@@ -1932,6 +1961,14 @@ define_class!(
                     };
                     if let Some(line) = fold {
                         self.toggle_fold(Some(line));
+                        return;
+                    }
+                    // A change's mark at the gutter's left edge.
+                    let bar = self
+                        .state()
+                        .and_then(|state| changes::change_bar_under(&state, event, x, y));
+                    if let Some(line) = bar {
+                        self.click_change_bar(line);
                         return;
                     }
                 }
@@ -3037,6 +3074,16 @@ define_class!(
         #[unsafe(method(revertChange:))]
         fn action_revert_change(&self, _sender: Option<&AnyObject>) {
             self.revert_change();
+        }
+
+        #[unsafe(method(showChange:))]
+        fn action_show_change(&self, _sender: Option<&AnyObject>) {
+            self.show_change(None);
+        }
+
+        #[unsafe(method(stageChange:))]
+        fn action_stage_change(&self, _sender: Option<&AnyObject>) {
+            self.stage_change(None);
         }
 
         #[unsafe(method(acceptCurrent:))]
@@ -4278,6 +4325,8 @@ define_class!(
             } else if action == sel!(nextChange:)
                 || action == sel!(previousChange:)
                 || action == sel!(revertChange:)
+                || action == sel!(showChange:)
+                || action == sel!(stageChange:)
             {
                 changes::active_has_changes(&state)
             } else if action == sel!(acceptBase:) {
@@ -8552,7 +8601,9 @@ fn install_menu(mtm: MainThreadMarker, app: &NSApplication) {
     previous_change
         .setKeyEquivalentModifierMask(NSEventModifierFlags::Shift | NSEventModifierFlags::Option);
     git_menu.addItem(&previous_change);
+    git_menu.addItem(&item("Show Change", sel!(showChange:), "", false));
     git_menu.addItem(&item("Revert Change", sel!(revertChange:), "", false));
+    git_menu.addItem(&item("Stage Change", sel!(stageChange:), "", false));
     git_menu.addItem(&NSMenuItem::separatorItem(mtm));
     git_menu.addItem(&item("Next Conflict", sel!(nextConflict:), "", false));
     git_menu.addItem(&item(
@@ -8973,6 +9024,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
             pending: HashSet::new(),
         },
         completion: None,
+        peek: None,
         panes: Vec::new(),
         focused_pane: 0,
         palette: None,

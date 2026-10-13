@@ -19,6 +19,8 @@ enum Operation {
     /// Every change of a section, staged or unstaged together.
     StageAll(Vec<Change>, bool),
     StageHunk(Change, git::Hunk),
+    /// One change the editor's gutter marks, staged from the editor's text.
+    StageText(StageText),
     Commit(String),
     Switch(String),
     CreateBranch(String),
@@ -32,6 +34,17 @@ enum Operation {
     /// `git add` on a path whose conflict the user has resolved.
     Resolve(Change),
 }
+/// A change from the editor to stage: the file, its text as of HEAD and in
+/// the editor, the change between them, and what the status line says
+/// once it is staged.
+pub struct StageText {
+    pub path: PathBuf,
+    pub head: std::sync::Arc<String>,
+    pub text: String,
+    pub change: crate::ide::diff::Change,
+    pub done: String,
+}
+
 struct Reply {
     snapshot: Snapshot,
     selected: usize,
@@ -639,6 +652,11 @@ impl Panel {
             self.start(Operation::Stage(change, staged));
         }
     }
+    /// Stages one change from the editor, in the repository its file is
+    /// in, and says how it went in the status line.
+    pub fn stage_text(&mut self, job: StageText) {
+        self.start(Operation::StageText(job));
+    }
     pub fn stage_hunk(&mut self, index: usize) {
         let Some(change) = self.selected_change().cloned() else {
             return;
@@ -746,6 +764,7 @@ impl Panel {
                 | Operation::Remote(..)
                 | Operation::Resolve(_)
                 | Operation::StageAll(..)
+                | Operation::StageText(_)
                 | Operation::Commit(_)
         );
         let directory = self.directory.clone();
@@ -865,6 +884,35 @@ impl Panel {
                     },
                     Operation::StageHunk(change, hunk) => {
                         git::stage_hunk(&root, &change, &hunk).err()
+                    }
+                    Operation::StageText(job) => {
+                        // The file's own repository, which in a workspace
+                        // of several need not be the panel's.
+                        let staged = job
+                            .path
+                            .parent()
+                            .ok_or_else(|| "no parent directory".to_string())
+                            .and_then(git::toplevel)
+                            .and_then(|top| {
+                                let relative = job
+                                    .path
+                                    .strip_prefix(&top)
+                                    .map_err(|_| "outside the repository".to_string())?;
+                                git::stage_text_hunk(
+                                    &top,
+                                    relative,
+                                    &job.head,
+                                    &job.text,
+                                    &job.change,
+                                )
+                            });
+                        match staged {
+                            Ok(()) => {
+                                done = Some(job.done);
+                                None
+                            }
+                            Err(error) => Some(error),
+                        }
                     }
                     Operation::Commit(message) => {
                         // The workspace's private markers, checked

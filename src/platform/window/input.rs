@@ -551,7 +551,15 @@ impl EditorView {
                 && state.goto.is_none()
                 && state.rename.is_none();
             let tip = state.lsp.signature.is_some();
+            let peek = state.peek.is_some();
             drop(state);
+            if idle && peek {
+                if let Some(mut state) = self.state_mut() {
+                    state.peek = None;
+                }
+                self.request_redraw();
+                return true;
+            }
             if idle && tip {
                 if let Some(mut state) = self.state_mut() {
                     state.lsp.signature = None;

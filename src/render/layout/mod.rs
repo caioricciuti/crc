@@ -1312,6 +1312,91 @@ mod tests {
     }
 
     #[test]
+    fn clicking_a_change_mark_finds_its_line() {
+        use crate::project::git::{Mark, MarkKind};
+        let atlas = atlas();
+        let m = atlas.metrics;
+        let buffer = Buffer::from_text("a\nb\nc\nd\ne\nf\n");
+        // Line 2 modified, lines removed above line 4, line 5 added.
+        let marks = [
+            Mark {
+                line: 1,
+                kind: MarkKind::Modified,
+            },
+            Mark {
+                line: 3,
+                kind: MarkKind::Removed,
+            },
+            Mark {
+                line: 4,
+                kind: MarkKind::Added,
+            },
+        ];
+        let middle = |line: usize| (line as f32 + 0.5) * m.line_height;
+        let bar = 2.0;
+        assert_eq!(
+            change_bar_at(&buffer, &atlas, &marks, bar, middle(1)),
+            Some(1)
+        );
+        assert_eq!(
+            change_bar_at(&buffer, &atlas, &marks, bar, middle(4)),
+            Some(4)
+        );
+        assert_eq!(change_bar_at(&buffer, &atlas, &marks, bar, middle(0)), None);
+        // The deletion's stub, from just above and just below the boundary.
+        let boundary = 3.0 * m.line_height;
+        assert_eq!(
+            change_bar_at(&buffer, &atlas, &marks, bar, boundary - 2.0),
+            Some(3)
+        );
+        assert_eq!(
+            change_bar_at(&buffer, &atlas, &marks, bar, boundary + 2.0),
+            Some(3)
+        );
+        assert_eq!(change_bar_at(&buffer, &atlas, &marks, bar, middle(3)), None);
+        // Past the first cell, where the numbers and the chevron are.
+        assert_eq!(
+            change_bar_at(&buffer, &atlas, &marks, m.advance + 1.0, middle(1)),
+            None
+        );
+        // The chevron's cell is not the mark's: neither takes the other's
+        // clicks.
+        let buffer = Buffer::from_text("a\nb\n    c\n    d\n");
+        let gutter = gutter_width(&buffer, &atlas);
+        let chevron = gutter - m.advance * 0.5;
+        assert_eq!(
+            fold_chevron_at(&buffer, &atlas, chevron, middle(1)),
+            Some(1)
+        );
+        assert_eq!(
+            change_bar_at(&buffer, &atlas, &marks, chevron, middle(1)),
+            None
+        );
+        assert_eq!(fold_chevron_at(&buffer, &atlas, bar, middle(1)), None);
+    }
+
+    #[test]
+    fn a_change_peek_shows_what_head_had() {
+        use crate::project::git::MarkKind;
+        let head = "one\n\ttwo\nthree\nfour\n";
+        let text = "one\nTWO\nthree\n";
+        let changes = crate::ide::diff::changes(head, text);
+        assert_eq!(changes.len(), 2);
+        let modified = change_peek(head, &changes[0]);
+        assert_eq!(modified.kind, MarkKind::Modified);
+        assert_eq!(modified.title, "Changed 1 line, 1 in HEAD");
+        // Tabs to the next stop, so the columns line up as in the file.
+        assert_eq!(modified.head, [" ".repeat(TAB_WIDTH) + "two"]);
+        let removed = change_peek(head, &changes[1]);
+        assert_eq!(removed.title, "Removed 1 line");
+        assert_eq!(removed.head, ["four"]);
+        let added = crate::ide::diff::changes("a\n", "a\nb\nc\n");
+        let added = change_peek("a\n", &added[0]);
+        assert_eq!(added.title, "Added 2 lines");
+        assert!(added.head.is_empty());
+    }
+
+    #[test]
     fn markdown_hides_syntax_off_the_caret_line() {
         let atlas = atlas();
         let text = "x\n**bold** end\n";

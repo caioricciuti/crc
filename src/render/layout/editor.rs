@@ -842,7 +842,8 @@ pub fn build_text_appending(
 /// Draws the Git marks down the left edge of the gutter: a bar beside an
 /// added or modified line, a short stub at the top of a line that lost the
 /// lines above it. Appended after the text, in the gutter's first cell,
-/// which the right-aligned line numbers never reach.
+/// which the right-aligned line numbers never reach. The cell is where a
+/// click on a mark lands ([`change_bar_at`]), so it points there.
 pub fn push_gutter_marks(
     out: &mut Vec<GlyphInstance>,
     atlas: &Atlas,
@@ -878,6 +879,16 @@ pub fn push_gutter_marks(
                     theme.diff_modified
                 };
                 push_rect(out, atlas, [x, y], [3.0, height], color);
+                hotspot(
+                    Viewport {
+                        x: viewport.x,
+                        y,
+                        width: m.advance,
+                        height,
+                    },
+                    Cursor::Pointing,
+                    None,
+                );
             }
             MarkKind::Removed => {
                 // Between two lines, so it may sit on the boundary just
@@ -886,6 +897,16 @@ pub fn push_gutter_marks(
                     continue;
                 }
                 push_rect(out, atlas, [x, y - 1.5], [8.0, 3.0], theme.diff_removed);
+                hotspot(
+                    Viewport {
+                        x: viewport.x,
+                        y: y - m.line_height * 0.25,
+                        width: m.advance,
+                        height: m.line_height * 0.5,
+                    },
+                    Cursor::Pointing,
+                    None,
+                );
             }
         }
     }
@@ -956,6 +977,385 @@ pub fn bulb_at(buffer: &Buffer, atlas: &Atlas, x: f32, y: f32) -> bool {
     let rows = rows_down_to(buffer, y, m.line_height);
     rows.iter()
         .any(|r| r.line == line && r.first && r.y <= y && y < r.y + m.line_height)
+}
+
+/// The line whose change mark is under a point in the text area's own
+/// coordinates (as [`offset_at_point`] takes them): the gutter's first
+/// cell, where [`push_gutter_marks`] draws. A deletion's stub sits on the
+/// boundary between two lines, so it is hit from a quarter of a line either
+/// side of it, and answers the line below, which it marks.
+pub fn change_bar_at(
+    buffer: &Buffer,
+    atlas: &Atlas,
+    marks: &[crate::project::git::Mark],
+    x: f32,
+    y: f32,
+) -> Option<usize> {
+    use crate::project::git::MarkKind;
+    let m = atlas.metrics;
+    if !(0.0..m.advance).contains(&x) || marks.is_empty() {
+        return None;
+    }
+    let rows = rows_down_to(buffer, y, m.line_height);
+    let row = rows.iter().find(|r| r.y <= y && y < r.y + m.line_height)?;
+    let kind = |line: usize| {
+        let i = marks.partition_point(|mark| mark.line < line);
+        marks
+            .get(i)
+            .filter(|mark| mark.line == line)
+            .map(|mark| mark.kind)
+    };
+    match kind(row.line) {
+        Some(MarkKind::Added | MarkKind::Modified) => return Some(row.line),
+        Some(MarkKind::Removed) if row.first && y < row.y + m.line_height * 0.25 => {
+            return Some(row.line);
+        }
+        _ => {}
+    }
+    (row.last && y >= row.y + m.line_height * 0.75 && kind(row.line + 1) == Some(MarkKind::Removed))
+        .then_some(row.line + 1)
+}
+
+/// What the peek at one change says: a title, and the lines HEAD had where
+/// the change is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChangePeek {
+    pub kind: crate::project::git::MarkKind,
+    pub title: String,
+    /// HEAD's lines the change replaced, without line breaks, tabs
+    /// expanded. Empty for an addition.
+    pub head: Vec<String>,
+}
+
+/// The peek's content for `change`, from `head`, the file as of HEAD.
+pub fn change_peek(head: &str, change: &crate::ide::diff::Change) -> ChangePeek {
+    use crate::project::git::MarkKind;
+    let lines = |n: usize| if n == 1 { "line" } else { "lines" };
+    let added = change.new_end - change.new_start;
+    let removed = change.old_end.saturating_sub(change.old_start);
+    let title = match change.kind {
+        MarkKind::Added => format!("Added {added} {}", lines(added)),
+        MarkKind::Removed => format!("Removed {removed} {}", lines(removed)),
+        MarkKind::Modified => format!("Changed {added} {}, {removed} in HEAD", lines(added)),
+    };
+    let head = head
+        .split_inclusive('\n')
+        .skip(change.old_start)
+        .take(removed)
+        .map(|line| {
+            let mut out = String::new();
+            let mut column = 0;
+            for ch in line.trim_end_matches(['\n', '\r']).chars() {
+                if ch == '\t' {
+                    let next = (column / TAB_WIDTH + 1) * TAB_WIDTH;
+                    out.extend(std::iter::repeat_n(' ', next - column));
+                    column = next;
+                } else {
+                    out.push(ch);
+                    column += display_width(ch);
+                }
+            }
+            out
+        })
+        .collect();
+    ChangePeek {
+        kind: change.kind,
+        title,
+        head,
+    }
+}
+
+/// Where the peek's controls were drawn, for clicks.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PeekHits {
+    pub panel: Viewport,
+    pub revert: Viewport,
+    pub stage: Viewport,
+    pub close: Viewport,
+}
+
+/// Lines of HEAD a peek shows before it says how many more there are.
+const PEEK_MAX_LINES: usize = 12;
+/// The peek's title row.
+const PEEK_HEADER: f32 = UI_CONTROL_SM + 14.0;
+/// Space around the peek's body inside the card.
+const PEEK_PAD: f32 = 8.0;
+/// Where the code starts in the body, after the `−` marker.
+const PEEK_CODE_X: f32 = 24.0;
+
+/// The peek at one change: a card under the change's last line (over its
+/// first when there is no room below), with a title, Revert, Stage and
+/// close, and what HEAD had there drawn as Source Control draws removed
+/// lines. `None` when the change is not on screen.
+#[allow(clippy::too_many_arguments)]
+pub fn build_change_peek(
+    peek: &ChangePeek,
+    change: &crate::ide::diff::Change,
+    buffer: &Buffer,
+    text: Viewport,
+    rows: &[ScreenRow],
+    atlas: &mut Atlas,
+    theme: &Theme,
+    out: &mut Vec<GlyphInstance>,
+) -> Option<PeekHits> {
+    use crate::project::git::MarkKind;
+    let m = atlas.metrics;
+    let lh = m.line_height;
+    // The change's extent on screen: from the top of its first row to the
+    // bottom of its last. A deletion holds the line under its boundary,
+    // where the caret goes, so the peek does not cover that line.
+    let (top, bottom) = if change.kind == MarkKind::Removed {
+        rows.iter()
+            .find(|r| r.line == change.new_start && r.first)
+            .map(|r| (r.y, r.y + lh))
+            .or_else(|| {
+                rows.last()
+                    .filter(|r| r.line + 1 == change.new_start)
+                    .map(|r| (r.y + lh, r.y + lh))
+            })?
+    } else {
+        let mut on = rows
+            .iter()
+            .filter(|r| (change.new_start..change.new_end).contains(&r.line));
+        let first = on.next()?;
+        let last = on.next_back().unwrap_or(first);
+        (first.y, last.y + lh)
+    };
+
+    let gutter = gutter_width(buffer, atlas);
+    let x = (text.x + gutter - m.advance * 0.5).max(text.x + 4.0);
+    let room_w = (text.x + text.width - x - 12.0).max(0.0);
+
+    // The body: HEAD's lines, as many as fit, or a note for an addition.
+    let room_below = text.y + text.height - bottom - 4.0;
+    let room_above = top - text.y - 4.0;
+    let fits = ((room_below.max(room_above) - PEEK_HEADER - PEEK_PAD * 2.0) / lh).floor();
+    let budget = (fits.max(1.0) as usize).min(PEEK_MAX_LINES);
+    let (shown, more) = if peek.head.len() > budget {
+        let shown = budget.saturating_sub(1).max(1);
+        (shown, peek.head.len() - shown)
+    } else {
+        (peek.head.len(), 0)
+    };
+    let body_rows = if peek.head.is_empty() {
+        1
+    } else {
+        shown + usize::from(more > 0)
+    };
+    let height = PEEK_HEADER + body_rows as f32 * lh + PEEK_PAD * 2.0;
+
+    // Wide enough for the longest line and the header, at most the text.
+    let note = "Added lines, nothing in HEAD";
+    let close_w = UI_CONTROL_SM;
+    let revert = Button::new(Viewport::new(0.0, UI_CONTROL_SM))
+        .label("Revert")
+        .icon(icons::DISCARD)
+        .tip("Put back what HEAD has here");
+    let stage = Button::new(Viewport::new(0.0, UI_CONTROL_SM))
+        .label("Stage")
+        .icon(icons::ADD)
+        .tip("Stage this change");
+    let revert_w = revert.content_width(atlas, 8.0);
+    let stage_w = stage.content_width(atlas, 8.0);
+    let title_w = ui_text_width(atlas, &peek.title);
+    let header_w =
+        12.0 + 10.0 + title_w + 24.0 + revert_w + UI_GAP + stage_w + UI_GAP + close_w + 8.0;
+    let longest = peek
+        .head
+        .iter()
+        .take(shown)
+        .map(|l| l.chars().map(display_width).sum::<usize>())
+        .max()
+        .unwrap_or(0);
+    let body_w = if peek.head.is_empty() {
+        ui_text_width(atlas, note) + PEEK_PAD * 4.0
+    } else {
+        PEEK_CODE_X + longest as f32 * m.advance + PEEK_PAD * 3.0
+    };
+    let width = header_w.max(body_w).max(360.0).min(room_w);
+    if width <= 0.0 {
+        return None;
+    }
+
+    let y = if height <= room_below || room_below >= room_above {
+        bottom + 2.0
+    } else {
+        top - 2.0 - height
+    };
+    let panel = Viewport {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    push_rounded_rect(
+        out,
+        Viewport {
+            x: panel.x - 3.0,
+            y: panel.y + 2.0,
+            width: panel.width + 6.0,
+            height: panel.height + 3.0,
+        },
+        10.0,
+        [0.0, 0.0, 0.0, 0.16],
+    );
+    push_panel(out, panel, 8.0, theme);
+
+    // The header: what kind of change, its title, and the controls.
+    let header = Viewport {
+        height: PEEK_HEADER,
+        ..panel
+    };
+    let kind_colour = match peek.kind {
+        MarkKind::Added => theme.diff_added,
+        MarkKind::Modified => theme.diff_modified,
+        MarkKind::Removed => theme.diff_removed,
+    };
+    push_rounded_rect(
+        out,
+        Viewport {
+            x: header.x + 12.0,
+            y: header.y + (PEEK_HEADER - 14.0) * 0.5,
+            width: 3.0,
+            height: 14.0,
+        },
+        1.5,
+        kind_colour,
+    );
+    let button_y = header.y + (PEEK_HEADER - UI_CONTROL_SM) * 0.5;
+    let close = Viewport {
+        x: panel.x + panel.width - 8.0 - close_w,
+        y: button_y,
+        width: close_w,
+        height: UI_CONTROL_SM,
+    };
+    let stage_rect = Viewport {
+        x: close.x - UI_GAP - stage_w,
+        width: stage_w,
+        ..close
+    };
+    let revert_rect = Viewport {
+        x: stage_rect.x - UI_GAP - revert_w,
+        width: revert_w,
+        ..close
+    };
+    let title_x = header.x + 22.0;
+    push_ui_text(
+        out,
+        atlas,
+        Viewport {
+            x: title_x,
+            width: (revert_rect.x - 12.0 - title_x).max(0.0),
+            ..header
+        },
+        &peek.title,
+        theme.text,
+    );
+    Button {
+        rect: revert_rect,
+        ..revert
+    }
+    .draw(out, atlas, theme);
+    Button {
+        rect: stage_rect,
+        ..stage
+    }
+    .draw(out, atlas, theme);
+    Button::new(close)
+        .icon(icons::CLOSE)
+        .tone(Tone::Ghost)
+        .tip("Close (Esc)")
+        .draw(out, atlas, theme);
+    push_rect(
+        out,
+        atlas,
+        [panel.x + 1.0, header.y + PEEK_HEADER - 1.0],
+        [panel.width - 2.0, 1.0 / m.scale],
+        theme.palette_border,
+    );
+
+    // The body: what HEAD had, as Source Control draws a removed line.
+    let body = Viewport {
+        x: panel.x + PEEK_PAD,
+        y: header.y + PEEK_HEADER + PEEK_PAD,
+        width: panel.width - PEEK_PAD * 2.0,
+        height: body_rows as f32 * lh,
+    };
+    if peek.head.is_empty() {
+        push_ui_text(
+            out,
+            atlas,
+            Viewport {
+                x: body.x + 6.0,
+                width: body.width - 6.0,
+                ..body
+            },
+            note,
+            theme.status_text,
+        );
+    } else {
+        push_rounded_rect(
+            out,
+            Viewport {
+                height: shown as f32 * lh,
+                ..body
+            },
+            UI_RADIUS_SM,
+            theme.diff_removed_band,
+        );
+        let columns = ((body.width - PEEK_CODE_X - PEEK_PAD) / m.advance).max(0.0) as usize;
+        for (i, line) in peek.head.iter().take(shown).enumerate() {
+            let row = Viewport {
+                y: body.y + i as f32 * lh,
+                height: lh,
+                ..body
+            };
+            push_ui_text(
+                out,
+                atlas,
+                Viewport {
+                    x: row.x + 8.0,
+                    width: 10.0,
+                    ..row
+                },
+                "\u{2212}",
+                theme.diff_removed,
+            );
+            let shown = crate::text::columns::fit_columns(line.chars(), columns);
+            push_text(
+                out,
+                atlas,
+                row.x + PEEK_CODE_X,
+                row.y,
+                &shown,
+                theme.diff_removed,
+            );
+        }
+        if more > 0 {
+            push_ui_text(
+                out,
+                atlas,
+                Viewport {
+                    x: body.x + PEEK_CODE_X,
+                    y: body.y + shown as f32 * lh,
+                    width: body.width - PEEK_CODE_X,
+                    height: lh,
+                },
+                &format!(
+                    "\u{2026} {more} more {}",
+                    if more == 1 { "line" } else { "lines" }
+                ),
+                theme.status_text,
+            );
+        }
+    }
+    Some(PeekHits {
+        panel,
+        revert: revert_rect,
+        stage: stage_rect,
+        close,
+    })
 }
 
 /// Squiggles under each of `marks`, a range of `buffer`'s text and its

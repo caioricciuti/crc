@@ -110,6 +110,7 @@ impl EditorView {
                     ..
                 },
             completion,
+            peek,
             claude,
             terminal: terminal_panel,
             agents,
@@ -125,6 +126,10 @@ impl EditorView {
             ..
         } = &mut *state;
         *unshaped_on_screen = false;
+        // Drawn again below when the document is; until then, nothing to click.
+        if let Some(open) = peek.as_mut() {
+            open.hits = None;
+        }
 
         // First, before anything in the frame can go wrong: what the panic
         // hook would write is the text as of this frame.
@@ -519,6 +524,23 @@ impl EditorView {
                     tip.signature.active.clone(),
                     caret,
                     editor_rect,
+                    &mut renderer.atlas,
+                    theme,
+                    glyphs,
+                );
+            }
+
+            // The peek at a Git change, over everything else on the text.
+            super::changes::check_peek(peek, buffer);
+            if let Some(open) = peek.as_mut()
+                && palette.is_none()
+            {
+                open.hits = layout::build_change_peek(
+                    &open.content,
+                    &open.change,
+                    buffer,
+                    editor_rect,
+                    &rows,
                     &mut renderer.atlas,
                     theme,
                     glyphs,
