@@ -106,6 +106,72 @@ impl EditorView {
             })
             .collect();
         state.agents.watched = paths;
+        drop(state);
+        self.watch_pushes();
+    }
+
+    /// Watches the Git directory of each main checkout with worktrees in
+    /// the list, so a push of a worktree's branch, from crc or anywhere
+    /// else, reads its pull request again. Made again only when the main
+    /// checkouts change.
+    fn watch_pushes(&self) {
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
+        let mains = state.agents.main_checkouts();
+        if mains == state.agents.ref_watched {
+            return;
+        }
+        let view = self as *const EditorView;
+        state.agents.ref_watchers = mains
+            .iter()
+            .filter_map(|main| {
+                // A main checkout keeps its Git directory in it.
+                let git_dir = main.join(".git");
+                if !git_dir.is_dir() {
+                    return None;
+                }
+                let main = main.clone();
+                crate::project::watch::Watcher::tree(
+                    &git_dir,
+                    Box::new(move |_| {
+                        let view = unsafe { &*view };
+                        view.refs_changed(&main);
+                    }),
+                )
+            })
+            .collect();
+        state.agents.ref_watched = mains;
+    }
+
+    /// Main thread, from a main checkout's Git directory watcher: if a
+    /// worktree's branch was pushed, its pull request is read once the
+    /// push settles.
+    fn refs_changed(&self, main: &std::path::Path) {
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
+        let git_dir = crate::platform::canonical(&main.join(".git"));
+        let Some(files) = state
+            .agents
+            .ref_watchers
+            .iter()
+            .find(|w| w.root() == git_dir)
+            .map(|w| w.take_files())
+        else {
+            return;
+        };
+        let branches = crate::platform::agents::pushed_branches(&git_dir, &files);
+        if let Some(b) = &branches
+            && b.is_empty()
+        {
+            return;
+        }
+        let pushed = state.agents.note_push(main, branches.as_deref());
+        drop(state);
+        if pushed {
+            self.arm_pushed_tick();
+        }
     }
 
     /// Main thread, from a worktree's watcher: a file in it changed.
@@ -166,6 +232,11 @@ impl EditorView {
             }
             state.agents.refresh();
             state.git.refresh();
+            // A pull request opened or merged: its row says so now, not
+            // at the next read.
+            if let Some(folder) = state.agents.pr_after.take() {
+                state.agents.refresh_pull_request(&folder);
+            }
         }
         drop(state);
         if ensure {
@@ -339,12 +410,7 @@ impl EditorView {
         };
         match action {
             Action::NewTask => self.new_task_prompt(),
-            Action::Refresh => {
-                if let Some(mut state) = self.state_mut() {
-                    state.agents.refresh();
-                }
-                self.resume_display_link();
-            }
+            Action::Refresh => self.refresh_agents(),
             // A double-click names a workspace in its row.
             Action::Select(index) if event.clickCount() >= 2 => {
                 let id = self
@@ -748,9 +814,11 @@ impl EditorView {
         self.after_terminal_layout();
     }
 
+    /// Refresh, asked for: the list, and every pull request again.
     pub(super) fn refresh_agents(&self) {
         if let Some(mut state) = self.state_mut() {
             state.agents.refresh();
+            state.agents.refresh_all_pull_requests();
         }
         self.resume_display_link();
     }

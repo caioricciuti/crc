@@ -3877,6 +3877,11 @@ define_class!(
             self.agents_tick();
         }
 
+        #[unsafe(method(agentsPushedTick:))]
+        fn action_agents_pushed_tick(&self, _sender: Option<&AnyObject>) {
+            self.pushed_tick();
+        }
+
         #[unsafe(method(sessionsTick:))]
         fn action_sessions_tick(&self, _sender: Option<&AnyObject>) {
             self.sessions_tick();

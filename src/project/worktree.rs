@@ -450,10 +450,12 @@ fn gh() -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
-/// The pull request for `branch`, asked of `gh` in `dir`. `None` without
-/// `gh`, without a pull request, or offline: the list just says less.
-pub fn pull_request(dir: &Path, branch: &str) -> Option<PullRequest> {
-    let output = Command::new(gh()?)
+/// The pull request for `branch`, asked of `gh` in `dir`: `None` when the
+/// branch has none; an error without `gh`, offline, or when `gh` failed,
+/// so a row keeps what it last said.
+pub fn pull_request(dir: &Path, branch: &str) -> Result<Option<PullRequest>, String> {
+    let gh = gh().ok_or("GitHub's gh is not installed")?;
+    let output = Command::new(gh)
         .current_dir(dir)
         .args([
             "pr",
@@ -465,13 +467,28 @@ pub fn pull_request(dir: &Path, branch: &str) -> Option<PullRequest> {
         ])
         .env("GH_PROMPT_DISABLED", "1")
         .env("NO_COLOR", "1")
+        .stdin(std::process::Stdio::null())
         .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| parse_pull_request(&String::from_utf8_lossy(&output.stdout)))
-        .flatten()
+        .map_err(|e| e.to_string())?;
+    pull_request_answer(
+        output.status.success(),
+        &String::from_utf8_lossy(&output.stdout),
+        &String::from_utf8_lossy(&output.stderr),
+    )
+}
+
+/// What `gh pr view` said: the pull request, none (gh says so), or a
+/// failure.
+pub fn pull_request_answer(ok: bool, out: &str, err: &str) -> Result<Option<PullRequest>, String> {
+    if ok {
+        return parse_pull_request(out)
+            .map(Some)
+            .ok_or_else(|| "gh said something unreadable".to_owned());
+    }
+    if err.contains("no pull requests found") {
+        return Ok(None);
+    }
+    Err(err.trim().lines().last().unwrap_or("gh failed").to_owned())
 }
 
 pub fn parse_pull_request(text: &str) -> Option<PullRequest> {
@@ -847,6 +864,25 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn no_pull_request_is_not_a_failure() {
+        let open = pull_request_answer(true, r#"{"number":7,"state":"OPEN","url":"u"}"#, "");
+        assert_eq!(open.unwrap().map(|pr| pr.number), Some(7));
+        assert_eq!(
+            pull_request_answer(
+                false,
+                "",
+                "no pull requests found for branch \"fix/seed-dates\"\n"
+            ),
+            Ok(None)
+        );
+        assert_eq!(
+            pull_request_answer(false, "", "warn\nerror connecting to api.github.com\n"),
+            Err("error connecting to api.github.com".to_owned())
+        );
+        assert!(pull_request_answer(true, "not json", "").is_err());
+    }
 
     #[test]
     fn parses_the_porcelain_list() {

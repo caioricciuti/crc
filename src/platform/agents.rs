@@ -508,6 +508,99 @@ pub struct Info {
     pub pull_request: Option<crate::project::worktree::PullRequest>,
 }
 
+/// What `gh` said about a row's pull request: it, none, or a failure.
+type PullRequestAnswer = Result<Option<crate::project::worktree::PullRequest>, String>;
+
+/// How long the open rows wait between pull request reads: shorter while
+/// an open pull request's checks run, longest when none is open.
+pub fn pr_wait<'a>(
+    prs: impl IntoIterator<Item = &'a crate::project::worktree::PullRequest>,
+) -> std::time::Duration {
+    use crate::project::worktree::Checks;
+    let open: Vec<_> = prs.into_iter().filter(|pr| pr.state == "OPEN").collect();
+    std::time::Duration::from_secs(if open.iter().any(|pr| pr.checks == Checks::Running) {
+        20
+    } else if !open.is_empty() {
+        60
+    } else {
+        300
+    })
+}
+
+/// How long a merged or closed pull request waits between reads: it
+/// rarely changes again.
+pub const PR_SETTLED: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Whether a row's pull request is due a read: never read yet, settled and
+/// [`PR_SETTLED`] old, or else `wait` old.
+pub fn pr_due(
+    pr: Option<&crate::project::worktree::PullRequest>,
+    since: Option<std::time::Duration>,
+    wait: std::time::Duration,
+) -> bool {
+    let Some(since) = since else {
+        return true;
+    };
+    match pr {
+        Some(pr) if pr.state == "MERGED" || pr.state == "CLOSED" => since >= PR_SETTLED,
+        _ => since >= wait,
+    }
+}
+
+/// The shortest wait, which the periodic read ticks at; a self-test may
+/// make it shorter with `CRC_SELFTEST_PR_EVERY` (seconds).
+pub fn pr_tick() -> std::time::Duration {
+    pr_every_override().unwrap_or(std::time::Duration::from_secs(20))
+}
+
+fn pr_every_override() -> Option<std::time::Duration> {
+    std::env::var_os("CRC_SELFTEST")?;
+    let secs: f64 = std::env::var("CRC_SELFTEST_PR_EVERY").ok()?.parse().ok()?;
+    (secs > 0.0).then(|| std::time::Duration::from_secs_f64(secs))
+}
+
+/// Whether pull requests are asked of `gh`: always in use; in a test
+/// instance only when it says so with `CRC_SELFTEST_GH`, with a stand-in
+/// `gh` on its PATH.
+fn github_allowed() -> bool {
+    std::env::var_os("CRC_SELFTEST").is_none() || std::env::var_os("CRC_SELFTEST_GH").is_some()
+}
+
+/// The branches a change under a repository's Git directory `git_dir` may
+/// have pushed: a remote-tracking ref's (`refs/remotes/<remote>/<branch>`);
+/// `None` when it cannot tell which (packed refs rewritten, or events
+/// dropped), so every branch may have.
+pub fn pushed_branches(git_dir: &Path, files: &[PathBuf]) -> Option<Vec<String>> {
+    if files.is_empty() {
+        return None;
+    }
+    let mut branches = Vec::new();
+    for file in files {
+        let Ok(inside) = file.strip_prefix(git_dir) else {
+            continue;
+        };
+        if inside == Path::new("packed-refs") {
+            return None;
+        }
+        let names: Vec<String> = inside
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        if names.len() < 4
+            || names[0] != "refs"
+            || names[1] != "remotes"
+            || names.last().is_some_and(|n| n.ends_with(".lock"))
+        {
+            continue;
+        }
+        let branch = names[3..].join("/");
+        if !branches.contains(&branch) {
+            branches.push(branch);
+        }
+    }
+    Some(branches)
+}
+
 /// A write this recent counts as writing now.
 pub const WRITING: std::time::Duration = std::time::Duration::from_secs(8);
 
@@ -694,7 +787,24 @@ pub struct Panel {
     pub info: std::collections::HashMap<PathBuf, Info>,
     /// Per main checkout, the worktrees Git records whose folder is gone.
     pub prunable: std::collections::HashMap<PathBuf, usize>,
-    info_rx: Option<mpsc::Receiver<(PathBuf, Info)>>,
+    /// Per worktree path, its commits ahead, from the list's read.
+    info_rx: Option<mpsc::Receiver<(PathBuf, usize)>>,
+    /// The pull request reads, one `gh` after another on one worker.
+    pr_rx: Option<mpsc::Receiver<(PathBuf, PullRequestAnswer)>>,
+    /// Rows asked for while a read ran, read after it.
+    pr_wanted: Vec<PathBuf>,
+    /// Per worktree path, when `gh` last answered about its pull request.
+    pr_read: std::collections::HashMap<PathBuf, std::time::Instant>,
+    /// A watcher per main checkout's Git directory, for pushes, and the
+    /// main checkouts they are for.
+    pub ref_watchers: Vec<crate::project::watch::Watcher>,
+    pub ref_watched: Vec<PathBuf>,
+    /// Worktrees whose branch was just pushed, by when: their pull
+    /// request is read once the push has settled.
+    pub pushed: std::collections::HashMap<PathBuf, std::time::Instant>,
+    /// The worktree a pull request operation runs on: its pull request is
+    /// read again when the operation answers.
+    pub pr_after: Option<PathBuf>,
     /// Per session (by its review folder), what its team hooks said.
     pub teams: std::collections::HashMap<PathBuf, Team>,
     /// Per worktree path, when a file in it was last written this run: by
@@ -850,7 +960,9 @@ pub fn follow(tasks: &[Workspace], owner: usize, cwd: &Path) -> Follow {
 
 impl Panel {
     /// Reads the kept workspaces once, then on a worker the repositories
-    /// in each folder workspace and their worktrees.
+    /// in each folder workspace, their worktrees and how far ahead each
+    /// is. Pull requests are read on their own (see
+    /// [`Panel::refresh_pull_requests`]): this is only Git.
     pub fn refresh(&mut self) {
         self.refreshed_at = Some(std::time::Instant::now());
         self.inspector.invalidate();
@@ -871,27 +983,182 @@ impl Panel {
             let listing = scan(&folders);
             let tasks = listing.worktrees.clone();
             let _ = tx.send(listing);
-            // Then what each row says, slower: `gh` asks GitHub. A test
-            // instance does not.
-            let ask_github = std::env::var_os("CRC_SELFTEST").is_none();
+            // Then how far ahead each row is.
             for task in tasks {
                 let (Some(branch), Some(main)) = (&task.branch, &task.repo) else {
                     continue;
                 };
-                let info = Info {
-                    ahead: crate::project::worktree::ahead(main, task.base.as_deref(), branch)
-                        .unwrap_or(0),
-                    pull_request: ask_github
-                        .then(|| crate::project::worktree::pull_request(&task.path, branch))
-                        .flatten(),
-                };
-                if info_tx.send((task.path, info)).is_err() {
+                let ahead = crate::project::worktree::ahead(main, task.base.as_deref(), branch)
+                    .unwrap_or(0);
+                if info_tx.send((task.path, ahead)).is_err() {
                     return;
                 }
             }
         });
         self.rx = Some(rx);
         self.info_rx = Some(info_rx);
+    }
+
+    /// Whether pull requests can be asked about: `gh` is there, and this
+    /// is not a test instance that keeps away from it.
+    fn asks_github(&mut self) -> bool {
+        if self.github.is_none() {
+            self.github = Some(crate::project::worktree::has_gh());
+        }
+        self.github == Some(true) && github_allowed()
+    }
+
+    /// The worktrees with a branch, whose pull requests can be read.
+    fn pr_rows(&self) -> impl Iterator<Item = &Workspace> {
+        self.worktrees
+            .iter()
+            .filter(|w| w.branch.is_some() && w.repo.is_some())
+    }
+
+    /// Reads the pull requests that are due (see [`pr_due`]), when no read
+    /// is running already.
+    pub fn refresh_pull_requests(&mut self) {
+        if self.pr_rx.is_some() {
+            return;
+        }
+        let override_wait = pr_every_override();
+        let wait = override_wait.unwrap_or_else(|| {
+            pr_wait(
+                self.pr_rows()
+                    .filter_map(|w| self.info.get(&w.path)?.pull_request.as_ref()),
+            )
+        });
+        let due: Vec<PathBuf> = self
+            .pr_rows()
+            .filter(|w| {
+                let pr = self.info.get(&w.path).and_then(|i| i.pull_request.as_ref());
+                let since = self.pr_read.get(&w.path).map(|at| at.elapsed());
+                pr_due(pr, since, wait)
+            })
+            .map(|w| w.path.clone())
+            .collect();
+        self.read_pull_requests(due);
+    }
+
+    /// Reads every row's pull request again: Refresh, asked for.
+    pub fn refresh_all_pull_requests(&mut self) {
+        let all = self.pr_rows().map(|w| w.path.clone()).collect();
+        self.read_pull_requests(all);
+    }
+
+    /// Reads the pull request of the worktree at `path` again soon: after
+    /// it was pushed, or a pull request operation on it answered.
+    pub fn refresh_pull_request(&mut self, path: &Path) {
+        self.read_pull_requests(vec![path.to_path_buf()]);
+    }
+
+    /// A remote-tracking ref of the repository whose main checkout is
+    /// `main` moved: the worktrees on `branches` (all of its worktrees
+    /// for `None`) were pushed, and are read once it settles. Returns
+    /// whether any was.
+    pub fn note_push(&mut self, main: &Path, branches: Option<&[String]>) -> bool {
+        let now = std::time::Instant::now();
+        let rows: Vec<PathBuf> = self
+            .pr_rows()
+            .filter(|w| w.repo.as_deref() == Some(main))
+            .filter(|w| {
+                branches.is_none_or(|b| w.branch.as_ref().is_some_and(|own| b.contains(own)))
+            })
+            .map(|w| w.path.clone())
+            .collect();
+        for path in &rows {
+            self.pushed.insert(path.clone(), now);
+        }
+        !rows.is_empty()
+    }
+
+    /// Reads the pull requests of the rows pushed at least `settle` ago.
+    /// Returns whether any push is still settling.
+    pub fn read_pushed(&mut self, settle: std::time::Duration) -> bool {
+        let ready: Vec<PathBuf> = self
+            .pushed
+            .iter()
+            .filter(|(_, at)| at.elapsed() >= settle)
+            .map(|(path, _)| path.clone())
+            .collect();
+        for path in &ready {
+            self.pushed.remove(path);
+        }
+        self.read_pull_requests(ready);
+        !self.pushed.is_empty()
+    }
+
+    /// The main checkouts of the worktrees in the list, for the watchers
+    /// that notice a push.
+    pub fn main_checkouts(&self) -> Vec<PathBuf> {
+        let mut mains: Vec<PathBuf> = Vec::new();
+        for main in self.pr_rows().filter_map(|w| w.repo.clone()) {
+            if !mains.contains(&main) {
+                mains.push(main);
+            }
+        }
+        mains
+    }
+
+    /// Asks `gh` about the rows at `paths`, one after another on a worker;
+    /// while a read runs they wait for it.
+    fn read_pull_requests(&mut self, paths: Vec<PathBuf>) {
+        if paths.is_empty() || !self.asks_github() {
+            return;
+        }
+        if self.pr_rx.is_some() {
+            for path in paths {
+                if !self.pr_wanted.contains(&path) {
+                    self.pr_wanted.push(path);
+                }
+            }
+            return;
+        }
+        let rows: Vec<(PathBuf, String)> = self
+            .pr_rows()
+            .filter(|w| paths.contains(&w.path))
+            .filter_map(|w| Some((w.path.clone(), w.branch.clone()?)))
+            .collect();
+        if rows.is_empty() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for (path, branch) in rows {
+                let answer = crate::project::worktree::pull_request(&path, &branch);
+                if tx.send((path, answer)).is_err() {
+                    return;
+                }
+            }
+        });
+        self.pr_rx = Some(rx);
+    }
+
+    /// Takes what `gh` said about the row at `path`: a failure keeps the
+    /// pull request it last had, so its badge does not come and go with
+    /// the network. Returns whether the row changed.
+    pub fn take_pull_request(&mut self, path: PathBuf, answer: PullRequestAnswer) -> bool {
+        self.pr_read.insert(path.clone(), std::time::Instant::now());
+        let Ok(pr) = answer else {
+            return false;
+        };
+        let info = self.info.entry(path).or_default();
+        let changed = info.pull_request != pr;
+        info.pull_request = pr;
+        changed
+    }
+
+    /// Forgets what was read about workspaces no longer in the list.
+    fn prune(&mut self) {
+        let listed: std::collections::HashSet<&Path> =
+            self.tasks.iter().map(|t| t.path.as_path()).collect();
+        self.info.retain(|path, _| listed.contains(path.as_path()));
+        self.pr_read
+            .retain(|path, _| listed.contains(path.as_path()));
+        self.pushed
+            .retain(|path, _| listed.contains(path.as_path()));
+        self.pr_wanted
+            .retain(|path| listed.contains(path.as_path()));
     }
 
     /// The kept workspaces and arrangement; the first time, every
@@ -990,8 +1257,8 @@ impl Panel {
         if let Some(rx) = &self.info_rx {
             loop {
                 match rx.try_recv() {
-                    Ok((path, info)) => {
-                        self.info.insert(path, info);
+                    Ok((path, ahead)) => {
+                        self.info.entry(path).or_default().ahead = ahead;
                         changed = true;
                     }
                     Err(mpsc::TryRecvError::Empty) => break,
@@ -1002,7 +1269,23 @@ impl Panel {
                 }
             }
         }
-        changed | self.poll_list() | self.inspector.poll()
+        changed | self.poll_pull_requests() | self.poll_list() | self.inspector.poll()
+    }
+
+    fn poll_pull_requests(&mut self) -> bool {
+        let mut changed = false;
+        while let Some(rx) = &self.pr_rx {
+            match rx.try_recv() {
+                Ok((path, answer)) => changed |= self.take_pull_request(path, answer),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.pr_rx = None;
+                    let wanted = std::mem::take(&mut self.pr_wanted);
+                    self.read_pull_requests(wanted);
+                }
+            }
+        }
+        changed
     }
 
     fn poll_list(&mut self) -> bool {
@@ -1023,6 +1306,9 @@ impl Panel {
         self.prunable = listing.prunable;
         self.repos = listing.repos.into_iter().collect();
         self.rebuild();
+        self.prune();
+        // Rows new to the list are read now; the others when due.
+        self.refresh_pull_requests();
         true
     }
 
@@ -1392,6 +1678,12 @@ impl Panel {
 
     /// A read or an operation is in flight.
     pub fn busy(&self) -> bool {
+        self.reading_list() || self.pr_rx.is_some()
+    }
+
+    /// The list, an operation or the inspector is being read; a pull
+    /// request read alone does not hold the list's.
+    pub fn reading_list(&self) -> bool {
         self.rx.is_some() || self.op.is_some() || self.info_rx.is_some() || self.inspector.busy()
     }
 
@@ -1652,6 +1944,26 @@ impl Panel {
             .iter()
             .filter(|t| !t.folder)
             .map(|t| format!("{}={}", self.title(t), self.pace(t).word()))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// The pull requests read, for the self-test: per worktree with one,
+    /// `name=#N:STATE:checks`.
+    pub fn report_pull_requests(&self) -> String {
+        self.tasks
+            .iter()
+            .filter(|t| !t.folder)
+            .filter_map(|t| {
+                let pr = self.info.get(&t.path)?.pull_request.as_ref()?;
+                let checks = format!("{:?}", pr.checks).to_ascii_lowercase();
+                Some(format!(
+                    "{}=#{}:{}:{checks}",
+                    self.title(t),
+                    pr.number,
+                    pr.state
+                ))
+            })
             .collect::<Vec<_>>()
             .join(",")
     }
@@ -2902,6 +3214,119 @@ mod tests {
         );
         fresh.arrange();
         assert_eq!(fresh.report_tree(), "garden-log,>a,~merged(+1),notes,x");
+    }
+
+    fn pr(state: &str, checks: crate::project::worktree::Checks) -> PullRequest {
+        PullRequest {
+            number: 7,
+            state: state.into(),
+            checks,
+            ..Default::default()
+        }
+    }
+
+    use crate::project::worktree::{Checks, PullRequest};
+
+    #[test]
+    fn pull_requests_are_read_more_often_while_checks_run() {
+        let secs = |prs: &[PullRequest]| pr_wait(prs).as_secs();
+        assert_eq!(secs(&[]), 300);
+        assert_eq!(secs(&[pr("MERGED", Checks::Running)]), 300);
+        assert_eq!(secs(&[pr("OPEN", Checks::Passing)]), 60);
+        assert_eq!(
+            secs(&[pr("OPEN", Checks::Passing), pr("OPEN", Checks::Running)]),
+            20
+        );
+        let s = std::time::Duration::from_secs;
+        let wait = s(60);
+        // Never read: now.
+        assert!(pr_due(None, None, wait));
+        assert!(!pr_due(None, Some(s(30)), wait));
+        assert!(pr_due(None, Some(s(60)), wait));
+        let open = pr("OPEN", Checks::None);
+        assert!(!pr_due(Some(&open), Some(s(59)), wait));
+        assert!(pr_due(Some(&open), Some(s(61)), wait));
+        // Merged and closed ones settle.
+        for state in ["MERGED", "CLOSED"] {
+            let done = pr(state, Checks::None);
+            assert!(!pr_due(Some(&done), Some(s(300)), wait));
+            assert!(pr_due(Some(&done), Some(PR_SETTLED), wait));
+        }
+    }
+
+    #[test]
+    fn a_failed_read_keeps_the_last_pull_request() {
+        let mut panel = nested();
+        let path = PathBuf::from("/w/a");
+        assert!(panel.take_pull_request(path.clone(), Ok(Some(pr("OPEN", Checks::Running)))));
+        assert!(!panel.take_pull_request(path.clone(), Err("offline".into())));
+        assert_eq!(panel.report_pull_requests(), "a=#7:OPEN:running");
+        assert!(panel.pr_read.contains_key(&path));
+        assert!(panel.take_pull_request(path.clone(), Ok(Some(pr("MERGED", Checks::None)))));
+        panel.arrange();
+        assert_eq!(panel.report_tree(), "garden-log,>b,~merged(+1),notes,x");
+        // gh says there is none: the badge goes.
+        assert!(panel.take_pull_request(path, Ok(None)));
+        assert_eq!(panel.report_pull_requests(), "");
+    }
+
+    #[test]
+    fn what_was_read_about_a_removed_worktree_is_forgotten() {
+        let mut panel = nested();
+        for path in ["/w/a", "/w/b"] {
+            panel.take_pull_request(path.into(), Ok(Some(pr("OPEN", Checks::None))));
+            panel.pushed.insert(path.into(), std::time::Instant::now());
+        }
+        panel.worktrees.retain(|w| w.path != Path::new("/w/a"));
+        panel.rebuild();
+        panel.prune();
+        assert!(!panel.info.contains_key(Path::new("/w/a")));
+        assert!(!panel.pr_read.contains_key(Path::new("/w/a")));
+        assert!(!panel.pushed.contains_key(Path::new("/w/a")));
+        assert!(panel.info.contains_key(Path::new("/w/b")));
+    }
+
+    #[test]
+    fn a_push_is_a_remote_tracking_ref_moving() {
+        let git = Path::new("/r/.git");
+        let files = |names: &[&str]| names.iter().map(|n| git.join(n)).collect::<Vec<_>>();
+        assert_eq!(
+            pushed_branches(
+                git,
+                &files(&[
+                    "objects/ab/cdef",
+                    "refs/remotes/origin/fix/seed-dates",
+                    "refs/remotes/origin/fix/seed-dates.lock",
+                    "logs/refs/remotes/origin/fix/seed-dates",
+                    "refs/heads/main",
+                ])
+            ),
+            Some(vec!["fix/seed-dates".to_owned()])
+        );
+        assert_eq!(
+            pushed_branches(git, &files(&["objects/ab/cdef"])),
+            Some(Vec::new())
+        );
+        assert_eq!(pushed_branches(git, &files(&["packed-refs"])), None);
+        assert_eq!(pushed_branches(git, &[]), None);
+
+        // Only that repository's worktree on that branch is read.
+        let mut panel = nested();
+        for w in &mut panel.worktrees {
+            w.branch = w.path.file_name().map(|n| n.to_string_lossy().into_owned());
+        }
+        assert!(panel.note_push(Path::new("/r"), Some(&["b".to_owned()])));
+        assert_eq!(
+            panel.pushed.keys().collect::<Vec<_>>(),
+            [&PathBuf::from("/w/b")]
+        );
+        assert!(!panel.note_push(Path::new("/r"), Some(&["x".to_owned()])));
+        assert!(panel.note_push(Path::new("/r"), None));
+        assert_eq!(panel.pushed.len(), 2);
+        assert_eq!(
+            panel.main_checkouts(),
+            [PathBuf::from("/r"), PathBuf::from("/o")]
+        );
     }
 
     #[test]

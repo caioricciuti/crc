@@ -10,9 +10,13 @@ use crate::platform::inspector::Action;
 use crate::project::worktree::MergeStrategy;
 use std::path::PathBuf;
 
-/// How often the workspace list and pull requests are read again while
-/// Agents mode is on.
+/// How often the workspace list is read again while Agents mode is on.
+/// Pull requests have their own cadence (`agents::pr_wait`), which the
+/// tick runs at the shortest of.
 const REFRESH_EVERY: f64 = 60.0;
+/// How long after a push is noticed its pull request is read: a push
+/// moves several refs, and GitHub needs a moment to see it.
+const PUSH_SETTLE: f64 = 2.0;
 /// How often the terminals are looked at for ssh, in Agents mode.
 const SESSIONS_EVERY: f64 = 2.0;
 
@@ -179,14 +183,16 @@ impl EditorView {
         }
         state.agents.ticking = true;
         drop(state);
+        let every = crate::platform::agents::pr_tick().as_secs_f64();
         let _: () = unsafe {
             msg_send![self, performSelector: sel!(agentsTick:),
-                withObject: None::<&AnyObject>, afterDelay: REFRESH_EVERY]
+                withObject: None::<&AnyObject>, afterDelay: every]
         };
     }
 
-    /// The periodic read: worktrees, pull requests and the inspector's
-    /// status, while Agents mode is on and nothing else is reading.
+    /// The periodic read while Agents mode is on: worktrees and the
+    /// inspector's status every minute, when nothing else is reading them;
+    /// the pull requests that are due.
     pub(super) fn agents_tick(&self) {
         let on = {
             let Some(mut state) = self.state_mut() else {
@@ -197,8 +203,11 @@ impl EditorView {
                 .agents
                 .refreshed_at
                 .is_none_or(|at| at.elapsed().as_secs_f64() >= REFRESH_EVERY - 1.0);
-            if state.agents.on && due && !state.agents.busy() {
+            if state.agents.on && due && !state.agents.reading_list() {
                 state.agents.refresh();
+            }
+            if state.agents.on {
+                state.agents.refresh_pull_requests();
             }
             state.agents.on
         };
@@ -207,6 +216,39 @@ impl EditorView {
             // The rows' relative times ("quiet · 5 min") move on.
             self.request_redraw();
             self.resume_display_link();
+        }
+    }
+
+    /// Reads the pushed rows' pull requests once the push has settled,
+    /// replacing any read already scheduled: a push heard again waits on.
+    pub(super) fn arm_pushed_tick(&self) {
+        let _: () = unsafe {
+            msg_send![
+                objc2::class!(NSObject),
+                cancelPreviousPerformRequestsWithTarget: self,
+                selector: sel!(agentsPushedTick:),
+                object: None::<&AnyObject>
+            ]
+        };
+        let _: () = unsafe {
+            msg_send![self, performSelector: sel!(agentsPushedTick:),
+                withObject: None::<&AnyObject>, afterDelay: PUSH_SETTLE]
+        };
+    }
+
+    pub(super) fn pushed_tick(&self) {
+        let again = {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            // A little early is settled: the timer is not exact.
+            state
+                .agents
+                .read_pushed(std::time::Duration::from_secs_f64(PUSH_SETTLE - 0.1))
+        };
+        self.resume_display_link();
+        if again {
+            self.arm_pushed_tick();
         }
     }
 
@@ -222,18 +264,14 @@ impl EditorView {
     }
 
     /// Runs `work` on the menu's workspace folder, saying `doing` until it
-    /// answers.
+    /// answers. Returns the folder it runs in, when it started.
     fn agent_operation(
         &self,
         doing: impl FnOnce(&crate::platform::agents::Workspace) -> String,
         work: impl FnOnce(PathBuf) -> Result<String, String> + Send + 'static,
-    ) {
-        let Some(task) = self.menu_task() else {
-            return;
-        };
-        let Some(mut state) = self.state_mut() else {
-            return;
-        };
+    ) -> Option<PathBuf> {
+        let task = self.menu_task()?;
+        let mut state = self.state_mut()?;
         if state.agents.op.is_some() {
             state.say(
                 layout::Feedback::Info,
@@ -241,7 +279,7 @@ impl EditorView {
             );
             drop(state);
             self.request_redraw();
-            return;
+            return None;
         }
         let path = state
             .agents
@@ -252,6 +290,7 @@ impl EditorView {
             name: repo_label(&task, &path),
             ..task
         };
+        let folder = path.clone();
         state.agents.start(&doing(&task), move || {
             Ok(Done {
                 said: work(path)?,
@@ -261,6 +300,15 @@ impl EditorView {
         drop(state);
         self.resume_display_link();
         self.request_redraw();
+        Some(folder)
+    }
+
+    /// Its pull request is read again when the operation running in
+    /// `folder` answers.
+    fn read_pull_request_after(&self, folder: Option<PathBuf>) {
+        if let (Some(folder), Some(mut state)) = (folder, self.state_mut()) {
+            state.agents.pr_after = Some(folder);
+        }
     }
 
     /// Pull (fast-forward only) or push, the way Source Control does them.
@@ -313,7 +361,7 @@ impl EditorView {
     /// Pushes the branch, then opens a pull request from its commits.
     pub(super) fn agent_create_pull_request(&self) {
         let sock = self.state().and_then(|state| state.ssh_auth_sock.clone());
-        self.agent_operation(
+        let folder = self.agent_operation(
             |t| format!("Opening a pull request for {}\u{2026}", t.name()),
             move |path| {
                 crate::project::git::remote(
@@ -324,6 +372,7 @@ impl EditorView {
                 crate::project::worktree::create_pull_request(&path)
             },
         );
+        self.read_pull_request_after(folder);
     }
 
     /// Merges the menu's workspace's pull request on GitHub, once asked.
@@ -370,10 +419,11 @@ impl EditorView {
             return;
         }
         let number = pr.number;
-        self.agent_operation(
+        let folder = self.agent_operation(
             |_| format!("Merging #{number}\u{2026}"),
             move |path| crate::project::worktree::merge_pull_request(&path, number, strategy),
         );
+        self.read_pull_request_after(folder);
     }
 }
 
