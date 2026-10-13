@@ -529,6 +529,8 @@ mod tests {
                 "platform::recovery::tests::a_panic_leaves_the_unsaved_text_on_disk",
             ])
             .env(CHILD, &dir)
+            // The crash log goes under HOME: here, not in the real logs.
+            .env("HOME", dir.join("home"))
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
@@ -543,6 +545,14 @@ mod tests {
                 stamp: None,
             }]
         );
+        let logs: Vec<_> = std::fs::read_dir(dir.join("home/Library/Logs/crc"))
+            .expect("the child's crash log folder")
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("crash-"))
+            .collect();
+        assert_eq!(logs.len(), 1);
+        let log = std::fs::read_to_string(logs[0].path()).expect("crash log");
+        assert!(log.contains("deliberate, to exercise the hook"));
         std::fs::remove_dir_all(&dir).ok();
     }
 }
