@@ -4,6 +4,26 @@ One entry per tag, written for people who use the editor.
 
 ## Unreleased
 
+- Agents: a workspace can live on a server. Type `host:/path` (an
+  `~/.ssh/config` alias or `user@host`) in New Workspace; its terminals
+  and Claude sessions open over `ssh` in that folder, sharing one
+  connection per host, and its row and inspector show the host and
+  folder. Terminals only for now: no Git, worktrees or Review for it yet.
+- Agents mode no longer stalls while agents write: counting the files to
+  review read every checkpoint on the main thread, which with a large
+  review history held the window for seconds. The count now reads one
+  listing per session, on a worker.
+- Pull request badges refresh on their own: every 20 s while checks run,
+  60 s with open pull requests, less often otherwise, and right after a
+  push of the branch from anywhere. A failed `gh` keeps the last badge.
+- Leaving Agents opens the selected workspace's folder in the editor,
+  and never opens the terminal panel by itself.
+- Removing a workspace takes the worktrees under it out of the list and
+  closes their sessions. Nothing on disk changes.
+- Closing a terminal tab always ends its program, also one that ignores
+  the hangup.
+- After crc is reinstalled while open, every new terminal says that Git
+  signing and SSH keys fail there until Help > Restart to Update.
 - Edit > Copy as One Line (`Cmd-Option-C`, also in the terminal's
   right-click menu) copies a terminal selection as a single line: the
   line breaks and indentation a program such as Claude Code puts in to
