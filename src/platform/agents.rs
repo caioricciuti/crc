@@ -1332,14 +1332,43 @@ impl Panel {
         self.save_folders();
     }
 
+    /// The folder workspace `id` and the worktrees under it, by index in
+    /// the list: what goes when it does.
+    pub fn family(&self, id: &str) -> Vec<usize> {
+        (0..self.tasks.len())
+            .filter(|i| {
+                let t = &self.tasks[*i];
+                (t.folder && t.id() == id) || self.parent_of(t).as_deref() == Some(id)
+            })
+            .collect()
+    }
+
     /// Forgets a folder workspace, and its place, pin and name with it.
+    /// The worktrees under it leave the list too, unless another folder
+    /// workspace holds their repository; on disk nothing changes.
     pub fn remove_folder(&mut self, id: &str) {
+        let under: Vec<String> = self
+            .worktrees
+            .iter()
+            .filter(|w| self.parent_of(w).as_deref() == Some(id))
+            .map(Workspace::id)
+            .collect();
         self.folders.retain(|t| t.id() != id);
-        self.arrangement.order.retain(|o| o != id);
-        self.arrangement.pinned.remove(id);
-        self.arrangement.titles.remove(id);
-        self.arrangement.collapsed.remove(id);
-        self.arrangement.merged_open.remove(id);
+        self.repos.remove(id);
+        let gone: Vec<String> = self
+            .worktrees
+            .iter()
+            .filter(|w| under.contains(&w.id()) && self.parent_of(w).is_none())
+            .map(Workspace::id)
+            .collect();
+        self.worktrees.retain(|w| !gone.contains(&w.id()));
+        for id in gone.iter().map(String::as_str).chain([id]) {
+            self.arrangement.order.retain(|o| o != id);
+            self.arrangement.pinned.remove(id);
+            self.arrangement.titles.remove(id);
+            self.arrangement.collapsed.remove(id);
+            self.arrangement.merged_open.remove(id);
+        }
         self.rebuild();
         self.save_folders();
         self.save_arrangement();
@@ -2971,6 +3000,38 @@ mod tests {
         // Deeper than `/`; of the two on `/r`, the first made.
         assert_eq!(panel.parent_of(&a).as_deref(), Some("folder:garden-log"));
         assert_eq!(panel.parent_of(&panel.folders[0].clone()), None);
+    }
+
+    #[test]
+    fn a_removed_workspace_takes_its_worktrees_with_it() {
+        let mut panel = nested();
+        panel.toggle_pin("/w/a");
+        panel.set_title("/w/b", "login fix");
+        let family: Vec<String> = panel
+            .family("folder:garden-log")
+            .into_iter()
+            .map(|i| panel.tasks[i].id())
+            .collect();
+        assert_eq!(family, ["folder:garden-log", "/w/a", "/w/b"]);
+        panel.remove_folder("folder:garden-log");
+        // No orphans at the top: the worktrees went with it, and their pin
+        // and name too. One no folder holds was never its to take.
+        let ids: Vec<String> = panel.tasks.iter().map(Workspace::id).collect();
+        assert_eq!(ids, ["folder:notes", "/elsewhere/x"]);
+        assert!(!panel.is_pinned("/w/a"));
+        assert!(!panel.arrangement.titles.contains_key("/w/b"));
+        assert!(panel.family("folder:garden-log").is_empty());
+
+        // Another folder workspace holding the repository keeps them.
+        let mut panel = nested();
+        panel.folders.push(folder("code", "/"));
+        panel
+            .repos
+            .insert("folder:code".into(), vec![PathBuf::from("/r")]);
+        panel.rebuild();
+        panel.remove_folder("folder:garden-log");
+        let a = panel.tasks[panel.by_id("/w/a").unwrap()].clone();
+        assert_eq!(panel.parent_of(&a).as_deref(), Some("folder:code"));
     }
 
     #[test]

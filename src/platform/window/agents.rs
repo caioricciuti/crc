@@ -863,27 +863,33 @@ impl EditorView {
         self.request_redraw();
     }
 
-    /// Forgets a folder workspace once asked; its sessions close. Nothing
-    /// on disk changes.
+    /// Forgets a folder workspace once asked, and the worktrees under it;
+    /// their sessions close. Nothing on disk changes.
     pub(super) fn agent_remove_workspace(&self) {
         let Some(task) = self.menu_task().filter(|t| t.folder) else {
             return;
         };
-        let id = task.id();
-        let sessions: Vec<usize> = self.state().map_or_else(Vec::new, |state| {
+        let (worktrees, sessions) = self.state().map_or((0, Vec::new()), |state| {
             let tasks = &state.agents.tasks;
-            (0..state.terminal.tabs.len())
+            let family = state.agents.family(&task.id());
+            let sessions = (0..state.terminal.tabs.len())
                 .filter(|i| {
-                    task_of(tasks, &state.terminal.tabs[*i]).map(|t| tasks[t].id())
-                        == Some(id.clone())
+                    task_of(tasks, &state.terminal.tabs[*i]).is_some_and(|t| family.contains(&t))
                 })
-                .collect()
+                .collect();
+            (family.len().saturating_sub(1), sessions)
         });
-        let detail = match sessions.len() {
-            0 => "The folder and its files stay as they are.".to_owned(),
-            1 => "Its session is closed. The folder and its files stay as they are.".to_owned(),
-            n => format!("Its {n} sessions are closed. The folder and its files stay as they are."),
+        let rows = match worktrees {
+            0 => String::new(),
+            1 => "Its worktree leaves the list. ".to_owned(),
+            n => format!("Its {n} worktrees leave the list. "),
         };
+        let closed = match sessions.len() {
+            0 => String::new(),
+            1 => "1 session is closed. ".to_owned(),
+            n => format!("{n} sessions are closed. "),
+        };
+        let detail = format!("{rows}{closed}The folders and their files stay as they are.");
         let yes = std::env::var_os("CRC_SELFTEST").is_some()
             || ask(
                 MainThreadMarker::from(self),
@@ -1473,17 +1479,19 @@ pub(super) fn forget_emptied(state: &mut State) {
         return;
     }
     let closed = std::mem::take(&mut state.terminal.closed_in);
-    let tasks = state.agents.tasks.clone();
     let mut gone = false;
     for id in closed {
-        let Some(index) = tasks.iter().position(|t| t.id() == id && t.folder) else {
+        // Not while a worktree under it has a terminal: it would go too.
+        let family = state.agents.family(&id);
+        if family.is_empty() {
             continue;
-        };
+        }
+        let tasks = &state.agents.tasks;
         let held = state
             .terminal
             .tabs
             .iter()
-            .any(|tab| task_of(&tasks, tab) == Some(index));
+            .any(|tab| task_of(tasks, tab).is_some_and(|t| family.contains(&t)));
         if !held {
             state.agents.remove_folder(&id);
             gone = true;
