@@ -107,6 +107,9 @@ pub struct Inspector {
     max_scroll: f32,
     /// The ssh session shown last frame, for the self-test.
     shown_remote: Option<String>,
+    /// The remote workspace shown last frame, `host:path`, for the
+    /// self-test.
+    shown_host: Option<String>,
     /// The worktree strips shown last frame, per repository, and whether
     /// each was merged, for the self-test.
     shown_worktrees: Vec<(PathBuf, PathBuf, String, bool)>,
@@ -216,6 +219,9 @@ impl Inspector {
         if let Some(login) = &self.shown_remote {
             return format!("ssh={login}");
         }
+        if let Some(at) = &self.shown_host {
+            return format!("remote={at}");
+        }
         let Some(repos) = repos else {
             return "-".into();
         };
@@ -317,6 +323,9 @@ impl Inspector {
     ) {
         self.hits.clear();
         self.shown_remote = remote.map(|r| r.login());
+        self.shown_host = workspace
+            .filter(|_| remote.is_none())
+            .and_then(|w| Some(format!("{}:{}", w.host.as_ref()?, w.path.display())));
         self.shown_worktrees.clear();
         layout::push_rect(
             out,
@@ -431,7 +440,10 @@ impl Inspector {
         let name = fit(atlas, &name, width);
         layout::push_title(out, atlas, x, y, 15.0, &name, theme.text, width);
         y += 24.0;
-        let shown = crate::platform::window::shown_path(&workspace.path);
+        let shown = match &workspace.host {
+            Some(host) => format!("{host}:{}", workspace.path.display()),
+            None => crate::platform::window::shown_path(&workspace.path),
+        };
         let shown = fit(atlas, &shown, width);
         text(out, atlas, x, y, width, &shown, theme.gutter_text);
         y += ROW;
@@ -453,6 +465,22 @@ impl Inspector {
                 ));
             }
             facts.push(("Connected", vec![(remote.connected_for(), theme.text)]));
+            card(out, atlas, x, y, width, &facts, theme);
+            return;
+        }
+        // A remote workspace: where its terminals go. Its Git is on the
+        // host, and not read from here.
+        if let Some(host) = &workspace.host {
+            text(out, atlas, x, y, width, "REMOTE FOLDER", theme.status_text);
+            y += ROW;
+            let facts: Vec<Fact> = vec![
+                ("Host", vec![(host.clone(), theme.text)]),
+                (
+                    "Folder",
+                    vec![(workspace.path.display().to_string(), theme.text)],
+                ),
+                ("Over", vec![("ssh".to_owned(), theme.gutter_text)]),
+            ];
             card(out, atlas, x, y, width, &facts, theme);
             return;
         }

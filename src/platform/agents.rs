@@ -90,6 +90,10 @@ pub struct Workspace {
     /// branch now: done, and safe to clean up. A squash merge Git cannot
     /// see is told by its pull request instead ([`Panel::is_merged`]).
     pub merged: bool,
+    /// A remote folder workspace's ssh host (an alias from ~/.ssh/config
+    /// or `user@host`): its path is on that host, its terminals open over
+    /// ssh, and nothing of this Mac (Git, its folders) is read for it.
+    pub host: Option<String>,
 }
 
 impl Workspace {
@@ -105,6 +109,7 @@ impl Workspace {
             base,
             commit: None,
             merged: false,
+            host: None,
         }
     }
 
@@ -429,22 +434,24 @@ pub struct RowDrag {
     pub active: bool,
 }
 
-/// One per line: the name, a tab, the folder, a tab, the key. A line
-/// written before keys existed keeps the id it had, `folder:` and its name,
-/// so the sessions holding it stay in it.
+/// One per line: the name, a tab, the folder, a tab, the key, and for a
+/// remote workspace a tab and its host. A line written before keys existed
+/// keeps the id it had, `folder:` and its name, so the sessions holding it
+/// stay in it.
 fn parse_folders(text: &str) -> Vec<Workspace> {
     text.lines()
         .filter_map(|line| {
-            let mut parts = line.splitn(3, '\t');
+            let mut parts = line.splitn(4, '\t');
             let (name, path) = (parts.next()?, parts.next()?);
             let key = parts
                 .next()
                 .filter(|k| !k.is_empty())
                 .map_or_else(|| format!("folder:{name}"), str::to_owned);
-            Some((name, path, key))
+            let host = parts.next().filter(|h| !h.is_empty()).map(str::to_owned);
+            Some((name, path, key, host))
         })
-        .filter(|(name, path, _)| !name.is_empty() && !path.is_empty())
-        .map(|(name, path, key)| Workspace {
+        .filter(|(name, path, ..)| !name.is_empty() && !path.is_empty())
+        .map(|(name, path, key, host)| Workspace {
             name: name.to_owned(),
             path: PathBuf::from(path),
             branch: None,
@@ -455,6 +462,7 @@ fn parse_folders(text: &str) -> Vec<Workspace> {
             base: None,
             commit: None,
             merged: false,
+            host,
         })
         .collect()
 }
@@ -462,7 +470,10 @@ fn parse_folders(text: &str) -> Vec<Workspace> {
 fn folders_text(folders: &[Workspace]) -> String {
     folders
         .iter()
-        .map(|w| format!("{}\t{}\t{}\n", w.name, w.path.display(), w.key))
+        .map(|w| match &w.host {
+            Some(host) => format!("{}\t{}\t{}\t{host}\n", w.name, w.path.display(), w.key),
+            None => format!("{}\t{}\t{}\n", w.name, w.path.display(), w.key),
+        })
         .collect()
 }
 
@@ -907,12 +918,13 @@ pub fn task_of(tasks: &[Workspace], tab: &Tab) -> Option<usize> {
 /// the main checkout is not taken for the main one; a worktree before a
 /// folder workspace on the same folder; of folder workspaces on one
 /// folder, the first in the list, so a new one never takes the sessions of
-/// the others.
+/// the others. A remote workspace's folder is not on this Mac: it holds
+/// only the sessions started in it.
 pub fn folder_task(tasks: &[Workspace], folder: &Path) -> Option<usize> {
     tasks
         .iter()
         .enumerate()
-        .filter(|(_, t)| folder.starts_with(&t.path))
+        .filter(|(_, t)| t.host.is_none() && folder.starts_with(&t.path))
         .max_by_key(|(i, t)| {
             (
                 t.path.components().count(),
@@ -940,10 +952,11 @@ pub enum Follow {
 /// has it. Into another worktree (one inside the main checkout too), the
 /// terminal joins it; a worktree keeps the rest of its own folders; a
 /// folder workspace moves with it; else it joins whatever holds the folder,
-/// else a new one is made there.
+/// else a new one is made there. A remote workspace's terminal is ssh, in a
+/// folder of this Mac that says nothing: it stays.
 pub fn follow(tasks: &[Workspace], owner: usize, cwd: &Path) -> Follow {
     let task = &tasks[owner];
-    if task.path == cwd {
+    if task.path == cwd || task.host.is_some() {
         return Follow::Stay;
     }
     match folder_task(tasks, cwd) {
@@ -969,9 +982,11 @@ impl Panel {
         if !self.loaded {
             self.load();
         }
+        // A remote workspace's folder is not here: no Git is run for it.
         let folders: Vec<(String, PathBuf)> = self
             .folders
             .iter()
+            .filter(|f| f.host.is_none())
             .map(|f| (f.id(), f.path.clone()))
             .collect();
         let (tx, rx) = mpsc::channel();
@@ -1458,6 +1473,16 @@ impl Panel {
 
     /// Adds a folder workspace, its name made unique, and returns its id.
     pub fn add_folder(&mut self, name: &str, path: PathBuf) -> String {
+        self.add(name, crate::platform::canonical(&path), None)
+    }
+
+    /// Adds a remote folder workspace: `path` on `host`, taken as typed
+    /// (nothing on this Mac to resolve it against). Returns its id.
+    pub fn add_remote(&mut self, name: &str, host: &str, path: &str) -> String {
+        self.add(name, PathBuf::from(path), Some(host.to_owned()))
+    }
+
+    fn add(&mut self, name: &str, path: PathBuf, host: Option<String>) -> String {
         let base = name.trim();
         let base = if base.is_empty() { "workspace" } else { base };
         let mut name = base.to_owned();
@@ -1468,7 +1493,7 @@ impl Panel {
         }
         let made = Workspace {
             name,
-            path: crate::platform::canonical(&path),
+            path,
             branch: None,
             main: false,
             folder: true,
@@ -1477,6 +1502,7 @@ impl Panel {
             base: None,
             commit: None,
             merged: false,
+            host,
         };
         let id = made.id();
         self.folders.push(made);
@@ -1690,9 +1716,12 @@ impl Panel {
     }
 
     /// The repositories a workspace's inspector shows: a worktree's own
-    /// folder, or the ones found in a folder workspace (`None` until read).
+    /// folder, or the ones found in a folder workspace (`None` until read);
+    /// none for a remote one, whose Git is not read.
     pub fn repos_of(&self, workspace: &Workspace) -> Option<Vec<PathBuf>> {
-        if workspace.folder {
+        if workspace.host.is_some() {
+            Some(Vec::new())
+        } else if workspace.folder {
             self.repos.get(&workspace.id()).cloned()
         } else {
             Some(vec![workspace.path.clone()])
@@ -1710,9 +1739,11 @@ impl Panel {
 
     /// The folder a new workspace takes unless you choose one: the selected
     /// workspace's (a worktree's repository), else `fallback`, the editor's.
+    /// A remote workspace's folder is not one of this Mac's.
     pub fn new_folder(&self, fallback: Option<&Path>) -> Option<PathBuf> {
         self.selected_index()
             .map(|i| &self.tasks[i])
+            .filter(|t| t.host.is_none())
             .map(|t| t.repo.clone().unwrap_or_else(|| t.path.clone()))
             .or_else(|| fallback.map(Path::to_path_buf))
     }
@@ -2683,7 +2714,7 @@ impl Panel {
                 out,
                 atlas,
                 icon_box,
-                if remote.is_some() {
+                if remote.is_some() || task.host.is_some() {
                     icons::SERVER
                 } else if task.main {
                     icons::HOME
@@ -2861,17 +2892,24 @@ impl Panel {
                 }
             }
             // A folder workspace says which folder, unless its name does; a
-            // workspace you named says its branch.
-            let folder = task
-                .path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .filter(|n| task.folder && *n != name);
+            // remote one, where, always; a workspace you named says its
+            // branch.
+            let folder = match &task.host {
+                Some(host) => Some(format!("{host}:{}", task.path.display())),
+                None => task
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .filter(|n| task.folder && *n != name),
+            };
             if !task.folder && name != task.name() {
                 parts.push(task.name());
             }
-            if let Some(folder) = folder {
-                parts.push(folder);
+            // Where a remote one is goes first: the last facts are cut.
+            match folder {
+                Some(at) if task.host.is_some() => parts.insert(0, at),
+                Some(folder) => parts.push(folder),
+                None => {}
             }
             let colour = if writing {
                 theme.status_text
@@ -2932,7 +2970,58 @@ mod tests {
             base: None,
             commit: None,
             merged: false,
+            host: None,
         }
+    }
+
+    #[test]
+    fn a_remote_workspace_keeps_its_host_in_a_fourth_field() {
+        let mut panel = Panel::default();
+        let local = panel.add_folder("notes", PathBuf::from("/tmp/crc-agents-remote"));
+        let remote = panel.add_remote("app", "myhost", "~/srv/app");
+        let text = folders_text(&panel.folders);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0].split('\t').count(), 3, "{text}");
+        assert_eq!(lines[1], format!("app\t~/srv/app\t{remote}\tmyhost"));
+        let back = parse_folders(&text);
+        assert_eq!(back, panel.folders);
+        assert_eq!(back[0].host, None);
+        assert_eq!(back[1].host.as_deref(), Some("myhost"));
+        assert_eq!(back[1].path, PathBuf::from("~/srv/app"));
+        // Written without a host, a file reads and writes back the same.
+        let old = format!("notes\t/tmp/crc-agents-remote\t{local}\nplain\t/p\n");
+        let parsed = parse_folders(&old);
+        assert!(parsed.iter().all(|w| w.host.is_none()));
+        assert_eq!(
+            folders_text(&parsed),
+            format!("notes\t/tmp/crc-agents-remote\t{local}\nplain\t/p\tfolder:plain\n")
+        );
+        // An empty host field is none.
+        assert_eq!(parse_folders("a\t/a\tws:1\t\n")[0].host, None);
+    }
+
+    #[test]
+    fn a_remote_workspace_takes_no_local_terminal_and_never_moves() {
+        let mut remote = folder("app", "/srv/app");
+        remote.host = Some("myhost".into());
+        let tasks = vec![remote, folder("srv", "/srv")];
+        // A local terminal in a folder named as the remote one's is not its.
+        assert_eq!(folder_task(&tasks, Path::new("/srv/app/x")), Some(1));
+        assert_eq!(folder_task(&tasks[..1], Path::new("/srv/app")), None);
+        // Its ssh runs in this Mac's home, which says nothing of where it is.
+        assert_eq!(follow(&tasks, 0, Path::new("/home/me")), Follow::Stay);
+        let panel = Panel {
+            folders: tasks.clone(),
+            tasks,
+            selected: Some("folder:app".into()),
+            ..Panel::default()
+        };
+        assert_eq!(panel.repos_of(&panel.tasks[0]), Some(Vec::new()));
+        assert_eq!(
+            panel.new_folder(Some(Path::new("/e"))),
+            Some(PathBuf::from("/e"))
+        );
+        assert_eq!(panel.task_repo(), None);
     }
 
     #[test]

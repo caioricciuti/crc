@@ -7207,6 +7207,8 @@ enum Pick {
     NewWorkspace(String),
     /// A folder workspace to make on a folder chosen in a panel.
     NewWorkspaceChosen(String),
+    /// A remote workspace to make: a host and a folder on it.
+    NewRemoteWorkspace(String, String),
     /// Commit everything in the workspace being asked about, with this
     /// message.
     CommitAll(String),
@@ -7235,6 +7237,18 @@ fn task_rows(
                 shortcut: String::new(),
             },
             Pick::NewWorkspace(name.to_owned()),
+        )];
+    }
+    // `host:/path` or `host:~/path`: a folder on that host, over ssh.
+    if let Some((host, path)) = crate::platform::remote::workspace_target(name) {
+        return vec![(
+            layout::PaletteRow {
+                icon: Some(crate::project::icons::SERVER),
+                title: format!("New remote workspace on {host}:{path}"),
+                detail: "terminals there over ssh; no Git read".into(),
+                shortcut: String::new(),
+            },
+            Pick::NewRemoteWorkspace(host, path),
         )];
     }
     let mut rows = vec![(

@@ -707,6 +707,23 @@ impl EditorView {
         self.create_workspace_in(name, &dir);
     }
 
+    /// The palette's answer for a remote workspace: `path` on `host`, named
+    /// after its folder, selected, and a terminal there over ssh.
+    pub(super) fn create_remote_workspace(&self, host: String, path: String) {
+        let id = {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            state.agents.on = true;
+            let name = crate::platform::remote::workspace_name(&host, &path);
+            let id = state.agents.add_remote(&name, &host, &path);
+            state.agents.selected = Some(id.clone());
+            id
+        };
+        self.set_agents_mode(true);
+        self.spawn_terminal_into(false, Some(Path::new(&path)), Some(id));
+    }
+
     /// A folder workspace on `dir`, selected, its repositories read, and a
     /// terminal in it.
     fn create_workspace_in(&self, name: String, dir: &Path) {
@@ -1015,9 +1032,9 @@ impl EditorView {
     fn task_menu(&self, index: usize) -> Retained<NSMenu> {
         let mtm = MainThreadMarker::from(self);
         let menu = context_menu_new(mtm);
-        let (main, folder, branch, base, pr, merged, prunable) =
+        let (main, folder, remote, branch, base, pr, merged, prunable) =
             self.state()
-                .map_or((true, false, None, None, None, false, 0), |state| {
+                .map_or((true, false, false, None, None, None, false, 0), |state| {
                     let task = state.agents.tasks.get(index);
                     // Worktrees Git still records whose folder is gone, in the
                     // repositories a folder workspace holds.
@@ -1033,6 +1050,7 @@ impl EditorView {
                     (
                         task.is_none_or(|t| t.main),
                         task.is_some_and(|t| t.folder),
+                        task.is_some_and(|t| t.host.is_some()),
                         task.and_then(|t| t.branch.clone()),
                         task.and_then(|t| t.base.clone()),
                         task.and_then(|t| state.agents.info.get(&t.path))
@@ -1052,7 +1070,10 @@ impl EditorView {
         let add = |title: &str, action: Sel| menu.addItem(&menu_item(mtm, title, action));
         add("New Terminal", sel!(agentNewShell:));
         add("New Claude Session", sel!(agentNewClaude:));
-        add("Open in Editor", sel!(agentOpenInEditor:));
+        // A remote workspace's folder is on its host, not for the editor.
+        if !remote {
+            add("Open in Editor", sel!(agentOpenInEditor:));
+        }
         if !folder
             && !main
             && let Some(base) = &base
@@ -1149,10 +1170,14 @@ impl EditorView {
 
     /// Agents leads: the editor opens on the selected workspace's folder,
     /// so what it shows is what the agents are working in. A folder gone
-    /// from disk, or too broad to index, leaves the project as it was.
+    /// from disk, or too broad to index, leaves the project as it was, and
+    /// so does a remote workspace, whose folder is on its host.
     fn editor_follows_agents(&self) {
         let path = self.state().and_then(|state| {
             let task = &state.agents.tasks[state.agents.selected_index()?];
+            if task.host.is_some() {
+                return None;
+            }
             let path = crate::platform::canonical(&task.path);
             let root = state.tree.root().map(crate::platform::canonical);
             (root.as_deref() != Some(path.as_path()) && path.is_dir() && !too_broad_to_adopt(&path))
@@ -1564,6 +1589,15 @@ pub(super) fn forget_emptied(state: &mut State) {
     let closed = std::mem::take(&mut state.terminal.closed_in);
     let mut gone = false;
     for id in closed {
+        // A remote workspace stays: its host and folder were typed, and a
+        // dropped connection ends its terminal without asking.
+        if state
+            .agents
+            .by_id(&id)
+            .is_some_and(|i| state.agents.tasks[i].host.is_some())
+        {
+            continue;
+        }
         // Not while a worktree under it has a terminal: it would go too.
         let family = state.agents.family(&id);
         if family.is_empty() {

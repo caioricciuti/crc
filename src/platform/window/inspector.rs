@@ -102,6 +102,10 @@ impl EditorView {
         else {
             return;
         };
+        // A remote workspace's Git is on its host: nothing to read here.
+        if task.host.is_some() {
+            return;
+        }
         let Some(repos) = state.agents.repos_of(&task) else {
             return;
         };

@@ -146,11 +146,15 @@ impl EditorView {
 
     /// What a new session runs: the login shell, or `claude` through it so
     /// it finds what the shell profile puts on PATH. Claude Code is told
-    /// this window's IDE port, so it connects without `/ide`.
+    /// this window's IDE port, so it connects without `/ide`. In a remote
+    /// workspace (`remote`: its host and folder) it is ssh to that folder,
+    /// run from home, and the shell or `claude` runs there without any of
+    /// this window: no IDE port, no review hooks.
     pub(super) fn terminal_launch(
         &self,
         claude: bool,
         cwd: Option<&Path>,
+        remote: Option<(&str, &Path)>,
     ) -> Option<crate::platform::terminal::Launch> {
         let state = self.state()?;
         let shell = std::env::var("CRC_TERMINAL_SHELL")
@@ -158,6 +162,7 @@ impl EditorView {
             .unwrap_or_else(|_| "/bin/zsh".into());
         let home = std::env::var_os("HOME").map_or_else(|| "/".into(), std::path::PathBuf::from);
         let cwd = match cwd {
+            _ if remote.is_some() => home,
             Some(dir) => dir.to_path_buf(),
             None => state.tree.root().map_or(home, Path::to_path_buf),
         };
@@ -179,6 +184,43 @@ impl EditorView {
                     .to_string_lossy()
                     .into_owned(),
             ));
+        }
+        // A Claude Code session that started this editor (from its own
+        // terminal, say) left its markers in our environment. Passed on,
+        // they make the `claude` here think it is that session's child.
+        let unset = std::env::vars_os()
+            .filter_map(|(name, _)| name.into_string().ok())
+            .filter(|name| name == "CLAUDECODE" || name.starts_with("CLAUDE_CODE_"))
+            .collect();
+        if let Some((host, path)) = remote {
+            // ssh sends none of these variables but what the person's own
+            // config says to; TERM it sends as the terminal's type.
+            let program = std::env::var_os("CRC_SSH_COMMAND")
+                .map_or_else(|| "/usr/bin/ssh".into(), std::path::PathBuf::from);
+            let control = crate::platform::app_support()
+                .map(|dir| dir.join("ssh"))
+                .filter(|dir| {
+                    use std::os::unix::fs::DirBuilderExt;
+                    std::fs::DirBuilder::new()
+                        .recursive(true)
+                        .mode(0o700)
+                        .create(dir)
+                        .is_ok()
+                })
+                .and_then(|dir| crate::platform::remote::control_path(&dir, host));
+            let args = crate::platform::remote::ssh_args(
+                host,
+                &path.to_string_lossy(),
+                claude.then_some("claude"),
+                control.as_deref(),
+            );
+            return Some(crate::platform::terminal::Launch {
+                program,
+                args,
+                cwd,
+                env,
+                unset,
+            });
         }
         // Every session knows this window's IDE port, so `claude` typed in
         // any of them connects without `/ide`.
@@ -206,13 +248,6 @@ impl EditorView {
         } else {
             vec!["-l".to_owned()]
         };
-        // A Claude Code session that started this editor (from its own
-        // terminal, say) left its markers in our environment. Passed on,
-        // they make the `claude` here think it is that session's child.
-        let unset = std::env::vars_os()
-            .filter_map(|(name, _)| name.into_string().ok())
-            .filter(|name| name == "CLAUDECODE" || name.starts_with("CLAUDE_CODE_"))
-            .collect();
         Some(crate::platform::terminal::Launch {
             program: shell.into(),
             args,
@@ -267,29 +302,49 @@ impl EditorView {
         self.say_if_replaced(true);
         // In Agents mode a session started in the selected workspace's
         // folder (or in no particular one) belongs to that workspace.
-        let workspace = {
+        let (workspace, remote) = {
             let Some(mut state) = self.state_mut() else {
                 return;
             };
             state.terminal.open = true;
             state.terminal.focus = true;
-            into.or_else(|| {
+            let workspace = into.or_else(|| {
                 state
                     .agents
                     .on
                     .then(|| state.agents.selected_index())
                     .flatten()
                     .map(|i| &state.agents.tasks[i])
-                    .filter(|t| cwd.is_none_or(|dir| crate::platform::canonical(dir) == t.path))
+                    .filter(|t| {
+                        cwd.is_none_or(|dir| match t.host {
+                            Some(_) => dir == t.path,
+                            None => crate::platform::canonical(dir) == t.path,
+                        })
+                    })
                     .map(|t| t.id())
-            })
+            });
+            // A remote workspace's terminal is ssh to its folder.
+            let remote = workspace
+                .as_deref()
+                .and_then(|id| state.agents.by_id(id))
+                .map(|i| &state.agents.tasks[i])
+                .and_then(|t| Some((t.host.clone()?, t.path.clone())));
+            (workspace, remote)
         };
-        let Some(launch) = self.terminal_launch(claude, cwd) else {
+        let Some(launch) = self.terminal_launch(
+            claude,
+            cwd,
+            remote
+                .as_ref()
+                .map(|(host, path)| (host.as_str(), path.as_path())),
+        ) else {
             return;
         };
         let (cols, rows) = self.terminal_grid();
         let title = if claude {
             "✻ Claude".to_owned()
+        } else if let Some((host, _)) = &remote {
+            format!("ssh {host}")
         } else {
             launch
                 .program
