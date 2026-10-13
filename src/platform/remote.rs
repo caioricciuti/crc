@@ -303,6 +303,36 @@ pub fn batch_args(host: &str, control: Option<&str>, line: &str) -> Vec<String> 
     args
 }
 
+/// The arguments for ssh that run `line` on `host` to change something
+/// there: asking nothing, as [`batch_args`], but never starting the shared
+/// connection. A connection ssh keeps open for later holds the stderr of
+/// the call that started it, and a write's stderr is read for Git's
+/// errors. With `ControlMaster=no` the call goes through `control` when
+/// the host's terminals or reads have it open, and on a connection of its
+/// own, closed with it, when not; options given here outrank the host's
+/// own in ~/.ssh/config.
+pub fn write_args(host: &str, control: Option<&str>, line: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    for option in [
+        "BatchMode=yes",
+        "ConnectTimeout=5",
+        "ServerAliveInterval=5",
+        "ServerAliveCountMax=2",
+        "ControlMaster=no",
+    ] {
+        args.push("-o".to_owned());
+        args.push(option.to_owned());
+    }
+    if let Some(control) = control {
+        args.push("-o".to_owned());
+        args.push(format!("ControlPath=\"{control}\""));
+    }
+    args.push("--".into());
+    args.push(host.to_owned());
+    args.push(line.to_owned());
+    args
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,6 +449,37 @@ mod tests {
         assert_eq!(&args[8..], ["--", "box", "true"]);
         assert_eq!(parse(&args).map(|t| t.host), Some("box".into()));
         assert_eq!(quote("it's"), r"'it'\''s'");
+    }
+
+    #[test]
+    fn a_change_over_ssh_asks_nothing_and_never_starts_the_shared_connection() {
+        let line = "cd '/srv/app' && git 'push'";
+        let args = write_args("me@box", Some("/s/cm-1"), line);
+        assert_eq!(
+            args,
+            [
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=5",
+                "-o",
+                "ServerAliveInterval=5",
+                "-o",
+                "ServerAliveCountMax=2",
+                "-o",
+                "ControlMaster=no",
+                "-o",
+                "ControlPath=\"/s/cm-1\"",
+                "--",
+                "me@box",
+                line,
+            ]
+        );
+        assert!(!args.iter().any(|a| a.starts_with("ControlPersist")));
+        // No socket: a connection of its own, still never a master.
+        let args = write_args("box", None, "true");
+        assert_eq!(&args[8..], ["-o", "ControlMaster=no", "--", "box", "true"]);
+        assert_eq!(parse(&args).map(|t| t.host), Some("box".into()));
     }
 
     fn words(s: &str) -> Vec<String> {

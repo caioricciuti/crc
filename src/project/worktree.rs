@@ -49,13 +49,18 @@ fn run(dir: &Path, args: &[&str]) -> Result<String, String> {
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     } else {
-        let said = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        Err(said
-            .strip_prefix("fatal: ")
-            .or_else(|| said.strip_prefix("error: "))
-            .unwrap_or(&said)
-            .to_owned())
+        Err(git_said(&String::from_utf8_lossy(&output.stderr)))
     }
+}
+
+/// What Git said on stderr when it failed, without its `fatal: ` or
+/// `error: `.
+fn git_said(stderr: &str) -> String {
+    let said = stderr.trim();
+    said.strip_prefix("fatal: ")
+        .or_else(|| said.strip_prefix("error: "))
+        .unwrap_or(said)
+        .to_owned()
 }
 
 /// Where a repository's Git runs: on this Mac, or on an ssh host through
@@ -193,6 +198,138 @@ fn run_on(runner: &Runner, dir: &Path, args: &[&str]) -> Result<String, String> 
                 .unwrap_or_else(|| Err(UNREACHABLE.into()))
         }
     }
+}
+
+/// How long a change made over ssh may take before it is stopped: a pull
+/// or a push talks to another server from the host.
+const SSH_WRITE_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The line a host's shell runs to change something with Git in `dir`: the
+/// commands one after another, stopping at the first that fails, their
+/// stderr left for the caller to read.
+pub fn write_line(dir: &Path, commands: &[Vec<String>]) -> String {
+    let mut line = format!(
+        "cd {} || exit 1; export LC_ALL=C GIT_TERMINAL_PROMPT=0",
+        crate::platform::remote::shell_path(&dir.to_string_lossy())
+    );
+    for (n, args) in commands.iter().enumerate() {
+        line.push_str(if n == 0 { "; git" } else { " && git" });
+        for arg in args {
+            line.push(' ');
+            line.push_str(&crate::platform::remote::quote(arg));
+        }
+    }
+    line
+}
+
+/// Runs `line` on `host` over ssh to change something there: what it
+/// printed on stdout and on stderr, when it exits 0; else what it said.
+/// Its stderr is read, unlike a read's: the call never becomes the shared
+/// connection (see [`crate::platform::remote::write_args`]), so nothing
+/// outlives it holding the pipe.
+pub fn ssh_write(
+    host: &str,
+    control: Option<&str>,
+    line: &str,
+) -> Result<(String, String), String> {
+    use std::io::Read;
+    let mut child = Command::new(crate::platform::remote::program())
+        .args(crate::platform::remote::write_args(host, control, line))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|_| UNREACHABLE.to_owned())?;
+    // Both pipes are read while it runs, so a chatty push never fills one.
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            let _ = tx.send(String::from_utf8_lossy(&bytes).into_owned());
+        });
+        rx
+    };
+    let out = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let err = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < SSH_WRITE_WAIT => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "{host} took over two minutes to answer and was stopped"
+                ));
+            }
+        }
+    };
+    let wait = std::time::Duration::from_secs(2);
+    let out = out.recv_timeout(wait).unwrap_or_default();
+    let err = err.recv_timeout(wait).unwrap_or_default();
+    match status.code() {
+        Some(0) => Ok((out, err)),
+        // ssh's own failure: it says why, a key refused or no route.
+        Some(255) | None => Err(match err.trim() {
+            "" => UNREACHABLE.to_owned(),
+            said => format!("{UNREACHABLE}: {said}"),
+        }),
+        Some(code) => Err(match git_said(&err) {
+            said if said.is_empty() => format!("git exited with {code}"),
+            said => said,
+        }),
+    }
+}
+
+/// Runs Git commands in `dir` that change something, one after another
+/// until one fails: here, or in one ssh call on a host. The last one's
+/// stdout and stderr, or what the failing one said.
+fn write_on(
+    runner: &Runner,
+    dir: &Path,
+    commands: &[Vec<String>],
+) -> Result<(String, String), String> {
+    match runner {
+        Runner::Local => {
+            let mut said = (String::new(), String::new());
+            for args in commands {
+                let output = git(dir)
+                    .args(args)
+                    .stdin(std::process::Stdio::null())
+                    .output()
+                    .map_err(|e| e.to_string())?;
+                let err = String::from_utf8_lossy(&output.stderr).into_owned();
+                if !output.status.success() {
+                    return Err(git_said(&err));
+                }
+                said = (String::from_utf8_lossy(&output.stdout).into_owned(), err);
+            }
+            Ok(said)
+        }
+        Runner::Ssh { host, control } => {
+            ssh_write(host, control.as_deref(), &write_line(dir, commands))
+        }
+    }
+}
+
+fn strings(args: &[&str]) -> Vec<String> {
+    args.iter().map(|a| (*a).to_owned()).collect()
 }
 
 /// Every worktree of the repository `dir` is in, its own checkout first.
@@ -890,21 +1027,136 @@ pub fn status(dir: &Path, base: Option<&str>, tags: bool) -> Result<Status, Stri
     Ok(out)
 }
 
+/// The questions [`status_on`] asks a host, all at once: what [`status`]
+/// asks here one after another, the base's two whether or not it turns out
+/// to be the branch itself, and the latest tag with its count in one
+/// `describe --long`.
+pub fn status_commands(base: Option<&str>, tags: bool) -> Vec<Vec<String>> {
+    let mut commands = vec![
+        strings(&["rev-parse", "--git-dir"]),
+        strings(&["symbolic-ref", "--quiet", "--short", "HEAD"]),
+        strings(&["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]),
+        strings(&["rev-list", "--left-right", "--count", "@{u}...HEAD"]),
+        strings(&["status", "--porcelain"]),
+        strings(&["diff", "HEAD", "--numstat"]),
+    ];
+    if let Some(base) = base {
+        let range = format!("{base}...HEAD");
+        commands.push(strings(&["rev-list", "--left-right", "--count", &range]));
+        commands.push(strings(&["diff", "--numstat", &range]));
+    }
+    if tags {
+        commands.push(strings(&["describe", "--tags", "--long"]));
+    }
+    commands
+}
+
+/// The answers to [`status_commands`], as [`status`] reads them.
+pub fn parse_status(
+    said: &[Result<String, String>],
+    base: Option<&str>,
+    tags: bool,
+) -> Result<Status, String> {
+    let at = |n: usize| said.get(n).and_then(|s| s.as_ref().ok());
+    if let Some(Err(e)) = said.first() {
+        return Err(e.clone());
+    }
+    let branch = at(1).map(|b| b.trim().to_owned()).filter(|b| !b.is_empty());
+    let mut out = Status {
+        branch: branch.clone(),
+        ..Status::default()
+    };
+    if let Some(upstream) = at(2) {
+        out.upstream = Some(upstream.trim().to_owned());
+        if let Some(counts) = at(3) {
+            (out.to_pull, out.to_push) = parse_left_right(counts);
+        }
+    }
+    out.dirty = at(4).map_or(0, |s| s.lines().filter(|l| !l.is_empty()).count());
+    if out.dirty > 0
+        && let Some(stat) = at(5)
+    {
+        let (_, a, r) = parse_numstat(stat);
+        (out.dirty_added, out.dirty_removed) = (a, r);
+    }
+    let mut next = 6;
+    if let Some(base) = base {
+        if branch.as_deref() != Some(base)
+            && let Some(counts) = at(next)
+        {
+            (out.behind, out.ahead) = parse_left_right(counts);
+            out.base = Some(base.to_owned());
+            if let Some(stat) = at(next + 1) {
+                (out.files, out.added, out.removed) = parse_numstat(stat);
+            }
+        }
+        next += 2;
+    }
+    if tags {
+        out.tag = at(next).and_then(|d| parse_describe(d.trim()));
+    }
+    Ok(out)
+}
+
+/// `git describe --tags --long`: the tag, then the commits since it (the
+/// tag's own name may have dashes; the last two parts are Git's).
+pub fn parse_describe(text: &str) -> Option<(String, usize)> {
+    let mut parts = text.rsplitn(3, '-');
+    let _hash = parts.next()?;
+    let since = parts.next()?.parse().ok()?;
+    let tag = parts.next().filter(|t| !t.is_empty())?;
+    Some((tag.to_owned(), since))
+}
+
+/// [`status`], by `runner`: on a host, every question in one ssh call.
+pub fn status_on(
+    runner: &Runner,
+    dir: &Path,
+    base: Option<&str>,
+    tags: bool,
+) -> Result<Status, String> {
+    if *runner == Runner::Local {
+        return status(dir, base, tags);
+    }
+    let said = batch_on(runner, dir, &status_commands(base, tags))?;
+    parse_status(&said, base, tags)
+}
+
 /// Merges `base` into the workspace's branch: the way to take main's new
 /// commits without rewriting the branch. Refused with uncommitted changes;
 /// on a conflict the merge is undone, so nothing is left half done.
 pub fn update_from(dir: &Path, base: &str) -> Result<String, String> {
-    if is_dirty(dir)? {
+    update_from_on(&Runner::Local, dir, base)
+}
+
+/// [`update_from`], by `runner`: on a host, the checks in one read and
+/// the merge in one call.
+pub fn update_from_on(runner: &Runner, dir: &Path, base: &str) -> Result<String, String> {
+    let mut read = batch_on(
+        runner,
+        dir,
+        &[
+            strings(&["status", "--porcelain", "--untracked-files=normal"]),
+            strings(&["branch", "--show-current"]),
+        ],
+    )?
+    .into_iter();
+    let dirty = read.next().unwrap_or_else(|| Err(UNREACHABLE.into()))?;
+    if !dirty.trim().is_empty() {
         return Err("Commit or stash the uncommitted changes first".into());
     }
-    let branch = run(dir, &["branch", "--show-current"])?.trim().to_owned();
-    match run(dir, &["merge", "--no-edit", base]) {
-        Ok(said) if said.contains("Already up to date") => {
+    let branch = read
+        .next()
+        .unwrap_or_else(|| Err(UNREACHABLE.into()))?
+        .trim()
+        .to_owned();
+    match write_on(runner, dir, &[strings(&["merge", "--no-edit", base])]) {
+        Ok((said, _)) if said.contains("Already up to date") => {
             Ok(format!("{branch} already has everything on {base}"))
         }
         Ok(_) => Ok(format!("Merged {base} into {branch}")),
         Err(e) => {
-            let conflicted = run(dir, &["diff", "--name-only", "--diff-filter=U"])
+            let conflicted = run_on(runner, dir, &["diff", "--name-only", "--diff-filter=U"])
                 .unwrap_or_default()
                 .lines()
                 .map(str::to_owned)
@@ -912,7 +1164,7 @@ pub fn update_from(dir: &Path, base: &str) -> Result<String, String> {
             if conflicted.is_empty() {
                 return Err(e);
             }
-            let _ = run(dir, &["merge", "--abort"]);
+            let _ = write_on(runner, dir, &[strings(&["merge", "--abort"])]);
             Err(format!(
                 "{base} conflicts with {branch} in {}; nothing changed. Merge it in a terminal there to resolve them",
                 conflicted.join(", ")
@@ -936,10 +1188,81 @@ pub fn commit_all(dir: &Path, message: &str) -> Result<String, String> {
     }
     run(dir, &["add", "--all"])?;
     crate::project::git::commit(dir, message)?;
-    Ok(match files {
+    Ok(committed(files))
+}
+
+fn committed(files: usize) -> String {
+    match files {
         1 => "Committed 1 file".to_owned(),
         n => format!("Committed {n} files"),
-    })
+    }
+}
+
+/// [`commit_all`], by `runner`. On a host the message goes as an argument
+/// (`-m`, which Git cleans up as it does a message from a file) and the
+/// commit is made with the host's own Git settings: one that signs with a
+/// key wanting a passphrase fails, saying so, as nothing can be asked.
+pub fn commit_all_on(runner: &Runner, dir: &Path, message: &str) -> Result<String, String> {
+    if message.trim().is_empty() {
+        return Err("Write a commit message first".into());
+    }
+    let files = run_on(runner, dir, &["status", "--porcelain"])?
+        .lines()
+        .filter(|l| !l.is_empty())
+        .count();
+    if files == 0 {
+        return Err("Nothing to commit".into());
+    }
+    write_on(
+        runner,
+        dir,
+        &[
+            strings(&["add", "--all"]),
+            strings(&["commit", "-q", "-m", message]),
+        ],
+    )?;
+    Ok(committed(files))
+}
+
+/// Pull (fast-forward only) or push in `dir` by `runner`, with the flags
+/// and refusals of [`crate::project::git::remote`]: on a host, the checks
+/// in one read and the pull or push in one call. What Git said, as there.
+pub fn remote_on(
+    runner: &Runner,
+    dir: &Path,
+    what: crate::project::git::Remote,
+) -> Result<String, String> {
+    use crate::project::git::Remote;
+    let mut read = batch_on(
+        runner,
+        dir,
+        &[
+            strings(&["symbolic-ref", "--quiet", "--short", "HEAD"]),
+            strings(&["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]),
+            strings(&["remote"]),
+        ],
+    )?
+    .into_iter();
+    let branch = read
+        .next()
+        .and_then(Result::ok)
+        .map(|b| b.trim().to_owned())
+        .filter(|b| !b.is_empty());
+    let upstream = read.next().is_some_and(|u| u.is_ok());
+    let remotes = read.next().and_then(Result::ok).unwrap_or_default();
+    let args = crate::project::git::remote_args(what, branch.as_deref(), upstream, || {
+        remotes.lines().any(|r| r == "origin")
+    })?;
+    match write_on(runner, dir, &[args]) {
+        Ok((out, err)) => Ok(match err.trim() {
+            "" => out.trim().to_owned(),
+            err => err.to_owned(),
+        }),
+        Err(e) if what == Remote::Pull && e.contains("fast-forward") => {
+            Err("the branches have diverged: pull with rebase or merge in a terminal there".into())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// `gh` in `dir`, never asking anything: what it printed, or its error.
@@ -1231,6 +1554,168 @@ mod tests {
             .output()
             .unwrap();
         assert!(!gone.status.success() && gone.stdout.is_empty());
+    }
+
+    #[test]
+    fn a_hosts_status_reads_as_the_local_one() {
+        // A main checkout with a tag, a commit since, a branch behind it as
+        // the base, and a change not committed: the batch a host's shell
+        // runs reads back as `status` reads it here.
+        let tree = fixture("status-shell", "main", &["old"]);
+        let repo = &tree.0;
+        let ok = |args: &[&str]| assert!(git(repo).args(args).output().unwrap().status.success());
+        ok(&["-c", "tag.gpgsign=false", "tag", "v1-rc"]);
+        std::fs::write(repo.join("b.txt"), "two\nthree\n").unwrap();
+        ok(&["add", "b.txt"]);
+        ok(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "two",
+        ]);
+        std::fs::write(repo.join("a.txt"), "one\nmore\n").unwrap();
+        std::fs::write(repo.join("new.txt"), "new\n").unwrap();
+        for (base, tags) in [(Some("old"), true), (Some("main"), false), (None, true)] {
+            let commands = status_commands(base, tags);
+            let shell = Command::new("/bin/sh")
+                .arg("-c")
+                .arg(batch_line(repo, &commands))
+                .output()
+                .unwrap();
+            let said =
+                parse_batch(&String::from_utf8_lossy(&shell.stdout), commands.len()).unwrap();
+            let there = parse_status(&said, base, tags).unwrap();
+            assert_eq!(there, status(repo, base, tags).unwrap(), "{base:?} {tags}");
+            if base == Some("old") {
+                assert_eq!((there.ahead, there.behind, there.files), (1, 0, 1));
+                assert_eq!((there.dirty, there.dirty_added), (2, 1));
+                assert_eq!(there.tag, Some(("v1-rc".to_owned(), 1)));
+            }
+        }
+        // Not a repository: the first answer says so.
+        let said = [Err("git exited with 128".to_owned())];
+        assert!(parse_status(&said, None, false).is_err());
+    }
+
+    #[test]
+    fn reads_a_describe_with_dashes_in_the_tag() {
+        assert_eq!(
+            parse_describe("v1.2-rc-1-4-gabc123"),
+            Some(("v1.2-rc-1".to_owned(), 4))
+        );
+        assert_eq!(parse_describe("v1-0-g1"), Some(("v1".to_owned(), 0)));
+        assert_eq!(parse_describe("gabc123"), None);
+        assert_eq!(parse_describe(""), None);
+    }
+
+    #[test]
+    fn a_hosts_change_is_one_line_that_stops_at_the_first_failure() {
+        let commands = [
+            vec!["add".to_owned(), "--all".into()],
+            vec!["commit".to_owned(), "-m".into(), "it's $HOME\nmore".into()],
+        ];
+        assert_eq!(
+            write_line(Path::new("/srv/my app"), &commands),
+            "cd '/srv/my app' || exit 1; export LC_ALL=C GIT_TERMINAL_PROMPT=0; \
+             git 'add' '--all' && git 'commit' '-m' 'it'\\''s $HOME\nmore'"
+        );
+        // Run by a shell: the message arrives as typed, and a failing first
+        // command stops the rest with Git's own error on stderr.
+        let tree = fixture("write-shell", "main", &[]);
+        let repo = &tree.0;
+        let ok = |args: &[&str]| assert!(git(repo).args(args).output().unwrap().status.success());
+        ok(&["config", "user.name", "t"]);
+        ok(&["config", "user.email", "t@t"]);
+        std::fs::write(repo.join("b.txt"), "b\n").unwrap();
+        let run = |line: String| {
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg(line)
+                .output()
+                .unwrap()
+        };
+        assert!(run(write_line(repo, &commands)).status.success());
+        let log = git(repo)
+            .args(["log", "-1", "--format=%B"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&log.stdout).trim(),
+            "it's $HOME\nmore"
+        );
+        let failed = run(write_line(
+            repo,
+            &[
+                vec!["merge".to_owned(), "nope".into()],
+                vec![
+                    "-c".to_owned(),
+                    "tag.gpgsign=false".into(),
+                    "tag".into(),
+                    "after".into(),
+                ],
+            ],
+        ));
+        assert!(!failed.status.success());
+        assert!(!String::from_utf8_lossy(&failed.stderr).is_empty());
+        let tags = git(repo).args(["tag"]).output().unwrap();
+        assert!(String::from_utf8_lossy(&tags.stdout).trim().is_empty());
+    }
+
+    #[test]
+    fn commit_pull_and_push_by_a_runner_do_what_they_do_here() {
+        // By the local runner, the same steps a host's run: committed, the
+        // branch pushed to origin with its upstream set, then pulled.
+        let tree = fixture("runner-ops", "main", &[]);
+        let repo = &tree.0;
+        let origin = repo.join("origin.git");
+        let ok = |args: &[&str]| assert!(git(repo).args(args).output().unwrap().status.success());
+        ok(&["config", "user.name", "t"]);
+        ok(&["config", "user.email", "t@t"]);
+        ok(&[
+            "init",
+            "-q",
+            "--bare",
+            "-b",
+            "main",
+            &origin.to_string_lossy(),
+        ]);
+        let runner = Runner::Local;
+        use crate::project::git::Remote;
+        assert_eq!(
+            remote_on(&runner, repo, Remote::Push),
+            Err("this branch has no upstream and there is no origin remote".to_owned())
+        );
+        assert_eq!(
+            remote_on(&runner, repo, Remote::Pull),
+            Err("this branch has no upstream to pull from".to_owned())
+        );
+        ok(&["remote", "add", "origin", &origin.to_string_lossy()]);
+        // The bare origin is inside the checkout: kept out of what is committed.
+        std::fs::write(repo.join(".git/info/exclude"), "origin.git/\n").unwrap();
+        assert_eq!(
+            commit_all_on(&runner, repo, "  "),
+            Err("Write a commit message first".to_owned())
+        );
+        assert_eq!(
+            commit_all_on(&runner, repo, "wip"),
+            Err("Nothing to commit".to_owned())
+        );
+        std::fs::write(repo.join("b.txt"), "b\n").unwrap();
+        assert_eq!(
+            commit_all_on(&runner, repo, "wip"),
+            Ok("Committed 1 file".to_owned())
+        );
+        remote_on(&runner, repo, Remote::Push).unwrap();
+        let upstream = run(repo, &["rev-parse", "--abbrev-ref", "@{u}"]).unwrap();
+        assert_eq!(upstream.trim(), "origin/main");
+        assert!(remote_on(&runner, repo, Remote::Pull).is_ok());
+        assert_eq!(
+            update_from_on(&runner, repo, "main"),
+            Ok("main already has everything on main".to_owned())
+        );
     }
 
     /// A repository on `branch` with one commit, and `others` branched

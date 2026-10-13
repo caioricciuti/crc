@@ -11,8 +11,9 @@ One entry per tag, written for people who use the editor.
   folder. Its repositories and worktrees are listed like a local
   workspace's (branch, last commit, ahead, merged), read over `ssh` in
   the background without ever prompting; a host that does not answer
-  says so and keeps the rows it had. Read only for now: no commit, push,
-  worktrees or Review over `ssh` yet.
+  says so and keeps the rows it had. Its inspector shows the same Git
+  cards as a local one, and Commit All, Pull, Push and Merge base In run
+  on the host. Not yet over `ssh`: new worktrees, pull requests, Review.
 - Agents mode no longer stalls while agents write: counting the files to
   review read every checkpoint on the main thread, which with a large
   review history held the window for seconds. The count now reads one

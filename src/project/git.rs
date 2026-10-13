@@ -1221,6 +1221,39 @@ impl Remote {
     }
 }
 
+/// The arguments for Git that do `what` on the branch checked out
+/// (`branch`, `None` when HEAD is detached), which has an upstream or not.
+/// A push without one goes to `origin` and tracks it, when `origin` says
+/// there is one; a pull without one is refused.
+pub fn remote_args(
+    what: Remote,
+    branch: Option<&str>,
+    upstream: bool,
+    origin: impl FnOnce() -> bool,
+) -> Result<Vec<String>, String> {
+    let mut args: Vec<String> = match what {
+        Remote::Fetch => vec!["fetch".into(), "--prune".into()],
+        Remote::Pull => vec!["pull".into(), "--ff-only".into()],
+        Remote::PullRebase => vec!["pull".into(), "--rebase".into()],
+        Remote::PullMerge => vec!["pull".into(), "--no-rebase".into(), "--no-edit".into()],
+        Remote::Push => vec!["push".into()],
+    };
+    if what == Remote::Push && !upstream {
+        let Some(branch) = branch else {
+            return Err("not on a branch: nothing to push".into());
+        };
+        if !origin() {
+            return Err("this branch has no upstream and there is no origin remote".into());
+        }
+        args.extend(["--set-upstream".into(), "origin".into(), branch.to_owned()]);
+    }
+    let pull = matches!(what, Remote::Pull | Remote::PullRebase | Remote::PullMerge);
+    if pull && !upstream {
+        return Err("this branch has no upstream to pull from".into());
+    }
+    Ok(args)
+}
+
 /// How long a remote command may take before it is stopped.
 const REMOTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
@@ -1238,30 +1271,12 @@ pub fn remote(root: &Path, what: Remote, ssh_auth_sock: Option<&Path>) -> Result
         &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
     )
     .is_ok();
-    let mut args: Vec<String> = match what {
-        Remote::Fetch => vec!["fetch".into(), "--prune".into()],
-        Remote::Pull => vec!["pull".into(), "--ff-only".into()],
-        Remote::PullRebase => vec!["pull".into(), "--rebase".into()],
-        Remote::PullMerge => vec!["pull".into(), "--no-rebase".into(), "--no-edit".into()],
-        Remote::Push => vec!["push".into()],
-    };
-    if what == Remote::Push && !upstream {
-        let Some(branch) = &branch else {
-            return Err("not on a branch: nothing to push".into());
-        };
+    let args = remote_args(what, branch.as_deref(), upstream, || {
         let remotes = run(root, &["remote"]).unwrap_or_default();
-        if !String::from_utf8_lossy(&remotes)
+        String::from_utf8_lossy(&remotes)
             .lines()
             .any(|r| r == "origin")
-        {
-            return Err("this branch has no upstream and there is no origin remote".into());
-        }
-        args.extend(["--set-upstream".into(), "origin".into(), branch.clone()]);
-    }
-    let pull = matches!(what, Remote::Pull | Remote::PullRebase | Remote::PullMerge);
-    if pull && !upstream {
-        return Err("this branch has no upstream to pull from".into());
-    }
+    })?;
     let mut cmd = command(root);
     cmd.args(&args)
         .stdin(Stdio::null())

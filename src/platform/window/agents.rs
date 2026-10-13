@@ -585,10 +585,8 @@ impl EditorView {
     }
 
     /// The inspector's Open on a worktree: its row, as a click on it.
-    pub(super) fn open_worktree(&self, path: &Path) {
-        let index = self
-            .state()
-            .and_then(|state| state.agents.by_id(&path.to_string_lossy()));
+    pub(super) fn open_worktree(&self, id: &str) {
+        let index = self.state().and_then(|state| state.agents.by_id(id));
         if let Some(index) = index {
             self.select_task(index);
         }
@@ -596,9 +594,9 @@ impl EditorView {
 
     /// The inspector's Terminal on a worktree: a new shell in it, which
     /// selects it, as Command-T does for the selected workspace.
-    pub(super) fn worktree_terminal(&self, path: &Path) {
+    pub(super) fn worktree_terminal(&self, id: &str) {
         let found = self.state_mut().and_then(|mut state| {
-            let index = state.agents.by_id(&path.to_string_lossy())?;
+            let index = state.agents.by_id(id)?;
             state.agents.select(index);
             Some(state.agents.tasks[index].path.clone())
         });
@@ -1079,8 +1077,9 @@ impl EditorView {
         let add = |title: &str, action: Sel| menu.addItem(&menu_item(mtm, title, action));
         add("New Terminal", sel!(agentNewShell:));
         add("New Claude Session", sel!(agentNewClaude:));
-        // A remote workspace's folder is on its host, not for the editor,
-        // and its Git is only read: nothing is changed there from here.
+        // A remote workspace's folder is on its host, not for the editor.
+        // Of its Git, only commit, pull, push and taking the base's commits
+        // are done there from here.
         if !remote {
             add("Open in Editor", sel!(agentOpenInEditor:));
         }
@@ -1109,18 +1108,18 @@ impl EditorView {
             }
             add("Remove Workspace\u{2026}", sel!(agentRemoveWorkspace:));
         }
-        if !folder && !remote {
+        if !folder {
             menu.addItem(&NSMenuItem::separatorItem(mtm));
             add("Commit All\u{2026}", sel!(agentCommitAll:));
             add("Pull", sel!(agentPull:));
             add("Push", sel!(agentPush:));
         }
-        if !main
-            && !remote
-            && let Some(branch) = branch
-        {
+        if !main && let Some(branch) = branch {
             let into = base.unwrap_or_else(|| "the main checkout".into());
             add(&format!("Merge {into} In"), sel!(agentUpdateFromBase:));
+            if remote {
+                return menu;
+            }
             menu.addItem(&NSMenuItem::separatorItem(mtm));
             add(&format!("Merge {branch} into {into}"), sel!(agentMerge:));
             match pr {

@@ -29,7 +29,8 @@ impl EditorView {
             return;
         };
         let (action, repo) = action;
-        // A worktree strip's buttons act on that worktree's workspace.
+        // A worktree strip's buttons act on that worktree's workspace: one
+        // on the host of the workspace shown, when it is remote.
         if let (
             Action::OpenWorktree
             | Action::WorktreeTerminal
@@ -38,11 +39,20 @@ impl EditorView {
             Some(path),
         ) = (action, &repo)
         {
+            let host = self.state().and_then(|state| {
+                let i = state.agents.selected_index()?;
+                state.agents.tasks[i].host.clone()
+            });
+            let id = match &host {
+                Some(host) => format!("{host}:{}", path.display()),
+                None => path.to_string_lossy().into_owned(),
+            };
             match action {
-                Action::OpenWorktree => self.open_worktree(path),
-                Action::ReviewWorktree => self.review_worktree(path),
-                Action::CleanUpWorktree => self.clean_up_worktree(path),
-                _ => self.worktree_terminal(path),
+                Action::OpenWorktree => self.open_worktree(&id),
+                Action::ReviewWorktree if host.is_none() => self.review_worktree(path),
+                Action::CleanUpWorktree if host.is_none() => self.clean_up_worktree(path),
+                Action::ReviewWorktree | Action::CleanUpWorktree => {}
+                _ => self.worktree_terminal(&id),
             }
             self.request_redraw();
             self.pump();
@@ -102,10 +112,6 @@ impl EditorView {
         else {
             return;
         };
-        // A remote workspace's Git is on its host: nothing to read here.
-        if task.host.is_some() {
-            return;
-        }
         let Some(repos) = state.agents.repos_of(&task) else {
             return;
         };
@@ -115,7 +121,7 @@ impl EditorView {
         let strips: Vec<_> = if task.folder {
             state
                 .agents
-                .worktrees_of(&repos)
+                .worktrees_of(task.host.as_deref(), &repos)
                 .into_iter()
                 .map(|w| (w.path, w.base, false))
                 .collect()
@@ -127,7 +133,8 @@ impl EditorView {
             .map(|path| (path, task.base.clone(), task.folder))
             .chain(strips)
             .collect();
-        state.agents.inspector.want(&wanted);
+        // A remote workspace's are read on its host, over ssh.
+        state.agents.inspector.want(task.host.as_deref(), &wanted);
     }
 
     /// Schedules the quick look at the terminals, once: a session that
@@ -315,12 +322,26 @@ impl EditorView {
         }
     }
 
-    /// Pull (fast-forward only) or push, the way Source Control does them.
+    /// The host of the menu's workspace, when it is remote: its Git
+    /// operations run there, over ssh.
+    fn menu_host(&self) -> Option<String> {
+        self.menu_task().and_then(|t| t.host)
+    }
+
+    /// Pull (fast-forward only) or push, the way Source Control does them;
+    /// on a remote workspace's host, with the same flags.
     pub(super) fn agent_remote(&self, what: crate::project::git::Remote) {
         let sock = self.state().and_then(|state| state.ssh_auth_sock.clone());
+        let host = self.menu_host();
         self.agent_operation(
             |t| format!("{} {}\u{2026}", what.verb(), t.name()),
-            move |path| crate::project::git::remote(&path, what, sock.as_deref()),
+            move |path| match host {
+                Some(host) => {
+                    let runner = crate::platform::agents::runner(Some(&host));
+                    crate::project::worktree::remote_on(&runner, &path, what)
+                }
+                None => crate::project::git::remote(&path, what, sock.as_deref()),
+            },
         );
     }
 
@@ -330,9 +351,13 @@ impl EditorView {
             return;
         };
         let doing = format!("Merging {base}\u{2026}");
+        let host = self.menu_host();
         self.agent_operation(
             |_| doing,
-            move |path| crate::project::worktree::update_from(&path, &base),
+            move |path| {
+                let runner = crate::platform::agents::runner(host.as_deref());
+                crate::project::worktree::update_from_on(&runner, &path, &base)
+            },
         );
     }
 
@@ -356,9 +381,16 @@ impl EditorView {
 
     /// The palette's answer: stage everything and commit it.
     pub(super) fn agent_commit_all(&self, message: String) {
+        let host = self.menu_host();
         self.agent_operation(
             |t| format!("Committing in {}\u{2026}", t.name()),
-            move |path| crate::project::worktree::commit_all(&path, &message),
+            move |path| match host {
+                Some(host) => {
+                    let runner = crate::platform::agents::runner(Some(&host));
+                    crate::project::worktree::commit_all_on(&runner, &path, &message)
+                }
+                None => crate::project::worktree::commit_all(&path, &message),
+            },
         );
     }
 

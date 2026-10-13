@@ -94,12 +94,14 @@ pub struct Inspector {
     pub hidden: bool,
     /// The last statuses read, per repository.
     pub status: Vec<Read>,
-    /// The repositories the statuses are for, in order.
+    /// The repositories the statuses are for, in order, and the host they
+    /// are on (`None` for this Mac).
     read_for: Vec<PathBuf>,
+    read_host: Option<String>,
     read_at: Option<Instant>,
-    rx: Option<mpsc::Receiver<Vec<Read>>>,
-    /// The repositories being read.
-    reading: Option<Vec<PathBuf>>,
+    rx: Option<mpsc::Receiver<(Option<String>, Vec<Read>)>>,
+    /// The repositories being read, and their host.
+    reading: Option<(Option<String>, Vec<PathBuf>)>,
     /// Each button, with the repository it acts on.
     pub hits: Vec<(Viewport, Action, Option<PathBuf>)>,
     /// How far the body is scrolled, and how far it can be, in points.
@@ -117,30 +119,42 @@ pub struct Inspector {
 
 impl Inspector {
     /// Reads each repository's status on a worker, unless fresh ones are in
-    /// hand or on their way.
-    pub fn want(&mut self, wanted: &[Want]) {
+    /// hand or on their way: on `host` over ssh, a call per repository, or
+    /// on this Mac for `None`.
+    pub fn want(&mut self, host: Option<&str>, wanted: &[Want]) {
         let paths: Vec<PathBuf> = wanted.iter().map(|w| w.0.clone()).collect();
-        let have = self.read_for == paths && self.read_at.is_some_and(|at| at.elapsed() < STALE);
-        if have || self.reading.as_ref() == Some(&paths) {
+        let host = host.map(str::to_owned);
+        let same = self.read_for == paths && self.read_host == host;
+        let have = same && self.read_at.is_some_and(|at| at.elapsed() < STALE);
+        let key = (host.clone(), paths.clone());
+        if have || self.reading.as_ref() == Some(&key) {
             return;
+        }
+        // Another machine's paths are other folders, even named the same.
+        if self.read_host != host {
+            self.status.clear();
+            self.read_for.clear();
+            self.read_host.clone_from(&host);
         }
         let (tx, rx) = mpsc::channel();
         let wanted = wanted.to_vec();
         std::thread::spawn(move || {
+            let runner = crate::platform::agents::runner(host.as_deref());
             let read = wanted
                 .into_iter()
                 .map(|(dir, base, tags)| {
-                    let status = crate::project::worktree::status(&dir, base.as_deref(), tags);
+                    let status =
+                        crate::project::worktree::status_on(&runner, &dir, base.as_deref(), tags);
                     (dir, status)
                 })
                 .collect();
-            let _ = tx.send(read);
+            let _ = tx.send((host, read));
         });
-        if self.read_for != paths {
+        if !same {
             self.scroll = 0.0;
         }
         self.rx = Some(rx);
-        self.reading = Some(paths);
+        self.reading = Some(key);
     }
 
     /// The next read reads again, now.
@@ -154,10 +168,11 @@ impl Inspector {
             return false;
         };
         match rx.try_recv() {
-            Ok(read) => {
+            Ok((host, read)) => {
                 // A read for a workspace no longer selected still counts:
                 // the next `want` reads the one that is.
                 self.read_for = read.iter().map(|(p, _)| p.clone()).collect();
+                self.read_host = host;
                 self.status = read;
                 self.read_at = Some(Instant::now());
             }
@@ -219,15 +234,23 @@ impl Inspector {
         if let Some(login) = &self.shown_remote {
             return format!("ssh={login}");
         }
-        if let Some(at) = &self.shown_host {
-            return format!("remote={at}");
-        }
+        // A remote workspace: where it is, then its Git as a local one's.
+        let at = self.shown_host.as_ref().map(|at| format!("remote={at}"));
         let Some(repos) = repos else {
-            return "-".into();
+            return at.unwrap_or_else(|| "-".into());
         };
         if repos.is_empty() {
-            return "none".into();
+            return at.unwrap_or_else(|| "none".into());
         }
+        let local = self.report_repos(repos);
+        match at {
+            Some(at) => format!("{at} {local}"),
+            None => local,
+        }
+    }
+
+    /// [`Inspector::report`] for the repositories shown.
+    fn report_repos(&self, repos: &[PathBuf]) -> String {
         let one = |path: &Path| {
             let status = match self.status_of(path) {
                 None => "reading".to_owned(),
@@ -468,8 +491,8 @@ impl Inspector {
             card(out, atlas, x, y, width, &facts, theme);
             return;
         }
-        // A remote workspace: where its terminals go. Its Git is on the
-        // host, and not read from here.
+        // A remote workspace: where its terminals go, then its Git as a
+        // local one's, read on the host.
         if let Some(host) = &workspace.host {
             text(out, atlas, x, y, width, "REMOTE FOLDER", theme.status_text);
             y += ROW;
@@ -485,8 +508,7 @@ impl Inspector {
                 facts.push(("Branch", vec![(branch.clone(), theme.text)]));
             }
             facts.push(("Over", vec![("ssh".to_owned(), theme.gutter_text)]));
-            card(out, atlas, x, y, width, &facts, theme);
-            return;
+            y = card(out, atlas, x, y, width, &facts, theme) + 14.0;
         }
         let skeleton = |out: &mut Vec<GlyphInstance>, y: f32, rows: usize| {
             for n in 0..rows {
@@ -558,8 +580,13 @@ impl Inspector {
                     skeleton(out, y, 3);
                     y += 3.0 * ROW + 10.0;
                 }
-                Some(Err(_)) => {
-                    note(out, atlas, x, y, width, "Not a Git repository", theme);
+                Some(Err(e)) => {
+                    let why = if e == crate::project::worktree::UNREACHABLE {
+                        "Host unreachable"
+                    } else {
+                        "Not a Git repository"
+                    };
+                    note(out, atlas, x, y, width, why, theme);
                     y += ROW;
                 }
                 Some(Ok(status)) => {
@@ -844,20 +871,25 @@ impl Inspector {
                 Some(base) => format!("Changes on this branch since {base}, uncommitted included"),
                 None => "Changes on this branch, uncommitted included".to_owned(),
             };
-            let first = if merged {
-                (
-                    "Clean up",
-                    Action::CleanUpWorktree,
-                    "Remove this merged worktree and its branch".to_owned(),
-                )
-            } else {
-                (
-                    "Terminal",
-                    Action::WorktreeTerminal,
-                    "Start a shell in this worktree".to_owned(),
-                )
+            let terminal = (
+                "Terminal",
+                Action::WorktreeTerminal,
+                "Start a shell in this worktree".to_owned(),
+            );
+            // A host's worktree is not reviewed or removed from here.
+            let buttons = match (merged, tree.host.is_some()) {
+                (_, true) => vec![terminal],
+                (true, false) => vec![
+                    (
+                        "Clean up",
+                        Action::CleanUpWorktree,
+                        "Remove this merged worktree and its branch".to_owned(),
+                    ),
+                    ("Review", Action::ReviewWorktree, review_tip),
+                ],
+                (false, false) => vec![terminal, ("Review", Action::ReviewWorktree, review_tip)],
             };
-            for (label, action, tip) in [first, ("Review", Action::ReviewWorktree, review_tip)] {
+            for (label, action, tip) in buttons {
                 let probe = layout::Button::new(Viewport {
                     x: 0.0,
                     y: 0.0,

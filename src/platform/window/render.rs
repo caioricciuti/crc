@@ -718,10 +718,11 @@ impl EditorView {
             );
             if let Some(rect) = inspector_rect {
                 let selected = agents.selected_index().map(|i| agents.tasks[i].clone());
-                // A pull request is a worktree branch's, once its row is read.
+                // A pull request is a worktree branch's, once its row is read;
+                // a host's are not asked about.
                 let pull_request = selected
                     .as_ref()
-                    .filter(|w| !w.main && !w.folder && w.branch.is_some())
+                    .filter(|w| !w.main && !w.folder && w.branch.is_some() && w.host.is_none())
                     .and_then(|w| agents.info.get(&w.path))
                     .map(|info| info.pull_request.clone());
                 let github = agents.github.unwrap_or(false);
@@ -729,7 +730,7 @@ impl EditorView {
                 // A folder workspace's repositories' worktrees, a strip each.
                 let worktrees: Vec<_> = match (&selected, &repos) {
                     (Some(w), Some(repos)) if w.folder => agents
-                        .worktrees_of(repos)
+                        .worktrees_of(w.host.as_deref(), repos)
                         .into_iter()
                         .map(|t| {
                             let title = agents.title(&t);
@@ -741,8 +742,11 @@ impl EditorView {
                     _ => Vec::new(),
                 };
                 // The terminal showing, when it is this workspace's and in ssh.
+                // A remote workspace's is ssh by design (a ProxyCommand's ssh
+                // under it would read as one): its own card and Git show.
                 let remote = terminal_panel
                     .active_tab()
+                    .filter(|_| selected.as_ref().is_none_or(|w| w.host.is_none()))
                     .filter(|t| {
                         crate::platform::agents::task_of(&agents.tasks, t)
                             == agents.selected_index()

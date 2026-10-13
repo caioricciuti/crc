@@ -263,9 +263,9 @@ fn discover_on(runner: &Runner, dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(found)
 }
 
-/// How the Git of a folder workspace on `host` (this Mac's for `None`) is
-/// read.
-fn runner(host: Option<&str>) -> Runner {
+/// How the Git of a workspace on `host` (this Mac's for `None`) is read
+/// and run.
+pub fn runner(host: Option<&str>) -> Runner {
     match host {
         None => Runner::Local,
         Some(host) => Runner::Ssh {
@@ -1967,23 +1967,23 @@ impl Panel {
     }
 
     /// The repositories a workspace's inspector shows: a worktree's own
-    /// folder, or the ones found in a folder workspace (`None` until read);
-    /// none for a remote one, whose Git is not read.
+    /// folder, or the ones found in a folder workspace (`None` until read).
+    /// A remote workspace's are paths on its host.
     pub fn repos_of(&self, workspace: &Workspace) -> Option<Vec<PathBuf>> {
-        if workspace.host.is_some() {
-            Some(Vec::new())
-        } else if workspace.folder {
+        if workspace.folder {
             self.repos.get(&workspace.id()).cloned()
         } else {
             Some(vec![workspace.path.clone()])
         }
     }
 
-    /// The worktree workspaces of `repos`, in the list's order.
-    pub fn worktrees_of(&self, repos: &[PathBuf]) -> Vec<Workspace> {
+    /// The worktree workspaces of `repos` on `host` (this Mac's for
+    /// `None`), in the list's order.
+    pub fn worktrees_of(&self, host: Option<&str>, repos: &[PathBuf]) -> Vec<Workspace> {
         self.tasks
             .iter()
-            .filter(|t| !t.folder && t.repo.as_ref().is_some_and(|r| repos.contains(r)))
+            .filter(|t| !t.folder && t.host.as_deref() == host)
+            .filter(|t| t.repo.as_ref().is_some_and(|r| repos.contains(r)))
             .cloned()
             .collect()
     }
@@ -2003,6 +2003,10 @@ impl Panel {
     /// the first one in the selected folder workspace.
     pub fn task_repo(&self) -> Option<PathBuf> {
         let task = &self.tasks[self.selected_index()?];
+        // Branches are not made on a host from here.
+        if task.host.is_some() {
+            return None;
+        }
         match &task.repo {
             Some(repo) => Some(repo.clone()),
             None => self.repos_of(task)?.into_iter().next(),
@@ -3287,7 +3291,8 @@ mod tests {
             selected: Some("folder:app".into()),
             ..Panel::default()
         };
-        assert_eq!(panel.repos_of(&panel.tasks[0]), Some(Vec::new()));
+        // Its repositories are its host's, unknown until they are read.
+        assert_eq!(panel.repos_of(&panel.tasks[0]), None);
         assert_eq!(
             panel.new_folder(Some(Path::new("/e"))),
             Some(PathBuf::from("/e"))
