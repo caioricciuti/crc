@@ -263,7 +263,8 @@ impl EditorView {
         cwd: Option<&Path>,
         into: Option<String>,
     ) {
-        self.say_if_replaced();
+        // Every new terminal says it: one opened later fails the same way.
+        self.say_if_replaced(true);
         // In Agents mode a session started in the selected workspace's
         // folder (or in no particular one) belongs to that workspace.
         let workspace = {

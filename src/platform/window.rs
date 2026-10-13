@@ -4521,7 +4521,7 @@ define_class!(
         #[unsafe(method(windowDidBecomeKey:))]
         fn window_did_become_key(&self, _notification: &NSNotification) {
             self.check_open_files();
-            self.say_if_replaced();
+            self.say_if_replaced(false);
             if let Some(mut state) = self.state_mut() {
                 state.caret_since = Instant::now();
             }
@@ -4809,20 +4809,21 @@ impl EditorView {
         }
     }
 
-    /// Says, once, that crc was installed again under this running copy,
-    /// and how to get its permissions back. Returns whether it was.
-    pub(super) fn say_if_replaced(&self) -> bool {
+    /// Says that crc was installed again under this running copy, and how
+    /// to get its permissions back: once on focus, `again` for each new
+    /// terminal. Returns whether it was.
+    pub(super) fn say_if_replaced(&self, again: bool) -> bool {
         if !crate::platform::update::replaced() {
             return false;
         }
         if let Some(mut state) = self.state_mut()
-            && !state.replaced_said
+            && (again || !state.replaced_said)
         {
             state.replaced_said = true;
             state.say(
                 layout::Feedback::Failure,
                 "crc was reinstalled while open: until Help > Restart to Update, macOS withholds its \
-                 permissions (microphone, SSH keys) from new terminals",
+                 permissions from its terminals, so git commit signing, SSH keys and the microphone fail",
             );
         }
         self.request_redraw();
