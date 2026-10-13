@@ -1479,9 +1479,12 @@ pub fn toolbar_search(rect: Viewport) -> Viewport {
     }
 }
 
+/// `inspector`: in Agents mode, whether the workspace inspector shows
+/// (its button takes the Terminal button's place); `None` in the editor.
 pub fn build_toolbar(
     tree: &Tree,
     agents: bool,
+    inspector: Option<bool>,
     atlas: &mut Atlas,
     rect: Viewport,
     theme: &Theme,
@@ -1588,6 +1591,16 @@ pub fn build_toolbar(
             .icon(icons::TERMINAL)
             .tone(Tone::Ghost)
             .tip("Terminal  \u{2303}`")
+            .draw(out, atlas, theme);
+    }
+    if terminal.width > 0.0
+        && let Some(shown) = inspector.filter(|_| agents)
+    {
+        Button::new(terminal)
+            .icon(icons::SIDEBAR_RIGHT)
+            .tone(Tone::Ghost)
+            .on(shown)
+            .tip("Show or Hide the Workspace Inspector  \u{2325}\u{2318}I")
             .draw(out, atlas, theme);
     }
     // The finder reads as a field: a search glyph, the prompt, the key.
@@ -2881,6 +2894,8 @@ pub enum Hit {
     ToolbarSearch,
     /// Shows or hides the terminal panel.
     ToolbarTerminal,
+    /// Shows or hides the workspace inspector, in Agents mode.
+    ToolbarInspector,
     /// The Editor (`false`) or Agents (`true`) half of the mode switch.
     ToolbarMode(bool),
     /// The grab band on the terminal panel's top edge.
@@ -2954,6 +2969,7 @@ impl Hit {
             Hit::ToolbarProject => "toolbar.project".into(),
             Hit::ToolbarSearch => "toolbar.search".into(),
             Hit::ToolbarTerminal => "toolbar.terminal".into(),
+            Hit::ToolbarInspector => "toolbar.inspector".into(),
             Hit::ToolbarMode(agents) => if *agents {
                 "toolbar.agents"
             } else {

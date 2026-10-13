@@ -50,6 +50,7 @@ pub const PASS: char = '\u{eba4}'; // cod-pass
 pub const SPLIT: char = '\u{eb56}'; // cod-split_horizontal
 pub const EDIT: char = '\u{ea73}'; // cod-edit
 pub const SIDEBAR_LEFT: char = '\u{ebf3}'; // cod-layout_sidebar_left
+pub const SIDEBAR_RIGHT: char = '\u{ebf4}'; // cod-layout_sidebar_right
 
 pub const CHEVRON_RIGHT: char = '\u{eab6}'; // cod-chevron_right
 pub const CHEVRON_DOWN: char = '\u{eab4}'; // cod-chevron_down

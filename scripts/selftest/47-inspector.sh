@@ -58,6 +58,12 @@ dump $T/inspector-pushed.out
 key 34 cmd,opt i
 wait 300
 dump $T/inspector-hidden.out
+click @toolbar.inspector
+wait 300
+dump $T/inspector-button-shown.out
+click @toolbar.inspector
+wait 300
+dump $T/inspector-button-hidden.out
 quit
 SCRIPT
 # The list is one for the app, kept under HOME: this scenario has its own.
@@ -90,6 +96,9 @@ git -C "$O" rev-parse -q --verify refs/heads/feat >/dev/null \
     || failed "inspector: Push did not put feat on origin"
 # Cmd-Option-I hides it; the terminal takes the room back.
 expect "$T/inspector-hidden.out" inspector "hidden"
+# The toolbar's inspector button brings it back, and hides it again.
+expect_prefix "$T/inspector-button-shown.out" inspector "branch=feat "
+expect "$T/inspector-button-hidden.out" inspector "hidden"
 
 # Someone else pushes to feat; the next launch has it to pull.
 git clone -q -b feat "$O" "$T/inspect-other"

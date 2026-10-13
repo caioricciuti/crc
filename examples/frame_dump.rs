@@ -365,6 +365,7 @@ fn main() -> std::io::Result<()> {
     layout::build_toolbar(
         &tree,
         false,
+        None,
         &mut renderer.atlas,
         chrome.toolbar,
         &theme,
@@ -408,6 +409,7 @@ fn main() -> std::io::Result<()> {
         layout::build_toolbar(
             &tree,
             false,
+            None,
             &mut renderer.atlas,
             chrome.toolbar,
             &theme,
@@ -660,6 +662,7 @@ fn main() -> std::io::Result<()> {
         layout::build_toolbar(
             &tree,
             false,
+            None,
             &mut renderer.atlas,
             chrome.toolbar,
             &theme,

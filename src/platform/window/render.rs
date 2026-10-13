@@ -541,6 +541,7 @@ impl EditorView {
         layout::build_toolbar(
             tree,
             agents.on,
+            agents.on.then_some(!agents.inspector.hidden),
             &mut renderer.atlas,
             toolbar_rect,
             theme,

@@ -1755,6 +1755,10 @@ define_class!(
                     let _: () = unsafe { msg_send![self, toggleTerminal: None::<&AnyObject>] };
                     return;
                 }
+                Some(Hit::ToolbarInspector) => {
+                    self.toggle_inspector();
+                    return;
+                }
                 Some(Hit::ToolbarMode(agents)) => {
                     self.set_agents_mode(agents);
                     return;
@@ -2315,6 +2319,7 @@ define_class!(
                         | Hit::ConflictResolve
                         | Hit::ConflictTake(..)
                         | Hit::ToolbarTerminal
+                        | Hit::ToolbarInspector
                         | Hit::TerminalTab(_)
                         | Hit::TerminalClose(_)
                         | Hit::TerminalNew
@@ -6784,6 +6789,9 @@ fn frame_of(state: &mut State) -> Frame {
     let terminal_button = layout::toolbar_terminal(chrome.toolbar);
     if terminal_button.width > 0.0 && !agents.on {
         frame.push(Hit::ToolbarTerminal, terminal_button);
+    }
+    if terminal_button.width > 0.0 && agents.on {
+        frame.push(Hit::ToolbarInspector, terminal_button);
     }
     // Before the editor's regions, which the band overlaps by half. In
     // Agents mode the terminal has the column and nothing to drag.
