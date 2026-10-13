@@ -60,12 +60,17 @@ struct Listing {
     host: Option<String>,
     repos: Vec<(String, Vec<PathBuf>)>,
     worktrees: Vec<Workspace>,
-    /// Per main checkout, the worktrees Git records whose folder is gone.
-    prunable: std::collections::HashMap<PathBuf, usize>,
+    /// Per main checkout (on the host read), the worktrees Git records
+    /// whose folder is gone.
+    prunable: Prunable,
     /// The remote folder workspaces, by id, whose host did not answer:
     /// what was last read of them stays.
     unreachable: Vec<String>,
 }
+
+/// Per main checkout, by host (`None` for this Mac) and path, how many
+/// worktrees Git records whose folder is gone.
+pub type Prunable = std::collections::HashMap<(Option<String>, PathBuf), usize>;
 
 /// A place to work: a folder, and the sessions started in it. A worktree
 /// of the open repository is one (named by its branch), and any folder
@@ -101,6 +106,10 @@ pub struct Workspace {
     /// or `user@host`): its path is on that host, its terminals open over
     /// ssh, and nothing of this Mac (Git, its folders) is read for it.
     pub host: Option<String>,
+    /// A worktree on a host: its repository on GitHub (`owner/name`), from
+    /// its `origin`, which `gh` here is told; `None` for one of this Mac's,
+    /// which `gh` asks in its folder, or one not on GitHub.
+    pub github: Option<String>,
 }
 
 impl Workspace {
@@ -117,6 +126,7 @@ impl Workspace {
             commit: None,
             merged: false,
             host: None,
+            github: None,
         }
     }
 
@@ -130,10 +140,8 @@ impl Workspace {
     pub fn id(&self) -> String {
         if self.folder {
             self.key.clone()
-        } else if let Some(host) = &self.host {
-            format!("{host}:{}", self.path.display())
         } else {
-            self.path.to_string_lossy().into_owned()
+            row_id(self.host.as_deref(), &self.path)
         }
     }
 
@@ -144,6 +152,15 @@ impl Workspace {
             branch: self.branch.clone(),
             main: self.main,
         })
+    }
+}
+
+/// A worktree's id (see [`Workspace::id`]): its path, on `host` as
+/// `host:path`.
+pub fn row_id(host: Option<&str>, path: &Path) -> String {
+    match host {
+        Some(host) => format!("{host}:{}", path.display()),
+        None => path.to_string_lossy().into_owned(),
     }
 }
 
@@ -238,7 +255,7 @@ pub fn discover_line(dir: &Path) -> String {
          git rev-parse --show-toplevel 2>/dev/null; \
          for d in */; do d=${{d%/}}; [ -e \"$d/.git\" ] || continue; \
          [ -f \"$d/.git\" ] && grep -q '^gitdir:.*/worktrees/' \"$d/.git\" && continue; \
-         printf '%s\\n' \"$PWD/$d\"; done",
+         printf '%s' \"$PWD/$d\"; echo; done",
         crate::platform::remote::shell_path(&dir.to_string_lossy())
     )
 }
@@ -319,8 +336,8 @@ fn scan(folders: &[(String, PathBuf)], host: Option<&str>) -> Listing {
             if let Some((main, rows, missing)) =
                 read_repo(&runner, repo, &mains, &read_mains, &worktrees, &read)?
             {
-                if missing > 0 && host.is_none() {
-                    prunable.insert(main.clone(), missing);
+                if missing > 0 {
+                    prunable.insert((host.map(str::to_owned), main.clone()), missing);
                 }
                 read_mains.push(main);
                 read.extend(rows);
@@ -390,10 +407,18 @@ fn read_repo(
         Err(e) if lost(&e) => return Err(e),
         read => read.unwrap_or_default(),
     };
-    let base = match git::default_branch_on(runner, &main.path, &tips, main.branch.as_deref()) {
+    // A host's repository's origin too: `gh` runs here, told its name.
+    let (base, origin) = match git::default_and_origin_on(
+        runner,
+        &main.path,
+        &tips,
+        main.branch.as_deref(),
+        host.is_some(),
+    ) {
         Err(e) if lost(&e) => return Err(e),
-        read => read.ok().flatten(),
+        read => read.unwrap_or_default(),
     };
+    let github = origin.as_deref().and_then(git::github_repo);
     let merged = match base
         .as_deref()
         .map(|b| git::merged_on(runner, &main.path, b))
@@ -440,6 +465,7 @@ fn read_repo(
             workspace.commit = commit;
             workspace.merged = merged;
             workspace.host = host.clone();
+            workspace.github = github.clone();
             workspace
         })
         .collect();
@@ -608,6 +634,7 @@ fn parse_folders(text: &str) -> Vec<Workspace> {
             commit: None,
             merged: false,
             host,
+            github: None,
         })
         .collect()
 }
@@ -944,28 +971,29 @@ pub struct Panel {
     /// The remote folder workspaces, by id, whose host did not answer the
     /// last read.
     pub unreachable: std::collections::HashSet<String>,
-    /// Per task path, once read.
-    pub info: std::collections::HashMap<PathBuf, Info>,
+    /// Per worktree, by [`Workspace::id`] (a host's are `host:path`, never
+    /// taken for one of this Mac's at the same path), once read.
+    pub info: std::collections::HashMap<String, Info>,
     /// Per main checkout, the worktrees Git records whose folder is gone.
-    pub prunable: std::collections::HashMap<PathBuf, usize>,
-    /// Per worktree path, its commits ahead, from the list's read.
-    info_rx: Option<mpsc::Receiver<(PathBuf, usize)>>,
+    pub prunable: Prunable,
+    /// Per worktree id, its commits ahead, from the list's read.
+    info_rx: Option<mpsc::Receiver<(String, usize)>>,
     /// The pull request reads, one `gh` after another on one worker.
-    pr_rx: Option<mpsc::Receiver<(PathBuf, PullRequestAnswer)>>,
-    /// Rows asked for while a read ran, read after it.
-    pr_wanted: Vec<PathBuf>,
-    /// Per worktree path, when `gh` last answered about its pull request.
-    pr_read: std::collections::HashMap<PathBuf, std::time::Instant>,
+    pr_rx: Option<mpsc::Receiver<(String, PullRequestAnswer)>>,
+    /// Rows asked for while a read ran, read after it, by id.
+    pr_wanted: Vec<String>,
+    /// Per worktree id, when `gh` last answered about its pull request.
+    pr_read: std::collections::HashMap<String, std::time::Instant>,
     /// A watcher per main checkout's Git directory, for pushes, and the
     /// main checkouts they are for.
     pub ref_watchers: Vec<crate::project::watch::Watcher>,
     pub ref_watched: Vec<PathBuf>,
-    /// Worktrees whose branch was just pushed, by when: their pull
+    /// Worktrees (by id) whose branch was just pushed, by when: their pull
     /// request is read once the push has settled.
-    pub pushed: std::collections::HashMap<PathBuf, std::time::Instant>,
-    /// The worktree a pull request operation runs on: its pull request is
-    /// read again when the operation answers.
-    pub pr_after: Option<PathBuf>,
+    pub pushed: std::collections::HashMap<String, std::time::Instant>,
+    /// The worktree (by id) a pull request operation or a push runs on:
+    /// its pull request is read again when the operation answers.
+    pub pr_after: Option<String>,
     /// Per session (by its review folder), what its team hooks said.
     pub teams: std::collections::HashMap<PathBuf, Team>,
     /// Per worktree path, when a file in it was last written this run: by
@@ -1004,11 +1032,11 @@ pub struct Panel {
     pub hits: Vec<(Viewport, Action)>,
 }
 
-/// A task operation that worked: what to say, and a folder to start Claude
-/// in (a new task's).
+/// A task operation that worked: what to say, and a folder to start a
+/// terminal in (a new task's), with its host when it is on one.
 pub struct Done {
     pub said: String,
-    pub start_in: Option<PathBuf>,
+    pub start_in: Option<(Option<String>, PathBuf)>,
 }
 
 impl Panel {
@@ -1169,10 +1197,10 @@ impl Panel {
                     }
                 }
                 for (main, base) in repos {
-                    let rows: Vec<(&PathBuf, String)> = tasks
+                    let rows: Vec<(String, String)> = tasks
                         .iter()
                         .filter(|t| t.repo.as_ref() == Some(&main))
-                        .filter_map(|t| Some((&t.path, t.branch.clone()?)))
+                        .filter_map(|t| Some((t.id(), t.branch.clone()?)))
                         .collect();
                     let branches: Vec<String> = rows.iter().map(|(_, b)| b.clone()).collect();
                     // A host that does not answer keeps the counts it had.
@@ -1184,8 +1212,8 @@ impl Panel {
                     ) else {
                         continue;
                     };
-                    for ((path, _), ahead) in rows.into_iter().zip(aheads) {
-                        if info_tx.send((path.clone(), ahead)).is_err() {
+                    for ((id, _), ahead) in rows.into_iter().zip(aheads) {
+                        if info_tx.send((id, ahead)).is_err() {
                             return;
                         }
                     }
@@ -1207,11 +1235,12 @@ impl Panel {
     }
 
     /// The worktrees with a branch, whose pull requests can be read: this
-    /// Mac's, as `gh` runs here.
+    /// Mac's, and a host's whose origin is on GitHub (`gh` runs here,
+    /// told the repository).
     fn pr_rows(&self) -> impl Iterator<Item = &Workspace> {
-        self.worktrees
-            .iter()
-            .filter(|w| w.branch.is_some() && w.repo.is_some() && w.host.is_none())
+        self.worktrees.iter().filter(|w| {
+            w.branch.is_some() && w.repo.is_some() && (w.host.is_none() || w.github.is_some())
+        })
     }
 
     /// Reads the pull requests that are due (see [`pr_due`]), when no read
@@ -1224,49 +1253,50 @@ impl Panel {
         let wait = override_wait.unwrap_or_else(|| {
             pr_wait(
                 self.pr_rows()
-                    .filter_map(|w| self.info.get(&w.path)?.pull_request.as_ref()),
+                    .filter_map(|w| self.info.get(&w.id())?.pull_request.as_ref()),
             )
         });
-        let due: Vec<PathBuf> = self
+        let due: Vec<String> = self
             .pr_rows()
             .filter(|w| {
-                let pr = self.info.get(&w.path).and_then(|i| i.pull_request.as_ref());
-                let since = self.pr_read.get(&w.path).map(|at| at.elapsed());
+                let id = w.id();
+                let pr = self.info.get(&id).and_then(|i| i.pull_request.as_ref());
+                let since = self.pr_read.get(&id).map(|at| at.elapsed());
                 pr_due(pr, since, wait)
             })
-            .map(|w| w.path.clone())
+            .map(Workspace::id)
             .collect();
         self.read_pull_requests(due);
     }
 
     /// Reads every row's pull request again: Refresh, asked for.
     pub fn refresh_all_pull_requests(&mut self) {
-        let all = self.pr_rows().map(|w| w.path.clone()).collect();
+        let all = self.pr_rows().map(Workspace::id).collect();
         self.read_pull_requests(all);
     }
 
-    /// Reads the pull request of the worktree at `path` again soon: after
-    /// it was pushed, or a pull request operation on it answered.
-    pub fn refresh_pull_request(&mut self, path: &Path) {
-        self.read_pull_requests(vec![path.to_path_buf()]);
+    /// Reads the pull request of the worktree `id` again soon: after it
+    /// was pushed, or a pull request operation on it answered.
+    pub fn refresh_pull_request(&mut self, id: &str) {
+        self.read_pull_requests(vec![id.to_owned()]);
     }
 
     /// A remote-tracking ref of the repository whose main checkout is
     /// `main` moved: the worktrees on `branches` (all of its worktrees
     /// for `None`) were pushed, and are read once it settles. Returns
-    /// whether any was.
+    /// whether any was. Only this Mac's: a host's Git is not watched.
     pub fn note_push(&mut self, main: &Path, branches: Option<&[String]>) -> bool {
         let now = std::time::Instant::now();
-        let rows: Vec<PathBuf> = self
+        let rows: Vec<String> = self
             .pr_rows()
-            .filter(|w| w.repo.as_deref() == Some(main))
+            .filter(|w| w.host.is_none() && w.repo.as_deref() == Some(main))
             .filter(|w| {
                 branches.is_none_or(|b| w.branch.as_ref().is_some_and(|own| b.contains(own)))
             })
-            .map(|w| w.path.clone())
+            .map(Workspace::id)
             .collect();
-        for path in &rows {
-            self.pushed.insert(path.clone(), now);
+        for id in &rows {
+            self.pushed.insert(id.clone(), now);
         }
         !rows.is_empty()
     }
@@ -1274,24 +1304,28 @@ impl Panel {
     /// Reads the pull requests of the rows pushed at least `settle` ago.
     /// Returns whether any push is still settling.
     pub fn read_pushed(&mut self, settle: std::time::Duration) -> bool {
-        let ready: Vec<PathBuf> = self
+        let ready: Vec<String> = self
             .pushed
             .iter()
             .filter(|(_, at)| at.elapsed() >= settle)
-            .map(|(path, _)| path.clone())
+            .map(|(id, _)| id.clone())
             .collect();
-        for path in &ready {
-            self.pushed.remove(path);
+        for id in &ready {
+            self.pushed.remove(id);
         }
         self.read_pull_requests(ready);
         !self.pushed.is_empty()
     }
 
-    /// The main checkouts of the worktrees in the list, for the watchers
-    /// that notice a push.
+    /// The main checkouts of this Mac's worktrees in the list, for the
+    /// watchers that notice a push.
     pub fn main_checkouts(&self) -> Vec<PathBuf> {
         let mut mains: Vec<PathBuf> = Vec::new();
-        for main in self.pr_rows().filter_map(|w| w.repo.clone()) {
+        for main in self
+            .pr_rows()
+            .filter(|w| w.host.is_none())
+            .filter_map(|w| w.repo.clone())
+        {
             if !mains.contains(&main) {
                 mains.push(main);
             }
@@ -1299,33 +1333,41 @@ impl Panel {
         mains
     }
 
-    /// Asks `gh` about the rows at `paths`, one after another on a worker;
-    /// while a read runs they wait for it.
-    fn read_pull_requests(&mut self, paths: Vec<PathBuf>) {
-        if paths.is_empty() || !self.asks_github() {
+    /// Asks `gh` about the rows `ids`, one after another on a worker; while
+    /// a read runs they wait for it. A host's row is asked by its GitHub
+    /// repository's name, `gh` running here.
+    fn read_pull_requests(&mut self, ids: Vec<String>) {
+        use crate::project::worktree::GitHub;
+        if ids.is_empty() || !self.asks_github() {
             return;
         }
         if self.pr_rx.is_some() {
-            for path in paths {
-                if !self.pr_wanted.contains(&path) {
-                    self.pr_wanted.push(path);
+            for id in ids {
+                if !self.pr_wanted.contains(&id) {
+                    self.pr_wanted.push(id);
                 }
             }
             return;
         }
-        let rows: Vec<(PathBuf, String)> = self
+        let rows: Vec<(String, GitHub, String)> = self
             .pr_rows()
-            .filter(|w| paths.contains(&w.path))
-            .filter_map(|w| Some((w.path.clone(), w.branch.clone()?)))
+            .filter(|w| ids.contains(&w.id()))
+            .filter_map(|w| {
+                let repo = match &w.host {
+                    Some(_) => GitHub::Repo(w.github.clone()?),
+                    None => GitHub::Dir(w.path.clone()),
+                };
+                Some((w.id(), repo, w.branch.clone()?))
+            })
             .collect();
         if rows.is_empty() {
             return;
         }
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            for (path, branch) in rows {
-                let answer = crate::project::worktree::pull_request(&path, &branch);
-                if tx.send((path, answer)).is_err() {
+            for (id, repo, branch) in rows {
+                let answer = crate::project::worktree::pull_request_in(&repo, &branch);
+                if tx.send((id, answer)).is_err() {
                     return;
                 }
             }
@@ -1333,15 +1375,15 @@ impl Panel {
         self.pr_rx = Some(rx);
     }
 
-    /// Takes what `gh` said about the row at `path`: a failure keeps the
-    /// pull request it last had, so its badge does not come and go with
-    /// the network. Returns whether the row changed.
-    pub fn take_pull_request(&mut self, path: PathBuf, answer: PullRequestAnswer) -> bool {
-        self.pr_read.insert(path.clone(), std::time::Instant::now());
+    /// Takes what `gh` said about the row `id`: a failure keeps the pull
+    /// request it last had, so its badge does not come and go with the
+    /// network. Returns whether the row changed.
+    pub fn take_pull_request(&mut self, id: String, answer: PullRequestAnswer) -> bool {
+        self.pr_read.insert(id.clone(), std::time::Instant::now());
         let Ok(pr) = answer else {
             return false;
         };
-        let info = self.info.entry(path).or_default();
+        let info = self.info.entry(id).or_default();
         let changed = info.pull_request != pr;
         info.pull_request = pr;
         changed
@@ -1349,15 +1391,12 @@ impl Panel {
 
     /// Forgets what was read about workspaces no longer in the list.
     fn prune(&mut self) {
-        let listed: std::collections::HashSet<&Path> =
-            self.tasks.iter().map(|t| t.path.as_path()).collect();
-        self.info.retain(|path, _| listed.contains(path.as_path()));
-        self.pr_read
-            .retain(|path, _| listed.contains(path.as_path()));
-        self.pushed
-            .retain(|path, _| listed.contains(path.as_path()));
-        self.pr_wanted
-            .retain(|path| listed.contains(path.as_path()));
+        let listed: std::collections::HashSet<String> =
+            self.tasks.iter().map(Workspace::id).collect();
+        self.info.retain(|id, _| listed.contains(id));
+        self.pr_read.retain(|id, _| listed.contains(id));
+        self.pushed.retain(|id, _| listed.contains(id));
+        self.pr_wanted.retain(|id| listed.contains(id));
     }
 
     /// The kept workspaces and arrangement; the first time, every
@@ -1390,7 +1429,7 @@ impl Panel {
         task.merged
             || self
                 .info
-                .get(&task.path)
+                .get(&task.id())
                 .and_then(|i| i.pull_request.as_ref())
                 .is_some_and(|pr| pr.state == "MERGED")
     }
@@ -1456,8 +1495,8 @@ impl Panel {
         if let Some(rx) = &self.info_rx {
             loop {
                 match rx.try_recv() {
-                    Ok((path, ahead)) => {
-                        self.info.entry(path).or_default().ahead = ahead;
+                    Ok((id, ahead)) => {
+                        self.info.entry(id).or_default().ahead = ahead;
                         changed = true;
                     }
                     Err(mpsc::TryRecvError::Empty) => break,
@@ -1475,7 +1514,7 @@ impl Panel {
         let mut changed = false;
         while let Some(rx) = &self.pr_rx {
             match rx.try_recv() {
-                Ok((path, answer)) => changed |= self.take_pull_request(path, answer),
+                Ok((id, answer)) => changed |= self.take_pull_request(id, answer),
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.pr_rx = None;
@@ -1526,6 +1565,7 @@ impl Panel {
             .map(Workspace::id)
             .collect();
         let mut kept: Vec<Workspace> = Vec::new();
+        let mut kept_mains: Vec<PathBuf> = Vec::new();
         for id in &listing.unreachable {
             let (Some(old), Some(folder)) = (
                 self.repos.get(id),
@@ -1533,6 +1573,7 @@ impl Panel {
             ) else {
                 continue;
             };
+            kept_mains.extend(old.iter().cloned());
             kept.extend(
                 self.worktrees
                     .iter()
@@ -1562,8 +1603,11 @@ impl Panel {
         // This Mac's first, then each host's, whichever answered first.
         rows.sort_by_key(|w| w.host.is_some());
         self.worktrees = rows;
+        // Its missing worktrees: those of a folder that did not answer stay.
+        self.prunable
+            .retain(|(host, main), _| *host != listing.host || kept_mains.contains(main));
+        self.prunable.extend(listing.prunable);
         if listing.host.is_none() {
-            self.prunable = listing.prunable;
             self.reading_local = false;
         }
     }
@@ -1623,6 +1667,11 @@ impl Panel {
             .filter(|(_, f)| self.repos.get(&f.id()).is_some_and(|r| r.contains(repo)))
             .max_by_key(|(i, f)| (f.path.components().count(), std::cmp::Reverse(*i)))
             .map(|(_, f)| f.id())
+    }
+
+    /// [`Panel::parent_of`] the workspace `id`.
+    pub fn parent_of_id(&self, id: &str) -> Option<String> {
+        self.parent_of(&self.tasks[self.by_id(id)?])
     }
 
     /// The worktrees in the list, for their watchers: this Mac's, as a
@@ -1753,6 +1802,7 @@ impl Panel {
             commit: None,
             merged: false,
             host,
+            github: None,
         };
         let id = made.id();
         self.folders.push(made);
@@ -2000,17 +2050,15 @@ impl Panel {
     }
 
     /// The repository a new branch is made in: the selected worktree's, or
-    /// the first one in the selected folder workspace.
-    pub fn task_repo(&self) -> Option<PathBuf> {
+    /// the first one in the selected folder workspace; with its host, when
+    /// it is on one.
+    pub fn task_repo(&self) -> Option<(Option<String>, PathBuf)> {
         let task = &self.tasks[self.selected_index()?];
-        // Branches are not made on a host from here.
-        if task.host.is_some() {
-            return None;
-        }
-        match &task.repo {
-            Some(repo) => Some(repo.clone()),
-            None => self.repos_of(task)?.into_iter().next(),
-        }
+        let repo = match &task.repo {
+            Some(repo) => repo.clone(),
+            None => self.repos_of(task)?.into_iter().next()?,
+        };
+        Some((task.host.clone(), repo))
     }
 
     /// Puts the list in your order and nothing else: the pinned first,
@@ -2244,7 +2292,7 @@ impl Panel {
             .iter()
             .filter(|t| !t.folder)
             .filter_map(|t| {
-                let pr = self.info.get(&t.path)?.pull_request.as_ref()?;
+                let pr = self.info.get(&t.id())?.pull_request.as_ref()?;
                 let checks = format!("{:?}", pr.checks).to_ascii_lowercase();
                 Some(format!(
                     "{}=#{}:{}:{checks}",
@@ -3013,7 +3061,7 @@ impl Panel {
         } else {
             let pr = self
                 .info
-                .get(&task.path)
+                .get(&task.id())
                 .and_then(|info| info.pull_request.as_ref());
             if let Some(pr) = pr {
                 let label = format!("#{}", pr.number);
@@ -3144,7 +3192,7 @@ impl Panel {
             if self.is_pinned(&task.id()) {
                 parts.push("pinned".to_owned());
             }
-            let ahead = self.info.get(&task.path).map_or(0, |i| i.ahead);
+            let ahead = self.info.get(&task.id()).map_or(0, |i| i.ahead);
             match pace {
                 Some(pace) => parts.extend(worktree_line(
                     pace,
@@ -3246,6 +3294,7 @@ mod tests {
             commit: None,
             merged: false,
             host: None,
+            github: None,
         }
     }
 
@@ -3298,6 +3347,15 @@ mod tests {
             Some(PathBuf::from("/e"))
         );
         assert_eq!(panel.task_repo(), None);
+        // Once read, a new task's repository is its first one, on its host.
+        let mut panel = panel;
+        panel
+            .repos
+            .insert("folder:app".into(), vec![PathBuf::from("/srv/app/api")]);
+        assert_eq!(
+            panel.task_repo(),
+            Some((Some("myhost".into()), PathBuf::from("/srv/app/api")))
+        );
     }
 
     #[test]
@@ -3565,7 +3623,7 @@ mod tests {
         // A pull request merged on GitHub counts too.
         let mut fresh = nested();
         fresh.info.insert(
-            PathBuf::from("/w/b"),
+            "/w/b".to_owned(),
             Info {
                 ahead: 0,
                 pull_request: Some(crate::project::worktree::PullRequest {
@@ -3619,7 +3677,7 @@ mod tests {
     #[test]
     fn a_failed_read_keeps_the_last_pull_request() {
         let mut panel = nested();
-        let path = PathBuf::from("/w/a");
+        let path = "/w/a".to_owned();
         assert!(panel.take_pull_request(path.clone(), Ok(Some(pr("OPEN", Checks::Running)))));
         assert!(!panel.take_pull_request(path.clone(), Err("offline".into())));
         assert_eq!(panel.report_pull_requests(), "a=#7:OPEN:running");
@@ -3642,10 +3700,60 @@ mod tests {
         panel.worktrees.retain(|w| w.path != Path::new("/w/a"));
         panel.rebuild();
         panel.prune();
-        assert!(!panel.info.contains_key(Path::new("/w/a")));
-        assert!(!panel.pr_read.contains_key(Path::new("/w/a")));
-        assert!(!panel.pushed.contains_key(Path::new("/w/a")));
-        assert!(panel.info.contains_key(Path::new("/w/b")));
+        assert!(!panel.info.contains_key("/w/a"));
+        assert!(!panel.pr_read.contains_key("/w/a"));
+        assert!(!panel.pushed.contains_key("/w/a"));
+        assert!(panel.info.contains_key("/w/b"));
+    }
+
+    #[test]
+    fn a_hosts_worktree_never_shares_what_was_read_with_one_here() {
+        // The same path on this Mac and on a host: two rows, two ids, each
+        // its own ahead count and pull request.
+        let mut panel = nested();
+        let mut there = tree("/w/a", false);
+        there.host = Some("box".into());
+        there.repo = Some("/r".into());
+        there.branch = Some("a".into());
+        there.github = Some("me/garden".into());
+        panel.worktrees.push(there);
+        panel.rebuild();
+        assert_eq!(
+            panel
+                .tasks
+                .iter()
+                .filter(|t| t.path == Path::new("/w/a"))
+                .count(),
+            2
+        );
+        panel.take_pull_request("box:/w/a".into(), Ok(Some(pr("OPEN", Checks::None))));
+        let here = panel.tasks.iter().find(|t| t.id() == "/w/a").unwrap();
+        let remote = panel.tasks.iter().find(|t| t.id() == "box:/w/a").unwrap();
+        assert!(!panel.info.contains_key(&here.id()));
+        assert_eq!(
+            panel
+                .info
+                .get(&remote.id())
+                .and_then(|i| i.pull_request.as_ref())
+                .map(|p| p.number),
+            Some(7)
+        );
+        // Its pull request is read (by its GitHub name), and a push heard
+        // here never counts for it.
+        assert!(panel.pr_rows().any(|w| w.id() == "box:/w/a"));
+        for w in &mut panel.worktrees {
+            if w.host.is_none() {
+                w.branch = w.path.file_name().map(|n| n.to_string_lossy().into_owned());
+            }
+        }
+        panel.note_push(Path::new("/r"), None);
+        assert!(!panel.pushed.contains_key("box:/w/a"));
+        assert!(!panel.main_checkouts().is_empty());
+        // Without a GitHub origin it is not asked about.
+        for w in &mut panel.worktrees {
+            w.github = None;
+        }
+        assert!(!panel.pr_rows().any(|w| w.host.is_some()));
     }
 
     #[test]
@@ -3678,10 +3786,7 @@ mod tests {
             w.branch = w.path.file_name().map(|n| n.to_string_lossy().into_owned());
         }
         assert!(panel.note_push(Path::new("/r"), Some(&["b".to_owned()])));
-        assert_eq!(
-            panel.pushed.keys().collect::<Vec<_>>(),
-            [&PathBuf::from("/w/b")]
-        );
+        assert_eq!(panel.pushed.keys().collect::<Vec<_>>(), ["/w/b"]);
         assert!(!panel.note_push(Path::new("/r"), Some(&["x".to_owned()])));
         assert!(panel.note_push(Path::new("/r"), None));
         assert_eq!(panel.pushed.len(), 2);

@@ -115,6 +115,10 @@ pub struct Inspector {
     /// The worktree strips shown last frame, per repository, and whether
     /// each was merged, for the self-test.
     shown_worktrees: Vec<(PathBuf, PathBuf, String, bool)>,
+    /// The folder workspace shown is on a host that did not answer, so its
+    /// repositories are not known: set before each draw. Its body says so
+    /// instead of waiting.
+    pub unreachable: bool,
 }
 
 impl Inspector {
@@ -237,10 +241,14 @@ impl Inspector {
         // A remote workspace: where it is, then its Git as a local one's.
         let at = self.shown_host.as_ref().map(|at| format!("remote={at}"));
         let Some(repos) = repos else {
-            return at.unwrap_or_else(|| "-".into());
+            return match at {
+                Some(at) if self.unreachable => format!("{at} unreachable"),
+                Some(at) => at,
+                None => "-".into(),
+            };
         };
         if repos.is_empty() {
-            return at.unwrap_or_else(|| "none".into());
+            return at.map_or_else(|| "none".into(), |at| format!("{at} none"));
         }
         let local = self.report_repos(repos);
         match at {
@@ -527,8 +535,14 @@ impl Inspector {
                 );
             }
         };
+        // Skeletons while the folder's repositories are first read; a host
+        // that did not answer is said.
         let Some(repos) = repos else {
-            skeleton(out, y, 4);
+            if self.unreachable {
+                note(out, atlas, x, y, width, "Host unreachable", theme);
+            } else {
+                skeleton(out, y, 4);
+            }
             return;
         };
         if repos.is_empty() {
@@ -876,17 +890,16 @@ impl Inspector {
                 Action::WorktreeTerminal,
                 "Start a shell in this worktree".to_owned(),
             );
-            // A host's worktree is not reviewed or removed from here.
+            let clean_up = (
+                "Clean up",
+                Action::CleanUpWorktree,
+                "Remove this merged worktree and its branch".to_owned(),
+            );
+            // A host's worktree is not reviewed from here.
             let buttons = match (merged, tree.host.is_some()) {
-                (_, true) => vec![terminal],
-                (true, false) => vec![
-                    (
-                        "Clean up",
-                        Action::CleanUpWorktree,
-                        "Remove this merged worktree and its branch".to_owned(),
-                    ),
-                    ("Review", Action::ReviewWorktree, review_tip),
-                ],
+                (true, true) => vec![clean_up, terminal],
+                (false, true) => vec![terminal],
+                (true, false) => vec![clean_up, ("Review", Action::ReviewWorktree, review_tip)],
                 (false, false) => vec![terminal, ("Review", Action::ReviewWorktree, review_tip)],
             };
             for (label, action, tip) in buttons {

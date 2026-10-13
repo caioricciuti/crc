@@ -176,8 +176,11 @@ impl EditorView {
             ),
         ];
         // Each session gets its own review folder, which the agent's hooks
-        // write into; created by the first hook, not here.
-        if let Some(dir) = crate::project::review::root() {
+        // write into; created by the first hook, not here. Not one on a
+        // host: what it changes is there, and nothing of this Mac's is its.
+        if remote.is_none()
+            && let Some(dir) = crate::project::review::root()
+        {
             env.push((
                 crate::project::review::SESSION_VAR.to_owned(),
                 dir.join(crate::project::review::new_id())
@@ -194,8 +197,8 @@ impl EditorView {
             .collect();
         if let Some((host, path)) = remote {
             // ssh sends none of these variables but what the person's own
-            // config says to; TERM it sends as the terminal's type.
-            let program = crate::platform::remote::program();
+            // config says to; TERM it sends as the terminal's type. It runs
+            // under sh, so a host it cannot reach leaves its error on screen.
             let control = crate::platform::remote::control_for(host);
             let args = crate::platform::remote::ssh_args(
                 host,
@@ -203,8 +206,14 @@ impl EditorView {
                 claude.then_some("claude"),
                 control.as_deref(),
             );
+            let args = crate::platform::remote::kept_open_args(
+                &crate::platform::remote::program(),
+                args,
+                host,
+                &crate::platform::remote::known_hosts(),
+            );
             return Some(crate::platform::terminal::Launch {
-                program,
+                program: "/bin/sh".into(),
                 args,
                 cwd,
                 env,
@@ -287,6 +296,24 @@ impl EditorView {
         cwd: Option<&Path>,
         into: Option<String>,
     ) {
+        self.spawn_terminal_on(claude, cwd, into, None);
+    }
+
+    /// A shell over ssh in `dir` on `host`, in the workspace `id`: a
+    /// worktree just made there, before the list has its row.
+    pub(super) fn spawn_remote_terminal(&self, host: &str, dir: &Path, id: String) {
+        self.spawn_terminal_on(false, Some(dir), Some(id), Some(host.to_owned()));
+    }
+
+    /// As [`Self::spawn_terminal_into`]; on `host`, in `cwd` there, when
+    /// the workspace's row does not say so yet.
+    fn spawn_terminal_on(
+        &self,
+        claude: bool,
+        cwd: Option<&Path>,
+        into: Option<String>,
+        host: Option<String>,
+    ) {
         // Every new terminal says it: one opened later fails the same way.
         self.say_if_replaced(true);
         // In Agents mode a session started in the selected workspace's
@@ -317,7 +344,8 @@ impl EditorView {
                 .as_deref()
                 .and_then(|id| state.agents.by_id(id))
                 .map(|i| &state.agents.tasks[i])
-                .and_then(|t| Some((t.host.clone()?, t.path.clone())));
+                .and_then(|t| Some((t.host.clone()?, t.path.clone())))
+                .or_else(|| Some((host?, cwd?.to_path_buf())));
             (workspace, remote)
         };
         let Some(launch) = self.terminal_launch(
@@ -453,6 +481,10 @@ impl EditorView {
     fn add_terminal_tab(&self, state: &mut State, tab: crate::platform::terminal::Tab) {
         state.terminal.tabs.push(tab);
         let tab = state.terminal.tabs.last().expect("just pushed");
+        // A tab on a host has no review folder: no hooks to hear.
+        if !tab.tracks_review() {
+            return;
+        }
         watch_events(
             tab.review.join("events"),
             std::sync::Arc::downgrade(&tab.alive),
@@ -809,6 +841,9 @@ impl EditorView {
             }
             // What its agent's hooks wrote since the last look: an agent
             // writes files and asks questions while it prints.
+            if !tab.tracks_review() {
+                continue;
+            }
             let (events, read) = crate::project::review::read_events(&tab.review, tab.events_read);
             tab.events_read = read;
             for event in events {

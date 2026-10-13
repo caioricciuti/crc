@@ -11,7 +11,11 @@
 # it is unreachable. A worktree row's terminal is ssh into its folder there.
 # The host answers again: the inspector shows the worktree's Git as a local
 # one's, and Commit All, Merge main In and Push run on the host, Push to a
-# bare origin; a second launch pulls what someone else pushed there.
+# bare origin; a second launch pulls what someone else pushed there. A
+# third, its origin now named on GitHub, has the pull request of its
+# worktree read by a stand-in `gh` here, told the repository; cleans up the
+# merged worktree on the host; and makes a new task there, its terminal ssh
+# into the new worktree.
 RG="$T/rgit"
 RGO="$T/rgit-origin.git"
 RGH="$T/home/rgit"
@@ -47,6 +51,8 @@ for last; do :; done
 case " \$* " in
 *BatchMode=yes*)
     printf '%s\n' "\$*" >> "$T/rgit-batch.log"
+    # The line itself, out of the \`sh -c\` ssh hands the login shell.
+    ( eval "set -- \$last"; printf '%s\n' "\$3" ) >> "$T/rgit-lines.log"
     [ "\$(cat "$T/rgit-down" 2>/dev/null)" = down ] && exit 255
     exec /bin/sh -c "\$last"
     ;;
@@ -107,14 +113,19 @@ expect "$T/rgit-down.out" agents_tree "app(unreachable),>fix,~merged(+1),rgitpro
 expect "$T/rgit-term.out" agents "on tasks=app,fix,old,rgitproj selected=fix sessions=rgitproj,*fix claude=0 pair=- op=-"
 expect "$T/rgit-term.out" inspector "remote=myhost:$fix_path error=host unreachable buttons="
 expect_terminal "$T/rgit-term.out" "remote stub up"
-grep -qxF -- "cd '$fix_path' && exec \"\${SHELL:-/bin/sh}\" -l" "$T/rgit-ssh.log" 2>/dev/null \
+q="'\"'\"'"
+grep -qxF -- "sh -c 'cd ${q}$fix_path${q} && exec \"\${SHELL:-/bin/sh}\" -l'" "$T/rgit-ssh.log" 2>/dev/null \
     || failed "remote-git: the worktree's ssh did not go to $fix_path: $(tr '\n' ' ' < "$T/rgit-ssh.log" 2>/dev/null)"
 # Every read asked nothing. (The shared connection's socket would not fit
 # under this run's long temporary HOME, so it is not asked for here; the
 # unit tests check its options.)
 blog="$T/rgit-batch.log"
-for arg in "BatchMode=yes" "ConnectTimeout=5" "-- myhost cd -P '$RG'" "'worktree' 'list' '--porcelain'" "'rev-list' '--count' 'main..fix'"; do
+llog="$T/rgit-lines.log"
+for arg in "BatchMode=yes" "ConnectTimeout=5" "-- myhost sh -c 'cd -P "; do
     grep -qF -- "$arg" "$blog" 2>/dev/null || failed "remote-git: no read over ssh had [$arg]"
+done
+for arg in "cd -P '$RG'" "'worktree' 'list' '--porcelain'" "'rev-list' '--count' 'main..fix'"; do
+    grep -qF -- "$arg" "$llog" 2>/dev/null || failed "remote-git: no line read over ssh had [$arg]"
 done
 
 # The host is back: the worktree's card, read over ssh, with its new file.
@@ -131,8 +142,9 @@ expect "$T/rgit-pushed.out" inspector "remote=myhost:$fix_path branch=fix base=m
     || failed "remote-git: Push did not put fix on origin"
 # The changes went over ssh without a shared connection of their own, the
 # message one argument.
-for arg in "ControlMaster=no" "'add' '--all' && git 'commit' '-q' '-m' 'wip remote'" "'merge' '--no-edit' 'main'" "'push' '--set-upstream' 'origin' 'fix'"; do
-    grep -qF -- "$arg" "$blog" 2>/dev/null || failed "remote-git: no change over ssh had [$arg]"
+grep -qF -- "ControlMaster=no" "$blog" 2>/dev/null || failed "remote-git: no change over ssh had [ControlMaster=no]"
+for arg in "'add' '--all' && git 'commit' '-q' '-m' 'wip remote'" "'merge' '--no-edit' 'main'" "'push' '--set-upstream' 'origin' 'fix'"; do
+    grep -qF -- "$arg" "$llog" 2>/dev/null || failed "remote-git: no change over ssh had [$arg]"
 done
 
 # Someone else pushes to fix; the next launch pulls it on the host.
@@ -162,4 +174,75 @@ HOME="$RGH" CRC_TERMINAL_SHELL=/bin/sh CRC_SSH_COMMAND="$T/rgit-ssh.sh" \
 expect "$T/rgit-behind.out" inspector "remote=myhost:$fix_path branch=fix base=main ahead=3 behind=0 upstream=origin/fix push=0 pull=1 dirty=0 changes=+2-0 tag=- buttons=pull"
 expect "$T/rgit-pulled.out" inspector "remote=myhost:$fix_path branch=fix base=main ahead=4 behind=0 upstream=origin/fix push=0 pull=0 dirty=0 changes=+3-0 tag=- buttons="
 [ -f "$fix_path/t.txt" ] || failed "remote-git: Pull did not bring t.txt on the host"
-grep -qF -- "'pull' '--ff-only'" "$blog" 2>/dev/null || failed "remote-git: no pull over ssh had [--ff-only]"
+grep -qF -- "'pull' '--ff-only'" "$llog" 2>/dev/null || failed "remote-git: no pull over ssh had [--ff-only]"
+
+# Its origin named on GitHub (nothing is fetched or pushed from here on):
+# the stand-in `gh` on PATH answers for fix, and logs how it was asked.
+testgit "$RG" remote set-url origin git@github.com:me/rgit.git
+mkdir -p "$T/rgitbin"
+cat > "$T/rgitbin/gh" <<'GH'
+#!/bin/sh
+echo "$*" >> "$RGIT_GH_LOG"
+[ "$1 $2" = "pr view" ] || exit 1
+if [ "$3" = fix ]; then
+    echo '{"number":21,"state":"OPEN","url":"https://github.com/me/rgit/pull/21","statusCheckRollup":[{"status":"IN_PROGRESS","conclusion":""}]}'
+    exit 0
+fi
+echo "no pull requests found for branch \"$3\"" >&2
+exit 1
+GH
+chmod +x "$T/rgitbin/gh"
+: > "$T/rgit-gh.log"
+cat > "$T/rgit-tasks.script" <<SCRIPT
+wait 500
+key 0 cmd,shift A
+idle 2500
+dump $T/rgit-prs.out
+click @agents.task.0
+wait 700
+wait 700
+click @inspector.worktree_cleanup.0
+wait 700
+wait 700
+wait 700
+dump $T/rgit-cleaned.out
+key 45 cmd,shift N
+wait 200
+text try-it
+key 125
+key 125
+key 36
+wait 700
+wait 700
+wait 700
+dump $T/rgit-task.out
+quit
+SCRIPT
+HOME="$RGH" PATH="$T/rgitbin:$PATH" RGIT_GH_LOG="$T/rgit-gh.log" CRC_SELFTEST_GH=1 \
+    CRC_SELFTEST_PR_EVERY=1 CRC_TERMINAL_SHELL=/bin/sh CRC_SSH_COMMAND="$T/rgit-ssh.sh" \
+    CRC_SELFTEST="$T/rgit-tasks.script" "$BIN" "$T/rgitproj" 2> "$T/rgit-tasks.err"
+# gh ran here, told the repository by name, for the host's branch.
+grep -q '^pr view fix .*--repo me/rgit' "$T/rgit-gh.log" \
+    || failed "remote-git: gh was not asked about fix with --repo: $(cat "$T/rgit-gh.log")"
+expect "$T/rgit-prs.out" agents_prs "fix=#21:OPEN:running"
+# Clean up removed the merged worktree on the host, and its branch.
+grep -q '^message: Removed old and its branch' "$T/rgit-cleaned.out" \
+    || failed "remote-git: clean up said $(grep '^message:' "$T/rgit-cleaned.out")"
+git -C "$RG" worktree list --porcelain | grep -q 'rgit-wt/old$' \
+    && failed "remote-git: the merged worktree is still listed: $(git -C "$RG" worktree list)"
+[ ! -e "$T/rgit-wt/old" ] || failed "remote-git: the cleaned up worktree's folder is still there"
+git -C "$RG" rev-parse -q --verify refs/heads/old >/dev/null \
+    && failed "remote-git: the merged branch old is still there"
+# The new task's worktree is on the host, beside its main checkout, and its
+# terminal is ssh into it.
+main_path=$(git -C "$RG" worktree list --porcelain | sed -n '1s/^worktree //p')
+task_path="$(dirname "$main_path")/rgit-worktrees/try-it"
+git -C "$RG" worktree list --porcelain | grep -qxF "worktree $task_path" \
+    || failed "remote-git: no worktree at $task_path: $(git -C "$RG" worktree list)"
+[ "$(git -C "$task_path" branch --show-current 2>/dev/null)" = try-it ] \
+    || failed "remote-git: the new worktree is not on try-it"
+grep -m1 '^agents: ' "$T/rgit-task.out" | grep -q 'selected=try-it ' \
+    || failed "remote-git: the new task is not selected: $(grep -m1 '^agents: ' "$T/rgit-task.out")"
+grep -qxF -- "sh -c 'cd ${q}$task_path${q} && exec \"\${SHELL:-/bin/sh}\" -l'" "$T/rgit-ssh.log" 2>/dev/null \
+    || failed "remote-git: the new task's ssh did not go to $task_path: $(tr '\n' ' ' < "$T/rgit-ssh.log" 2>/dev/null)"
+git -C "$RG" worktree remove --force "$task_path" 2>/dev/null || true

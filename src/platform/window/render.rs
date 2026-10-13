@@ -720,14 +720,18 @@ impl EditorView {
             if let Some(rect) = inspector_rect {
                 let selected = agents.selected_index().map(|i| agents.tasks[i].clone());
                 // A pull request is a worktree branch's, once its row is read;
-                // a host's are not asked about.
+                // a host's when its origin is on GitHub.
                 let pull_request = selected
                     .as_ref()
-                    .filter(|w| !w.main && !w.folder && w.branch.is_some() && w.host.is_none())
-                    .and_then(|w| agents.info.get(&w.path))
+                    .filter(|w| !w.main && !w.folder && w.branch.is_some())
+                    .filter(|w| w.host.is_none() || w.github.is_some())
+                    .and_then(|w| agents.info.get(&w.id()))
                     .map(|info| info.pull_request.clone());
                 let github = agents.github.unwrap_or(false);
                 let repos = selected.as_ref().and_then(|w| agents.repos_of(w));
+                agents.inspector.unreachable = selected
+                    .as_ref()
+                    .is_some_and(|w| agents.unreachable.contains(&w.id()));
                 // A folder workspace's repositories' worktrees, a strip each.
                 let worktrees: Vec<_> = match (&selected, &repos) {
                     (Some(w), Some(repos)) if w.folder => agents
@@ -1042,7 +1046,9 @@ impl EditorView {
                 mcp_url: *mcp_url_prompt,
                 task: *task_prompt,
                 task_folder: agents.new_folder(tree.root()),
-                task_repo: agents.task_repo(),
+                task_repo: agents
+                    .task_repo()
+                    .map(|(host, repo)| shown_repo(host, &repo)),
                 task_rename: agents.renaming_name(),
                 commit: commit_prompt.as_deref(),
             };

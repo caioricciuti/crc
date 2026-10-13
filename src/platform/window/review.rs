@@ -12,6 +12,7 @@ fn running(state: &State) -> Vec<std::path::PathBuf> {
         .terminal
         .tabs
         .iter()
+        .filter(|t| t.tracks_review())
         .map(|t| t.review.clone())
         .collect()
 }
@@ -77,6 +78,7 @@ fn apply_summary(state: &mut State, summary: Vec<(std::path::PathBuf, String, us
             .review_page
             .summary
             .iter()
+            .filter(|_| tab.tracks_review())
             .find(|(dir, _, _)| *dir == tab.review)
             .map_or(0, |(_, _, n)| *n);
     }
@@ -112,10 +114,12 @@ pub(super) fn note_unhooked_writes(state: &mut State) {
         .iter()
         .map(|t| t.review.clone())
         .collect();
+    // A terminal in ssh writes on its host: nothing here is its.
     let working: Vec<_> = state
         .terminal
         .tabs
         .iter()
+        .filter(|t| t.tracks_review())
         .filter(|t| t.last_output.is_some_and(|at| at.elapsed() < WORKING))
         .map(|t| {
             (

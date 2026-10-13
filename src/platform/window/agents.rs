@@ -204,7 +204,8 @@ impl EditorView {
             return;
         };
         let mut changed = state.agents.poll();
-        if changed && state.agents.selected_index().is_none() {
+        let coming = selection_coming(&state);
+        if changed && !coming && state.agents.selected_index().is_none() {
             // Nothing selected that the list knows: the workspace of the
             // session showing, else the first.
             let tasks = state.agents.tasks.clone();
@@ -246,17 +247,28 @@ impl EditorView {
             self.watch_worktrees();
         }
         self.want_inspector();
-        if let Some(dir) = start_in {
+        match start_in {
             // A worktree's id is its path: selectable before the list
             // comes back with it.
-            if let Some(mut state) = self.state_mut() {
-                state.agents.selected = Some(
-                    crate::platform::canonical(&dir)
-                        .to_string_lossy()
-                        .into_owned(),
-                );
+            Some((None, dir)) => {
+                if let Some(mut state) = self.state_mut() {
+                    state.agents.selected = Some(
+                        crate::platform::canonical(&dir)
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                }
+                self.spawn_terminal_in(false, Some(&dir));
             }
-            self.spawn_terminal_in(false, Some(&dir));
+            // One on a host is `host:path`, its terminal ssh there.
+            Some((Some(host), dir)) => {
+                let id = crate::platform::agents::row_id(Some(&host), &dir);
+                if let Some(mut state) = self.state_mut() {
+                    state.agents.selected = Some(id.clone());
+                }
+                self.spawn_remote_terminal(&host, &dir, id);
+            }
+            None => {}
         }
         if changed {
             self.request_redraw();
@@ -337,13 +349,21 @@ impl EditorView {
         if !state.agents.listed() {
             return false;
         }
+        if selection_coming(&state) {
+            return true;
+        }
         let tasks = state.agents.tasks.clone();
         // The terminal showing, when no workspace holds it, gets one on its
-        // own folder.
+        // own folder. Not one ssh'd into a host's workspace: its folder here
+        // is only where ssh started, and its row comes when the host answers.
         let loose = state
             .terminal
             .active_tab()
             .filter(|t| task_of(&tasks, t).is_none())
+            .filter(|t| {
+                t.workspace.is_none()
+                    || !crate::platform::remote::is_ssh_launch(&t.launch.program, &t.launch.args)
+            })
             .map(|t| t.folder.clone());
         if loose.is_none() && state.agents.selected_index().is_some() {
             return true;
@@ -716,6 +736,8 @@ impl EditorView {
             let name = crate::platform::remote::workspace_name(&host, &path);
             let id = state.agents.add_remote(&name, &host, &path);
             state.agents.selected = Some(id.clone());
+            // Its repositories read now, not at the next periodic read.
+            state.agents.refresh();
             id
         };
         self.set_agents_mode(true);
@@ -769,16 +791,7 @@ impl EditorView {
                 }
                 self.task_menu(index)
             }
-            // A host's merged worktrees are not cleaned up from here.
-            Some(Action::Merged(index))
-                if !self.state().is_some_and(|state| {
-                    state
-                        .agents
-                        .tasks
-                        .get(index)
-                        .is_some_and(|t| t.host.is_some())
-                }) =>
-            {
+            Some(Action::Merged(index)) => {
                 if let Some(mut state) = self.state_mut() {
                     state.agents.menu_task = state.agents.tasks.get(index).map(|t| t.id());
                     state.agents.target = None;
@@ -1008,12 +1021,13 @@ impl EditorView {
     }
 
     /// The palette's answer: a worktree on a new branch of the selected
-    /// workspace's repository, then a terminal in it.
+    /// workspace's repository, then a terminal in it; on its host, over
+    /// ssh, for a remote one.
     pub(super) fn create_task(&self, name: String) {
         let Some(mut state) = self.state_mut() else {
             return;
         };
-        let Some(dir) = state.agents.task_repo() else {
+        let Some((host, dir)) = state.agents.task_repo() else {
             return;
         };
         state.agents.on = true;
@@ -1021,14 +1035,15 @@ impl EditorView {
         state
             .agents
             .start(&format!("Making {branch}\u{2026}"), move || {
-                let main = crate::project::worktree::list(&dir)
+                let runner = crate::platform::agents::runner(host.as_deref());
+                let main = crate::project::worktree::list_all_on(&runner, &dir)
                     .ok()
-                    .and_then(|list| list.into_iter().find(|w| w.main))
+                    .and_then(|(list, _)| list.into_iter().find(|w| w.main))
                     .map_or(dir, |w| w.path);
-                let made = crate::project::worktree::add(&main, &name)?;
+                let made = crate::project::worktree::add_on(&runner, &main, &name)?;
                 Ok(Done {
                     said: format!("Task {branch} ready in its own worktree"),
-                    start_in: Some(made),
+                    start_in: Some((host, made)),
                 })
             });
         drop(state);
@@ -1045,22 +1060,27 @@ impl EditorView {
                     let task = state.agents.tasks.get(index);
                     // Worktrees Git still records whose folder is gone, in the
                     // repositories a folder workspace holds.
-                    let prunable = task
-                        .filter(|t| t.folder)
-                        .and_then(|t| state.agents.repos_of(t))
-                        .map_or(0, |repos| {
+                    let prunable = task.filter(|t| t.folder).map_or(0, |t| {
+                        state.agents.repos_of(t).map_or(0, |repos| {
                             repos
                                 .iter()
-                                .filter_map(|r| state.agents.prunable.get(r))
+                                .filter_map(|r| {
+                                    state.agents.prunable.get(&(t.host.clone(), r.clone()))
+                                })
                                 .sum()
-                        });
+                        })
+                    });
                     (
                         task.is_none_or(|t| t.main),
                         task.is_some_and(|t| t.folder),
                         task.is_some_and(|t| t.host.is_some()),
-                        task.and_then(|t| t.branch.clone()),
+                        // The branch, and whether it can have pull requests:
+                        // a host's repository not on GitHub has none here.
+                        task.and_then(|t| {
+                            Some((t.branch.clone()?, t.host.is_none() || t.github.is_some()))
+                        }),
                         task.and_then(|t| t.base.clone()),
-                        task.and_then(|t| state.agents.info.get(&t.path))
+                        task.and_then(|t| state.agents.info.get(&t.id()))
                             .and_then(|info| info.pull_request.as_ref())
                             .map(|pr| pr.number),
                         task.is_some_and(|t| state.agents.is_merged(t)),
@@ -1077,9 +1097,8 @@ impl EditorView {
         let add = |title: &str, action: Sel| menu.addItem(&menu_item(mtm, title, action));
         add("New Terminal", sel!(agentNewShell:));
         add("New Claude Session", sel!(agentNewClaude:));
-        // A remote workspace's folder is on its host, not for the editor.
-        // Of its Git, only commit, pull, push and taking the base's commits
-        // are done there from here.
+        // A remote workspace's folder is on its host, not for the editor,
+        // and its branches are not merged into a checkout or reviewed here.
         if !remote {
             add("Open in Editor", sel!(agentOpenInEditor:));
         }
@@ -1097,7 +1116,7 @@ impl EditorView {
         );
         add("Rename", sel!(agentRenameInPlace:));
         if folder {
-            if prunable > 0 && !remote {
+            if prunable > 0 {
                 add(
                     &match prunable {
                         1 => "Prune 1 Missing Worktree".to_owned(),
@@ -1114,15 +1133,15 @@ impl EditorView {
             add("Pull", sel!(agentPull:));
             add("Push", sel!(agentPush:));
         }
-        if !main && let Some(branch) = branch {
+        if !main && let Some((branch, github)) = branch {
             let into = base.unwrap_or_else(|| "the main checkout".into());
             add(&format!("Merge {into} In"), sel!(agentUpdateFromBase:));
-            if remote {
-                return menu;
-            }
             menu.addItem(&NSMenuItem::separatorItem(mtm));
-            add(&format!("Merge {branch} into {into}"), sel!(agentMerge:));
+            if !remote {
+                add(&format!("Merge {branch} into {into}"), sel!(agentMerge:));
+            }
             match pr {
+                _ if !github => {}
                 Some(number) => {
                     add(
                         &format!("Open Pull Request #{number}"),
@@ -1231,7 +1250,7 @@ impl EditorView {
     pub(super) fn agent_open_pull_request(&self) {
         let url = self.menu_task().and_then(|task| {
             let state = self.state()?;
-            let pr = state.agents.info.get(&task.path)?.pull_request.as_ref()?;
+            let pr = state.agents.info.get(&task.id())?.pull_request.as_ref()?;
             Some(pr.url.clone())
         });
         if let Some(url) = url.filter(|u| u.starts_with("https://"))
@@ -1245,10 +1264,11 @@ impl EditorView {
         }
     }
 
-    /// The inspector's Clean up on a merged worktree: Remove Task on it.
-    pub(super) fn clean_up_worktree(&self, path: &Path) {
+    /// The inspector's Clean up on a merged worktree, by id: Remove Task
+    /// on it.
+    pub(super) fn clean_up_worktree(&self, id: &str) {
         if let Some(mut state) = self.state_mut() {
-            state.agents.menu_task = Some(path.to_string_lossy().into_owned());
+            state.agents.menu_task = Some(id.to_owned());
         }
         self.agent_remove();
     }
@@ -1269,7 +1289,7 @@ impl EditorView {
                     let t = &agents.tasks[i];
                     let pr_head = agents
                         .info
-                        .get(&t.path)
+                        .get(&t.id())
                         .and_then(|i| i.pull_request.as_ref())
                         .filter(|pr| pr.state == "MERGED")
                         .map(|pr| pr.head_oid.clone());
@@ -1309,11 +1329,13 @@ impl EditorView {
         let Some(mut state) = self.state_mut() else {
             return;
         };
+        // A host's are checked and removed there, over ssh.
+        let runner = crate::platform::agents::runner(parent.host.as_deref());
         // Dirty worktrees are skipped before anything closes.
         let mut skipped = 0;
         let mut clean = Vec::new();
         for item in found {
-            match crate::project::worktree::is_dirty(&item.1.path) {
+            match crate::project::worktree::is_dirty_on(&runner, &item.1.path) {
                 Ok(false) => clean.push(item),
                 Ok(true) | Err(_) => skipped += 1,
             }
@@ -1341,7 +1363,8 @@ impl EditorView {
                 .filter(|i| {
                     let tab = &state.terminal.tabs[*i];
                     task_of(tasks, tab).is_some_and(|t| ids.contains(&tasks[t].id()))
-                        || clean.iter().any(|c| tab.folder.starts_with(&c.1.path))
+                        || (parent.host.is_none()
+                            && clean.iter().any(|c| tab.folder.starts_with(&c.1.path)))
                 })
                 .collect()
         };
@@ -1363,7 +1386,8 @@ impl EditorView {
                 let failed: Vec<String> = clean
                     .iter()
                     .filter_map(|(_, tree, main, base, pr_head)| {
-                        crate::project::worktree::remove(
+                        crate::project::worktree::remove_on(
+                            &runner,
                             main,
                             tree,
                             base.as_deref(),
@@ -1405,15 +1429,22 @@ impl EditorView {
             .repos_of(&task)
             .unwrap_or_default()
             .into_iter()
-            .filter(|r| state.agents.prunable.contains_key(r))
+            .filter(|r| {
+                state
+                    .agents
+                    .prunable
+                    .contains_key(&(task.host.clone(), r.clone()))
+            })
             .collect();
         if mains.is_empty() {
             return;
         }
+        let host = task.host.clone();
         state.agents.start("Pruning\u{2026}", move || {
+            let runner = crate::platform::agents::runner(host.as_deref());
             let said: Vec<String> = mains
                 .iter()
-                .map(|main| crate::project::worktree::prune(main))
+                .map(|main| crate::project::worktree::prune_on(&runner, main))
                 .collect::<Result<_, _>>()?;
             Ok(Done {
                 said: said.join("; "),
@@ -1436,13 +1467,17 @@ impl EditorView {
             return;
         };
         let task = worktree;
+        // A host's worktree is checked and removed there, over ssh; no
+        // folder of this Mac is its.
+        let host = self.menu_task().and_then(|t| t.host);
         let sessions: Vec<usize> = self.state().map_or_else(Vec::new, |state| {
             let tasks = &state.agents.tasks;
             (0..state.terminal.tabs.len())
                 .filter(|i| {
                     task_of(tasks, &state.terminal.tabs[*i]).map(|t| tasks[t].id())
                         == Some(id.clone())
-                        || state.terminal.tabs[*i].folder.starts_with(&task.path)
+                        || (host.is_none()
+                            && state.terminal.tabs[*i].folder.starts_with(&task.path))
                 })
                 .collect()
         });
@@ -1455,7 +1490,7 @@ impl EditorView {
                 let pr_head = state
                     .agents
                     .info
-                    .get(&t.path)
+                    .get(&t.id())
                     .and_then(|i| i.pull_request.as_ref())
                     .filter(|pr| pr.state == "MERGED")
                     .map(|pr| pr.head_oid.clone());
@@ -1496,8 +1531,9 @@ impl EditorView {
         let Some(main) = repo else {
             return;
         };
+        let runner = crate::platform::agents::runner(host.as_deref());
         // Dirty worktrees are refused before anything closes.
-        match crate::project::worktree::is_dirty(&task.path) {
+        match crate::project::worktree::is_dirty_on(&runner, &task.path) {
             Ok(false) => {}
             Ok(true) => {
                 state.say(
@@ -1530,15 +1566,21 @@ impl EditorView {
                 .filter(|t| t.folder)
                 .cloned()
                 .collect();
-            state.agents.selected =
-                crate::platform::agents::folder_task(&folders, &main).map(|i| folders[i].id());
+            state.agents.selected = match &host {
+                // The folder workspace on its host whose row it was under.
+                Some(_) => state.agents.parent_of_id(&id),
+                None => {
+                    crate::platform::agents::folder_task(&folders, &main).map(|i| folders[i].id())
+                }
+            };
         }
         let name = task.name();
         state
             .agents
             .start(&format!("Removing {name}\u{2026}"), move || {
                 Ok(Done {
-                    said: crate::project::worktree::remove(
+                    said: crate::project::worktree::remove_on(
+                        &runner,
                         &main,
                         &task,
                         base.as_deref(),
@@ -1551,6 +1593,19 @@ impl EditorView {
         self.after_terminal_layout();
         self.resume_display_link();
     }
+}
+
+/// Whether the selection is a workspace not in the list yet that the
+/// terminal showing is in: a worktree just made on a host, whose row comes
+/// when the host's list is read again. It stays selected until then.
+fn selection_coming(state: &State) -> bool {
+    state.agents.selected.is_some()
+        && state.agents.selected_index().is_none()
+        && state
+            .terminal
+            .active_tab()
+            .and_then(|t| t.workspace.as_ref())
+            == state.agents.selected.as_ref()
 }
 
 /// A terminal into the workspace `id`, its holder told too so a relaunch

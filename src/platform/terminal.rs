@@ -89,6 +89,16 @@ pub enum Activity {
 }
 
 impl Tab {
+    /// Whether what changes on this Mac can be its agent's, for review:
+    /// it has a review folder, and is not ssh to a host (a remote
+    /// workspace's terminal, or a shell in ssh now), whose writes are
+    /// there.
+    pub fn tracks_review(&self) -> bool {
+        !self.review.as_os_str().is_empty()
+            && self.remote.is_none()
+            && !crate::platform::remote::is_ssh_launch(&self.launch.program, &self.launch.args)
+    }
+
     /// Reads whether its shell is running ssh now, and where to. Returns
     /// whether that changed.
     pub fn read_remote(&mut self) -> bool {

@@ -43,15 +43,12 @@ impl EditorView {
                 let i = state.agents.selected_index()?;
                 state.agents.tasks[i].host.clone()
             });
-            let id = match &host {
-                Some(host) => format!("{host}:{}", path.display()),
-                None => path.to_string_lossy().into_owned(),
-            };
+            let id = crate::platform::agents::row_id(host.as_deref(), path);
             match action {
                 Action::OpenWorktree => self.open_worktree(&id),
                 Action::ReviewWorktree if host.is_none() => self.review_worktree(path),
-                Action::CleanUpWorktree if host.is_none() => self.clean_up_worktree(path),
-                Action::ReviewWorktree | Action::CleanUpWorktree => {}
+                Action::ReviewWorktree => {}
+                Action::CleanUpWorktree => self.clean_up_worktree(&id),
                 _ => self.worktree_terminal(&id),
             }
             self.request_redraw();
@@ -315,10 +312,11 @@ impl EditorView {
     }
 
     /// Its pull request is read again when the operation running in
-    /// `folder` answers.
+    /// `folder` (of the menu's workspace, on its host when remote) answers.
     fn read_pull_request_after(&self, folder: Option<PathBuf>) {
+        let host = self.menu_host();
         if let (Some(folder), Some(mut state)) = (folder, self.state_mut()) {
-            state.agents.pr_after = Some(folder);
+            state.agents.pr_after = Some(crate::platform::agents::row_id(host.as_deref(), &folder));
         }
     }
 
@@ -333,7 +331,8 @@ impl EditorView {
     pub(super) fn agent_remote(&self, what: crate::project::git::Remote) {
         let sock = self.state().and_then(|state| state.ssh_auth_sock.clone());
         let host = self.menu_host();
-        self.agent_operation(
+        let remote = host.is_some();
+        let folder = self.agent_operation(
             |t| format!("{} {}\u{2026}", what.verb(), t.name()),
             move |path| match host {
                 Some(host) => {
@@ -343,6 +342,11 @@ impl EditorView {
                 None => crate::project::git::remote(&path, what, sock.as_deref()),
             },
         );
+        // A host's pushes are not heard here (its Git is not watched): its
+        // pull request is read again when the push answers.
+        if remote && what == crate::project::git::Remote::Push {
+            self.read_pull_request_after(folder);
+        }
     }
 
     /// Merges the main checkout's branch into the workspace's.
@@ -394,18 +398,40 @@ impl EditorView {
         );
     }
 
-    /// Pushes the branch, then opens a pull request from its commits.
+    /// Pushes the branch, then opens a pull request from its commits. On
+    /// a host: pushed there, its title and body read there, and opened by
+    /// `gh` here on the repository's GitHub name.
     pub(super) fn agent_create_pull_request(&self) {
         let sock = self.state().and_then(|state| state.ssh_auth_sock.clone());
+        let task = self.menu_task();
+        let remote = task.as_ref().and_then(|t| {
+            Some((
+                t.host.clone()?,
+                t.github.clone()?,
+                t.branch.clone()?,
+                t.base.clone(),
+            ))
+        });
+        if task.as_ref().is_some_and(|t| t.host.is_some()) && remote.is_none() {
+            return;
+        }
         let folder = self.agent_operation(
             |t| format!("Opening a pull request for {}\u{2026}", t.name()),
             move |path| {
-                crate::project::git::remote(
+                use crate::project::git::Remote;
+                let Some((host, repo, branch, base)) = remote else {
+                    crate::project::git::remote(&path, Remote::Push, sock.as_deref())?;
+                    return crate::project::worktree::create_pull_request(&path);
+                };
+                let runner = crate::platform::agents::runner(Some(&host));
+                crate::project::worktree::remote_on(&runner, &path, Remote::Push)?;
+                let (title, body) = crate::project::worktree::pull_request_text_on(
+                    &runner,
                     &path,
-                    crate::project::git::Remote::Push,
-                    sock.as_deref(),
+                    base.as_deref(),
+                    &branch,
                 )?;
-                crate::project::worktree::create_pull_request(&path)
+                crate::project::worktree::create_pull_request_in(&repo, &branch, &title, &body)
             },
         );
         self.read_pull_request_after(folder);
@@ -420,7 +446,7 @@ impl EditorView {
             state
                 .agents
                 .info
-                .get(&task.path)
+                .get(&task.id())
                 .and_then(|info| info.pull_request.clone())
         }) else {
             return;
@@ -455,9 +481,20 @@ impl EditorView {
             return;
         }
         let number = pr.number;
+        // A host's is merged by `gh` here, told the repository's name.
+        let repo = task.github.clone().filter(|_| task.host.is_some());
+        if task.host.is_some() && repo.is_none() {
+            return;
+        }
         let folder = self.agent_operation(
             |_| format!("Merging #{number}\u{2026}"),
-            move |path| crate::project::worktree::merge_pull_request(&path, number, strategy),
+            move |path| {
+                let on = match repo {
+                    Some(repo) => crate::project::worktree::GitHub::Repo(repo),
+                    None => crate::project::worktree::GitHub::Dir(path),
+                };
+                crate::project::worktree::merge_pull_request_in(&on, number, strategy)
+            },
         );
         self.read_pull_request_after(folder);
     }

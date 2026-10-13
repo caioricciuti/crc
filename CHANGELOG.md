@@ -13,7 +13,18 @@ One entry per tag, written for people who use the editor.
   the background without ever prompting; a host that does not answer
   says so and keeps the rows it had. Its inspector shows the same Git
   cards as a local one, and Commit All, Pull, Push and Merge base In run
-  on the host. Not yet over `ssh`: new worktrees, pull requests, Review.
+  on the host. Worktrees work there too: a new task makes its worktree
+  on the host, beside the repository in `<repo>-worktrees`, and opens a
+  terminal in it; Remove, Clean Up, Clean Up All Merged and Prune run on
+  the host with the same checks and the same confirmation. Pull requests
+  of a repository whose origin is on GitHub show as badges and in the
+  inspector, asked of `gh` on this Mac by the repository's name, and can
+  be created and merged from crc. Whatever the login shell on the host
+  (bash, zsh, csh, fish), crc's commands run there with `sh`. A host ssh
+  cannot reach keeps its terminal open with ssh's error and the hosts in
+  `~/.ssh/config`, and New Workspace says when a typed host is not one of
+  them. A remote terminal never counts files on this Mac for review. Not
+  over `ssh`: Review, and merging a branch into a checkout.
 - Agents mode no longer stalls while agents write: counting the files to
   review read every checkpoint on the main thread, which with a large
   review history held the window for seconds. The count now reads one
@@ -21,6 +32,8 @@ One entry per tag, written for people who use the editor.
 - Pull request badges refresh on their own: every 20 s while checks run,
   60 s with open pull requests, less often otherwise, and right after a
   push of the branch from anywhere. A failed `gh` keeps the last badge.
+- In Agents mode a toolbar button shows or hides the workspace
+  inspector (also View > Workspace Inspector, `Cmd-Option-I`).
 - Leaving Agents opens the selected workspace's folder in the editor,
   and never opens the terminal panel by itself.
 - Removing a workspace takes the worktrees under it out of the list and

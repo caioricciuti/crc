@@ -101,7 +101,9 @@ pub fn batch_line(dir: &Path, commands: &[Vec<String>]) -> String {
             line.push(' ');
             line.push_str(&crate::platform::remote::quote(arg));
         }
-        line.push_str(" 2>/dev/null; printf '\\n\\036%d\\n' $?");
+        // `echo` ends the line: a backslash before a quote would not read
+        // the same in every login shell (see `remote::for_any_shell`).
+        line.push_str(" 2>/dev/null; printf '\\n\\036%d' $?; echo");
     }
     line
 }
@@ -359,9 +361,14 @@ pub fn parse_prunable(text: &str) -> usize {
 
 /// Forgets the worktrees of the repository at `main` whose folder is gone.
 pub fn prune(main: &Path) -> Result<String, String> {
-    let before = list_all(main)?.1;
-    run(main, &["worktree", "prune"])?;
-    let pruned = before.saturating_sub(list_all(main)?.1);
+    prune_on(&Runner::Local, main)
+}
+
+/// [`prune`], by `runner`.
+pub fn prune_on(runner: &Runner, main: &Path) -> Result<String, String> {
+    let before = list_all_on(runner, main)?.1;
+    write_on(runner, main, &[strings(&["worktree", "prune"])])?;
+    let pruned = before.saturating_sub(list_all_on(runner, main)?.1);
     Ok(match pruned {
         1 => "Pruned 1 missing worktree".to_owned(),
         n => format!("Pruned {n} missing worktrees"),
@@ -453,14 +460,55 @@ pub fn add(main: &Path, name: &str) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+/// Where a new task's worktree goes on a host, for the repository whose
+/// main checkout is `main` there: beside it, in `<main>-worktrees`, out of
+/// its tree as Application Support's folder is here (a host has none),
+/// and named for it, so two repositories never share one.
+pub fn remote_home(main: &Path) -> PathBuf {
+    let name = main
+        .file_name()
+        .map_or_else(|| "repo".into(), |n| n.to_string_lossy().into_owned());
+    main.with_file_name(format!("{name}-worktrees"))
+}
+
+/// [`add`], by `runner`: on a host, in [`remote_home`], with the same new
+/// branch from HEAD. Git makes the folders and refuses one that is there
+/// with something in it.
+pub fn add_on(runner: &Runner, main: &Path, name: &str) -> Result<PathBuf, String> {
+    if *runner == Runner::Local {
+        return add(main, name);
+    }
+    let branch = branch_name(name);
+    if branch.is_empty() {
+        return Err("Type a name with a letter or digit in it".into());
+    }
+    let dir = remote_home(main).join(branch.replace('/', "-"));
+    let target = dir.to_string_lossy().into_owned();
+    write_on(
+        runner,
+        main,
+        &[strings(&[
+            "worktree", "add", "-b", &branch, &target, "HEAD",
+        ])],
+    )?;
+    Ok(dir)
+}
+
 /// Whether the checkout at `dir` has changes Git would lose on removal:
 /// anything modified, staged or untracked.
 pub fn is_dirty(dir: &Path) -> Result<bool, String> {
-    Ok(
-        !run(dir, &["status", "--porcelain", "--untracked-files=normal"])?
-            .trim()
-            .is_empty(),
-    )
+    is_dirty_on(&Runner::Local, dir)
+}
+
+/// [`is_dirty`], by `runner`.
+pub fn is_dirty_on(runner: &Runner, dir: &Path) -> Result<bool, String> {
+    Ok(!run_on(
+        runner,
+        dir,
+        &["status", "--porcelain", "--untracked-files=normal"],
+    )?
+    .trim()
+    .is_empty())
 }
 
 /// Removes a task's worktree, refused while it has changes. The branch is
@@ -475,38 +523,51 @@ pub fn remove(
     base: Option<&str>,
     merged_pr_head: Option<&str>,
 ) -> Result<String, String> {
+    remove_on(&Runner::Local, main, tree, base, merged_pr_head)
+}
+
+/// [`remove`], by `runner`: on a host, each check and change over ssh.
+pub fn remove_on(
+    runner: &Runner,
+    main: &Path,
+    tree: &Worktree,
+    base: Option<&str>,
+    merged_pr_head: Option<&str>,
+) -> Result<String, String> {
     if tree.main {
         return Err("The repository's own checkout is not a task".into());
     }
-    if is_dirty(&tree.path)? {
+    if is_dirty_on(runner, &tree.path)? {
         return Err(format!(
             "{} has uncommitted changes; commit or discard them first",
             tree.name()
         ));
     }
     let target = tree.path.to_string_lossy().into_owned();
-    run(main, &["worktree", "remove", &target])?;
+    write_on(runner, main, &[strings(&["worktree", "remove", &target])])?;
     let Some(branch) = &tree.branch else {
         return Ok(format!("Removed {}", tree.name()));
     };
+    let delete = || write_on(runner, main, &[strings(&["branch", "-D", branch])]);
     // Checked now, not from what the list last read: -D deletes whatever
     // the branch holds.
-    let in_base = base.filter(|b| *b != branch).is_some_and(|b| {
-        git(main)
-            .args(["merge-base", "--is-ancestor", branch, b])
-            .output()
-            .is_ok_and(|o| o.status.success())
-    });
+    let in_base = match base.filter(|b| *b != branch) {
+        Some(b) => match run_on(runner, main, &["merge-base", "--is-ancestor", branch, b]) {
+            Err(e) if e == UNREACHABLE => return Err(e),
+            said => said.is_ok(),
+        },
+        None => false,
+    };
     if in_base {
-        run(main, &["branch", "-D", branch])?;
+        delete()?;
         return Ok(format!("Removed {branch} and its branch"));
     }
     if let Some(head) = merged_pr_head.filter(|h| !h.is_empty()) {
-        let tip = run(main, &["rev-parse", "--verify", "--quiet", branch])
+        let tip = run_on(runner, main, &["rev-parse", "--verify", "--quiet", branch])
             .map(|t| t.trim().to_owned())
             .unwrap_or_default();
         if tip == head {
-            run(main, &["branch", "-D", branch])?;
+            delete()?;
             return Ok(format!(
                 "Removed {branch} and its branch (its pull request was merged)"
             ));
@@ -515,10 +576,12 @@ pub fn remove(
             "Removed {branch}; the branch has commits its merged pull request does not, so it was kept"
         ));
     }
-    Ok(match run(main, &["branch", "-d", branch]) {
-        Ok(_) => format!("Removed {branch} and its branch"),
-        Err(_) => format!("Removed {branch}; the branch has unmerged commits and was kept"),
-    })
+    Ok(
+        match write_on(runner, main, &[strings(&["branch", "-d", branch])]) {
+            Ok(_) => format!("Removed {branch} and its branch"),
+            Err(_) => format!("Removed {branch}; the branch has unmerged commits and was kept"),
+        },
+    )
 }
 
 /// The local branches of the repository at `main` whose commits are all on
@@ -693,25 +756,42 @@ pub fn default_branch_on(
     branches: &[Tip],
     current: Option<&str>,
 ) -> Result<Option<String>, String> {
-    let commands = [
-        vec![
+    Ok(default_and_origin_on(runner, main, branches, current, false)?.0)
+}
+
+/// [`default_branch_on`], and with `origin`, in the same batch, the URL of
+/// the `origin` remote (`None` without one).
+pub fn default_and_origin_on(
+    runner: &Runner,
+    main: &Path,
+    branches: &[Tip],
+    current: Option<&str>,
+    origin: bool,
+) -> Result<(Option<String>, Option<String>), String> {
+    let mut commands = vec![
+        strings(&[
             "symbolic-ref",
             "--quiet",
             "--short",
             "refs/remotes/origin/HEAD",
-        ],
-        vec!["config", "--get", "init.defaultBranch"],
-    ]
-    .map(|args| args.into_iter().map(str::to_owned).collect::<Vec<_>>());
+        ]),
+        strings(&["config", "--get", "init.defaultBranch"]),
+    ];
+    if origin {
+        commands.push(strings(&["remote", "get-url", "origin"]));
+    }
     let mut said = batch_on(runner, main, &commands)?
         .into_iter()
         .map(Result::ok);
-    let (origin, init) = (said.next().flatten(), said.next().flatten());
-    Ok(pick_default(
-        origin.as_deref(),
-        init.as_deref(),
-        branches,
-        current,
+    let (head, init) = (said.next().flatten(), said.next().flatten());
+    let url = said
+        .next()
+        .flatten()
+        .map(|u| u.trim().to_owned())
+        .filter(|u| !u.is_empty());
+    Ok((
+        pick_default(head.as_deref(), init.as_deref(), branches, current),
+        url,
     ))
 }
 
@@ -806,24 +886,93 @@ fn gh() -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
+/// Where `gh` finds a repository: its checkout on this Mac, or for one on
+/// a host, its GitHub name (`owner/name`, from its origin; see
+/// [`github_repo`]), `gh` still running here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GitHub {
+    Dir(PathBuf),
+    Repo(String),
+}
+
+impl GitHub {
+    /// `gh`, never asking anything, in the checkout or told the repository.
+    /// The repository goes after the subcommand's own arguments.
+    fn command(&self, args: &[&str]) -> Result<Command, String> {
+        let gh = gh().ok_or("GitHub's gh is not installed")?;
+        let mut cmd = Command::new(gh);
+        cmd.args(args)
+            .env("GH_PROMPT_DISABLED", "1")
+            .env("NO_COLOR", "1")
+            .stdin(std::process::Stdio::null());
+        match self {
+            GitHub::Dir(dir) => {
+                cmd.current_dir(dir);
+            }
+            // Run away from any checkout, so none but the one named is
+            // taken for it.
+            GitHub::Repo(repo) => {
+                cmd.args(["--repo", repo]).current_dir(std::env::temp_dir());
+            }
+        }
+        Ok(cmd)
+    }
+}
+
+/// The GitHub repository (`owner/name`) a remote's URL points at: the
+/// https and ssh forms of github.com. `None` for any other host, which
+/// `gh` is not asked about.
+pub fn github_repo(url: &str) -> Option<String> {
+    let url = url.trim();
+    let rest = if let Some(rest) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .or_else(|| url.strip_prefix("ssh://"))
+        .or_else(|| url.strip_prefix("git://"))
+    {
+        // `user@` and a port, as `ssh://git@github.com:22/o/r` has them.
+        let (host, path) = rest.split_once('/')?;
+        let host = host.rsplit('@').next()?;
+        let host = host.split(':').next()?;
+        (host.eq_ignore_ascii_case("github.com") || host.eq_ignore_ascii_case("www.github.com"))
+            .then_some(path)?
+    } else {
+        // scp-like: `git@github.com:o/r.git`.
+        let (host, path) = url.split_once(':')?;
+        let host = host.rsplit('@').next()?;
+        host.eq_ignore_ascii_case("github.com").then_some(path)?
+    };
+    let rest = rest.trim_end_matches('/');
+    let rest = rest.strip_suffix(".git").unwrap_or(rest);
+    let (owner, name) = rest.split_once('/')?;
+    let fine = |part: &str| {
+        !part.is_empty()
+            && !part.starts_with('.')
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    (fine(owner) && fine(name)).then(|| format!("{owner}/{name}"))
+}
+
 /// The pull request for `branch`, asked of `gh` in `dir`: `None` when the
 /// branch has none; an error without `gh`, offline, or when `gh` failed,
 /// so a row keeps what it last said.
 pub fn pull_request(dir: &Path, branch: &str) -> Result<Option<PullRequest>, String> {
-    let gh = gh().ok_or("GitHub's gh is not installed")?;
-    let output = Command::new(gh)
-        .current_dir(dir)
-        .args([
+    pull_request_in(&GitHub::Dir(dir.to_path_buf()), branch)
+}
+
+/// [`pull_request`], of the repository `where_`.
+pub fn pull_request_in(where_: &GitHub, branch: &str) -> Result<Option<PullRequest>, String> {
+    let output = where_
+        .command(&[
             "pr",
             "view",
             branch,
             "--json",
             "number,state,url,statusCheckRollup,title,author,commits,additions,deletions,\
              baseRefName,headRefName,headRefOid,isDraft,mergeable",
-        ])
-        .env("GH_PROMPT_DISABLED", "1")
-        .env("NO_COLOR", "1")
-        .stdin(std::process::Stdio::null())
+        ])?
         .output()
         .map_err(|e| e.to_string())?;
     pull_request_answer(
@@ -1265,17 +1414,10 @@ pub fn remote_on(
     }
 }
 
-/// `gh` in `dir`, never asking anything: what it printed, or its error.
-fn run_gh(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let gh = gh().ok_or("GitHub's gh is not installed")?;
-    let output = Command::new(gh)
-        .current_dir(dir)
-        .args(args)
-        .env("GH_PROMPT_DISABLED", "1")
-        .env("NO_COLOR", "1")
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|e| e.to_string())?;
+/// `gh` on the repository `where_`, never asking anything: what it
+/// printed, or its error.
+fn run_gh(where_: &GitHub, args: &[&str]) -> Result<String, String> {
+    let output = where_.command(args)?.output().map_err(|e| e.to_string())?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
     } else {
@@ -1292,11 +1434,73 @@ pub fn has_gh() -> bool {
 /// Opens a pull request for the workspace's branch, its title and body
 /// from the commits. The branch must be pushed first.
 pub fn create_pull_request(dir: &Path) -> Result<String, String> {
-    let url = run_gh(dir, &["pr", "create", "--fill"])?;
-    Ok(format!(
+    let url = run_gh(&GitHub::Dir(dir.to_path_buf()), &["pr", "create", "--fill"])?;
+    Ok(opened(&url))
+}
+
+fn opened(url: &str) -> String {
+    format!(
         "Opened {}",
         url.lines().last().unwrap_or("the pull request")
-    ))
+    )
+}
+
+/// A pull request's title and body from the commits `dir`'s branch has
+/// that `base` does not, by `runner`, as `gh`'s `--fill` makes them: one
+/// commit's subject and body, else the branch's name and a line per
+/// commit. For a branch on a host, whose commits `gh` here cannot read.
+pub fn pull_request_text_on(
+    runner: &Runner,
+    dir: &Path,
+    base: Option<&str>,
+    branch: &str,
+) -> Result<(String, String), String> {
+    let range = format!("{}..HEAD", base.unwrap_or("@{u}"));
+    let mut said = batch_on(
+        runner,
+        dir,
+        &[
+            strings(&["log", "--reverse", "--format=%s", &range]),
+            strings(&["log", "-1", "--format=%b"]),
+        ],
+    )?
+    .into_iter();
+    let subjects: Vec<String> = said
+        .next()
+        .and_then(Result::ok)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_owned)
+        .collect();
+    let body = said.next().and_then(Result::ok).unwrap_or_default();
+    Ok(match subjects.as_slice() {
+        [one] => (one.clone(), body.trim().to_owned()),
+        many => (
+            branch.replace(['-', '_'], " "),
+            many.iter()
+                .map(|s| format!("- {s}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+    })
+}
+
+/// Opens a pull request on the GitHub repository `repo` for `branch`,
+/// pushed there already, with `title` and `body`: no checkout here.
+pub fn create_pull_request_in(
+    repo: &str,
+    branch: &str,
+    title: &str,
+    body: &str,
+) -> Result<String, String> {
+    let url = run_gh(
+        &GitHub::Repo(repo.to_owned()),
+        &[
+            "pr", "create", "--head", branch, "--title", title, "--body", body,
+        ],
+    )?;
+    Ok(opened(&url))
 }
 
 /// How a pull request is merged on GitHub.
@@ -1324,8 +1528,17 @@ pub fn merge_pull_request(
     number: u64,
     strategy: MergeStrategy,
 ) -> Result<String, String> {
+    merge_pull_request_in(&GitHub::Dir(dir.to_path_buf()), number, strategy)
+}
+
+/// [`merge_pull_request`], on the repository `where_`.
+pub fn merge_pull_request_in(
+    where_: &GitHub,
+    number: u64,
+    strategy: MergeStrategy,
+) -> Result<String, String> {
     let n = number.to_string();
-    run_gh(dir, &["pr", "merge", &n, strategy.flag()])?;
+    run_gh(where_, &["pr", "merge", &n, strategy.flag()])?;
     Ok(format!("Merged pull request #{number}"))
 }
 
@@ -1488,8 +1701,8 @@ mod tests {
             "cd '/srv/my app' || exit 1; \
              export LC_ALL=C GIT_TERMINAL_PROMPT=0 GIT_OPTIONAL_LOCKS=0; \
              git 'for-each-ref' '--format=%(refname:short)%09x' 2>/dev/null; \
-             printf '\\n\\036%d\\n' $?; \
-             git 'log' 'it'\\''s $HOME' 2>/dev/null; printf '\\n\\036%d\\n' $?"
+             printf '\\n\\036%d' $?; echo; \
+             git 'log' 'it'\"'\"'s $HOME' 2>/dev/null; printf '\\n\\036%d' $?; echo"
         );
         assert!(batch_line(Path::new("~/x"), &[]).starts_with("cd ~/'x' || exit 1;"));
         assert_eq!(
@@ -1620,7 +1833,7 @@ mod tests {
         assert_eq!(
             write_line(Path::new("/srv/my app"), &commands),
             "cd '/srv/my app' || exit 1; export LC_ALL=C GIT_TERMINAL_PROMPT=0; \
-             git 'add' '--all' && git 'commit' '-m' 'it'\\''s $HOME\nmore'"
+             git 'add' '--all' && git 'commit' '-m' 'it'\"'\"'s $HOME\nmore'"
         );
         // Run by a shell: the message arrives as typed, and a failing first
         // command stops the rest with Git's own error on stderr.
@@ -1962,6 +2175,112 @@ mod tests {
             "Removed later; the branch has commits its merged pull request does not, so it was kept"
         );
         assert!(run(repo, &["rev-parse", "--verify", "--quiet", "later"]).is_ok());
+    }
+
+    #[test]
+    fn a_remote_names_its_github_repository() {
+        for url in [
+            "https://github.com/me/garden-log.git",
+            "https://github.com/me/garden-log",
+            "https://token@github.com/me/garden-log/",
+            "git@github.com:me/garden-log.git",
+            "ssh://git@github.com/me/garden-log.git",
+            "ssh://git@github.com:22/me/garden-log",
+            "git://github.com/me/garden-log.git",
+            " https://www.github.com/me/garden-log \n",
+        ] {
+            assert_eq!(github_repo(url).as_deref(), Some("me/garden-log"), "{url}");
+        }
+        for url in [
+            "https://gitlab.com/me/garden-log.git",
+            "git@example.com:me/garden-log.git",
+            "/srv/git/garden-log.git",
+            "../origin.git",
+            "https://github.com/me",
+            "https://github.com/me/x/y",
+            "https://github.com/me/$(x)",
+            "",
+        ] {
+            assert_eq!(github_repo(url), None, "{url}");
+        }
+    }
+
+    #[test]
+    fn a_task_is_made_committed_to_removed_and_pruned_on_a_host() {
+        // The host is this Mac, its login shell csh: a stand-in ssh runs
+        // what it is given with `/bin/csh -c`, as ssh has the login shell
+        // do. Every step goes through it, the commit's message with a line
+        // break and a `!` in it.
+        if !Path::new("/bin/csh").exists() {
+            return;
+        }
+        let tree = fixture("remote-tasks", "main", &[]);
+        let repo = &tree.0;
+        ok_in(repo, &["config", "user.name", "t"]);
+        ok_in(repo, &["config", "user.email", "t@t"]);
+        let stub = repo.with_extension("ssh");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\nfor last; do :; done\nexec /bin/csh -c \"$last\"\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // SAFETY: tests in this module are the only readers of the variable.
+        unsafe { std::env::set_var("CRC_SSH_COMMAND", &stub) };
+        let runner = Runner::Ssh {
+            host: "box".into(),
+            control: None,
+        };
+        let home = remote_home(repo);
+        assert_eq!(
+            home.file_name().map(|n| n.to_string_lossy().into_owned()),
+            Some(format!(
+                "{}-worktrees",
+                repo.file_name().unwrap().to_string_lossy()
+            ))
+        );
+        let dir = add_on(&runner, repo, "Try It").unwrap();
+        assert_eq!(dir, home.join("try-it"));
+        assert!(dir.join("a.txt").is_file());
+        assert_eq!(list_all_on(&runner, repo).unwrap().0.len(), 2);
+        // Made again: Git refuses, and says why.
+        let again = add_on(&runner, repo, "Try It").unwrap_err();
+        assert!(again.contains("already exists"), "{again}");
+
+        std::fs::write(dir.join("b.txt"), "two\n").unwrap();
+        assert_eq!(is_dirty_on(&runner, &dir), Ok(true));
+        let task = Worktree {
+            path: dir.clone(),
+            branch: Some("try-it".into()),
+            main: false,
+        };
+        assert!(remove_on(&runner, repo, &task, Some("main"), None).is_err());
+        assert!(dir.is_dir());
+        assert_eq!(
+            commit_all_on(&runner, &dir, "two\nlines! and \\ a backslash"),
+            Ok("Committed 1 file".to_owned())
+        );
+        let log = run(&dir, &["log", "-1", "--format=%B"]).unwrap();
+        assert_eq!(log.trim(), "two\nlines! and \\ a backslash");
+        ok_in(repo, &["merge", "-q", "--ff-only", "try-it"]);
+        assert_eq!(
+            remove_on(&runner, repo, &task, Some("main"), None),
+            Ok("Removed try-it and its branch".to_owned())
+        );
+        assert!(!dir.exists());
+        assert!(run(repo, &["rev-parse", "--verify", "--quiet", "try-it"]).is_err());
+
+        // One whose folder went: pruned there.
+        let gone = add_on(&runner, repo, "gone").unwrap();
+        std::fs::remove_dir_all(&gone).unwrap();
+        assert_eq!(list_all_on(&runner, repo).unwrap().1, 1);
+        assert_eq!(
+            prune_on(&runner, repo),
+            Ok("Pruned 1 missing worktree".to_owned())
+        );
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_file(&stub);
     }
 
     #[test]

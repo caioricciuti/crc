@@ -7225,10 +7225,19 @@ enum Pick {
 /// The New Workspace prompt's rows: a folder workspace on `folder` (or,
 /// while renaming one, its new name), and in a repository a task on a
 /// new branch.
+/// A new task's repository as the palette names it: a folder of this Mac
+/// as [`shown_path`] has it, one on a host as `host:path`.
+pub(crate) fn shown_repo(host: Option<String>, repo: &Path) -> String {
+    match host {
+        Some(host) => format!("{host}:{}", repo.display()),
+        None => shown_path(repo),
+    }
+}
+
 fn task_rows(
     query: &str,
     folder: Option<&Path>,
-    repo: Option<&Path>,
+    repo: Option<&str>,
     renaming: Option<&str>,
 ) -> Vec<(layout::PaletteRow, Pick)> {
     let name = query.trim();
@@ -7247,13 +7256,18 @@ fn task_rows(
             Pick::NewWorkspace(name.to_owned()),
         )];
     }
-    // `host:/path` or `host:~/path`: a folder on that host, over ssh.
+    // `host:/path` or `host:~/path`: a folder on that host, over ssh. A
+    // host ssh will likely not find is said, the config's offered; it can
+    // still be made.
     if let Some((host, path)) = crate::platform::remote::workspace_target(name) {
+        let detail =
+            crate::platform::remote::unknown_host(&host, &crate::platform::remote::known_hosts())
+                .unwrap_or_else(|| "terminals, worktrees and Git there over ssh".into());
         return vec![(
             layout::PaletteRow {
                 icon: Some(crate::project::icons::SERVER),
                 title: format!("New remote workspace on {host}:{path}"),
-                detail: "terminals there over ssh; no Git read".into(),
+                detail,
                 shortcut: String::new(),
             },
             Pick::NewRemoteWorkspace(host, path),
@@ -7287,10 +7301,7 @@ fn task_rows(
             layout::PaletteRow {
                 icon: Some(crate::project::icons::GIT_BRANCH),
                 title: format!("Start \u{201c}{branch}\u{201d} on a new branch"),
-                detail: format!(
-                    "from HEAD of {}, in its own worktree, with a terminal",
-                    shown_path(repo)
-                ),
+                detail: format!("from HEAD of {repo}, in its own worktree, with a terminal"),
                 shortcut: String::new(),
             },
             Pick::NewTask(name.to_owned()),
@@ -7593,7 +7604,8 @@ struct PaletteSources<'a> {
     /// The folder a new workspace is made on unless you choose one, and
     /// the repository a task on a new branch is made in, when there is one.
     task_folder: Option<std::path::PathBuf>,
-    task_repo: Option<std::path::PathBuf>,
+    /// As the palette shows it: `host:path` for one on a host.
+    task_repo: Option<String>,
     /// The folder workspace being renamed, by name.
     task_rename: Option<&'a str>,
     /// Set while taking a commit message, the workspace's name.
@@ -7619,7 +7631,10 @@ fn palette_sources(state: &State) -> PaletteSources<'_> {
         mcp_url: state.mcp_url_prompt,
         task: state.task_prompt,
         task_folder: state.agents.new_folder(state.tree.root()),
-        task_repo: state.agents.task_repo(),
+        task_repo: state
+            .agents
+            .task_repo()
+            .map(|(host, repo)| shown_repo(host, &repo)),
         task_rename: state.agents.renaming_name(),
         commit: state.commit_prompt.as_deref(),
     }
