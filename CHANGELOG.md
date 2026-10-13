@@ -2,7 +2,7 @@
 
 One entry per tag, written for people who use the editor.
 
-## Unreleased
+## v0.2.0-alpha.23, 2026-10-13
 
 - Agents: a workspace can live on a server. Type `host:/path` (an
   `~/.ssh/config` alias or `user@host`) in New Workspace; its terminals
