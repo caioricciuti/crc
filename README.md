@@ -143,10 +143,20 @@ the size and write it back.
   a workspace and `Cmd-Shift-U` the next session waiting on you, which
   the Dock icon counts. The list keeps your order (pinned, then dragged,
   then as made); nothing a terminal does moves a row. It is read again
-  every minute.
+  every minute, and pull requests on their own: every 20 s while checks
+  run, every minute with open ones, and right after a push.
+- **Workspaces on a server**: type `host:/path` in New Workspace (an
+  `~/.ssh/config` alias or `user@host`). Its terminals and Claude
+  sessions open over `ssh` in that folder, one connection shared per
+  host; its repositories and worktrees are listed and its inspector
+  cards read over `ssh` in the background, never prompting. Commit,
+  pull, push, merge base in, new tasks (worktrees beside the repository
+  on the host), clean up and prune run on the host; pull requests are
+  asked of `gh` on this Mac by the repository's GitHub name. A host that
+  does not answer keeps its rows and says so.
 - **The workspace inspector** (right of the terminal in Agents mode,
-  `Cmd-Option-I` to hide or show it) says where each repository of the
-  selected workspace stands, one card each: commits ahead of and behind
+  `Cmd-Option-I` or the toolbar button to hide or show it) says where
+  each repository of the selected workspace stands, one card each: commits ahead of and behind
   main, the lines it changes, what is left to push or pull, and its
   uncommitted files; for a main checkout, the latest tag and the
   commits since. Each card's buttons act on its own repository. The
@@ -294,17 +304,19 @@ the size and write it back.
   too, compared with Git's staged copy, but can only be kept: no copy from
   before exists. `claude` typed in a crc shell gets the hooks only if you
   add them to its settings.
-- **Agents mode is local.** A workspace's sessions outlive crc; after a
-  reboot they are started again (a new shell in the same folder, and
+- **Agents mode is mostly local.** A workspace's sessions outlive crc;
+  after a reboot they are started again (a new shell in the same folder, and
   `claude --continue`, which picks the folder's latest conversation, so
   two Claude sessions in one folder both resume the same one; the
   scrollback is gone). A session taken back after a restart has lost its link to the
-  editor (`/ide` in Claude Code reconnects it), pull requests and checks
-  are read again every minute rather than live, and tasks run on this
-  Mac only. Only the terminals of the folder open in the editor come
-  back after a reboot. An ssh session is shown from its command line
-  and `~/.ssh/config` alone: nothing about the server itself (load,
-  disk, its Git) is read.
+  editor (`/ide` in Claude Code reconnects it), and pull requests and
+  checks are polled rather than live. Only the terminals of the folder
+  open in the editor come back after a reboot. On a server workspace,
+  Claude runs without crc's review hooks (no Review page or undo for
+  it), the editor cannot open its files, and nothing about
+  the server itself (load, disk) is read. An ssh session typed in a
+  local terminal is shown from its command line and `~/.ssh/config`
+  alone.
 - **No minimap.** Folding is by indentation, not by syntax.
 - **Markdown styling has edges.** Italic is not drawn on lines with
   non-ASCII text, and bold there is the regular face drawn twice; a line
