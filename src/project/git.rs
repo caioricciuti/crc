@@ -689,50 +689,24 @@ pub struct Mark {
     pub kind: MarkKind,
 }
 
-/// Gutter marks for a diff of HEAD against the current text.
+/// Gutter marks for the changes from HEAD to the current text.
 ///
-/// A run of removed and added lines is one change: its added lines are
-/// modifications when anything was removed in the same run, additions
-/// otherwise, and a run with nothing added is a deletion sitting above the
-/// next line that survived.
-pub fn marks(diff: &Diff) -> Vec<Mark> {
+/// Each line a change holds is marked with its kind: modified when the
+/// change removed anything, added otherwise. A change with nothing added is
+/// one deletion mark, on the next line that survived.
+pub fn marks(changes: &[crate::ide::diff::Change]) -> Vec<Mark> {
     let mut out = Vec::new();
-    let lines = &diff.lines;
-    let mut previous_new = 0;
-    let mut i = 0;
-    while i < lines.len() {
-        if !matches!(lines[i].kind, DiffKind::Removed | DiffKind::Added) {
-            if let Some(new) = lines[i].new {
-                previous_new = new;
-            }
-            i += 1;
-            continue;
-        }
-        let start = i;
-        while i < lines.len() && matches!(lines[i].kind, DiffKind::Removed | DiffKind::Added) {
-            i += 1;
-        }
-        let run = &lines[start..i];
-        let removed = run.iter().any(|l| l.kind == DiffKind::Removed);
-        let added: Vec<usize> = run.iter().filter_map(|l| l.new).collect();
-        if added.is_empty() {
+    for change in changes {
+        if change.kind == MarkKind::Removed {
             out.push(Mark {
-                line: previous_new,
+                line: change.new_start,
                 kind: MarkKind::Removed,
             });
         } else {
-            let kind = if removed {
-                MarkKind::Modified
-            } else {
-                MarkKind::Added
-            };
-            for new in added {
-                out.push(Mark {
-                    line: new - 1,
-                    kind,
-                });
-                previous_new = new;
-            }
+            out.extend((change.new_start..change.new_end).map(|line| Mark {
+                line,
+                kind: change.kind,
+            }));
         }
     }
     out
@@ -1813,7 +1787,7 @@ mod tests {
     }
 
     fn marks_between(old: &str, new: &str) -> Vec<(usize, MarkKind)> {
-        marks(&crate::ide::diff::diff(old, new))
+        marks(&crate::ide::diff::changes(old, new))
             .into_iter()
             .map(|m| (m.line, m.kind))
             .collect()

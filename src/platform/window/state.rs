@@ -14,8 +14,8 @@ pub(super) struct Gutter {
     /// Buffers whose HEAD text is being fetched on a worker.
     pub(super) pending: HashSet<u64>,
     pub(super) heads: (mpsc::Sender<HeadText>, mpsc::Receiver<HeadText>),
-    /// Gutter marks computed on a worker: document, the text they are for,
-    /// the marks.
+    /// Changes against HEAD computed on a worker: document, the text they
+    /// are for, the changes.
     pub(super) computed: (mpsc::Sender<GutterMarks>, mpsc::Receiver<GutterMarks>),
     pub(super) diffing: HashSet<u64>,
 }

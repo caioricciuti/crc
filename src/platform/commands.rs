@@ -263,6 +263,12 @@ mod tests {
         assert_eq!(shortcut("\r", cmd), "⌘↩");
         assert_eq!(shortcut("\u{8}", cmd), "⌘⌫");
         assert_eq!(shortcut("\u{F70F}", cmd), "⌘F12");
+        let option = NSEventModifierFlags::Option;
+        assert_eq!(shortcut("\u{F708}", option), "⌥F5");
+        assert_eq!(
+            shortcut("\u{F708}", option | NSEventModifierFlags::Shift),
+            "⌥⇧F5"
+        );
         assert_eq!(shortcut("", cmd), "");
     }
 }

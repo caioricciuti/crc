@@ -82,7 +82,9 @@ the size and write it back.
   Python, C, C++, Go, HTML, CSS, JavaScript and JSX, TypeScript and TSX,
   JSON, TOML, YAML and shell. Languages embedded in one another are parsed
   as themselves. Indent guides, bracket-pair highlight, and Git marks in the
-  gutter for lines that differ from HEAD.
+  gutter for lines that differ from HEAD. Git > Next Change (`Option-F5`)
+  and Previous Change (`Shift-Option-F5`) step through them, and Revert
+  Change puts the one at the caret back to HEAD as an edit you can undo.
 - **Completion that learns, in every language**: the best guess appears as
   ghost text at the caret (Tab takes it) and the alternatives as a single
   row of chips under the line, with a line saying why the picked one is

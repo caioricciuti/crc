@@ -52,6 +52,7 @@ use crate::text::documents::Documents;
 
 mod agents;
 mod appearance;
+mod changes;
 mod claude;
 mod completion;
 mod conflicts;
@@ -178,6 +179,7 @@ mod key {
     pub const SPACE: u16 = 49;
     pub const F1: u16 = 122;
     pub const F2: u16 = 120;
+    pub const F5: u16 = 96;
     pub const F12: u16 = 111;
     pub const F: u16 = 3;
     pub const O: u16 = 31;
@@ -3022,6 +3024,21 @@ define_class!(
             self.step_conflict(false, false);
         }
 
+        #[unsafe(method(nextChange:))]
+        fn action_next_change(&self, _sender: Option<&AnyObject>) {
+            self.step_change(true);
+        }
+
+        #[unsafe(method(previousChange:))]
+        fn action_previous_change(&self, _sender: Option<&AnyObject>) {
+            self.step_change(false);
+        }
+
+        #[unsafe(method(revertChange:))]
+        fn action_revert_change(&self, _sender: Option<&AnyObject>) {
+            self.revert_change();
+        }
+
         #[unsafe(method(acceptCurrent:))]
         fn action_accept_current(&self, _sender: Option<&AnyObject>) {
             self.take_conflict_at_caret(crate::project::conflict::Take::Current);
@@ -4258,6 +4275,11 @@ define_class!(
                 || action == sel!(acceptBoth:)
             {
                 active_conflicts(&state).is_some_and(|v| !v.conflicts.is_empty())
+            } else if action == sel!(nextChange:)
+                || action == sel!(previousChange:)
+                || action == sel!(revertChange:)
+            {
+                changes::active_has_changes(&state)
             } else if action == sel!(acceptBase:) {
                 active_conflicts(&state).is_some_and(|v| v.has_base())
             } else if action == sel!(gitFetch:)
@@ -4555,6 +4577,11 @@ struct GutterState {
     /// `None` means the file is not in a repository, so there are no marks.
     head: Option<std::sync::Arc<String>>,
     marks: Vec<crate::project::git::Mark>,
+    /// The runs of changed lines the marks come from.
+    changes: Vec<crate::ide::diff::Change>,
+    /// The text `changes` describe; the buffer has moved on when it is not
+    /// this very rope.
+    text: Option<crate::text::rope::Rope>,
 }
 
 /// Files past this size get no gutter marks: the diff reads the whole
@@ -6098,7 +6125,7 @@ fn claude_selection(state: &State) -> Option<crate::ide::mcp::Selection> {
 type ReloadRead = (u64, std::io::Result<crate::text::buffer::DiskRead>);
 /// Gutter marks worked out on a worker: buffer id, the text they are for,
 /// the marks.
-type GutterMarks = (u64, crate::text::rope::Rope, Vec<crate::project::git::Mark>);
+type GutterMarks = (u64, crate::text::rope::Rope, Vec<crate::ide::diff::Change>);
 
 /// Files changed on disk up to this size are reloaded at once; larger ones
 /// are read on a worker so the window stays responsive.
@@ -8516,6 +8543,16 @@ fn install_menu(mtm: MainThreadMarker, app: &NSApplication) {
         "",
         false,
     ));
+    git_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    // Option-F5, as the editors that step through changes bind it.
+    let next_change = item("Next Change", sel!(nextChange:), "\u{F708}", false);
+    next_change.setKeyEquivalentModifierMask(NSEventModifierFlags::Option);
+    git_menu.addItem(&next_change);
+    let previous_change = item("Previous Change", sel!(previousChange:), "\u{F708}", false);
+    previous_change
+        .setKeyEquivalentModifierMask(NSEventModifierFlags::Shift | NSEventModifierFlags::Option);
+    git_menu.addItem(&previous_change);
+    git_menu.addItem(&item("Revert Change", sel!(revertChange:), "", false));
     git_menu.addItem(&NSMenuItem::separatorItem(mtm));
     git_menu.addItem(&item("Next Conflict", sel!(nextConflict:), "", false));
     git_menu.addItem(&item(

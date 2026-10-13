@@ -132,14 +132,16 @@ impl EditorView {
             return;
         };
         // Marks worked out on a worker, for text that has not moved on.
-        while let Ok((id, text, marks)) = state.gutter.computed.1.try_recv() {
+        while let Ok((id, text, changes)) = state.gutter.computed.1.try_recv() {
             state.gutter.diffing.remove(&id);
             let current = all_docs(&state)
                 .flat_map(|d| d.iter())
                 .find(|b| b.id() == id)
                 .is_some_and(|b| b.rope.same_as(&text));
             if current && let Some(entry) = state.gutter.docs.get_mut(&id) {
-                entry.marks = marks;
+                entry.marks = crate::project::git::marks(&changes);
+                entry.changes = changes;
+                entry.text = Some(text);
                 self.ivars().needs_redraw.set(true);
             }
         }
@@ -152,6 +154,8 @@ impl EditorView {
                 GutterState {
                     head: head.map(std::sync::Arc::new),
                     marks: Vec::new(),
+                    changes: Vec::new(),
+                    text: None,
                 },
             );
             if has_head {
@@ -219,6 +223,8 @@ impl EditorView {
             };
             if buffer.rope.len_bytes() > GUTTER_MAX_BYTES {
                 entry.marks.clear();
+                entry.changes.clear();
+                entry.text = None;
                 continue;
             }
             // Myers over a couple of megabytes with hundreds of changes is
@@ -228,8 +234,8 @@ impl EditorView {
             gutter_diffing.insert(id);
             std::thread::spawn(move || {
                 let text = snapshot.to_string();
-                let marks = crate::project::git::marks(&crate::ide::diff::diff(&head, &text));
-                let _ = tx.send((id, snapshot, marks));
+                let changes = crate::ide::diff::changes(&head, &text);
+                let _ = tx.send((id, snapshot, changes));
             });
         }
     }

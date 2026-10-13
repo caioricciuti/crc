@@ -2,6 +2,14 @@
 
 One entry per tag, written for people who use the editor.
 
+## Unreleased
+
+- Git > Next Change (`Option-F5`) and Previous Change (`Shift-Option-F5`)
+  move the caret through the lines that differ from HEAD, wrapping at the
+  ends, and say which change of how many it is on. Git > Revert Change
+  puts the change at the caret back to its HEAD text in the editor, as
+  one undoable edit; the file on disk is only written when you save.
+
 ## v0.2.0-alpha.23, 2026-10-13
 
 - Agents: a workspace can live on a server. Type `host:/path` (an

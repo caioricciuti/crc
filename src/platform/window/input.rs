@@ -456,6 +456,16 @@ impl EditorView {
                     self.request_redraw();
                     return true;
                 }
+                // Option-F5 also when the menu item is greyed out, so the
+                // key says why there is no change to go to.
+                key::F5
+                    if flags.contains(NSEventModifierFlags::Option)
+                        && !flags.contains(NSEventModifierFlags::Command)
+                        && !overlay =>
+                {
+                    self.step_change(!shift);
+                    return true;
+                }
                 key::F1 if plain && !overlay => {
                     self.show_hover();
                     return true;
