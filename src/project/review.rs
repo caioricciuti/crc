@@ -313,6 +313,29 @@ pub fn files(dir: &Path) -> Vec<File> {
     out
 }
 
+/// How many files [`files`] lists, from one listing of the folder: a claim
+/// counts when its copy or one of its markers is there by name. No file is
+/// read and none is looked up on its own, so a session of thousands of
+/// files costs one directory read.
+pub fn count(dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir.join("files")) else {
+        return 0;
+    };
+    let names: std::collections::HashSet<String> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect();
+    names
+        .iter()
+        .filter_map(|name| name.strip_suffix(".path"))
+        .filter(|key| {
+            ["", ".unhooked", ".untracked", ".absent", ".large"]
+                .iter()
+                .any(|marker| names.contains(&format!("{key}{marker}")))
+        })
+        .count()
+}
+
 /// One line per event. Tabs and line breaks in the text become spaces, so
 /// a line always splits back into the same fields.
 fn append(dir: &Path, event: &Event) -> std::io::Result<()> {
@@ -522,7 +545,7 @@ pub fn summary(root: &Path) -> Vec<(PathBuf, String, usize)> {
     let mut out: Vec<(PathBuf, String, usize)> = sessions(root)
         .into_iter()
         .filter_map(|dir| {
-            let n = files(&dir).len();
+            let n = count(&dir);
             (n > 0).then(|| {
                 let title = about(&dir).0;
                 (dir, title, n)
@@ -1062,5 +1085,72 @@ mod tests {
         assert_eq!(n.checkpoint, Checkpoint::Unhooked(None));
         keep_all(&dir, n).expect("keep all");
         assert_eq!(super::files(&dir).len(), 1, "the hooked one is left");
+    }
+
+    /// A session folder with `n` claims of each kind, written straight,
+    /// as the hook and the watcher leave them.
+    fn mixed_session(root: &Path, n: usize) -> PathBuf {
+        let dir = root.join("session");
+        let files = dir.join("files");
+        std::fs::create_dir_all(&files).expect("files");
+        // A finished copy, a copy still being written, a file that did
+        // not exist, one too large, and the two kinds the watcher notes.
+        let kinds = [
+            Some(""),
+            None,
+            Some(".absent"),
+            Some(".large"),
+            Some(".untracked"),
+            Some(".unhooked"),
+        ];
+        for i in 0..n {
+            for (k, suffix) in kinds.iter().enumerate() {
+                let path = root.join(format!("f{k}-{i}.txt"));
+                let key = key(&path);
+                std::fs::write(
+                    files.join(format!("{key}.path")),
+                    path.to_string_lossy().as_bytes(),
+                )
+                .expect("claim");
+                match suffix {
+                    Some(s) => std::fs::write(files.join(format!("{key}{s}")), "x").expect("copy"),
+                    None => {
+                        std::fs::write(files.join(format!("{key}.partial")), "x").expect("partial")
+                    }
+                }
+            }
+        }
+        dir
+    }
+
+    #[test]
+    fn the_count_matches_the_files_listed() {
+        let tree = TempTree::new("review-count", &[]);
+        let dir = mixed_session(&tree.0, 40);
+        assert_eq!(files(&dir).len(), 200, "the unfinished copies are left out");
+        assert_eq!(count(&dir), files(&dir).len());
+        assert_eq!(count(&tree.0.join("none")), 0);
+        let summary = summary(&tree.0);
+        assert_eq!(summary.len(), 1);
+        assert_eq!(summary[0].2, 200);
+    }
+
+    #[test]
+    fn the_count_reads_no_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let tree = TempTree::new("review-count-unread", &[]);
+        let dir = mixed_session(&tree.0, 1000);
+        // Claims nobody may open: listing them is all the count can do.
+        for entry in std::fs::read_dir(dir.join("files")).expect("list") {
+            let path = entry.expect("entry").path();
+            if path.extension().is_some_and(|e| e == "path") {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
+                    .expect("chmod");
+            }
+        }
+        let started = std::time::Instant::now();
+        assert_eq!(count(&dir), 5000);
+        assert_eq!(summary(&tree.0)[0].2, 5000);
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
     }
 }

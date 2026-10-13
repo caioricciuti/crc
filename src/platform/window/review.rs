@@ -16,11 +16,62 @@ fn running(state: &State) -> Vec<std::path::PathBuf> {
         .collect()
 }
 
+/// Every session with something to review, as Home lists it.
+fn read_summary() -> Vec<(std::path::PathBuf, String, usize)> {
+    review::root().map_or_else(Vec::new, |r| review::summary(&r))
+}
+
 /// After anything that changes what is under review: Home's list, each
-/// terminal tab's count, and the page itself when it is open.
+/// terminal tab's count, and the page itself when it is open. The list is
+/// read on a worker, since agents write often and the store can hold
+/// thousands of files; a write while one is read asks for one more read
+/// after it. [`poll_counts`] applies what it finds.
 pub(super) fn refresh_review(state: &mut State) {
+    if state.review_page.counting.is_some() {
+        state.review_page.recount = true;
+        return;
+    }
+    let (tx, rx) = mpsc::channel();
+    state.review_page.counting = Some(rx);
+    std::thread::spawn(move || {
+        let _ = tx.send(read_summary());
+    });
+}
+
+/// [`refresh_review`] read here and now, for what has to show the change
+/// at once: the page opening, or one of its buttons. A read still running
+/// is dropped, as this one is newer.
+fn refresh_review_now(state: &mut State) {
+    state.review_page.counting = None;
+    state.review_page.recount = false;
+    apply_summary(state, read_summary());
+}
+
+/// The counts a worker read, once they are in. Says whether anything
+/// changed on screen.
+fn poll_counts(state: &mut State) -> bool {
+    let Some(rx) = &state.review_page.counting else {
+        return false;
+    };
+    let summary = match rx.try_recv() {
+        Ok(summary) => Some(summary),
+        Err(mpsc::TryRecvError::Empty) => return false,
+        Err(mpsc::TryRecvError::Disconnected) => None,
+    };
+    state.review_page.counting = None;
+    let applied = summary.is_some();
+    if let Some(summary) = summary {
+        apply_summary(state, summary);
+    }
+    if std::mem::take(&mut state.review_page.recount) {
+        refresh_review(state);
+    }
+    applied
+}
+
+fn apply_summary(state: &mut State, summary: Vec<(std::path::PathBuf, String, usize)>) {
     state.review_page.running = running(state);
-    state.review_page.summary = review::root().map_or_else(Vec::new, |r| review::summary(&r));
+    state.review_page.summary = summary;
     for tab in &mut state.terminal.tabs {
         tab.review_files = state
             .review_page
@@ -121,7 +172,7 @@ impl EditorView {
             // Agents' sessions, not a branch reviewed before.
             state.review_page.loading = None;
             state.review_page.sessions.clear();
-            refresh_review(&mut state);
+            refresh_review_now(&mut state);
             state.review_page.diff_scroll = 0;
             if let Some(page) = &mut state.extensions {
                 page.details = false;
@@ -195,11 +246,15 @@ impl EditorView {
         self.pump();
     }
 
-    /// A branch read for the Review page, once it is in.
+    /// Home's counts and a branch read for the Review page, once they are
+    /// in.
     pub(super) fn poll_review(&self) {
         let Some(mut state) = self.state_mut() else {
             return;
         };
+        if poll_counts(&mut state) {
+            self.ivars().needs_redraw.set(true);
+        }
         let Some(loading) = &state.review_page.loading else {
             return;
         };
@@ -251,7 +306,7 @@ impl EditorView {
             Action::UndoHunk(_) | Action::UndoFile | Action::UndoSession(_)
         );
         if let Some(mut state) = self.state_mut() {
-            refresh_review(&mut state);
+            refresh_review_now(&mut state);
             match said {
                 Ok(Some(text)) => state.say(layout::Feedback::Success, text),
                 Ok(None) => {}

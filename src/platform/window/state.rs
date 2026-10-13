@@ -187,6 +187,7 @@ impl State {
             && self.update.is_none()
             && self.update_install.is_none()
             && self.review_scan.is_none()
+            && self.review_page.counting.is_none()
             && self.review_page.loading.is_none()
             && self.branch_rx.is_none()
             && self.home_rx.is_none()

@@ -108,6 +108,10 @@ pub struct Page {
     /// Each session with something to review, its title and file count,
     /// for Home; kept current while the page is closed.
     pub summary: Vec<(PathBuf, String, usize)>,
+    /// The summary being read again on a worker, and whether more changed
+    /// since that read started, so one more follows it.
+    pub counting: Option<mpsc::Receiver<Vec<(PathBuf, String, usize)>>>,
+    pub recount: bool,
     /// A destructive action clicked once, waiting for its second click.
     pub confirm: Option<Action>,
     pub hits: Vec<(Viewport, Action)>,
