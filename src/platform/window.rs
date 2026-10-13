@@ -64,6 +64,7 @@ mod git_menu;
 mod http;
 mod input;
 mod inspector;
+mod issues;
 mod lsp;
 mod lsp_features;
 mod mcp;
@@ -660,6 +661,8 @@ struct State {
     /// The tab a Source Control diff is shown in, by buffer id. The diff
     /// is on screen exactly when that tab is the active one.
     diff_tab: Option<u64>,
+    /// The GitHub issue each issue tab shows, by buffer id.
+    issue_tabs: HashMap<u64, issues::IssueTab>,
     /// Whether the commit message field has the keyboard. Source control is
     /// docked, not modal, so it only takes typing when it is asked to.
     git_focus: bool,
@@ -1880,6 +1883,14 @@ define_class!(
                     self.claude_decide(false);
                     return;
                 }
+                Some(Hit::IssueStartTask) => {
+                    self.issue_start_task();
+                    return;
+                }
+                Some(Hit::IssueOpenGitHub) => {
+                    self.issue_open_on_github();
+                    return;
+                }
                 // A review draws a diff, not its text: there is no caret
                 // to place in it.
                 Some(Hit::Text) if self.state().is_some_and(|state| active_review(&state).is_some()) => {
@@ -2353,6 +2364,8 @@ define_class!(
                         | Hit::ResponseSegment(_)
                         | Hit::ReviewAccept
                         | Hit::ReviewReject
+                        | Hit::IssueStartTask
+                        | Hit::IssueOpenGitHub
                         | Hit::ConflictMode(_)
                         | Hit::ConflictStep(_)
                         | Hit::ConflictResolve
@@ -3822,6 +3835,16 @@ define_class!(
             self.new_task_prompt();
         }
 
+        #[unsafe(method(startIssueTask:))]
+        fn action_start_issue_task(&self, _sender: Option<&AnyObject>) {
+            self.issue_start_task();
+        }
+
+        #[unsafe(method(openIssueOnGitHub:))]
+        fn action_open_issue_on_github(&self, _sender: Option<&AnyObject>) {
+            self.issue_open_on_github();
+        }
+
         #[unsafe(method(nextWaitingAgent:))]
         fn action_next_waiting_agent(&self, _sender: Option<&AnyObject>) {
             self.next_waiting_agent();
@@ -4284,6 +4307,12 @@ define_class!(
                 state.update_ready.is_some() || crate::platform::update::replaced()
             } else if action == sel!(switchRepository:) {
                 state.workspace.has_several()
+            } else if action == sel!(startIssueTask:) {
+                // The issue tab is the editor's: not while Agents hides it.
+                !state.agents.on && issues::active_issue(&state).is_some()
+            } else if action == sel!(openIssueOnGitHub:) {
+                !state.agents.on
+                    && issues::active_issue(&state).is_some_and(|t| issues::on_github(&t.issue.url))
             } else if action == sel!(paste:) {
                 clipboard::has_text()
             } else if action == sel!(moveContextTabLeft:) {
@@ -6079,6 +6108,7 @@ fn forget_document(state: &mut State, id: u64) {
     state.gutter.stale.remove(&id);
     state.lsp.dirty.remove(&id);
     state.conflict_scans.remove(&id);
+    state.issue_tabs.remove(&id);
 }
 
 /// What has the editor column.
@@ -6844,6 +6874,7 @@ fn frame_of(state: &mut State) -> Frame {
         sidebar_edit,
         extensions,
         diff_tab,
+        issue_tabs,
         agents,
         ..
     } = state;
@@ -7015,6 +7046,15 @@ fn frame_of(state: &mut State) -> Frame {
         frame.push(Hit::ReviewAccept, accept);
         frame.push(Hit::ReviewReject, reject);
     }
+    if let Some(strip) = chrome.response
+        && let Some(tab) = issue_tabs.get(&docs.active().id())
+    {
+        let [start, github] = issues::strip_buttons(&mut renderer.atlas, strip);
+        frame.push(Hit::IssueStartTask, start);
+        if issues::on_github(&tab.issue.url) {
+            frame.push(Hit::IssueOpenGitHub, github);
+        }
+    }
     // A review or response owns the strip; conflicts only draw there when
     // neither does.
     if claude
@@ -7139,7 +7179,8 @@ fn chrome_of(state: &State) -> Chrome {
     });
     let response = state.responses.contains_key(&state.docs.active().id())
         || active_review(state).is_some()
-        || active_conflicts(state).is_some();
+        || active_conflicts(state).is_some()
+        || issues::active_issue(state).is_some();
     let mut chrome = Chrome::with_panes(
         state.viewport,
         sidebar,
@@ -8546,6 +8587,18 @@ fn install_menu(mtm: MainThreadMarker, app: &NSApplication) {
         .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
     git_menu.addItem(&source_control);
     git_menu.addItem(&item("Review Agent Changes", sel!(showReview:), "", false));
+    git_menu.addItem(&item(
+        "Start Task for Issue",
+        sel!(startIssueTask:),
+        "",
+        false,
+    ));
+    git_menu.addItem(&item(
+        "Open Issue on GitHub",
+        sel!(openIssueOnGitHub:),
+        "",
+        false,
+    ));
     git_menu.addItem(&mcp_servers);
     git_menu.addItem(&item(
         "Add MCP Server\u{2026}",
@@ -8916,6 +8969,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         git,
         git_open: false,
         diff_tab: None,
+        issue_tabs: HashMap::new(),
         git_focus: false,
         hovered_tab: None,
         tree,

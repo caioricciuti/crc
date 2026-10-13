@@ -520,7 +520,7 @@ impl EditorView {
                 };
                 let report = format!(
                     // First: the report ends with the document's text.
-                    "message: {}\npreview: {}\nmd: {md}\nactivity: {}\npointer_targets: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nrepo: {}\ngit_note: {}\nhome: {}\nmcp: {}\nmcp_page: {}\nsettings_page: {}\nreview_page: {}\nterminals: {}\nagents: {}\ninspector: {}\nteams: {}\nagents_tree: {}\nagents_activity: {}\nagents_prs: {}\nconflicts: {}\ngit_conflicts: {}\nblame: {}\nfind_results: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\npeek: {}\ngutter: {}\n{report}",
+                    "message: {}\npreview: {}\nmd: {md}\nactivity: {}\npointer_targets: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nrepo: {}\ngit_note: {}\nhome: {}\nmcp: {}\nmcp_page: {}\nsettings_page: {}\nreview_page: {}\nterminals: {}\nagents: {}\ninspector: {}\nteams: {}\nagents_tree: {}\nagents_activity: {}\nagents_prs: {}\nconflicts: {}\ngit_conflicts: {}\nblame: {}\nfind_results: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\npeek: {}\ngutter: {}\nissue_tab: {}\n{report}",
                     state.message.as_ref().map_or("", |(text, _)| text.as_str()),
                     state.html_preview.as_ref().map_or("closed".to_string(), |p| format!(
                         "open ext={} view={} probe={}",
@@ -731,6 +731,16 @@ impl EditorView {
                         }
                         marks
                     }),
+                    // The issue the active tab shows: number, repository,
+                    // whether it takes typing, and its page.
+                    super::issues::active_issue(&state).map_or("none".to_string(), |t| format!(
+                        "#{} repo={}{} view_only={} url={}",
+                        t.issue.number,
+                        t.repo.0.as_deref().map(|h| format!("{h}:")).unwrap_or_default(),
+                        t.repo.1.display(),
+                        state.docs.active().is_view_only(),
+                        t.issue.url
+                    )),
                 );
                 if let Err(e) = std::fs::write(path, report) {
                     eprintln!("crc: selftest could not write {path}: {e}");

@@ -5,15 +5,17 @@
 //! request with each check, and the buttons to open or merge it. A folder
 //! workspace shows every repository in it: the folder itself and its direct
 //! children, each with a strip per worktree of it: where its branch stands
-//! against the base, and buttons to open it or start a shell in it. The Git
-//! status is read on a worker; the pull request comes with the workspace
-//! list's own read.
+//! against the base, and buttons to open it or start a shell in it. Under
+//! each repository's card, its open issues on GitHub. The Git status is
+//! read on a worker; the pull request comes with the workspace list's own
+//! read, the issues with the panel's.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use crate::platform::agents::{Pace, Workspace};
+use crate::platform::agents::{IssueSet, Pace, RepoKey, Workspace};
 use crate::project::icons;
 use crate::project::worktree::{CheckState, PullRequest, Status};
 use crate::render::{
@@ -53,6 +55,10 @@ pub enum Action {
     /// A merged worktree strip's Clean up: the worktree and its branch
     /// removed.
     CleanUpWorktree,
+    /// An issue row: that issue, read whole.
+    OpenIssue(u64),
+    /// Under a repository's issues: all of them, or the first few again.
+    ToggleIssues,
 }
 
 impl Action {
@@ -71,8 +77,25 @@ impl Action {
             Action::WorktreeTerminal => "worktree_terminal",
             Action::ReviewWorktree => "worktree_review",
             Action::CleanUpWorktree => "worktree_cleanup",
+            Action::OpenIssue(_) => "issue_open",
+            Action::ToggleIssues => "issues_toggle",
         }
     }
+}
+
+/// How many issues a repository shows until Show all.
+const ISSUES_SHOWN: usize = 10;
+/// The least an issue's title keeps beside its labels: they go first.
+const TITLE_ROOM: f32 = 140.0;
+
+/// What the issue lists are drawn from: what was read per repository,
+/// whether `gh` is asked at all (a list not read yet is on its way), and
+/// now, in Unix seconds, for their ages.
+#[derive(Clone, Copy)]
+pub struct Issues<'a> {
+    pub read: &'a HashMap<RepoKey, IssueSet>,
+    pub asked: bool,
+    pub now: u64,
 }
 
 type Read = (PathBuf, Result<Status, String>);
@@ -115,6 +138,12 @@ pub struct Inspector {
     /// The worktree strips shown last frame, per repository, and whether
     /// each was merged, for the self-test.
     shown_worktrees: Vec<(PathBuf, PathBuf, String, bool)>,
+    /// The repositories (main checkouts) whose issues all show, past the
+    /// first few.
+    pub issues_open: HashSet<PathBuf>,
+    /// What each repository card's issues said last frame, for the
+    /// self-test.
+    shown_issues: Vec<(PathBuf, String)>,
     /// The folder workspace shown is on a host that did not answer, so its
     /// repositories are not known: set before each draw. Its body says so
     /// instead of waiting.
@@ -212,8 +241,9 @@ impl Inspector {
             Some((rest, n)) if n.parse::<usize>().is_ok() => (rest, n.parse().ok()),
             _ => (rest, None),
         };
-        // A worktree strip's button by the strip's place: `.1` the second.
-        if rest.starts_with("worktree_") {
+        // A worktree strip's button, or an issue row, by its place: `.1`
+        // the second.
+        if rest.starts_with("worktree_") || rest.starts_with("issue") {
             return self
                 .hits
                 .iter()
@@ -284,8 +314,13 @@ impl Inspector {
                 .hits
                 .iter()
                 .filter(|(_, a, r)| {
-                    !matches!(a, Action::Close | Action::Refresh)
-                        && r.as_deref().is_none_or(|r| r == path)
+                    !matches!(
+                        a,
+                        Action::Close
+                            | Action::Refresh
+                            | Action::OpenIssue(_)
+                            | Action::ToggleIssues
+                    ) && r.as_deref().is_none_or(|r| r == path)
                 })
                 .map(|(_, a, _)| a.name())
                 .collect();
@@ -309,7 +344,7 @@ impl Inspector {
                     }
                 })
                 .collect();
-            if strips.is_empty() {
+            let mut line = if strips.is_empty() {
                 format!("{status} buttons={}", live.join(","))
             } else {
                 format!(
@@ -317,7 +352,11 @@ impl Inspector {
                     live.join(","),
                     strips.join(",")
                 )
+            };
+            if let Some((_, issues)) = self.shown_issues.iter().find(|(p, _)| p == path) {
+                line.push_str(&format!(" issues={issues}"));
             }
+            line
         };
         if let [only] = repos {
             return one(only);
@@ -347,12 +386,14 @@ impl Inspector {
         remote: Option<&crate::platform::remote::Remote>,
         pull_request: Option<Option<&PullRequest>>,
         github: bool,
+        issues: Issues,
         atlas: &mut Atlas,
         rect: Viewport,
         theme: &Theme,
         out: &mut Vec<GlyphInstance>,
     ) {
         self.hits.clear();
+        self.shown_issues.clear();
         self.shown_remote = remote.map(|r| r.login());
         self.shown_host = workspace
             .filter(|_| remote.is_none())
@@ -403,6 +444,7 @@ impl Inspector {
             remote,
             pull_request,
             github,
+            issues,
             atlas,
             rect,
             top - self.scroll,
@@ -452,6 +494,7 @@ impl Inspector {
         remote: Option<&crate::platform::remote::Remote>,
         pull_request: Option<Option<&PullRequest>>,
         github: bool,
+        issues: Issues,
         atlas: &mut Atlas,
         rect: Viewport,
         y: f32,
@@ -607,6 +650,14 @@ impl Inspector {
                     let status = status.clone();
                     y = self.repo_card(&status, repo, x, y, width, atlas, theme, out);
                     single = Some(status);
+                    // A worktree's are its repository's, read once for all
+                    // its worktrees.
+                    let main = match &workspace.repo {
+                        Some(main) if !workspace.folder => main.clone(),
+                        _ => repo.clone(),
+                    };
+                    let key = (workspace.host.clone(), main);
+                    y = self.issues_section(repo, &key, issues, x, y, width, atlas, theme, out);
                 }
             }
             let mine: Vec<&(Workspace, String, Pace, bool)> = worktrees
@@ -1060,6 +1111,254 @@ impl Inspector {
         y + height + 14.0
     }
 
+    /// Shows all of the issues of the repository `main`, or the first few
+    /// again.
+    pub fn toggle_issues(&mut self, main: &Path) {
+        if !self.issues_open.remove(main) {
+            self.issues_open.insert(main.to_path_buf());
+        }
+    }
+
+    /// The open issues of `key`'s repository, under `repo`'s card: the
+    /// first few in a card, a row each (a click reads it whole), and Show
+    /// all; skeletons until they are first read; what went wrong when they
+    /// could not be. Nothing for a repository not on GitHub, or with `gh`
+    /// not asked. Returns the y under it.
+    #[allow(clippy::too_many_arguments)]
+    fn issues_section(
+        &mut self,
+        repo: &Path,
+        key: &RepoKey,
+        issues: Issues,
+        x: f32,
+        y: f32,
+        width: f32,
+        atlas: &mut Atlas,
+        theme: &Theme,
+        out: &mut Vec<GlyphInstance>,
+    ) -> f32 {
+        use crate::project::worktree::IssueError;
+        let set = issues.read.get(key);
+        if !issues.asked
+            || set.is_some_and(|s| s.list.is_empty() && s.error == Some(IssueError::NotGitHub))
+        {
+            return y;
+        }
+        let mut y = y;
+        text(out, atlas, x, y, width, "ISSUES", theme.status_text);
+        // The count over a list; none over a note.
+        if let Some(set) = set.filter(|s| !s.list.is_empty()) {
+            let open = format!("{} open", set.count());
+            let ow = layout::ui_text_width(atlas, &open);
+            text(
+                out,
+                atlas,
+                x + width - ow,
+                y,
+                ow + 2.0,
+                &open,
+                theme.gutter_text,
+            );
+        }
+        y += ROW;
+        let Some(set) = set else {
+            for n in 0..3 {
+                layout::push_skeleton_row(
+                    out,
+                    Viewport {
+                        x,
+                        y: y + n as f32 * ROW,
+                        width,
+                        height: ROW,
+                    },
+                    0.0,
+                    (0.8, 0.0),
+                    false,
+                    theme,
+                );
+            }
+            self.shown_issues
+                .push((repo.to_path_buf(), "loading".into()));
+            return y + 3.0 * ROW + 10.0;
+        };
+        if set.list.is_empty() {
+            let (said, shown) = match &set.error {
+                None => ("No open issues".to_owned(), "0"),
+                Some(IssueError::NeedsAuth) => (IssueError::NeedsAuth.message(), "auth"),
+                Some(e) => (format!("Could not read them: {}", e.message()), "error"),
+            };
+            for line in wrap(atlas, &said, width) {
+                note(out, atlas, x, y, width, &line, theme);
+                y += 20.0;
+            }
+            self.shown_issues.push((repo.to_path_buf(), shown.into()));
+            return y + 14.0;
+        }
+        let all = self.issues_open.contains(&key.1);
+        let more = set.list.len() > ISSUES_SHOWN;
+        let shown = if all || !more {
+            set.list.len()
+        } else {
+            ISSUES_SHOWN
+        };
+        let rows = &set.list[..shown];
+        let height = (shown + usize::from(more)) as f32 * ROW + 8.0;
+        layout::push_card(
+            out,
+            Viewport {
+                x,
+                y,
+                width,
+                height,
+            },
+            theme,
+        );
+        // The titles line up after the widest number.
+        let numbers: Vec<String> = rows.iter().map(|i| format!("#{}", i.number)).collect();
+        let nw = numbers
+            .iter()
+            .map(|n| layout::ui_text_width(atlas, n))
+            .fold(0.0, f32::max);
+        let inner = width - 20.0;
+        for (n, (issue, number)) in rows.iter().zip(&numbers).enumerate() {
+            let top = y + 4.0 + n as f32 * ROW;
+            let row = Viewport {
+                x: x + 4.0,
+                y: top,
+                width: width - 8.0,
+                height: ROW,
+            };
+            if layout::hovered(row) {
+                layout::push_rounded_rect(out, row, layout::UI_RADIUS_SM, theme.row_hover);
+            }
+            // The whole title, for one cut short.
+            layout::hotspot(row, layout::Cursor::Pointing, Some(&issue.title));
+            self.hits
+                .push((row, Action::OpenIssue(issue.number), Some(key.1.clone())));
+            let ty = top + 3.0;
+            text(
+                out,
+                atlas,
+                x + 10.0,
+                ty,
+                nw + 2.0,
+                number,
+                theme.status_text,
+            );
+            let age = crate::project::worktree::age(&issue.created_at, issues.now);
+            let aw = layout::ui_text_width(atlas, &age);
+            let right = x + 10.0 + inner;
+            text(
+                out,
+                atlas,
+                right - aw,
+                ty,
+                aw + 2.0,
+                &age,
+                theme.gutter_text,
+            );
+            // Its labels, two at most, between the title and its age: as
+            // many as leave the title its room.
+            let title_x = x + 10.0 + nw + 8.0;
+            let mut end = right - aw - if age.is_empty() { 0.0 } else { 8.0 };
+            let mut pills: Vec<(String, f32)> = issue
+                .labels
+                .iter()
+                .take(2)
+                .map(|l| {
+                    let l = fit(atlas, l, 72.0);
+                    let w = layout::ui_text_width(atlas, &l) + 12.0;
+                    (l, w)
+                })
+                .collect();
+            while end - pills.iter().map(|(_, w)| w + 4.0).sum::<f32>() - title_x < TITLE_ROOM {
+                if pills.pop().is_none() {
+                    break;
+                }
+            }
+            for (label, w) in pills.iter().rev() {
+                let pill = Viewport {
+                    x: end - w,
+                    y: top + 4.0,
+                    width: *w,
+                    height: 18.0,
+                };
+                layout::push_rounded_rect(
+                    out,
+                    pill,
+                    layout::UI_RADIUS_SM,
+                    layout::faded(theme.status_text, 0.16),
+                );
+                layout::push_ui_text_centered(out, atlas, pill, label, theme.status_text);
+                end = pill.x - 4.0;
+            }
+            let room = (end - 4.0 - title_x).max(0.0);
+            let title = fit(atlas, &issue.title, room);
+            text(out, atlas, title_x, ty, room, &title, theme.text);
+        }
+        if more {
+            let top = y + 4.0 + shown as f32 * ROW;
+            layout::push_rect(
+                out,
+                atlas,
+                [x + 10.0, top],
+                [width - 20.0, 1.0],
+                theme.hairline,
+            );
+            let label = if all {
+                "Show fewer".to_owned()
+            } else {
+                format!("Show all {}", set.count())
+            };
+            let lw = layout::ui_text_width(atlas, &label);
+            let row = Viewport {
+                x: x + 4.0,
+                y: top,
+                width: width - 8.0,
+                height: ROW,
+            };
+            let over = layout::hovered(row);
+            if over {
+                layout::push_rounded_rect(out, row, layout::UI_RADIUS_SM, theme.row_hover);
+            }
+            layout::hotspot(row, layout::Cursor::Pointing, None);
+            text(
+                out,
+                atlas,
+                x + 10.0,
+                top + 3.0,
+                lw + 2.0,
+                &label,
+                theme.accent,
+            );
+            self.hits
+                .push((row, Action::ToggleIssues, Some(key.1.clone())));
+        }
+        y += height;
+        let mut said = format!("{}:rows={shown}", set.count());
+        // A read that failed keeps the list before, and says so faintly.
+        if let Some(e) = &set.error {
+            let why = match e {
+                IssueError::NeedsAuth => e.message(),
+                _ => "Last read failed, showing the one before".to_owned(),
+            };
+            let why = fit(atlas, &why, width);
+            text(
+                out,
+                atlas,
+                x,
+                y + 4.0,
+                width,
+                &why,
+                layout::faded(theme.gutter_text, 0.7),
+            );
+            y += 22.0;
+            said.push_str(":stale");
+        }
+        self.shown_issues.push((repo.to_path_buf(), said));
+        y + 14.0
+    }
+
     /// One repository's facts and its buttons; returns the y under them.
     #[allow(clippy::too_many_arguments)]
     fn repo_card(
@@ -1341,4 +1640,235 @@ fn wrap(atlas: &mut Atlas, s: &str, width: f32) -> Vec<String> {
         lines.push(fit(atlas, &rest, width));
     }
     lines.into_iter().map(|l| fit(atlas, &l, width)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::project::worktree::{Issue, IssueError};
+
+    fn issue(number: u64) -> Issue {
+        Issue {
+            number,
+            title: format!("Seed tray {number} drains too slowly after a long watering"),
+            state: "OPEN".into(),
+            labels: vec!["bug".into(), "garden".into()],
+            created_at: "2026-10-01T12:00:00Z".into(),
+            ..Default::default()
+        }
+    }
+
+    fn set(list: Vec<Issue>, error: Option<IssueError>) -> IssueSet {
+        IssueSet {
+            list,
+            capped: false,
+            error,
+            read_at: Instant::now(),
+        }
+    }
+
+    /// The inspector of a repository at `/r` on this Mac, its status read,
+    /// drawn with `read` as its issues.
+    fn drawn(
+        inspector: &mut Inspector,
+        read: &HashMap<RepoKey, IssueSet>,
+        asked: bool,
+    ) -> Vec<GlyphInstance> {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let workspace = Workspace {
+            name: "garden-log".into(),
+            path: PathBuf::from("/r"),
+            branch: Some("main".into()),
+            main: true,
+            folder: false,
+            key: String::new(),
+            repo: None,
+            base: None,
+            commit: None,
+            merged: false,
+            host: None,
+            github: None,
+        };
+        inspector.status = vec![(
+            PathBuf::from("/r"),
+            Ok(Status {
+                branch: Some("main".into()),
+                ..Default::default()
+            }),
+        )];
+        let mut out = Vec::new();
+        inspector.draw(
+            Some(&workspace),
+            Some(&[PathBuf::from("/r")]),
+            &[],
+            None,
+            None,
+            true,
+            Issues {
+                read,
+                asked,
+                // Twelve days after the issues were opened.
+                now: 1_790_856_000 + 12 * 86_400,
+            },
+            &mut atlas,
+            Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: WIDTH,
+                height: 4000.0,
+            },
+            &Theme::dark(),
+            &mut out,
+        );
+        out
+    }
+
+    fn rows(inspector: &Inspector) -> Vec<Viewport> {
+        inspector
+            .hits
+            .iter()
+            .filter(|(_, a, _)| matches!(a, Action::OpenIssue(_)))
+            .map(|(rect, ..)| *rect)
+            .collect()
+    }
+
+    fn report(inspector: &Inspector) -> String {
+        inspector.report(Some(&[PathBuf::from("/r")]))
+    }
+
+    #[test]
+    fn a_repositorys_issues_show_ten_until_show_all() {
+        let key: RepoKey = (None, PathBuf::from("/r"));
+        let read = HashMap::from([(key, set((1..=12).map(issue).collect(), None))]);
+        let mut inspector = Inspector::default();
+        drawn(&mut inspector, &read, true);
+        let shown = rows(&inspector);
+        assert_eq!(shown.len(), 10);
+        assert!(report(&inspector).ends_with(" issues=12:rows=10"));
+        // A row each, inside the column, one under the other.
+        for pair in shown.windows(2) {
+            assert!(pair[1].y >= pair[0].y + pair[0].height);
+        }
+        assert!(
+            shown
+                .iter()
+                .all(|r| r.x >= PAD && r.x + r.width <= WIDTH - PAD)
+        );
+        // The rows are named by their place; the first is #1.
+        assert_eq!(inspector.named("inspector.issue_open.0"), Some(shown[0]));
+        assert_eq!(
+            inspector.hit(shown[0].x + 1.0, shown[0].y + 1.0),
+            Some((Action::OpenIssue(1), Some(PathBuf::from("/r"))))
+        );
+        // Show all: all twelve, then Show fewer folds them again.
+        let toggle = inspector.named("inspector.issues_toggle").unwrap();
+        let (action, repo) = inspector.hit(toggle.x + 1.0, toggle.y + 1.0).unwrap();
+        assert_eq!(action, Action::ToggleIssues);
+        inspector.toggle_issues(&repo.unwrap());
+        drawn(&mut inspector, &read, true);
+        assert_eq!(rows(&inspector).len(), 12);
+        assert!(report(&inspector).ends_with(" issues=12:rows=12"));
+        assert!(inspector.named("inspector.issue_open.11").is_some());
+        inspector.toggle_issues(Path::new("/r"));
+        drawn(&mut inspector, &read, true);
+        assert_eq!(rows(&inspector).len(), 10);
+        // The issues are not among the card's buttons.
+        assert!(!report(&inspector).contains("issue_open"));
+    }
+
+    #[test]
+    fn an_issue_list_says_why_it_is_missing_or_old() {
+        let key: RepoKey = (None, PathBuf::from("/r"));
+        let mut inspector = Inspector::default();
+        let says = |inspector: &mut Inspector, read: HashMap<RepoKey, IssueSet>, asked| {
+            drawn(inspector, &read, asked);
+            (rows(inspector).len(), report(inspector))
+        };
+        // Not read yet: skeletons, while `gh` is asked.
+        let (n, said) = says(&mut inspector, HashMap::new(), true);
+        assert_eq!(n, 0);
+        assert!(said.ends_with(" issues=loading"), "{said}");
+        // `gh` not asked (missing, or a test instance): nothing.
+        let (_, said) = says(&mut inspector, HashMap::new(), false);
+        assert!(!said.contains("issues="), "{said}");
+        let one = |list, error| HashMap::from([(key.clone(), set(list, error))]);
+        let (n, said) = says(
+            &mut inspector,
+            one(Vec::new(), Some(IssueError::NeedsAuth)),
+            true,
+        );
+        assert_eq!(n, 0);
+        assert!(said.ends_with(" issues=auth"), "{said}");
+        let (_, said) = says(
+            &mut inspector,
+            one(Vec::new(), Some(IssueError::NotGitHub)),
+            true,
+        );
+        assert!(!said.contains("issues="), "{said}");
+        let (_, said) = says(&mut inspector, one(Vec::new(), None), true);
+        assert!(said.ends_with(" issues=0"), "{said}");
+        // A failed read keeps the list before, and says so.
+        let offline = IssueError::Other("error connecting to api.github.com".into());
+        let (n, said) = says(
+            &mut inspector,
+            one(vec![issue(3), issue(4)], Some(offline)),
+            true,
+        );
+        assert_eq!(n, 2);
+        assert!(said.ends_with(" issues=2:rows=2:stale"), "{said}");
+    }
+
+    #[test]
+    fn a_worktrees_issues_are_its_repositorys() {
+        let mut inspector = Inspector::default();
+        let read = HashMap::from([((None, PathBuf::from("/main")), set(vec![issue(7)], None))]);
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let workspace = Workspace {
+            name: "feat".into(),
+            path: PathBuf::from("/w/feat"),
+            branch: Some("feat".into()),
+            main: false,
+            folder: false,
+            key: String::new(),
+            repo: Some(PathBuf::from("/main")),
+            base: Some("main".into()),
+            commit: None,
+            merged: false,
+            host: None,
+            github: None,
+        };
+        inspector.status = vec![(PathBuf::from("/w/feat"), Ok(Status::default()))];
+        inspector.draw(
+            Some(&workspace),
+            Some(&[PathBuf::from("/w/feat")]),
+            &[],
+            None,
+            None,
+            true,
+            Issues {
+                read: &read,
+                asked: true,
+                now: 0,
+            },
+            &mut atlas,
+            Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: WIDTH,
+                height: 4000.0,
+            },
+            &Theme::dark(),
+            &mut Vec::new(),
+        );
+        let row = rows(&inspector)[0];
+        assert_eq!(
+            inspector.hit(row.x + 1.0, row.y + 1.0),
+            Some((Action::OpenIssue(7), Some(PathBuf::from("/main"))))
+        );
+        assert!(
+            inspector
+                .report(Some(&[PathBuf::from("/w/feat")]))
+                .ends_with(" issues=1:rows=1")
+        );
+    }
 }

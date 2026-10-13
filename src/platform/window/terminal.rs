@@ -149,12 +149,14 @@ impl EditorView {
     /// this window's IDE port, so it connects without `/ide`. In a remote
     /// workspace (`remote`: its host and folder) it is ssh to that folder,
     /// run from home, and the shell or `claude` runs there without any of
-    /// this window: no IDE port, no review hooks.
+    /// this window: no IDE port, no review hooks. `prompt` is what `claude`
+    /// is first told, here, as one argument quoted for the shell.
     pub(super) fn terminal_launch(
         &self,
         claude: bool,
         cwd: Option<&Path>,
         remote: Option<(&str, &Path)>,
+        prompt: Option<&str>,
     ) -> Option<crate::platform::terminal::Launch> {
         let state = self.state()?;
         let shell = std::env::var("CRC_TERMINAL_SHELL")
@@ -227,10 +229,10 @@ impl EditorView {
             env.push(("ENABLE_IDE_INTEGRATION".to_owned(), "true".to_owned()));
         }
         let args = if claude {
-            // A command given in CRC_CLAUDE_COMMAND runs exactly as given.
-            // Plain `claude` gets the review hooks as extra settings: Claude
-            // merges them with the person's own, and nothing in ~/.claude
-            // is touched.
+            // A command given in CRC_CLAUDE_COMMAND runs as given, with
+            // the prompt after it as for `claude`. Plain `claude` gets the
+            // review hooks as extra settings: Claude merges them with the
+            // person's own, and nothing in ~/.claude is touched.
             let command = match std::env::var("CRC_CLAUDE_COMMAND") {
                 Ok(command) => command,
                 Err(_) => match state
@@ -242,6 +244,7 @@ impl EditorView {
                     None => "claude".into(),
                 },
             };
+            let command = crate::platform::agents::with_prompt(&command, prompt);
             vec!["-l".to_owned(), "-i".to_owned(), "-c".to_owned(), command]
         } else {
             vec!["-l".to_owned()]
@@ -296,23 +299,30 @@ impl EditorView {
         cwd: Option<&Path>,
         into: Option<String>,
     ) {
-        self.spawn_terminal_on(claude, cwd, into, None);
+        self.spawn_terminal_on(claude, cwd, into, None, None);
     }
 
     /// A shell over ssh in `dir` on `host`, in the workspace `id`: a
     /// worktree just made there, before the list has its row.
     pub(super) fn spawn_remote_terminal(&self, host: &str, dir: &Path, id: String) {
-        self.spawn_terminal_on(false, Some(dir), Some(id), Some(host.to_owned()));
+        self.spawn_terminal_on(false, Some(dir), Some(id), Some(host.to_owned()), None);
+    }
+
+    /// Claude in `dir` on this Mac, in the workspace `id`, first told
+    /// `prompt`: an issue's task, whose row the list may not have yet.
+    pub(super) fn spawn_claude_told(&self, dir: &Path, id: String, prompt: &str) {
+        self.spawn_terminal_on(true, Some(dir), Some(id), None, Some(prompt));
     }
 
     /// As [`Self::spawn_terminal_into`]; on `host`, in `cwd` there, when
-    /// the workspace's row does not say so yet.
+    /// the workspace's row does not say so yet; Claude first told `prompt`.
     fn spawn_terminal_on(
         &self,
         claude: bool,
         cwd: Option<&Path>,
         into: Option<String>,
         host: Option<String>,
+        prompt: Option<&str>,
     ) {
         // Every new terminal says it: one opened later fails the same way.
         self.say_if_replaced(true);
@@ -354,6 +364,7 @@ impl EditorView {
             remote
                 .as_ref()
                 .map(|(host, path)| (host.as_str(), path.as_path())),
+            prompt,
         ) else {
             return;
         };

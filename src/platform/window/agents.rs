@@ -218,16 +218,20 @@ impl EditorView {
         }
         let ensure = changed && state.agents.on;
         let done = state.agents.take_done();
+        let issue = state.agents.take_issue_detail();
         let mut start_in = None;
+        let mut prompt = None;
         if let Some(done) = done {
             changed = true;
             match done {
                 Ok(Done {
                     said,
                     start_in: dir,
+                    claude,
                 }) => {
                     state.say(layout::Feedback::Success, said);
                     start_in = dir;
+                    prompt = claude;
                 }
                 Err(e) => state.say(layout::Feedback::Failure, e),
             }
@@ -247,18 +251,23 @@ impl EditorView {
             self.watch_worktrees();
         }
         self.want_inspector();
+        if let Some((repo, answer)) = issue {
+            self.take_issue(repo, answer);
+        }
         match start_in {
             // A worktree's id is its path: selectable before the list
             // comes back with it.
             Some((None, dir)) => {
+                let id = crate::platform::canonical(&dir)
+                    .to_string_lossy()
+                    .into_owned();
                 if let Some(mut state) = self.state_mut() {
-                    state.agents.selected = Some(
-                        crate::platform::canonical(&dir)
-                            .to_string_lossy()
-                            .into_owned(),
-                    );
+                    state.agents.selected = Some(id.clone());
                 }
-                self.spawn_terminal_in(false, Some(&dir));
+                match prompt {
+                    Some(prompt) => self.spawn_claude_told(&dir, id, &prompt),
+                    None => self.spawn_terminal_in(false, Some(&dir)),
+                }
             }
             // One on a host is `host:path`, its terminal ssh there.
             Some((Some(host), dir)) => {
@@ -851,11 +860,15 @@ impl EditorView {
         self.after_terminal_layout();
     }
 
-    /// Refresh, asked for: the list, and every pull request again.
+    /// Refresh, asked for: the list, every pull request, and the selected
+    /// workspace's issues again.
     pub(super) fn refresh_agents(&self) {
         if let Some(mut state) = self.state_mut() {
             state.agents.refresh();
             state.agents.refresh_all_pull_requests();
+            for repo in state.agents.selected_repos() {
+                state.agents.want_issues_now(repo);
+            }
         }
         self.resume_display_link();
     }
@@ -1024,10 +1037,24 @@ impl EditorView {
     /// workspace's repository, then a terminal in it; on its host, over
     /// ssh, for a remote one.
     pub(super) fn create_task(&self, name: String) {
-        let Some(mut state) = self.state_mut() else {
+        let Some((host, dir)) = self.state().and_then(|state| state.agents.task_repo()) else {
             return;
         };
-        let Some((host, dir)) = state.agents.task_repo() else {
+        self.make_task(host, dir, name, None);
+    }
+
+    /// A worktree on a new branch `name` of the repository at `dir`, on
+    /// `host` when it is on one, then a terminal in it. With `claude` (what
+    /// to tell it), Claude starts there instead of a shell, and a worktree
+    /// already on that branch is gone back to rather than made again.
+    pub(super) fn make_task(
+        &self,
+        host: Option<String>,
+        dir: std::path::PathBuf,
+        name: String,
+        claude: Option<String>,
+    ) {
+        let Some(mut state) = self.state_mut() else {
             return;
         };
         state.agents.on = true;
@@ -1036,14 +1063,24 @@ impl EditorView {
             .agents
             .start(&format!("Making {branch}\u{2026}"), move || {
                 let runner = crate::platform::agents::runner(host.as_deref());
-                let main = crate::project::worktree::list_all_on(&runner, &dir)
-                    .ok()
-                    .and_then(|(list, _)| list.into_iter().find(|w| w.main))
-                    .map_or(dir, |w| w.path);
+                let list = crate::project::worktree::list_all_on(&runner, &dir)
+                    .map(|(list, _)| list)
+                    .unwrap_or_default();
+                if claude.is_some()
+                    && let Some(there) = crate::platform::agents::worktree_on_branch(&list, &branch)
+                {
+                    return Ok(Done {
+                        said: format!("Task {branch} is open in its worktree"),
+                        start_in: Some((host, there)),
+                        claude,
+                    });
+                }
+                let main = list.into_iter().find(|w| w.main).map_or(dir, |w| w.path);
                 let made = crate::project::worktree::add_on(&runner, &main, &name)?;
                 Ok(Done {
                     said: format!("Task {branch} ready in its own worktree"),
                     start_in: Some((host, made)),
+                    claude,
                 })
             });
         drop(state);
@@ -1239,6 +1276,7 @@ impl EditorView {
                 Ok(Done {
                     said: crate::project::worktree::merge(&main, &branch)?,
                     start_in: None,
+                    claude: None,
                 })
             });
         drop(state);
@@ -1404,6 +1442,7 @@ impl EditorView {
                     Ok(Done {
                         said,
                         start_in: None,
+                        claude: None,
                     })
                 } else {
                     Err(format!("{said}; {}", failed.join("; ")))
@@ -1449,6 +1488,7 @@ impl EditorView {
             Ok(Done {
                 said: said.join("; "),
                 start_in: None,
+                claude: None,
             })
         });
         drop(state);
@@ -1587,6 +1627,7 @@ impl EditorView {
                         pr_head.as_deref(),
                     )?,
                     start_in: None,
+                    claude: None,
                 })
             });
         drop(state);

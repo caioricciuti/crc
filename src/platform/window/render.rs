@@ -123,6 +123,7 @@ impl EditorView {
             completion_chips,
             conflict_scans,
             conflict_side,
+            issue_tabs,
             ..
         } = &mut *state;
         *unshaped_on_screen = false;
@@ -677,6 +678,11 @@ impl EditorView {
                     glyphs,
                 );
             }
+            if let Some(strip) = response_rect
+                && let Some(tab) = issue_tabs.get(&buffer.id())
+            {
+                super::issues::draw_strip(tab, &mut renderer.atlas, strip, theme, glyphs);
+            }
         }
 
         if let Some(rect) = find_rect
@@ -779,6 +785,11 @@ impl EditorView {
                             == agents.selected_index()
                     })
                     .and_then(|t| t.remote.clone());
+                let issues = crate::platform::inspector::Issues {
+                    read: &agents.issues,
+                    asked: agents.github_asked(),
+                    now: crate::platform::unix_seconds(),
+                };
                 agents.inspector.draw(
                     selected.as_ref(),
                     repos.as_deref(),
@@ -786,6 +797,7 @@ impl EditorView {
                     remote.as_ref(),
                     pull_request.as_ref().map(Option::as_ref),
                     github,
+                    issues,
                     &mut renderer.atlas,
                     rect,
                     theme,

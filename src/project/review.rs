@@ -454,7 +454,7 @@ pub fn prune(root: &Path, max_age: std::time::Duration) -> usize {
 }
 
 /// Quoted for `sh`: the whole string, literally.
-fn shell_quote(text: &str) -> String {
+pub fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
 }
 

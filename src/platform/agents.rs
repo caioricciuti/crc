@@ -12,7 +12,7 @@ use std::sync::mpsc;
 
 use crate::platform::terminal::{Activity, Tab};
 use crate::project::icons;
-use crate::project::worktree::{Runner, Worktree};
+use crate::project::worktree::{IssueError, Runner, Worktree};
 use crate::render::{
     font::Atlas,
     layout::{self, Theme, Viewport},
@@ -63,6 +63,9 @@ struct Listing {
     /// Per main checkout (on the host read), the worktrees Git records
     /// whose folder is gone.
     prunable: Prunable,
+    /// Per main checkout on a host, its repository on GitHub (`owner/name`)
+    /// from its origin, which `gh` here is told.
+    github: std::collections::HashMap<RepoKey, String>,
     /// The remote folder workspaces, by id, whose host did not answer:
     /// what was last read of them stays.
     unreachable: Vec<String>,
@@ -70,7 +73,10 @@ struct Listing {
 
 /// Per main checkout, by host (`None` for this Mac) and path, how many
 /// worktrees Git records whose folder is gone.
-pub type Prunable = std::collections::HashMap<(Option<String>, PathBuf), usize>;
+pub type Prunable = std::collections::HashMap<RepoKey, usize>;
+
+/// A repository: its host (`None` for this Mac) and its main checkout.
+pub type RepoKey = (Option<String>, PathBuf);
 
 /// A place to work: a folder, and the sessions started in it. A worktree
 /// of the open repository is one (named by its branch), and any folder
@@ -312,6 +318,7 @@ fn scan(folders: &[(String, PathBuf)], host: Option<&str>) -> Listing {
     let mut worktrees: Vec<Workspace> = Vec::new();
     let mut mains: Vec<PathBuf> = Vec::new();
     let mut prunable = std::collections::HashMap::new();
+    let mut github = std::collections::HashMap::new();
     let mut unreachable = Vec::new();
     for (id, dir) in folders {
         // A host that did not answer for one folder is not asked again,
@@ -333,11 +340,14 @@ fn scan(folders: &[(String, PathBuf)], host: Option<&str>) -> Listing {
         let mut read = Vec::new();
         let mut read_mains = Vec::new();
         let lost = found.iter().try_for_each(|repo| {
-            if let Some((main, rows, missing)) =
+            if let Some((main, rows, missing, name)) =
                 read_repo(&runner, repo, &mains, &read_mains, &worktrees, &read)?
             {
                 if missing > 0 {
                     prunable.insert((host.map(str::to_owned), main.clone()), missing);
+                }
+                if let Some(name) = name {
+                    github.insert((host.map(str::to_owned), main.clone()), name);
                 }
                 read_mains.push(main);
                 read.extend(rows);
@@ -357,15 +367,21 @@ fn scan(folders: &[(String, PathBuf)], host: Option<&str>) -> Listing {
         repos,
         worktrees,
         prunable,
+        github,
         unreachable,
     }
 }
 
+/// What [`read_repo`] read of a repository: its main checkout, its
+/// worktrees' rows, how many worktrees Git records whose folder is gone,
+/// and for one on a host its GitHub name.
+type RepoRead = (PathBuf, Vec<Workspace>, usize, Option<String>);
+
 /// One repository's worktrees other than its main checkout, as rows, with
-/// its main checkout and how many worktrees Git records whose folder is
-/// gone; `None` when Git cannot list it or its main checkout was read
-/// already (in `mains` or `more`). Rows already in `rows` or `more_rows`
-/// are not made twice. `Err` when the host stopped answering.
+/// the rest of a [`RepoRead`]; `None` when Git cannot list it or its main
+/// checkout was read already (in `mains` or `more`). Rows already in
+/// `rows` or `more_rows` are not made twice. `Err` when the host stopped
+/// answering.
 fn read_repo(
     runner: &Runner,
     repo: &Path,
@@ -373,7 +389,7 @@ fn read_repo(
     more: &[PathBuf],
     rows: &[Workspace],
     more_rows: &[Workspace],
-) -> Result<Option<(PathBuf, Vec<Workspace>, usize)>, String> {
+) -> Result<Option<RepoRead>, String> {
     use crate::project::worktree::{self as git, UNREACHABLE};
     let host = match runner {
         Runner::Local => None,
@@ -469,7 +485,7 @@ fn read_repo(
             workspace
         })
         .collect();
-    Ok(Some((main.path, out, missing)))
+    Ok(Some((main.path, out, missing, github)))
 }
 
 /// What the list keeps of your arrangement, per workspace id.
@@ -693,6 +709,117 @@ pub struct Info {
 
 /// What `gh` said about a row's pull request: it, none, or a failure.
 type PullRequestAnswer = Result<Option<crate::project::worktree::PullRequest>, String>;
+
+/// What `gh` said about a repository's open issues: them, and whether
+/// the list stopped at [`crate::project::worktree::ISSUE_LIMIT`].
+type IssuesAnswer = Result<(Vec<crate::project::worktree::Issue>, bool), IssueError>;
+
+/// One issue read whole, body and comments, for its tab.
+pub type IssueAnswer = Result<crate::project::worktree::Issue, IssueError>;
+
+/// How long a repository's issue list waits between reads.
+pub const ISSUES_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// What was read of a repository's open issues on GitHub. Read only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IssueSet {
+    /// The open issues, as `gh` lists them (no bodies), from the last read
+    /// that worked.
+    pub list: Vec<crate::project::worktree::Issue>,
+    /// The list stopped at its limit: there may be more.
+    pub capped: bool,
+    /// Why the last read failed; the list is still the one before.
+    pub error: Option<IssueError>,
+    /// When `gh` last answered, either way.
+    pub read_at: std::time::Instant,
+}
+
+impl IssueSet {
+    /// How many there are: `12`, or `100+` when the list stopped.
+    pub fn count(&self) -> String {
+        format!("{}{}", self.list.len(), if self.capped { "+" } else { "" })
+    }
+}
+
+/// An issue tab's title: `#42 Fix the login`, the title cut to fit a tab.
+pub fn issue_tab_label(number: u64, title: &str) -> String {
+    const COLUMNS: usize = 36;
+    let title = title.trim();
+    let shown = crate::text::columns::fit_columns(title.chars(), COLUMNS);
+    if shown.len() < title.len() {
+        format!("#{number} {}\u{2026}", shown.trim_end())
+    } else {
+        format!("#{number} {title}")
+    }
+}
+
+/// Where Start Task leaves issue `number` of `repo` for Claude to read:
+/// under `dir` (Application Support), out of every repository, named for
+/// the repository by a hash so two of the same name never share one.
+pub fn issue_file(dir: &Path, repo: &RepoKey, number: u64) -> PathBuf {
+    let key = format!(
+        "{}\n{}",
+        repo.0.as_deref().unwrap_or(""),
+        repo.1.to_string_lossy()
+    );
+    dir.join("issues").join(format!(
+        "{:016x}-{number}.md",
+        crate::platform::fnv1a(key.as_bytes())
+    ))
+}
+
+/// Writes `text` to [`issue_file`], readable by you alone (0600), and
+/// returns where.
+pub fn write_issue_file(
+    dir: &Path,
+    repo: &RepoKey,
+    number: u64,
+    text: &str,
+) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let path = issue_file(dir, repo, number);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)?;
+    // One written before with a looser mode keeps it through `mode`.
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.write_all(text.as_bytes())?;
+    Ok(path)
+}
+
+/// What Claude is first told in an issue's task. Only the number and the
+/// file's path: the issue's own words stay in the file, never on a
+/// command line.
+pub fn issue_prompt(file: &Path, number: u64) -> String {
+    format!(
+        "Read the GitHub issue in {} and work on issue #{number}.",
+        file.display()
+    )
+}
+
+/// `command` with `prompt`, when there is one, after it as one argument
+/// quoted for `sh`.
+pub fn with_prompt(command: &str, prompt: Option<&str>) -> String {
+    match prompt {
+        Some(prompt) => format!("{command} {}", crate::project::review::shell_quote(prompt)),
+        None => command.to_owned(),
+    }
+}
+
+/// The worktree in `list` that has `branch` checked out: an issue's task
+/// started before, which Start Task goes back to rather than making again.
+pub fn worktree_on_branch(list: &[Worktree], branch: &str) -> Option<PathBuf> {
+    list.iter()
+        .find(|w| !w.main && w.branch.as_deref() == Some(branch))
+        .map(|w| w.path.clone())
+}
 
 /// How long the open rows wait between pull request reads: shorter while
 /// an open pull request's checks run, longest when none is open.
@@ -984,6 +1111,18 @@ pub struct Panel {
     pr_wanted: Vec<String>,
     /// Per worktree id, when `gh` last answered about its pull request.
     pr_read: std::collections::HashMap<String, std::time::Instant>,
+    /// Per repository, its open issues on GitHub, once read.
+    pub issues: std::collections::HashMap<RepoKey, IssueSet>,
+    /// The issue list reads, one repository after another on a worker of
+    /// their own, so they never hold the pull requests back.
+    issues_rx: Option<mpsc::Receiver<(RepoKey, IssuesAnswer)>>,
+    /// Repositories asked for while a read ran, read after it.
+    issues_wanted: Vec<RepoKey>,
+    /// The one issue being read whole, for its tab: the latest asked.
+    issue_rx: Option<mpsc::Receiver<(RepoKey, IssueAnswer)>>,
+    /// Per main checkout on a host, its repository on GitHub, from its
+    /// origin.
+    pub github_repos: std::collections::HashMap<RepoKey, String>,
     /// A watcher per main checkout's Git directory, for pushes, and the
     /// main checkouts they are for.
     pub ref_watchers: Vec<crate::project::watch::Watcher>,
@@ -1033,10 +1172,12 @@ pub struct Panel {
 }
 
 /// A task operation that worked: what to say, and a folder to start a
-/// terminal in (a new task's), with its host when it is on one.
+/// terminal in (a new task's), with its host when it is on one, and what
+/// to tell Claude when Claude starts there instead of a shell.
 pub struct Done {
     pub said: String,
     pub start_in: Option<(Option<String>, PathBuf)>,
+    pub claude: Option<String>,
 }
 
 impl Panel {
@@ -1225,6 +1366,12 @@ impl Panel {
         self.info_rx = Some(info_rx);
     }
 
+    /// Whether `gh` is asked about issues and pull requests, as far as is
+    /// known: not before it was looked for.
+    pub fn github_asked(&self) -> bool {
+        self.github == Some(true) && github_allowed()
+    }
+
     /// Whether pull requests can be asked about: `gh` is there, and this
     /// is not a test instance that keeps away from it.
     fn asks_github(&mut self) -> bool {
@@ -1389,7 +1536,213 @@ impl Panel {
         changed
     }
 
-    /// Forgets what was read about workspaces no longer in the list.
+    /// The repositories the selected workspace's inspector shows, by host
+    /// and main checkout: a worktree's repository, or those found in a
+    /// folder workspace (none until read).
+    pub fn selected_repos(&self) -> Vec<RepoKey> {
+        let Some(task) = self.selected_index().map(|i| &self.tasks[i]) else {
+            return Vec::new();
+        };
+        let repos = match &task.repo {
+            Some(repo) if !task.folder => vec![repo.clone()],
+            _ => self.repos_of(task).unwrap_or_default(),
+        };
+        repos
+            .into_iter()
+            .map(|repo| (task.host.clone(), repo))
+            .collect()
+    }
+
+    /// Every repository in the list, by host and main checkout.
+    fn repo_keys(&self) -> std::collections::HashSet<RepoKey> {
+        let found = self.folders.iter().flat_map(|f| {
+            self.repos
+                .get(&f.id())
+                .into_iter()
+                .flatten()
+                .map(|r| (f.host.clone(), r.clone()))
+        });
+        let held = self
+            .worktrees
+            .iter()
+            .filter_map(|w| Some((w.host.clone(), w.repo.clone()?)));
+        found.chain(held).collect()
+    }
+
+    /// The issues read of the repository `repo`, once read.
+    pub fn issues_of(&self, repo: &RepoKey) -> Option<&IssueSet> {
+        self.issues.get(repo)
+    }
+
+    /// Where `gh` finds the repository `repo`: this Mac's in its checkout,
+    /// a host's by its GitHub name; `None` for a host's not on GitHub.
+    fn issue_target(&self, repo: &RepoKey) -> Option<crate::project::worktree::GitHub> {
+        use crate::project::worktree::GitHub;
+        match &repo.0 {
+            None => Some(GitHub::Dir(repo.1.clone())),
+            Some(_) => self.github_repos.get(repo).cloned().map(GitHub::Repo),
+        }
+    }
+
+    /// The selected workspace's repositories whose issues are due at
+    /// `now`: never read, or read [`ISSUES_EVERY`] ago.
+    fn issues_due(&self, now: std::time::Instant) -> Vec<RepoKey> {
+        self.selected_repos()
+            .into_iter()
+            .filter(|repo| {
+                self.issues
+                    .get(repo)
+                    .is_none_or(|set| now.saturating_duration_since(set.read_at) >= ISSUES_EVERY)
+            })
+            .collect()
+    }
+
+    /// Reads the issues of the selected workspace's repositories that are
+    /// due, when no read is running already. Only those: another
+    /// workspace's are read when it is selected.
+    pub fn refresh_issues(&mut self) {
+        if self.issues_rx.is_some() {
+            return;
+        }
+        let due = self.issues_due(std::time::Instant::now());
+        self.read_issues(due);
+    }
+
+    /// Reads the issues of `repo` now, due or not: on selecting it, or
+    /// Refresh.
+    pub fn want_issues_now(&mut self, repo: RepoKey) {
+        self.read_issues(vec![repo]);
+    }
+
+    /// Asks `gh` for the open issues of `repos`, one after another on a
+    /// worker; while a read runs they wait for it. A host's repository
+    /// not on GitHub is answered so without asking.
+    fn read_issues(&mut self, repos: Vec<RepoKey>) {
+        use crate::project::worktree::{ISSUE_LIMIT, issues_in};
+        if repos.is_empty() || !self.asks_github() {
+            return;
+        }
+        if self.issues_rx.is_some() {
+            for repo in repos {
+                if !self.issues_wanted.contains(&repo) {
+                    self.issues_wanted.push(repo);
+                }
+            }
+            return;
+        }
+        let jobs: Vec<_> = repos
+            .into_iter()
+            .map(|repo| {
+                let target = self.issue_target(&repo);
+                (repo, target)
+            })
+            .collect();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for (repo, target) in jobs {
+                let answer = match target {
+                    Some(target) => issues_in(&target, ISSUE_LIMIT).map(|list| {
+                        let capped = list.len() >= ISSUE_LIMIT;
+                        (list, capped)
+                    }),
+                    None => Err(IssueError::NotGitHub),
+                };
+                if tx.send((repo, answer)).is_err() {
+                    return;
+                }
+            }
+        });
+        self.issues_rx = Some(rx);
+    }
+
+    /// Takes what `gh` said about `repo`'s issues: a failure keeps the
+    /// list last read and says why. Returns whether anything shown
+    /// changed.
+    pub fn take_issues(&mut self, repo: RepoKey, answer: IssuesAnswer) -> bool {
+        let read_at = std::time::Instant::now();
+        let fresh = match (answer, self.issues.get(&repo)) {
+            (Ok((list, capped)), _) => IssueSet {
+                list,
+                capped,
+                error: None,
+                read_at,
+            },
+            (Err(error), Some(old)) => IssueSet {
+                error: Some(error),
+                read_at,
+                ..old.clone()
+            },
+            (Err(error), None) => IssueSet {
+                list: Vec::new(),
+                capped: false,
+                error: Some(error),
+                read_at,
+            },
+        };
+        let changed = self.issues.get(&repo).is_none_or(|old| {
+            (&old.list, old.capped, &old.error) != (&fresh.list, fresh.capped, &fresh.error)
+        });
+        self.issues.insert(repo, fresh);
+        changed
+    }
+
+    fn poll_issues(&mut self) -> bool {
+        let mut changed = false;
+        while let Some(rx) = &self.issues_rx {
+            match rx.try_recv() {
+                Ok((repo, answer)) => changed |= self.take_issues(repo, answer),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.issues_rx = None;
+                    let wanted = std::mem::take(&mut self.issues_wanted);
+                    self.read_issues(wanted);
+                }
+            }
+        }
+        changed
+    }
+
+    /// Reads issue `number` of `repo` whole, body and comments, on a
+    /// worker; [`Panel::take_issue_detail`] has the answer. Asking again
+    /// drops the read before.
+    pub fn request_issue(&mut self, repo: RepoKey, number: u64) {
+        if !self.asks_github() {
+            return;
+        }
+        let target = self.issue_target(&repo);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let answer = match target {
+                Some(target) => crate::project::worktree::issue_in(&target, number),
+                None => Err(IssueError::NotGitHub),
+            };
+            let _ = tx.send((repo, answer));
+        });
+        self.issue_rx = Some(rx);
+    }
+
+    /// The issue [`Panel::request_issue`] read, once it answers.
+    pub fn take_issue_detail(&mut self) -> Option<(RepoKey, IssueAnswer)> {
+        let rx = self.issue_rx.as_ref()?;
+        let answer = match rx.try_recv() {
+            Ok(answer) => answer,
+            Err(mpsc::TryRecvError::Empty) => return None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.issue_rx = None;
+                return None;
+            }
+        };
+        self.issue_rx = None;
+        Some(answer)
+    }
+
+    /// Whether an issue is being read whole.
+    pub fn reading_issue(&self) -> bool {
+        self.issue_rx.is_some()
+    }
+
+    /// Forgets what was read about workspaces no longer in the list, and
+    /// the issues of repositories no longer in it.
     fn prune(&mut self) {
         let listed: std::collections::HashSet<String> =
             self.tasks.iter().map(Workspace::id).collect();
@@ -1397,6 +1750,9 @@ impl Panel {
         self.pr_read.retain(|id, _| listed.contains(id));
         self.pushed.retain(|id, _| listed.contains(id));
         self.pr_wanted.retain(|id| listed.contains(id));
+        let repos = self.repo_keys();
+        self.issues.retain(|repo, _| repos.contains(repo));
+        self.issues_wanted.retain(|repo| repos.contains(repo));
     }
 
     /// The kept workspaces and arrangement; the first time, every
@@ -1507,7 +1863,11 @@ impl Panel {
                 }
             }
         }
-        changed | self.poll_pull_requests() | self.poll_list() | self.inspector.poll()
+        changed
+            | self.poll_pull_requests()
+            | self.poll_issues()
+            | self.poll_list()
+            | self.inspector.poll()
     }
 
     fn poll_pull_requests(&mut self) -> bool {
@@ -1607,6 +1967,9 @@ impl Panel {
         self.prunable
             .retain(|(host, main), _| *host != listing.host || kept_mains.contains(main));
         self.prunable.extend(listing.prunable);
+        self.github_repos
+            .retain(|(host, main), _| *host != listing.host || kept_mains.contains(main));
+        self.github_repos.extend(listing.github);
         if listing.host.is_none() {
             self.reading_local = false;
         }
@@ -2000,9 +2363,10 @@ impl Panel {
         self.loaded && !self.reading_local
     }
 
-    /// A read or an operation is in flight.
+    /// A read or an operation is in flight: an issue read whole for its
+    /// tab too, which nothing else wakes the window for.
     pub fn busy(&self) -> bool {
-        self.reading_list() || self.pr_rx.is_some()
+        self.reading_list() || self.pr_rx.is_some() || self.reading_issue()
     }
 
     /// The list, an operation or the inspector is being read; a pull
@@ -3690,6 +4054,157 @@ mod tests {
         assert_eq!(panel.report_pull_requests(), "");
     }
 
+    fn issue(number: u64) -> crate::project::worktree::Issue {
+        crate::project::worktree::Issue {
+            number,
+            title: format!("Issue {number}"),
+            state: "OPEN".into(),
+            ..Default::default()
+        }
+    }
+
+    fn here(path: &str) -> RepoKey {
+        (None, PathBuf::from(path))
+    }
+
+    #[test]
+    fn issues_are_read_every_five_minutes_for_the_selected_workspace_only() {
+        let mut panel = nested();
+        assert!(panel.selected_repos().is_empty());
+        assert!(panel.issues_due(std::time::Instant::now()).is_empty());
+        // A folder workspace: the repositories found in it.
+        panel.selected = Some("folder:garden-log".into());
+        assert_eq!(panel.selected_repos(), vec![here("/r")]);
+        assert_eq!(
+            panel.issues_due(std::time::Instant::now()),
+            vec![here("/r")]
+        );
+        assert!(panel.take_issues(here("/r"), Ok((vec![issue(1)], false))));
+        let at = panel.issues_of(&here("/r")).unwrap().read_at;
+        let s = std::time::Duration::from_secs;
+        assert!(panel.issues_due(at + s(299)).is_empty());
+        assert_eq!(panel.issues_due(at + ISSUES_EVERY), vec![here("/r")]);
+        // A worktree: its repository's, read once for all its worktrees.
+        panel.selected = Some("/w/a".into());
+        assert_eq!(panel.selected_repos(), vec![here("/r")]);
+        assert!(panel.issues_due(at + s(10)).is_empty());
+        panel.selected = Some("/elsewhere/x".into());
+        assert_eq!(panel.issues_due(at + s(10)), vec![here("/o")]);
+        // A folder with no repository in it reads nothing.
+        panel.selected = Some("folder:notes".into());
+        assert!(panel.issues_due(at + ISSUES_EVERY).is_empty());
+    }
+
+    #[test]
+    fn a_failed_issue_read_keeps_the_last_list() {
+        let mut panel = nested();
+        let r = here("/r");
+        // A first read that fails: no list, and why.
+        assert!(panel.take_issues(r.clone(), Err(IssueError::NeedsAuth)));
+        let set = panel.issues_of(&r).unwrap();
+        assert_eq!(
+            (set.list.len(), &set.error),
+            (0, &Some(IssueError::NeedsAuth))
+        );
+        assert!(panel.take_issues(r.clone(), Ok((vec![issue(1), issue(2)], false))));
+        assert!(!panel.take_issues(r.clone(), Ok((vec![issue(1), issue(2)], false))));
+        let offline = IssueError::Other("error connecting to api.github.com".into());
+        assert!(panel.take_issues(r.clone(), Err(offline.clone())));
+        let set = panel.issues_of(&r).unwrap();
+        assert_eq!(
+            (
+                set.list.iter().map(|i| i.number).collect::<Vec<_>>(),
+                &set.error
+            ),
+            (vec![1, 2], &Some(offline.clone()))
+        );
+        // The same failure again changes nothing shown, but counts as read.
+        let before = set.read_at;
+        assert!(!panel.take_issues(r.clone(), Err(offline)));
+        assert!(panel.issues_of(&r).unwrap().read_at >= before);
+        assert!(panel.take_issues(r.clone(), Ok((vec![issue(3)], true))));
+        let set = panel.issues_of(&r).unwrap();
+        assert_eq!((set.count(), &set.error), ("1+".to_owned(), &None));
+    }
+
+    #[test]
+    fn the_issues_of_a_repository_no_longer_listed_are_forgotten() {
+        let mut panel = nested();
+        let host = (Some("box".to_owned()), PathBuf::from("/r"));
+        for repo in [here("/r"), here("/o"), here("/gone"), host.clone()] {
+            panel.take_issues(repo, Ok((vec![issue(1)], false)));
+        }
+        panel.issues_wanted = vec![here("/gone"), here("/o")];
+        panel.prune();
+        let mut kept: Vec<RepoKey> = panel.issues.keys().cloned().collect();
+        kept.sort();
+        assert_eq!(kept, vec![here("/o"), here("/r")]);
+        assert_eq!(panel.issues_wanted, vec![here("/o")]);
+        // Its last worktree gone, a repository no folder holds goes too.
+        panel
+            .worktrees
+            .retain(|w| w.path != Path::new("/elsewhere/x"));
+        panel.rebuild();
+        panel.prune();
+        assert_eq!(
+            panel.issues.keys().cloned().collect::<Vec<_>>(),
+            vec![here("/r")]
+        );
+    }
+
+    #[test]
+    fn a_hosts_repository_is_asked_about_by_its_github_name() {
+        use crate::project::worktree::GitHub;
+        let mut panel = Panel {
+            folders: vec![{
+                let mut f = folder("srv", "/srv");
+                f.host = Some("box".into());
+                f
+            }],
+            ..Panel::default()
+        };
+        let box_ = |path: &str| (Some("box".to_owned()), PathBuf::from(path));
+        let listing = |names: &[(&str, &str)]| Listing {
+            host: Some("box".into()),
+            repos: vec![(
+                "folder:srv".into(),
+                vec![PathBuf::from("/srv/app"), PathBuf::from("/srv/tool")],
+            )],
+            worktrees: Vec::new(),
+            prunable: std::collections::HashMap::new(),
+            github: names
+                .iter()
+                .map(|(path, name)| (box_(path), (*name).to_owned()))
+                .collect(),
+            unreachable: Vec::new(),
+        };
+        // A repository with no worktree but its own checkout still has it.
+        panel.take_listing(listing(&[("/srv/app", "me/app")]));
+        panel.rebuild();
+        panel.selected = Some("folder:srv".into());
+        assert_eq!(
+            panel.selected_repos(),
+            vec![box_("/srv/app"), box_("/srv/tool")]
+        );
+        assert_eq!(
+            panel.issue_target(&box_("/srv/app")),
+            Some(GitHub::Repo("me/app".into()))
+        );
+        // Its origin not on GitHub: `gh` is not asked.
+        assert_eq!(panel.issue_target(&box_("/srv/tool")), None);
+        assert_eq!(
+            panel.issue_target(&here("/srv/app")),
+            Some(GitHub::Dir("/srv/app".into()))
+        );
+        // The next read of the host says what its origins are now.
+        panel.take_listing(listing(&[("/srv/tool", "me/tool")]));
+        assert_eq!(panel.issue_target(&box_("/srv/app")), None);
+        assert_eq!(
+            panel.issue_target(&box_("/srv/tool")),
+            Some(GitHub::Repo("me/tool".into()))
+        );
+    }
+
     #[test]
     fn what_was_read_about_a_removed_worktree_is_forgotten() {
         let mut panel = nested();
@@ -4033,6 +4548,7 @@ mod tests {
                     .collect(),
                 worktrees: rows,
                 prunable: std::collections::HashMap::new(),
+                github: std::collections::HashMap::new(),
                 unreachable: unreachable.iter().map(|s| (*s).to_owned()).collect(),
             };
         let take = |panel: &mut Panel, l: Listing| {
@@ -4179,5 +4695,89 @@ mod tests {
         panel.add_folder("crc", dir.clone());
         let at = folder_task(&panel.tasks, &first.path.join("src"));
         assert_eq!(at.map(|i| panel.tasks[i].id()), Some(new));
+    }
+
+    #[test]
+    fn an_issue_reaches_claude_as_a_quoted_path_never_as_its_words() {
+        use std::os::unix::fs::PermissionsExt;
+        // A home with a quote and a command in it, and an issue that tries
+        // to end the quoting with its title and body.
+        let dir = std::env::temp_dir().join(format!(
+            "crc-issue-'; touch pwned; '-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let hostile = "'; rm -rf ~; '";
+        let issue = crate::project::worktree::Issue {
+            number: 42,
+            title: hostile.into(),
+            body: hostile.into(),
+            ..Default::default()
+        };
+        let repo = here("/r");
+        let text = crate::project::worktree::issue_markdown(&issue);
+        let file = write_issue_file(&dir, &repo, issue.number, &text).unwrap();
+        assert_eq!(file, issue_file(&dir, &repo, 42));
+        assert!(file.starts_with(dir.join("issues")));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let prompt = issue_prompt(&file, issue.number);
+        let command = with_prompt("claude", Some(&prompt));
+        assert!(!command.contains(hostile), "{command}");
+        assert!(command.starts_with("claude '"), "{command}");
+        // `sh` reads it back as one argument: the prompt, whole.
+        let echo = with_prompt("printf '%s|%s' \"$#\"", Some(&prompt));
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "set -- {}; {echo}",
+                crate::project::review::shell_quote(&prompt)
+            ))
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), format!("1|{prompt}"));
+        assert!(!dir.join("pwned").exists());
+        assert_eq!(with_prompt("claude", None), "claude");
+        // Written again, a file left with a looser mode is made 0600.
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_issue_file(&dir, &repo, issue.number, "again").unwrap();
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        // Another repository's issue of the same number has its own file.
+        assert_ne!(issue_file(&dir, &here("/other"), 42), file,);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn start_task_goes_back_to_an_issues_worktree() {
+        let tree = |path: &str, branch: Option<&str>, main: bool| Worktree {
+            path: PathBuf::from(path),
+            branch: branch.map(str::to_owned),
+            main,
+        };
+        let list = vec![
+            tree("/r", Some("issue-7-fix"), true),
+            tree("/w/a", Some("issue-7-fix-login"), false),
+            tree("/w/b", None, false),
+        ];
+        assert_eq!(
+            worktree_on_branch(&list, "issue-7-fix-login"),
+            Some(PathBuf::from("/w/a"))
+        );
+        // The main checkout on that branch is not a task to go back to.
+        assert_eq!(worktree_on_branch(&list, "issue-7-fix"), None);
+        assert_eq!(worktree_on_branch(&list, "issue-8"), None);
+    }
+
+    #[test]
+    fn an_issue_tab_is_named_for_its_number_and_title() {
+        assert_eq!(issue_tab_label(42, " Fix login "), "#42 Fix login");
+        let long = issue_tab_label(
+            7,
+            "Seed tray drains too slowly after watering in the morning",
+        );
+        assert_eq!(long, "#7 Seed tray drains too slowly after wa\u{2026}");
     }
 }

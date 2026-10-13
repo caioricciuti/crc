@@ -168,7 +168,11 @@ the size and write it back.
   nothing changes), pull (fast-forward only) and push. With `gh`
   installed it shows the branch's pull request (title, author, commits,
   lines, each check) and opens one, or merges it on GitHub: squash,
-  merge commit or rebase, chosen each time and confirmed. The same
+  merge commit or rebase, chosen each time and confirmed. Under each
+  card of a repository on GitHub are its open issues (the newest ten,
+  Show all for the rest), read with `gh` every five minutes. Click one
+  to read it in a tab; Start Task there makes an `issue-N-title`
+  worktree and starts Claude in it on that issue. The same
   operations are on a workspace's right-click menu, with opening it in
   the editor, merging its branch into the main checkout, removing it
   (refused while it has uncommitted changes), and renaming or forgetting

@@ -2926,6 +2926,9 @@ pub enum Hit {
     /// Accept and Reject above a change proposed by Claude.
     ReviewAccept,
     ReviewReject,
+    /// Start Task and Open on GitHub above an issue's tab.
+    IssueStartTask,
+    IssueOpenGitHub,
     /// Above a document with merge conflicts: the inline or side-by-side
     /// switch (`true` for side by side), Previous and Next (`true`), and
     /// Mark Resolved.
@@ -2993,6 +2996,8 @@ impl Hit {
             Hit::ResponseSegment(i) => format!("response.segment.{i}"),
             Hit::ReviewAccept => "review.accept".into(),
             Hit::ReviewReject => "review.reject".into(),
+            Hit::IssueStartTask => "issue.start".into(),
+            Hit::IssueOpenGitHub => "issue.github".into(),
             Hit::ConflictMode(side) => if *side {
                 "conflict.side"
             } else {

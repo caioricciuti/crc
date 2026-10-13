@@ -29,6 +29,27 @@ impl EditorView {
             return;
         };
         let (action, repo) = action;
+        // An issue row, and Show all: in the repository (a main checkout)
+        // on the host of the workspace shown.
+        if let (Action::OpenIssue(_) | Action::ToggleIssues, Some(main)) = (action, &repo) {
+            match action {
+                Action::OpenIssue(number) => {
+                    let host = self.state().and_then(|state| {
+                        let i = state.agents.selected_index()?;
+                        state.agents.tasks[i].host.clone()
+                    });
+                    self.open_issue((host, main.clone()), number);
+                }
+                _ => {
+                    if let Some(mut state) = self.state_mut() {
+                        state.agents.inspector.toggle_issues(main);
+                    }
+                }
+            }
+            self.request_redraw();
+            self.pump();
+            return;
+        }
         // A worktree strip's buttons act on that worktree's workspace: one
         // on the host of the workspace shown, when it is remote.
         if let (
@@ -78,10 +99,25 @@ impl EditorView {
             Action::OpenWorktree
             | Action::WorktreeTerminal
             | Action::ReviewWorktree
-            | Action::CleanUpWorktree => {}
+            | Action::CleanUpWorktree
+            | Action::OpenIssue(_)
+            | Action::ToggleIssues => {}
         }
         self.request_redraw();
         self.pump();
+    }
+
+    /// Issue `number` of the repository `repo`, clicked in the inspector:
+    /// read whole, body and comments, on a worker.
+    pub(super) fn open_issue(&self, repo: crate::platform::agents::RepoKey, number: u64) {
+        if let Some(mut state) = self.state_mut() {
+            state.agents.request_issue(repo, number);
+            state.say(
+                layout::Feedback::Info,
+                format!("Loading issue #{number}\u{2026}"),
+            );
+        }
+        self.resume_display_link();
     }
 
     /// View > Workspace Inspector, and its close button.
@@ -94,7 +130,8 @@ impl EditorView {
     }
 
     /// Reads the selected workspace's status for the inspector, when it is
-    /// showing and the one in hand is old or another workspace's.
+    /// showing and the one in hand is old or another workspace's, and its
+    /// issues when they are due.
     pub(super) fn want_inspector(&self) {
         let Some(mut state) = self.state_mut() else {
             return;
@@ -102,6 +139,9 @@ impl EditorView {
         if !state.agents.on || state.agents.inspector.hidden {
             return;
         }
+        // Its issues, once a workspace is selected or its repositories are
+        // found; after that every few minutes.
+        state.agents.refresh_issues();
         let Some(task) = state
             .agents
             .selected_index()
@@ -200,7 +240,7 @@ impl EditorView {
 
     /// The periodic read while Agents mode is on: worktrees and the
     /// inspector's status every minute, when nothing else is reading them;
-    /// the pull requests that are due.
+    /// the pull requests that are due, and the selected workspace's issues.
     pub(super) fn agents_tick(&self) {
         let on = {
             let Some(mut state) = self.state_mut() else {
@@ -216,6 +256,7 @@ impl EditorView {
             }
             if state.agents.on {
                 state.agents.refresh_pull_requests();
+                state.agents.refresh_issues();
             }
             state.agents.on
         };
@@ -303,6 +344,7 @@ impl EditorView {
             Ok(Done {
                 said: work(path)?,
                 start_in: None,
+                claude: None,
             })
         });
         drop(state);

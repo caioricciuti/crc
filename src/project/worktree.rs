@@ -1542,6 +1542,455 @@ pub fn merge_pull_request_in(
     Ok(format!("Merged pull request #{number}"))
 }
 
+/// How many open issues a repository's list reads; more is said as
+/// "100+".
+pub const ISSUE_LIMIT: usize = 100;
+/// The most of an issue's body kept; GitHub has the rest.
+const BODY_CAP: usize = 200 * 1024;
+/// The most comments kept, and the most of their text in all.
+const COMMENTS_CAP: usize = 50;
+const COMMENTS_BYTES: usize = 1024 * 1024;
+const CUT: &str = "(truncated, see GitHub)";
+
+/// An issue on GitHub, as `gh` reports it. Read only: crc never writes
+/// one. A list read leaves the body and comments empty; [`issue_in`]
+/// reads them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Issue {
+    pub number: u64,
+    pub title: String,
+    /// `OPEN` or `CLOSED`.
+    pub state: String,
+    pub url: String,
+    /// The author's login.
+    pub author: String,
+    pub labels: Vec<String>,
+    /// ISO 8601, as GitHub has them (see [`age`]).
+    pub created_at: String,
+    pub updated_at: String,
+    pub body: String,
+    pub comments: Vec<IssueComment>,
+    /// Comments were left out, or one was cut short: GitHub has them all.
+    pub comments_cut: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IssueComment {
+    pub author: String,
+    pub created_at: String,
+    pub body: String,
+}
+
+/// Why a repository's issues could not be read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IssueError {
+    /// `gh` is not signed in to GitHub.
+    NeedsAuth,
+    /// The repository has no GitHub remote, or GitHub does not know it.
+    NotGitHub,
+    /// Anything else: what `gh` said last.
+    Other(String),
+}
+
+impl IssueError {
+    /// A line to show where the issues would be.
+    pub fn message(&self) -> String {
+        match self {
+            IssueError::NeedsAuth => "Sign in to GitHub: run gh auth login in a terminal".into(),
+            IssueError::NotGitHub => "Not a GitHub repository".into(),
+            IssueError::Other(said) => said.clone(),
+        }
+    }
+}
+
+/// What a failed `gh` said, sorted: not signed in, not a GitHub
+/// repository, or its last line.
+pub fn issue_error(err: &str) -> IssueError {
+    let low = err.to_ascii_lowercase();
+    if low.contains("gh auth login")
+        || low.contains("not logged in")
+        || low.contains("not logged into")
+        || low.contains("http 401")
+        || low.contains("bad credentials")
+    {
+        IssueError::NeedsAuth
+    } else if low.contains("no git remotes")
+        || low.contains("could not resolve")
+        || low.contains("point to a known github host")
+        || low.contains("not a git repository")
+        || low.contains("failed to determine base repo")
+    {
+        IssueError::NotGitHub
+    } else {
+        IssueError::Other(clean_line(err.trim().lines().last().unwrap_or("gh failed")))
+    }
+}
+
+/// The open issues of the repository `where_`, newest first as `gh` lists
+/// them, at most `limit`: as many means there may be more.
+pub fn issues_in(where_: &GitHub, limit: usize) -> Result<Vec<Issue>, IssueError> {
+    let limit = limit.to_string();
+    let output = where_
+        .command(&[
+            "issue",
+            "list",
+            "--state",
+            "open",
+            "--limit",
+            &limit,
+            "--json",
+            "number,title,labels,createdAt,updatedAt,author,url",
+        ])
+        .map_err(IssueError::Other)?
+        .output()
+        .map_err(|e| IssueError::Other(e.to_string()))?;
+    issues_answer(
+        output.status.success(),
+        &String::from_utf8_lossy(&output.stdout),
+        &String::from_utf8_lossy(&output.stderr),
+    )
+}
+
+/// What `gh issue list` said.
+pub fn issues_answer(ok: bool, out: &str, err: &str) -> Result<Vec<Issue>, IssueError> {
+    if !ok {
+        return Err(issue_error(err));
+    }
+    parse_issues(out).ok_or_else(|| IssueError::Other("gh said something unreadable".into()))
+}
+
+/// Issue `number` of the repository `where_`, with its body and comments.
+pub fn issue_in(where_: &GitHub, number: u64) -> Result<Issue, IssueError> {
+    let n = number.to_string();
+    let output = where_
+        .command(&[
+            "issue",
+            "view",
+            &n,
+            "--json",
+            "number,title,state,url,author,labels,body,comments,createdAt,updatedAt",
+        ])
+        .map_err(IssueError::Other)?
+        .output()
+        .map_err(|e| IssueError::Other(e.to_string()))?;
+    issue_answer(
+        output.status.success(),
+        &String::from_utf8_lossy(&output.stdout),
+        &String::from_utf8_lossy(&output.stderr),
+    )
+}
+
+/// What `gh issue view` said.
+pub fn issue_answer(ok: bool, out: &str, err: &str) -> Result<Issue, IssueError> {
+    if !ok {
+        return Err(issue_error(err));
+    }
+    crate::json::parse(out)
+        .ok()
+        .as_ref()
+        .and_then(read_issue)
+        .ok_or_else(|| IssueError::Other("gh said something unreadable".into()))
+}
+
+/// `gh issue list`'s JSON: an array of issues.
+pub fn parse_issues(text: &str) -> Option<Vec<Issue>> {
+    let value = crate::json::parse(text).ok()?;
+    Some(value.as_array()?.iter().filter_map(read_issue).collect())
+}
+
+/// One issue of `gh`'s JSON; its text cleaned of anything a terminal or
+/// the screen would take for more than text, and cut to size.
+fn read_issue(value: &crate::json::Value) -> Option<Issue> {
+    let text = |v: &crate::json::Value, key: &str| {
+        v.get(key).and_then(|w| w.as_str()).unwrap_or("").to_owned()
+    };
+    let login = |v: &crate::json::Value| {
+        v.get("author")
+            .map(|a| clean_line(&text(a, "login")))
+            .unwrap_or_default()
+    };
+    let labels = value
+        .get("labels")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&[])
+        .iter()
+        .map(|l| clean_line(&text(l, "name")))
+        .filter(|l| !l.is_empty())
+        .collect();
+    let mut comments = Vec::new();
+    let mut comments_cut = false;
+    let mut budget = COMMENTS_BYTES;
+    let all = value
+        .get("comments")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&[]);
+    for c in all {
+        if comments.len() == COMMENTS_CAP || budget == 0 {
+            comments_cut = true;
+            break;
+        }
+        let mut body = clean_text(&text(c, "body"));
+        if body.len() > budget {
+            body.truncate(char_floor(&body, budget));
+            comments_cut = true;
+        }
+        budget -= body.len();
+        comments.push(IssueComment {
+            author: login(c),
+            created_at: clean_line(&text(c, "createdAt")),
+            body,
+        });
+    }
+    let mut body = clean_text(&text(value, "body"));
+    if body.len() > BODY_CAP {
+        body.truncate(char_floor(&body, BODY_CAP));
+        body.push_str("\n\n");
+        body.push_str(CUT);
+    }
+    let state = clean_line(&text(value, "state")).to_ascii_uppercase();
+    Some(Issue {
+        number: value.get("number")?.as_u64()?,
+        title: clean_line(&text(value, "title")),
+        // A list read asks for open ones only, and not their state.
+        state: if state.is_empty() {
+            "OPEN".into()
+        } else {
+            state
+        },
+        url: clean_line(&text(value, "url")),
+        author: login(value),
+        labels,
+        created_at: clean_line(&text(value, "createdAt")),
+        updated_at: clean_line(&text(value, "updatedAt")),
+        body,
+        comments,
+        comments_cut,
+    })
+}
+
+/// The largest index at most `at` that starts a character of `s`.
+fn char_floor(s: &str, at: usize) -> usize {
+    let mut at = at.min(s.len());
+    while !s.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
+}
+
+/// `s` without terminal escapes (CSI, OSC and the two-byte ones), control
+/// characters or the marks that reorder text on screen; `keep` says which
+/// control characters stay.
+fn strip(s: &str, keep: impl Fn(char) -> bool) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            match chars.next() {
+                // CSI: parameters, then one final byte.
+                Some('[') => {
+                    for c in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                // OSC and the other strings: to BEL or ESC \.
+                Some(']' | 'P' | 'X' | '^' | '_') => {
+                    while let Some(c) = chars.next() {
+                        if c == '\u{7}' {
+                            break;
+                        }
+                        if c == '\u{1b}' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        let bidi = matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+        if bidi || (c.is_control() && !keep(c)) {
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// One line of untrusted text (a title, a label, a login): no control
+/// characters at all, a line break or tab made a space.
+fn clean_line(s: &str) -> String {
+    let spaced: String = s
+        .chars()
+        .map(|c| {
+            if matches!(c, '\n' | '\r' | '\t') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    strip(&spaced, |_| false).trim().to_owned()
+}
+
+/// Untrusted text of many lines (a body, a comment): line breaks and tabs
+/// stay, `\r\n` read as `\n`.
+fn clean_text(s: &str) -> String {
+    strip(&s.replace("\r\n", "\n"), |c| matches!(c, '\n' | '\t'))
+}
+
+/// The branch Start Task makes for issue `number`: `issue-42-fix-login`,
+/// its title cut at a word near 40 characters; `issue-42` when the title
+/// leaves nothing. One level: a `/` in the title is a word break.
+pub fn issue_branch(number: u64, title: &str) -> String {
+    let slug = branch_name(&title.replace('/', " "));
+    let slug = if slug.chars().count() > 40 {
+        let head: String = slug.chars().take(40).collect();
+        match head.rfind('-') {
+            Some(at) if at > 0 => head[..at].to_owned(),
+            _ => head,
+        }
+    } else {
+        slug
+    };
+    let slug = slug.trim_matches(|c| matches!(c, '-' | '.'));
+    if slug.is_empty() {
+        format!("issue-{number}")
+    } else {
+        format!("issue-{number}-{slug}")
+    }
+}
+
+/// The read-only tab of an issue: its title, a line of what it is, its
+/// description and its comments, as Markdown.
+pub fn issue_markdown(issue: &Issue) -> String {
+    let mut meta = vec![issue.state.clone()];
+    if !issue.author.is_empty() {
+        meta.push(format!("@{}", issue.author));
+    }
+    if !issue.labels.is_empty() {
+        meta.push(issue.labels.join(", "));
+    }
+    if let Some(day) = day(&issue.created_at) {
+        meta.push(format!("opened {day}"));
+    }
+    if !issue.url.is_empty() {
+        meta.push(issue.url.clone());
+    }
+    let mut out = format!(
+        "# #{} {}\n\n{}\n\n## Description\n\n",
+        issue.number,
+        issue.title,
+        meta.join(" · ")
+    );
+    let body = issue.body.trim();
+    out.push_str(if body.is_empty() {
+        "No description."
+    } else {
+        body
+    });
+    out.push_str(&format!("\n\n## Comments ({})\n", issue.comments.len()));
+    for c in &issue.comments {
+        let who = if c.author.is_empty() {
+            "someone"
+        } else {
+            &c.author
+        };
+        match day(&c.created_at) {
+            Some(day) => out.push_str(&format!("\n### {who}, {day}\n\n")),
+            None => out.push_str(&format!("\n### {who}\n\n")),
+        }
+        out.push_str(c.body.trim());
+        out.push('\n');
+    }
+    if issue.comments_cut {
+        out.push('\n');
+        out.push_str(CUT);
+        out.push('\n');
+    }
+    out
+}
+
+/// The date of an ISO 8601 time: `2026-10-12`.
+fn day(iso: &str) -> Option<&str> {
+    let day = iso.get(..10)?;
+    unix_time(iso).is_some().then_some(day)
+}
+
+/// An ISO 8601 time (`2026-10-12T08:30:00Z`, a fraction or an offset
+/// allowed) in Unix seconds; `None` when it is not one.
+pub fn unix_time(iso: &str) -> Option<i64> {
+    let iso = iso.trim();
+    let num = |from: usize, to: usize| -> Option<i64> {
+        let part = iso.get(from..to)?;
+        part.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| part.parse().ok())?
+    };
+    let b = iso.as_bytes();
+    if b.len() < 19 || b[4] != b'-' || b[7] != b'-' || !matches!(b[10], b'T' | b't' | b' ') {
+        return None;
+    }
+    if b[13] != b':' || b[16] != b':' {
+        return None;
+    }
+    let (y, mo, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
+    let (h, mi, s) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || s > 60 {
+        return None;
+    }
+    let mut rest = &iso[19..];
+    if let Some(frac) = rest.strip_prefix('.') {
+        rest = frac.trim_start_matches(|c: char| c.is_ascii_digit());
+    }
+    let offset = match rest {
+        "" | "Z" | "z" => 0,
+        _ => {
+            let sign = match rest.as_bytes()[0] {
+                b'+' => 1,
+                b'-' => -1,
+                _ => return None,
+            };
+            let rest = rest[1..].replace(':', "");
+            if rest.len() != 4 || !rest.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            sign * (rest[..2].parse::<i64>().ok()? * 3600 + rest[2..].parse::<i64>().ok()? * 60)
+        }
+    };
+    // Days since 1970 from the civil date (Howard Hinnant's algorithm).
+    let y = if mo <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (mo + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + h * 3600 + mi * 60 + s - offset)
+}
+
+/// How long ago the ISO 8601 time `iso` was, at `now` (Unix seconds), in
+/// a few characters: `now`, `3m`, `2h`, `5d`, `3w`, `4mo`, `2y`. Empty
+/// when `iso` is not a time.
+pub fn age(iso: &str, now: u64) -> String {
+    let Some(then) = unix_time(iso) else {
+        return String::new();
+    };
+    let s = (now as i64 - then).max(0);
+    let day = 86_400;
+    match s {
+        s if s < 60 => "now".into(),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < day => format!("{}h", s / 3600),
+        s if s < 7 * day => format!("{}d", s / day),
+        s if s < 30 * day => format!("{}w", s / (7 * day)),
+        s if s < 365 * day => format!("{}mo", s / (30 * day)),
+        s => format!("{}y", s / (365 * day)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1637,6 +2086,277 @@ mod tests {
             Err("error connecting to api.github.com".to_owned())
         );
         assert!(pull_request_answer(true, "not json", "").is_err());
+    }
+
+    #[test]
+    fn reads_an_issue_list() {
+        let list = issues_answer(
+            true,
+            r#"[{"number":42,"title":"Login fails on Safari","labels":[{"id":"x","name":"bug","color":"d73a4a"},{"name":"ui"}],"createdAt":"2026-10-01T08:00:00Z","updatedAt":"2026-10-12T09:30:00Z","author":{"login":"sam","is_bot":false},"url":"https://github.com/o/r/issues/42"},{"number":7,"title":"Docs","labels":[],"author":null,"url":"u"}]"#,
+            "",
+        )
+        .unwrap();
+        assert_eq!(list.len(), 2);
+        let first = &list[0];
+        assert_eq!(
+            (
+                first.number,
+                first.title.as_str(),
+                first.state.as_str(),
+                first.author.as_str(),
+                first.labels.clone(),
+                first.updated_at.as_str(),
+                first.url.as_str(),
+            ),
+            (
+                42,
+                "Login fails on Safari",
+                "OPEN",
+                "sam",
+                vec!["bug".to_owned(), "ui".to_owned()],
+                "2026-10-12T09:30:00Z",
+                "https://github.com/o/r/issues/42",
+            )
+        );
+        assert!(first.body.is_empty() && first.comments.is_empty());
+        // No labels and no author (a deleted account) read as empty.
+        assert_eq!((list[1].author.as_str(), list[1].labels.len()), ("", 0));
+        assert_eq!(issues_answer(true, "[]", ""), Ok(Vec::new()));
+        assert!(matches!(
+            issues_answer(true, "not json", ""),
+            Err(IssueError::Other(_))
+        ));
+    }
+
+    #[test]
+    fn reads_an_issue_with_its_comments() {
+        let issue = issue_answer(
+            true,
+            r#"{"number":42,"title":"Login fails","state":"OPEN","url":"https://github.com/o/r/issues/42","author":{"login":"sam"},"labels":[{"name":"bug"}],"body":"Steps:\r\n1. open\n\t2. click","comments":[{"author":{"login":"kim"},"body":"Same here","createdAt":"2026-10-02T10:00:00Z"},{"author":{"login":"sam"},"body":"Fixed?","createdAt":"2026-10-03T10:00:00Z"}],"createdAt":"2026-10-01T08:00:00Z","updatedAt":"2026-10-03T10:00:00Z"}"#,
+            "",
+        )
+        .unwrap();
+        assert_eq!(issue.body, "Steps:\n1. open\n\t2. click");
+        assert_eq!(
+            issue.comments,
+            vec![
+                IssueComment {
+                    author: "kim".into(),
+                    created_at: "2026-10-02T10:00:00Z".into(),
+                    body: "Same here".into(),
+                },
+                IssueComment {
+                    author: "sam".into(),
+                    created_at: "2026-10-03T10:00:00Z".into(),
+                    body: "Fixed?".into(),
+                },
+            ]
+        );
+        assert!(!issue.comments_cut);
+        let closed = issue_answer(true, r#"{"number":3,"state":"closed"}"#, "").unwrap();
+        assert_eq!(
+            (closed.state.as_str(), closed.title.as_str()),
+            ("CLOSED", "")
+        );
+    }
+
+    #[test]
+    fn sorts_what_gh_said_when_issues_cannot_be_read() {
+        let cases = [
+            (
+                "To get started with GitHub CLI, please run:  gh auth login\n",
+                IssueError::NeedsAuth,
+            ),
+            (
+                "You are not logged into any GitHub hosts. To log in, run: gh auth login",
+                IssueError::NeedsAuth,
+            ),
+            (
+                "HTTP 401: Bad credentials (https://api.github.com/graphql)",
+                IssueError::NeedsAuth,
+            ),
+            ("no git remotes found", IssueError::NotGitHub),
+            (
+                "none of the git remotes configured for this repository point to a known GitHub host.",
+                IssueError::NotGitHub,
+            ),
+            (
+                "GraphQL: Could not resolve to a Repository with the name 'o/gone'. (repository)",
+                IssueError::NotGitHub,
+            ),
+            (
+                "warn\nerror connecting to api.github.com\n",
+                IssueError::Other("error connecting to api.github.com".into()),
+            ),
+            (
+                "the 'o/r' repository has disabled issues\u{1b}[31m!",
+                IssueError::Other("the 'o/r' repository has disabled issues!".into()),
+            ),
+        ];
+        for (said, want) in cases {
+            assert_eq!(issue_error(said), want, "{said}");
+            assert_eq!(issues_answer(false, "", said), Err(want.clone()));
+            assert_eq!(issue_answer(false, "", said), Err(want));
+        }
+        assert_eq!(issue_error(""), IssueError::Other("gh failed".into()));
+    }
+
+    #[test]
+    fn a_hostile_issue_is_only_text() {
+        let title = "Fix\u{1b}[2J\u{1b}]0;owned\u{7} it\u{0}\nnow\u{202e}txt.exe";
+        let body = format!(
+            "line\u{1b}[31mred\u{1b}[0m\n\ttab\u{0}\u{7}\u{8}{}",
+            "x".repeat(BODY_CAP + 10)
+        );
+        let json = crate::json::compact(&crate::json::object([
+            ("number", crate::json::number(1)),
+            ("title", crate::json::string(title)),
+            ("body", crate::json::string(&body)),
+            (
+                "author",
+                crate::json::object([("login", crate::json::string("ev\u{1b}[1mil\r"))]),
+            ),
+            (
+                "labels",
+                crate::json::Value::Array(vec![crate::json::object([(
+                    "name",
+                    crate::json::string("bu\u{9b}g\u{7f}"),
+                )])]),
+            ),
+        ]));
+        let issue = issue_answer(true, &json, "").unwrap();
+        assert_eq!(issue.title, "Fix it nowtxt.exe");
+        assert_eq!(issue.author, "evil");
+        assert_eq!(issue.labels, vec!["bug".to_owned()]);
+        assert!(
+            issue.body.starts_with("linered\n\ttab"),
+            "{:?}",
+            &issue.body[..20]
+        );
+        assert!(issue.body.ends_with(CUT));
+        assert!(issue.body.len() <= BODY_CAP + CUT.len() + 2);
+        // Too many comments, and too much of them: cut, and said so.
+        let comment = |i: usize, size: usize| {
+            crate::json::object([
+                (
+                    "author",
+                    crate::json::object([("login", crate::json::string("a"))]),
+                ),
+                (
+                    "body",
+                    crate::json::string(&format!("{i}{}", "é".repeat(size))),
+                ),
+            ])
+        };
+        let many = |n: usize, size: usize| {
+            crate::json::compact(&crate::json::object([
+                ("number", crate::json::number(2)),
+                (
+                    "comments",
+                    crate::json::Value::Array((0..n).map(|i| comment(i, size)).collect()),
+                ),
+            ]))
+        };
+        let issue = issue_answer(true, &many(80, 10), "").unwrap();
+        assert_eq!(
+            (issue.comments.len(), issue.comments_cut),
+            (COMMENTS_CAP, true)
+        );
+        let issue = issue_answer(true, &many(40, 15_000), "").unwrap();
+        let total: usize = issue.comments.iter().map(|c| c.body.len()).sum();
+        assert!(issue.comments_cut && total <= COMMENTS_BYTES, "{total}");
+        assert!(issue.comments.len() < 40);
+        assert!(issue_markdown(&issue).trim_end().ends_with(CUT));
+    }
+
+    #[test]
+    fn an_issue_names_its_branch() {
+        assert_eq!(
+            issue_branch(42, "Login fails on Safari"),
+            "issue-42-login-fails-on-safari"
+        );
+        assert_eq!(issue_branch(7, ""), "issue-7");
+        assert_eq!(issue_branch(7, "!!! ??? ..."), "issue-7");
+        // Cut at a word, near 40 characters.
+        let long = issue_branch(
+            9,
+            "The sidebar flickers when a workspace with many sessions is selected",
+        );
+        assert_eq!(long, "issue-9-the-sidebar-flickers-when-a-workspace");
+        // One word longer than the cut: cut inside it.
+        let word = issue_branch(1, &"a".repeat(60));
+        assert_eq!(word, format!("issue-1-{}", "a".repeat(40)));
+        assert_eq!(
+            issue_branch(3, "Crash in src/app.rs: fix/it"),
+            "issue-3-crash-in-src-app.rs-fix-it"
+        );
+        assert_eq!(
+            issue_branch(5, "Écran noir à l'ouverture"),
+            "issue-5-écran-noir-à-l-ouverture"
+        );
+        assert_eq!(issue_branch(6, "..hidden.."), "issue-6-hidden");
+    }
+
+    #[test]
+    fn an_issue_reads_as_markdown() {
+        let mut issue = Issue {
+            number: 42,
+            title: "Login fails".into(),
+            state: "OPEN".into(),
+            url: "https://github.com/o/r/issues/42".into(),
+            author: "sam".into(),
+            labels: vec!["bug".into(), "ui".into()],
+            created_at: "2026-10-01T08:00:00Z".into(),
+            updated_at: String::new(),
+            body: "It fails.\n".into(),
+            comments: vec![IssueComment {
+                author: "kim".into(),
+                created_at: "2026-10-02T10:00:00Z".into(),
+                body: "Same here".into(),
+            }],
+            comments_cut: false,
+        };
+        assert_eq!(
+            issue_markdown(&issue),
+            "# #42 Login fails\n\n\
+             OPEN · @sam · bug, ui · opened 2026-10-01 · https://github.com/o/r/issues/42\n\n\
+             ## Description\n\nIt fails.\n\n\
+             ## Comments (1)\n\n### kim, 2026-10-02\n\nSame here\n"
+        );
+        issue.body = "  ".into();
+        issue.comments.clear();
+        issue.labels.clear();
+        issue.author.clear();
+        assert_eq!(
+            issue_markdown(&issue),
+            "# #42 Login fails\n\n\
+             OPEN · opened 2026-10-01 · https://github.com/o/r/issues/42\n\n\
+             ## Description\n\nNo description.\n\n## Comments (0)\n"
+        );
+    }
+
+    #[test]
+    fn says_how_old_a_time_is() {
+        let at = unix_time("2026-10-13T12:00:00Z").unwrap() as u64;
+        assert_eq!(unix_time("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(unix_time("2000-03-01T00:00:00Z"), Some(951_868_800));
+        assert_eq!(unix_time("2026-10-13T14:00:00.123+02:00"), Some(at as i64));
+        let cases = [
+            ("2026-10-13T11:59:30Z", "now"),
+            ("2026-10-13T11:57:00Z", "3m"),
+            ("2026-10-13T10:00:00Z", "2h"),
+            ("2026-10-08T12:00:00Z", "5d"),
+            ("2026-09-22T12:00:00Z", "3w"),
+            ("2026-06-10T12:00:00Z", "4mo"),
+            ("2024-10-01T12:00:00Z", "2y"),
+            // A clock behind GitHub's says now, not a negative age.
+            ("2026-10-13T12:05:00Z", "now"),
+            ("yesterday", ""),
+            ("2026-13-01T00:00:00Z", ""),
+        ];
+        for (iso, want) in cases {
+            assert_eq!(age(iso, at), want, "{iso}");
+        }
     }
 
     #[test]

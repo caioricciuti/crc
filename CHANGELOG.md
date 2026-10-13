@@ -15,6 +15,18 @@ One entry per tag, written for people who use the editor.
   Change stages just that change, unsaved lines included. It refuses, and
   says so, for files with CRLF line endings and for files whose index
   already differs from HEAD; stage those from Source Control.
+- Gutter marks no longer blink out after a stage, commit or branch
+  switch, and the change commands stay available while Git reads the
+  file again.
+- Agents: the workspace inspector lists the open GitHub issues of each
+  repository under its card (the newest ten, Show all for the rest, with
+  labels and age), read with `gh` every five minutes and on Refresh.
+  Clicking one opens it in a read-only tab with its comments, with Start
+  Task and Open on GitHub above it. Start Task makes a worktree on an
+  `issue-N-title` branch (or goes back to the one it made before) and
+  starts Claude there, told to read the issue from a private file; the
+  issue's text never reaches a command line. Repositories on a server
+  list their issues, but Start Task works only on this Mac for now.
 
 ## v0.2.0-alpha.23, 2026-10-13
 
