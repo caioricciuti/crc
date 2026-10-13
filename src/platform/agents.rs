@@ -839,9 +839,6 @@ pub struct Panel {
     /// the text so far and the caret's character index; set by the window
     /// from its field before each draw.
     pub inline: Option<(String, String, usize)>,
-    /// Whether the terminal panel was open in the editor before Agents
-    /// mode took the column, to put it back as it was.
-    pub editor_terminal: bool,
     pub scroll: usize,
     pub hits: Vec<(Viewport, Action)>,
 }

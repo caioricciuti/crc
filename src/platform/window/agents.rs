@@ -9,7 +9,7 @@ use crate::platform::terminal::Activity;
 impl EditorView {
     /// Editor or Agents. Agents gives the terminal the column and the
     /// sidebar to the workspaces, starting a shell when nothing runs yet;
-    /// the editor gets back its panel as it was.
+    /// the editor gets the column back with the terminal panel closed.
     pub(super) fn set_agents_mode(&self, on: bool) {
         let start = {
             let Some(mut state) = self.state_mut() else {
@@ -24,7 +24,6 @@ impl EditorView {
             }
             state.agents.on = on;
             if on {
-                state.agents.editor_terminal = state.terminal.open;
                 state.terminal.open = true;
                 state.terminal.focus = true;
                 state.sidebar_keys = false;
@@ -41,8 +40,9 @@ impl EditorView {
                 }
                 state.terminal.tabs.is_empty()
             } else {
-                state.terminal.open =
-                    state.agents.editor_terminal && !state.terminal.tabs.is_empty();
+                // The editor never opens the terminal for you: the sessions
+                // keep running, a click on the terminal button shows them.
+                state.terminal.open = false;
                 state.terminal.focus = false;
                 false
             }

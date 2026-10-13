@@ -216,6 +216,13 @@ dump $T/agents-closed.out
 key 0 cmd,shift A
 wait 700
 dump $T/agents-plain-off.out
+key 50 ctrl \`
+wait 500
+key 0 cmd,shift A
+wait 700
+key 0 cmd,shift A
+wait 700
+dump $T/agents-plain-off2.out
 quit
 SCRIPT
 HOME="$T/home/agents-plain" CRC_TERMINAL_SHELL=/bin/sh CRC_SELFTEST="$T/agents-plain.script" "$BIN" "$T/plainproj" \
@@ -242,3 +249,8 @@ expect "$T/agents-closed.out" agents "on tasks=other selected=other sessions=*ot
 # workspace's folder (movedrepo), not the one the editor opened on.
 grep -q '^home: .* repos=movedrepo:main:' "$T/agents-plain-off.out" \
     || failed "agents-plain-off.out: $(grep '^home:' "$T/agents-plain-off.out")"
+# The editor never opens the terminal for you, even one it had open.
+grep -q '^terminal: open=false ' "$T/agents-plain-off.out" \
+    || failed "agents-plain-off.out: $(grep '^terminal:' "$T/agents-plain-off.out" | cut -c1-80)"
+grep -q '^terminal: open=false ' "$T/agents-plain-off2.out" \
+    || failed "agents-plain-off2.out: $(grep '^terminal:' "$T/agents-plain-off2.out" | cut -c1-80)"
