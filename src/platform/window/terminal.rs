@@ -195,19 +195,8 @@ impl EditorView {
         if let Some((host, path)) = remote {
             // ssh sends none of these variables but what the person's own
             // config says to; TERM it sends as the terminal's type.
-            let program = std::env::var_os("CRC_SSH_COMMAND")
-                .map_or_else(|| "/usr/bin/ssh".into(), std::path::PathBuf::from);
-            let control = crate::platform::app_support()
-                .map(|dir| dir.join("ssh"))
-                .filter(|dir| {
-                    use std::os::unix::fs::DirBuilderExt;
-                    std::fs::DirBuilder::new()
-                        .recursive(true)
-                        .mode(0o700)
-                        .create(dir)
-                        .is_ok()
-                })
-                .and_then(|dir| crate::platform::remote::control_path(&dir, host));
+            let program = crate::platform::remote::program();
+            let control = crate::platform::remote::control_for(host);
             let args = crate::platform::remote::ssh_args(
                 host,
                 &path.to_string_lossy(),

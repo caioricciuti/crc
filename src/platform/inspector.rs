@@ -473,14 +473,18 @@ impl Inspector {
         if let Some(host) = &workspace.host {
             text(out, atlas, x, y, width, "REMOTE FOLDER", theme.status_text);
             y += ROW;
-            let facts: Vec<Fact> = vec![
+            let mut facts: Vec<Fact> = vec![
                 ("Host", vec![(host.clone(), theme.text)]),
                 (
                     "Folder",
                     vec![(workspace.path.display().to_string(), theme.text)],
                 ),
-                ("Over", vec![("ssh".to_owned(), theme.gutter_text)]),
             ];
+            // A worktree there: its branch, as its row has it.
+            if let Some(branch) = &workspace.branch {
+                facts.push(("Branch", vec![(branch.clone(), theme.text)]));
+            }
+            facts.push(("Over", vec![("ssh".to_owned(), theme.gutter_text)]));
             card(out, atlas, x, y, width, &facts, theme);
             return;
         }

@@ -12,8 +12,12 @@ RS="$RH/Library/Application Support/crc"
 mkdir -p "$T/remoteproj" "$RS/agents"
 printf 'one\n' > "$T/remoteproj/a.txt"
 printf 'app\t/srv/app\tws:remote1\tmyhost\n' > "$RS/agents/workspaces"
+# Its Git is read over ssh too: those calls (BatchMode) run here, where
+# neither folder is, so each finds nothing (scenario 53 has a host's Git).
 cat > "$T/remote-ssh.sh" <<STUB
 #!/bin/sh
+for last; do :; done
+case " \$* " in *BatchMode=yes*) exec /bin/sh -c "\$last" ;; esac
 printf '%s\n' "\$@" >> "$T/remote-ssh.log"
 echo '==' >> "$T/remote-ssh.log"
 echo 'remote stub up'

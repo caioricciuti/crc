@@ -58,6 +58,143 @@ fn run(dir: &Path, args: &[&str]) -> Result<String, String> {
     }
 }
 
+/// Where a repository's Git runs: on this Mac, or on an ssh host through
+/// the connection its terminals share (`control`, see
+/// [`crate::platform::remote::control_path`]). A host's paths are its own:
+/// nothing here resolves them or looks for them on this Mac.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Runner {
+    Local,
+    Ssh {
+        host: String,
+        control: Option<String>,
+    },
+}
+
+/// What a read over ssh says when the host did not answer: ssh's own exit
+/// status, 255, no ssh to run, or no answer in [`SSH_WAIT`].
+pub const UNREACHABLE: &str = "host unreachable";
+
+/// How long one read over ssh may take before the host counts as
+/// unreachable: a hung connection must not hold the list's reads forever.
+const SSH_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// After each command of a batch, on a line of its own: this byte (ASCII's
+/// record separator), then the command's exit status.
+const MARK: char = '\u{1e}';
+
+/// The line a host's shell runs for a batch of Git commands in `dir`: each
+/// one's output, then a line with [`MARK`] and its exit status.
+pub fn batch_line(dir: &Path, commands: &[Vec<String>]) -> String {
+    let mut line = format!(
+        "cd {} || exit 1; export LC_ALL=C GIT_TERMINAL_PROMPT=0 GIT_OPTIONAL_LOCKS=0",
+        crate::platform::remote::shell_path(&dir.to_string_lossy())
+    );
+    for args in commands {
+        line.push_str("; git");
+        for arg in args {
+            line.push(' ');
+            line.push_str(&crate::platform::remote::quote(arg));
+        }
+        line.push_str(" 2>/dev/null; printf '\\n\\036%d\\n' $?");
+    }
+    line
+}
+
+/// The output of [`batch_line`], per command: what it printed, or an error
+/// for one that failed. `None` when it stopped before the last.
+pub fn parse_batch(text: &str, count: usize) -> Option<Vec<Result<String, String>>> {
+    let mut out = Vec::with_capacity(count);
+    let mut rest = text;
+    let mark = format!("\n{MARK}");
+    while out.len() < count {
+        let (said, after) = rest.split_once(&mark)?;
+        let (status, after) = after.split_once('\n')?;
+        out.push(match status.trim() {
+            "0" => Ok(said.to_owned()),
+            status => Err(format!("git exited with {status}")),
+        });
+        rest = after;
+    }
+    Some(out)
+}
+
+/// Runs `line` on `host` over ssh: what it printed, when it exits 0.
+pub fn ssh_output(host: &str, control: Option<&str>, line: &str) -> Result<String, String> {
+    use std::io::Read;
+    // Nothing on stderr is read: a connection ssh keeps open for later
+    // would hold the pipe, and the read with it.
+    let mut child = Command::new(crate::platform::remote::program())
+        .args(crate::platform::remote::batch_args(host, control, line))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|_| UNREACHABLE.to_owned())?;
+    let mut stdout = child.stdout.take().ok_or(UNREACHABLE)?;
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.read_to_end(&mut bytes);
+        bytes
+    });
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < SSH_WAIT => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(UNREACHABLE.into());
+            }
+        }
+    };
+    let bytes = reader.join().unwrap_or_default();
+    match status.code() {
+        Some(0) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+        Some(255) | None => Err(UNREACHABLE.into()),
+        Some(code) => Err(format!("exited with {code}")),
+    }
+}
+
+/// Runs a batch of Git commands in `dir`: one after another here, or in one
+/// ssh call on a host. Per command, its output or why it failed; `Err` when
+/// none ran (the host did not answer, or `dir` is not there).
+pub fn batch_on(
+    runner: &Runner,
+    dir: &Path,
+    commands: &[Vec<String>],
+) -> Result<Vec<Result<String, String>>, String> {
+    match runner {
+        Runner::Local => Ok(commands
+            .iter()
+            .map(|args| {
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                run(dir, &args)
+            })
+            .collect()),
+        Runner::Ssh { host, control } => {
+            let text = ssh_output(host, control.as_deref(), &batch_line(dir, commands))?;
+            parse_batch(&text, commands.len()).ok_or_else(|| UNREACHABLE.to_owned())
+        }
+    }
+}
+
+/// One Git command in `dir`, by `runner`.
+fn run_on(runner: &Runner, dir: &Path, args: &[&str]) -> Result<String, String> {
+    match runner {
+        Runner::Local => run(dir, args),
+        Runner::Ssh { .. } => {
+            let args = args.iter().map(|a| (*a).to_owned()).collect();
+            batch_on(runner, dir, &[args])?
+                .pop()
+                .unwrap_or_else(|| Err(UNREACHABLE.into()))
+        }
+    }
+}
+
 /// Every worktree of the repository `dir` is in, its own checkout first.
 /// Prunable ones (their folder is gone) are left out.
 pub fn list(dir: &Path) -> Result<Vec<Worktree>, String> {
@@ -67,7 +204,12 @@ pub fn list(dir: &Path) -> Result<Vec<Worktree>, String> {
 /// [`list`], and how many worktrees Git still records whose folder is
 /// gone: what [`prune`] would clear.
 pub fn list_all(dir: &Path) -> Result<(Vec<Worktree>, usize), String> {
-    let text = run(dir, &["worktree", "list", "--porcelain"])?;
+    list_all_on(&Runner::Local, dir)
+}
+
+/// [`list_all`], by `runner`.
+pub fn list_all_on(runner: &Runner, dir: &Path) -> Result<(Vec<Worktree>, usize), String> {
+    let text = run_on(runner, dir, &["worktree", "list", "--porcelain"])?;
     Ok((parse_list(&text), parse_prunable(&text)))
 }
 
@@ -246,8 +388,14 @@ pub fn remove(
 /// `base`. A branch made and never committed to is on it too; see
 /// [`has_own_commits`].
 pub fn merged(main: &Path, base: &str) -> Vec<String> {
+    merged_on(&Runner::Local, main, base).unwrap_or_default()
+}
+
+/// [`merged`], by `runner`; the failure is told.
+pub fn merged_on(runner: &Runner, main: &Path, base: &str) -> Result<Vec<String>, String> {
     let flag = format!("--merged={base}");
-    run(
+    run_on(
+        runner,
         main,
         &[
             "for-each-ref",
@@ -262,7 +410,6 @@ pub fn merged(main: &Path, base: &str) -> Vec<String> {
             .map(str::to_owned)
             .collect()
     })
-    .unwrap_or_default()
 }
 
 /// Whether `branch` was ever committed to: its reflog has more than the
@@ -271,6 +418,30 @@ pub fn merged(main: &Path, base: &str) -> Vec<String> {
 pub fn has_own_commits(main: &Path, branch: &str) -> bool {
     std::fs::read(main.join(".git/logs/refs/heads").join(branch))
         .is_ok_and(|log| log.split(|b| *b == b'\n').filter(|l| !l.is_empty()).count() > 1)
+}
+
+/// [`has_own_commits`] for each of `branches`, by `runner`: on a host, its
+/// reflog as Git shows it, every branch in one call.
+pub fn own_commits_on(
+    runner: &Runner,
+    main: &Path,
+    branches: &[String],
+) -> Result<Vec<bool>, String> {
+    if *runner == Runner::Local || branches.is_empty() {
+        return Ok(branches.iter().map(|b| has_own_commits(main, b)).collect());
+    }
+    let commands: Vec<Vec<String>> = branches
+        .iter()
+        .map(|b| {
+            ["reflog", "show", "--format=%h", &format!("refs/heads/{b}")]
+                .map(str::to_owned)
+                .to_vec()
+        })
+        .collect();
+    Ok(batch_on(runner, main, &commands)?
+        .into_iter()
+        .map(|said| said.is_ok_and(|text| text.lines().filter(|l| !l.is_empty()).count() > 1))
+        .collect())
 }
 
 /// Merges a task's branch into whatever the main checkout has out.
@@ -300,6 +471,27 @@ pub fn ahead(main: &Path, base: Option<&str>, branch: &str) -> Result<usize, Str
         .unwrap_or(0))
 }
 
+/// [`ahead`] for each of `branches`, by `runner`, in one batch; a branch
+/// Git could not count is 0.
+pub fn aheads_on(
+    runner: &Runner,
+    main: &Path,
+    base: Option<&str>,
+    branches: &[String],
+) -> Result<Vec<usize>, String> {
+    let commands: Vec<Vec<String>> = branches
+        .iter()
+        .map(|b| {
+            let range = format!("{}..{b}", base.unwrap_or("HEAD"));
+            vec!["rev-list".to_owned(), "--count".to_owned(), range]
+        })
+        .collect();
+    Ok(batch_on(runner, main, &commands)?
+        .into_iter()
+        .map(|said| said.map_or(0, |text| text.trim().parse().unwrap_or(0)))
+        .collect())
+}
+
 /// A local branch and its last commit: when (Unix seconds, the committer's
 /// date) and its subject.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -312,7 +504,13 @@ pub struct Tip {
 /// Every local branch of the repository at `main` and its last commit, in
 /// one `for-each-ref`.
 pub fn tips(main: &Path) -> Result<Vec<Tip>, String> {
-    Ok(parse_tips(&run(
+    tips_on(&Runner::Local, main)
+}
+
+/// [`tips`], by `runner`.
+pub fn tips_on(runner: &Runner, main: &Path) -> Result<Vec<Tip>, String> {
+    Ok(parse_tips(&run_on(
+        runner,
         main,
         &[
             "for-each-ref",
@@ -345,18 +543,39 @@ pub fn parse_tips(text: &str) -> Vec<Tip> {
 /// branch exists, else `main` or `master`, else what the main checkout has
 /// out. `branches` are the local ones, from [`tips`].
 pub fn default_branch(main: &Path, branches: &[Tip], current: Option<&str>) -> Option<String> {
-    let origin = run(
-        main,
-        &[
+    default_branch_on(&Runner::Local, main, branches, current)
+        .ok()
+        .flatten()
+}
+
+/// [`default_branch`], by `runner`, its two questions in one batch. `Err`
+/// when neither could be asked.
+pub fn default_branch_on(
+    runner: &Runner,
+    main: &Path,
+    branches: &[Tip],
+    current: Option<&str>,
+) -> Result<Option<String>, String> {
+    let commands = [
+        vec![
             "symbolic-ref",
             "--quiet",
             "--short",
             "refs/remotes/origin/HEAD",
         ],
-    )
-    .ok();
-    let init = run(main, &["config", "--get", "init.defaultBranch"]).ok();
-    pick_default(origin.as_deref(), init.as_deref(), branches, current)
+        vec!["config", "--get", "init.defaultBranch"],
+    ]
+    .map(|args| args.into_iter().map(str::to_owned).collect::<Vec<_>>());
+    let mut said = batch_on(runner, main, &commands)?
+        .into_iter()
+        .map(Result::ok);
+    let (origin, init) = (said.next().flatten(), said.next().flatten());
+    Ok(pick_default(
+        origin.as_deref(),
+        init.as_deref(),
+        branches,
+        current,
+    ))
 }
 
 /// [`default_branch`]'s choice from what Git said.
@@ -930,6 +1149,88 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn a_hosts_batch_is_quoted_and_read_back() {
+        let commands = [
+            vec![
+                "for-each-ref".to_owned(),
+                "--format=%(refname:short)%09x".into(),
+            ],
+            vec!["log".to_owned(), "it's $HOME".into()],
+        ];
+        assert_eq!(
+            batch_line(Path::new("/srv/my app"), &commands),
+            "cd '/srv/my app' || exit 1; \
+             export LC_ALL=C GIT_TERMINAL_PROMPT=0 GIT_OPTIONAL_LOCKS=0; \
+             git 'for-each-ref' '--format=%(refname:short)%09x' 2>/dev/null; \
+             printf '\\n\\036%d\\n' $?; \
+             git 'log' 'it'\\''s $HOME' 2>/dev/null; printf '\\n\\036%d\\n' $?"
+        );
+        assert!(batch_line(Path::new("~/x"), &[]).starts_with("cd ~/'x' || exit 1;"));
+        assert_eq!(
+            parse_batch("a\nb\n\n\u{1e}0\n\n\u{1e}128\nmain\n\n\u{1e}0\n", 3),
+            Some(vec![
+                Ok("a\nb\n".to_owned()),
+                Err("git exited with 128".to_owned()),
+                Ok("main\n".to_owned()),
+            ])
+        );
+        // Cut off before the last: the host went away partway.
+        assert_eq!(parse_batch("a\n\n\u{1e}0\n", 2), None);
+        assert_eq!(parse_batch("", 0), Some(Vec::new()));
+    }
+
+    #[test]
+    fn a_batch_run_by_a_shell_reads_as_git_run_here() {
+        // What a host's shell does with the line, done by this Mac's: the
+        // same answers as running each command here.
+        let tree = fixture("batch-shell", "main", &["fix/it's"]);
+        let repo = &tree.0;
+        let commands: Vec<Vec<String>> = [
+            &["worktree", "list", "--porcelain"][..],
+            &[
+                "for-each-ref",
+                "refs/heads",
+                "--format=%(refname:short)%09%(committerdate:unix)%09%(subject)",
+            ],
+            &[
+                "symbolic-ref",
+                "--quiet",
+                "--short",
+                "refs/remotes/origin/HEAD",
+            ],
+            &["rev-list", "--count", "main..fix/it's"],
+        ]
+        .iter()
+        .map(|args| args.iter().map(|a| (*a).to_owned()).collect())
+        .collect();
+        let shell = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(batch_line(repo, &commands))
+            .output()
+            .unwrap();
+        assert!(shell.status.success());
+        let remote = parse_batch(&String::from_utf8_lossy(&shell.stdout), commands.len()).unwrap();
+        let here = batch_on(&Runner::Local, repo, &commands).unwrap();
+        assert_eq!(remote.len(), here.len());
+        for (there, here) in remote.iter().zip(&here) {
+            assert_eq!(there.is_ok(), here.is_ok(), "{there:?} {here:?}");
+            if let (Ok(there), Ok(here)) = (there, here) {
+                assert_eq!(there, here);
+            }
+        }
+        assert_eq!(parse_list(remote[0].as_ref().unwrap()).len(), 1);
+        assert_eq!(parse_tips(remote[1].as_ref().unwrap()).len(), 2);
+        assert!(remote[2].is_err());
+        // A folder that is not there: nothing ran.
+        let gone = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(batch_line(&repo.join("gone"), &commands))
+            .output()
+            .unwrap();
+        assert!(!gone.status.success() && gone.stdout.is_empty());
     }
 
     /// A repository on `branch` with one commit, and `others` branched

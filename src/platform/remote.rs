@@ -188,7 +188,7 @@ pub fn workspace_name(host: &str, path: &str) -> String {
 }
 
 /// `text` in single quotes for a POSIX shell.
-fn quote(text: &str) -> String {
+pub fn quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))
 }
 
@@ -229,16 +229,28 @@ pub fn control_path(dir: &Path, host: &str) -> Option<String> {
     (path.len() <= SOCKET_ROOM && !path.contains('"')).then_some(path)
 }
 
-/// The arguments for ssh that open a terminal in `path` on `host` (or run
-/// `command` there through the login shell), sharing one connection per
-/// host through `control` (see [`control_path`]) when given.
-pub fn ssh_args(
-    host: &str,
-    path: &str,
-    command: Option<&str>,
-    control: Option<&str>,
-) -> Vec<String> {
-    let mut args = vec!["-t".to_owned()];
+/// The socket the connections to `host` share, in a folder of Application
+/// Support only you can open, made when it is not there yet.
+pub fn control_for(host: &str) -> Option<String> {
+    let dir = crate::platform::app_support()?.join("ssh");
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .ok()?;
+    control_path(&dir, host)
+}
+
+/// The ssh to run: CRC_SSH_COMMAND when set (a self-test's stand-in), else
+/// the system's.
+pub fn program() -> std::path::PathBuf {
+    std::env::var_os("CRC_SSH_COMMAND")
+        .map_or_else(|| "/usr/bin/ssh".into(), std::path::PathBuf::from)
+}
+
+/// The options that share one connection per host through `control`.
+fn control_options(args: &mut Vec<String>, control: Option<&str>) {
     if let Some(control) = control {
         for option in [
             "ControlMaster=auto".to_owned(),
@@ -250,9 +262,44 @@ pub fn ssh_args(
             args.push(option);
         }
     }
+}
+
+/// The arguments for ssh that open a terminal in `path` on `host` (or run
+/// `command` there through the login shell), sharing one connection per
+/// host through `control` (see [`control_path`]) when given.
+pub fn ssh_args(
+    host: &str,
+    path: &str,
+    command: Option<&str>,
+    control: Option<&str>,
+) -> Vec<String> {
+    let mut args = vec!["-t".to_owned()];
+    control_options(&mut args, control);
     args.push("--".into());
     args.push(host.to_owned());
     args.push(remote_command(path, command));
+    args
+}
+
+/// The arguments for ssh that run `line` on `host` with no terminal and
+/// nothing asked: a host that wants a password or a new key's approval
+/// fails at once instead, as one that does not answer does in seconds.
+/// The connection is the one the host's terminals share, when given.
+pub fn batch_args(host: &str, control: Option<&str>, line: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    for option in [
+        "BatchMode=yes",
+        "ConnectTimeout=5",
+        "ServerAliveInterval=5",
+        "ServerAliveCountMax=2",
+    ] {
+        args.push("-o".to_owned());
+        args.push(option.to_owned());
+    }
+    control_options(&mut args, control);
+    args.push("--".into());
+    args.push(host.to_owned());
+    args.push(line.to_owned());
     args
 }
 
@@ -338,6 +385,40 @@ mod tests {
         assert_eq!(&args[..3], ["-t", "--", "myhost"]);
         // The destination is ssh's, after the options: parse finds it.
         assert_eq!(parse(&args[1..]).map(|t| t.host), Some("myhost".into()));
+    }
+
+    #[test]
+    fn a_read_over_ssh_asks_nothing_and_shares_the_connection() {
+        let line = "cd '/srv/app' && git 'status'";
+        let args = batch_args("me@box", Some("/s/cm-1"), line);
+        assert_eq!(
+            args,
+            [
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=5",
+                "-o",
+                "ServerAliveInterval=5",
+                "-o",
+                "ServerAliveCountMax=2",
+                "-o",
+                "ControlMaster=auto",
+                "-o",
+                "ControlPath=\"/s/cm-1\"",
+                "-o",
+                "ControlPersist=600",
+                "--",
+                "me@box",
+                line,
+            ]
+        );
+        // No terminal is asked for, and the line is one argument, last.
+        assert!(!args.contains(&"-t".to_owned()));
+        let args = batch_args("box", None, "true");
+        assert_eq!(&args[8..], ["--", "box", "true"]);
+        assert_eq!(parse(&args).map(|t| t.host), Some("box".into()));
+        assert_eq!(quote("it's"), r"'it'\''s'");
     }
 
     fn words(s: &str) -> Vec<String> {

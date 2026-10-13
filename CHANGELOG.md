@@ -8,7 +8,11 @@ One entry per tag, written for people who use the editor.
   `~/.ssh/config` alias or `user@host`) in New Workspace; its terminals
   and Claude sessions open over `ssh` in that folder, sharing one
   connection per host, and its row and inspector show the host and
-  folder. Terminals only for now: no Git, worktrees or Review for it yet.
+  folder. Its repositories and worktrees are listed like a local
+  workspace's (branch, last commit, ahead, merged), read over `ssh` in
+  the background without ever prompting; a host that does not answer
+  says so and keeps the rows it had. Read only for now: no commit, push,
+  worktrees or Review over `ssh` yet.
 - Agents mode no longer stalls while agents write: counting the files to
   review read every checkpoint on the main thread, which with a large
   review history held the window for seconds. The count now reads one

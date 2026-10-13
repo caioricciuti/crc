@@ -12,7 +12,7 @@ use std::sync::mpsc;
 
 use crate::platform::terminal::{Activity, Tab};
 use crate::project::icons;
-use crate::project::worktree::Worktree;
+use crate::project::worktree::{Runner, Worktree};
 use crate::render::{
     font::Atlas,
     layout::{self, Theme, Viewport},
@@ -52,12 +52,19 @@ pub enum Action {
 
 /// What a worker read of the folder workspaces: per folder workspace (by
 /// id), the repositories in it; and the worktrees of those repositories
-/// other than their main checkouts, every path resolved.
+/// other than their main checkouts, every path resolved. The local folder
+/// workspaces are read apart from the remote ones, so a slow host never
+/// holds this Mac's rows back.
 struct Listing {
+    /// The host whose folder workspaces were read; `None` for this Mac's.
+    host: Option<String>,
     repos: Vec<(String, Vec<PathBuf>)>,
     worktrees: Vec<Workspace>,
     /// Per main checkout, the worktrees Git records whose folder is gone.
     prunable: std::collections::HashMap<PathBuf, usize>,
+    /// The remote folder workspaces, by id, whose host did not answer:
+    /// what was last read of them stays.
+    unreachable: Vec<String>,
 }
 
 /// A place to work: a folder, and the sessions started in it. A worktree
@@ -118,10 +125,13 @@ impl Workspace {
     }
 
     /// What sessions and the selection hold on to: a folder workspace by
-    /// its key (two can share a folder), a worktree by its path.
+    /// its key (two can share a folder), a worktree by its path, and one on
+    /// a host by `host:path`, never taken for a folder of this Mac.
     pub fn id(&self) -> String {
         if self.folder {
             self.key.clone()
+        } else if let Some(host) = &self.host {
+            format!("{host}:{}", self.path.display())
         } else {
             self.path.to_string_lossy().into_owned()
         }
@@ -218,6 +228,53 @@ pub fn discover(dir: &Path) -> Vec<PathBuf> {
     found
 }
 
+/// What [`discover`] does, as one line for a host's shell: the repository
+/// `dir` is in, then its direct children with a `.git`, by name, the hidden
+/// ones and linked worktrees left out. Paths as the host has them, with
+/// links resolved there.
+pub fn discover_line(dir: &Path) -> String {
+    format!(
+        "cd -P {} || exit 1; export LC_ALL=C GIT_TERMINAL_PROMPT=0 GIT_OPTIONAL_LOCKS=0; \
+         git rev-parse --show-toplevel 2>/dev/null; \
+         for d in */; do d=${{d%/}}; [ -e \"$d/.git\" ] || continue; \
+         [ -f \"$d/.git\" ] && grep -q '^gitdir:.*/worktrees/' \"$d/.git\" && continue; \
+         printf '%s\\n' \"$PWD/$d\"; done",
+        crate::platform::remote::shell_path(&dir.to_string_lossy())
+    )
+}
+
+/// [`discover`], by `runner`. `Err` when the host did not answer, or the
+/// folder is not there.
+fn discover_on(runner: &Runner, dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let Runner::Ssh { host, control } = runner else {
+        return Ok(discover(dir)
+            .iter()
+            .map(|p| crate::platform::canonical(p))
+            .collect());
+    };
+    let text = crate::project::worktree::ssh_output(host, control.as_deref(), &discover_line(dir))?;
+    let mut found: Vec<PathBuf> = Vec::new();
+    for line in text.lines().filter(|l| l.starts_with('/')) {
+        let path = PathBuf::from(line);
+        if !found.contains(&path) {
+            found.push(path);
+        }
+    }
+    Ok(found)
+}
+
+/// How the Git of a folder workspace on `host` (this Mac's for `None`) is
+/// read.
+fn runner(host: Option<&str>) -> Runner {
+    match host {
+        None => Runner::Local,
+        Some(host) => Runner::Ssh {
+            host: host.to_owned(),
+            control: crate::platform::remote::control_for(host),
+        },
+    }
+}
+
 /// Whether `dir` is a linked worktree: its `.git` a file pointing into a
 /// repository's `worktrees` folder (a submodule's points elsewhere).
 fn linked_worktree(dir: &Path) -> bool {
@@ -228,77 +285,165 @@ fn linked_worktree(dir: &Path) -> bool {
     })
 }
 
-/// Reads what the folder workspaces hold, on the calling thread: their
-/// repositories, and each repository's worktrees once.
-fn scan(folders: &[(String, PathBuf)]) -> Listing {
+/// Reads what the folder workspaces on `host` hold (this Mac's for
+/// `None`), on the calling thread: their repositories, and each
+/// repository's worktrees once. A remote one whose host does not answer is
+/// left out, and named in [`Listing::unreachable`].
+fn scan(folders: &[(String, PathBuf)], host: Option<&str>) -> Listing {
+    let runner = runner(host);
     let mut repos = Vec::new();
     let mut worktrees: Vec<Workspace> = Vec::new();
     let mut mains: Vec<PathBuf> = Vec::new();
     let mut prunable = std::collections::HashMap::new();
+    let mut unreachable = Vec::new();
     for (id, dir) in folders {
-        let found: Vec<PathBuf> = discover(dir)
-            .iter()
-            .map(|p| crate::platform::canonical(p))
-            .collect();
-        for repo in &found {
-            let Ok((list, missing)) = crate::project::worktree::list_all(repo) else {
-                continue;
-            };
-            let list: Vec<Worktree> = list
-                .into_iter()
-                .map(|mut w| {
-                    w.path = crate::platform::canonical(&w.path);
-                    w
-                })
-                .collect();
-            let Some(main) = list.iter().find(|w| w.main).cloned() else {
-                continue;
-            };
-            if mains.contains(&main.path) {
-                continue;
-            }
-            mains.push(main.path.clone());
-            if missing > 0 {
-                prunable.insert(main.path.clone(), missing);
-            }
-            // Once per repository: every branch's last commit, the default
-            // branch the worktrees are compared with, and the branches all
-            // on it.
-            let tips = crate::project::worktree::tips(&main.path).unwrap_or_default();
-            let base =
-                crate::project::worktree::default_branch(&main.path, &tips, main.branch.as_deref());
-            let merged = base
-                .as_deref()
-                .map(|b| crate::project::worktree::merged(&main.path, b))
-                .unwrap_or_default();
-            for w in list.into_iter().filter(|w| !w.main) {
-                if !worktrees.iter().any(|t| t.path == w.path) {
-                    let commit = w.branch.as_ref().and_then(|b| {
-                        tips.iter()
-                            .find(|t| t.branch == *b)
-                            .map(|t| (t.time, t.subject.clone()))
-                    });
-                    // On the default branch is not enough: a branch made and
-                    // never committed to is there from the start.
-                    let done = w.branch.as_ref().is_some_and(|b| {
-                        merged.contains(b)
-                            && base.as_deref() != Some(b.as_str())
-                            && crate::project::worktree::has_own_commits(&main.path, b)
-                    });
-                    let mut workspace = Workspace::of(w, Some(main.path.clone()), base.clone());
-                    workspace.commit = commit;
-                    workspace.merged = done;
-                    worktrees.push(workspace);
-                }
-            }
+        // A host that did not answer for one folder is not asked again,
+        // and its timeout waited out again, for the next.
+        if !unreachable.is_empty() {
+            unreachable.push(id.clone());
+            continue;
         }
+        let found = match discover_on(&runner, dir) {
+            Ok(found) => found,
+            Err(e) if e == crate::project::worktree::UNREACHABLE => {
+                unreachable.push(id.clone());
+                continue;
+            }
+            Err(_) => Vec::new(),
+        };
+        // A host that stops answering partway: nothing of this folder is
+        // taken, so its rows stay as they were.
+        let mut read = Vec::new();
+        let mut read_mains = Vec::new();
+        let lost = found.iter().try_for_each(|repo| {
+            if let Some((main, rows, missing)) =
+                read_repo(&runner, repo, &mains, &read_mains, &worktrees, &read)?
+            {
+                if missing > 0 && host.is_none() {
+                    prunable.insert(main.clone(), missing);
+                }
+                read_mains.push(main);
+                read.extend(rows);
+            }
+            Ok::<(), String>(())
+        });
+        if lost.is_err() {
+            unreachable.push(id.clone());
+            continue;
+        }
+        mains.extend(read_mains);
+        worktrees.extend(read);
         repos.push((id.clone(), found));
     }
     Listing {
+        host: host.map(str::to_owned),
         repos,
         worktrees,
         prunable,
+        unreachable,
     }
+}
+
+/// One repository's worktrees other than its main checkout, as rows, with
+/// its main checkout and how many worktrees Git records whose folder is
+/// gone; `None` when Git cannot list it or its main checkout was read
+/// already (in `mains` or `more`). Rows already in `rows` or `more_rows`
+/// are not made twice. `Err` when the host stopped answering.
+fn read_repo(
+    runner: &Runner,
+    repo: &Path,
+    mains: &[PathBuf],
+    more: &[PathBuf],
+    rows: &[Workspace],
+    more_rows: &[Workspace],
+) -> Result<Option<(PathBuf, Vec<Workspace>, usize)>, String> {
+    use crate::project::worktree::{self as git, UNREACHABLE};
+    let host = match runner {
+        Runner::Local => None,
+        Runner::Ssh { host, .. } => Some(host.clone()),
+    };
+    let (list, missing) = match git::list_all_on(runner, repo) {
+        Ok(read) => read,
+        Err(e) if e == UNREACHABLE => return Err(e),
+        Err(_) => return Ok(None),
+    };
+    // A host's paths are its own: only this Mac's are resolved.
+    let list: Vec<Worktree> = list
+        .into_iter()
+        .map(|mut w| {
+            if host.is_none() {
+                w.path = crate::platform::canonical(&w.path);
+            }
+            w
+        })
+        .collect();
+    let Some(main) = list.iter().find(|w| w.main).cloned() else {
+        return Ok(None);
+    };
+    if mains.contains(&main.path) || more.contains(&main.path) {
+        return Ok(None);
+    }
+    // Once per repository: every branch's last commit, the default branch
+    // the worktrees are compared with, and the branches all on it.
+    let lost = |e: &String| e == UNREACHABLE;
+    let tips = match git::tips_on(runner, &main.path) {
+        Err(e) if lost(&e) => return Err(e),
+        read => read.unwrap_or_default(),
+    };
+    let base = match git::default_branch_on(runner, &main.path, &tips, main.branch.as_deref()) {
+        Err(e) if lost(&e) => return Err(e),
+        read => read.ok().flatten(),
+    };
+    let merged = match base
+        .as_deref()
+        .map(|b| git::merged_on(runner, &main.path, b))
+    {
+        Some(Err(e)) if lost(&e) => return Err(e),
+        read => read.and_then(Result::ok).unwrap_or_default(),
+    };
+    let fresh: Vec<Worktree> = list
+        .into_iter()
+        .filter(|w| !w.main)
+        .filter(|w| {
+            !rows
+                .iter()
+                .chain(more_rows)
+                .any(|t| t.path == w.path && t.host == host)
+        })
+        .collect();
+    // On the default branch is not enough: a branch made and never
+    // committed to is there from the start.
+    let candidates: Vec<String> = fresh
+        .iter()
+        .filter_map(|w| w.branch.clone())
+        .filter(|b| merged.contains(b) && base.as_deref() != Some(b.as_str()))
+        .collect();
+    let own = match git::own_commits_on(runner, &main.path, &candidates) {
+        Err(e) if lost(&e) => return Err(e),
+        read => read.unwrap_or_default(),
+    };
+    let done: Vec<&String> = candidates
+        .iter()
+        .zip(own)
+        .filter_map(|(b, own)| own.then_some(b))
+        .collect();
+    let out = fresh
+        .into_iter()
+        .map(|w| {
+            let commit = w.branch.as_ref().and_then(|b| {
+                tips.iter()
+                    .find(|t| t.branch == *b)
+                    .map(|t| (t.time, t.subject.clone()))
+            });
+            let merged = w.branch.as_ref().is_some_and(|b| done.contains(&b));
+            let mut workspace = Workspace::of(w, Some(main.path.clone()), base.clone());
+            workspace.commit = commit;
+            workspace.merged = merged;
+            workspace.host = host.clone();
+            workspace
+        })
+        .collect();
+    Ok(Some((main.path, out, missing)))
 }
 
 /// What the list keeps of your arrangement, per workspace id.
@@ -794,6 +939,11 @@ pub struct Panel {
     /// several; taken by the operation.
     pub target: Option<PathBuf>,
     rx: Option<mpsc::Receiver<Listing>>,
+    /// This Mac's part of the read [`Panel::rx`] brings is still to come.
+    reading_local: bool,
+    /// The remote folder workspaces, by id, whose host did not answer the
+    /// last read.
+    pub unreachable: std::collections::HashSet<String>,
     /// Per task path, once read.
     pub info: std::collections::HashMap<PathBuf, Info>,
     /// Per main checkout, the worktrees Git records whose folder is gone.
@@ -982,32 +1132,68 @@ impl Panel {
         if !self.loaded {
             self.load();
         }
-        // A remote workspace's folder is not here: no Git is run for it.
-        let folders: Vec<(String, PathBuf)> = self
-            .folders
-            .iter()
-            .filter(|f| f.host.is_none())
-            .map(|f| (f.id(), f.path.clone()))
-            .collect();
         let (tx, rx) = mpsc::channel();
         let (info_tx, info_rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let listing = scan(&folders);
-            let tasks = listing.worktrees.clone();
-            let _ = tx.send(listing);
-            // Then how far ahead each row is.
-            for task in tasks {
-                let (Some(branch), Some(main)) = (&task.branch, &task.repo) else {
-                    continue;
-                };
-                let ahead = crate::project::worktree::ahead(main, task.base.as_deref(), branch)
-                    .unwrap_or(0);
-                if info_tx.send((task.path, ahead)).is_err() {
+        // This Mac's folders on one worker, each host's on its own: a host
+        // that is slow or gone holds back only its own rows. A remote
+        // folder's Git is read on its host, over ssh.
+        let mut hosts: Vec<Option<String>> = vec![None];
+        for host in self.folders.iter().filter_map(|f| f.host.clone()) {
+            if !hosts.contains(&Some(host.clone())) {
+                hosts.push(Some(host));
+            }
+        }
+        for host in hosts {
+            let folders: Vec<(String, PathBuf)> = self
+                .folders
+                .iter()
+                .filter(|f| f.host == host)
+                .map(|f| (f.id(), f.path.clone()))
+                .collect();
+            let (tx, info_tx) = (tx.clone(), info_tx.clone());
+            std::thread::spawn(move || {
+                let listing = scan(&folders, host.as_deref());
+                let tasks = listing.worktrees.clone();
+                if tx.send(listing).is_err() {
                     return;
                 }
-            }
-        });
+                drop(tx);
+                // Then how far ahead each row is, a repository at a time.
+                let runner = runner(host.as_deref());
+                let mut repos: Vec<(PathBuf, Option<String>)> = Vec::new();
+                for task in &tasks {
+                    if let Some(main) = &task.repo
+                        && !repos.iter().any(|(r, _)| r == main)
+                    {
+                        repos.push((main.clone(), task.base.clone()));
+                    }
+                }
+                for (main, base) in repos {
+                    let rows: Vec<(&PathBuf, String)> = tasks
+                        .iter()
+                        .filter(|t| t.repo.as_ref() == Some(&main))
+                        .filter_map(|t| Some((&t.path, t.branch.clone()?)))
+                        .collect();
+                    let branches: Vec<String> = rows.iter().map(|(_, b)| b.clone()).collect();
+                    // A host that does not answer keeps the counts it had.
+                    let Ok(aheads) = crate::project::worktree::aheads_on(
+                        &runner,
+                        &main,
+                        base.as_deref(),
+                        &branches,
+                    ) else {
+                        continue;
+                    };
+                    for ((path, _), ahead) in rows.into_iter().zip(aheads) {
+                        if info_tx.send((path.clone(), ahead)).is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
         self.rx = Some(rx);
+        self.reading_local = true;
         self.info_rx = Some(info_rx);
     }
 
@@ -1020,11 +1206,12 @@ impl Panel {
         self.github == Some(true) && github_allowed()
     }
 
-    /// The worktrees with a branch, whose pull requests can be read.
+    /// The worktrees with a branch, whose pull requests can be read: this
+    /// Mac's, as `gh` runs here.
     fn pr_rows(&self) -> impl Iterator<Item = &Workspace> {
         self.worktrees
             .iter()
-            .filter(|w| w.branch.is_some() && w.repo.is_some())
+            .filter(|w| w.branch.is_some() && w.repo.is_some() && w.host.is_none())
     }
 
     /// Reads the pull requests that are due (see [`pr_due`]), when no read
@@ -1301,27 +1488,84 @@ impl Panel {
     }
 
     fn poll_list(&mut self) -> bool {
-        let Some(rx) = &self.rx else {
-            return false;
-        };
-        let listing = match rx.try_recv() {
-            Ok(listing) => listing,
-            Err(mpsc::TryRecvError::Empty) => return false,
-            Err(mpsc::TryRecvError::Disconnected) => Listing {
-                repos: Vec::new(),
-                worktrees: self.worktrees.clone(),
-                prunable: self.prunable.clone(),
-            },
-        };
-        self.rx = None;
-        self.worktrees = listing.worktrees;
-        self.prunable = listing.prunable;
-        self.repos = listing.repos.into_iter().collect();
-        self.rebuild();
-        self.prune();
-        // Rows new to the list are read now; the others when due.
-        self.refresh_pull_requests();
-        true
+        let mut changed = false;
+        while let Some(rx) = &self.rx {
+            match rx.try_recv() {
+                Ok(listing) => {
+                    self.take_listing(listing);
+                    changed = true;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // Every part has answered, or a worker stopped without:
+                    // what was read before stays.
+                    self.rx = None;
+                    self.reading_local = false;
+                }
+            }
+        }
+        if changed {
+            self.rebuild();
+            self.prune();
+            // Rows new to the list are read now; the others when due.
+            self.refresh_pull_requests();
+        }
+        changed
+    }
+
+    /// Takes one part of a read: this Mac's folder workspaces, or one
+    /// host's. The rows of the folders it did not read are kept, and so
+    /// are those of a folder whose host did not answer.
+    fn take_listing(&mut self, listing: Listing) {
+        // The folders and rows this part read again: those on its host.
+        let covers = |host: &Option<String>| *host == listing.host;
+        let ids: Vec<String> = self
+            .folders
+            .iter()
+            .filter(|f| covers(&f.host))
+            .map(Workspace::id)
+            .collect();
+        let mut kept: Vec<Workspace> = Vec::new();
+        for id in &listing.unreachable {
+            let (Some(old), Some(folder)) = (
+                self.repos.get(id),
+                self.folders.iter().find(|f| f.id() == *id),
+            ) else {
+                continue;
+            };
+            kept.extend(
+                self.worktrees
+                    .iter()
+                    .filter(|w| w.host == folder.host)
+                    .filter(|w| w.repo.as_ref().is_some_and(|r| old.contains(r)))
+                    .cloned(),
+            );
+        }
+        for id in &ids {
+            if listing.unreachable.contains(id) {
+                self.unreachable.insert(id.clone());
+            } else {
+                self.unreachable.remove(id);
+                self.repos.remove(id);
+            }
+        }
+        self.repos.extend(listing.repos);
+        let mut rows: Vec<Workspace> = std::mem::take(&mut self.worktrees)
+            .into_iter()
+            .filter(|w| !covers(&w.host))
+            .collect();
+        for row in listing.worktrees.into_iter().chain(kept) {
+            if !rows.iter().any(|r| r.id() == row.id()) {
+                rows.push(row);
+            }
+        }
+        // This Mac's first, then each host's, whichever answered first.
+        rows.sort_by_key(|w| w.host.is_some());
+        self.worktrees = rows;
+        if listing.host.is_none() {
+            self.prunable = listing.prunable;
+            self.reading_local = false;
+        }
     }
 
     /// The list from Git and the folder workspaces, in your order with the
@@ -1375,14 +1619,20 @@ impl Panel {
         self.folders
             .iter()
             .enumerate()
+            .filter(|(_, f)| f.host == workspace.host)
             .filter(|(_, f)| self.repos.get(&f.id()).is_some_and(|r| r.contains(repo)))
             .max_by_key(|(i, f)| (f.path.components().count(), std::cmp::Reverse(*i)))
             .map(|(_, f)| f.id())
     }
 
-    /// The worktrees in the list, for their watchers.
+    /// The worktrees in the list, for their watchers: this Mac's, as a
+    /// host's folders cannot be watched from here.
     pub fn worktree_paths(&self) -> Vec<PathBuf> {
-        self.worktrees.iter().map(|w| w.path.clone()).collect()
+        self.worktrees
+            .iter()
+            .filter(|w| w.host.is_none())
+            .map(|w| w.path.clone())
+            .collect()
     }
 
     /// An agent's hook says it is writing `path`: now is the last write of
@@ -1664,6 +1914,7 @@ impl Panel {
             .collect();
         self.folders.retain(|t| t.id() != id);
         self.repos.remove(id);
+        self.unreachable.remove(id);
         let gone: Vec<String> = self
             .worktrees
             .iter()
@@ -1696,7 +1947,7 @@ impl Panel {
     /// their repositories has answered, so an empty list means there are
     /// none.
     pub fn listed(&self) -> bool {
-        self.loaded && self.rx.is_none()
+        self.loaded && !self.reading_local
     }
 
     /// A read or an operation is in flight.
@@ -1918,8 +2169,9 @@ impl Panel {
 
     /// The rows, for the self-test, in the order Control-1 to 9 count them:
     /// a worktree under a folder workspace as `>name`, a folder workspace
-    /// with its worktrees folded away as `name(+2)`, and the line over its
-    /// merged worktrees as `~merged`, `~merged(+1)` while it hides one.
+    /// with its worktrees folded away as `name(+2)`, one whose host did not
+    /// answer as `name(unreachable)`, and the line over its merged
+    /// worktrees as `~merged`, `~merged(+1)` while it hides one.
     pub fn report_tree(&self) -> String {
         let visible = self.visible();
         let mut out = Vec::new();
@@ -1948,6 +2200,11 @@ impl Panel {
             }
             let id = task.id();
             let hidden = self.children(&id) - self.shown_children(&id);
+            let title = if self.unreachable.contains(&id) {
+                format!("{title}(unreachable)")
+            } else {
+                title
+            };
             out.push(if self.is_collapsed(&id) && hidden > 0 {
                 format!("{title}(+{hidden})")
             } else {
@@ -2714,7 +2971,7 @@ impl Panel {
                 out,
                 atlas,
                 icon_box,
-                if remote.is_some() || task.host.is_some() {
+                if remote.is_some() || (task.folder && task.host.is_some()) {
                     icons::SERVER
                 } else if task.main {
                     icons::HOME
@@ -2852,6 +3109,17 @@ impl Panel {
                 },
                 theme.status_text,
             )
+        } else if let Some(host) = task
+            .host
+            .as_ref()
+            .filter(|_| self.unreachable.contains(&task.id()))
+        {
+            // Its Git could not be read: the rows under it are the last read.
+            let said = format!("host unreachable \u{b7} {host}:{}", task.path.display());
+            (
+                crate::platform::inspector::fit(atlas, &said, (line2_end - name_x).max(0.0)),
+                theme.diff_removed,
+            )
         } else if let Some(remote) = remote {
             (
                 format!("ssh {} \u{b7} {}", remote.login(), remote.connected_for()),
@@ -2892,10 +3160,13 @@ impl Panel {
                 }
             }
             // A folder workspace says which folder, unless its name does; a
-            // remote one, where, always; a workspace you named says its
+            // remote one, where, always (a worktree under it, nothing more:
+            // its folder's row says where); a workspace you named says its
             // branch.
             let folder = match &task.host {
-                Some(host) => Some(format!("{host}:{}", task.path.display())),
+                Some(host) => task
+                    .folder
+                    .then(|| format!("{host}:{}", task.path.display())),
                 None => task
                     .path
                     .file_name()
@@ -3581,6 +3852,126 @@ mod tests {
         assert_eq!(by(&mine).path, PathBuf::from("/tmp/crc-move/duck-ui"));
         assert!(named_after("crc 2", Path::new("/a/crc")));
         assert!(!named_after("crc two", Path::new("/a/crc")));
+    }
+
+    #[test]
+    fn a_hosts_shell_finds_the_repositories_discover_does() {
+        // The line a host runs, run by this Mac's shell, in a folder whose
+        // name needs quoting.
+        let dir =
+            std::env::temp_dir().join(format!("crc-discover-line it's {}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for sub in ["b/.git", "a/.git", ".hidden/.git", "plain", "c/d/.git"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        std::fs::create_dir_all(dir.join("w")).unwrap();
+        std::fs::write(dir.join("w/.git"), "gitdir: /r/.git/worktrees/w\n").unwrap();
+        std::fs::create_dir_all(dir.join("s")).unwrap();
+        std::fs::write(dir.join("s/.git"), "gitdir: ../.git/modules/s\n").unwrap();
+        let shell = |dir: &Path| {
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(discover_line(dir))
+                .output()
+                .unwrap();
+            (
+                out.status.success(),
+                String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .map(PathBuf::from)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let real = crate::platform::canonical(&dir);
+        let local: Vec<PathBuf> = discover(&dir)
+            .iter()
+            .map(|p| crate::platform::canonical(p))
+            .collect();
+        assert_eq!(shell(&dir), (true, local));
+        assert_eq!(
+            shell(&dir).1,
+            vec![real.join("a"), real.join("b"), real.join("s")]
+        );
+        // Not there: it fails, and finds nothing.
+        assert_eq!(shell(&dir.join("gone")), (false, Vec::new()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_hosts_rows_stay_while_it_does_not_answer() {
+        let mut app = folder("app", "/srv");
+        app.host = Some("box".into());
+        // A folder of this Mac on a path like the host's.
+        let mut panel = Panel {
+            folders: vec![folder("srv", "/srv"), app],
+            ..Panel::default()
+        };
+        let row = |path: &str, branch: &str| {
+            let mut w = tree(path, false);
+            w.branch = Some(branch.into());
+            w.name = branch.into();
+            w.repo = Some(PathBuf::from("/srv/app"));
+            w.host = Some("box".into());
+            w
+        };
+        let listing =
+            |host: Option<&str>, repos: Vec<(&str, &[&str])>, rows, unreachable: &[&str]| Listing {
+                host: host.map(str::to_owned),
+                repos: repos
+                    .into_iter()
+                    .map(|(id, r)| (id.to_owned(), r.iter().map(PathBuf::from).collect()))
+                    .collect(),
+                worktrees: rows,
+                prunable: std::collections::HashMap::new(),
+                unreachable: unreachable.iter().map(|s| (*s).to_owned()).collect(),
+            };
+        let take = |panel: &mut Panel, l: Listing| {
+            panel.take_listing(l);
+            panel.rebuild();
+        };
+        take(
+            &mut panel,
+            listing(
+                Some("box"),
+                vec![("folder:app", &["/srv/app"])],
+                vec![row("/srv/wt/fix", "fix")],
+                &[],
+            ),
+        );
+        // This Mac's read, after: the host's rows stay, under their own
+        // folder, not this Mac's folder with the same repository path.
+        take(
+            &mut panel,
+            listing(None, vec![("folder:srv", &["/srv/app"])], Vec::new(), &[]),
+        );
+        assert_eq!(panel.report_tree(), "srv,app,>fix");
+        assert_eq!(panel.tasks[2].id(), "box:/srv/wt/fix");
+        // Nothing of the host is watched or asked of gh here.
+        assert!(panel.worktree_paths().is_empty());
+        assert!(panel.main_checkouts().is_empty());
+        // The host does not answer: the rows it had stay, and its folder
+        // says so.
+        take(
+            &mut panel,
+            listing(Some("box"), Vec::new(), Vec::new(), &["folder:app"]),
+        );
+        assert_eq!(panel.report_tree(), "srv,app(unreachable),>fix");
+        assert_eq!(
+            panel.repos.get("folder:app"),
+            Some(&vec![PathBuf::from("/srv/app")])
+        );
+        // It answers again: what it says now.
+        take(
+            &mut panel,
+            listing(
+                Some("box"),
+                vec![("folder:app", &["/srv/app"])],
+                vec![row("/srv/wt/next", "next")],
+                &[],
+            ),
+        );
+        assert_eq!(panel.report_tree(), "srv,app,>next");
+        assert!(panel.unreachable.is_empty());
     }
 
     #[test]

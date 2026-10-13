@@ -771,7 +771,16 @@ impl EditorView {
                 }
                 self.task_menu(index)
             }
-            Some(Action::Merged(index)) => {
+            // A host's merged worktrees are not cleaned up from here.
+            Some(Action::Merged(index))
+                if !self.state().is_some_and(|state| {
+                    state
+                        .agents
+                        .tasks
+                        .get(index)
+                        .is_some_and(|t| t.host.is_some())
+                }) =>
+            {
                 if let Some(mut state) = self.state_mut() {
                     state.agents.menu_task = state.agents.tasks.get(index).map(|t| t.id());
                     state.agents.target = None;
@@ -1070,12 +1079,14 @@ impl EditorView {
         let add = |title: &str, action: Sel| menu.addItem(&menu_item(mtm, title, action));
         add("New Terminal", sel!(agentNewShell:));
         add("New Claude Session", sel!(agentNewClaude:));
-        // A remote workspace's folder is on its host, not for the editor.
+        // A remote workspace's folder is on its host, not for the editor,
+        // and its Git is only read: nothing is changed there from here.
         if !remote {
             add("Open in Editor", sel!(agentOpenInEditor:));
         }
         if !folder
             && !main
+            && !remote
             && let Some(base) = &base
         {
             add(&format!("Review Changes vs {base}"), sel!(agentReview:));
@@ -1087,7 +1098,7 @@ impl EditorView {
         );
         add("Rename", sel!(agentRenameInPlace:));
         if folder {
-            if prunable > 0 {
+            if prunable > 0 && !remote {
                 add(
                     &match prunable {
                         1 => "Prune 1 Missing Worktree".to_owned(),
@@ -1098,13 +1109,16 @@ impl EditorView {
             }
             add("Remove Workspace\u{2026}", sel!(agentRemoveWorkspace:));
         }
-        if !folder {
+        if !folder && !remote {
             menu.addItem(&NSMenuItem::separatorItem(mtm));
             add("Commit All\u{2026}", sel!(agentCommitAll:));
             add("Pull", sel!(agentPull:));
             add("Push", sel!(agentPush:));
         }
-        if !main && let Some(branch) = branch {
+        if !main
+            && !remote
+            && let Some(branch) = branch
+        {
             let into = base.unwrap_or_else(|| "the main checkout".into());
             add(&format!("Merge {into} In"), sel!(agentUpdateFromBase:));
             menu.addItem(&NSMenuItem::separatorItem(mtm));
