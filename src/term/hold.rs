@@ -35,6 +35,12 @@ pub const KEEP: usize = 2 << 20;
 const START_TIMEOUT: Duration = Duration::from_secs(5);
 
 const SIGHUP: i32 = 1;
+const SIGKILL: i32 = 9;
+const SIGTERM: i32 = 15;
+const SIGCONT: i32 = 19;
+
+/// How long a program has to end after each signal of a Kill.
+const KILL_GRACE: Duration = Duration::from_secs(1);
 
 /// Where the helpers' files live: `CRC_HELD_DIR`, or `held` under
 /// Application Support.
@@ -325,6 +331,42 @@ fn pid_path(dir: &Path, id: &str) -> PathBuf {
 
 fn left_path(dir: &Path, id: &str) -> PathBuf {
     dir.join(format!("{id}.left"))
+}
+
+/// Ends the program as closing its tab asks: a hangup, as a terminal
+/// closing sends, then, for a program that ignores it or had not set up
+/// yet, a terminate and at last a kill. Whatever happens, the helper and
+/// its files go: a Kill never leaves a session behind.
+fn end(pid: i32, ended: &Arc<AtomicBool>, dir: &Path, id: &str) {
+    crate::platform::send_signal(-pid, SIGHUP);
+    let (ended, dir, id) = (ended.clone(), dir.to_path_buf(), id.to_owned());
+    std::thread::spawn(move || {
+        let gone = || {
+            let until = Instant::now() + KILL_GRACE;
+            while Instant::now() < until {
+                if ended.load(Ordering::Acquire) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            ended.load(Ordering::Acquire)
+        };
+        if gone() {
+            return;
+        }
+        crate::platform::send_signal(-pid, SIGCONT);
+        crate::platform::send_signal(-pid, SIGTERM);
+        if gone() {
+            return;
+        }
+        crate::platform::send_signal(-pid, SIGKILL);
+        if gone() || gone() {
+            return;
+        }
+        // The reaper never woke: leave anyway, with nothing kept.
+        remove_all(&dir, &id);
+        std::process::exit(0);
+    });
 }
 
 fn remove_all(dir: &Path, id: &str) {
@@ -714,6 +756,7 @@ pub fn run(dir: &Path, id: &str) -> ! {
             hold.clients
         };
         let (hold, input) = (hold.clone(), input.clone());
+        let (ended, dir, id) = (ended.clone(), dir.clone(), id.clone());
         let master = master.try_clone().unwrap_or_else(|_| std::process::exit(2));
         std::thread::spawn(move || {
             loop {
@@ -727,9 +770,7 @@ pub fn run(dir: &Path, id: &str) -> ! {
                         hold.cols = cols;
                         hold.rows = rows;
                     }
-                    Ok(Frame::Kill) => {
-                        crate::platform::send_signal(-pid, SIGHUP);
-                    }
+                    Ok(Frame::Kill) => end(pid, &ended, &dir, &id),
                     // Nothing else is for the helper; a window gone, by
                     // quitting or by a crash, leaves the program running.
                     Ok(_) => {}

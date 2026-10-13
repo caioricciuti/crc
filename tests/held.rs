@@ -197,3 +197,32 @@ fn a_helper_of_another_project_is_live_everywhere() {
     assert!(wait_until(|| hold::live(&dir).is_empty()));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_program_that_ignores_the_hangup_is_still_ended() {
+    let dir = scratch("stubborn");
+    let spec = Spec {
+        args: vec![
+            "-c".into(),
+            "trap '' HUP TERM; echo ready; while :; do sleep 1; done".into(),
+        ],
+        ..shell_spec(&dir)
+    };
+    let helper = Path::new(env!("CARGO_BIN_EXE_crc"));
+    let (_, socket) = hold::start(&dir, &spec, helper).expect("the helper starts");
+    let mut socket = limited(socket);
+    assert_eq!(hold::receive(&mut socket).unwrap(), Frame::Size(40, 6));
+    // Once its traps are set, so the hangup and the terminate both miss.
+    let mut seen = Vec::new();
+    while !String::from_utf8_lossy(&seen).contains("ready") {
+        match hold::receive(&mut socket) {
+            Ok(Frame::Output(bytes)) => seen.extend(bytes),
+            Ok(_) => {}
+            Err(e) => panic!("no output before ready: {e}"),
+        }
+    }
+    hold::send(&mut socket, &Frame::Kill).unwrap();
+    while !matches!(hold::receive(&mut socket), Ok(Frame::Exited(_)) | Err(_)) {}
+    assert!(wait_until(|| hold::live(&dir).is_empty()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
