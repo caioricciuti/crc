@@ -7,11 +7,16 @@
 //! one `git cat-file --batch`, nearest the version shown first, with the
 //! diff between each pair of neighbours: it moves the caret from one
 //! version to the next and draws the gutter marks.
+//!
+//! A step marks what it changed for a moment: a wash behind the lines it
+//! added or changed, and the lines it removed drawn where they were, all
+//! fading out over [`FADE`].
 
 use std::collections::VecDeque;
 
 use super::*;
 use crate::ide::diff::Change;
+use crate::project::git::MarkKind;
 use crate::project::history::{Blob, BlobReader, HISTORY_LIMIT, Version};
 
 /// Versions kept loaded either side of the one shown. This is the memory
@@ -53,6 +58,8 @@ pub(super) enum Step {
     Newer,
     Oldest,
     WorkingTree,
+    /// A version by its place, oldest first, from the timeline.
+    To(usize),
 }
 
 /// An open file history.
@@ -80,6 +87,8 @@ pub(super) struct Scrub {
     /// The file's caret (line, column) and first line when the history
     /// opened, which the first version shown starts from.
     start: (usize, usize, usize),
+    /// What the last step changed, while it fades.
+    fade: Option<Fade>,
     tx: mpsc::Sender<Request>,
     rx: mpsc::Receiver<Reply>,
     stop: Arc<AtomicBool>,
@@ -201,6 +210,12 @@ impl Scrub {
     /// Whether `id` is the file's tab or the history's.
     pub(super) fn involves(&self, id: u64) -> bool {
         self.live == id || self.sibling == Some(id)
+    }
+
+    /// Whether the strip shows above tab `active`: the history's own, or
+    /// the file's while the versions are listed and there is no tab yet.
+    pub(super) fn strip_over(&self, active: u64) -> bool {
+        self.sibling == Some(active) || (self.sibling.is_none() && self.live == active)
     }
 
     /// Something is on its way that the display link has to poll for.
@@ -326,6 +341,554 @@ pub(super) fn dump(state: &State) -> String {
     )
 }
 
+// ---- the fade ---------------------------------------------------------------
+// What a step changed, marked over the version it goes to and faded out.
+// macOS has a Reduce Motion setting, which nothing in crc reads yet; a
+// fade this short and this faint is drawn either way.
+
+/// How long what a step changed stays marked.
+const FADE: Duration = Duration::from_millis(150);
+/// Removed lines a ghost shows; past these it says how many more.
+const GHOST_LINES: usize = 3;
+/// The most text, both versions together, a jump of several versions is
+/// diffed across for its fade. A step to a neighbour has its diff from
+/// the worker; a jump has none, and this one would run on the main
+/// thread, on every step of a drag, so it is kept to small files. A
+/// longer jump shows its version unmarked.
+const FADE_JUMP_BYTES: usize = 32 * 1024;
+
+/// What a step changed: the lines it added or changed in the version it
+/// goes to, and the ones it removed, where they were.
+pub(super) struct Fade {
+    started: Instant,
+    /// Held at this point, for a self-test's frames.
+    frozen: Option<Duration>,
+    tints: Vec<(std::ops::Range<usize>, MarkKind)>,
+    ghosts: Vec<layout::Ghost>,
+}
+
+impl Fade {
+    /// From `changes`, from the version shown to the one a step goes to,
+    /// and `old`, the text of the one shown.
+    fn new(changes: &[Change], old: &str, started: Instant) -> Self {
+        let mut tints = Vec::new();
+        let mut ghosts = Vec::new();
+        let mut lines: Option<Vec<&str>> = None;
+        for change in changes {
+            if change.kind != MarkKind::Removed {
+                tints.push((change.new_start..change.new_end, change.kind));
+                continue;
+            }
+            let lines = lines.get_or_insert_with(|| old.split_inclusive('\n').collect());
+            let removed = change.old_end - change.old_start;
+            ghosts.push(layout::Ghost {
+                at: change.new_start,
+                lines: lines
+                    .iter()
+                    .skip(change.old_start)
+                    .take(removed.min(GHOST_LINES))
+                    .map(|line| layout::expanded_line(line))
+                    .collect(),
+                more: removed.saturating_sub(GHOST_LINES),
+            });
+        }
+        Fade {
+            started,
+            frozen: None,
+            tints,
+            ghosts,
+        }
+    }
+
+    fn elapsed(&self, now: Instant) -> Duration {
+        self.frozen
+            .unwrap_or_else(|| now.saturating_duration_since(self.started))
+    }
+
+    /// How strongly the marks show at `now`; `None` once the fade is over.
+    fn alpha(&self, now: Instant) -> Option<f32> {
+        let t = self.elapsed(now).as_secs_f32() / FADE.as_secs_f32();
+        (t < 1.0).then(|| fade_alpha(t))
+    }
+}
+
+/// From 1 at the step to 0 at the end, `t` the fraction of the fade gone:
+/// an ease-out, most of the change early and the rest settling.
+fn fade_alpha(t: f32) -> f32 {
+    let left = 1.0 - t.clamp(0.0, 1.0);
+    left * left
+}
+
+/// `changes` from one text to another as the changes back: what was added
+/// is removed, and the other way round.
+fn reversed(changes: &[Change]) -> Vec<Change> {
+    changes
+        .iter()
+        .map(|c| Change {
+            new_start: c.old_start,
+            new_end: c.old_end,
+            old_start: c.new_start,
+            old_end: c.new_end,
+            kind: match c.kind {
+                MarkKind::Added => MarkKind::Removed,
+                MarkKind::Removed => MarkKind::Added,
+                MarkKind::Modified => MarkKind::Modified,
+            },
+        })
+        .collect()
+}
+
+/// The wash behind lines of `kind` at `alpha`. There is no band for a
+/// changed line: its gutter mark's colour, as strong as the added band.
+fn tint_colour(kind: MarkKind, theme: &Theme, alpha: f32) -> [f32; 4] {
+    let band = match kind {
+        MarkKind::Modified => {
+            let [r, g, b, _] = theme.diff_modified;
+            [r, g, b, theme.diff_added_band[3]]
+        }
+        _ => theme.diff_added_band,
+    };
+    layout::faded(band, alpha)
+}
+
+impl Scrub {
+    /// What a step from version `from` to `target` changes, from the
+    /// neighbours' diff, or across a short jump between small texts;
+    /// `None` when it is not here or changes nothing.
+    fn fade_for(&self, from: usize, target: usize) -> Option<Fade> {
+        let old = self.texts.get(&from)?;
+        let changes = if from.abs_diff(target) == 1 {
+            let pair = self.diffs.get(&from.min(target))?;
+            if target > from {
+                pair.to_vec()
+            } else {
+                reversed(pair)
+            }
+        } else {
+            let new = self.texts.get(&target)?;
+            if from.abs_diff(target) > RADIUS || old.len() + new.len() > FADE_JUMP_BYTES {
+                return None;
+            }
+            crate::ide::diff::changes(old, new)
+        };
+        let fade = Fade::new(&changes, old, Instant::now());
+        (!fade.tints.is_empty() || !fade.ghosts.is_empty()).then_some(fade)
+    }
+
+    /// A step's fade is on screen: the frames come at the display's pace.
+    pub(super) fn fading(&self) -> bool {
+        self.fade
+            .as_ref()
+            .is_some_and(|f| f.alpha(Instant::now()).is_some())
+    }
+}
+
+/// The fade over the history's tab, when `buffer` is it: the washes under
+/// the text, which go in at the front of `out` as the conflicts' do, and
+/// the removed lines over it. Asks for the next frame until it is over,
+/// then lets it go.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn draw_fade(
+    scrub: &mut Option<Scrub>,
+    buffer: &Buffer,
+    atlas: &mut Atlas,
+    text: Viewport,
+    rows: &[layout::ScreenRow],
+    theme: &Theme,
+    out: &mut Vec<GlyphInstance>,
+) {
+    let Some(scrub) = scrub.as_mut() else {
+        return;
+    };
+    let Some(fade) = &scrub.fade else {
+        return;
+    };
+    let Some(alpha) = fade.alpha(Instant::now()) else {
+        scrub.fade = None;
+        return;
+    };
+    if scrub.sibling != Some(buffer.id()) {
+        return;
+    }
+    layout::keep_animating();
+    let tints: Vec<_> = fade
+        .tints
+        .iter()
+        .map(|(lines, kind)| (lines.clone(), tint_colour(*kind, theme, alpha)))
+        .collect();
+    out.splice(0..0, layout::line_tints(rows, atlas, text, &tints));
+    for ghost in &fade.ghosts {
+        layout::push_ghost(out, atlas, buffer, text, rows, ghost, alpha, theme);
+    }
+}
+
+/// What the self-test dump says of the fade: how far along, and how many
+/// washes and ghosts it draws.
+pub(super) fn dump_fade(state: &State) -> String {
+    let fade = state.scrub.as_ref().and_then(|s| s.fade.as_ref());
+    match fade {
+        Some(fade) if fade.alpha(Instant::now()).is_some() => format!(
+            "t={}ms, tints={} ghosts={}",
+            fade.elapsed(Instant::now()).as_millis(),
+            fade.tints.len(),
+            fade.ghosts.len()
+        ),
+        _ => "none".into(),
+    }
+}
+
+/// A self-test holds the fade `ms` in, to take its frames there. It stays
+/// until the next step replaces it.
+pub(super) fn freeze_fade(state: &mut State, ms: u64) {
+    match state.scrub.as_mut().and_then(|s| s.fade.as_mut()) {
+        Some(fade) => fade.frozen = Some(Duration::from_millis(ms)),
+        None => eprintln!("selftest: no fade to hold"),
+    }
+}
+
+// ---- the strip --------------------------------------------------------------
+// Above the history's tab: which version it is, Older and Newer, and a
+// timeline of every version with the working tree at its right end, to
+// click or drag along.
+
+const OLDER: &str = "Older";
+const NEWER: &str = "Newer";
+
+/// The history whose strip is above the active tab.
+pub(super) fn strip_scrub(state: &State) -> Option<&Scrub> {
+    let active = state.docs.active().id();
+    state.scrub.as_ref().filter(|s| s.strip_over(active))
+}
+
+/// Where the strip's controls are.
+pub(super) struct StripRects {
+    pub(super) older: Viewport,
+    pub(super) newer: Viewport,
+    pub(super) close: Viewport,
+    /// The rest of the second row, right of Newer.
+    pub(super) track: Viewport,
+}
+
+pub(super) fn strip_rects(atlas: &mut Atlas, strip: Viewport) -> StripRects {
+    let older = layout::strip_button(atlas, strip, strip.x + 16.0, OLDER, 24.0);
+    let newer = layout::strip_button(
+        atlas,
+        strip,
+        older.x + older.width + layout::UI_GAP,
+        NEWER,
+        24.0,
+    );
+    // On the first row, level with the pill.
+    let close = Viewport {
+        x: strip.x + strip.width - 16.0 - layout::UI_CONTROL,
+        y: strip.y + 6.0,
+        width: layout::UI_CONTROL,
+        height: layout::UI_CONTROL,
+    };
+    let left = newer.x + newer.width + layout::UI_INSET;
+    let track = Viewport {
+        x: left,
+        width: (strip.x + strip.width - 16.0 - left).max(0.0),
+        ..older
+    };
+    StripRects {
+        older,
+        newer,
+        close,
+        track,
+    }
+}
+
+/// Whether Older and Newer have somewhere to go.
+fn steps_open(scrub: &Scrub) -> (bool, bool) {
+    let at = scrub.center();
+    let listed = scrub.versions.is_some();
+    (listed && at > 0, listed && at < scrub.count())
+}
+
+/// The strip's clickable parts: the close button always, the rest once
+/// the versions are listed.
+pub(super) fn strip_hits(
+    scrub: &Scrub,
+    atlas: &mut Atlas,
+    strip: Viewport,
+) -> Vec<(Hit, Viewport)> {
+    let rects = strip_rects(atlas, strip);
+    let mut hits = vec![(Hit::ScrubClose, rects.close)];
+    if scrub.versions.is_some() {
+        hits.extend([
+            (Hit::ScrubOlder, rects.older),
+            (Hit::ScrubNewer, rects.newer),
+            (Hit::ScrubTrack, rects.track),
+        ]);
+    }
+    hits
+}
+
+/// What the first row says: the facts, the summary apart so it can be
+/// cut to the room left, and the place at the right.
+struct StripText {
+    lead: String,
+    summary: String,
+    right: String,
+}
+
+/// The version the thumb is on, which is the one a step or a drag is
+/// waiting for while its text is read.
+fn strip_text(scrub: &Scrub, now: i64) -> StripText {
+    let more = if scrub.capped { "+" } else { "" };
+    let Some(versions) = &scrub.versions else {
+        return StripText {
+            lead: format!("Reading the history of {}", scrub.name),
+            summary: String::new(),
+            right: "loading\u{2026}".into(),
+        };
+    };
+    let count = versions.len();
+    let at = scrub.center();
+    match versions.get(at) {
+        Some(version) => StripText {
+            lead: format!(
+                "{}   {}, {}   ",
+                short(&version.commit),
+                version.author,
+                crate::project::git::ago(version.time, now)
+            ),
+            summary: version.summary.clone(),
+            right: format!("{} of {count}{more}", at + 1),
+        },
+        None => StripText {
+            lead: format!(
+                "{} as open in its tab, after {count}{more} commits",
+                scrub.name
+            ),
+            summary: String::new(),
+            right: "working tree".into(),
+        },
+    }
+}
+
+/// What the pointer resting on slot `slot` of the timeline is told.
+fn slot_tip(scrub: &Scrub, slot: usize, now: i64) -> String {
+    match scrub.versions.as_ref().and_then(|v| v.get(slot)) {
+        Some(version) => format!(
+            "{}  {}, {}\n{}",
+            short(&version.commit),
+            version.author,
+            crate::project::git::ago(version.time, now),
+            version.summary
+        ),
+        None => format!("Working tree: {} as open in its tab", scrub.name),
+    }
+}
+
+/// The pill, the facts, the place, the buttons and the timeline.
+pub(super) fn draw_strip(
+    scrub: &Scrub,
+    atlas: &mut Atlas,
+    strip: Viewport,
+    theme: &Theme,
+    out: &mut Vec<GlyphInstance>,
+) {
+    let now = crate::platform::unix_seconds() as i64;
+    let pill = layout::strip_pill(out, atlas, strip, "History", theme.accent);
+    let rects = strip_rects(atlas, strip);
+    let text = strip_text(scrub, now);
+    let left = pill.x + pill.width + 12.0;
+    let right_width = layout::ui_text_width(atlas, &text.right);
+    layout::push_ui_text_right(
+        out,
+        atlas,
+        Viewport {
+            x: left,
+            width: (rects.close.x - 8.0 - left).max(0.0),
+            ..pill
+        },
+        &text.right,
+        theme.status_text,
+    );
+    // The facts stop short of the place; the summary gives way first.
+    let room = (rects.close.x - 8.0 - right_width - 16.0 - left).max(0.0);
+    let lead_width = layout::ui_text_width(atlas, &text.lead);
+    let facts = if lead_width >= room {
+        crate::platform::inspector::fit(atlas, text.lead.trim_end(), room)
+    } else {
+        // Measured widths stop at 120 characters: cut a long one first.
+        let summary: String = text.summary.chars().take(100).collect();
+        let summary = crate::platform::inspector::fit(atlas, &summary, room - lead_width);
+        format!("{}{summary}", text.lead)
+    };
+    layout::strip_facts(out, atlas, strip, pill, &facts, theme);
+    let (older, newer) = steps_open(scrub);
+    Button::new(rects.older)
+        .label(OLDER)
+        .enabled(older)
+        .tip("Older Version  \u{2190}")
+        .draw(out, atlas, theme);
+    Button::new(rects.newer)
+        .label(NEWER)
+        .enabled(newer)
+        .tip("Newer Version  \u{2192}")
+        .draw(out, atlas, theme);
+    Button::new(rects.close)
+        .icon(crate::project::icons::CLOSE)
+        .tone(Tone::Ghost)
+        .tip("Back to the File  \u{238b}")
+        .draw(out, atlas, theme);
+    draw_timeline(scrub, atlas, rects.track, theme, now, out);
+    layout::strip_hairline(out, atlas, strip, theme);
+}
+
+/// The timeline: a line with a tick per version, brighter where the text
+/// is already read, a ring for the working tree at the right end, and the
+/// thumb on the version shown. Too many versions for a tick each, and it
+/// is a band instead, brighter over the versions read. While the versions
+/// are listed, a bar runs along it.
+fn draw_timeline(
+    scrub: &Scrub,
+    atlas: &mut Atlas,
+    track: Viewport,
+    theme: &Theme,
+    now: i64,
+    out: &mut Vec<GlyphInstance>,
+) {
+    if track.width <= 2.0 * layout::TIMELINE_INSET {
+        return;
+    }
+    let m = atlas.metrics;
+    let mid = track.y + (track.height * 0.5).round();
+    let ink = theme.status_text;
+    let Some(count) = scrub.versions.as_ref().map(Vec::len) else {
+        let line = Viewport {
+            x: track.x + layout::TIMELINE_INSET,
+            y: mid - 1.0,
+            width: track.width - 2.0 * layout::TIMELINE_INSET,
+            height: 2.0,
+        };
+        layout::push_rounded_rect(out, line, 1.0, layout::faded(ink, 0.25));
+        layout::push_progress(out, atlas, line, theme);
+        return;
+    };
+    let slots = count + 1;
+    let x_of = |slot: usize| layout::timeline_x(track, slots, slot);
+    let first = x_of(0);
+    let last = x_of(count);
+    let dense = layout::timeline_dense(track, slots);
+    if dense {
+        let band = |out: &mut Vec<GlyphInstance>, from: f32, to: f32, colour| {
+            layout::push_rounded_rect(
+                out,
+                Viewport {
+                    x: from - 2.0,
+                    y: mid - 2.0,
+                    width: to - from + 4.0,
+                    height: 4.0,
+                },
+                2.0,
+                colour,
+            )
+        };
+        band(out, first, last, layout::faded(ink, 0.22));
+        // The versions read: a few runs, at most the window around the
+        // one shown and the working tree.
+        let mut read: Vec<usize> = scrub.texts.keys().copied().filter(|&s| s < count).collect();
+        read.sort_unstable();
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        for slot in read {
+            match runs.last_mut() {
+                Some((_, end)) if *end + 1 == slot => *end = slot,
+                _ => runs.push((slot, slot)),
+            }
+        }
+        for (from, to) in runs {
+            band(out, x_of(from), x_of(to), layout::faded(ink, 0.5));
+        }
+    } else {
+        layout::push_rect(
+            out,
+            atlas,
+            [first, mid - 1.0],
+            [last - first, 2.0],
+            layout::faded(ink, 0.22),
+        );
+        for slot in 0..count {
+            let alpha = if scrub.texts.contains_key(&slot) {
+                0.85
+            } else {
+                0.4
+            };
+            layout::push_rect(
+                out,
+                atlas,
+                [m.snap(x_of(slot) - 0.5), mid - 5.0],
+                [1.0, 10.0],
+                layout::faded(ink, alpha),
+            );
+        }
+    }
+    // The working tree: a ring, not a tick, as it is no commit.
+    let ground = theme.background.map(|c| c as f32);
+    let ring = |size: f32| Viewport {
+        x: m.snap(last - size * 0.5),
+        y: mid - size * 0.5,
+        width: size,
+        height: size,
+    };
+    layout::push_rounded_rect(out, ring(10.0), 5.0, layout::faded(ink, 0.9));
+    layout::push_rounded_rect(out, ring(6.0), 3.0, ground);
+    // Under the pointer: that version brighter, and what it is said when
+    // the pointer rests there.
+    layout::hotspot(track, layout::Cursor::Pointing, None);
+    if let Some((x, _)) = layout::pointer().filter(|_| layout::hovered(track)) {
+        let slot = layout::timeline_slot_at(track, slots, x);
+        if slot < count {
+            layout::push_rect(
+                out,
+                atlas,
+                [m.snap(x_of(slot) - 0.5), mid - 7.0],
+                [1.0, 14.0],
+                theme.text,
+            );
+        }
+        layout::hotspot(
+            layout::timeline_column(track, slots, slot),
+            layout::Cursor::Pointing,
+            Some(&slot_tip(scrub, slot, now)),
+        );
+    }
+    // The thumb, dimmer while the version it is on is read.
+    let thumb = Viewport {
+        x: m.snap(x_of(scrub.center()) - 3.0),
+        y: mid - 9.0,
+        width: 6.0,
+        height: 18.0,
+    };
+    let fill = if scrub.pending.is_some() {
+        layout::faded(theme.accent, 0.55)
+    } else {
+        theme.accent
+    };
+    layout::push_rounded_rect(out, thumb, 3.0, fill);
+}
+
+/// What the self-test dump says of the strip: its facts, uncut, its
+/// place, and which steps it offers.
+pub(super) fn dump_strip(state: &State) -> String {
+    let Some(scrub) = strip_scrub(state) else {
+        return "none".into();
+    };
+    if chrome_of(state).response.is_none() {
+        return "hidden".into();
+    }
+    let text = strip_text(scrub, crate::platform::unix_seconds() as i64);
+    let (older, newer) = steps_open(scrub);
+    format!(
+        "{} | {} | older={older} newer={newer}",
+        format!("{}{}", text.lead, text.summary).trim_end(),
+        text.right
+    )
+}
+
 /// Whether the arrows and Escape step the history: its tab is in front and
 /// the keyboard is the document's.
 pub(super) fn has_keys(state: &State) -> bool {
@@ -385,11 +948,24 @@ fn show(state: &mut State) -> Option<(String, bool)> {
         return None;
     }
     let text = scrub.texts.get(&target)?.clone();
+    // What the step changes, faded out over the version it shows: none for
+    // the first, which only opens the tab. A step during a fade starts
+    // its own; nothing queues.
+    let fade = if made {
+        scrub.fade_for(from, target)
+    } else {
+        None
+    };
     let label = scrub.label(target);
     let ((line, column), top) = match scrub.sibling.and_then(|id| buffer_by_id(docs, panes, id)) {
         Some(buffer) => (buffer.cursor_position(), buffer.scroll_line),
         None => ((scrub.start.0, scrub.start.1), scrub.start.2),
     };
+    // A jump of several versions, from the timeline, maps through every
+    // diff between the two. Only the window around the version asked for
+    // is loaded, so a long jump usually finds one missing: then the caret
+    // and the view keep their line numbers, clamped to the version's
+    // length, rather than wait for every version in between to be read.
     let map = |line| map_through(&scrub.diffs, from, target, line).unwrap_or(line);
     let (line, top) = (map(line), map(top));
     if !made {
@@ -414,6 +990,7 @@ fn show(state: &mut State) -> Option<(String, bool)> {
     let rope = buffer.rope.clone();
     scrub.shown = target;
     scrub.pending = None;
+    scrub.fade = fade;
     // What this commit changed, against its parent: the oldest version
     // has no parent read, and no marks rather than every line added.
     // No HEAD text: nothing here acts on the changes, and nothing reads
@@ -544,6 +1121,7 @@ impl EditorView {
             diffs: HashMap::new(),
             worktree,
             start,
+            fade: None,
             tx,
             rx,
             stop,
@@ -584,6 +1162,7 @@ impl EditorView {
                         Step::Newer => (at < count).then_some(at + 1),
                         Step::Oldest => Some(0),
                         Step::WorkingTree => Some(count),
+                        Step::To(slot) => Some(slot.min(count)),
                     };
                     if target == Some(count)
                         && let Some(live) = buffer_by_id(docs, panes, scrub.live)
@@ -597,6 +1176,8 @@ impl EditorView {
                             scrub.request();
                             None
                         }
+                        // The timeline on the version already there.
+                        Some(_) if matches!(step, Step::To(_)) => return,
                         _ if at == count => Some("this is the working tree".to_string()),
                         _ if scrub.capped => {
                             format!("the oldest of the {count} versions read").into()
@@ -615,6 +1196,31 @@ impl EditorView {
         }
         self.show_pending();
         self.resume_display_link();
+    }
+
+    /// A press or a drag on the timeline at `x`: the version under it. A
+    /// drag asks for every version it crosses; the worker drops what an
+    /// older request still had queued, so the last one is read first.
+    pub(super) fn scrub_track_at(&self, x: f32) {
+        let slot = {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            let Some(strip) = chrome_of(&state).response else {
+                return;
+            };
+            let state = &mut *state;
+            let active = state.docs.active().id();
+            let Some(scrub) = state.scrub.as_ref().filter(|s| s.sibling == Some(active)) else {
+                return;
+            };
+            let Some(count) = scrub.versions.as_ref().map(Vec::len) else {
+                return;
+            };
+            let track = strip_rects(&mut state.renderer.atlas, strip).track;
+            layout::timeline_slot_at(track, count + 1, x)
+        };
+        self.step_history(Step::To(slot));
     }
 
     /// Shows the version a step waits for if it is here, else says it is
@@ -972,6 +1578,97 @@ mod tests {
         assert_eq!(map_through(&diffs, 1, 0, 1), Some(0));
         assert_eq!(map_through(&diffs, 1, 1, 7), Some(7));
         assert_eq!(map_through(&diffs, 0, 3, 0), None, "a diff not loaded");
+    }
+
+    fn fade_between(old: &str, new: &str) -> Fade {
+        Fade::new(&crate::ide::diff::changes(old, new), old, Instant::now())
+    }
+
+    #[test]
+    fn a_fade_washes_what_was_added_or_changed_and_ghosts_what_went() {
+        let fade = fade_between("a\nb\nc\nd\n", "a\nB\nc\nnew\none\n");
+        assert_eq!(
+            fade.tints,
+            [(1..2, MarkKind::Modified), (3..5, MarkKind::Modified)]
+        );
+        assert!(fade.ghosts.is_empty());
+        let fade = fade_between("a\nb\n", "a\nx\ny\nb\n");
+        assert_eq!(fade.tints, [(1..3, MarkKind::Added)]);
+        // Removed lines sit where they were in the new version, tabs
+        // expanded and line breaks gone, CRLF ones included.
+        let fade = fade_between("a\n\tgone\r\nb\n", "a\nb\n");
+        assert!(fade.tints.is_empty());
+        assert_eq!(
+            fade.ghosts,
+            [layout::Ghost {
+                at: 1,
+                lines: vec!["    gone".into()],
+                more: 0,
+            }]
+        );
+        // Removed from the end: above the line count.
+        let fade = fade_between("a\nb\nc\n", "a\n");
+        assert_eq!(fade.ghosts[0].at, 1);
+        assert_eq!(fade.ghosts[0].lines, ["b", "c"]);
+        assert!(fade_between("same\n", "same\n").tints.is_empty());
+    }
+
+    #[test]
+    fn a_long_removal_shows_three_lines_and_how_many_more() {
+        let fade = fade_between("1\n2\n3\n4\n5\n6\nkeep\n", "keep\n");
+        assert_eq!(
+            fade.ghosts,
+            [layout::Ghost {
+                at: 0,
+                lines: vec!["1".into(), "2".into(), "3".into()],
+                more: 3,
+            }]
+        );
+        let fade = fade_between("1\n2\n3\nkeep\n", "keep\n");
+        assert_eq!(fade.ghosts[0].lines.len(), 3);
+        assert_eq!(fade.ghosts[0].more, 0, "exactly three: no more line");
+    }
+
+    #[test]
+    fn a_step_back_swaps_what_was_added_and_removed() {
+        // The worker's diff runs from the older version to the newer; a
+        // step back reads it the other way, against the newer text.
+        let (older, newer) = ("a\nb\nc\n", "a\nadded\nb\nC\n");
+        let forward = crate::ide::diff::changes(older, newer);
+        let back = Fade::new(&reversed(&forward), newer, Instant::now());
+        assert_eq!(back.tints, [(2..3, MarkKind::Modified)]);
+        assert_eq!(
+            back.ghosts,
+            [layout::Ghost {
+                at: 1,
+                lines: vec!["added".into()],
+                more: 0,
+            }]
+        );
+        // The same as diffing the other way round.
+        assert_eq!(reversed(&forward), crate::ide::diff::changes(newer, older));
+        assert_eq!(reversed(&reversed(&forward)), forward);
+    }
+
+    #[test]
+    fn a_fade_eases_out_and_ends() {
+        let start = Instant::now();
+        let mut fade = Fade::new(&[], "", start);
+        assert_eq!(fade.alpha(start), Some(1.0));
+        let mid = fade.alpha(start + FADE / 2).unwrap();
+        assert!((mid - 0.25).abs() < 1e-4, "{mid}");
+        // Faster early than late: past half its strength before a third.
+        assert!(fade.alpha(start + FADE / 3).unwrap() < 0.5);
+        assert!(fade.alpha(start + FADE * 9 / 10).unwrap() < 0.02);
+        assert_eq!(fade.alpha(start + FADE), None);
+        assert_eq!(fade.alpha(start + FADE * 4), None);
+        // A clock behind the start is the start.
+        assert_eq!(fade_alpha(-1.0), 1.0);
+        assert_eq!(fade_alpha(2.0), 0.0);
+        // Held by a self-test, whatever the clock says.
+        fade.frozen = Some(Duration::from_millis(75));
+        let held = fade.alpha(start + FADE * 10).unwrap();
+        assert!((held - 0.25).abs() < 1e-4, "{held}");
     }
 
     #[test]

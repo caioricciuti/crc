@@ -124,6 +124,7 @@ impl EditorView {
             conflict_scans,
             conflict_side,
             issue_tabs,
+            scrub,
             ..
         } = &mut *state;
         *unshaped_on_screen = false;
@@ -423,6 +424,16 @@ impl EditorView {
                     glyphs,
                 );
             }
+            // A step through File History: what it changed, fading out.
+            super::scrub::draw_fade(
+                scrub,
+                buffer,
+                &mut renderer.atlas,
+                editor_rect,
+                &rows,
+                theme,
+                glyphs,
+            );
 
             // A composition in progress, drawn at the caret it will land at.
             if let Some(text) = marked.as_deref()
@@ -682,6 +693,11 @@ impl EditorView {
                 && let Some(tab) = issue_tabs.get(&buffer.id())
             {
                 super::issues::draw_strip(tab, &mut renderer.atlas, strip, theme, glyphs);
+            }
+            if let Some(strip) = response_rect
+                && let Some(history) = scrub.as_ref().filter(|s| s.strip_over(buffer.id()))
+            {
+                super::scrub::draw_strip(history, &mut renderer.atlas, strip, theme, glyphs);
             }
         }
 

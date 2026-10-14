@@ -86,6 +86,12 @@ pub fn set_pressed(at: Option<(f32, f32)>) {
     });
 }
 
+/// Where the pointer is, while it is in the window: for a control whose
+/// parts are finer than its hotspots, such as a timeline's slots.
+pub fn pointer() -> Option<(f32, f32)> {
+    POINTER.with(|p| p.get().at)
+}
+
 /// Whether the pointer is over `rect`.
 pub fn hovered(rect: Viewport) -> bool {
     POINTER.with(|p| p.get().at.is_some_and(|(x, y)| rect.contains(x, y)))
@@ -842,6 +848,11 @@ pub fn push_spinner(out: &mut Vec<GlyphInstance>, x: f32, row: Viewport, colour:
 
 thread_local! {
     static ANIMATING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Something drawn in this frame is still moving: the next one is wanted.
+pub fn keep_animating() {
+    ANIMATING.with(|a| a.set(true));
 }
 
 /// Whether the frame just drawn has something moving in it, and clears the

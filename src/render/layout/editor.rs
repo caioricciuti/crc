@@ -1042,27 +1042,31 @@ pub fn change_peek(head: &str, change: &crate::ide::diff::Change) -> ChangePeek 
         .split_inclusive('\n')
         .skip(change.old_start)
         .take(removed)
-        .map(|line| {
-            let mut out = String::new();
-            let mut column = 0;
-            for ch in line.trim_end_matches(['\n', '\r']).chars() {
-                if ch == '\t' {
-                    let next = (column / TAB_WIDTH + 1) * TAB_WIDTH;
-                    out.extend(std::iter::repeat_n(' ', next - column));
-                    column = next;
-                } else {
-                    out.push(ch);
-                    column += display_width(ch);
-                }
-            }
-            out
-        })
+        .map(expanded_line)
         .collect();
     ChangePeek {
         kind: change.kind,
         title,
         head,
     }
+}
+
+/// `line` without its line break, its tabs expanded to the columns they
+/// reach: a line of another text, drawn cell by cell.
+pub fn expanded_line(line: &str) -> String {
+    let mut out = String::new();
+    let mut column = 0;
+    for ch in line.trim_end_matches(['\n', '\r']).chars() {
+        if ch == '\t' {
+            let next = (column / TAB_WIDTH + 1) * TAB_WIDTH;
+            out.extend(std::iter::repeat_n(' ', next - column));
+            column = next;
+        } else {
+            out.push(ch);
+            column += display_width(ch);
+        }
+    }
+    out
 }
 
 /// Where the peek's controls were drawn, for clicks.
@@ -1356,6 +1360,155 @@ pub fn build_change_peek(
         stage: stage_rect,
         close,
     })
+}
+
+/// Washes behind the rows of each of `tints`, a range of lines and its
+/// colour, across the text: what a step through a file's history changed.
+/// They go under the text. `rows` are the frame's screen rows in `text`.
+pub fn line_tints(
+    rows: &[ScreenRow],
+    atlas: &Atlas,
+    text: Viewport,
+    tints: &[(std::ops::Range<usize>, [f32; 4])],
+) -> Vec<GlyphInstance> {
+    let mut out = Vec::new();
+    if tints.is_empty() {
+        return out;
+    }
+    for row in rows {
+        if let Some((_, colour)) = tints.iter().find(|(lines, _)| lines.contains(&row.line)) {
+            push_rect(
+                &mut out,
+                atlas,
+                [text.x, row.y],
+                [text.width, atlas.metrics.line_height],
+                *colour,
+            );
+        }
+    }
+    for quad in &mut out {
+        clip_vertical(quad, text.y, text.y + text.height);
+    }
+    out
+}
+
+/// Lines a step through a file's history removed, drawn for a moment where
+/// they were.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ghost {
+    /// The line they were above in the text shown: the line count when
+    /// they were at its end.
+    pub at: usize,
+    /// The first few, without line breaks, tabs expanded.
+    pub lines: Vec<String>,
+    /// How many more there were.
+    pub more: usize,
+}
+
+/// Of a ghost's `alpha`, the part below which its text is gone and its
+/// cover starts to go.
+const GHOST_HANDOFF: f32 = 0.25;
+
+/// `ghost` over the text from its boundary down, as the peek draws removed
+/// lines: `diff_removed` on `diff_removed_band`, over the editor's own
+/// background. An overlay only: the rows under it stay where they are, for
+/// the pointer as for the eye. Nothing when the boundary is off screen.
+///
+/// Two texts in one place cannot fade into each other legibly, so as
+/// `alpha` goes from 1 to 0 the ghost's lines fade first, with the cover
+/// still whole, and only once they are gone does the cover fade off the
+/// rows under it.
+#[allow(clippy::too_many_arguments)]
+pub fn push_ghost(
+    out: &mut Vec<GlyphInstance>,
+    atlas: &mut Atlas,
+    buffer: &Buffer,
+    text: Viewport,
+    rows: &[ScreenRow],
+    ghost: &Ghost,
+    alpha: f32,
+    theme: &Theme,
+) {
+    let m = atlas.metrics;
+    let lh = m.line_height;
+    let top = rows
+        .iter()
+        .find(|r| r.line == ghost.at && r.first)
+        .map(|r| r.y)
+        .or_else(|| {
+            rows.last()
+                .filter(|r| r.last && r.line + 1 == ghost.at)
+                .map(|r| r.y + lh)
+        });
+    let Some(top) = top else {
+        return;
+    };
+    let count = ghost.lines.len() + usize::from(ghost.more > 0);
+    let code_x = text.x + gutter_width(buffer, atlas);
+    let x = code_x - m.advance * 0.5;
+    let width = (text.x + text.width - x).max(0.0);
+    let height = count as f32 * lh;
+    let mut quads = Vec::new();
+    let cover = (alpha / GHOST_HANDOFF).clamp(0.0, 1.0);
+    let words = ((alpha - GHOST_HANDOFF) / (1.0 - GHOST_HANDOFF)).clamp(0.0, 1.0);
+    let ground = theme.background.map(|c| c as f32);
+    push_rect(
+        &mut quads,
+        atlas,
+        [x, top],
+        [width, height],
+        faded(ground, cover),
+    );
+    push_rect(
+        &mut quads,
+        atlas,
+        [x, top],
+        [width, height],
+        faded(theme.diff_removed_band, cover),
+    );
+    push_rect(
+        &mut quads,
+        atlas,
+        [x, top],
+        [2.0, height],
+        faded(theme.diff_removed, cover),
+    );
+    if words <= 0.0 {
+        for quad in &mut quads {
+            clip_vertical(quad, text.y, text.y + text.height);
+        }
+        out.extend(quads);
+        return;
+    }
+    let columns = ((text.x + text.width - code_x) / m.advance).max(0.0) as usize;
+    let ink = faded(theme.diff_removed, words);
+    for (i, line) in ghost.lines.iter().enumerate() {
+        let shown =
+            crate::text::columns::fit_columns(line.chars().skip(buffer.scroll_column), columns);
+        push_text(&mut quads, atlas, code_x, top + i as f32 * lh, &shown, ink);
+    }
+    if ghost.more > 0 {
+        push_ui_text(
+            &mut quads,
+            atlas,
+            Viewport {
+                x: code_x,
+                y: top + ghost.lines.len() as f32 * lh,
+                width: (text.x + text.width - code_x).max(0.0),
+                height: lh,
+            },
+            &format!(
+                "\u{2026} {} more {}",
+                ghost.more,
+                if ghost.more == 1 { "line" } else { "lines" }
+            ),
+            faded(theme.status_text, words),
+        );
+    }
+    for quad in &mut quads {
+        clip_vertical(quad, text.y, text.y + text.height);
+    }
+    out.extend(quads);
 }
 
 /// Squiggles under each of `marks`, a range of `buffer`'s text and its

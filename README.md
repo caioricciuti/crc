@@ -88,7 +88,9 @@ the size and write it back.
   stage just that change. Git > File History (`Cmd-Option-Y`) walks the
   file back through every commit that touched it, renames included, in a
   read-only tab beside it: Left and Right step, Home and End go to the
-  oldest version and back to your working text, Escape returns.
+  oldest version and back to your working text, or drag along the
+  timeline above it; each step washes in what changed and fades out what
+  went. Escape returns.
 - **Completion that learns, in every language**: the best guess appears as
   ghost text at the caret (Tab takes it) and the alternatives as a single
   row of chips under the line, with a line saying why the picked one is

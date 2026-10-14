@@ -10,7 +10,11 @@ One entry per tag, written for people who use the editor.
   text, and Escape closes it, leaving your file and caret as they were.
   Renames are followed, the caret stays on the same code from version to
   version, and the gutter marks what each commit changed. Versions are
-  read in the background, nearest first.
+  read in the background, nearest first. A strip above it names the
+  commit (hash, author, age, summary, "12 of 47") with Older and Newer
+  buttons and a timeline to click or drag along; lines a step adds or
+  changes are washed in colour and removed lines fade out where they
+  were, over about 150 ms.
 - Git > Next Change (`Option-F5`) and Previous Change (`Shift-Option-F5`)
   move the caret through the lines that differ from HEAD, wrapping at the
   ends, and say which change of how many it is on. Git > Revert Change

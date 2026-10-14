@@ -31,6 +31,7 @@
 //! touch <file>                create a file without notifying the project UI
 //! write <file> <text>         overwrite a file, as another program would
 //! dump <file>                 write the state of the active document
+//! fade <ms>                   hold File History's fade <ms> in, for frames
 //! quit
 //! ```
 //!
@@ -83,6 +84,15 @@ pub enum Step {
         dx: f64,
         dy: f64,
     },
+    /// A click, press, drag or release at a fraction of a named region's
+    /// width and height, resolved when it runs: `0 0.5` is the middle of
+    /// its left edge, `1 0.5` of its right, kept just inside it.
+    At {
+        mouse: Mouse,
+        name: String,
+        fx: f64,
+        fy: f64,
+    },
     Drag {
         x: f64,
         y: f64,
@@ -110,6 +120,9 @@ pub enum Step {
     Dump(String),
     /// The window's frame, drawn again offscreen, as a BMP at this path.
     Frame(String),
+    /// Holds the fade of the last step through File History this many
+    /// milliseconds in, so a frame can show it there.
+    Fade(u64),
     /// A real panic, so the crash hook and recovery run end to end.
     Panic,
     Wait(u64),
@@ -123,6 +136,15 @@ pub enum Step {
     /// points AppKit can re-enter through: each must skip, none may abort.
     Reenter,
     Quit,
+}
+
+/// What an [`Step::At`] does with the left button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mouse {
+    Click,
+    Down,
+    Drag,
+    Up,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -271,6 +293,22 @@ pub fn parse(script: &str) -> Result<Vec<Step>, String> {
                 dx: args.num().ok_or_else(bad)?,
                 dy: args.num().ok_or_else(bad)?,
             }),
+            "clickat" | "downat" | "dragat" | "upat" if rest.starts_with('@') => {
+                let mouse = match command {
+                    "clickat" => Mouse::Click,
+                    "downat" => Mouse::Down,
+                    "dragat" => Mouse::Drag,
+                    _ => Mouse::Up,
+                };
+                let name = args.word().ok_or_else(bad)?.to_string();
+                let (fx, fy) = (args.num().ok_or_else(bad)?, args.num().ok_or_else(bad)?);
+                Some(Step::At {
+                    mouse,
+                    name,
+                    fx,
+                    fy,
+                })
+            }
             "down" => {
                 let (x, y) = (args.num().ok_or_else(bad)?, args.num().ok_or_else(bad)?);
                 let count = args.opt_num().map_or(1, |c| c as isize);
@@ -323,6 +361,7 @@ pub fn parse(script: &str) -> Result<Vec<Step>, String> {
             }
             "dump" if !rest.is_empty() => steps.push(Step::Dump(rest.to_string())),
             "frame" if !rest.is_empty() => steps.push(Step::Frame(rest.to_string())),
+            "fade" => steps.push(Step::Fade(rest.parse().map_err(|_| bad())?)),
             "wait" => steps.push(Step::Wait(rest.parse().map_err(|_| bad())?)),
             "idle" => steps.push(Step::Idle(rest.parse().map_err(|_| bad())?)),
             "webjs" if !rest.is_empty() => steps.push(Step::WebJs(rest.to_string())),
@@ -397,11 +436,26 @@ mod tests {
             })
             .collect();
         assert_eq!(mods, vec![(1, true, false), (2, false, true)]);
+        let at = parse("clickat @scrub.track 0 0.5\ndragat @scrub.track 0.25 0.5\n").unwrap();
+        assert_eq!(
+            at[1],
+            Step::At {
+                mouse: Mouse::Drag,
+                name: "scrub.track".into(),
+                fx: 0.25,
+                fy: 0.5
+            }
+        );
+        assert_eq!(parse("fade 40\n").unwrap(), [Step::Fade(40)]);
         for junk in [
+            "clickat scrub.track 0 0.5",
+            "upat @scrub.track 0",
+            "downat @scrub.track 0 0.5 2",
             "click 1 2 x",
             "click @tab 2 x",
             "resize 10 20 30",
             "key 36 - a b",
+            "fade soon",
         ] {
             assert!(parse(junk).is_err(), "{junk} should be refused");
         }

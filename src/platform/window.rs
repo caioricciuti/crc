@@ -1329,6 +1329,8 @@ enum Drag {
     /// The editor's scrollbar thumb: where on the thumb the press landed,
     /// so the thumb does not jump under the pointer.
     Scrollbar(f32),
+    /// Along a file history's timeline: the version under the pointer.
+    Timeline,
     /// A tab across the strip, by its current index.
     Tab(usize),
     /// A sidebar row onto a folder.
@@ -1895,6 +1897,25 @@ define_class!(
                     self.issue_open_on_github();
                     return;
                 }
+                Some(Hit::ScrubOlder) => {
+                    self.step_history(scrub::Step::Older);
+                    return;
+                }
+                Some(Hit::ScrubNewer) => {
+                    self.step_history(scrub::Step::Newer);
+                    return;
+                }
+                Some(Hit::ScrubClose) => {
+                    self.close_history();
+                    return;
+                }
+                Some(Hit::ScrubTrack) => {
+                    if let Some(mut state) = self.state_mut() {
+                        state.drag = Some(Drag::Timeline);
+                    }
+                    self.scrub_track_at(x);
+                    return;
+                }
                 // A review draws a diff, not its text: there is no caret
                 // to place in it.
                 Some(Hit::Text) if self.state().is_some_and(|state| active_review(&state).is_some()) => {
@@ -2174,6 +2195,10 @@ define_class!(
                 return;
             }
             if self.state().is_some_and(|state| matches!(state.drag, Some(Drag::Tab(_)))) { return; }
+            if self.state().is_some_and(|state| matches!(state.drag, Some(Drag::Timeline))) {
+                self.scrub_track_at(point.x as f32);
+                return;
+            }
 
             let Some(grab) = self.state().map(|state| match state.drag {
                 Some(Drag::Scrollbar(grab)) => Some(grab),
@@ -2370,6 +2395,10 @@ define_class!(
                         | Hit::ReviewReject
                         | Hit::IssueStartTask
                         | Hit::IssueOpenGitHub
+                        | Hit::ScrubOlder
+                        | Hit::ScrubNewer
+                        | Hit::ScrubClose
+                        | Hit::ScrubTrack
                         | Hit::ConflictMode(_)
                         | Hit::ConflictStep(_)
                         | Hit::ConflictResolve
@@ -2726,8 +2755,16 @@ define_class!(
                     state.message = None;
                     self.ivars().needs_redraw.set(true);
                 }
+                // Spinners and the like move at 30 frames a second; a step's
+                // fade in File History, at the display's own pace: every
+                // refresh, with slack for one that fires a little early.
+                let pace = if state.scrub.as_ref().is_some_and(|s| s.fading()) {
+                    state.frame_interval / 2
+                } else {
+                    Duration::from_millis(33)
+                };
                 if self.ivars().animating.get()
-                    && state.last_draw.is_none_or(|at| at.elapsed() >= Duration::from_millis(33))
+                    && state.last_draw.is_none_or(|at| at.elapsed() >= pace)
                 {
                     self.ivars().needs_redraw.set(true);
                 }
@@ -6893,6 +6930,17 @@ fn frame_of(state: &mut State) -> Frame {
             _ => Vec::new(),
         }
     };
+    let scrub_hits = match (chrome.response, scrub::strip_scrub(state).is_some()) {
+        (Some(strip), true) => {
+            let State {
+                scrub, renderer, ..
+            } = &mut *state;
+            scrub.as_ref().map_or_else(Vec::new, |s| {
+                scrub::strip_hits(s, &mut renderer.atlas, strip)
+            })
+        }
+        _ => Vec::new(),
+    };
     let mut frame = Frame::default();
     let State {
         tree,
@@ -7089,6 +7137,9 @@ fn frame_of(state: &mut State) -> Frame {
             frame.push(Hit::IssueOpenGitHub, github);
         }
     }
+    for (hit, rect) in scrub_hits {
+        frame.push(hit, rect);
+    }
     // A review or response owns the strip; conflicts only draw there when
     // neither does.
     if claude
@@ -7214,7 +7265,8 @@ fn chrome_of(state: &State) -> Chrome {
     let response = state.responses.contains_key(&state.docs.active().id())
         || active_review(state).is_some()
         || active_conflicts(state).is_some()
-        || issues::active_issue(state).is_some();
+        || issues::active_issue(state).is_some()
+        || scrub::strip_scrub(state).is_some();
     let mut chrome = Chrome::with_panes(
         state.viewport,
         sidebar,

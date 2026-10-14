@@ -1263,6 +1263,77 @@ pub fn scrollbar_line_at(buffer: &Buffer, viewport: Viewport, line_height: f32, 
     line_at_unit(buffer, unit, &units)
 }
 
+// ---- timeline -------------------------------------------------------------
+// A horizontal track with one slot per version, oldest at the left: the
+// File History strip's. One set of functions for drawing and for hit
+// testing, as with the scrollbar.
+
+/// Points between neighbouring slots below which they get no tick each: a
+/// 1pt tick needs air either side to read as one.
+pub const TIMELINE_TICK_MIN: f32 = 3.0;
+/// Air at each end of the track, so the thumb on the first or the last
+/// slot is drawn whole inside it.
+pub const TIMELINE_INSET: f32 = 8.0;
+
+/// Where the slots are spread: the track less its insets, as its left
+/// edge and its length.
+fn timeline_run(track: Viewport) -> (f32, f32) {
+    (
+        track.x + TIMELINE_INSET,
+        (track.width - 2.0 * TIMELINE_INSET).max(0.0),
+    )
+}
+
+/// Where slot `index` of `slots` is on `track`: the first at the left end
+/// of the run, the last at the right, one alone in the middle.
+pub fn timeline_x(track: Viewport, slots: usize, index: usize) -> f32 {
+    let (x0, run) = timeline_run(track);
+    if slots < 2 {
+        return x0 + run * 0.5;
+    }
+    x0 + run * index.min(slots - 1) as f32 / (slots - 1) as f32
+}
+
+/// The slot nearest `x`, the ends past the run included: the inverse of
+/// [`timeline_x`].
+pub fn timeline_slot_at(track: Viewport, slots: usize, x: f32) -> usize {
+    let (x0, run) = timeline_run(track);
+    if slots < 2 || run <= 0.0 {
+        return 0;
+    }
+    let at = ((x - x0) / run).clamp(0.0, 1.0);
+    (at * (slots - 1) as f32).round() as usize
+}
+
+/// Whether `slots` are too close on `track` for a tick each: then the
+/// track is drawn as one band, with the thumb alone on it.
+pub fn timeline_dense(track: Viewport, slots: usize) -> bool {
+    let (_, run) = timeline_run(track);
+    slots > 1 && run / ((slots - 1) as f32) < TIMELINE_TICK_MIN
+}
+
+/// The part of `track` that is slot `index`'s: halfway to each neighbour,
+/// and out to the track's ends for the first and the last.
+pub fn timeline_column(track: Viewport, slots: usize, index: usize) -> Viewport {
+    let index = index.min(slots.saturating_sub(1));
+    let at = timeline_x(track, slots, index);
+    let left = if index == 0 {
+        track.x
+    } else {
+        (timeline_x(track, slots, index - 1) + at) * 0.5
+    };
+    let right = if index + 1 >= slots {
+        track.x + track.width
+    } else {
+        (at + timeline_x(track, slots, index + 1)) * 0.5
+    };
+    Viewport {
+        x: left,
+        width: (right - left).max(0.0),
+        ..track
+    }
+}
+
 /// Results the Cmd-P palette lists; more than fit, so the list scrolls.
 pub const PALETTE_RESULTS: usize = 100;
 pub const PALETTE_HEADER: f32 = 72.0;
@@ -2929,6 +3000,12 @@ pub enum Hit {
     /// Start Task and Open on GitHub above an issue's tab.
     IssueStartTask,
     IssueOpenGitHub,
+    /// Above a version from a file's history: Older, Newer, the close
+    /// button, and the timeline of the versions.
+    ScrubOlder,
+    ScrubNewer,
+    ScrubClose,
+    ScrubTrack,
     /// Above a document with merge conflicts: the inline or side-by-side
     /// switch (`true` for side by side), Previous and Next (`true`), and
     /// Mark Resolved.
@@ -2998,6 +3075,10 @@ impl Hit {
             Hit::ReviewReject => "review.reject".into(),
             Hit::IssueStartTask => "issue.start".into(),
             Hit::IssueOpenGitHub => "issue.github".into(),
+            Hit::ScrubOlder => "scrub.older".into(),
+            Hit::ScrubNewer => "scrub.newer".into(),
+            Hit::ScrubClose => "scrub.close".into(),
+            Hit::ScrubTrack => "scrub.track".into(),
             Hit::ConflictMode(side) => if *side {
                 "conflict.side"
             } else {

@@ -1397,6 +1397,118 @@ mod tests {
     }
 
     #[test]
+    fn line_tints_wash_the_rows_of_their_lines() {
+        let atlas = atlas();
+        let m = atlas.metrics;
+        let mut buffer = Buffer::from_text(&"line\n".repeat(40));
+        buffer.scroll_line = 2;
+        let text = Viewport {
+            x: 30.0,
+            y: 50.0,
+            width: 400.0,
+            height: m.line_height * 6.5,
+        };
+        let rows = screen_rows(&buffer, text, m.line_height);
+        let (added, changed) = ([0.0, 1.0, 0.0, 0.1], [1.0, 0.5, 0.0, 0.1]);
+        // Lines 0..3 start above the view: only 2 is on screen. 5 and 6
+        // are changed; 8, the half row at the bottom, is cut to the view.
+        let out = line_tints(
+            &rows,
+            &atlas,
+            text,
+            &[(0..3, added), (5..7, changed), (8..9, added)],
+        );
+        let lh = m.line_height;
+        let expected = [
+            (text.y, lh, added),
+            (text.y + 3.0 * lh, lh, changed),
+            (text.y + 4.0 * lh, lh, changed),
+            (text.y + 6.0 * lh, 0.5 * lh, added),
+        ];
+        assert_eq!(out.len(), expected.len());
+        for (quad, (y, height, colour)) in out.iter().zip(expected) {
+            assert!((quad.pos[1] - y).abs() < 1e-3, "{:?} at {y}", quad.pos);
+            assert!((quad.size[1] - height).abs() < 1e-3, "{:?}", quad.size);
+            assert_eq!(quad.color, colour);
+        }
+        assert!(
+            out.iter()
+                .all(|q| q.pos[0] == text.x && q.size[0] == text.width)
+        );
+        assert!(line_tints(&rows, &atlas, text, &[]).is_empty());
+    }
+
+    #[test]
+    fn a_ghost_sits_at_its_boundary_and_says_how_many_more() {
+        let mut atlas = atlas();
+        let m = atlas.metrics;
+        let theme = Theme::default();
+        let buffer = Buffer::from_text("a\nb\nc\n");
+        let text = Viewport::new(600.0, 400.0);
+        let rows = screen_rows(&buffer, text, m.line_height);
+        let ghost = Ghost {
+            at: 1,
+            lines: vec!["gone".into(), "too".into()],
+            more: 4,
+        };
+        let mut out = Vec::new();
+        push_ghost(
+            &mut out, &mut atlas, &buffer, text, &rows, &ghost, 1.0, &theme,
+        );
+        let band = theme.diff_removed_band;
+        let bands: Vec<_> = out.iter().filter(|q| q.color == band).collect();
+        assert_eq!(bands.len(), 1);
+        // From the top of line 1, over the two lines and the "more" row,
+        // the gutter left alone.
+        assert_eq!(bands[0].pos[1], m.line_height);
+        assert_eq!(bands[0].size[1], 3.0 * m.line_height);
+        assert!(bands[0].pos[0] > gutter_width(&buffer, &atlas) - m.advance);
+        let glyphs = |out: &[GlyphInstance], ink| {
+            out.iter()
+                .filter(|q| q.color == ink && q.size[0] > 2.0)
+                .count()
+        };
+        assert_eq!(glyphs(&out, theme.diff_removed), "gonetoo".len());
+        assert!(out.iter().any(|q| q.color == theme.status_text));
+        // Fading, the lines go first under a whole cover, then the cover
+        // goes off the text it hides: never two texts half shown at once.
+        let at = |atlas: &mut Atlas, alpha| {
+            let mut out = Vec::new();
+            push_ghost(&mut out, atlas, &buffer, text, &rows, &ghost, alpha, &theme);
+            out
+        };
+        let early = at(&mut atlas, 0.625);
+        assert!(early.iter().any(|q| q.color == theme.diff_removed_band));
+        assert_eq!(
+            glyphs(&early, faded(theme.diff_removed, 0.5)),
+            "gonetoo".len()
+        );
+        let late = at(&mut atlas, 0.125);
+        assert!(
+            late.iter()
+                .any(|q| q.color == faded(theme.diff_removed_band, 0.5))
+        );
+        assert_eq!(late.len(), 3, "the cover alone, no lines");
+        // Past the last line: under its row. Off screen: nothing.
+        let mut end = Vec::new();
+        let last = Ghost {
+            at: 4,
+            ..ghost.clone()
+        };
+        push_ghost(
+            &mut end, &mut atlas, &buffer, text, &rows, &last, 1.0, &theme,
+        );
+        let rows_drawn = rows.len() as f32;
+        assert!(end.iter().any(|q| q.pos[1] == rows_drawn * m.line_height));
+        let mut none = Vec::new();
+        let far = Ghost { at: 99, ..ghost };
+        push_ghost(
+            &mut none, &mut atlas, &buffer, text, &rows, &far, 1.0, &theme,
+        );
+        assert!(none.is_empty());
+    }
+
+    #[test]
     fn markdown_hides_syntax_off_the_caret_line() {
         let atlas = atlas();
         let text = "x\n**bold** end\n";
@@ -1679,6 +1791,56 @@ mod tests {
         let (shown, _, _) = scroll_extent(&folded);
         assert_eq!(line_at_unit(&folded, 1, &[]), 20, "the line after the fold");
         assert!(shown < 41);
+    }
+
+    #[test]
+    fn a_timeline_maps_slots_to_points_and_back() {
+        let track = Viewport {
+            x: 100.0,
+            y: 40.0,
+            width: 216.0,
+            height: 28.0,
+        };
+        // Six slots on a 200pt run: 40pt apart, from 108 to 308.
+        assert_eq!(timeline_x(track, 6, 0), 108.0);
+        assert_eq!(timeline_x(track, 6, 5), 308.0);
+        assert_eq!(timeline_x(track, 6, 9), 308.0, "past the end: the last");
+        for slot in 0..6 {
+            assert_eq!(timeline_slot_at(track, 6, timeline_x(track, 6, slot)), slot);
+        }
+        // Nearest, and the ends past the run clamp.
+        assert_eq!(timeline_slot_at(track, 6, 127.0), 0);
+        assert_eq!(timeline_slot_at(track, 6, 129.0), 1);
+        assert_eq!(timeline_slot_at(track, 6, track.x), 0);
+        assert_eq!(timeline_slot_at(track, 6, -50.0), 0);
+        assert_eq!(timeline_slot_at(track, 6, track.x + track.width), 5);
+        assert_eq!(timeline_slot_at(track, 6, 9000.0), 5);
+        // A slot's column reaches halfway to each neighbour, the ends to
+        // the track's edges, and the columns tile the track.
+        let first = timeline_column(track, 6, 0);
+        assert_eq!((first.x, first.width), (100.0, 28.0));
+        let middle = timeline_column(track, 6, 2);
+        assert_eq!((middle.x, middle.width), (168.0, 40.0));
+        let last = timeline_column(track, 6, 5);
+        assert_eq!(last.x + last.width, track.x + track.width);
+        let covered: f32 = (0..6).map(|s| timeline_column(track, 6, s).width).sum();
+        assert_eq!(covered, track.width);
+        // A tick each while they are at least 3pt apart; a band past that.
+        assert!(!timeline_dense(track, 6));
+        assert!(!timeline_dense(track, 67), "200 / 66 is just over 3");
+        assert!(timeline_dense(track, 68));
+        assert!(timeline_dense(track, 1001));
+        let x = timeline_x(track, 1001, 500);
+        assert_eq!(timeline_slot_at(track, 1001, x), 500);
+        // One slot, or no room: the middle, and slot 0.
+        assert_eq!(timeline_x(track, 1, 0), 208.0);
+        assert!(!timeline_dense(track, 1));
+        let narrow = Viewport {
+            width: 10.0,
+            ..track
+        };
+        assert_eq!(timeline_slot_at(narrow, 6, 105.0), 0);
+        assert!(timeline_dense(narrow, 6));
     }
 
     #[test]

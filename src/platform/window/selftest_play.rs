@@ -175,6 +175,47 @@ impl EditorView {
                 };
                 send(NSEventType::LeftMouseUp, x + dx, y + dy, 1);
             }
+            Step::At {
+                mouse,
+                name,
+                fx,
+                fy,
+            } => {
+                let target = {
+                    let Some(mut state) = self.state_mut() else {
+                        return;
+                    };
+                    region_named(&mut state, name)
+                };
+                let Some(rect) = target else {
+                    eprintln!("selftest: no region named {name} in this frame");
+                    return;
+                };
+                // Just inside: a rectangle holds its left edge, not its right.
+                let inside = |start: f32, size: f32, f: f64| {
+                    let at = f64::from(start) + f64::from(size) * f.clamp(0.0, 1.0);
+                    at.min(f64::from(start + size) - 0.5).max(f64::from(start))
+                };
+                let (x, y) = (
+                    inside(rect.x, rect.width, *fx),
+                    inside(rect.y, rect.height, *fy),
+                );
+                use crate::platform::selftest::Mouse;
+                match mouse {
+                    Mouse::Click => {
+                        send(NSEventType::LeftMouseDown, x, y, 1);
+                        send(NSEventType::LeftMouseUp, x, y, 1);
+                    }
+                    Mouse::Down => {
+                        if let Some(mut state) = self.state_mut() {
+                            state.selftest_pointer = (x, y);
+                        }
+                        send(NSEventType::LeftMouseDown, x, y, 1);
+                    }
+                    Mouse::Drag => send(NSEventType::LeftMouseDragged, x, y, 1),
+                    Mouse::Up => send(NSEventType::LeftMouseUp, x, y, 1),
+                }
+            }
             Step::Down { x, y, count } => {
                 if let Some(mut state) = self.state_mut() {
                     state.selftest_pointer = (*x, *y);
@@ -299,6 +340,12 @@ impl EditorView {
                 if let Some(mut state) = self.state_mut() {
                     state.git.poll();
                 }
+            }
+            Step::Fade(ms) => {
+                if let Some(mut state) = self.state_mut() {
+                    super::scrub::freeze_fade(&mut state, *ms);
+                }
+                self.request_redraw();
             }
             Step::Frame(path) => {
                 // What is on screen, drawn again through the same renderer
@@ -520,7 +567,7 @@ impl EditorView {
                 };
                 let report = format!(
                     // First: the report ends with the document's text.
-                    "message: {}\npreview: {}\nmd: {md}\nactivity: {}\npointer_targets: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nrepo: {}\ngit_note: {}\nhome: {}\nmcp: {}\nmcp_page: {}\nsettings_page: {}\nreview_page: {}\nterminals: {}\nagents: {}\ninspector: {}\nteams: {}\nagents_tree: {}\nagents_activity: {}\nagents_prs: {}\nconflicts: {}\ngit_conflicts: {}\nblame: {}\nfind_results: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\npeek: {}\ngutter: {}\nissue_tab: {}\nscrub: {}\n{report}",
+                    "message: {}\npreview: {}\nmd: {md}\nactivity: {}\npointer_targets: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nrepo: {}\ngit_note: {}\nhome: {}\nmcp: {}\nmcp_page: {}\nsettings_page: {}\nreview_page: {}\nterminals: {}\nagents: {}\ninspector: {}\nteams: {}\nagents_tree: {}\nagents_activity: {}\nagents_prs: {}\nconflicts: {}\ngit_conflicts: {}\nblame: {}\nfind_results: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\npeek: {}\ngutter: {}\nissue_tab: {}\nscrub: {}\nscrub_strip: {}\nscrub_fade: {}\n{report}",
                     state.message.as_ref().map_or("", |(text, _)| text.as_str()),
                     state.html_preview.as_ref().map_or("closed".to_string(), |p| format!(
                         "open ext={} view={} probe={}",
@@ -742,6 +789,8 @@ impl EditorView {
                         t.issue.url
                     )),
                     super::scrub::dump(&state),
+                    super::scrub::dump_strip(&state),
+                    super::scrub::dump_fade(&state),
                 );
                 if let Err(e) = std::fs::write(path, report) {
                     eprintln!("crc: selftest could not write {path}: {e}");
