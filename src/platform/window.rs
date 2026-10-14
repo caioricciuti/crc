@@ -1116,6 +1116,18 @@ fn note_documents_edited(state: &mut State, ids: impl IntoIterator<Item = u64>) 
     }
 }
 
+/// After the user edited the active document, by key or by menu: the
+/// server and the gutter catch up once typing pauses, each edit pushing the
+/// pause back.
+fn note_typed(state: &mut State) {
+    let buffer = state.docs.active();
+    if buffer.path.is_some() {
+        let id = buffer.id();
+        state.lsp.dirty.insert(id, Instant::now());
+        state.gutter.dirty.insert(id, Instant::now());
+    }
+}
+
 /// An extension thread: where jobs go, and where answers come back.
 type ExtWorker = (
     mpsc::Sender<crate::ext::run::Job>,

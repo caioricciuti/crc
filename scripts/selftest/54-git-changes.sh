@@ -158,6 +158,53 @@ expect "$T/peek-branch.out" message "change 1 of 1"
 [ "$(cat "$T/peekproj/notes.txt")" = "$(printf 'one\nTWO\nthree\nfour\nsix\nseven\neight\nnine')" ] \
     || failed "peek: staging wrote notes.txt: $(cat "$T/peekproj/notes.txt")"
 
+# ---- typing keeps the marks current -------------------------------------------
+# Real key events, not menu actions: typing a character, Return and
+# Backspace edit through the key path, which used to skip the gutter, so
+# the marks stayed as they were before the edit. Each dump waits past the
+# gutter's pause. Last, a cut line pasted back clears its Removed mark.
+mkdir -p "$T/typedproj"
+git init -q -b main "$T/typedproj"
+printf 'one\ntwo\nthree\nfour\n' > "$T/typedproj/notes.txt"
+git -C "$T/typedproj" add notes.txt
+testgit "$T/typedproj" commit -q -m notes
+cat > "$T/typed.script" <<SCRIPT
+wait 800
+wait 300
+dump $T/typed-clean.out
+key 125
+text x
+wait 500
+dump $T/typed-char.out
+key 36
+wait 500
+dump $T/typed-return.out
+key 51
+key 51
+wait 500
+dump $T/typed-back.out
+key 125 shift
+key 7 cmd x
+wait 500
+dump $T/typed-cut.out
+key 9 cmd v
+wait 500
+dump $T/typed-paste.out
+quit
+SCRIPT
+CRC_SELFTEST="$T/typed.script" "$BIN" "$T/typedproj/notes.txt" 2> "$T/typed.err"
+expect "$T/typed-clean.out" gutter " inactive"
+expect_line "$T/typed-char.out" 2 "xtwo"
+expect "$T/typed-char.out" gutter "2M"
+expect_line "$T/typed-return.out" 2 "x"
+expect "$T/typed-return.out" gutter "2A"
+expect_line "$T/typed-back.out" 2 "two"
+expect "$T/typed-back.out" gutter " inactive"
+expect_line "$T/typed-cut.out" 2 "three"
+expect "$T/typed-cut.out" gutter "2R"
+expect_line "$T/typed-paste.out" 2 "two"
+expect "$T/typed-paste.out" gutter " inactive"
+
 # A file outside any repository says why there is nothing to step to.
 mkdir -p "$T/norepo"
 printf 'loose\n' > "$T/norepo/loose.txt"

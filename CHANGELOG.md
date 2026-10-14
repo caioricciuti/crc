@@ -44,6 +44,9 @@ One entry per tag, written for people who use the editor.
 - Agents: closing or exiting a terminal shows the next terminal of the
   same workspace, never another workspace's. A workspace whose last
   terminal ends stays selected, saying so, instead of being forgotten.
+- The gutter's change marks follow typing again: text typed, Return,
+  Backspace and the other key edits never asked for a new diff, so the
+  marks stayed as they were until a menu edit or a save.
 - Gutter marks no longer blink out after a stage, commit or branch
   switch, and the change commands stay available while Git reads the
   file again.

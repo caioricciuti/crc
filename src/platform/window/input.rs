@@ -1013,11 +1013,7 @@ impl EditorView {
         let Some(mut state) = self.state_mut() else {
             return;
         };
-        let id = state.docs.active().id();
-        if state.docs.active().path.is_some() {
-            state.lsp.dirty.insert(id, Instant::now());
-            state.gutter.dirty.insert(id, Instant::now());
-        }
+        note_typed(&mut state);
         follow_completion(&mut state);
         state.docs.active_mut().scroll_to_cursor(rows, cols);
         drop(state);

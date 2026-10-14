@@ -179,6 +179,23 @@ impl EditorView {
                 let _ = tx.send((id, epoch, super::changes::read_head(&path)));
             });
         }
+        // A shown file whose text moved on from its marks by a path that
+        // did not say so waits out the pause like any edit.
+        let moved = std::iter::once(state.docs.active())
+            .chain(state.panes.iter().map(|p| p.docs.active()))
+            .filter(|b| {
+                !state.gutter.dirty.contains_key(&b.id())
+                    && !state.gutter.diffing.contains(&b.id())
+                    && state.gutter.docs.get(&b.id()).is_some_and(|entry| {
+                        entry.head.is_some()
+                            && entry.text.as_ref().is_some_and(|t| !t.same_as(&b.rope))
+                    })
+            })
+            .map(|b| b.id())
+            .collect::<Vec<_>>();
+        for id in moved {
+            state.gutter.dirty.insert(id, Instant::now());
+        }
         // Files edited a moment ago.
         let due = due(&state.gutter.dirty, PAUSE);
         if due.is_empty() {
@@ -448,7 +465,8 @@ impl EditorView {
     }
 
     /// After any key reached the document: remember the edit for the
-    /// server, and keep the completion list honest about the caret.
+    /// server and the gutter, and keep the completion list honest about
+    /// the caret.
     pub(super) fn lsp_after_key(&self, edited: bool) {
         let Some(mut state) = self.state_mut() else {
             return;
@@ -462,8 +480,8 @@ impl EditorView {
                 state.lsp.signature = None;
             }
         }
-        if edited && state.docs.active().path.is_some() {
-            state.lsp.dirty.insert(id, Instant::now());
+        if edited {
+            note_typed(&mut state);
         }
         let still = follow_completion(&mut state);
         drop(state);
