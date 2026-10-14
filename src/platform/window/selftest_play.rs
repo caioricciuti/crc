@@ -490,7 +490,7 @@ impl EditorView {
                         c.reviews.values().filter(|r| r.decided.is_none()).count()
                     )),
                     format_args!(
-                        "open={} focus={} height={} tabs={} selection={:?} screen={:?}",
+                        "open={} focus={} height={} tabs={} selection={:?} screen={:?} scrollback={} back={} find={}",
                         state.terminal.open,
                         state.terminal.focus,
                         state.terminal.height,
@@ -519,7 +519,28 @@ impl EditorView {
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
                                 .screen_text())
-                            .unwrap_or_default()
+                            .unwrap_or_default(),
+                        state.terminal.active_tab().map_or(0, |t| t
+                            .session
+                            .term
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .scrollback_len()),
+                        state.terminal.back,
+                        state.find.as_ref().map_or("none".to_string(), |bar| {
+                            let query = bar.query.rope.to_string();
+                            match &bar.terminal {
+                                Some(find) => {
+                                    let (at, total) = find.count();
+                                    let at = if total == 0 { 0 } else { at + 1 };
+                                    format!(
+                                        "{query} {at} of {total} target=terminal keys={}",
+                                        bar.has_keys
+                                    )
+                                }
+                                None => format!("{query} target=document keys={}", bar.has_keys),
+                            }
+                        }),
                     ),
                     selftest::report(
                         state.docs.active(),

@@ -47,11 +47,12 @@ impl EditorView {
                 return true;
             }
             TAB => {
-                // Tab crosses between Find and Replace rather than inserting.
+                // Tab crosses between Find and Replace rather than inserting;
+                // over the terminal there is no Replace.
                 let Some(mut state) = self.state_mut() else {
                     return false;
                 };
-                if let Some(find) = &mut state.find {
+                if let Some(find) = state.find.as_mut().filter(|f| f.terminal.is_none()) {
                     find.replacing = !find.replacing;
                 }
                 drop(state);
@@ -220,7 +221,8 @@ impl EditorView {
     ) -> Option<(String, Vec<search::Match>)> {
         let mut state = self.state_mut()?;
         let state = &mut *state;
-        let bar = state.find.as_ref()?;
+        // Searching the terminal: nothing in the document to act on.
+        let bar = state.find.as_ref().filter(|bar| bar.terminal.is_none())?;
         let needle = bar.query.rope.to_string();
         if needle.is_empty() {
             return None;
@@ -240,6 +242,11 @@ impl EditorView {
     }
 
     pub(super) fn refresh_find(&self) {
+        if self.searching_terminal() {
+            self.terminal_find_sync(true);
+            self.terminal_find_reveal();
+            return;
+        }
         {
             let Some(mut state) = self.state_mut() else {
                 return;
@@ -283,8 +290,36 @@ impl EditorView {
         }
     }
 
-    /// Opens the find bar, seeding it from the selection when there is one.
+    /// Whether the find bar searches the terminal.
+    pub(super) fn searching_terminal(&self) -> bool {
+        self.state().is_some_and(|state| {
+            state
+                .find
+                .as_ref()
+                .is_some_and(|bar| bar.terminal.is_some())
+        })
+    }
+
+    /// Cmd-F: the find bar over the terminal while it has the keyboard (or
+    /// its bar has them back), the document's otherwise.
     pub(super) fn open_find(&self) {
+        let terminal = self.terminal_has_keys()
+            || self.state().is_some_and(|state| {
+                state.terminal.has_keys()
+                    && state
+                        .find
+                        .as_ref()
+                        .is_some_and(|bar| bar.has_keys && bar.terminal.is_some())
+            });
+        if terminal {
+            self.open_terminal_find();
+        } else {
+            self.open_document_find();
+        }
+    }
+
+    /// Opens the find bar, seeding it from the selection when there is one.
+    pub(super) fn open_document_find(&self) {
         let seed = {
             let Some(state) = self.state() else {
                 return;
@@ -315,6 +350,8 @@ impl EditorView {
             }
             bar.has_keys = true;
             bar.replacing = false;
+            // Off the terminal, onto the document.
+            bar.terminal = None;
             drop(state);
             self.refresh_find();
             self.request_redraw();
@@ -333,6 +370,7 @@ impl EditorView {
                 selected: 0,
                 result_scroll: 0,
                 searching: false,
+                terminal: None,
             });
         }
         self.request_redraw();
@@ -347,7 +385,10 @@ impl EditorView {
             cancel.store(true, Ordering::Relaxed);
         }
         state.project_search.rx = None;
-        state.find = None;
+        // The terminal it searched has the keyboard again.
+        if state.find.take().is_some_and(|bar| bar.terminal.is_some()) && state.terminal.open {
+            state.terminal.focus = true;
+        }
         drop(state);
         self.request_redraw();
         self.pump();
@@ -483,7 +524,9 @@ impl EditorView {
         // them: `right - 180.0` here and `right - 180.0` there, option slots
         // 66pt wide in the handler and 62pt wide on screen, so a click beside
         // a chip still toggled it.
-        let g = layout::FindGeometry::new(rect);
+        let terminal = self.searching_terminal();
+        // The terminal's bar: Aa, Word and .*, one row, no Replace.
+        let g = layout::FindGeometry::with_chips(rect, if terminal { 3 } else { 4 });
         let project = self
             .ivars()
             .state
@@ -537,6 +580,8 @@ impl EditorView {
             } else {
                 self.find_step(forward);
             }
+        } else if terminal && !g.find_field.contains(x, y) {
+            // Nothing else of the bar is over the terminal.
         } else if g.replace_one.contains(x, y) {
             if project {
                 self.search_project();
@@ -802,6 +847,10 @@ impl EditorView {
 
     /// Moves the cursor to the next or previous match and selects it.
     pub(super) fn find_step(&self, forward: bool) {
+        if self.searching_terminal() {
+            self.terminal_find_step(forward);
+            return;
+        }
         let (from, selected) = {
             let Some(state) = self.state() else {
                 return;

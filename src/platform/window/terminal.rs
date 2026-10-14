@@ -668,8 +668,217 @@ impl EditorView {
         self.pump();
     }
 
+    /// Cmd-F with the terminal's keys: the find bar over its screen,
+    /// seeded from a one-line selection, on the newest match.
+    pub(super) fn open_terminal_find(&self) {
+        let seed = self
+            .terminal_selected_text(false)
+            .filter(|t| !t.contains('\n') && t.len() < 200);
+        {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            close_fields(&mut state);
+            if let Some(cancel) = state.project_search.cancel.take() {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            state.project_search.rx = None;
+            // A document's bar moves over: its options come with it.
+            let bar = state.find.get_or_insert_with(|| FindBar {
+                query: Buffer::new(),
+                replacement: Buffer::new(),
+                replacing: false,
+                has_keys: true,
+                options: SearchOptions::default(),
+                project: false,
+                results: Vec::new(),
+                selected: 0,
+                result_scroll: 0,
+                searching: false,
+                terminal: None,
+            });
+            if let Some(seed) = &seed {
+                bar.query = Buffer::new();
+                bar.query.insert(seed);
+            }
+            bar.query.select_all();
+            bar.has_keys = true;
+            bar.replacing = false;
+            bar.project = false;
+            bar.searching = false;
+            bar.reset_results();
+            bar.terminal.get_or_insert_with(Default::default);
+        }
+        self.terminal_find_sync(true);
+        self.terminal_find_reveal();
+        self.request_redraw();
+        self.pump();
+    }
+
+    /// Searches the active session again when its output, the query, the
+    /// options or the session changed since the last search. Output alone
+    /// is searched again at most every so often (`forced` or not), so a
+    /// busy program is not searched on every frame; until then a frame is
+    /// asked for to look again. `forced` (the query or a step) also says
+    /// an invalid pattern in the status line.
+    pub(super) fn terminal_find_sync(&self, forced: bool) {
+        const AGAIN_AFTER: Duration = Duration::from_millis(100);
+        let (made_for, hay) = {
+            let Some(state) = self.state() else {
+                return;
+            };
+            let Some(bar) = state.find.as_ref() else {
+                return;
+            };
+            let Some(find) = bar.terminal.as_ref() else {
+                return;
+            };
+            let Some(tab) = state.terminal.active_tab() else {
+                return;
+            };
+            // Copied out under the lock; searched after it is let go.
+            let term = tab.session.term.lock().unwrap_or_else(|e| e.into_inner());
+            let key = (
+                Arc::as_ptr(&tab.session.term) as usize,
+                term.generation,
+                bar.query.rope.to_string(),
+                bar.options,
+            );
+            if let Some(made) = &find.made_for {
+                if *made == key {
+                    return;
+                }
+                let output_only = made.0 == key.0 && made.2 == key.2 && made.3 == key.3;
+                if !forced
+                    && output_only
+                    && find.searched.is_some_and(|at| at.elapsed() < AGAIN_AFTER)
+                {
+                    drop(term);
+                    drop(state);
+                    self.request_redraw();
+                    self.resume_display_link();
+                    return;
+                }
+            }
+            (key, term.haystack())
+        };
+        let found = match made_for.2.as_str() {
+            "" => Ok(Vec::new()),
+            query => crate::platform::terminal::find_in(&hay, query, made_for.3),
+        };
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
+        let State { find, message, .. } = &mut *state;
+        let Some(find) = find.as_mut().and_then(|bar| bar.terminal.as_mut()) else {
+            return;
+        };
+        // Another session: where the last one's match was means nothing.
+        if find.made_for.as_ref().is_none_or(|m| m.0 != made_for.0) {
+            find.anchor = None;
+        }
+        find.made_for = Some(made_for);
+        find.searched = Some(Instant::now());
+        match found {
+            Ok(matches) => find.take(matches),
+            Err(error) => {
+                find.matches.clear();
+                find.current = None;
+                if forced {
+                    *message = Some((format!("invalid regex: {error}"), Instant::now()));
+                }
+                find.error = Some(error);
+            }
+        }
+        // Found after the frame was drawn: another shows it.
+        if !forced {
+            drop(state);
+            self.request_redraw();
+            self.resume_display_link();
+        }
+    }
+
+    /// Scrolls the active session so its current match shows below the bar.
+    pub(super) fn terminal_find_reveal(&self) {
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
+        let covered = crate::platform::terminal::find_bar_rows(&state.renderer.atlas);
+        let State { find, terminal, .. } = &mut *state;
+        let Some(line) = find
+            .as_ref()
+            .and_then(|bar| bar.terminal.as_ref())
+            .and_then(|find| find.current_hit())
+            .map(|hit| hit.start.0)
+        else {
+            return;
+        };
+        let Some(tab) = terminal.active_tab() else {
+            return;
+        };
+        let term = tab.session.term.lock().unwrap_or_else(|e| e.into_inner());
+        let back = crate::platform::terminal::back_showing(
+            line,
+            term.view_line(0, 0),
+            terminal.back,
+            term.rows(),
+            covered,
+            term.scrollback_len(),
+        );
+        drop(term);
+        terminal.back = back;
+    }
+
+    /// Enter, Cmd-G and the bar's arrows over the terminal: the next or
+    /// previous match, around the ends, scrolled into view.
+    pub(super) fn terminal_find_step(&self, forward: bool) {
+        self.terminal_find_sync(true);
+        {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            let State { find, message, .. } = &mut *state;
+            let Some(bar) = find.as_mut() else {
+                return;
+            };
+            let query = bar.query.rope.to_string();
+            let Some(find) = bar.terminal.as_mut() else {
+                return;
+            };
+            find.step(forward);
+            if find.matches.is_empty() && find.error.is_none() && !query.is_empty() {
+                *message = Some((format!("no match for {query:?}"), Instant::now()));
+            }
+        }
+        self.terminal_find_reveal();
+        self.request_redraw();
+        self.pump();
+    }
+
+    /// After a frame: the terminal's find bar goes with the panel, and
+    /// follows the output while it is open.
+    fn terminal_find_after_frame(&self) {
+        let gone = self.state().is_some_and(|state| {
+            state
+                .find
+                .as_ref()
+                .is_some_and(|bar| bar.terminal.is_some())
+                && !(state.terminal.open && !state.terminal.tabs.is_empty())
+        });
+        if gone {
+            if let Some(mut state) = self.state_mut() {
+                state.find = None;
+            }
+            self.request_redraw();
+            self.resume_display_link();
+            return;
+        }
+        self.terminal_find_sync(false);
+    }
+
     /// Keeps every session's grid the size of the panel.
     pub(super) fn terminal_after_frame(&self) {
+        self.terminal_find_after_frame();
         let Some(state) = self.state() else {
             return;
         };
@@ -744,11 +953,28 @@ impl EditorView {
         self.after_terminal_layout();
     }
 
-    /// Clears the active session's screen the way Control-L does in a
-    /// shell: the program redraws its prompt at the top.
+    /// Cmd-K: the active session's history and screen go, its cursor's
+    /// line moved to the top, as in Terminal. Done here, not by the
+    /// program: nothing is typed into it, so a half-typed command or a
+    /// running one is left alone.
     pub(super) fn clear_terminal(&self) {
-        self.terminal_write(b"\x0c");
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
+        let panel = &mut state.terminal;
+        panel.back = 0;
+        panel.selection = None;
+        panel.selecting = false;
+        if let Some(tab) = panel.active_tab() {
+            tab.session
+                .term
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear_all();
+        }
+        drop(state);
         self.request_redraw();
+        self.pump();
     }
 
     pub(super) fn terminal_write(&self, bytes: &[u8]) {
@@ -1111,6 +1337,19 @@ impl EditorView {
         let code = event.keyCode();
         if flags.contains(NSEventModifierFlags::Command) {
             // The Mac line-editing shortcuts, as the shell's own keys.
+            // The menu's shortcuts, for when the key never reached the menu.
+            let shift = flags.contains(NSEventModifierFlags::Shift);
+            match code {
+                key::K if !shift => {
+                    self.clear_terminal();
+                    return true;
+                }
+                key::F if !shift => {
+                    self.open_find();
+                    return true;
+                }
+                _ => {}
+            }
             let bytes: &[u8] = match code {
                 key::DELETE => b"\x15",
                 key::LEFT => b"\x01",
@@ -1148,6 +1387,15 @@ impl EditorView {
         }
         true
     }
+}
+
+/// The find bar over the terminal, while it searches the terminal and the
+/// panel shows a session.
+pub(super) fn find_rect(state: &State, chrome: &Chrome) -> Option<Viewport> {
+    state.find.as_ref()?.terminal.as_ref()?;
+    let rect = chrome.terminal?;
+    (!state.terminal.tabs.is_empty())
+        .then(|| crate::platform::terminal::find_bar_rect(&state.terminal, rect))
 }
 
 /// What a look at a tab found: its newest notification, whether it

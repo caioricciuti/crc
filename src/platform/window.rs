@@ -184,6 +184,7 @@ mod key {
     pub const F5: u16 = 96;
     pub const F12: u16 = 111;
     pub const F: u16 = 3;
+    pub const K: u16 = 40;
     pub const O: u16 = 31;
     pub const Y: u16 = 16;
 }
@@ -1212,7 +1213,10 @@ fn find_matches<'a>(
     bar: &FindBar,
     buffer: &Buffer,
 ) -> Option<&'a [search::Match]> {
-    if bar.query.rope.len_bytes() == 0 || buffer.rope.len_bytes() > 2 * 1024 * 1024 {
+    if bar.query.rope.len_bytes() == 0
+        || buffer.rope.len_bytes() > 2 * 1024 * 1024
+        || bar.terminal.is_some()
+    {
         return None;
     }
     fill_find_cache(cache, bar, buffer).ok()
@@ -1264,6 +1268,10 @@ struct FindBar {
     selected: usize,
     result_scroll: usize,
     searching: bool,
+    /// Searching the terminal with the keyboard rather than the document:
+    /// its matches and the current one. Drawn over the terminal's top
+    /// row, with no replace row and no Project.
+    terminal: Option<crate::platform::terminal::Find>,
 }
 
 impl FindBar {
@@ -1843,6 +1851,13 @@ define_class!(
                     return;
                 }
                 Some(Hit::Terminal) => {
+                    // Its find bar stays open with its matches; typing
+                    // goes to the terminal again.
+                    if let Some(mut state) = self.state_mut()
+                        && let Some(bar) = state.find.as_mut().filter(|b| b.terminal.is_some())
+                    {
+                        bar.has_keys = false;
+                    }
                     self.terminal_press(event, x, y);
                     return;
                 }
@@ -1959,7 +1974,11 @@ define_class!(
                     return;
                 }
                 Some(Hit::Find) => {
-                    if let Some(rect) = chrome.find {
+                    let rect = chrome.find.or_else(|| {
+                        self.state()
+                            .and_then(|state| terminal::find_rect(&state, &chrome))
+                    });
+                    if let Some(rect) = rect {
                         self.find_click(x, y, rect);
                     }
                     return;
@@ -2977,6 +2996,13 @@ define_class!(
                 self.open_find();
                 return;
             }
+            // The terminal's text is not replaced.
+            if self
+                .state()
+                .is_some_and(|state| state.find.as_ref().is_some_and(|bar| bar.terminal.is_some()))
+            {
+                return;
+            }
             if self
                 .state()
                 .is_some_and(|state| state.find.as_ref().is_some_and(|bar| bar.project))
@@ -3295,7 +3321,7 @@ define_class!(
 
         #[unsafe(method(findInProject:))]
         fn action_find_project(&self, _sender: Option<&AnyObject>) {
-            self.open_find();
+            self.open_document_find();
             if let Some(mut state) = self.state_mut()
                 && let Some(bar) = &mut state.find
             {
@@ -4452,7 +4478,8 @@ define_class!(
             } else if action == sel!(closeTabsToRight:) {
                 state.context_tab.is_some_and(|index| index + 1 < state.docs.len())
             } else if action == sel!(clearTerminal:) {
-                !state.terminal.tabs.is_empty()
+                // Cmd-K is the document's elsewhere: only with the keys.
+                terminal
             } else if action == sel!(copyProjectItemPath:) || action == sel!(copyProjectItemRelativePath:) {
                 state.tree.selected.is_some()
             } else if action == sel!(gitAbort:) {
@@ -4788,6 +4815,11 @@ impl EditorView {
         // The terminal has its own: copy and paste, never the document's
         // Cut or Find.
         if chrome.terminal.is_some_and(|r| r.contains(x, y)) {
+            // It takes the keyboard, as a press does: its items act on it.
+            if let Some(mut state) = self.state_mut() {
+                state.terminal.focus = true;
+                state.sidebar_keys = false;
+            }
             return Some(terminal_context_menu(mtm));
         }
         let in_tab_bar = chrome.tabs.contains(x, y);
@@ -6882,6 +6914,7 @@ fn draw_other_pane(
 fn frame_of(state: &mut State) -> Frame {
     sync_conflicts(state);
     let chrome = chrome_of(state);
+    let terminal_find = terminal::find_rect(state, &chrome);
     let column = column_of(state);
     let side = column == Column::ConflictColumns;
     let conflict_hits = {
@@ -7152,7 +7185,8 @@ fn frame_of(state: &mut State) -> Frame {
             frame.push(hit, rect);
         }
     }
-    if let Some(find) = chrome.find {
+    // Before the terminal: the terminal's bar is over its screen.
+    if let Some(find) = chrome.find.or(terminal_find) {
         frame.push(Hit::Find, find);
     }
     if let Some(rect) = chrome.terminal {
@@ -7255,13 +7289,18 @@ fn chrome_of(state: &State) -> Chrome {
     });
     // Two rows: find and replace. The option chips used to need a third,
     // spanning the window with four small toggles and nothing else on it.
-    let find_rows = state.find.as_ref().map_or(0, |bar| {
-        2 + if bar.project {
-            bar.results.len().min(FIND_RESULT_ROWS)
-        } else {
-            0
-        }
-    });
+    // Over the terminal, the bar takes no room from the document.
+    let find_rows = state
+        .find
+        .as_ref()
+        .filter(|bar| bar.terminal.is_none())
+        .map_or(0, |bar| {
+            2 + if bar.project {
+                bar.results.len().min(FIND_RESULT_ROWS)
+            } else {
+                0
+            }
+        });
     let response = state.responses.contains_key(&state.docs.active().id())
         || active_review(state).is_some()
         || active_conflicts(state).is_some()
@@ -8171,7 +8210,13 @@ fn terminal_context_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
         cmd,
     ));
     menu.addItem(&NSMenuItem::separatorItem(mtm));
-    menu.addItem(&menu_item(mtm, "Clear", sel!(clearTerminal:)));
+    menu.addItem(&hinted_menu_item(
+        mtm,
+        "Clear",
+        sel!(clearTerminal:),
+        "k",
+        cmd,
+    ));
     menu.addItem(&NSMenuItem::separatorItem(mtm));
     menu.addItem(&menu_item(mtm, "New Terminal", sel!(newTerminal:)));
     menu.addItem(&hinted_menu_item(
@@ -8663,6 +8708,7 @@ fn install_menu(mtm: MainThreadMarker, app: &NSApplication) {
     view_menu.addItem(&terminal);
     view_menu.addItem(&item("New Terminal", sel!(newTerminal:), "", false));
     view_menu.addItem(&item("Toggle Panel", sel!(toggleTerminal:), "j", false));
+    view_menu.addItem(&item("Clear Terminal", sel!(clearTerminal:), "k", false));
     view_item.setSubmenu(Some(&view_menu));
     menubar.addItem(&view_item);
 

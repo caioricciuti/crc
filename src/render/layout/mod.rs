@@ -2068,6 +2068,24 @@ mod find_geometry_tests {
         }
     }
 
+    /// The terminal's bar: three chips against the arrows, as the
+    /// document's four are, and the field taking the fourth's room.
+    #[test]
+    fn fewer_chips_leave_no_gap_and_no_target() {
+        let rect = Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: 700.0,
+            height: FIND_ROW_HEIGHT,
+        };
+        let (four, three) = (FindGeometry::new(rect), FindGeometry::with_chips(rect, 3));
+        assert_eq!(three.options[2].x, four.options[3].x);
+        assert_eq!(three.options[3].width, 0.0);
+        assert!(!three.options[3].contains(three.options[3].x, rect.y + 17.0));
+        assert!(three.find_field.width > four.find_field.width);
+        assert!(three.find_field.x + three.find_field.width < three.options[0].x);
+    }
+
     #[test]
     fn every_control_stays_inside_the_bar() {
         for width in [700.0, 1100.0, 2400.0] {

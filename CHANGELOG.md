@@ -4,6 +4,14 @@ One entry per tag, written for people who use the editor.
 
 ## Unreleased
 
+- Terminal: `Cmd-F` finds text in what a session printed, history and
+  screen, with the same find bar as documents laid over the terminal
+  (case, word and regex options; `Cmd-G` and `Cmd-Shift-G` or Return
+  and Shift-Return step, scrolling the match into view; matches follow
+  new output). `Cmd-K` (View > Clear Terminal, and Clear in its menu)
+  clears the screen and history, keeping the line you are on; it no
+  longer types Ctrl-L into the program, and a full-screen program keeps
+  its screen. Works in Agents mode and in split terminals too.
 - Git > File History (`Cmd-Option-Y`) opens a read-only tab beside the
   file showing it at its newest commit; Left and Right step to older and
   newer versions, Home and End go to the oldest one and to your working

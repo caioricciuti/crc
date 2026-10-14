@@ -46,6 +46,13 @@ pub struct FindGeometry {
 
 impl FindGeometry {
     pub fn new(rect: Viewport) -> Self {
+        Self::with_chips(rect, 4)
+    }
+
+    /// The bar with only the first `chips` option chips: the terminal's
+    /// has no Project. The others are left with no width, so nothing hits
+    /// them, and the field takes their room.
+    pub fn with_chips(rect: Viewport, chips: usize) -> Self {
         const PAD: f32 = 12.0;
         const GAP: f32 = 6.0;
         const CHIP: f32 = 46.0;
@@ -89,17 +96,27 @@ impl FindGeometry {
             control,
         );
         let chips_right = previous.x - PAD;
+        let shown = chips.min(4) as f32;
         let mut options = [close; 4];
         for (index, slot) in options.iter_mut().enumerate() {
-            let x = chips_right - CHIP * (4.0 - index as f32) - GAP * (3.0 - index as f32);
-            *slot = inset(
+            let at = index as f32;
+            *slot = if at < shown {
+                let x = chips_right - CHIP * (shown - at) - GAP * (shown - 1.0 - at);
+                inset(
+                    Viewport {
+                        x,
+                        width: CHIP,
+                        ..row(0.0)
+                    },
+                    control,
+                )
+            } else {
                 Viewport {
-                    x,
-                    width: CHIP,
-                    ..row(0.0)
-                },
-                control,
-            );
+                    x: chips_right,
+                    width: 0.0,
+                    ..inset(row(0.0), control)
+                }
+            };
         }
         let field_width = (options[0].x - PAD - (rect.x + PAD)).max(0.0);
         let find_field = inset(

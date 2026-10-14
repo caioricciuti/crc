@@ -347,6 +347,152 @@ impl Panel {
     }
 }
 
+/// Matches Find keeps in a session; past this the count says so.
+pub const FIND_LIMIT: usize = 10_000;
+
+/// A match in a session: where it starts, and the line and columns
+/// `[from, to)` of each row it covers, several across a wrap.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hit {
+    pub start: (u64, usize),
+    pub spans: Vec<(u64, usize, usize)>,
+}
+
+/// Find in the terminal: the active session's matches and the one the bar
+/// is on. Searched again when the output, the query, the options or the
+/// session change; see [`Find::stale`].
+#[derive(Default)]
+pub struct Find {
+    /// The session (its terminal's address), its generation, the query
+    /// and the options the matches are for.
+    pub made_for: Option<(usize, u64, String, crate::platform::search::Options)>,
+    pub matches: Vec<Hit>,
+    pub current: Option<usize>,
+    /// Where the current match starts, so it stays current while output
+    /// arrives and the list is made again.
+    pub anchor: Option<(u64, usize)>,
+    /// An invalid pattern, in the search's words.
+    pub error: Option<String>,
+    pub searched: Option<std::time::Instant>,
+}
+
+impl Find {
+    /// Takes the matches of a new search. The current one stays on its
+    /// anchor, or moves to the next after it, or the last before it;
+    /// with no anchor it is the last, the newest output.
+    pub fn take(&mut self, matches: Vec<Hit>) {
+        self.matches = matches;
+        self.error = None;
+        self.current = match self.anchor {
+            _ if self.matches.is_empty() => None,
+            None => Some(self.matches.len() - 1),
+            Some(at) => Some(
+                self.matches
+                    .iter()
+                    .position(|m| m.start >= at)
+                    .unwrap_or(self.matches.len() - 1),
+            ),
+        };
+        self.anchor = self.current.map(|i| self.matches[i].start);
+    }
+
+    /// The next or previous match, around the end to the other end.
+    pub fn step(&mut self, forward: bool) {
+        let len = self.matches.len();
+        if len == 0 {
+            return;
+        }
+        let next = match self.current {
+            None if forward => 0,
+            None => len - 1,
+            Some(i) if forward => (i + 1) % len,
+            Some(i) => (i + len - 1) % len,
+        };
+        self.current = Some(next);
+        self.anchor = Some(self.matches[next].start);
+    }
+
+    pub fn current_hit(&self) -> Option<&Hit> {
+        self.matches.get(self.current?)
+    }
+
+    /// "3 of 17" as numbers: the current match's place from 0, and how
+    /// many there are.
+    pub fn count(&self) -> (usize, usize) {
+        (self.current.unwrap_or(0), self.matches.len())
+    }
+}
+
+/// The matches of `query` in a session's text, at most [`FIND_LIMIT`].
+pub fn find_in(
+    hay: &term::Haystack,
+    query: &str,
+    options: crate::platform::search::Options,
+) -> Result<Vec<Hit>, String> {
+    let found = crate::platform::search::find_first(&hay.text, query, "", options, FIND_LIMIT)?;
+    Ok(found
+        .into_iter()
+        .filter_map(|m| {
+            let spans = hay.spans(m.range);
+            let (line, from, _) = *spans.first()?;
+            Some(Hit {
+                start: (line, from),
+                spans,
+            })
+        })
+        .collect())
+}
+
+/// The find bar over the session with the keyboard, in the panel `rect`:
+/// one row across the top of its pane, over the grid rather than taking
+/// room from it, which would resize the program's terminal.
+pub fn find_bar_rect(panel: &Panel, rect: Viewport) -> Viewport {
+    let (header, screen) = split(rect);
+    let pane = panel
+        .screens(screen)
+        .into_iter()
+        .find(|(tab, _)| *tab == panel.active)
+        .map_or(screen, |(_, s)| s);
+    Viewport {
+        x: pane.x - PAD,
+        y: header.y + header.height,
+        width: pane.width + PAD * 2.0,
+        height: layout::FIND_ROW_HEIGHT,
+    }
+}
+
+/// The screen rows the find bar hides, at the top.
+pub fn find_bar_rows(atlas: &Atlas) -> usize {
+    ((layout::FIND_ROW_HEIGHT - PAD * 0.5) / row_height(atlas)).ceil() as usize
+}
+
+/// How far back to scroll so line `line` shows below the top `covered`
+/// rows (under the find bar): as it is when it already does, otherwise
+/// with the line in the middle of what is left, as far as the history
+/// goes. `base` is the number of the screen's first line.
+pub fn back_showing(
+    line: u64,
+    base: u64,
+    back: usize,
+    rows: usize,
+    covered: usize,
+    history: usize,
+) -> usize {
+    let shows = |back: usize| {
+        let top = base.saturating_sub(back as u64);
+        line >= top + covered as u64 && line < top + rows as u64
+    };
+    if shows(back) {
+        return back;
+    }
+    // On the screen itself: back to following the output.
+    if shows(0) {
+        return 0;
+    }
+    let middle = (covered + rows.saturating_sub(covered) / 2) as u64;
+    (base + middle).saturating_sub(line).min(history as u64) as usize
+}
+
 /// The row, the column boundary nearest the point and the column of the
 /// cell under it, for a point in `screen`, clamped into the grid.
 pub fn point(
@@ -547,9 +693,11 @@ fn colours(cell: &Cell, theme: &Theme, background: [f32; 4]) -> ([f32; 4], [f32;
     (fg, bg)
 }
 
-/// The panel: header, then the active session's screen.
+/// The panel: header, then the active session's screen, with `find`'s
+/// matches in it while the find bar searches it.
 pub fn draw(
     panel: &Panel,
+    find: Option<&Find>,
     atlas: &mut Atlas,
     rect: Viewport,
     theme: &Theme,
@@ -684,14 +832,17 @@ pub fn draw(
         );
     }
     for (index, screen) in screens {
-        draw_screen(panel, index, screen, atlas, theme, background, out);
+        let find = find.filter(|_| index == panel.active);
+        draw_screen(panel, find, index, screen, atlas, theme, background, out);
     }
 }
 
 /// One session's screen: its cells, the selection and the cursor when it
 /// is the active one, and how far back it is scrolled.
+#[allow(clippy::too_many_arguments)]
 fn draw_screen(
     panel: &Panel,
+    find: Option<&Find>,
     index: usize,
     screen: Viewport,
     atlas: &mut Atlas,
@@ -747,6 +898,21 @@ fn draw_screen(
             term.modes.cursor_visible,
         )
     };
+    // Find's matches on the rows showing, the current one marked.
+    let mut found: Vec<(u64, usize, usize, bool)> = Vec::new();
+    if let (Some(find), Some((_, first)), Some((_, last))) = (find, visible.first(), visible.last())
+    {
+        let from = find
+            .matches
+            .partition_point(|h| h.spans.last().is_some_and(|s| s.0 < *first));
+        for (i, hit) in find.matches.iter().enumerate().skip(from) {
+            if hit.start.0 > *last {
+                break;
+            }
+            let current = find.current == Some(i);
+            found.extend(hit.spans.iter().map(|&(l, a, b)| (l, a, b, current)));
+        }
+    }
     let mut run = String::new();
     for (row, (cells, line)) in visible.iter().enumerate() {
         let line = *line;
@@ -769,6 +935,20 @@ fn draw_screen(
                     [(col - start) as f32 * advance, row_h],
                     bg,
                 );
+            }
+        }
+        // Find's matches, as the editor draws them: the current one also
+        // in the selection's colour, as the editor selects it.
+        for &(_, from, to, current) in found.iter().filter(|f| f.0 == line) {
+            let to = to.min(cols);
+            if to <= from {
+                continue;
+            }
+            let x = screen.x + from as f32 * advance;
+            let width = (to - from) as f32 * advance;
+            layout::push_rect(out, atlas, [x, y], [width, row_h], theme.find_match);
+            if current {
+                layout::push_rect(out, atlas, [x, y], [width, row_h], theme.selection);
             }
         }
         // The selection, over the backgrounds and under the text.
@@ -856,5 +1036,161 @@ fn draw_screen(
         };
         layout::push_rounded_rect(out, pill, 6.0, theme.tab_hover);
         layout::push_ui_text_centered(out, atlas, pill, &note, theme.status_text);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::platform::search::Options;
+
+    fn find(t: &term::Term, query: &str, options: Options) -> Vec<Hit> {
+        find_in(&t.haystack(), query, options).unwrap()
+    }
+
+    #[test]
+    fn a_match_across_a_wrap_covers_both_rows() {
+        let mut t = term::Term::new(10, 4);
+        t.advance(b"abcdefghijklm\r\nshort hijk");
+        let first = t.view_line(0, 0);
+        let found = find(&t, "hijk", Options::default());
+        assert_eq!(
+            found,
+            [
+                Hit {
+                    start: (first, 7),
+                    spans: vec![(first, 7, 10), (first + 1, 0, 1)],
+                },
+                Hit {
+                    start: (first + 2, 6),
+                    spans: vec![(first + 2, 6, 10)],
+                },
+            ]
+        );
+        // A line that ended is not joined to the next.
+        assert!(find(&t, "mshort", Options::default()).is_empty());
+        assert_eq!(find(&t, "m\nshort", Options::default()).len(), 1);
+    }
+
+    #[test]
+    fn wide_characters_cover_two_columns() {
+        let mut t = term::Term::new(8, 3);
+        t.advance("漢字 x漢".as_bytes());
+        let line = t.view_line(0, 0);
+        let found = find(&t, "字 x", Options::default());
+        assert_eq!(found[0].spans, vec![(line, 2, 6)]);
+        let found = find(&t, "漢", Options::default());
+        assert_eq!(
+            found.iter().map(|h| h.spans[0]).collect::<Vec<_>>(),
+            [(line, 0, 2), (line, 6, 8)]
+        );
+    }
+
+    #[test]
+    fn case_follows_the_option() {
+        let mut t = term::Term::new(20, 2);
+        t.advance(b"Error error ERROR");
+        assert_eq!(find(&t, "error", Options::default()).len(), 3);
+        let case = Options {
+            case_sensitive: true,
+            ..Options::default()
+        };
+        assert_eq!(find(&t, "error", case).len(), 1);
+        let regex = Options {
+            regex: true,
+            ..Options::default()
+        };
+        assert!(find_in(&t.haystack(), "(", regex).is_err());
+    }
+
+    #[test]
+    fn history_and_screen_are_searched_up_to_the_limit() {
+        let mut t = term::Term::new(100, 2);
+        for _ in 0..200 {
+            t.advance(&[b'a'; 60]);
+            t.advance(b"\r\n");
+        }
+        assert_eq!(find(&t, "a", Options::default()).len(), FIND_LIMIT);
+        // A full-screen program: only its screen.
+        t.advance(b"\x1b[?1049h\x1b[Hfull a");
+        assert_eq!(find(&t, "a", Options::default()).len(), 1);
+    }
+
+    #[test]
+    fn matches_keep_their_lines_while_history_drops_off() {
+        let mut t = term::Term::new(8, 2);
+        t.advance(b"needle\r\n");
+        let before = find(&t, "needle", Options::default());
+        for n in 0..50 {
+            t.advance(format!("{n}\r\n").as_bytes());
+        }
+        assert_eq!(find(&t, "needle", Options::default()), before);
+        let line = before[0].start.0;
+        t.clear_all();
+        assert!(find(&t, "needle", Options::default()).is_empty());
+        t.advance(b"needle");
+        let after = find(&t, "needle", Options::default());
+        assert!(after[0].start.0 > line);
+        assert_eq!(after[0].start.0, t.view_line(0, 0));
+    }
+
+    fn hit(line: u64, col: usize) -> Hit {
+        Hit {
+            start: (line, col),
+            spans: vec![(line, col, col + 1)],
+        }
+    }
+
+    #[test]
+    fn the_current_match_stays_on_its_anchor_and_steps_around() {
+        let mut find = Find::default();
+        find.take(vec![hit(1, 0), hit(5, 2), hit(9, 0)]);
+        assert_eq!(find.current, Some(2), "the newest first");
+        find.step(true);
+        assert_eq!((find.current, find.anchor), (Some(0), Some((1, 0))));
+        find.step(false);
+        assert_eq!(find.current, Some(2));
+        find.step(false);
+        assert_eq!(find.anchor, Some((5, 2)));
+        // Output arrives: more matches before and after, the same one stays.
+        find.take(vec![hit(0, 0), hit(1, 0), hit(5, 2), hit(9, 0), hit(12, 0)]);
+        assert_eq!(find.current, Some(2));
+        assert_eq!(find.count(), (2, 5));
+        // Its text went: the next after where it was.
+        find.take(vec![hit(1, 0), hit(9, 0)]);
+        assert_eq!(find.current_hit().map(|h| h.start), Some((9, 0)));
+        find.take(vec![hit(1, 0)]);
+        assert_eq!(find.current, Some(0), "or the last before it");
+        find.take(Vec::new());
+        assert_eq!(find.current, None);
+        find.step(true);
+        assert_eq!(find.current, None);
+    }
+
+    #[test]
+    fn scrolling_brings_a_match_into_view_below_the_bar() {
+        // 10 rows, the screen's first line 100, 100 lines of history.
+        assert_eq!(back_showing(105, 100, 0, 10, 2, 100), 0, "in view");
+        assert_eq!(
+            back_showing(100, 100, 0, 10, 2, 100),
+            6,
+            "under the bar: to the middle of the rest"
+        );
+        assert_eq!(back_showing(40, 100, 0, 10, 2, 100), 66);
+        assert_eq!(
+            back_showing(45, 100, 60, 10, 2, 100),
+            60,
+            "in view back there"
+        );
+        assert_eq!(
+            back_showing(105, 100, 60, 10, 2, 100),
+            0,
+            "back to the output"
+        );
+        assert_eq!(
+            back_showing(1, 100, 0, 10, 2, 50),
+            50,
+            "as far as history goes"
+        );
     }
 }

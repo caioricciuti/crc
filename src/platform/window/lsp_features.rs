@@ -138,6 +138,7 @@ impl EditorView {
             selected: 0,
             result_scroll: 0,
             searching: true,
+            terminal: None,
         });
         drop(state);
         self.resume_display_link();

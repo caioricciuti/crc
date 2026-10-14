@@ -96,6 +96,57 @@ impl Term {
         }
         Some(span_while(cells.len(), col, |i| wordy(&cells[i])))
     }
+    /// What Find searches: the history and the screen as one text (the
+    /// screen alone while a full-screen program shows), lines the terminal
+    /// wrapped joined, the rest each ending in a newline without their
+    /// trailing blanks.
+    pub fn haystack(&self) -> Haystack {
+        let first = if self.alternate {
+            self.screen_base()
+        } else {
+            self.dropped
+        };
+        let last = self.screen_base() + self.rows as u64;
+        let mut hay = Haystack::default();
+        for number in first..last {
+            let Some(cells) = self.line(number) else {
+                continue;
+            };
+            let wrapped = cells.last().is_some_and(|c| c.flags & WRAPPED != 0);
+            let end = if wrapped {
+                cells.len()
+            } else {
+                cells
+                    .iter()
+                    .rposition(|c| c.ch != ' ' || c.flags & WIDE_TAIL != 0)
+                    .map_or(0, |i| i + 1)
+            };
+            let mut row = HayRow {
+                line: number,
+                start: hay.text.len(),
+                end: 0,
+                columns: Vec::new(),
+            };
+            for (col, cell) in cells[..end].iter().enumerate() {
+                if cell.flags & WIDE_TAIL != 0 {
+                    // The left half's character spans this column too.
+                    if let Some(last) = row.columns.last_mut() {
+                        last.1 = col as u16 + 1;
+                    }
+                    continue;
+                }
+                hay.text.push(cell.ch);
+                row.columns.push((col as u16, col as u16 + 1));
+            }
+            row.end = hay.text.len();
+            hay.rows.push(row);
+            if !wrapped {
+                hay.text.push('\n');
+            }
+        }
+        hay
+    }
+
     /// Line `line` as text, with the column each character starts at.
     pub fn line_chars(&self, line: u64) -> Vec<(usize, char)> {
         self.line(line)
@@ -108,6 +159,54 @@ impl Term {
                     .collect()
             })
             .unwrap_or_default()
+    }
+}
+
+/// A terminal's text for a search, from [`Term::haystack`], with where on
+/// screen each character of it is.
+#[derive(Default)]
+pub struct Haystack {
+    pub text: String,
+    rows: Vec<HayRow>,
+}
+
+/// One line of a [`Haystack`]: its number, the bytes of its text, and
+/// the columns `[from, to)` each of its characters covers.
+struct HayRow {
+    line: u64,
+    start: usize,
+    end: usize,
+    columns: Vec<(u16, u16)>,
+}
+
+impl Haystack {
+    /// The bytes `range` of the text as a line number and columns
+    /// `[from, to)` per line it covers: more than one for a match across a
+    /// wrap. Nothing for a range that holds no character.
+    pub fn spans(&self, range: std::ops::Range<usize>) -> Vec<(u64, usize, usize)> {
+        let first = self.rows.partition_point(|r| r.end <= range.start);
+        let mut spans = Vec::new();
+        for row in &self.rows[first..] {
+            if row.start >= range.end {
+                break;
+            }
+            let mut cover: Option<(usize, usize)> = None;
+            let text = &self.text[row.start..row.end];
+            for ((at, _), (from, to)) in text.char_indices().zip(&row.columns) {
+                let at = row.start + at;
+                if at >= range.end {
+                    break;
+                }
+                if at >= range.start {
+                    let from = cover.map_or(*from as usize, |(f, _)| f);
+                    cover = Some((from, *to as usize));
+                }
+            }
+            if let Some((from, to)) = cover {
+                spans.push((row.line, from, to));
+            }
+        }
+        spans
     }
 }
 

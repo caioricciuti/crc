@@ -765,6 +765,31 @@ impl Term {
         self.pending_wrap = false;
     }
 
+    /// Clear Terminal: the history goes, and so does the screen but the
+    /// cursor's line, which moves to the top. Nothing is said to the
+    /// program. A full-screen program keeps its screen, which it owns; the
+    /// shell's history under it goes. Lines keep their numbers: what went
+    /// counts as dropped.
+    pub fn clear_all(&mut self) {
+        let mut gone = self.scrollback.len() as u64;
+        self.scrollback.clear();
+        if !self.alternate {
+            let row = self.row;
+            let blank = Cell::blank(&self.pen);
+            self.screen.drain(..row);
+            for line in &mut self.screen[1..] {
+                line.fill(blank);
+            }
+            self.screen.resize(self.rows, vec![blank; self.cols]);
+            gone += row as u64;
+            // The column and a pending wrap stay: the next character goes
+            // where it would have gone.
+            self.row = 0;
+        }
+        self.dropped += gone;
+        self.generation += 1;
+    }
+
     fn erase_line(&mut self, mode: usize) {
         let blank = Cell::blank(&self.pen);
         let (row, col) = (self.row, self.col);
@@ -1288,6 +1313,48 @@ mod tests {
             t.one_line_between((first, 0), (first + 1, 10)),
             "abcdefghijklm"
         );
+    }
+
+    #[test]
+    fn clear_all_keeps_only_the_cursor_line() {
+        let mut t = Term::new(10, 5);
+        for n in 1..=30 {
+            t.advance(format!("{n}\r\n").as_bytes());
+        }
+        t.advance(b"$ ab");
+        assert!(t.scrollback_len() > 0);
+        let prompt = t.view_line(t.cursor().0, 0);
+        let generation = t.generation;
+        t.clear_all();
+        assert_eq!(t.scrollback_len(), 0);
+        assert_eq!(t.screen_text(), "$ ab");
+        assert_eq!(t.cursor(), (0, 4));
+        assert!(t.generation > generation);
+        // The line keeps its number, and nothing is kept before it.
+        assert_eq!(t.view_line(0, 0), prompt);
+        assert!(t.line(prompt - 1).is_none());
+        assert_eq!(t.text_between((prompt, 0), (prompt, 10)), "$ ab");
+        // Output carries on under it.
+        t.advance(b"c\r\nnext");
+        assert_eq!(t.screen_text(), "$ abc\nnext");
+        assert_eq!(t.view_line(1, 0), prompt + 1);
+    }
+
+    #[test]
+    fn clear_all_leaves_a_full_screen_program_alone() {
+        let mut t = Term::new(10, 3);
+        for n in 1..=10 {
+            t.advance(format!("{n}\r\n").as_bytes());
+        }
+        t.advance(b"\x1b[?1049h\x1b[Hfull\r\nscreen");
+        let generation = t.generation;
+        t.clear_all();
+        assert_eq!(t.screen_text(), "full\nscreen");
+        assert_eq!(t.cursor(), (1, 6));
+        assert!(t.generation > generation);
+        // Back on the shell's screen, its history is gone.
+        t.advance(b"\x1b[?1049l");
+        assert_eq!(t.scrollback_len(), 0);
     }
 
     #[test]

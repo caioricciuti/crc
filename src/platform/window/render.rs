@@ -48,6 +48,7 @@ impl EditorView {
         super::agents::forget_emptied(&mut state);
         let column = column_of(&state);
         let chrome = chrome_of(&state);
+        let terminal_find_rect = super::terminal::find_rect(&state, &chrome);
         let carets_on = !self.caret_blinks(&state) || caret_phase(state.caret_since.elapsed()).0;
         let State {
             docs,
@@ -707,8 +708,11 @@ impl EditorView {
             // From the selection's start: a found match is selected with
             // the caret at its end.
             let from = buffer.selection().map_or(buffer.cursor(), |r| r.start);
-            let found = search_matches.map(|found| (found, from));
-            draw_find_bar(glyphs, renderer, theme, rect, bar, found, tree);
+            let count = search_matches.map(|found| {
+                let at = found.iter().position(|m| m.range.start >= from);
+                (at.unwrap_or(0), found.len())
+            });
+            draw_find_bar(glyphs, renderer, theme, rect, bar, count, tree);
         }
 
         if activity_rect.width > 0.0 {
@@ -887,12 +891,30 @@ impl EditorView {
         }
 
         if let Some(rect) = terminal_rect {
+            let searching = find.as_ref().and_then(|bar| bar.terminal.as_ref());
             crate::platform::terminal::draw(
                 terminal_panel,
+                searching,
                 &mut renderer.atlas,
                 rect,
                 theme,
                 glyphs,
+            );
+        }
+        // The terminal's find bar, over the top of its screen, with a
+        // hairline under it as the document's has the text's edge.
+        if let Some(rect) = terminal_find_rect
+            && let Some(bar) = find.as_ref()
+            && let Some(searching) = bar.terminal.as_ref()
+        {
+            let count = searching.error.is_none().then(|| searching.count());
+            draw_find_bar(glyphs, renderer, theme, rect, bar, count, tree);
+            layout::push_rect(
+                glyphs,
+                &renderer.atlas,
+                [rect.x, rect.y + rect.height - 1.0],
+                [rect.width, 1.0],
+                theme.hairline,
             );
         }
 
@@ -1173,17 +1195,19 @@ impl EditorView {
 }
 
 /// The find bar: its two fields, the buttons and options beside them and,
-/// for a project search, the results under them. `found` is the active
-/// document's matches and the offset the "n of m" count starts from.
+/// for a project search, the results under them. `count` is the current
+/// match's place from 0 and how many there are, in the document or the
+/// terminal. Over the terminal it is one row: no Replace, no Project.
 fn draw_find_bar(
     glyphs: &mut Vec<GlyphInstance>,
     renderer: &mut Renderer,
     theme: &Theme,
     rect: Viewport,
     bar: &FindBar,
-    found: Option<(&[search::Match], usize)>,
+    count: Option<(usize, usize)>,
     tree: &Tree,
 ) {
+    let terminal = bar.terminal.is_some();
     layout::push_rect(
         glyphs,
         &renderer.atlas,
@@ -1191,7 +1215,8 @@ fn draw_find_bar(
         [rect.width, rect.height],
         theme.find_background,
     );
-    let g = layout::FindGeometry::new(rect);
+    let chips = if terminal { 3 } else { 4 };
+    let g = layout::FindGeometry::with_chips(rect, chips);
 
     // A field that looks like a field. There was no box at all: a
     // "Find" label sat at the far left and the text began eleven
@@ -1244,19 +1269,16 @@ fn draw_find_bar(
     // "3 of 17" in the field it belongs to, which the bar never
     // reported at all: there was no way to tell a search that found
     // nothing from one that found everything.
-    let count = if bar.project {
+    let said = if bar.project {
         (!bar.results.is_empty()).then(|| format!("{} found", bar.results.len()))
     } else {
-        found.map(|(found, from)| {
-            if found.is_empty() {
-                "No matches".to_string()
-            } else {
-                let at = found
-                    .iter()
-                    .position(|m| m.range.start >= from)
-                    .unwrap_or(0);
-                format!("{} of {}", at + 1, found.len())
+        count.map(|(at, total)| match total {
+            0 => "No matches".to_string(),
+            // The terminal's search stops at a limit; past it, more.
+            n if terminal && n >= crate::platform::terminal::FIND_LIMIT => {
+                format!("{} of {n}+", at + 1)
             }
+            n => format!("{} of {n}", at + 1),
         })
     };
     field(
@@ -1270,21 +1292,23 @@ fn draw_find_bar(
         },
         &bar.query,
         bar.has_keys && !bar.replacing,
-        count.as_deref(),
+        said.as_deref(),
     );
-    field(
-        glyphs,
-        &mut renderer.atlas,
-        g.replace_field,
-        if bar.project {
-            "Replace in every file listed"
-        } else {
-            "Replace with"
-        },
-        &bar.replacement,
-        bar.has_keys && bar.replacing,
-        None,
-    );
+    if !terminal {
+        field(
+            glyphs,
+            &mut renderer.atlas,
+            g.replace_field,
+            if bar.project {
+                "Replace in every file listed"
+            } else {
+                "Replace with"
+            },
+            &bar.replacement,
+            bar.has_keys && bar.replacing,
+            None,
+        );
+    }
 
     // The shared button: the same height, corners and hover as every
     // other control, with arrows and a cross from the icon font rather
@@ -1292,7 +1316,7 @@ fn draw_find_bar(
     let has_matches = if bar.project {
         !bar.results.is_empty()
     } else {
-        found.is_some_and(|(f, _)| !f.is_empty())
+        count.is_some_and(|(_, total)| total > 0)
     };
     let atlas = &mut renderer.atlas;
     Button::new(g.previous)
@@ -1312,7 +1336,9 @@ fn draw_find_bar(
         .tone(Tone::Ghost)
         .tip("Close  \u{238b}")
         .draw(glyphs, atlas, theme);
-    if !bar.project {
+    if terminal {
+        // One row: nothing to replace in a terminal.
+    } else if !bar.project {
         Button::new(g.replace_one)
             .label("Replace")
             .enabled(has_matches)
@@ -1348,6 +1374,7 @@ fn draw_find_bar(
         ),
     ]
     .into_iter()
+    .take(chips)
     .enumerate()
     {
         Button::new(g.options[slot])

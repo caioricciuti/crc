@@ -241,7 +241,10 @@ the size and write it back.
   `Cmd`-click a path such as `src/main.rs:42:7` in the output to open it
   at that line. Drag to select (past the top or bottom scrolls the
   history under the pointer), `Cmd-A` selects everything the session
-  printed, `Cmd-C` copies, `Cmd-V` pastes. A session that sends a notification
+  printed, `Cmd-C` copies, `Cmd-V` pastes. `Cmd-F` searches what the
+  session printed (history and screen) with the same find bar as
+  documents, `Cmd-G` steps through the matches, and `Cmd-K` clears the
+  screen and history without sending anything to the program. A session that sends a notification
   (OSC 9, 777 or 99) or rings the bell gets a dot and a line in the status
   bar saying what it asked, until you type into it; Home lists the
   waiting ones first.
