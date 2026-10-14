@@ -38,6 +38,18 @@ impl EditorView {
                         .and_then(|t| task_of(tasks, t))
                         .map(|i| tasks[i].id());
                 }
+                // The selected workspace's newest terminal, when the one
+                // showing is another's; with none, its empty state.
+                if active_hidden(&state) {
+                    let tasks = &state.agents.tasks;
+                    let selected = state.agents.selected_index();
+                    if let Some(last) = (0..state.terminal.tabs.len())
+                        .rev()
+                        .find(|i| task_of(tasks, &state.terminal.tabs[*i]) == selected)
+                    {
+                        state.terminal.show(last);
+                    }
+                }
                 state.terminal.tabs.is_empty()
             } else {
                 // The editor never opens the terminal for you: the sessions
@@ -310,6 +322,11 @@ impl EditorView {
             let Some(index) = task_of(&tasks, tab) else {
                 return;
             };
+            // Another workspace's terminal, behind this one's empty state:
+            // where it went never selects anything.
+            if state.agents.selected_index().is_some_and(|s| s != index) {
+                return;
+            }
             let task = &tasks[index];
             let id = match follow(&tasks, index, &cwd) {
                 Follow::Stay => return,
@@ -326,10 +343,7 @@ impl EditorView {
                     let name = cwd
                         .file_name()
                         .map_or_else(|| "workspace".into(), |n| n.to_string_lossy().into_owned());
-                    let id = state
-                        .agents
-                        .add_folder(&name, cwd.clone())
-                        .unwrap_or_else(|there| there);
+                    let id = state.agents.add_folder(&name, cwd.clone());
                     state.agents.refresh();
                     Some(id)
                 }
@@ -400,10 +414,7 @@ impl EditorView {
                 let name = folder
                     .file_name()
                     .map_or_else(|| "workspace".into(), |n| n.to_string_lossy().into_owned());
-                let id = state
-                    .agents
-                    .add_folder(&name, folder.clone())
-                    .unwrap_or_else(|there| there);
+                let id = state.agents.add_folder(&name, folder.clone());
                 state.agents.refresh();
                 // The terminals in its folder that no workspace held are
                 // its own; the others stay where they are.
@@ -422,10 +433,18 @@ impl EditorView {
     }
 
     /// A double-click on the empty part of the list: a new folder workspace
-    /// on the open folder while no workspace has it, named after it, with a
-    /// terminal in it; else New Workspace, to choose its folder.
+    /// on the selected one's folder (see
+    /// [`crate::platform::agents::Panel::blank_folder`]), else the open
+    /// folder, named after it, with a terminal in it; with no folder at
+    /// all, New Workspace.
     fn new_blank_workspace(&self) {
-        let Some(folder) = self.workspace_folder() else {
+        let folder = self.state().and_then(|state| {
+            state
+                .agents
+                .blank_folder(state.tree.root())
+                .or_else(|| state.terminal.active_tab().map(|t| t.folder.clone()))
+        });
+        let Some(folder) = folder else {
             self.new_task_prompt();
             return;
         };
@@ -510,7 +529,7 @@ impl EditorView {
 
     fn task_path(&self, index: usize) -> Option<std::path::PathBuf> {
         let state = self.state()?;
-        state.agents.tasks.get(index).map(|t| t.path.clone())
+        state.agents.tasks.get(index).map(|t| t.dir())
     }
 
     /// Shows a task: its waiting session first, else the newest one it
@@ -523,7 +542,7 @@ impl EditorView {
             let Some(task) = state.agents.tasks.get(index) else {
                 return;
             };
-            let path = task.path.clone();
+            let path = task.dir();
             state.agents.select(index);
             let tasks = state.agents.tasks.clone();
             let mine: Vec<usize> = (0..state.terminal.tabs.len())
@@ -630,7 +649,7 @@ impl EditorView {
         let found = self.state_mut().and_then(|mut state| {
             let index = state.agents.by_id(id)?;
             state.agents.select(index);
-            Some(state.agents.tasks[index].path.clone())
+            Some(state.agents.tasks[index].dir())
         });
         if let Some(dir) = found {
             self.set_agents_mode(true);
@@ -765,14 +784,7 @@ impl EditorView {
             };
             state.agents.on = true;
             let name = crate::platform::remote::workspace_name(&host, &path);
-            let id = match state.agents.add_remote(&name, &host, &path) {
-                Ok(id) => id,
-                Err(there) => {
-                    drop(state);
-                    self.show_existing_workspace(&there);
-                    return;
-                }
-            };
+            let id = state.agents.add_remote(&name, &host, &path);
             state.agents.selected = Some(id.clone());
             // Its repositories read now, not at the next periodic read.
             state.agents.refresh();
@@ -783,8 +795,7 @@ impl EditorView {
     }
 
     /// A folder workspace on `dir`, selected, its repositories read, and a
-    /// terminal in it. A folder has one workspace: on one that has it, that
-    /// one is shown instead.
+    /// terminal in it. A folder holds any number of workspaces.
     fn create_workspace_in(&self, name: String, dir: &Path) {
         let dir = crate::platform::canonical(dir);
         {
@@ -792,38 +803,29 @@ impl EditorView {
                 return;
             };
             state.agents.on = true;
-            match state.agents.add_folder(&name, dir.clone()) {
-                Ok(id) => state.agents.selected = Some(id),
-                Err(there) => {
-                    drop(state);
-                    self.show_existing_workspace(&there);
-                    return;
-                }
-            }
+            let id = state.agents.add_folder(&name, dir.clone());
+            state.agents.selected = Some(id);
             state.agents.refresh();
         }
         self.set_agents_mode(true);
         self.spawn_terminal_in(false, Some(&dir));
     }
 
-    /// A new workspace asked for on a folder the workspace `id` has: that
-    /// one, selected and shown, and the message saying so.
-    fn show_existing_workspace(&self, id: &str) {
-        let index = self.state_mut().and_then(|mut state| {
-            let index = state.agents.by_id(id)?;
-            let there = state.agents.tasks[index].clone();
-            let said = format!(
-                "{} is already the workspace {}",
-                crate::platform::agents::shown_folder(&there),
-                state.agents.title(&there)
-            );
-            state.say(layout::Feedback::Failure, said);
-            Some(index)
-        });
-        if let Some(index) = index {
-            self.select_task(index);
-        }
-        self.request_redraw();
+    /// The palette's answer for a workspace without a folder: made from
+    /// its name, selected, and a terminal in the home folder.
+    pub(super) fn create_folderless_workspace(&self, name: String) {
+        let (id, dir) = {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            state.agents.on = true;
+            let id = state.agents.add_folderless(&name);
+            state.agents.selected = Some(id.clone());
+            let dir = state.agents.by_id(&id).map(|i| state.agents.tasks[i].dir());
+            (id, dir)
+        };
+        self.set_agents_mode(true);
+        self.spawn_terminal_into(false, dir.as_deref(), Some(id));
     }
 
     /// The context menu for a point in the Agents sidebar: the session's,
@@ -895,7 +897,7 @@ impl EditorView {
             match task_of(&tasks, &state.terminal.tabs[tab]) {
                 Some(index) => {
                     state.agents.select(index);
-                    tasks[index].path.clone()
+                    tasks[index].dir()
                 }
                 None => state.terminal.tabs[tab].folder.clone(),
             }
@@ -1166,7 +1168,8 @@ impl EditorView {
                     (
                         task.is_none_or(|t| t.main),
                         task.is_some_and(|t| t.folder),
-                        task.is_some_and(|t| t.host.is_some()),
+                        // Nothing for the editor: on a host, or no folder.
+                        task.is_some_and(|t| t.host.is_some() || t.folderless()),
                         // The branch, and whether it can have pull requests:
                         // a host's repository not on GitHub has none here.
                         task.and_then(|t| {
@@ -1278,7 +1281,7 @@ impl EditorView {
             state.agents.selected = Some(task.id());
         }
         self.set_agents_mode(true);
-        self.spawn_terminal_in(claude, Some(&task.path));
+        self.spawn_terminal_in(claude, Some(&task.dir()));
     }
 
     /// The task's folder as the editor's project. Its sessions keep
@@ -1300,7 +1303,7 @@ impl EditorView {
     fn editor_follows_agents(&self) {
         let path = self.state().and_then(|state| {
             let task = &state.agents.tasks[state.agents.selected_index()?];
-            if task.host.is_some() {
+            if task.host.is_some() || task.folderless() {
                 return None;
             }
             let path = crate::platform::canonical(&task.path);
@@ -1705,6 +1708,21 @@ fn selection_coming(state: &State) -> bool {
             == state.agents.selected.as_ref()
 }
 
+/// Whether the session at the front is not the selected workspace's, in
+/// Agents mode: that workspace has no terminal left, and its empty state
+/// shows, so nothing typed or Cmd-W reaches the one behind it. Not while
+/// a workspace about to be listed is selected (see [`selection_coming`]).
+pub(super) fn active_hidden(state: &State) -> bool {
+    let tasks = &state.agents.tasks;
+    state.agents.on
+        && !tasks.is_empty()
+        && !selection_coming(state)
+        && state
+            .terminal
+            .active_tab()
+            .is_some_and(|t| task_of(tasks, t) != state.agents.selected_index())
+}
+
 /// A terminal into the workspace `id`, its holder told too so a relaunch
 /// finds it there.
 fn adopt(tab: &mut crate::platform::terminal::Tab, id: &str) {
@@ -1723,29 +1741,29 @@ fn pick_numbered(items: &[usize], number: usize) -> Option<usize> {
     }
 }
 
-/// A folder workspace whose last terminal closed goes with it, as a tab
-/// group does. A worktree stays: forgetting it would mean removing it from
-/// Git, which its menu asks about first.
+/// A folder workspace a terminal left by `cd`, leaving it with none, goes.
+/// One whose last terminal closed stays, as you made it. A worktree stays:
+/// forgetting it would mean removing it from Git, which its menu asks
+/// about first.
 pub(super) fn forget_emptied(state: &mut State) {
     // The tab showing closed: the next one of its workspace shows, the one
-    // after it or else the one before.
-    if let Some((Some(id), at)) = state.terminal.closed_active.take()
+    // after it or else the one before; with none left, that workspace stays
+    // selected, empty. Never another workspace's.
+    if let Some((id, folder, at)) = state.terminal.closed_active.take()
         && state.agents.on
     {
         let tasks = state.agents.tasks.clone();
-        if let Some(owner) = tasks.iter().position(|t| t.id() == id) {
-            let mine: Vec<usize> = (0..state.terminal.tabs.len())
-                .filter(|i| task_of(&tasks, &state.terminal.tabs[*i]) == Some(owner))
-                .collect();
-            if let Some(next) = mine
+        if let Some(owner) = crate::platform::agents::owner(&tasks, id.as_deref(), &folder) {
+            let owners: Vec<Option<usize>> = state
+                .terminal
+                .tabs
                 .iter()
-                .copied()
-                .find(|i| *i >= at)
-                .or_else(|| mine.last().copied())
-            {
-                state.terminal.active = next;
-                state.agents.selected = Some(id);
+                .map(|t| task_of(&tasks, t))
+                .collect();
+            if let Some(next) = crate::platform::agents::after_close(&owners, owner, at) {
+                state.terminal.show(next);
             }
+            state.agents.selected = Some(tasks[owner].id());
         }
     }
     if state.terminal.closed_in.is_empty() {

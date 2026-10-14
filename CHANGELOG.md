@@ -37,9 +37,13 @@ One entry per tag, written for people who use the editor.
 - Agents: New Workspace no longer starts from the selected worktree's
   repository, which could quietly make a second workspace for a
   repository that already had one and take over its worktrees in the
-  list. A folder that already has a workspace is refused, and that
-  workspace is shown instead. Each folder workspace's row shows its
-  folder, so a wrong one is easy to see.
+  list. Each folder workspace's row shows its folder, so a wrong one is
+  easy to see. A folder can hold any number of workspaces, and a
+  workspace needs no folder at all: New Workspace offers one "without a
+  folder", whose terminals start in your home folder.
+- Agents: closing or exiting a terminal shows the next terminal of the
+  same workspace, never another workspace's. A workspace whose last
+  terminal ends stays selected, saying so, instead of being forgotten.
 - Gutter marks no longer blink out after a stage, commit or branch
   switch, and the change commands stay available while Git reads the
   file again.

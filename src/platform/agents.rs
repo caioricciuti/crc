@@ -154,6 +154,23 @@ impl Workspace {
         }
     }
 
+    /// A workspace made from a name alone: no folder, no repositories;
+    /// its terminals start in the home folder.
+    pub fn folderless(&self) -> bool {
+        self.folder && self.path.as_os_str().is_empty()
+    }
+
+    /// Where its terminals start: its folder, or for one without a folder
+    /// the home folder.
+    pub fn dir(&self) -> PathBuf {
+        if self.folderless() {
+            return crate::platform::canonical(
+                &std::env::var_os("HOME").map_or_else(|| "/".into(), PathBuf::from),
+            );
+        }
+        self.path.clone()
+    }
+
     /// The worktree behind it, for the Git operations.
     pub fn worktree(&self) -> Option<Worktree> {
         (!self.folder).then(|| Worktree {
@@ -624,10 +641,10 @@ pub struct RowDrag {
     pub active: bool,
 }
 
-/// One per line: the name, a tab, the folder, a tab, the key, and for a
-/// remote workspace a tab and its host. A line written before keys existed
-/// keeps the id it had, `folder:` and its name, so the sessions holding it
-/// stay in it.
+/// One per line: the name, a tab, the folder (empty for a workspace
+/// without one), a tab, the key, and for a remote workspace a tab and its
+/// host. A line written before keys existed keeps the id it had, `folder:`
+/// and its name, so the sessions holding it stay in it.
 fn parse_folders(text: &str) -> Vec<Workspace> {
     text.lines()
         .filter_map(|line| {
@@ -640,7 +657,8 @@ fn parse_folders(text: &str) -> Vec<Workspace> {
             let host = parts.next().filter(|h| !h.is_empty()).map(str::to_owned);
             Some((name, path, key, host))
         })
-        .filter(|(name, path, ..)| !name.is_empty() && !path.is_empty())
+        // No folder is a workspace without one; not one on a host.
+        .filter(|(name, path, _, host)| !name.is_empty() && (!path.is_empty() || host.is_none()))
         .map(|(name, path, key, host)| Workspace {
             name: name.to_owned(),
             path: PathBuf::from(path),
@@ -1228,25 +1246,40 @@ enum Line {
 /// The workspace a session belongs to: the one it was started in, when
 /// that still exists, else the one holding its folder.
 pub fn task_of(tasks: &[Workspace], tab: &Tab) -> Option<usize> {
-    if let Some(id) = &tab.workspace
-        && let Some(i) = tasks.iter().position(|t| t.id() == *id)
+    owner(tasks, tab.workspace.as_deref(), &tab.folder)
+}
+
+/// [`task_of`] a tab started in workspace `id` (when it was) and `folder`.
+pub fn owner(tasks: &[Workspace], id: Option<&str>, folder: &Path) -> Option<usize> {
+    if let Some(id) = id
+        && let Some(i) = tasks.iter().position(|t| t.id() == id)
     {
         return Some(i);
     }
-    folder_task(tasks, &tab.folder)
+    folder_task(tasks, folder)
+}
+
+/// The tab to show once the one at `at` closed in the workspace `owner`,
+/// by `owners`, the workspace of each tab left: its own next tab, the one
+/// that slid into its place or else the one before, as the editor's tabs
+/// go. `None` when that workspace has none left: it stays, empty, and no
+/// other workspace's tab is taken for it.
+pub fn after_close(owners: &[Option<usize>], owner: usize, at: usize) -> Option<usize> {
+    let mine = || (0..owners.len()).filter(|i| owners[*i] == Some(owner));
+    mine().find(|i| *i >= at).or_else(|| mine().next_back())
 }
 
 /// The workspace holding a folder: the deepest one, so a worktree inside
 /// the main checkout is not taken for the main one; a worktree before a
 /// folder workspace on the same folder; of folder workspaces on one
 /// folder, the first in the list, so a new one never takes the sessions of
-/// the others. A remote workspace's folder is not on this Mac: it holds
-/// only the sessions started in it.
+/// the others. A remote workspace's folder is not on this Mac, and one
+/// without a folder has none: they hold only the sessions started in them.
 pub fn folder_task(tasks: &[Workspace], folder: &Path) -> Option<usize> {
     tasks
         .iter()
         .enumerate()
-        .filter(|(_, t)| t.host.is_none() && folder.starts_with(&t.path))
+        .filter(|(_, t)| t.host.is_none() && !t.folderless() && folder.starts_with(&t.path))
         .max_by_key(|(i, t)| {
             (
                 t.path.components().count(),
@@ -1275,10 +1308,11 @@ pub enum Follow {
 /// terminal joins it; a worktree keeps the rest of its own folders; a
 /// folder workspace moves with it; else it joins whatever holds the folder,
 /// else a new one is made there. A remote workspace's terminal is ssh, in a
-/// folder of this Mac that says nothing: it stays.
+/// folder of this Mac that says nothing: it stays; and so does one of a
+/// workspace without a folder, whose terminals go anywhere.
 pub fn follow(tasks: &[Workspace], owner: usize, cwd: &Path) -> Follow {
     let task = &tasks[owner];
-    if task.path == cwd || task.host.is_some() {
+    if task.path == cwd || task.host.is_some() || task.folderless() {
         return Follow::Stay;
     }
     match folder_task(tasks, cwd) {
@@ -1319,7 +1353,7 @@ impl Panel {
             let folders: Vec<(String, PathBuf)> = self
                 .folders
                 .iter()
-                .filter(|f| f.host == host)
+                .filter(|f| f.host == host && !f.folderless())
                 .map(|f| (f.id(), f.path.clone()))
                 .collect();
             let (tx, info_tx) = (tx.clone(), info_tx.clone());
@@ -2136,39 +2170,22 @@ impl Panel {
         let _ = crate::platform::write_atomically(&file, folders_text(&self.folders).as_bytes());
     }
 
-    /// Adds a folder workspace, its name made unique, and returns its id;
-    /// a folder has one workspace, so on one that has it already, nothing
-    /// is added and the `Err` is that one's id.
-    pub fn add_folder(&mut self, name: &str, path: PathBuf) -> Result<String, String> {
-        let path = crate::platform::canonical(&path);
-        if let Some(there) = self.folder_at(None, &path) {
-            return Err(there.id());
-        }
-        Ok(self.add(name, path, None))
+    /// Adds a folder workspace, its name made unique, and returns its id.
+    /// A folder holds any number of workspaces, each with its own key.
+    pub fn add_folder(&mut self, name: &str, path: PathBuf) -> String {
+        self.add(name, crate::platform::canonical(&path), None)
     }
 
     /// Adds a remote folder workspace: `path` on `host`, taken as typed
-    /// (nothing on this Mac to resolve it against). Returns its id, or as
-    /// [`Panel::add_folder`] the one already there.
-    pub fn add_remote(&mut self, name: &str, host: &str, path: &str) -> Result<String, String> {
-        if let Some(there) = self.folder_at(Some(host), Path::new(path)) {
-            return Err(there.id());
-        }
-        Ok(self.add(name, PathBuf::from(path), Some(host.to_owned())))
+    /// (nothing on this Mac to resolve it against). Returns its id.
+    pub fn add_remote(&mut self, name: &str, host: &str, path: &str) -> String {
+        self.add(name, PathBuf::from(path), Some(host.to_owned()))
     }
 
-    /// The folder workspace on `path` on `host` (`None` for this Mac): the
-    /// same folder however it is written, a slash at its end or (on this
-    /// Mac) through a symlink. One on a host is never one of this Mac's.
-    pub fn folder_at(&self, host: Option<&str>, path: &Path) -> Option<&Workspace> {
-        let local = host.is_none().then(|| crate::platform::canonical(path));
-        self.folders.iter().find(|f| {
-            f.host.as_deref() == host
-                && match &local {
-                    Some(path) => crate::platform::canonical(&f.path) == *path,
-                    None => f.path.as_path() == path,
-                }
-        })
+    /// Adds a workspace without a folder, by name alone, and returns its
+    /// id.
+    pub fn add_folderless(&mut self, name: &str) -> String {
+        self.add(name, PathBuf::new(), None)
     }
 
     /// Whether a workspace has the folder `path` of this Mac already: a
@@ -2176,8 +2193,11 @@ impl Panel {
     /// worktree's.
     pub fn has_workspace(&self, path: &Path) -> bool {
         let path = crate::platform::canonical(path);
-        let local = |t: &&Workspace| t.host.is_none();
-        self.folder_at(None, &path).is_some()
+        let local = |t: &&Workspace| t.host.is_none() && !t.folderless();
+        self.folders
+            .iter()
+            .filter(local)
+            .any(|f| crate::platform::canonical(&f.path) == path)
             || self
                 .tasks
                 .iter()
@@ -2432,7 +2452,9 @@ impl Panel {
     /// folder, or the ones found in a folder workspace (`None` until read).
     /// A remote workspace's are paths on its host.
     pub fn repos_of(&self, workspace: &Workspace) -> Option<Vec<PathBuf>> {
-        if workspace.folder {
+        if workspace.folderless() {
+            Some(Vec::new())
+        } else if workspace.folder {
             self.repos.get(&workspace.id()).cloned()
         } else {
             Some(vec![workspace.path.clone()])
@@ -2458,6 +2480,24 @@ impl Panel {
         fallback
             .filter(|f| !self.has_workspace(f))
             .map(Path::to_path_buf)
+    }
+
+    /// The folder a double-click under the list makes a workspace on: the
+    /// selected folder workspace's, or a selected worktree's folder
+    /// workspace's (never its repository, deeper, which would take that
+    /// one's worktrees); else `fallback`, the editor's. Not a host's, nor
+    /// one without a folder.
+    pub fn blank_folder(&self, fallback: Option<&Path>) -> Option<PathBuf> {
+        self.selected_index()
+            .map(|i| &self.tasks[i])
+            .filter(|t| t.host.is_none())
+            .and_then(|t| match t.folder {
+                true => Some(t.clone()),
+                false => self.tasks.get(self.by_id(&self.parent_of(t)?)?).cloned(),
+            })
+            .filter(|t| !t.folderless())
+            .map(|t| t.path)
+            .or_else(|| fallback.map(Path::to_path_buf))
     }
 
     /// Where the folder panel for a new workspace opens: in the folder
@@ -2584,7 +2624,14 @@ impl Panel {
 
     fn height(&self, line: &Line) -> f32 {
         match line {
-            Line::Task(i) if self.tasks.get(*i).is_some_and(|t| t.folder) => FOLDER_CARD,
+            Line::Task(i)
+                if self
+                    .tasks
+                    .get(*i)
+                    .is_some_and(|t| t.folder && !t.folderless()) =>
+            {
+                FOLDER_CARD
+            }
             Line::Task(_) => CARD,
             Line::Child(_) => CHILD,
             _ => ROW,
@@ -2692,7 +2739,7 @@ impl Panel {
     }
 
     /// The folder each folder workspace's row shows, for the self-test, as
-    /// `name=folder` in the list's order.
+    /// `name=folder` in the list's order (`name=-` without a folder).
     pub fn report_folders(&self) -> String {
         self.tasks
             .iter()
@@ -3186,8 +3233,12 @@ impl Panel {
 }
 
 /// A workspace's folder as its row and inspector show it: `host:path` for
-/// one on a host, else as the palette shows a folder (`~/...`).
+/// one on a host, else as the palette shows a folder (`~/...`); `-` for
+/// one without a folder.
 pub fn shown_folder(workspace: &Workspace) -> String {
+    if workspace.folderless() {
+        return "-".into();
+    }
     match &workspace.host {
         Some(host) => format!("{host}:{}", workspace.path.display()),
         None => crate::platform::window::shown_path(&workspace.path),
@@ -3329,7 +3380,7 @@ impl Panel {
         let task = self.tasks[index].clone();
         let (indent, height, inset, gap) = match child {
             Some(_) => (INDENT, CHILD, 2.0, 17.0),
-            None if task.folder => (0.0, FOLDER_CARD, 4.0, 18.0),
+            None if task.folder && !task.folderless() => (0.0, FOLDER_CARD, 4.0, 18.0),
             None => (0.0, CARD, 4.0, 18.0),
         };
         let card = Viewport {
@@ -3663,6 +3714,9 @@ impl Panel {
             if !task.folder && name != task.name() {
                 parts.push(task.name());
             }
+            if task.folderless() {
+                parts.push("no folder".to_owned());
+            }
             let colour = if writing {
                 theme.status_text
             } else {
@@ -3692,7 +3746,7 @@ impl Panel {
         );
         // The folder, dimmer, cut from its start: its end is the folder
         // itself, the part that tells two apart.
-        if task.folder && child.is_none() {
+        if task.folder && !task.folderless() && child.is_none() {
             let room = (right - name_x).max(0.0);
             let shown = crate::platform::inspector::fit_start(atlas, &shown_folder(&task), room);
             layout::push_ui_text(
@@ -3748,10 +3802,8 @@ mod tests {
     #[test]
     fn a_remote_workspace_keeps_its_host_in_a_fourth_field() {
         let mut panel = Panel::default();
-        let local = panel
-            .add_folder("notes", PathBuf::from("/tmp/crc-agents-remote"))
-            .unwrap();
-        let remote = panel.add_remote("app", "myhost", "~/srv/app").unwrap();
+        let local = panel.add_folder("notes", PathBuf::from("/tmp/crc-agents-remote"));
+        let remote = panel.add_remote("app", "myhost", "~/srv/app");
         let text = folders_text(&panel.folders);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0].split('\t').count(), 3, "{text}");
@@ -3909,12 +3961,9 @@ mod tests {
             worktrees: vec![tree("/r", true)],
             ..Panel::default()
         };
-        let a = panel
-            .add_folder("notes", PathBuf::from("/tmp/crc-agents-test"))
-            .unwrap();
-        let b = panel
-            .add_folder("notes", PathBuf::from("/tmp/crc-agents-test-2"))
-            .unwrap();
+        let dir = PathBuf::from("/tmp/crc-agents-test");
+        let a = panel.add_folder("notes", dir.clone());
+        let b = panel.add_folder("notes", dir);
         assert_ne!(a, b);
         assert_eq!(panel.tasks.len(), 3);
         assert_eq!(panel.tasks[0].id(), "/r");
@@ -4528,41 +4577,159 @@ mod tests {
     }
 
     #[test]
-    fn a_folder_has_one_workspace() {
-        let dir = std::env::temp_dir().join(format!("crc-one-workspace-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("garden")).unwrap();
-        std::os::unix::fs::symlink(dir.join("garden"), dir.join("link")).unwrap();
-        // Never written: the panel was not loaded from the file.
-        let mut panel = Panel::default();
-        let first = panel.add_folder("GARDEN", dir.join("garden")).unwrap();
-        // The same folder, as typed, with a slash at its end, or through a
-        // symlink: refused, the one there named.
-        assert_eq!(
-            panel.add_folder("seedbank", dir.join("garden")),
-            Err(first.clone())
-        );
-        let slash = PathBuf::from(format!("{}/", dir.join("garden").display()));
-        assert_eq!(panel.add_folder("seedbank", slash), Err(first.clone()));
-        assert_eq!(
-            panel.add_folder("seedbank", dir.join("link")),
-            Err(first.clone())
-        );
-        assert_eq!(panel.folders.len(), 1);
-        // A folder beside it is another.
-        assert!(panel.add_folder("seedbank", dir.join("seedbank")).is_ok());
-        // On a host: the same path there is refused, on another host or
-        // this Mac it is a folder of its own.
-        let app = panel.add_remote("app", "myhost", "/srv/app").unwrap();
-        assert_eq!(
-            panel.add_remote("again", "myhost", "/srv/app/"),
-            Err(app.clone())
-        );
-        assert_eq!(panel.add_remote("again", "myhost", "/srv/app"), Err(app));
-        assert!(panel.add_remote("app", "otherhost", "/srv/app").is_ok());
-        assert!(panel.add_folder("app", PathBuf::from("/srv/app")).is_ok());
+    fn a_folder_holds_any_number_of_workspaces() {
+        let mut wt = tree("/x/garden/.claude/worktrees/fix", false);
+        wt.repo = Some(PathBuf::from("/x/garden"));
+        let mut panel = Panel {
+            worktrees: vec![wt],
+            ..Panel::default()
+        };
+        // The same folder, as typed and with a slash at its end: each a
+        // workspace of its own, with an id of its own, also on a host.
+        let first = panel.add_folder("garden", PathBuf::from("/x/garden"));
+        let second = panel.add_folder("garden", PathBuf::from("/x/garden/"));
+        let third = panel.add_folder("seeds", PathBuf::from("/x/garden"));
+        let app = panel.add_remote("app", "myhost", "/srv/app");
+        let again = panel.add_remote("app", "myhost", "/srv/app");
+        let ids = [&first, &second, &third, &app, &again];
+        for (n, id) in ids.iter().enumerate() {
+            assert!(!ids[n + 1..].contains(id), "{id} twice");
+        }
         assert_eq!(panel.folders.len(), 5);
-        let _ = std::fs::remove_dir_all(&dir);
+        let names: Vec<&str> = panel.folders.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["garden", "garden 2", "seeds", "app", "app 2"]);
+        // A rename keeps each id, so two on one folder never trade theirs.
+        assert_eq!(panel.rename_folder(&second, "beds"), Some(second.clone()));
+        assert_eq!(panel.rename_folder(&first, "garden"), Some(first.clone()));
+        let at = |id: &str| panel.by_id(id).map(|i| panel.title(&panel.tasks[i]));
+        assert_eq!(at(&first).as_deref(), Some("garden"));
+        assert_eq!(at(&second).as_deref(), Some("beds"));
+        // Each selected apart.
+        panel.selected = Some(second.clone());
+        assert_eq!(panel.selected_index(), panel.by_id(&second));
+        assert_ne!(panel.selected_index(), panel.by_id(&first));
+        // Their worktree sits under one of them only: the first made.
+        for id in [&first, &second, &third] {
+            panel
+                .repos
+                .insert(id.to_string(), vec![PathBuf::from("/x/garden")]);
+        }
+        panel.rebuild();
+        let fix = "/x/garden/.claude/worktrees/fix";
+        assert_eq!(panel.parent_of_id(fix).as_deref(), Some(first.as_str()));
+        assert_eq!(panel.children(&first), 1);
+        assert_eq!(panel.children(&second), 0);
+        // Forget the first: the next made takes it.
+        panel.remove_folder(&first);
+        assert_eq!(panel.parent_of_id(fix).as_deref(), Some(second.as_str()));
+        // A terminal started on the folder, in no workspace in particular,
+        // is the first one's on it.
+        let at = folder_task(&panel.tasks, Path::new("/x/garden/src"));
+        assert_eq!(at.map(|i| panel.tasks[i].id()), Some(second));
+    }
+
+    #[test]
+    fn a_double_click_makes_a_workspace_on_the_selected_ones_folder() {
+        let mut wt = tree("/x/garden/garden/.claude/worktrees/fix", false);
+        wt.repo = Some(PathBuf::from("/x/garden/garden"));
+        let mut panel = Panel {
+            folders: vec![folder("GARDEN", "/x/garden"), folder("notes", "/x/notes")],
+            worktrees: vec![wt],
+            ..Panel::default()
+        };
+        panel.repos.insert(
+            "folder:GARDEN".into(),
+            vec![PathBuf::from("/x/garden/garden")],
+        );
+        panel.rebuild();
+        let some = |p: &str| Some(PathBuf::from(p));
+        let open = Some(Path::new("/e"));
+        // A folder workspace: its folder.
+        panel.selected = Some("folder:notes".into());
+        assert_eq!(panel.blank_folder(open), some("/x/notes"));
+        // A worktree: its folder workspace's folder, never its repository.
+        panel.selected = Some("/x/garden/garden/.claude/worktrees/fix".into());
+        assert_eq!(panel.blank_folder(open), some("/x/garden"));
+        // Nothing selected, or one without a folder: the open folder.
+        panel.selected = None;
+        assert_eq!(panel.blank_folder(open), some("/e"));
+        let scratch = panel.add_folderless("scratch");
+        panel.selected = Some(scratch);
+        assert_eq!(panel.blank_folder(open), some("/e"));
+        assert_eq!(panel.blank_folder(None), None);
+    }
+
+    #[test]
+    fn a_workspace_needs_no_folder() {
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
+        let mut wt = tree("/x/garden/.claude/worktrees/fix", false);
+        wt.repo = Some(PathBuf::from("/x/garden"));
+        let mut panel = Panel {
+            worktrees: vec![wt],
+            ..Panel::default()
+        };
+        let garden = panel.add_folder("garden", PathBuf::from("/x/garden"));
+        let bare = panel.add_folderless("scratch");
+        let task = panel.tasks[panel.by_id(&bare).unwrap()].clone();
+        assert!(task.folderless());
+        // Its terminals start in the home folder; it reads no repository.
+        assert_eq!(task.dir(), crate::platform::canonical(&home));
+        assert_eq!(panel.repos_of(&task), Some(Vec::new()));
+        assert_eq!(shown_folder(&task), "-");
+        assert!(!panel.has_workspace(&home));
+        // It holds no folder, so no terminal is taken for it by where it
+        // is, and its own never move it.
+        assert_eq!(folder_task(&panel.tasks, &home), None);
+        assert_eq!(folder_task(&panel.tasks, Path::new("/elsewhere")), None);
+        let i = panel.by_id(&bare).unwrap();
+        assert_eq!(
+            follow(&panel.tasks, i, Path::new("/x/garden")),
+            Follow::Stay
+        );
+        // Nor does it take worktrees.
+        panel
+            .repos
+            .insert(garden.clone(), vec![PathBuf::from("/x/garden")]);
+        panel.rebuild();
+        let fix = "/x/garden/.claude/worktrees/fix";
+        assert_eq!(panel.parent_of_id(fix).as_deref(), Some(garden.as_str()));
+        assert_eq!(panel.children(&bare), 0);
+        // Through the workspaces file and back, as a folder workspace's
+        // line with an empty folder; an older file reads as it did.
+        let text = folders_text(&panel.folders);
+        assert!(text.contains(&format!("scratch\t\t{bare}\n")), "{text}");
+        assert_eq!(parse_folders(&text), panel.folders);
+        assert_eq!(
+            parse_folders("old\t/x/old\n")[0].path,
+            PathBuf::from("/x/old")
+        );
+        assert!(parse_folders("far\t\tws:1\tmyhost\n").is_empty());
+        // Renamed, pinned and moved like any other; forgotten too.
+        assert_eq!(panel.rename_folder(&bare, "notes"), Some(bare.clone()));
+        panel.toggle_pin(&bare);
+        assert!(panel.is_pinned(&bare));
+        panel.move_before(&bare, Some(garden.as_str()));
+        panel.remove_folder(&bare);
+        assert_eq!(panel.by_id(&bare), None);
+        assert!(!panel.is_pinned(&bare));
+    }
+
+    #[test]
+    fn a_closed_tab_gives_way_to_its_own_workspaces_next() {
+        // Two workspaces' tabs, interleaved as they were opened: 0 and 1.
+        let (a, b) = (Some(0), Some(1));
+        // A's tab at 2 closed: left [A, B, A, B]; the A that slid into 2.
+        assert_eq!(after_close(&[a, b, a, b], 0, 2), Some(2));
+        // The A at the end closed: the one before, never B's beside it.
+        assert_eq!(after_close(&[a, b, a, b], 0, 4), Some(2));
+        assert_eq!(after_close(&[b, a, b], 0, 3), Some(1));
+        // A's first closed: the next A, past B's.
+        assert_eq!(after_close(&[b, b, a], 0, 0), Some(2));
+        // A has none left: no tab of B is taken for it.
+        assert_eq!(after_close(&[b, b], 0, 1), None);
+        assert_eq!(after_close(&[], 0, 0), None);
+        // A tab no workspace holds is never one of A's.
+        assert_eq!(after_close(&[None, b], 0, 0), None);
     }
 
     #[test]
@@ -4661,12 +4828,8 @@ mod tests {
     #[test]
     fn a_workspace_follows_its_terminal_and_keeps_a_name_you_gave_it() {
         let mut panel = Panel::default();
-        let auto = panel
-            .add_folder("ch-ui", PathBuf::from("/tmp/crc-move/ch-ui"))
-            .unwrap();
-        let mine = panel
-            .add_folder("CRC", PathBuf::from("/tmp/crc-move/crc"))
-            .unwrap();
+        let auto = panel.add_folder("seed-tray", PathBuf::from("/tmp/crc-move/seed-tray"));
+        let mine = panel.add_folder("CRC", PathBuf::from("/tmp/crc-move/seed-tray"));
         panel.move_folder(&auto, Path::new("/tmp/crc-move/duck-ui"));
         panel.move_folder(&mine, Path::new("/tmp/crc-move/duck-ui"));
         let by = |id: &str| panel.tasks[panel.by_id(id).unwrap()].clone();
@@ -4879,23 +5042,19 @@ mod tests {
         // on a new one with the same name.
         let mut panel = Panel::default();
         let dir = PathBuf::from("/tmp/crc-agents-test");
-        let old = panel.add_folder("crc", dir.clone()).unwrap();
+        let old = panel.add_folder("crc", dir.clone());
         panel.set_title(&old, "Mine");
         panel.toggle_pin(&old);
         panel.remove_folder(&old);
-        let new = panel.add_folder("crc", dir.clone()).unwrap();
+        let new = panel.add_folder("crc", dir.clone());
         assert_ne!(old, new);
         let task = panel.tasks[panel.by_id(&new).unwrap()].clone();
         assert_eq!(panel.title(&task), "crc");
         assert!(!panel.is_pinned(&new));
         // A session whose workspace is gone stays with the first one on
-        // its folder (two from before can share one), not the newest.
+        // its folder, not the newest.
         let first = panel.tasks[panel.by_id(&new).unwrap()].clone();
-        let mut second = first.clone();
-        second.key = "ws:second".into();
-        second.name = "crc 2".into();
-        panel.folders.push(second);
-        panel.rebuild();
+        panel.add_folder("crc", dir.clone());
         let at = folder_task(&panel.tasks, &first.path.join("src"));
         assert_eq!(at.map(|i| panel.tasks[i].id()), Some(new));
     }

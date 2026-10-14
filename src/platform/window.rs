@@ -3367,7 +3367,10 @@ define_class!(
                     return;
                 };
                 let active = state.terminal.active;
-                state.terminal.close_tab(active);
+                // Not another workspace's, behind this one's empty state.
+                if !agents::active_hidden(&state) {
+                    state.terminal.close_tab(active);
+                }
                 drop(state);
                 self.after_terminal_layout();
                 return;
@@ -7464,6 +7467,8 @@ enum Pick {
     NewWorkspace(String),
     /// A folder workspace to make on a folder chosen in a panel.
     NewWorkspaceChosen(String),
+    /// A workspace to make without a folder, by name alone.
+    NewWorkspaceFolderless(String),
     /// A remote workspace to make: a host and a folder on it.
     NewRemoteWorkspace(String, String),
     /// Commit everything in the workspace being asked about, with this
@@ -7556,6 +7561,15 @@ fn task_rows(
             Pick::NewTask(name.to_owned()),
         ));
     }
+    rows.push((
+        layout::PaletteRow {
+            icon: Some(crate::project::icons::TERMINAL),
+            title: format!("New workspace \u{201c}{name}\u{201d} without a folder"),
+            detail: "its terminals start in your home folder".into(),
+            shortcut: String::new(),
+        },
+        Pick::NewWorkspaceFolderless(name.to_owned()),
+    ));
     rows
 }
 

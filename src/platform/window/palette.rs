@@ -191,6 +191,7 @@ impl EditorView {
             Pick::NewTask(name) => self.create_task(name),
             Pick::NewWorkspace(name) => self.create_workspace(name),
             Pick::NewWorkspaceChosen(name) => self.create_workspace_chosen(name),
+            Pick::NewWorkspaceFolderless(name) => self.create_folderless_workspace(name),
             Pick::NewRemoteWorkspace(host, path) => self.create_remote_workspace(host, path),
             Pick::CommitAll(message) => self.agent_commit_all(message),
             Pick::Repo(path) => self.select_repo(&path),

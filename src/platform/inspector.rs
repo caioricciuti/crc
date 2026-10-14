@@ -514,6 +514,21 @@ impl Inspector {
         let name = fit(atlas, &name, width);
         layout::push_title(out, atlas, x, y, 15.0, &name, theme.text, width);
         y += 24.0;
+        // No folder: no Git to show, only where its terminals start.
+        if workspace.folderless() {
+            text(out, atlas, x, y, width, "No folder", theme.gutter_text);
+            y += ROW;
+            let said = wrap(
+                atlas,
+                "Its terminals and Claude sessions start in your home folder.",
+                width,
+            );
+            for line in said {
+                note(out, atlas, x, y, width, &line, theme);
+                y += ROW;
+            }
+            return;
+        }
         let shown = crate::platform::agents::shown_folder(workspace);
         let shown = fit_start(atlas, &shown, width);
         text(out, atlas, x, y, width, &shown, theme.gutter_text);

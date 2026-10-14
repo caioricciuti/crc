@@ -210,7 +210,6 @@ key 45 cmd,shift N
 wait 200
 text try-it
 key 125
-key 125
 key 36
 wait 700
 wait 700

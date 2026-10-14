@@ -201,12 +201,13 @@ impl Tab {
 }
 
 pub struct Panel {
-    /// The workspaces of tabs closed since the window last looked: one
-    /// whose last terminal closed goes with it.
+    /// The folder workspaces a terminal left by `cd` since the window last
+    /// looked: one left with no terminal goes.
     pub closed_in: Vec<String>,
-    /// The tab showing was closed: its workspace and its place, so the
+    /// The tab showing was closed: the workspace it was started in, its
+    /// folder (which name the workspace it was in) and its place, so the
     /// next tab shown is that workspace's, not whichever slid into place.
-    pub closed_active: Option<(Option<String>, usize)>,
+    pub closed_active: Option<(Option<String>, PathBuf, usize)>,
     pub open: bool,
     /// Whether typing goes to the terminal rather than the editor.
     pub focus: bool,
@@ -264,6 +265,14 @@ impl Panel {
     /// Whether keys should go to the terminal.
     pub fn has_keys(&self) -> bool {
         self.open && self.focus && !self.tabs.is_empty()
+    }
+
+    /// Whether the active session is one the header lists: not, in Agents
+    /// mode, when the selected workspace has none left.
+    pub fn showing(&self) -> bool {
+        self.shown
+            .as_ref()
+            .is_none_or(|shown| shown.contains(&self.active))
     }
 
     /// The pair, while both its tabs exist and one of them is active.
@@ -331,9 +340,18 @@ impl Panel {
             // Dropping the session hangs up on its program.
             let tab = self.tabs.remove(index);
             if index == self.active {
-                self.closed_active = Some((tab.workspace.clone(), index));
+                self.closed_active = Some((tab.workspace.clone(), tab.folder.clone(), index));
+            } else if index < self.active {
+                // The one showing slid down a place: it stays the one.
+                self.active -= 1;
             }
-            self.closed_in.extend(tab.workspace);
+            // The tabs listed, renumbered as they are.
+            if let Some(shown) = &mut self.shown {
+                shown.retain(|i| *i != index);
+                for i in shown.iter_mut().filter(|i| **i > index) {
+                    *i -= 1;
+                }
+            }
         }
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len().saturating_sub(1);
@@ -830,6 +848,25 @@ pub fn draw(
                 theme.hairline
             },
         );
+    }
+    // The workspace listed has no terminal left: the one at the front is
+    // another's, and is not shown in its place.
+    if !panel.showing() {
+        let said = "No terminal in this workspace. \u{2318}T starts one.";
+        let width = layout::ui_text_width(atlas, said);
+        layout::push_ui_text(
+            out,
+            atlas,
+            Viewport {
+                x: screen.x + ((screen.width - width) * 0.5).max(0.0).floor(),
+                y: screen.y + (screen.height * 0.4).floor(),
+                width: width.min(screen.width),
+                height: 20.0,
+            },
+            said,
+            theme.gutter_text,
+        );
+        return;
     }
     for (index, screen) in screens {
         let find = find.filter(|_| index == panel.active);

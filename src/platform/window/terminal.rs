@@ -282,7 +282,7 @@ impl EditorView {
                 .on
                 .then(|| state.agents.selected_index())
                 .flatten()
-                .map(|i| state.agents.tasks[i].path.clone())
+                .map(|i| state.agents.tasks[i].dir())
         });
         self.spawn_terminal_in(claude, task.as_deref());
     }
@@ -344,7 +344,7 @@ impl EditorView {
                     .filter(|t| {
                         cwd.is_none_or(|dir| match t.host {
                             Some(_) => dir == t.path,
-                            None => crate::platform::canonical(dir) == t.path,
+                            None => crate::platform::canonical(dir) == t.dir(),
                         })
                     })
                     .map(|t| t.id())
@@ -961,6 +961,9 @@ impl EditorView {
         let Some(mut state) = self.state_mut() else {
             return;
         };
+        if super::agents::active_hidden(&state) {
+            return;
+        }
         let panel = &mut state.terminal;
         panel.back = 0;
         panel.selection = None;
@@ -981,6 +984,11 @@ impl EditorView {
         let Some(mut state) = self.state_mut() else {
             return;
         };
+        // The selected workspace has no terminal: nothing goes to the
+        // other workspace's behind its empty state.
+        if super::agents::active_hidden(&state) {
+            return;
+        }
         state.terminal.back = 0;
         state.terminal.selection = None;
         let mut answered = false;
@@ -1333,6 +1341,14 @@ impl EditorView {
     /// A key while the terminal has the keyboard. Always handled: anything
     /// unhandled would otherwise reach the text system and the document.
     pub(super) fn terminal_key(&self, event: &NSEvent) -> bool {
+        // The selected workspace's empty state takes the keys: none reach
+        // another workspace's session behind it.
+        if self
+            .state()
+            .is_some_and(|state| super::agents::active_hidden(&state))
+        {
+            return true;
+        }
         let flags = event.modifierFlags();
         let code = event.keyCode();
         if flags.contains(NSEventModifierFlags::Command) {

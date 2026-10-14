@@ -6,11 +6,10 @@
 # cmux and supacode have it (a test instance takes the folder named as it
 # beside the selected one's); each row shows its folder. A row dragged
 # above another stays there; a double-click on a row names it in place.
-# New Workspace on a folder a workspace has is refused, and that one is
-# selected (sideproj, from its name here). Then a reboot, played as crc
-# quitting and its session helpers ending: the next launch starts the lost
-# terminals again in their workspaces, and types `claude --continue` into
-# the one that ran Claude (a stand-in here, on PATH as `claude`).
+# Then a reboot, played as crc quitting and its session helpers ending:
+# the next launch starts the lost terminals again in their workspaces, and
+# types `claude --continue` into the one that ran Claude (a stand-in here,
+# on PATH as `claude`). Two workspaces on one folder: scenario 60.
 S="$T/sideproj"
 mkdir -p "$S" "$T/sidebin" "$T/beta" "$T/gamma"
 printf 'x\n' > "$S/x.txt"
@@ -54,12 +53,6 @@ dump $T/side-renamed.out
 key 8 cmd,shift c
 wait 900
 dump $T/side-claude.out
-key 45 cmd n
-wait 200
-text sideproj
-key 36
-wait 700
-dump $T/side-again.out
 quit
 SCRIPT
 # The list is one for the app, kept under HOME: this scenario has its own.
@@ -79,14 +72,6 @@ gamma_key=$(awk -F'\t' '$1 == "gamma" { print $3 }' "$side_kept/workspaces" 2>/d
 # beta, now third, renamed in its row (a folder workspace takes the name).
 # (The script's double-click is one event, so it does not select first.)
 expect "$T/side-renamed.out" agents "on tasks=sideproj,gamma,notes selected=gamma sessions=sideproj,notes,*gamma claude=0 pair=- op=-"
-# A second workspace on sideproj's folder is refused: sideproj is selected,
-# its terminal showing, and nothing is added.
-grep -q "^message: $S is already the workspace sideproj$" "$T/side-again.out" \
-    || failed "sidebar: a second workspace on a folder: $(grep '^message:' "$T/side-again.out")"
-case "$(grep '^agents:' "$T/side-again.out")" in
-"agents: on tasks=sideproj,gamma,notes selected=sideproj sessions=*sideproj,"*) ;;
-*) failed "sidebar: after the refusal: $(grep '^agents:' "$T/side-again.out")" ;;
-esac
 
 # The reboot: the helpers end without a word (the self-test's quit writes
 # nothing either, as a crash would not); each session's record kept its

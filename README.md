@@ -132,7 +132,8 @@ the size and write it back.
   request, coloured by its checks. The terminal's tabs are the selected
   workspace's sessions. The list is one for the whole app, not the
   folder open in the editor. New Workspace (`Cmd-Shift-N`) adds one on
-  a folder you choose, or on the selected workspace's folder, or starts
+  a folder you choose (a folder can hold several), with no folder at all
+  (its terminals start in your home folder), or starts
   a task on a new branch of its repository in a worktree under
   `~/Library/Application Support/crc/worktrees/`; each opens a terminal
   in it. A workspace holds the Git repositories in its folder (the

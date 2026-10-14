@@ -13,8 +13,8 @@
 # The list is one for the app, kept under HOME: this scenario has its own. The agent is typed into the shell, as `claude` would be:
 # here a stand-in on PATH that ends its turn with the Stop hook, which
 # marks its session as waiting. Control-2 shows the second workspace; Cmd-T
-# starts a shell in the selected one; a double-click under the list, with
-# every folder at hand in a workspace, asks for a new one; Cmd-Shift-A
+# starts a shell in the selected one; a double-click under the list makes a
+# second workspace on the selected one's folder, with a shell; Cmd-Shift-A
 # again gives the column back to the editor. No session ever runs Claude on
 # its own (claude=0).
 case "$BIN" in /*) hook_bin=$BIN ;; *) hook_bin=$PWD/$BIN ;; esac
@@ -50,7 +50,6 @@ dump $T/agents-on.out
 key 45 cmd,shift N
 wait 200
 text try-it
-key 125
 key 125
 key 36
 wait 700
@@ -108,8 +107,6 @@ dump $T/agents-single.out
 click @agents.blank 2
 wait 700
 dump $T/agents-blank.out
-key 53
-wait 200
 key 0 cmd,shift A
 wait 400
 dump $T/agents-off.out
@@ -155,15 +152,14 @@ expect_terminal "$T/agents-folder.out" "agent ready in notes"
 expect "$T/agents-cmdt.out" agents "on tasks=agentsproj,try-it,notes selected=notes sessions=agentsproj,try-it,try-it,notes,*notes claude=0 pair=- op=-"
 grep -q "^notes	" "$T"/home/agents/Library/Application\ Support/crc/agents/workspaces 2>/dev/null \
     || failed "agents: the notes workspace was not kept under Application Support/crc/agents"
-# One click under the list does nothing; a double-click, the open folder
-# (agentsproj) having its workspace, asks for a new one's name instead of
-# making a second there.
+# One click under the list does nothing; a double-click makes a second
+# workspace on the selected one's folder (notes), named after it, with a
+# shell: a folder holds any number of workspaces.
 expect "$T/agents-single.out" agents "on tasks=agentsproj,try-it,notes selected=notes sessions=agentsproj,try-it,try-it,notes,*notes claude=0 pair=- op=-"
-expect "$T/agents-blank.out" agents "on tasks=agentsproj,try-it,notes selected=notes sessions=agentsproj,try-it,try-it,notes,*notes claude=0 pair=- op=-"
-grep -q '^palette_query: $' "$T/agents-blank.out" \
-    || failed "agents: a double-click under the list did not ask for a workspace"
+expect "$T/agents-blank.out" agents "on tasks=agentsproj,try-it,notes,notes 2 selected=notes 2 sessions=agentsproj,try-it,try-it,notes,notes,*notes 2 claude=0 pair=- op=-"
+expect "$T/agents-blank.out" agents_folders "agentsproj=$T/agentsproj,notes=$T/notes,notes 2=$T/notes"
 # Back in the editor, the sessions keep running.
-expect "$T/agents-off.out" agents "off tasks=agentsproj,try-it,notes selected=notes sessions=agentsproj,try-it,try-it,notes,*notes claude=0 pair=- op=-"
+expect "$T/agents-off.out" agents "off tasks=agentsproj,try-it,notes,notes 2 selected=notes 2 sessions=agentsproj,try-it,try-it,notes,notes,*notes 2 claude=0 pair=- op=-"
 grep -q '^terminals: waiting: finished|waiting: finished|' "$T/agents-off.out" \
     || failed "agents-off.out: $(grep '^terminals:' "$T/agents-off.out")"
 testgit "$T/agentsproj" worktree remove --force "$(ls -d "$T"/worktrees/agentsproj-*/try-it)" 2>/dev/null || true
@@ -250,17 +246,19 @@ grep -q '^inspector: branch=main base=- ahead=0 behind=0 upstream=-' "$T/agents-
 # A second workspace, then back to the first: Command-1 and 2 pick its
 # terminals. The one showing exits: the next shown is the first
 # workspace's other terminal, not the second workspace's that slid into
-# its place. The last one exits and its workspace goes with it.
+# its place. The last one exits: its workspace stays, selected and empty,
+# and the second's terminal is not shown in its place.
 expect "$T/agents-other-made.out" agents "on tasks=movedrepo,other selected=other sessions=movedrepo,movedrepo,*other claude=0 pair=- op=-"
 # The first terminal never left plainproj: showing it, the workspace is there.
 expect "$T/agents-cmd1.out" agents "on tasks=plainproj,other selected=plainproj sessions=*plainproj,plainproj,other claude=0 pair=- op=-"
 expect "$T/agents-cmd2.out" agents "on tasks=movedrepo,other selected=movedrepo sessions=movedrepo,*movedrepo,other claude=0 pair=- op=-"
 # The one left is the plainproj shell: the workspace follows it there.
 expect "$T/agents-one-left.out" agents "on tasks=plainproj,other selected=plainproj sessions=*plainproj,other claude=0 pair=- op=-"
-expect "$T/agents-closed.out" agents "on tasks=other selected=other sessions=*other claude=0 pair=- op=-"
+expect "$T/agents-closed.out" agents "on tasks=plainproj,other selected=plainproj sessions=*other claude=0 pair=- op=-"
 # Agents leads: back in the editor, the project is the selected
-# workspace's folder (other), not the one the editor opened on.
-grep -q '^home: .* repos=other:main:' "$T/agents-plain-off.out" \
+# workspace's folder (plainproj, no repository in it), not that of the
+# other workspace, whose terminal is the one left.
+grep -q '^home: .* repos= ' "$T/agents-plain-off.out" \
     || failed "agents-plain-off.out: $(grep '^home:' "$T/agents-plain-off.out")"
 # The editor never opens the terminal for you, even one it had open.
 grep -q '^terminal: open=false ' "$T/agents-plain-off.out" \
