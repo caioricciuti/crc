@@ -325,7 +325,7 @@ fn hunk_start(counts: &str) -> (usize, usize) {
     (old, new)
 }
 
-fn command(root: &Path) -> Command {
+pub(super) fn command(root: &Path) -> Command {
     let mut cmd = Command::new("git");
     cmd.arg("-C")
         .arg(root)

@@ -259,6 +259,138 @@ pub fn unchanged_lines(old: &str, new: &str) -> Vec<(usize, usize)> {
         .collect()
 }
 
+/// Where line `line` of `old` is in `new`, given `changes(old, new)`: the
+/// lines around the changes shift with them. A line inside a change lands
+/// on the line at the same offset into what replaced it, or that run's
+/// last line when it is shorter; a removed line lands on the line the
+/// deletion sits above, which is the line count when it was at the end.
+pub fn map_line(changes: &[Change], line: usize) -> usize {
+    translate(changes, line, |c| {
+        ((c.old_start, c.old_end), (c.new_start, c.new_end))
+    })
+}
+
+/// [`map_line`] the other way: where line `line` of `new` was in `old`.
+pub fn map_line_back(changes: &[Change], line: usize) -> usize {
+    translate(changes, line, |c| {
+        ((c.new_start, c.new_end), (c.old_start, c.old_end))
+    })
+}
+
+/// `line` from the first side of `changes` to the second; `sides` gives a
+/// change's (from, to) line ranges.
+fn translate(
+    changes: &[Change],
+    line: usize,
+    sides: impl Fn(&Change) -> ((usize, usize), (usize, usize)),
+) -> usize {
+    // The changes ending at or before the line; past the last of them
+    // the two texts are in step again.
+    let i = changes.partition_point(|c| sides(c).0.1 <= line);
+    if let Some(c) = changes.get(i) {
+        let ((from, _), (start, end)) = sides(c);
+        if from <= line {
+            return if end > start {
+                (start + (line - from)).min(end - 1)
+            } else {
+                start
+            };
+        }
+    }
+    match i.checked_sub(1).map(|p| sides(&changes[p])) {
+        Some(((_, from_end), (_, to_end))) => line - from_end + to_end,
+        None => line,
+    }
+}
+
+/// Which text a line of [`merged`] comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MergedKind {
+    Both,
+    OldOnly,
+    NewOnly,
+}
+
+/// One line of [`merged`], with its zero-based line in each text that has
+/// it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MergedLine {
+    pub kind: MergedKind,
+    pub old: Option<usize>,
+    pub new: Option<usize>,
+}
+
+/// Every line of `old` and of `new` once, in reading order: unchanged
+/// lines once, and each run of changes as its removed lines then its added
+/// ones, so removed lines can be drawn where they were. Lines are counted
+/// with their line breaks, as [`changes`] counts them.
+pub fn merged(old: &str, new: &str) -> Vec<MergedLine> {
+    let a: Vec<&str> = old.split_inclusive('\n').collect();
+    let b: Vec<&str> = new.split_inclusive('\n').collect();
+    let mut out = Vec::with_capacity(a.len().max(b.len()));
+    // A run's added lines, held until its removed ones are all out.
+    let mut added = Vec::new();
+    let line = |kind, old, new| MergedLine { kind, old, new };
+    for op in script(&a, &b) {
+        match op {
+            Op::Equal(i, j) => {
+                out.append(&mut added);
+                out.push(line(MergedKind::Both, Some(i), Some(j)));
+            }
+            Op::Delete(i) => out.push(line(MergedKind::OldOnly, Some(i), None)),
+            Op::Insert(j) => added.push(line(MergedKind::NewOnly, None, Some(j))),
+        }
+    }
+    out.append(&mut added);
+    out
+}
+
+/// The one edit that turns `old` into `new`: everything between their
+/// common start and common end, on whole characters, in the shape the
+/// incremental parser takes. `None` when the texts are the same. Points
+/// count rows by `\n`, so both texts should have the buffer's line breaks.
+pub fn prefix_suffix_edit(old: &str, new: &str) -> Option<crate::text::buffer::Edit> {
+    let (a, b) = (old.as_bytes(), new.as_bytes());
+    let shorter = a.len().min(b.len());
+    let mut prefix = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    let mut suffix = a
+        .iter()
+        .rev()
+        .zip(b.iter().rev())
+        .take(shorter - prefix)
+        .take_while(|(x, y)| x == y)
+        .count();
+    while !(old.is_char_boundary(prefix) && new.is_char_boundary(prefix)) {
+        prefix -= 1;
+    }
+    while !(old.is_char_boundary(a.len() - suffix) && new.is_char_boundary(b.len() - suffix)) {
+        suffix -= 1;
+    }
+    let (old_end, new_end) = (a.len() - suffix, b.len() - suffix);
+    if prefix == old_end && prefix == new_end {
+        return None;
+    }
+    // (row, byte column) of `at`, counting on from `from`, a point of
+    // `text` already known.
+    let point = |text: &str, from: (usize, (usize, usize)), at: usize| {
+        let (start, (row, column)) = from;
+        let span = &text[start..at];
+        match span.rfind('\n') {
+            Some(last) => (row + span.matches('\n').count(), at - (start + last + 1)),
+            None => (row, column + (at - start)),
+        }
+    };
+    let start_point = point(old, (0, (0, 0)), prefix);
+    Some(crate::text::buffer::Edit {
+        start_byte: prefix,
+        old_end_byte: old_end,
+        new_end_byte: new_end,
+        start_point,
+        old_end_point: point(old, (prefix, start_point), old_end),
+        new_end_point: point(new, (prefix, start_point), new_end),
+    })
+}
+
 /// The edit script from `a` to `b`, in order.
 fn script(a: &[&str], b: &[&str]) -> Vec<Op> {
     let prefix = a.iter().zip(b).take_while(|(x, y)| x == y).count();
@@ -752,6 +884,171 @@ mod tests {
                 now = undo_hunk(old, &now, last).expect("undo");
             }
             assert_eq!(now, old, "undoing {old:?} -> {new:?}");
+        }
+    }
+
+    #[test]
+    fn lines_map_across_changes_and_back() {
+        // Lines 1-2 modified into three, a deletion above old 6, an
+        // addition after old 8.
+        let old = "0\n1\n2\n3\n4\n5\ngone\n6\n7\n8\n";
+        let new = "0\nA\nB\nC\n3\n4\n5\n6\n7\n8\nnew\n";
+        let found = changes(old, new);
+        assert_eq!(found.len(), 3);
+        let forward: Vec<usize> = (0..11).map(|l| map_line(&found, l)).collect();
+        // `gone` lands on `6`, the line its deletion sits above; past the
+        // end the texts stay in step.
+        assert_eq!(forward, [0, 1, 2, 4, 5, 6, 7, 7, 8, 9, 11]);
+        let back: Vec<usize> = (0..12).map(|l| map_line_back(&found, l)).collect();
+        // `C` has no old line at its offset, so it takes the run's last.
+        assert_eq!(back, [0, 1, 2, 2, 3, 4, 5, 7, 8, 9, 10, 10]);
+        // Every unchanged line goes there and back to itself.
+        for (i, j) in unchanged_lines(old, new) {
+            assert_eq!(map_line(&found, i), j);
+            assert_eq!(map_line_back(&found, j), i);
+        }
+        assert_eq!(map_line(&[], 7), 7);
+        // Removed from the end: the line count, for the caller to clamp.
+        assert_eq!(map_line(&changes("a\nb\nc\n", "a\n"), 2), 1);
+        // Everything added: old line 0 is past the new text.
+        assert_eq!(map_line(&changes("", "a\nb\n"), 0), 2);
+        assert_eq!(map_line_back(&changes("", "a\nb\n"), 1), 0);
+        // A random pair agrees with the unchanged lines too.
+        let a = "a\nb\nc\nd\na\nb\nb\na\nc\n";
+        let b = "c\nb\na\nb\na\nc\nd\nd\n";
+        let found = changes(a, b);
+        for (i, j) in unchanged_lines(a, b) {
+            assert_eq!((map_line(&found, i), map_line_back(&found, j)), (j, i));
+        }
+    }
+
+    #[test]
+    fn merged_lines_put_removed_before_added_in_place() {
+        use MergedKind::{Both, NewOnly, OldOnly};
+        let got: Vec<(MergedKind, Option<usize>, Option<usize>)> =
+            merged("a\nb\nc\nd\ne\n", "a\nB\nc\ne\nf\n")
+                .into_iter()
+                .map(|l| (l.kind, l.old, l.new))
+                .collect();
+        assert_eq!(
+            got,
+            [
+                (Both, Some(0), Some(0)),
+                (OldOnly, Some(1), None),
+                (NewOnly, None, Some(1)),
+                (Both, Some(2), Some(2)),
+                (OldOnly, Some(3), None),
+                (Both, Some(4), Some(3)),
+                (NewOnly, None, Some(4)),
+            ]
+        );
+        assert!(merged("", "").is_empty());
+        // Each text read off the merge is that text.
+        let cases = [
+            (OLD, NEW),
+            ("x\ny\n", ""),
+            ("", "x\n"),
+            ("a\nb\nc\na\nb\nb\na\n", "c\nb\na\nb\na\nc\n"),
+        ];
+        for (old, new) in cases {
+            let lines = merged(old, new);
+            let olds: Vec<usize> = lines.iter().filter_map(|l| l.old).collect();
+            let news: Vec<usize> = lines.iter().filter_map(|l| l.new).collect();
+            assert_eq!(
+                olds,
+                (0..old.split_inclusive('\n').count()).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                news,
+                (0..new.split_inclusive('\n').count()).collect::<Vec<_>>()
+            );
+            // Within a run, no added line comes before a removed one.
+            for pair in lines.windows(2) {
+                assert!(!(pair[0].kind == NewOnly && pair[1].kind == OldOnly));
+            }
+        }
+        // Past the edit limit: the middle removed whole, then added whole.
+        let old: String = (0..3000).map(|n| format!("{n}\n")).collect();
+        let new: String = (0..3000).map(|n| format!("x{n}\n")).collect();
+        let lines = merged(&old, &new);
+        assert_eq!(lines.len(), 6000);
+        assert!(lines[..3000].iter().all(|l| l.kind == OldOnly));
+        assert!(lines[3000..].iter().all(|l| l.kind == NewOnly));
+    }
+
+    /// `old` with `edit` applied, the replacement taken from `new`.
+    fn applied(old: &str, new: &str) -> String {
+        let Some(edit) = prefix_suffix_edit(old, new) else {
+            return old.to_owned();
+        };
+        let mut out = old.to_owned();
+        out.replace_range(
+            edit.start_byte..edit.old_end_byte,
+            &new[edit.start_byte..edit.new_end_byte],
+        );
+        out
+    }
+
+    #[test]
+    fn one_edit_spans_the_difference_on_whole_characters() {
+        use crate::text::buffer::Edit;
+        assert_eq!(prefix_suffix_edit("same\n", "same\n"), None);
+        assert_eq!(
+            prefix_suffix_edit("let a = 1;\nok\n", "let a = 22;\nok\n"),
+            Some(Edit {
+                start_byte: 8,
+                old_end_byte: 9,
+                new_end_byte: 10,
+                start_point: (0, 8),
+                old_end_point: (0, 9),
+                new_end_point: (0, 10),
+            })
+        );
+        // Lines added in the middle: the points move down.
+        assert_eq!(
+            prefix_suffix_edit("a\nb\n", "a\nx\ny\nb\n"),
+            Some(Edit {
+                start_byte: 2,
+                old_end_byte: 2,
+                new_end_byte: 6,
+                start_point: (1, 0),
+                old_end_point: (1, 0),
+                new_end_point: (3, 0),
+            })
+        );
+        // é and è share their first byte, and the text after them: the
+        // edit still starts and ends on character boundaries.
+        let edit = prefix_suffix_edit("caf\u{e9}\u{e9}\n", "caf\u{e8}\u{e9}\n").unwrap();
+        assert_eq!(
+            (edit.start_byte, edit.old_end_byte, edit.new_end_byte),
+            (3, 5, 5)
+        );
+        assert_eq!(edit.old_end_point, (0, 5), "columns are bytes");
+        // Repeated text: prefix and suffix do not overlap.
+        let edit = prefix_suffix_edit("aaaa", "aa").unwrap();
+        assert_eq!(
+            (edit.start_byte, edit.old_end_byte, edit.new_end_byte),
+            (2, 4, 2)
+        );
+        let cases = [
+            ("", "\u{1f600}\n"),
+            ("\u{1f600}\n", ""),
+            ("\u{1f600}\u{1f601}", "\u{1f600}\u{1f602}"),
+            ("\u{4e2d}\u{6587}\n\u{6587}", "\u{4e2d}\n\u{6587}"),
+            ("x\ny\u{e9}z\n", "x\nyz\n"),
+        ];
+        for (old, new) in cases {
+            assert_eq!(applied(old, new), new, "{old:?} -> {new:?}");
+            let edit = prefix_suffix_edit(old, new).unwrap();
+            // The points match a count of the text.
+            let point = |text: &str, at: usize| {
+                let row = text[..at].matches('\n').count();
+                let column = at - text[..at].rfind('\n').map_or(0, |n| n + 1);
+                (row, column)
+            };
+            assert_eq!(edit.start_point, point(old, edit.start_byte));
+            assert_eq!(edit.old_end_point, point(old, edit.old_end_byte));
+            assert_eq!(edit.new_end_point, point(new, edit.new_end_byte));
         }
     }
 }

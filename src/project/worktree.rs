@@ -1821,7 +1821,7 @@ fn strip(s: &str, keep: impl Fn(char) -> bool) -> String {
 
 /// One line of untrusted text (a title, a label, a login): no control
 /// characters at all, a line break or tab made a space.
-fn clean_line(s: &str) -> String {
+pub(super) fn clean_line(s: &str) -> String {
     let spaced: String = s
         .chars()
         .map(|c| {

@@ -3,6 +3,7 @@
 pub mod conflict;
 pub mod finder;
 pub mod git;
+pub mod history;
 pub mod icons;
 pub mod review;
 pub mod tree;
