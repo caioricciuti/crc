@@ -314,7 +314,9 @@ the size and write it back.
   (OAuth), and shows interactive MCP Apps as nothing: their results show
   as text. `crc --mcp` has no live editor state yet, only what is on disk
   and in the index.
-- **Git stops short of history.** No history browser, and no merge or
+- **Git history is per file.** File History and Blame Heat walk one
+  file's commits; there is no log of the whole repository or commit
+  graph, and no merge or
   rebase of your own branches from the menus (start one in the terminal;
   crc resolves, aborts and continues it). Hunk staging covers tracked text
   changes; other change types use whole-file actions. Gutter marks compare

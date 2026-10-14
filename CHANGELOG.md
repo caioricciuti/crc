@@ -2,7 +2,7 @@
 
 One entry per tag, written for people who use the editor.
 
-## Unreleased
+## v0.2.0-alpha.24, 2026-10-15
 
 - Terminal: programs that ask for the mouse now get it. crc read the
   request but never passed clicks on, so the buttons of full-screen
