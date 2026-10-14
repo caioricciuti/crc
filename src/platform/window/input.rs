@@ -413,6 +413,26 @@ impl EditorView {
         {
             return true;
         }
+        // Cmd-Option-Y also when the menu item is greyed out, so the key
+        // says why there is no history to show.
+        if event
+            .modifierFlags()
+            .contains(NSEventModifierFlags::Command | NSEventModifierFlags::Option)
+            && event.keyCode() == key::Y
+            && !self.state().is_some_and(|state| field_has_keys(&state))
+        {
+            self.open_history();
+            return true;
+        }
+        if self.state().is_some_and(|state| scrub::has_keys(&state))
+            && let Some(step) = scrub::history_step(event)
+        {
+            match step {
+                Some(step) => self.step_history(step),
+                None => self.close_history(),
+            }
+            return true;
+        }
         {
             let flags = event.modifierFlags();
             let plain = !flags.contains(NSEventModifierFlags::Command)

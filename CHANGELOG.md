@@ -4,6 +4,13 @@ One entry per tag, written for people who use the editor.
 
 ## Unreleased
 
+- Git > File History (`Cmd-Option-Y`) opens a read-only tab beside the
+  file showing it at its newest commit; Left and Right step to older and
+  newer versions, Home and End go to the oldest one and to your working
+  text, and Escape closes it, leaving your file and caret as they were.
+  Renames are followed, the caret stays on the same code from version to
+  version, and the gutter marks what each commit changed. Versions are
+  read in the background, nearest first.
 - Git > Next Change (`Option-F5`) and Previous Change (`Shift-Option-F5`)
   move the caret through the lines that differ from HEAD, wrapping at the
   ends, and say which change of how many it is on. Git > Revert Change

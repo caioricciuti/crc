@@ -554,6 +554,12 @@ impl EditorView {
     /// Saves, falling back to a Save As panel when there is no path yet.
     /// Returns whether the file actually reached disk.
     pub(super) fn save(&self, force_panel: bool) -> bool {
+        if let Some(mut state) = self.state_mut()
+            && state.docs.active().is_frozen()
+        {
+            state.message = Some(("a version from history is not saved".into(), Instant::now()));
+            return false;
+        }
         let Some(chosen) = self.choose_save_path(force_panel) else {
             return false;
         };

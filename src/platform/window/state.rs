@@ -240,6 +240,7 @@ impl State {
             && !self.agents.busy()
             && self.reloads.pending.is_empty()
             && !self.symbols.pending()
+            && self.scrub.as_ref().is_none_or(|s| !s.busy())
             && self
                 .claude
                 .as_ref()

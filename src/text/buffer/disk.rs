@@ -266,7 +266,14 @@ impl Buffer {
     /// Whether edits are refused: a preview has no text to edit, and a
     /// read-only file is too big to.
     pub(super) fn is_locked(&self) -> bool {
-        self.preview_file || self.read_only || self.home_page || self.view_only
+        self.preview_file || self.read_only || self.home_page || self.view_only || self.frozen
+    }
+    /// Makes this a document that is read and never edited or saved.
+    pub fn set_frozen(&mut self, frozen: bool) {
+        self.frozen = frozen;
+    }
+    pub fn is_frozen(&self) -> bool {
+        self.frozen
     }
     pub fn set_view_only(&mut self, view_only: bool) {
         self.view_only = view_only;
@@ -423,6 +430,12 @@ impl Buffer {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "preview files are read-only",
+            ));
+        }
+        if self.frozen {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "a version from history is not saved",
             ));
         }
         let target = match (path, &self.path) {
@@ -643,6 +656,7 @@ impl Buffer {
             read_only: false,
             home_page: false,
             view_only: false,
+            frozen: false,
             scroll_line: 0,
             scroll_fraction: 0.0,
             scroll_column: 0,

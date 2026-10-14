@@ -1514,6 +1514,8 @@ fn status_texts(parts: &StatusParts<'_>) -> (String, String) {
                 "Read-only: over {}",
                 crate::text::buffer::human_size(crate::text::buffer::read_only_limit())
             )
+        } else if buffer.is_frozen() {
+            "Read-only".to_string()
         } else if buffer.is_dirty() {
             "Unsaved changes".to_string()
         } else {

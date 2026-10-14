@@ -72,6 +72,7 @@ mod palette;
 mod project;
 mod render;
 mod review;
+mod scrub;
 mod selftest_play;
 mod sidebar;
 mod state;
@@ -184,6 +185,7 @@ mod key {
     pub const F12: u16 = 111;
     pub const F: u16 = 3;
     pub const O: u16 = 31;
+    pub const Y: u16 = 16;
 }
 
 /// What a key event's `characters` contributes as typed text.
@@ -663,6 +665,8 @@ struct State {
     diff_tab: Option<u64>,
     /// The GitHub issue each issue tab shows, by buffer id.
     issue_tabs: HashMap<u64, issues::IssueTab>,
+    /// Git > File History: a file's versions in a read-only tab beside it.
+    scrub: Option<scrub::Scrub>,
     /// Whether the commit message field has the keyboard. Source control is
     /// docked, not modal, so it only takes typing when it is asked to.
     git_focus: bool,
@@ -2694,6 +2698,7 @@ define_class!(
             self.lsp_flush_changes();
             self.gutter_refresh();
             self.blame_refresh();
+            self.poll_scrub();
             self.bulb_refresh();
             self.ext_poll();
             self.sync_html_preview();
@@ -3092,6 +3097,21 @@ define_class!(
         #[unsafe(method(showChange:))]
         fn action_show_change(&self, _sender: Option<&AnyObject>) {
             self.show_change(None);
+        }
+
+        #[unsafe(method(fileHistory:))]
+        fn action_file_history(&self, _sender: Option<&AnyObject>) {
+            self.open_history();
+        }
+
+        #[unsafe(method(olderVersion:))]
+        fn action_older_version(&self, _sender: Option<&AnyObject>) {
+            self.step_history(scrub::Step::Older);
+        }
+
+        #[unsafe(method(newerVersion:))]
+        fn action_newer_version(&self, _sender: Option<&AnyObject>) {
+            self.step_history(scrub::Step::Newer);
         }
 
         #[unsafe(method(stageChange:))]
@@ -4298,7 +4318,16 @@ define_class!(
             } else if action == sel!(redo:) {
                 focused_buffer(&state).can_redo()
             } else if action == sel!(saveDocument:) {
-                state.docs.active().is_dirty() || state.docs.active().path.is_none()
+                (state.docs.active().is_dirty() || state.docs.active().path.is_none())
+                    && !state.docs.active().is_frozen()
+            } else if action == sel!(saveDocumentAs:) {
+                !state.docs.active().is_frozen()
+            } else if action == sel!(fileHistory:) {
+                // The key says why when it is not.
+                let active = state.docs.active();
+                active.path.is_some() && !active.is_preview_file()
+            } else if action == sel!(olderVersion:) || action == sel!(newerVersion:) {
+                scrub::has_keys(&state)
             } else if action == sel!(revertDocumentToSaved:) {
                 let active = state.docs.active();
                 active.path.is_some()
@@ -6109,6 +6138,11 @@ fn forget_document(state: &mut State, id: u64) {
     state.lsp.dirty.remove(&id);
     state.conflict_scans.remove(&id);
     state.issue_tabs.remove(&id);
+    // Either side of the file history gone: stepping stops. A version
+    // left open stays a read-only tab.
+    if state.scrub.as_ref().is_some_and(|s| s.involves(id)) {
+        state.scrub = None;
+    }
 }
 
 /// What has the editor column.
@@ -8665,6 +8699,15 @@ fn install_menu(mtm: MainThreadMarker, app: &NSApplication) {
     git_menu.addItem(&item("Revert Change", sel!(revertChange:), "", false));
     git_menu.addItem(&item("Stage Change", sel!(stageChange:), "", false));
     git_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    // Fold and Unfold keep Cmd-Option-Left and Right; the steps are the
+    // bare arrows while the history's tab is in front.
+    let history = item("File History", sel!(fileHistory:), "y", false);
+    history
+        .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
+    git_menu.addItem(&history);
+    git_menu.addItem(&item("Older Version", sel!(olderVersion:), "", false));
+    git_menu.addItem(&item("Newer Version", sel!(newerVersion:), "", false));
+    git_menu.addItem(&NSMenuItem::separatorItem(mtm));
     git_menu.addItem(&item("Next Conflict", sel!(nextConflict:), "", false));
     git_menu.addItem(&item(
         "Previous Conflict",
@@ -8970,6 +9013,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         git_open: false,
         diff_tab: None,
         issue_tabs: HashMap::new(),
+        scrub: None,
         git_focus: false,
         hovered_tab: None,
         tree,

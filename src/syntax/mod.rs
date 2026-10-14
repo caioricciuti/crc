@@ -1766,6 +1766,28 @@ mod tests {
         assert_store_matches_a_full_parse(&store, &buffer);
     }
 
+    /// Stepping a document through versions of a file: each one is a single
+    /// edit, and the tree it parses to is the one a full parse gives.
+    #[test]
+    fn a_version_shown_in_place_parses_incrementally() {
+        let mut store = SyntaxStore::new();
+        let mut buffer = rust_buffer("fn a() {}\nfn b() { let 日本 = 1; }\n", "v.rs");
+        buffer.set_frozen(true);
+        store.update(&mut buffer, BUDGET);
+        for version in [
+            "fn a() {}\nstruct S;\nfn b() { let 日本 = 1; }\n",
+            "fn a() { /* 本 */ }\n",
+            "",
+            "fn c(x: u8) -> u8 { x }\n",
+        ] {
+            // The buffer's own tests check this is one edit, not a full
+            // parse; here, that the parse it leads to is right.
+            buffer.show_text(version, 1, 4);
+            store.update(&mut buffer, BUDGET);
+            assert_store_matches_a_full_parse(&store, &buffer);
+        }
+    }
+
     #[test]
     fn an_empty_buffer_parses_to_nothing() {
         let mut h = rust();

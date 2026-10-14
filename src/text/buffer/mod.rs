@@ -230,6 +230,9 @@ pub struct Buffer {
     /// A tab that shows something else in the editor column (a Source
     /// Control diff) and has no text of its own to edit.
     view_only: bool,
+    /// Text shown to be read, never edited or saved: a version of a file
+    /// from its history. Drawn like any other text, unlike `view_only`.
+    frozen: bool,
     /// Whether there are unsaved changes.
     dirty: bool,
     /// Last contents read from or written to disk, shared with the rope.
@@ -277,6 +280,28 @@ impl Buffer {
         self.invalidate_edits();
         self.undo_stack.clear();
         self.redo_stack.clear();
+        self.dirty = false;
+    }
+    /// Shows `text` in place of the whole document, as stepping through a
+    /// file's versions does, with one caret at `line` and `column`, both
+    /// clamped. Unlike [`Buffer::regenerate`], the change is described as
+    /// one edit over what differs, so the parser goes on incrementally. A
+    /// frozen document takes it all the same: this is how its text moves.
+    /// Nothing is left to undo, and nothing is unsaved.
+    pub fn show_text(&mut self, text: &str, line: usize, column: usize) {
+        let before = std::mem::replace(&mut self.rope, Rope::from_text(&normalize_newlines(text)));
+        self.extra.clear();
+        self.record_replacement(&before);
+        let line = line.min(self.rope.len_lines().saturating_sub(1));
+        self.cursor = self.byte_at(line, column);
+        self.anchor = self.cursor;
+        self.goal_column = None;
+        self.last_edit = None;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.scroll_line = self
+            .scroll_line
+            .min(self.rope.len_lines().saturating_sub(1));
         self.dirty = false;
     }
     /// The lowercase file extension, from the path or the display hint.
@@ -2803,6 +2828,49 @@ mod tests {
         assert_eq!(refused.kind(), std::io::ErrorKind::FileTooLarge);
         assert!(refused.to_string().contains("big.txt"), "{refused}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A version from history: every edit and save refused, but its text
+    /// moves through `show_text`, as one edit, with the caret clamped.
+    #[test]
+    fn a_frozen_document_refuses_edits_and_takes_a_version_as_one_edit() {
+        let mut b = Buffer::generated("notes.txt @ abc1234", "txt", "one\ntwo\nthree\n");
+        b.set_frozen(true);
+        b.drain_edits();
+        b.goto_line(2);
+        b.insert("x");
+        b.backspace();
+        b.select_all();
+        b.delete_forward();
+        assert!(!b.undo());
+        assert_eq!(b.rope.to_string(), "one\ntwo\nthree\n");
+        assert!(
+            b.save(Some(std::path::Path::new("/nonexistent/never.txt")))
+                .is_err()
+        );
+        assert!(!b.is_dirty());
+        assert!(!b.has_pending_edits());
+
+        b.scroll_line = 2;
+        b.show_text("one\nTWO\r\n", 2, 9);
+        assert_eq!(b.rope.to_string(), "one\nTWO\n", "line breaks as kept");
+        let edits = b.drain_edits().expect("an edit, not a full parse");
+        assert_eq!(
+            edits,
+            [crate::ide::diff::prefix_suffix_edit("one\ntwo\nthree\n", "one\nTWO\n").unwrap()]
+        );
+        // Line 2 is the empty last line now; the column is clamped to it.
+        assert_eq!(b.cursor_position(), (2, 0));
+        assert_eq!(b.selection(), None);
+        assert_eq!(b.scroll_line, 2);
+        b.show_text("solo", 1, 3);
+        assert_eq!(b.cursor_position(), (0, 3));
+        assert_eq!(b.scroll_line, 0);
+        b.drain_edits();
+        b.show_text("solo", 0, 2);
+        assert!(!b.has_pending_edits(), "the same text is no edit");
+        assert!(!b.can_undo() && !b.is_dirty());
+        assert!(b.is_frozen());
     }
 
     /// The real cap, on a sparse file: refused from its size alone, so the

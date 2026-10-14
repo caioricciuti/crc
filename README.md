@@ -85,7 +85,10 @@ the size and write it back.
   gutter for lines that differ from HEAD. Git > Next Change (`Option-F5`)
   and Previous Change (`Shift-Option-F5`) step through them; click a mark
   to see what HEAD had there, then revert it as an edit you can undo or
-  stage just that change.
+  stage just that change. Git > File History (`Cmd-Option-Y`) walks the
+  file back through every commit that touched it, renames included, in a
+  read-only tab beside it: Left and Right step, Home and End go to the
+  oldest version and back to your working text, Escape returns.
 - **Completion that learns, in every language**: the best guess appears as
   ghost text at the caret (Tab takes it) and the alternatives as a single
   row of chips under the line, with a line saying why the picked one is
