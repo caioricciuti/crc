@@ -4499,58 +4499,58 @@ mod tests {
 
     #[test]
     fn deepest_folder_holding_the_repo_owns_its_merged_group() {
-        // A workspace on a repository (`pkgfire` on ch-ui's checkout) under
+        // A workspace on a repository (`seedbank` on garden's checkout) under
         // one on the folder holding it: the deeper one takes its worktrees,
         // merged ones too. By design; the fix is never making such a
         // second workspace by accident.
-        let mut done = tree("/x/ch-ui/ch-ui/.claude/worktrees/old", false);
-        done.repo = Some(PathBuf::from("/x/ch-ui/ch-ui"));
+        let mut done = tree("/x/garden/garden/.claude/worktrees/old", false);
+        done.repo = Some(PathBuf::from("/x/garden/garden"));
         done.merged = true;
         let mut panel = Panel {
             folders: vec![
-                folder("CH-UI", "/x/ch-ui"),
-                folder("PKGFIRE", "/x/ch-ui/ch-ui"),
+                folder("GARDEN", "/x/garden"),
+                folder("SEEDBANK", "/x/garden/garden"),
             ],
             worktrees: vec![done],
             ..Panel::default()
         };
-        for id in ["folder:CH-UI", "folder:PKGFIRE"] {
+        for id in ["folder:GARDEN", "folder:SEEDBANK"] {
             panel
                 .repos
-                .insert(id.into(), vec![PathBuf::from("/x/ch-ui/ch-ui")]);
+                .insert(id.into(), vec![PathBuf::from("/x/garden/garden")]);
         }
         panel.rebuild();
-        let old = "/x/ch-ui/ch-ui/.claude/worktrees/old";
-        assert_eq!(panel.parent_of_id(old).as_deref(), Some("folder:PKGFIRE"));
+        let old = "/x/garden/garden/.claude/worktrees/old";
+        assert_eq!(panel.parent_of_id(old).as_deref(), Some("folder:SEEDBANK"));
         let i = panel.by_id(old).unwrap();
-        assert_eq!(panel.merged_under("folder:PKGFIRE"), [i]);
-        assert!(panel.merged_under("folder:CH-UI").is_empty());
+        assert_eq!(panel.merged_under("folder:SEEDBANK"), [i]);
+        assert!(panel.merged_under("folder:GARDEN").is_empty());
     }
 
     #[test]
     fn a_folder_has_one_workspace() {
         let dir = std::env::temp_dir().join(format!("crc-one-workspace-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("ch-ui")).unwrap();
-        std::os::unix::fs::symlink(dir.join("ch-ui"), dir.join("link")).unwrap();
+        std::fs::create_dir_all(dir.join("garden")).unwrap();
+        std::os::unix::fs::symlink(dir.join("garden"), dir.join("link")).unwrap();
         // Never written: the panel was not loaded from the file.
         let mut panel = Panel::default();
-        let first = panel.add_folder("CH-UI", dir.join("ch-ui")).unwrap();
+        let first = panel.add_folder("GARDEN", dir.join("garden")).unwrap();
         // The same folder, as typed, with a slash at its end, or through a
         // symlink: refused, the one there named.
         assert_eq!(
-            panel.add_folder("pkgfire", dir.join("ch-ui")),
+            panel.add_folder("seedbank", dir.join("garden")),
             Err(first.clone())
         );
-        let slash = PathBuf::from(format!("{}/", dir.join("ch-ui").display()));
-        assert_eq!(panel.add_folder("pkgfire", slash), Err(first.clone()));
+        let slash = PathBuf::from(format!("{}/", dir.join("garden").display()));
+        assert_eq!(panel.add_folder("seedbank", slash), Err(first.clone()));
         assert_eq!(
-            panel.add_folder("pkgfire", dir.join("link")),
+            panel.add_folder("seedbank", dir.join("link")),
             Err(first.clone())
         );
         assert_eq!(panel.folders.len(), 1);
         // A folder beside it is another.
-        assert!(panel.add_folder("pkgfire", dir.join("pkgfire")).is_ok());
+        assert!(panel.add_folder("seedbank", dir.join("seedbank")).is_ok());
         // On a host: the same path there is refused, on another host or
         // this Mac it is a folder of its own.
         let app = panel.add_remote("app", "myhost", "/srv/app").unwrap();
@@ -4567,23 +4567,24 @@ mod tests {
 
     #[test]
     fn a_new_workspace_never_defaults_to_a_folder_with_one() {
-        let mut wt = tree("/x/ch-ui/ch-ui/.claude/worktrees/fix", false);
-        wt.repo = Some(PathBuf::from("/x/ch-ui/ch-ui"));
+        let mut wt = tree("/x/garden/garden/.claude/worktrees/fix", false);
+        wt.repo = Some(PathBuf::from("/x/garden/garden"));
         let mut panel = Panel {
-            folders: vec![folder("CH-UI", "/x/ch-ui"), folder("notes", "/x/notes")],
+            folders: vec![folder("GARDEN", "/x/garden"), folder("notes", "/x/notes")],
             worktrees: vec![wt],
             ..Panel::default()
         };
-        panel
-            .repos
-            .insert("folder:CH-UI".into(), vec![PathBuf::from("/x/ch-ui/ch-ui")]);
+        panel.repos.insert(
+            "folder:GARDEN".into(),
+            vec![PathBuf::from("/x/garden/garden")],
+        );
         panel.rebuild();
         let some = |p: &str| Some(PathBuf::from(p));
         // The worktree selected: neither its repository nor its folder.
-        panel.selected = Some("/x/ch-ui/ch-ui/.claude/worktrees/fix".into());
+        panel.selected = Some("/x/garden/garden/.claude/worktrees/fix".into());
         assert_eq!(panel.new_folder(None), None);
-        assert_eq!(panel.new_folder(Some(Path::new("/x/ch-ui/ch-ui"))), None);
-        assert_eq!(panel.new_folder(Some(Path::new("/x/ch-ui"))), None);
+        assert_eq!(panel.new_folder(Some(Path::new("/x/garden/garden"))), None);
+        assert_eq!(panel.new_folder(Some(Path::new("/x/garden"))), None);
         assert_eq!(panel.new_folder(Some(Path::new("/x/notes"))), None);
         // The open folder while nothing has it.
         assert_eq!(
@@ -4592,9 +4593,9 @@ mod tests {
         );
         // The folder panel opens beside the repository, so the new one is
         // picked next to it.
-        assert_eq!(panel.pick_from(Some(Path::new("/e"))), some("/x/ch-ui"));
+        assert_eq!(panel.pick_from(Some(Path::new("/e"))), some("/x/garden"));
         // A folder workspace selected: beside its folder.
-        panel.selected = Some("folder:CH-UI".into());
+        panel.selected = Some("folder:GARDEN".into());
         assert_eq!(panel.new_folder(None), None);
         assert_eq!(panel.pick_from(Some(Path::new("/e"))), some("/x"));
         // Nothing selected: the open folder.
