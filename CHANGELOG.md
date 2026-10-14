@@ -26,6 +26,12 @@ One entry per tag, written for people who use the editor.
   Change stages just that change, unsaved lines included. It refuses, and
   says so, for files with CRLF line endings and for files whose index
   already differs from HEAD; stage those from Source Control.
+- Agents: New Workspace no longer starts from the selected worktree's
+  repository, which could quietly make a second workspace for a
+  repository that already had one and take over its worktrees in the
+  list. A folder that already has a workspace is refused, and that
+  workspace is shown instead. Each folder workspace's row shows its
+  folder, so a wrong one is easy to see.
 - Gutter marks no longer blink out after a stage, commit or branch
   switch, and the change commands stay available while Git reads the
   file again.

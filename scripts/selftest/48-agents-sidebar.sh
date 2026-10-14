@@ -3,13 +3,16 @@
 
 # ---- The Agents list: Cmd-N, drag to reorder, rename in place, restore ----
 # A plain folder. Cmd-N in Agents mode takes a new workspace's name, as
-# cmux and supacode have it; a row dragged above another stays there; a
-# double-click on a row names it in place. Then a reboot, played as crc
+# cmux and supacode have it (a test instance takes the folder named as it
+# beside the selected one's); each row shows its folder. A row dragged
+# above another stays there; a double-click on a row names it in place.
+# New Workspace on a folder a workspace has is refused, and that one is
+# selected (sideproj, from its name here). Then a reboot, played as crc
 # quitting and its session helpers ending: the next launch starts the lost
 # terminals again in their workspaces, and types `claude --continue` into
 # the one that ran Claude (a stand-in here, on PATH as `claude`).
 S="$T/sideproj"
-mkdir -p "$S" "$T/sidebin"
+mkdir -p "$S" "$T/sidebin" "$T/beta" "$T/gamma"
 printf 'x\n' > "$S/x.txt"
 printf '#!/bin/sh\necho "resumed $*"\nsleep 30\n' > "$T/sidebin/claude"
 chmod +x "$T/sidebin/claude"
@@ -34,11 +37,12 @@ text gamma
 key 36
 wait 700
 dump $T/side-made.out
+frame $T/side-made.bmp
 down @agents.task.2
 wait 100
-dragby 0 -50
+dragby 0 -70
 wait 100
-upby 0 -50
+upby 0 -70
 wait 400
 dump $T/side-dragged.out
 click @agents.task.2 2
@@ -50,6 +54,12 @@ dump $T/side-renamed.out
 key 8 cmd,shift c
 wait 900
 dump $T/side-claude.out
+key 45 cmd n
+wait 200
+text sideproj
+key 36
+wait 700
+dump $T/side-again.out
 quit
 SCRIPT
 # The list is one for the app, kept under HOME: this scenario has its own.
@@ -57,6 +67,8 @@ mkdir -p "$T/home/sidebar"
 HOME="$T/home/sidebar" PATH="$T/sidebin:$PATH" CRC_TERMINAL_SHELL=/bin/sh CRC_CLAUDE_COMMAND="$T/side-agent.sh" \
     CRC_SELFTEST="$T/side.script" "$BIN" "$S" 2> "$T/side.err"
 expect "$T/side-made.out" agents "on tasks=sideproj,beta,gamma selected=gamma sessions=sideproj,beta,*gamma claude=0 pair=- op=-"
+expect "$T/side-made.out" agents_folders "sideproj=$S,beta=$T/beta,gamma=$T/gamma"
+[ -z "${SELFTEST_FRAMES:-}" ] || cp -f "$T/side-made.bmp" "$SELFTEST_FRAMES/"
 # gamma dragged above beta stays there.
 expect "$T/side-dragged.out" agents "on tasks=sideproj,gamma,beta selected=gamma sessions=sideproj,beta,*gamma claude=0 pair=- op=-"
 # The order file keeps ids: gamma's is its key in the workspaces file.
@@ -67,6 +79,14 @@ gamma_key=$(awk -F'\t' '$1 == "gamma" { print $3 }' "$side_kept/workspaces" 2>/d
 # beta, now third, renamed in its row (a folder workspace takes the name).
 # (The script's double-click is one event, so it does not select first.)
 expect "$T/side-renamed.out" agents "on tasks=sideproj,gamma,notes selected=gamma sessions=sideproj,notes,*gamma claude=0 pair=- op=-"
+# A second workspace on sideproj's folder is refused: sideproj is selected,
+# its terminal showing, and nothing is added.
+grep -q "^message: $S is already the workspace sideproj$" "$T/side-again.out" \
+    || failed "sidebar: a second workspace on a folder: $(grep '^message:' "$T/side-again.out")"
+case "$(grep '^agents:' "$T/side-again.out")" in
+"agents: on tasks=sideproj,gamma,notes selected=sideproj sessions=*sideproj,"*) ;;
+*) failed "sidebar: after the refusal: $(grep '^agents:' "$T/side-again.out")" ;;
+esac
 
 # The reboot: the helpers end without a word (the self-test's quit writes
 # nothing either, as a crash would not); each session's record kept its

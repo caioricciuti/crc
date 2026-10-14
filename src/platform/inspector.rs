@@ -514,11 +514,8 @@ impl Inspector {
         let name = fit(atlas, &name, width);
         layout::push_title(out, atlas, x, y, 15.0, &name, theme.text, width);
         y += 24.0;
-        let shown = match &workspace.host {
-            Some(host) => format!("{host}:{}", workspace.path.display()),
-            None => crate::platform::window::shown_path(&workspace.path),
-        };
-        let shown = fit(atlas, &shown, width);
+        let shown = crate::platform::agents::shown_folder(workspace);
+        let shown = fit_start(atlas, &shown, width);
         text(out, atlas, x, y, width, &shown, theme.gutter_text);
         y += ROW;
         // The terminal showing is in ssh: where it is, not this Mac's Git.
@@ -1605,6 +1602,23 @@ pub(crate) fn fit(atlas: &mut Atlas, s: &str, width: f32) -> String {
     while n > 0 {
         n -= 1;
         let cut: String = chars[..n].iter().collect::<String>() + "\u{2026}";
+        if layout::ui_text_width(atlas, &cut) <= width {
+            return cut;
+        }
+    }
+    String::new()
+}
+
+/// `s`, cut from its start with an ellipsis to fit `width`: for a path,
+/// whose end says the most.
+pub(crate) fn fit_start(atlas: &mut Atlas, s: &str, width: f32) -> String {
+    let width = width + 0.5;
+    if layout::ui_text_width(atlas, s) <= width {
+        return s.to_owned();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    for n in 1..chars.len() {
+        let cut: String = "\u{2026}".to_owned() + &chars[n..].iter().collect::<String>();
         if layout::ui_text_width(atlas, &cut) <= width {
             return cut;
         }

@@ -679,7 +679,13 @@ impl EditorView {
                             .as_deref(),
                     ),
                     state.agents.report_teams(&state.terminal.tabs),
-                    state.agents.report_tree(),
+                    // With the folder each folder workspace's row shows,
+                    // on a line of its own.
+                    format_args!(
+                        "{}\nagents_folders: {}",
+                        state.agents.report_tree(),
+                        state.agents.report_folders()
+                    ),
                     state.agents.report_activity(),
                     state.agents.report_pull_requests(),
                     active_conflicts(&state).map_or("none".to_string(), |v| format!(

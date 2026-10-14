@@ -326,7 +326,10 @@ impl EditorView {
                     let name = cwd
                         .file_name()
                         .map_or_else(|| "workspace".into(), |n| n.to_string_lossy().into_owned());
-                    let id = state.agents.add_folder(&name, cwd.clone());
+                    let id = state
+                        .agents
+                        .add_folder(&name, cwd.clone())
+                        .unwrap_or_else(|there| there);
                     state.agents.refresh();
                     Some(id)
                 }
@@ -351,7 +354,7 @@ impl EditorView {
     /// one is made on the open folder, named after it. Returns whether a
     /// workspace is selected.
     pub(super) fn ensure_workspace(&self) -> bool {
-        let editor = self.workspace_folder();
+        let editor = self.editor_folder();
         let Some(mut state) = self.state_mut() else {
             return false;
         };
@@ -397,7 +400,10 @@ impl EditorView {
                 let name = folder
                     .file_name()
                     .map_or_else(|| "workspace".into(), |n| n.to_string_lossy().into_owned());
-                let id = state.agents.add_folder(&name, folder.clone());
+                let id = state
+                    .agents
+                    .add_folder(&name, folder.clone())
+                    .unwrap_or_else(|there| there);
                 state.agents.refresh();
                 // The terminals in its folder that no workspace held are
                 // its own; the others stay where they are.
@@ -416,21 +422,18 @@ impl EditorView {
     }
 
     /// A double-click on the empty part of the list: a new folder workspace
-    /// on the selected one's folder, named after it, with a terminal in it.
+    /// on the open folder while no workspace has it, named after it, with a
+    /// terminal in it; else New Workspace, to choose its folder.
     fn new_blank_workspace(&self) {
         let Some(folder) = self.workspace_folder() else {
+            self.new_task_prompt();
             return;
         };
         let folder = crate::platform::canonical(&folder);
         let name = folder
             .file_name()
             .map_or_else(|| "workspace".into(), |n| n.to_string_lossy().into_owned());
-        if let Some(mut state) = self.state_mut() {
-            let id = state.agents.add_folder(&name, folder.clone());
-            state.agents.selected = Some(id);
-            state.agents.refresh();
-        }
-        self.spawn_terminal_in(false, Some(&folder));
+        self.create_workspace_in(name, &folder);
     }
 
     pub(super) fn agents_click(&self, event: &NSEvent, x: f32, y: f32) {
@@ -655,8 +658,8 @@ impl EditorView {
     }
 
     /// The palette, taking a new workspace's name: a folder workspace on a
-    /// folder you choose or the selected one's, or a task on a new branch
-    /// of the selected workspace's repository.
+    /// folder you choose or the open one (while no workspace has it), or a
+    /// task on a new branch of the selected workspace's repository.
     pub(super) fn new_task_prompt(&self) {
         self.open_palette_with("");
         if let Some(mut state) = self.state_mut() {
@@ -666,24 +669,43 @@ impl EditorView {
         self.request_redraw();
     }
 
-    /// The folder a new workspace is made on unless you choose one: the
-    /// selected workspace's, else the editor's open folder, else the
-    /// session showing's.
-    fn workspace_folder(&self) -> Option<std::path::PathBuf> {
+    /// The editor's open folder, else the session showing's.
+    fn editor_folder(&self) -> Option<std::path::PathBuf> {
         let state = self.state()?;
         state
-            .agents
-            .new_folder(state.tree.root())
+            .tree
+            .root()
+            .map(Path::to_path_buf)
             .or_else(|| state.terminal.active_tab().map(|t| t.folder.clone()))
     }
 
+    /// The folder a new workspace is made on unless you choose one: the
+    /// editor's open folder, else the session showing's, while no
+    /// workspace has it (see [`crate::platform::agents::Panel::new_folder`]).
+    fn workspace_folder(&self) -> Option<std::path::PathBuf> {
+        let state = self.state()?;
+        state.agents.new_folder(state.tree.root()).or_else(|| {
+            state
+                .terminal
+                .active_tab()
+                .map(|t| t.folder.clone())
+                .filter(|f| !state.agents.has_workspace(f))
+        })
+    }
+
     /// The palette's answer when you choose the folder: a folder panel
-    /// opening on the selected workspace's, then the workspace. A test
-    /// instance takes the selected one's without a panel.
+    /// opening beside the selected workspace's folder, then the workspace.
+    /// A test instance, with no panel to answer, takes the folder named as
+    /// the workspace in the one the panel opens on, else that one.
     pub(super) fn create_workspace_chosen(&self, name: String) {
-        let start = self.workspace_folder();
+        let start = self
+            .state()
+            .and_then(|state| state.agents.pick_from(state.tree.root()));
         let dir = if std::env::var_os("CRC_SELFTEST").is_some() {
-            start
+            start.map(|start| {
+                let named = start.join(name.trim());
+                if named.is_dir() { named } else { start }
+            })
         } else {
             choose_folder_from(
                 MainThreadMarker::from(self),
@@ -743,7 +765,14 @@ impl EditorView {
             };
             state.agents.on = true;
             let name = crate::platform::remote::workspace_name(&host, &path);
-            let id = state.agents.add_remote(&name, &host, &path);
+            let id = match state.agents.add_remote(&name, &host, &path) {
+                Ok(id) => id,
+                Err(there) => {
+                    drop(state);
+                    self.show_existing_workspace(&there);
+                    return;
+                }
+            };
             state.agents.selected = Some(id.clone());
             // Its repositories read now, not at the next periodic read.
             state.agents.refresh();
@@ -754,7 +783,8 @@ impl EditorView {
     }
 
     /// A folder workspace on `dir`, selected, its repositories read, and a
-    /// terminal in it.
+    /// terminal in it. A folder has one workspace: on one that has it, that
+    /// one is shown instead.
     fn create_workspace_in(&self, name: String, dir: &Path) {
         let dir = crate::platform::canonical(dir);
         {
@@ -762,12 +792,38 @@ impl EditorView {
                 return;
             };
             state.agents.on = true;
-            let id = state.agents.add_folder(&name, dir.clone());
-            state.agents.selected = Some(id);
+            match state.agents.add_folder(&name, dir.clone()) {
+                Ok(id) => state.agents.selected = Some(id),
+                Err(there) => {
+                    drop(state);
+                    self.show_existing_workspace(&there);
+                    return;
+                }
+            }
             state.agents.refresh();
         }
         self.set_agents_mode(true);
         self.spawn_terminal_in(false, Some(&dir));
+    }
+
+    /// A new workspace asked for on a folder the workspace `id` has: that
+    /// one, selected and shown, and the message saying so.
+    fn show_existing_workspace(&self, id: &str) {
+        let index = self.state_mut().and_then(|mut state| {
+            let index = state.agents.by_id(id)?;
+            let there = state.agents.tasks[index].clone();
+            let said = format!(
+                "{} is already the workspace {}",
+                crate::platform::agents::shown_folder(&there),
+                state.agents.title(&there)
+            );
+            state.say(layout::Feedback::Failure, said);
+            Some(index)
+        });
+        if let Some(index) = index {
+            self.select_task(index);
+        }
+        self.request_redraw();
     }
 
     /// The context menu for a point in the Agents sidebar: the session's,
