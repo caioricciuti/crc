@@ -259,6 +259,31 @@ impl EditorView {
             Step::Trackpad { x, y, dy } => {
                 self.scroll_at(*x as f32, *y as f32, 0.0, *dy, true);
             }
+            // Over the terminal, the way `scrollWheel:` sends it there.
+            Step::WheelAt { name, fx, fy, dy } => {
+                let target = {
+                    let Some(mut state) = self.state_mut() else {
+                        return;
+                    };
+                    region_named(&mut state, name)
+                };
+                let Some(rect) = target else {
+                    eprintln!("selftest: no region named {name} in this frame");
+                    return;
+                };
+                let x = rect.x + rect.width * fx.clamp(0.0, 1.0) as f32;
+                let y = rect.y + rect.height * fy.clamp(0.0, 1.0) as f32;
+                let (x, y) = (
+                    x.min(rect.x + rect.width - 0.5),
+                    y.min(rect.y + rect.height - 0.5),
+                );
+                if self.chrome().terminal.is_some_and(|r| r.contains(x, y)) {
+                    let lines = self.wheel_lines_by(*dy, true, WheelTarget::Terminal);
+                    self.terminal_wheel(x, y, lines, NSEventModifierFlags::empty());
+                } else {
+                    self.scroll_at(x, y, 0.0, *dy, true);
+                }
+            }
             Step::Idle(_) => {}
             Step::Reenter => {
                 let held = self.ivars().state.borrow_mut();

@@ -1480,6 +1480,7 @@ define_class!(
             if self.ivars().testing && event.timestamp() != 0.0 { return; }
             let point = self.convertPoint_fromView(event.locationInWindow(), None);
             self.note_hover(point.x as f32, point.y as f32);
+            self.terminal_mouse_hover(event, point.x as f32, point.y as f32);
         }
 
         #[unsafe(method(mouseExited:))]
@@ -1699,6 +1700,9 @@ define_class!(
                     state.sidebar_keys = false;
                 }
                 state.terminal.focus = chrome.terminal.is_some_and(|rect| rect.contains(x, y));
+                // A program told of focus hears it went before any press.
+                let key = self.key_window();
+                terminal::report_focus(&mut state, key);
             }
 
             // Clicking away from a half-typed accent abandons it, here and in
@@ -1714,6 +1718,11 @@ define_class!(
             // Control-click is a right click. AppKit turns it into one inside
             // NSView's own mouseDown:, which this override replaces.
             if event.modifierFlags().contains(NSEventModifierFlags::Control) {
+                // A program in the terminal that asked for the mouse hears
+                // it as the right button.
+                if self.terminal_mouse_press(event, x, y, crate::term::mouse::Button::Right) {
+                    return;
+                }
                 // Asked through the runtime, as AppKit itself would ask.
                 let menu: Option<Retained<NSMenu>> =
                     unsafe { msg_send![self, menuForEvent: event] };
@@ -2219,6 +2228,9 @@ define_class!(
             if self.ivars().testing && event.timestamp() != 0.0 { return; }
             let point = self.convertPoint_fromView(event.locationInWindow(), None);
             layout::set_pointer(Some((point.x as f32, point.y as f32)));
+            if self.terminal_mouse_drag(event, point.x as f32, point.y as f32) {
+                return;
+            }
 
             if let Some(mut state) = self.state_mut()
                 && let Some(drag) = &mut state.agents.drag
@@ -2355,6 +2367,59 @@ define_class!(
             self.pump();
         }
 
+        /// The right and middle buttons go to a program in the terminal
+        /// that asked for the mouse; otherwise the right one is the menu,
+        /// as NSView makes it.
+        #[unsafe(method(rightMouseDown:))]
+        fn right_mouse_down(&self, event: &NSEvent) {
+            if self.ivars().testing && event.timestamp() != 0.0 { return; }
+            let point = self.convertPoint_fromView(event.locationInWindow(), None);
+            let right = crate::term::mouse::Button::Right;
+            if !self.terminal_mouse_press(event, point.x as f32, point.y as f32, right) {
+                let _: () = unsafe { msg_send![super(self), rightMouseDown: event] };
+            }
+        }
+
+        #[unsafe(method(rightMouseDragged:))]
+        fn right_mouse_dragged(&self, event: &NSEvent) {
+            let point = self.convertPoint_fromView(event.locationInWindow(), None);
+            self.terminal_mouse_drag(event, point.x as f32, point.y as f32);
+        }
+
+        #[unsafe(method(rightMouseUp:))]
+        fn right_mouse_up(&self, event: &NSEvent) {
+            let point = self.convertPoint_fromView(event.locationInWindow(), None);
+            if !self.terminal_mouse_release(event, point.x as f32, point.y as f32) {
+                let _: () = unsafe { msg_send![super(self), rightMouseUp: event] };
+            }
+        }
+
+        #[unsafe(method(otherMouseDown:))]
+        fn other_mouse_down(&self, event: &NSEvent) {
+            if self.ivars().testing && event.timestamp() != 0.0 { return; }
+            let point = self.convertPoint_fromView(event.locationInWindow(), None);
+            let middle = crate::term::mouse::Button::Middle;
+            if event.buttonNumber() != 2
+                || !self.terminal_mouse_press(event, point.x as f32, point.y as f32, middle)
+            {
+                let _: () = unsafe { msg_send![super(self), otherMouseDown: event] };
+            }
+        }
+
+        #[unsafe(method(otherMouseDragged:))]
+        fn other_mouse_dragged(&self, event: &NSEvent) {
+            let point = self.convertPoint_fromView(event.locationInWindow(), None);
+            self.terminal_mouse_drag(event, point.x as f32, point.y as f32);
+        }
+
+        #[unsafe(method(otherMouseUp:))]
+        fn other_mouse_up(&self, event: &NSEvent) {
+            let point = self.convertPoint_fromView(event.locationInWindow(), None);
+            if !self.terminal_mouse_release(event, point.x as f32, point.y as f32) {
+                let _: () = unsafe { msg_send![super(self), otherMouseUp: event] };
+            }
+        }
+
         /// Builds the right-click menu for wherever the click landed.
         ///
         /// Returning a menu from here is all AppKit needs: it handles the
@@ -2371,6 +2436,8 @@ define_class!(
             if self.ivars().testing && _event.timestamp() != 0.0 { return; }
             layout::set_pressed(None);
             self.request_redraw();
+            let point = self.convertPoint_fromView(_event.locationInWindow(), None);
+            self.terminal_mouse_release(_event, point.x as f32, point.y as f32);
             if let Some(mut state) = self.state_mut()
                 && let Some(drag) = state.agents.drag.take()
                 && drag.active
@@ -2625,17 +2692,7 @@ define_class!(
                 let panel = self.chrome().terminal;
                 if panel.is_some_and(|rect| rect.contains(point.x as f32, point.y as f32)) {
                     let lines = self.wheel_lines(event, WheelTarget::Terminal);
-                    let Some(mut state) = self.state_mut() else {
-                        return;
-                    };
-                    let history = state.terminal.active_tab().map_or(0, |tab| {
-                        tab.session.term.lock().unwrap_or_else(|e| e.into_inner()).scrollback_len()
-                    });
-                    let back = state.terminal.back as isize;
-                    state.terminal.back = (back - lines).clamp(0, history as isize) as usize;
-                    drop(state);
-                    self.request_redraw();
-                    self.pump();
+                    self.terminal_wheel(point.x as f32, point.y as f32, lines, event.modifierFlags());
                     return;
                 }
             }

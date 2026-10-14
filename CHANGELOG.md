@@ -4,6 +4,12 @@ One entry per tag, written for people who use the editor.
 
 ## Unreleased
 
+- Terminal: programs that ask for the mouse now get it. crc read the
+  request but never passed clicks on, so the buttons of full-screen
+  programs (Claude Code's panels among them) did nothing. Clicks, drags,
+  the wheel and focus changes now reach the program; Option or Shift
+  keeps a click for crc's own selection, and Cmd-click still opens a
+  path.
 - Git > Blame Heat (off by default, also `blame_heat` in the settings)
   draws a thin violet strip beside the line numbers: strongest for lines
   changed in the last day, fading over a year, nothing for older or

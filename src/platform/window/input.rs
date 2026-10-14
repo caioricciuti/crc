@@ -162,10 +162,18 @@ impl EditorView {
     /// mouse wheel's notch is three lines, and a smooth wheel's fraction of
     /// a notch adds up too. Call with the state not borrowed.
     pub(super) fn wheel_lines(&self, event: &NSEvent, target: WheelTarget) -> isize {
-        let dy = event.scrollingDeltaY();
+        self.wheel_lines_by(
+            event.scrollingDeltaY(),
+            event.hasPreciseScrollingDeltas(),
+            target,
+        )
+    }
+
+    /// [`Self::wheel_lines`] for a delta `dy`, in points when `precise`.
+    pub(super) fn wheel_lines_by(&self, dy: f64, precise: bool, target: WheelTarget) -> isize {
         let (owner, rest) = self.ivars().wheel_rest.get();
         let rest = if owner == Some(target) { rest } else { 0.0 };
-        let total = if event.hasPreciseScrollingDeltas() {
+        let total = if precise {
             let line = self
                 .state()
                 .map_or(16.0, |s| s.renderer.atlas.metrics.line_height as f64);

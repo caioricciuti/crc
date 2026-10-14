@@ -8,12 +8,13 @@
 //!
 //! The target is what `claude`, shells and the usual full-screen tools use:
 //! xterm's cursor and editing controls, SGR colours up to 24-bit, bracketed
-//! paste, the alternate screen, DEC line drawing, and mode queries. Mouse
-//! reporting is recorded but not generated yet. There is no reflow on
-//! resize; programs redraw on SIGWINCH.
+//! paste, the alternate screen, DEC line drawing, mode queries, and the mouse
+//! modes, which [`mouse`] turns into reports. There is no reflow on resize;
+//! programs redraw on SIGWINCH.
 
 pub mod hold;
 pub mod keys;
+pub mod mouse;
 mod parser;
 pub mod pty;
 pub mod status;
@@ -113,8 +114,9 @@ pub struct Modes {
     pub cursor_visible: bool,
     pub bracketed_paste: bool,
     pub focus_events: bool,
-    pub mouse: bool,
+    pub mouse: mouse::Tracking,
     pub sgr_mouse: bool,
+    pub urxvt_mouse: bool,
     pub insert: bool,
     pub sync: bool,
 }
@@ -128,9 +130,9 @@ impl Modes {
             6 => &mut self.origin,
             7 => &mut self.autowrap,
             25 => &mut self.cursor_visible,
-            1000 | 1002 | 1003 => &mut self.mouse,
             1004 => &mut self.focus_events,
             1006 => &mut self.sgr_mouse,
+            1015 => &mut self.urxvt_mouse,
             2004 => &mut self.bracketed_paste,
             2026 => &mut self.sync,
             _ => return None,
@@ -506,6 +508,7 @@ impl Term {
     fn private_mode(&self, mode: usize) -> Option<bool> {
         match mode {
             47 | 1047 | 1049 => Some(self.alternate),
+            1000 | 1002 | 1003 => Some(self.modes.mouse == mouse_tracking(mode)),
             _ => {
                 let mut modes = self.modes;
                 modes.flag(mode).copied()
@@ -518,6 +521,13 @@ impl Term {
             match self.param(i, 0) {
                 47 | 1047 => self.switch_screen(on, false),
                 1049 => self.switch_screen(on, true),
+                n @ (1000 | 1002 | 1003) => {
+                    self.modes.mouse = if on {
+                        mouse_tracking(n)
+                    } else {
+                        mouse::Tracking::Off
+                    };
+                }
                 n => {
                     if let Some(flag) = self.modes.flag(n) {
                         *flag = on;
@@ -886,6 +896,15 @@ impl Term {
     }
 }
 
+/// The mouse tracking private mode `n` (1000, 1002 or 1003) turns on.
+fn mouse_tracking(n: usize) -> mouse::Tracking {
+    match n {
+        1003 => mouse::Tracking::Any,
+        1002 => mouse::Tracking::Button,
+        _ => mouse::Tracking::Press,
+    }
+}
+
 /// Adds a line to history, counting in `dropped` the oldest line when it
 /// had to go to make room. Free, not a method: callers drain the screen
 /// while they push.
@@ -1135,7 +1154,7 @@ mod tests {
     #[test]
     fn every_private_mode_reports_what_was_set() {
         for mode in [
-            1, 6, 7, 25, 47, 1047, 1049, 1000, 1002, 1003, 1004, 1006, 2004, 2026,
+            1, 6, 7, 25, 47, 1047, 1049, 1000, 1002, 1003, 1004, 1006, 1015, 2004, 2026,
         ] {
             let mut t = term(&format!(
                 "\x1b[?{mode}h\x1b[?{mode}$p\x1b[?{mode}l\x1b[?{mode}$p"
@@ -1146,6 +1165,29 @@ mod tests {
                 "mode {mode}"
             );
         }
+    }
+
+    #[test]
+    fn mouse_tracking_is_one_level_the_last_set_wins() {
+        let mut t = term("\x1b[?1000h\x1b[?1006h");
+        assert_eq!(t.modes.mouse, mouse::Tracking::Press);
+        assert!(t.modes.sgr_mouse);
+        t.advance(b"\x1b[?1002h");
+        assert_eq!(t.modes.mouse, mouse::Tracking::Button);
+        t.advance(b"\x1b[?1000$p\x1b[?1002$p");
+        assert_eq!(
+            String::from_utf8(t.take_replies()).unwrap(),
+            "\x1b[?1000;2$y\x1b[?1002;1$y"
+        );
+        t.advance(b"\x1b[?1003h");
+        assert_eq!(t.modes.mouse, mouse::Tracking::Any);
+        // Resetting any of the three turns reporting off.
+        t.advance(b"\x1b[?1000l");
+        assert_eq!(t.modes.mouse, mouse::Tracking::Off);
+        assert!(t.modes.sgr_mouse);
+        t.advance(b"\x1b[?1002h\x1b[?1006l");
+        assert_eq!(t.modes.mouse, mouse::Tracking::Button);
+        assert!(!t.modes.sgr_mouse);
     }
 
     #[test]

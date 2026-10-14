@@ -466,6 +466,7 @@ impl EditorView {
                     cwd: crate::platform::canonical(&launch.cwd),
                     program_pid: None,
                     remote: None,
+                    told_focus: false,
                     launch,
                     held,
                     status: None,
@@ -614,6 +615,7 @@ impl EditorView {
                     cwd: crate::platform::canonical(&launch.cwd),
                     program_pid: None,
                     remote: None,
+                    told_focus: false,
                     launch,
                     held: Some(id),
                 },
@@ -1167,6 +1169,10 @@ impl EditorView {
     /// opens the file reference under the pointer.
     pub(super) fn terminal_press(&self, event: &NSEvent, x: f32, y: f32) {
         // A press in the other pane of a pair gives it the keyboard first.
+        // Where its program asked for the mouse that is all it does, as in
+        // other terminals: the program does not hear the press that only
+        // chose its pane.
+        let mut switched = false;
         if let Some(rect) = self.chrome().terminal
             && let Some(mut state) = self.state_mut()
             && state.terminal.shown_pair().is_some()
@@ -1175,8 +1181,17 @@ impl EditorView {
             let tab = state.terminal.screen_at(screen, x);
             if tab != state.terminal.active {
                 state.terminal.show(tab);
+                switched = true;
             }
             state.terminal.focus = true;
+        }
+        if switched && !mouse_kept(event.modifierFlags()) && self.mouse_pane(x, y).is_some() {
+            self.request_redraw();
+            self.pump();
+            return;
+        }
+        if self.terminal_mouse_press(event, x, y, crate::term::mouse::Button::Left) {
+            return;
         }
         let Some((screen, cols, rows)) = self.terminal_screen() else {
             return;
@@ -1223,6 +1238,279 @@ impl EditorView {
         }
         self.request_redraw();
         self.pump();
+    }
+
+    /// The pane under a point whose program asked for the mouse: its tab,
+    /// its screen and grid size. None when no program there did, when the
+    /// view is scrolled back into history, or when the point is off the
+    /// screen or on the find bar over it.
+    fn mouse_pane(&self, x: f32, y: f32) -> Option<(usize, Viewport, usize, usize)> {
+        let chrome = self.chrome();
+        let rect = chrome.terminal?;
+        let state = self.state()?;
+        if state.palette.is_some()
+            || super::agents::active_hidden(&state)
+            || find_rect(&state, &chrome).is_some_and(|r| r.contains(x, y))
+        {
+            return None;
+        }
+        let (_, screen) = crate::platform::terminal::split(rect);
+        let (tab, screen) = state
+            .terminal
+            .screens(screen)
+            .into_iter()
+            .find(|(_, s)| s.contains(x, y))?;
+        if tab == state.terminal.active && state.terminal.back > 0 {
+            return None;
+        }
+        let term = state.terminal.tabs.get(tab)?.session.term.lock();
+        let term = term.unwrap_or_else(|e| e.into_inner());
+        (term.modes.mouse != crate::term::mouse::Tracking::Off)
+            .then(|| (tab, screen, term.cols(), term.rows()))
+    }
+
+    /// The cell (row, column) under a point in a pane's screen, clamped
+    /// into its grid.
+    fn mouse_cell(
+        &self,
+        screen: Viewport,
+        x: f32,
+        y: f32,
+        cols: usize,
+        rows: usize,
+    ) -> Option<(usize, usize)> {
+        let state = self.state()?;
+        let (row, _, col) =
+            crate::platform::terminal::point(&state.renderer.atlas, screen, x, y, cols, rows);
+        Some((row, col))
+    }
+
+    /// Writes the report of a mouse event to a tab's program, in the
+    /// encoding it asked for, if it asked for this kind of event.
+    fn mouse_report(&self, tab: usize, event: crate::term::mouse::Event) {
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
+        let Some(tab) = state.terminal.tabs.get_mut(tab) else {
+            return;
+        };
+        let modes = tab
+            .session
+            .term
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .modes;
+        if let Some(bytes) = crate::term::mouse::encode(&event, &modes) {
+            tab.session.write(&bytes);
+        }
+    }
+
+    /// A press in a pane whose program asked for the mouse goes to the
+    /// program instead of starting a selection. Option or Shift keeps it
+    /// for crc (Option-drag selects, Shift as in xterm), and so does
+    /// Command, which opens the file reference under it. Returns whether
+    /// the press was reported.
+    pub(super) fn terminal_mouse_press(
+        &self,
+        event: &NSEvent,
+        x: f32,
+        y: f32,
+        button: crate::term::mouse::Button,
+    ) -> bool {
+        let flags = event.modifierFlags();
+        if mouse_kept(flags) {
+            return false;
+        }
+        let Some((tab, screen, cols, rows)) = self.mouse_pane(x, y) else {
+            return false;
+        };
+        // A press in the other pane of a pair only gives it the keyboard.
+        if self
+            .state()
+            .is_none_or(|state| tab != state.terminal.active)
+        {
+            return false;
+        }
+        let Some(cell) = self.mouse_cell(screen, x, y, cols, rows) else {
+            return false;
+        };
+        {
+            let Some(mut state) = self.state_mut() else {
+                return false;
+            };
+            state.terminal.focus = true;
+            state.sidebar_keys = false;
+            state.terminal.selection = None;
+            state.terminal.selecting = false;
+            state.terminal.mouse_press = Some((tab, button, cell));
+            // The program hears it has the keyboard before the press.
+            let key = self.key_window();
+            report_focus(&mut state, key);
+        }
+        self.mouse_report(
+            tab,
+            mouse_event(crate::term::mouse::Action::Press, Some(button), cell, flags),
+        );
+        self.request_redraw();
+        self.pump();
+        true
+    }
+
+    /// The pointer moved with a reported press held: motion goes to the
+    /// program, at 1002 and 1003, each time it reaches another cell, held
+    /// to the pane's grid past its edges. Returns whether a press is held.
+    pub(super) fn terminal_mouse_drag(&self, event: &NSEvent, x: f32, y: f32) -> bool {
+        let Some((tab, button, last)) = self.state().and_then(|state| state.terminal.mouse_press)
+        else {
+            return false;
+        };
+        let Some((screen, cols, rows)) = self.pane_grid(tab) else {
+            return true;
+        };
+        let Some(cell) = self.mouse_cell(screen, x, y, cols, rows) else {
+            return true;
+        };
+        if cell == last {
+            return true;
+        }
+        if let Some(mut state) = self.state_mut() {
+            state.terminal.mouse_press = Some((tab, button, cell));
+        }
+        let flags = event.modifierFlags();
+        self.mouse_report(
+            tab,
+            mouse_event(
+                crate::term::mouse::Action::Motion,
+                Some(button),
+                cell,
+                flags,
+            ),
+        );
+        true
+    }
+
+    /// The button of a reported press went up: the release goes to the
+    /// program that had the press, at the cell under the pointer held to
+    /// its grid, even off its screen. Returns whether a press was held.
+    pub(super) fn terminal_mouse_release(&self, event: &NSEvent, x: f32, y: f32) -> bool {
+        let Some((tab, button, last)) = self
+            .state_mut()
+            .and_then(|mut state| state.terminal.mouse_press.take())
+        else {
+            return false;
+        };
+        let cell = self
+            .pane_grid(tab)
+            .and_then(|(screen, cols, rows)| self.mouse_cell(screen, x, y, cols, rows))
+            .unwrap_or(last);
+        let flags = event.modifierFlags();
+        self.mouse_report(
+            tab,
+            mouse_event(
+                crate::term::mouse::Action::Release,
+                Some(button),
+                cell,
+                flags,
+            ),
+        );
+        true
+    }
+
+    /// The pointer moved with no button down: a program that asked for
+    /// all motion (1003) hears each new cell under it.
+    pub(super) fn terminal_mouse_hover(&self, event: &NSEvent, x: f32, y: f32) {
+        if self
+            .state()
+            .is_none_or(|state| state.terminal.mouse_press.is_some() || !state.terminal.open)
+        {
+            return;
+        }
+        let flags = event.modifierFlags();
+        let target = (!mouse_kept(flags))
+            .then(|| self.mouse_pane(x, y))
+            .flatten()
+            .and_then(|(tab, screen, cols, rows)| {
+                Some((tab, self.mouse_cell(screen, x, y, cols, rows)?))
+            });
+        let Some((tab, cell)) = target else {
+            if let Some(mut state) = self.state_mut() {
+                state.terminal.mouse_cell = None;
+            }
+            return;
+        };
+        {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            if state.terminal.mouse_cell == Some((tab, cell)) {
+                return;
+            }
+            state.terminal.mouse_cell = Some((tab, cell));
+        }
+        self.mouse_report(
+            tab,
+            mouse_event(crate::term::mouse::Action::Motion, None, cell, flags),
+        );
+    }
+
+    /// The wheel over the terminal, `lines` of it, negative up: reported
+    /// as wheel buttons, one per line, to a program that asked for the
+    /// mouse, and otherwise a scroll through the history.
+    pub(super) fn terminal_wheel(&self, x: f32, y: f32, lines: isize, flags: NSEventModifierFlags) {
+        let target = (lines != 0 && !mouse_kept(flags))
+            .then(|| self.mouse_pane(x, y))
+            .flatten()
+            .and_then(|(tab, screen, cols, rows)| {
+                Some((tab, self.mouse_cell(screen, x, y, cols, rows)?))
+            });
+        if let Some((tab, cell)) = target {
+            use crate::term::mouse::{Action, Button};
+            let button = if lines < 0 {
+                Button::WheelUp
+            } else {
+                Button::WheelDown
+            };
+            for _ in 0..lines.unsigned_abs() {
+                self.mouse_report(tab, mouse_event(Action::Press, Some(button), cell, flags));
+            }
+            return;
+        }
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
+        let history = state.terminal.active_tab().map_or(0, |tab| {
+            tab.session
+                .term
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .scrollback_len()
+        });
+        let back = state.terminal.back as isize;
+        state.terminal.back = (back - lines).clamp(0, history as isize) as usize;
+        drop(state);
+        self.request_redraw();
+        self.pump();
+    }
+
+    /// A tab's screen, if it is on screen, and its grid size.
+    fn pane_grid(&self, tab: usize) -> Option<(Viewport, usize, usize)> {
+        let rect = self.chrome().terminal?;
+        let (_, screen) = crate::platform::terminal::split(rect);
+        let state = self.state()?;
+        let (_, screen) = state
+            .terminal
+            .screens(screen)
+            .into_iter()
+            .find(|(t, _)| *t == tab)?;
+        let term = state.terminal.tabs.get(tab)?.session.term.lock();
+        let term = term.unwrap_or_else(|e| e.into_inner());
+        Some((screen, term.cols(), term.rows()))
+    }
+
+    /// Whether this window has the keyboard. A test instance counts as
+    /// having it, since it often runs behind whatever is in front.
+    pub(super) fn key_window(&self) -> bool {
+        self.ivars().testing || self.window().is_some_and(|window| window.isKeyWindow())
     }
 
     pub(super) fn terminal_drag(&self, x: f32, y: f32) {
@@ -1407,6 +1695,65 @@ impl EditorView {
 
 /// The find bar over the terminal, while it searches the terminal and the
 /// panel shows a session.
+/// Whether crc keeps a mouse event over a program that asked for the
+/// mouse: Option or Shift held, or Command.
+fn mouse_kept(flags: NSEventModifierFlags) -> bool {
+    flags.intersects(
+        NSEventModifierFlags::Option | NSEventModifierFlags::Shift | NSEventModifierFlags::Command,
+    )
+}
+
+/// A mouse event at a cell, with the modifiers a report carries. Control
+/// on a press of the right button is how a Mac makes it, so it is not
+/// reported as held.
+fn mouse_event(
+    action: crate::term::mouse::Action,
+    button: Option<crate::term::mouse::Button>,
+    (row, col): (usize, usize),
+    flags: NSEventModifierFlags,
+) -> crate::term::mouse::Event {
+    crate::term::mouse::Event {
+        action,
+        button,
+        row,
+        col,
+        shift: flags.contains(NSEventModifierFlags::Shift),
+        option: flags.contains(NSEventModifierFlags::Option),
+        control: flags.contains(NSEventModifierFlags::Control)
+            && button != Some(crate::term::mouse::Button::Right),
+    }
+}
+
+/// Tells each program that asked for focus reports (mode 1004) when its
+/// session gains or loses the keyboard, `CSI I` and `CSI O`, on a change
+/// only: a click away from the terminal, another pane of a pair, another
+/// tab, another window or app.
+pub(super) fn report_focus(state: &mut State, key_window: bool) {
+    let keys = key_window
+        && state.terminal.has_keys()
+        && state.terminal.showing()
+        && !field_has_keys(state)
+        && !super::agents::active_hidden(state);
+    let active = state.terminal.active;
+    for (index, tab) in state.terminal.tabs.iter_mut().enumerate() {
+        let has = keys && index == active;
+        if tab.told_focus == has {
+            continue;
+        }
+        tab.told_focus = has;
+        let asked = tab
+            .session
+            .term
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .modes
+            .focus_events;
+        if asked {
+            tab.session.write(if has { b"\x1b[I" } else { b"\x1b[O" });
+        }
+    }
+}
+
 pub(super) fn find_rect(state: &State, chrome: &Chrome) -> Option<Viewport> {
     state.find.as_ref()?.terminal.as_ref()?;
     let rect = chrome.terminal?;

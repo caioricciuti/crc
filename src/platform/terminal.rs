@@ -75,6 +75,9 @@ pub struct Tab {
     pub program_pid: Option<i32>,
     /// The ssh session its shell is running, while it runs one.
     pub remote: Option<crate::platform::remote::Remote>,
+    /// Whether its program was last told it has the keyboard, for focus
+    /// reports (mode 1004) on a change only.
+    pub told_focus: bool,
 }
 
 /// What a session is doing, as the Agents sidebar shows it.
@@ -231,6 +234,13 @@ pub struct Panel {
     /// Two sessions side by side, left and right, in Agents mode. The
     /// active one is the pane with the keyboard.
     pub pair: Option<(usize, usize)>,
+    /// A press reported to a program that asked for the mouse: its tab,
+    /// the button, and the cell (row, column) last reported, which motion
+    /// and the release follow wherever the pointer goes.
+    pub mouse_press: Option<(usize, term::mouse::Button, (usize, usize))>,
+    /// The tab and cell the pointer was last reported over, so motion is
+    /// reported only when it reaches another cell.
+    pub mouse_cell: Option<(usize, (usize, usize))>,
 }
 
 impl Default for Panel {
@@ -249,6 +259,8 @@ impl Default for Panel {
             drag_point: None,
             shown: None,
             pair: None,
+            mouse_press: None,
+            mouse_cell: None,
         }
     }
 }
@@ -336,6 +348,8 @@ impl Panel {
     pub fn close_tab(&mut self, index: usize) {
         // Indices after it move down; a pair is not worth renumbering.
         self.pair = None;
+        self.mouse_press = None;
+        self.mouse_cell = None;
         if index < self.tabs.len() {
             // Dropping the session hangs up on its program.
             let tab = self.tabs.remove(index);

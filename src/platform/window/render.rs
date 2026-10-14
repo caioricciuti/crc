@@ -42,8 +42,10 @@ impl EditorView {
         // resetCursorRects is called during tracking. If a borrow is already
         // live, the honest answer is to skip this frame and draw on the next
         // one, not to abort the process.
+        let key = self.key_window();
         let mut state = self.state_mut()?;
         layout::begin_frame();
+        super::terminal::report_focus(&mut state, key);
         sync_conflicts(&mut state);
         super::agents::forget_emptied(&mut state);
         let column = column_of(&state);

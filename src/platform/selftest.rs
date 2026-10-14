@@ -27,6 +27,9 @@
 //! dragby <dx> <dy>            a drag to a point relative to the press
 //! up <x> <y>                  release
 //! upby <dx> <dy>              release relative to the press
+//! wheelat @<region> <fx> <fy> <dy>
+//!                             a trackpad scroll of <dy> points at a fraction
+//!                             of a region, as for `clickat`
 //! resize <width> <height>     resize the native window in points
 //! touch <file>                create a file without notifying the project UI
 //! write <file> <text>         overwrite a file, as another program would
@@ -115,6 +118,14 @@ pub enum Step {
     Trackpad {
         x: f64,
         y: f64,
+        dy: f64,
+    },
+    /// A trackpad scroll at a fraction of a named region, as [`Step::At`]
+    /// places a click.
+    WheelAt {
+        name: String,
+        fx: f64,
+        fy: f64,
         dy: f64,
     },
     Dump(String),
@@ -309,6 +320,12 @@ pub fn parse(script: &str) -> Result<Vec<Step>, String> {
                     fy,
                 })
             }
+            "wheelat" if rest.starts_with('@') => {
+                let name = args.word().ok_or_else(bad)?.to_string();
+                let (fx, fy) = (args.num().ok_or_else(bad)?, args.num().ok_or_else(bad)?);
+                let dy = args.num().ok_or_else(bad)?;
+                Some(Step::WheelAt { name, fx, fy, dy })
+            }
             "down" => {
                 let (x, y) = (args.num().ok_or_else(bad)?, args.num().ok_or_else(bad)?);
                 let count = args.opt_num().map_or(1, |c| c as isize);
@@ -447,6 +464,15 @@ mod tests {
             }
         );
         assert_eq!(parse("fade 40\n").unwrap(), [Step::Fade(40)]);
+        assert_eq!(
+            parse("wheelat @terminal 0.5 0.5 -40\n").unwrap(),
+            [Step::WheelAt {
+                name: "terminal".into(),
+                fx: 0.5,
+                fy: 0.5,
+                dy: -40.0
+            }]
+        );
         for junk in [
             "clickat scrub.track 0 0.5",
             "upat @scrub.track 0",
@@ -456,6 +482,8 @@ mod tests {
             "resize 10 20 30",
             "key 36 - a b",
             "fade soon",
+            "wheelat @terminal 0.5 0.5",
+            "wheelat terminal 0.5 0.5 1",
         ] {
             assert!(parse(junk).is_err(), "{junk} should be refused");
         }
