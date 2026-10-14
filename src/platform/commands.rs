@@ -44,6 +44,8 @@ fn keywords(action: Sel) -> &'static str {
         "join unwrap command"
     } else if action == sel!(showReview:) {
         "agent claude undo keep diff changes"
+    } else if action == sel!(toggleBlameHeat:) {
+        "age recent gutter annotate"
     } else {
         ""
     }

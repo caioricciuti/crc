@@ -1565,6 +1565,109 @@ fn parse_blame(text: &str) -> Option<Blame> {
     Some(blame)
 }
 
+/// A commit some line of a blamed file was last changed in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitInfo {
+    pub sha: String,
+    pub author: String,
+    /// Seconds since the epoch.
+    pub time: i64,
+    pub summary: String,
+}
+
+/// In [`BlameMap::lines`], a line not committed yet.
+pub const NOT_COMMITTED: u32 = u32::MAX;
+
+/// Who last changed every line of a file: each commit once, and each
+/// line's index into them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BlameMap {
+    pub commits: Vec<CommitInfo>,
+    /// Per line, zero-based: an index into `commits`, or [`NOT_COMMITTED`].
+    pub lines: Vec<u32>,
+}
+
+/// Blames every line of `path` as the editor has it: `contents` is the
+/// document's text, so unsaved edits count as not committed yet.
+pub fn blame_file(root: &Path, path: &Path, contents: &str) -> Result<BlameMap, String> {
+    let output = run_with_stdin(
+        command(root)
+            .args(["blame", "--porcelain", "--contents", "-", "--"])
+            .arg(path),
+        contents.as_bytes().to_vec(),
+    )?;
+    let mut map = parse_blame_file(&String::from_utf8_lossy(&output));
+    // Git answers for the lines `contents` has; a final line break leaves
+    // the editor one more, empty, line, which no commit changed.
+    let lines = contents.bytes().filter(|&b| b == b'\n').count() + 1;
+    map.lines.truncate(lines);
+    Ok(map)
+}
+
+/// `git blame --porcelain` for a whole file. A commit's details come with
+/// its first line only; the lines after name it by its hash alone.
+pub fn parse_blame_file(text: &str) -> BlameMap {
+    let mut map = BlameMap::default();
+    let mut index: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
+    // Every line of the file comes with a line of its own, so no answer
+    // has more lines than that.
+    let most = text.bytes().filter(|&b| b == b'\n').count();
+    // The commit the header just read names, while its details follow.
+    let mut current: Option<u32> = None;
+    for line in text.lines() {
+        if line.starts_with('\t') {
+            current = None;
+            continue;
+        }
+        let mut words = line.split(' ');
+        let first = words.next().unwrap_or("");
+        let is_header = first.len() >= 40 && first.bytes().all(|b| b.is_ascii_hexdigit());
+        if is_header {
+            let Some(final_line) = words
+                .nth(1)
+                .and_then(|n| n.parse::<usize>().ok())
+                .filter(|n| (1..=most).contains(n))
+            else {
+                current = None;
+                continue;
+            };
+            let at = if first.bytes().all(|b| b == b'0') {
+                current = None;
+                NOT_COMMITTED
+            } else {
+                let next = map.commits.len() as u32;
+                let at = *index.entry(first).or_insert(next);
+                if at == next {
+                    map.commits.push(CommitInfo {
+                        sha: first.to_owned(),
+                        author: String::new(),
+                        time: 0,
+                        summary: String::new(),
+                    });
+                }
+                current = Some(at);
+                at
+            };
+            if map.lines.len() < final_line {
+                map.lines.resize(final_line, NOT_COMMITTED);
+            }
+            map.lines[final_line - 1] = at;
+            continue;
+        }
+        let Some(commit) = current.and_then(|at| map.commits.get_mut(at as usize)) else {
+            continue;
+        };
+        if let Some(name) = line.strip_prefix("author ") {
+            commit.author = super::worktree::clean_line(name);
+        } else if let Some(time) = line.strip_prefix("author-time ") {
+            commit.time = time.parse().unwrap_or(0);
+        } else if let Some(summary) = line.strip_prefix("summary ") {
+            commit.summary = super::worktree::clean_line(summary);
+        }
+    }
+    map
+}
+
 /// "3 days ago", for a blame.
 pub fn ago(time: i64, now: i64) -> String {
     let seconds = (now - time).max(0);
@@ -1793,6 +1896,86 @@ mod tests {
         assert_eq!(parse_blame(local).unwrap().author, None);
         assert_eq!(ago(1000, 1000 + 3 * 86_400), "3 days ago");
         assert_eq!(ago(1000, 1000 + 3600), "1 hour ago");
+    }
+
+    #[test]
+    fn a_whole_file_blame_names_each_commit_once() {
+        let a = "a".repeat(40);
+        let b = "b".repeat(40);
+        let zero = "0".repeat(40);
+        let porcelain = format!(
+            "{a} 1 1 2\nauthor Ana\nauthor-mail <a@example.com>\nauthor-time 1700000000\nauthor-tz +0000\nsummary first\x1b[31m words\nfilename f.txt\n\tone\n\
+             {a} 2 2\n\ttwo\n\
+             {zero} 3 3 1\nauthor Not Committed Yet\nauthor-time 1\nsummary Version of f.txt from -\nfilename f.txt\n\tTHREE\n\
+             {b} 3 4 1\nauthor Bo\tBloggs\nauthor-time 1600000000\nsummary second\nprevious {a} f.txt\nfilename f.txt\n\tfour\n\
+             {a} 4 5 1\nfilename f.txt\n\tfive\n"
+        );
+        let map = parse_blame_file(&porcelain);
+        assert_eq!(map.commits.len(), 2);
+        assert_eq!(map.commits[0].sha, a);
+        assert_eq!(map.commits[0].author, "Ana");
+        assert_eq!(map.commits[0].time, 1_700_000_000);
+        assert_eq!(
+            map.commits[0].summary, "first words",
+            "no escape gets through"
+        );
+        assert_eq!(map.commits[1].author, "Bo Bloggs");
+        assert_eq!(map.commits[1].summary, "second");
+        assert_eq!(map.lines, vec![0, 0, NOT_COMMITTED, 1, 0]);
+        // A line number past what the answer holds is not believed.
+        let wild = format!("{a} 1 9999999 1\nauthor X\n\tone\n");
+        assert!(parse_blame_file(&wild).lines.is_empty());
+        assert_eq!(parse_blame_file(""), BlameMap::default());
+    }
+
+    #[test]
+    fn a_whole_file_is_blamed_with_its_unsaved_lines() {
+        let dir = std::env::temp_dir().join(format!("crc-blame-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str], date: &str| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args([
+                    "-c",
+                    "user.name=Robin Example",
+                    "-c",
+                    "user.email=r@example.com",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .env("GIT_AUTHOR_DATE", date)
+                .env("GIT_COMMITTER_DATE", date)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        let date = "2020-01-01T00:00:00Z";
+        git(&["init", "-q", "-b", "main"], date);
+        std::fs::write(dir.join("garden.txt"), "beans\npeas\n").unwrap();
+        git(&["add", "garden.txt"], date);
+        git(&["commit", "-q", "-m", "plant beans"], date);
+        std::fs::write(dir.join("garden.txt"), "beans\npeas\nkale\n").unwrap();
+        git(&["commit", "-q", "-am", "add kale"], "2024-06-01T00:00:00Z");
+        let map = blame_file(&dir, Path::new("garden.txt"), "beans\nPEAS\nkale\n").unwrap();
+        assert_eq!(
+            map.lines.len(),
+            3,
+            "no line for the empty one after the last break"
+        );
+        assert_eq!(map.commits.len(), 2);
+        let summary = |line: usize| &map.commits[map.lines[line] as usize].summary;
+        assert_eq!(summary(0), "plant beans");
+        assert_eq!(map.lines[1], NOT_COMMITTED, "the edited line");
+        assert_eq!(summary(2), "add kale");
+        assert_eq!(map.commits[map.lines[2] as usize].time, 1_717_200_000);
+        assert_eq!(map.commits[0].author, "Robin Example");
+        assert!(blame_file(&dir, Path::new("missing.txt"), "x\n").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

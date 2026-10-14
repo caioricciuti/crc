@@ -13,7 +13,8 @@
 //!
 //! Run with: cargo run --release --offline --example frame_latency
 //! (`-- --wrap`, `--fold` or `--chrome` for those frames, `--scrub` for
-//! steps through a file's history).
+//! steps through a file's history, `--heat` to add Git > Blame Heat's
+//! strip to every frame).
 
 use crc::project::tree::Tree;
 use crc::render::font::Atlas;
@@ -106,6 +107,79 @@ impl ChromeFrame {
             theme.status_text,
         );
     }
+}
+
+/// `--heat`: the blame heat strip as the window draws it, over a blame
+/// that names one of five commits of every age for each line.
+struct HeatFrame {
+    lines: Vec<u32>,
+    alpha: Vec<f32>,
+    tips: Vec<String>,
+}
+
+impl HeatFrame {
+    fn new(lines: usize) -> Self {
+        HeatFrame {
+            lines: (0..lines).map(|n| (n / 7 % 5) as u32).collect(),
+            alpha: vec![1.0, 0.8, 0.55, 0.35, 0.18],
+            tips: (0..5)
+                .map(|n| format!("{n}abcdef  Robin Example  {n} days ago\nplant beans"))
+                .collect(),
+        }
+    }
+
+    fn append(
+        &self,
+        atlas: &Atlas,
+        buffer: &Buffer,
+        viewport: Viewport,
+        theme: &Theme,
+        out: &mut Vec<GlyphInstance>,
+    ) {
+        // The window starts the frame's hotspots, and works the rows out
+        // once for everything drawn on them; `build` keeps its own.
+        layout::begin_frame();
+        let rows = layout::screen_rows(buffer, viewport, atlas.metrics.line_height);
+        layout::push_blame_heat(
+            out,
+            atlas,
+            viewport,
+            &rows,
+            theme,
+            &layout::BlameHeat {
+                lines: &self.lines,
+                alpha: &self.alpha,
+                tips: &self.tips,
+                hide_from: usize::MAX,
+            },
+        );
+    }
+}
+
+/// What an edit costs the strip besides drawing: finding the first line
+/// that differs from the text blamed, in a file at the 2 MB limit, with
+/// the edit at its end, the worst place.
+fn heat_follow() {
+    use crc::text::rope::Rope;
+    let text = "    let x = compute(a, b, c); // a line of ordinary length\n".repeat(36_000);
+    let blamed = Rope::from_text(&text);
+    let mut edited = blamed.clone();
+    let mut samples = Vec::with_capacity(200);
+    for _ in 0..200 {
+        edited.insert(edited.len_bytes() - 1, "x");
+        let started = Instant::now();
+        let line = blamed
+            .first_difference(&edited)
+            .map(|at| edited.byte_to_line(at));
+        samples.push(started.elapsed().as_secs_f64() * 1e3);
+        std::hint::black_box(line);
+    }
+    println!();
+    println!(
+        "follow      {} KiB blamed, edits at the end",
+        text.len() / 1024
+    );
+    report("heat follow", samples);
 }
 
 fn percentile(sorted: &[f64], p: f64) -> f64 {
@@ -220,6 +294,10 @@ fn main() {
         }
     });
     let viewport = chrome.as_ref().map_or(window, |c| c.rects.text);
+    let heat = std::env::args().any(|arg| arg == "--heat").then(|| {
+        println!("scope       blame heat strip, five commits, every line blamed");
+        HeatFrame::new(buffer.rope.len_lines())
+    });
     let rows = viewport.rows(renderer.atlas.metrics.line_height);
     buffer.scroll_to_cursor(rows, 0);
     println!("cursor      line {middle}, viewport holds {rows} lines\n");
@@ -231,6 +309,9 @@ fn main() {
     // texture allocation, which no steady-state keystroke pays again.
     for _ in 0..30 {
         layout::build(&buffer, &mut renderer.atlas, viewport, &theme, &mut glyphs);
+        if let Some(heat) = &heat {
+            heat.append(&renderer.atlas, &buffer, viewport, &theme, &mut glyphs);
+        }
         if let Some(chrome) = &mut chrome {
             chrome.append(&mut renderer.atlas, &buffer, &theme, &mut glyphs);
         }
@@ -262,6 +343,9 @@ fn main() {
 
         let t_layout = Instant::now();
         let stats = layout::build(&buffer, &mut renderer.atlas, viewport, &theme, &mut glyphs);
+        if let Some(heat) = &heat {
+            heat.append(&renderer.atlas, &buffer, viewport, &theme, &mut glyphs);
+        }
         if let Some(chrome) = &mut chrome {
             chrome.append(&mut renderer.atlas, &buffer, &theme, &mut glyphs);
         }
@@ -295,6 +379,9 @@ fn main() {
         let started = Instant::now();
         buffer.scroll_by(if i % 2 == 0 { 3 } else { -1 }, rows);
         layout::build(&buffer, &mut renderer.atlas, viewport, &theme, &mut glyphs);
+        if let Some(heat) = &heat {
+            heat.append(&renderer.atlas, &buffer, viewport, &theme, &mut glyphs);
+        }
         if let Some(chrome) = &mut chrome {
             chrome.append(&mut renderer.atlas, &buffer, &theme, &mut glyphs);
         }
@@ -309,6 +396,10 @@ fn main() {
     }
     println!();
     report("scroll frame", scroll);
+
+    if heat.is_some() {
+        heat_follow();
+    }
 
     std::hint::black_box(&glyphs);
     std::hint::black_box(Duration::from_nanos(0));

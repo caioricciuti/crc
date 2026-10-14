@@ -363,6 +363,37 @@ impl Rope {
         true
     }
 
+    /// The first byte offset where `other` differs from this text, or
+    /// `None` for the same text. One ending inside the other differs where
+    /// the shorter ends. Compared a chunk at a time, as [`Rope::same_text`]
+    /// is, so its cost is the length of what the two share.
+    pub fn first_difference(&self, other: &Rope) -> Option<usize> {
+        if self.same_as(other) {
+            return None;
+        }
+        let mut theirs = other.bytes_in(0..other.len_bytes());
+        let mut pending: &[u8] = &[];
+        let mut at = 0;
+        for mut mine in self.bytes_in(0..self.len_bytes()) {
+            while !mine.is_empty() {
+                if pending.is_empty() {
+                    match theirs.next() {
+                        Some(next) => pending = next,
+                        None => return Some(at),
+                    }
+                }
+                let n = mine.len().min(pending.len());
+                if mine[..n] != pending[..n] {
+                    return Some(at + mine.iter().zip(pending).take_while(|(a, b)| a == b).count());
+                }
+                at += n;
+                mine = &mine[n..];
+                pending = &pending[n..];
+            }
+        }
+        (self.len_bytes() != other.len_bytes()).then_some(at)
+    }
+
     /// Inserts at a byte offset. Panics if the offset is out of bounds or
     /// lands inside a multi-byte character.
     pub fn insert(&mut self, at: usize, text: &str) {
@@ -1028,6 +1059,17 @@ mod tests {
         assert_eq!(d.len_bytes(), a.len_bytes());
         assert!(!a.same_text(&d));
         assert!(Rope::new().same_text(&Rope::from_text("")));
+        // Where they part, across chunking.
+        assert_eq!(a.first_difference(&b), None);
+        assert_eq!(a.first_difference(&c), None);
+        assert_eq!(a.first_difference(&d), Some(at));
+        let mut e = b.clone();
+        e.insert(10, "x");
+        assert_eq!(a.first_difference(&e), Some(10));
+        let short = Rope::from_text(&source[..source.len() - 5]);
+        assert_eq!(a.first_difference(&short), Some(source.len() - 5));
+        assert_eq!(short.first_difference(&a), Some(source.len() - 5));
+        assert_eq!(Rope::new().first_difference(&Rope::from_text("")), None);
     }
 
     #[test]

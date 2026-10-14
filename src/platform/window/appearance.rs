@@ -227,6 +227,13 @@ impl EditorView {
             state.ssh_auth_sock = settings.ssh_auth_sock.clone();
             state.conflict_side = settings.conflict_side_by_side;
             state.agent_review = settings.agent_review;
+            if settings.blame_heat != state.heat.on {
+                if settings.blame_heat {
+                    state.heat.on = true;
+                } else {
+                    state.heat.turn_off();
+                }
+            }
         }
         self.apply_theme();
         if let Some(mut state) = self.state_mut() {

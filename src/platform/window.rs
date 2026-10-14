@@ -80,7 +80,7 @@ mod tabs;
 mod terminal;
 use extensions::{ext_details, preview_command, preview_displaced};
 use mcp::{mcp_details, mcp_url_rows};
-use state::{Blame, Ext, Gutter, Lsp, ProjectSearch, Reloads, Watch};
+use state::{Blame, Ext, Gutter, Heat, Lsp, ProjectSearch, Reloads, Watch};
 
 struct ProjectIndexResult {
     root: std::path::PathBuf,
@@ -635,6 +635,8 @@ struct State {
     gutter: Gutter,
     /// Who last changed the caret's line, for the status line.
     blame: Blame,
+    /// Git > Blame Heat: how recently each line changed, in the gutter.
+    heat: Heat,
     /// Language servers, and what is asked of them.
     lsp: Lsp,
     /// Installed extensions: their threads, commands and calls in flight.
@@ -2746,6 +2748,7 @@ define_class!(
             self.lsp_flush_changes();
             self.gutter_refresh();
             self.blame_refresh();
+            self.heat_refresh();
             self.poll_scrub();
             self.bulb_refresh();
             self.ext_poll();
@@ -3165,6 +3168,11 @@ define_class!(
         #[unsafe(method(fileHistory:))]
         fn action_file_history(&self, _sender: Option<&AnyObject>) {
             self.open_history();
+        }
+
+        #[unsafe(method(toggleBlameHeat:))]
+        fn action_toggle_blame_heat(&self, _sender: Option<&AnyObject>) {
+            self.toggle_blame_heat();
         }
 
         #[unsafe(method(olderVersion:))]
@@ -4394,6 +4402,11 @@ define_class!(
                 active.path.is_some() && !active.is_preview_file()
             } else if action == sel!(olderVersion:) || action == sel!(newerVersion:) {
                 scrub::has_keys(&state)
+            } else if action == sel!(toggleBlameHeat:) {
+                // Checked while it is on; it can always be flipped.
+                let on: isize = if state.heat.on { 1 } else { 0 };
+                let _: () = unsafe { msg_send![item, setState: on] };
+                true
             } else if action == sel!(revertDocumentToSaved:) {
                 let active = state.docs.active();
                 active.path.is_some()
@@ -6207,6 +6220,9 @@ fn forget_document(state: &mut State, id: u64) {
     state.gutter.dirty.remove(&id);
     state.gutter.pending.remove(&id);
     state.gutter.stale.remove(&id);
+    state.heat.docs.remove(&id);
+    state.heat.dirty.remove(&id);
+    state.heat.pending.remove(&id);
     state.lsp.dirty.remove(&id);
     state.conflict_scans.remove(&id);
     state.issue_tabs.remove(&id);
@@ -6800,6 +6816,7 @@ fn draw_other_pane(
     syntax: &mut SyntaxStore,
     responses: &HashMap<u64, crate::http::view::View>,
     marks: &HashMap<u64, GutterState>,
+    heat: &mut Heat,
     renderer: &mut Renderer,
     theme: &Theme,
     glyphs: &mut Vec<GlyphInstance>,
@@ -6896,6 +6913,11 @@ fn draw_other_pane(
     );
     if let Some(entry) = marks.get(&buffer.id()) {
         layout::push_gutter_marks(glyphs, &renderer.atlas, text, &rows, theme, &entry.marks);
+    }
+    if heat.on
+        && let Some(doc) = heat.follow(buffer.id(), &buffer.rope)
+    {
+        layout::push_blame_heat(glyphs, &renderer.atlas, text, &rows, theme, &doc.strip());
     }
     // The seam between panes.
     layout::push_rect(
@@ -8819,6 +8841,7 @@ fn install_menu(mtm: MainThreadMarker, app: &NSApplication) {
     git_menu.addItem(&history);
     git_menu.addItem(&item("Older Version", sel!(olderVersion:), "", false));
     git_menu.addItem(&item("Newer Version", sel!(newerVersion:), "", false));
+    git_menu.addItem(&item("Blame Heat", sel!(toggleBlameHeat:), "", false));
     git_menu.addItem(&NSMenuItem::separatorItem(mtm));
     git_menu.addItem(&item("Next Conflict", sel!(nextConflict:), "", false));
     git_menu.addItem(&item(
@@ -9269,6 +9292,14 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
             shown: None,
             want: None,
             rx: None,
+        },
+        heat: Heat {
+            on: settings.blame_heat,
+            docs: HashMap::new(),
+            dirty: HashMap::new(),
+            pending: HashSet::new(),
+            generation: 0,
+            channel: mpsc::channel(),
         },
         lsp: Lsp {
             servers: HashMap::new(),

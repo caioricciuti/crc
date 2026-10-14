@@ -36,9 +36,9 @@ HOME="$T/settingshome" CRC_SELFTEST="$T/settings.script" "$BIN" "$T/settings.txt
 # The window is 1000 pt tall, so it is that tall on any display (a taller
 # one was cut to the screen, and the count followed whichever display the
 # window opened on): the last setting is below the fold, scrolled to.
-expect "$T/settings-page.out" settings_page "open changed=0 problems=0 targets=21"
+expect "$T/settings-page.out" settings_page "open changed=0 problems=0 targets=22"
 expect "$T/settings-page.out" tabs "settings.txt"
-expect "$T/settings-escaped.out" settings_page "closed changed=0 problems=0 targets=21"
+expect "$T/settings-escaped.out" settings_page "closed changed=0 problems=0 targets=22"
 if ! grep -q '^tabs: .*config.toml' "$T/settings-open.out"; then
     failed "settings-open.out: $(grep -m1 '^tabs' "$T/settings-open.out"), expected a config.toml tab"
 fi

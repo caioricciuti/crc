@@ -116,6 +116,7 @@ impl EditorView {
             terminal: terminal_panel,
             agents,
             gutter: Gutter { docs: gutter, .. },
+            heat,
             home_hits,
             recent_projects,
             home: home_summary,
@@ -380,6 +381,18 @@ impl EditorView {
                     &marks.marks,
                 );
             }
+            if heat.on
+                && let Some(doc) = heat.follow(buffer.id(), &buffer.rope)
+            {
+                layout::push_blame_heat(
+                    glyphs,
+                    &renderer.atlas,
+                    editor_rect,
+                    &rows,
+                    theme,
+                    &doc.strip(),
+                );
+            }
             if palette.is_none()
                 && bulb.as_ref().is_some_and(|b| {
                     (b.buffer, b.caret) == (buffer.id(), buffer.cursor()) && b.shows()
@@ -570,7 +583,8 @@ impl EditorView {
                 continue;
             };
             draw_other_pane(
-                store, rects, tree, syntax, responses, gutter, renderer, theme, glyphs, *word_wrap,
+                store, rects, tree, syntax, responses, gutter, heat, renderer, theme, glyphs,
+                *word_wrap,
             );
         }
         layout::build_toolbar(

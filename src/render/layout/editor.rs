@@ -915,6 +915,113 @@ pub fn push_gutter_marks(
     }
 }
 
+/// How strongly the blame heat strip shows a line last changed
+/// `age_seconds` ago: full for a day, fading over a year, then not at all.
+pub fn heat(age_seconds: i64) -> f32 {
+    const DAY: i64 = 86_400;
+    match age_seconds {
+        a if a < DAY => 1.0,
+        a if a < 7 * DAY => 0.8,
+        a if a < 30 * DAY => 0.55,
+        a if a < 90 * DAY => 0.35,
+        a if a < 365 * DAY => 0.18,
+        _ => 0.0,
+    }
+}
+
+/// Where the blame heat strip sits, from the gutter's left edge, and how
+/// wide it is, for a cell `advance` wide. Right of the change bar (`2..5`)
+/// when the first cell has room before the line numbers start; at small
+/// sizes it has none, and the strip takes the gap left of the bar.
+pub fn heat_strip(advance: f32) -> (f32, f32) {
+    const FROM: f32 = 6.0;
+    let room = advance - 0.5 - FROM;
+    if room >= 1.0 {
+        (FROM, room.min(2.0))
+    } else {
+        (0.0, 1.5)
+    }
+}
+
+/// One document's blame, as the heat strip draws it.
+pub struct BlameHeat<'a> {
+    /// Per line, an index into `alpha` and `tips`, or
+    /// [`crate::project::git::NOT_COMMITTED`].
+    pub lines: &'a [u32],
+    /// Per commit, the strip's opacity: [`heat`] of its age.
+    pub alpha: &'a [f32],
+    /// Per commit, what the strip's tooltip says.
+    pub tips: &'a [String],
+    /// Lines from here down were edited since the blame and are not drawn.
+    pub hide_from: usize,
+}
+
+/// Draws the blame heat strip down the gutter's first cell: per line, the
+/// accent colour as strong as its commit is recent, nothing for a line not
+/// committed yet or older than a year. A run of rows blamed to one commit
+/// is one rectangle, and one hotspot whose tooltip names the commit.
+pub fn push_blame_heat(
+    out: &mut Vec<GlyphInstance>,
+    atlas: &Atlas,
+    viewport: Viewport,
+    rows: &[ScreenRow],
+    theme: &Theme,
+    heat: &BlameHeat,
+) {
+    let m = atlas.metrics;
+    let (dx, width) = heat_strip(m.advance);
+    let x = m.snap(viewport.x + dx);
+    let drawn_from = out.len();
+    let commit_of = |row: &ScreenRow| {
+        (row.line < heat.hide_from)
+            .then(|| heat.lines.get(row.line).copied())
+            .flatten()
+            .filter(|&c| heat.alpha.get(c as usize).is_some_and(|&a| a > 0.0))
+    };
+    let flush = |out: &mut Vec<GlyphInstance>, (commit, top, bottom): (u32, f32, f32)| {
+        let alpha = heat.alpha[commit as usize];
+        push_rect(
+            out,
+            atlas,
+            [x, top],
+            [width, bottom - top],
+            faded(theme.accent, alpha),
+        );
+        hotspot(
+            Viewport {
+                x: viewport.x,
+                y: top,
+                width: m.advance,
+                height: bottom - top,
+            },
+            Cursor::Pointing,
+            heat.tips.get(commit as usize).map(String::as_str),
+        );
+    };
+    // The commit, top and bottom of the rows being gathered.
+    let mut run: Option<(u32, f32, f32)> = None;
+    for row in rows {
+        let commit = commit_of(row);
+        match (run, commit) {
+            (Some((c, top, bottom)), Some(n)) if c == n && (row.y - bottom).abs() < 0.5 => {
+                run = Some((c, top, row.y + m.line_height));
+            }
+            _ => {
+                if let Some(done) = run {
+                    flush(out, done);
+                }
+                run = commit.map(|c| (c, row.y, row.y + m.line_height));
+            }
+        }
+    }
+    if let Some(done) = run {
+        flush(out, done);
+    }
+    for quad in &mut out[drawn_from..] {
+        clip_vertical(quad, viewport.y, viewport.y + viewport.height);
+    }
+}
+
 /// The lightbulb on the caret's line, where its number was: the server has
 /// code actions there. The number is the only one drawn in the active
 /// gutter colour, so it is taken back out of `out`, which [`build_full`]

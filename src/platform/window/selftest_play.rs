@@ -588,7 +588,7 @@ impl EditorView {
                 };
                 let report = format!(
                     // First: the report ends with the document's text.
-                    "message: {}\npreview: {}\nmd: {md}\nactivity: {}\npointer_targets: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nrepo: {}\ngit_note: {}\nhome: {}\nmcp: {}\nmcp_page: {}\nsettings_page: {}\nreview_page: {}\nterminals: {}\nagents: {}\ninspector: {}\nteams: {}\nagents_tree: {}\nagents_activity: {}\nagents_prs: {}\nconflicts: {}\ngit_conflicts: {}\nblame: {}\nfind_results: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\npeek: {}\ngutter: {}\nissue_tab: {}\nscrub: {}\nscrub_strip: {}\nscrub_fade: {}\n{report}",
+                    "message: {}\npreview: {}\nmd: {md}\nactivity: {}\npointer_targets: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nrepo: {}\ngit_note: {}\nhome: {}\nmcp: {}\nmcp_page: {}\nsettings_page: {}\nreview_page: {}\nterminals: {}\nagents: {}\ninspector: {}\nteams: {}\nagents_tree: {}\nagents_activity: {}\nagents_prs: {}\nconflicts: {}\ngit_conflicts: {}\nblame: {}\nfind_results: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\npeek: {}\ngutter: {}\nissue_tab: {}\nscrub: {}\nscrub_strip: {}\nscrub_fade: {}\nblame_heat: {}\n{report}",
                     state.message.as_ref().map_or("", |(text, _)| text.as_str()),
                     state.html_preview.as_ref().map_or("closed".to_string(), |p| format!(
                         "open ext={} view={} probe={}",
@@ -818,6 +818,40 @@ impl EditorView {
                     super::scrub::dump(&state),
                     super::scrub::dump_strip(&state),
                     super::scrub::dump_fade(&state),
+                    // The active document's strip: its lines, commits, the
+                    // lines drawn, and the first line hidden as edited.
+                    if !state.heat.on {
+                        "off".to_string()
+                    } else {
+                        state.heat.docs.get(&buffer.id()).map_or("on none".to_string(), |doc| {
+                            let strip = doc.strip();
+                            let shown = strip
+                                .lines
+                                .iter()
+                                .take(strip.hide_from)
+                                .filter(|&&c| strip.alpha.get(c as usize).is_some_and(|&a| a > 0.0))
+                                .count();
+                            // The runs drawn last frame, by their tooltips;
+                            // the first one's, its line break a slash.
+                            let tips: Vec<&str> = state
+                                .hotspots
+                                .iter()
+                                .filter_map(|h| h.tip.as_deref())
+                                .filter(|t| strip.tips.iter().any(|tip| tip == t))
+                                .collect();
+                            format!(
+                                "on lines={} commits={} shown={shown} hidden_from={} spots={} tip={}",
+                                strip.lines.len(),
+                                doc.map.commits.len(),
+                                match strip.hide_from {
+                                    usize::MAX => "-".to_string(),
+                                    line => (line + 1).to_string(),
+                                },
+                                tips.len(),
+                                tips.first().map_or(String::new(), |t| t.replace('\n', " / ")),
+                            )
+                        })
+                    },
                 );
                 if let Err(e) = std::fs::write(path, report) {
                     eprintln!("crc: selftest could not write {path}: {e}");

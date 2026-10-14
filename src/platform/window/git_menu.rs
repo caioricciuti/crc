@@ -406,4 +406,132 @@ impl EditorView {
             let _ = tx.send((id, line, note));
         });
     }
+
+    /// Git > Blame Heat: the strip on or off until crc quits. Off drops
+    /// every blame, and any still running is dropped when it lands.
+    pub(super) fn toggle_blame_heat(&self) {
+        if let Some(mut state) = self.state_mut() {
+            if state.heat.on {
+                state.heat.turn_off();
+            } else {
+                state.heat.on = true;
+            }
+        }
+        if let Some(window) = self.window() {
+            window.invalidateCursorRectsForView(self);
+        }
+        self.resume_display_link();
+        self.request_redraw();
+        self.pump();
+    }
+
+    /// Keeps the blame heat strip of the documents on screen current:
+    /// takes blames that landed, and asks for one when a document has
+    /// none, HEAD may have moved, or typing stopped a second ago. Runs from
+    /// the display link.
+    pub(super) fn heat_refresh(&self) {
+        const PAUSE: Duration = Duration::from_secs(1);
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
+        let state = &mut *state;
+        let now = crate::platform::unix_seconds() as i64;
+        while let Ok((id, generation, epoch, text, blamed)) = state.heat.channel.1.try_recv() {
+            let rope = buffer_by_id(&state.docs, &state.panes, id).map(|b| &b.rope);
+            // An answer Git could not give leaves the document without a
+            // strip, rather than asking again every frame.
+            let blamed = (id, generation, epoch, text, blamed.unwrap_or_default());
+            if state.heat.land(blamed, state.gutter.epoch, rope, now) {
+                self.ivars().needs_redraw.set(true);
+                if let Some(window) = self.window() {
+                    window.invalidateCursorRectsForView(self);
+                }
+            }
+        }
+        if !state.heat.on {
+            return;
+        }
+        // The documents on screen. Others are looked at when next shown.
+        let shown: Vec<u64> = std::iter::once(state.docs.active())
+            .chain(state.panes.iter().map(|p| p.docs.active()))
+            .map(Buffer::id)
+            .collect();
+        for id in shown {
+            let Some(buffer) = buffer_by_id(&state.docs, &state.panes, id) else {
+                continue;
+            };
+            match heat_wanted(&state.gutter, buffer) {
+                // Not known yet: the gutter has not read its HEAD text.
+                None => continue,
+                Some(false) => {
+                    state.heat.docs.remove(&id);
+                    state.heat.dirty.remove(&id);
+                    continue;
+                }
+                Some(true) => {}
+            }
+            let epoch = state.gutter.epoch;
+            let heat = &mut state.heat;
+            let ask = match heat.follow(id, &buffer.rope) {
+                Some(doc) => doc.epoch != epoch,
+                None => true,
+            };
+            if ask && !heat.pending.contains(&id) && !heat.dirty.contains_key(&id) {
+                start_heat(heat, epoch, id, buffer);
+            }
+        }
+        // Typing stopped.
+        for id in due(&state.heat.dirty, PAUSE) {
+            if state.heat.pending.contains(&id) {
+                continue;
+            }
+            state.heat.dirty.remove(&id);
+            let Some(buffer) = buffer_by_id(&state.docs, &state.panes, id) else {
+                continue;
+            };
+            if heat_wanted(&state.gutter, buffer) == Some(true) {
+                start_heat(&mut state.heat, state.gutter.epoch, id, buffer);
+            }
+        }
+    }
+}
+
+/// Whether `buffer` gets a blame heat strip: a saved file Git tracks, of
+/// at most 2 MB, not a preview or a version from File History. `None`
+/// until the gutter has read its HEAD text, which says whether Git has it.
+fn heat_wanted(gutter: &Gutter, buffer: &Buffer) -> Option<bool> {
+    if buffer.path.is_none()
+        || buffer.is_preview_file()
+        || buffer.is_frozen()
+        || buffer.rope.len_bytes() > GUTTER_MAX_BYTES
+    {
+        return Some(false);
+    }
+    let entry = gutter.docs.get(&buffer.id())?;
+    Some(entry.head.as_ref().is_some_and(|h| !h.is_empty()))
+}
+
+/// Blames `buffer`'s text on a worker; the answer lands in `heat`'s
+/// channel.
+fn start_heat(heat: &mut Heat, epoch: u64, id: u64, buffer: &Buffer) {
+    let Some(path) = buffer.path.clone() else {
+        return;
+    };
+    heat.pending.insert(id);
+    let snapshot = buffer.rope.clone();
+    let tx = heat.channel.0.clone();
+    let generation = heat.generation;
+    std::thread::spawn(move || {
+        // The repository the file is in, which in a workspace of several
+        // is not always the one Source Control shows.
+        let blamed = path
+            .parent()
+            .ok_or_else(|| "no parent directory".to_string())
+            .and_then(crate::project::git::toplevel)
+            .and_then(|root| {
+                let relative = path.strip_prefix(&root).unwrap_or(&path);
+                crate::project::git::blame_file(&root, relative, &snapshot.to_string())
+            });
+        let _ = tx.send((id, generation, epoch, snapshot, blamed));
+    });
 }

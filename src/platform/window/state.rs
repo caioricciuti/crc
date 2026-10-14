@@ -37,6 +37,116 @@ pub(super) struct Blame {
     pub(super) rx: Option<mpsc::Receiver<(u64, usize, String)>>,
 }
 
+/// Blame as heat in the gutter, per open document, while it is on.
+pub(super) struct Heat {
+    /// `blame_heat` from the settings, or as Git > Blame Heat last left it.
+    pub(super) on: bool,
+    /// The blame drawn for each document, by buffer id.
+    pub(super) docs: HashMap<u64, HeatDoc>,
+    /// Documents edited since their blame, and when: blamed again once
+    /// typing has stopped for a moment.
+    pub(super) dirty: HashMap<u64, Instant>,
+    /// Documents being blamed on a worker.
+    pub(super) pending: HashSet<u64>,
+    /// Bumped when it is turned off, so a blame started before is dropped.
+    pub(super) generation: u64,
+    pub(super) channel: (mpsc::Sender<HeatBlame>, mpsc::Receiver<HeatBlame>),
+}
+
+/// A blame worked out on a worker: document, generation, the gutter's
+/// epoch and the text it was asked for, and Git's answer.
+pub(super) type HeatBlame = (
+    u64,
+    u64,
+    u64,
+    crate::text::rope::Rope,
+    Result<crate::project::git::BlameMap, String>,
+);
+
+/// One document's blame, as the strip draws it.
+pub(super) struct HeatDoc {
+    pub(super) map: Arc<crate::project::git::BlameMap>,
+    /// The gutter's epoch when it was asked: an older one means HEAD may
+    /// have moved since.
+    pub(super) epoch: u64,
+    /// The text it was blamed for.
+    pub(super) text: crate::text::rope::Rope,
+    /// Per commit, how strongly it shows and what its tooltip says,
+    /// worked out once rather than every frame.
+    pub(super) alpha: Vec<f32>,
+    pub(super) tips: Vec<String>,
+    /// The text `hide_from` was worked out for.
+    pub(super) seen: crate::text::rope::Rope,
+    /// The first line edited since the blame: from it down, lines may
+    /// have moved, and nothing is drawn until the blame is run again.
+    pub(super) hide_from: usize,
+}
+
+impl HeatDoc {
+    pub(super) fn new(
+        map: crate::project::git::BlameMap,
+        epoch: u64,
+        text: crate::text::rope::Rope,
+        now: i64,
+    ) -> HeatDoc {
+        let alpha = map
+            .commits
+            .iter()
+            .map(|c| layout::heat(now - c.time))
+            .collect();
+        let tips = map
+            .commits
+            .iter()
+            .map(|c| {
+                format!(
+                    "{}  {}  {}\n{}",
+                    c.sha.get(..7).unwrap_or(&c.sha),
+                    c.author,
+                    crate::project::git::ago(c.time, now),
+                    c.summary
+                )
+            })
+            .collect();
+        HeatDoc {
+            map: Arc::new(map),
+            epoch,
+            seen: text.clone(),
+            text,
+            alpha,
+            tips,
+            hide_from: usize::MAX,
+        }
+    }
+
+    /// Catches up with `rope`, the document's text now: `true` when it
+    /// differs from the text that was blamed.
+    pub(super) fn follow(&mut self, rope: &crate::text::rope::Rope) -> bool {
+        if !self.seen.same_as(rope) {
+            self.hide_from = first_changed_line(&self.text, rope).unwrap_or(usize::MAX);
+            self.seen = rope.clone();
+        }
+        self.hide_from != usize::MAX
+    }
+
+    /// What the strip draws for this document.
+    pub(super) fn strip(&self) -> layout::BlameHeat<'_> {
+        layout::BlameHeat {
+            lines: &self.map.lines,
+            alpha: &self.alpha,
+            tips: &self.tips,
+            hide_from: self.hide_from,
+        }
+    }
+}
+
+/// The first line where `b` differs from `a`, or `None` for the same text.
+pub(super) fn first_changed_line(
+    a: &crate::text::rope::Rope,
+    b: &crate::text::rope::Rope,
+) -> Option<usize> {
+    a.first_difference(b).map(|at| b.byte_to_line(at))
+}
+
 /// Language servers for the current root, and requests in flight.
 pub(super) struct Lsp {
     /// Language servers by their shared language key, for the current root.
@@ -191,6 +301,77 @@ impl Blame {
     }
 }
 
+impl Heat {
+    /// No document waits for typing to stop or for its blame.
+    pub(super) fn idle(&self) -> bool {
+        self.dirty.is_empty() && self.pending.is_empty()
+    }
+
+    /// The blame to draw for `id`, caught up with `rope`, its text now.
+    /// Typed text is drawn before the display link looks, so the frame
+    /// does this itself: an edit since the blame hides the strip from the
+    /// edited line down at once, and has it asked again once typing stops.
+    pub(super) fn follow(&mut self, id: u64, rope: &crate::text::rope::Rope) -> Option<&HeatDoc> {
+        let doc = self.docs.get_mut(&id)?;
+        if !doc.seen.same_as(rope) {
+            if doc.follow(rope) {
+                self.dirty.insert(id, Instant::now());
+            } else {
+                self.dirty.remove(&id);
+            }
+        }
+        Some(doc)
+    }
+
+    /// Off: every blame dropped, and those still running dropped when
+    /// they land.
+    pub(super) fn turn_off(&mut self) {
+        self.on = false;
+        self.generation += 1;
+        self.docs.clear();
+        self.dirty.clear();
+        self.pending.clear();
+    }
+
+    /// Takes a blame that landed for `id`, asked at `generation` and the
+    /// gutter's `epoch` (the gutter is at `current` now) for `text`, when
+    /// the document has `rope`. A blame from before it was last turned
+    /// off, before HEAD may have moved, or for text since edited is
+    /// dropped: `false`, and the document is asked again.
+    pub(super) fn land(
+        &mut self,
+        (id, generation, epoch, text, map): (
+            u64,
+            u64,
+            u64,
+            crate::text::rope::Rope,
+            crate::project::git::BlameMap,
+        ),
+        current: u64,
+        rope: Option<&crate::text::rope::Rope>,
+        now: i64,
+    ) -> bool {
+        if generation != self.generation {
+            return false;
+        }
+        self.pending.remove(&id);
+        let Some(rope) = rope else {
+            return false;
+        };
+        if !self.on || epoch != current {
+            return false;
+        }
+        if !rope.same_text(&text) {
+            self.dirty.insert(id, Instant::now());
+            return false;
+        }
+        let mut doc = HeatDoc::new(map, epoch, text, now);
+        doc.follow(rope);
+        self.docs.insert(id, doc);
+        true
+    }
+}
+
 impl Lsp {
     /// No change waits to be sent and no bulb waits to be asked for.
     pub(super) fn idle(&self) -> bool {
@@ -220,6 +401,7 @@ impl State {
     pub(super) fn idle(&self) -> bool {
         self.gutter.idle()
             && self.blame.idle()
+            && self.heat.idle()
             && self.lsp.idle()
             && self.ext.idle()
             && self.watch.idle()
@@ -332,6 +514,121 @@ mod tests {
             gutter.docs[&1].head.as_deref().map(String::as_str),
             Some("one\n")
         );
+    }
+
+    fn rope(text: &str) -> crate::text::rope::Rope {
+        crate::text::rope::Rope::from_text(text)
+    }
+
+    #[test]
+    fn the_first_changed_line_is_found_wherever_the_texts_part() {
+        let a = rope("one\ntwo\nthree\n");
+        assert_eq!(first_changed_line(&a, &a.clone()), None);
+        assert_eq!(first_changed_line(&a, &rope("one\ntwo\nthree\n")), None);
+        assert_eq!(first_changed_line(&a, &rope("one\ntwX\nthree\n")), Some(1));
+        assert_eq!(
+            first_changed_line(&a, &rope("one\n\ntwo\nthree\n")),
+            Some(1)
+        );
+        assert_eq!(
+            first_changed_line(&a, &rope("one\ntwo\nthree\nfour\n")),
+            Some(3)
+        );
+        assert_eq!(first_changed_line(&a, &rope("one\ntwo\n")), Some(2));
+        assert_eq!(first_changed_line(&a, &rope("")), Some(0));
+        // Past the size of one chunk of the rope.
+        let long = "line\n".repeat(5000);
+        let edited = format!("{}LINE\n{}", "line\n".repeat(4000), "line\n".repeat(999));
+        assert_eq!(first_changed_line(&rope(&long), &rope(&edited)), Some(4000));
+    }
+
+    fn blamed(text: &str) -> HeatDoc {
+        use crate::project::git::{BlameMap, CommitInfo, NOT_COMMITTED};
+        let commit = |sha: &str, time: i64| CommitInfo {
+            sha: sha.repeat(40),
+            author: "Robin".into(),
+            time,
+            summary: "plant beans".into(),
+        };
+        let map = BlameMap {
+            commits: vec![commit("a", 40_000_000 - 3600), commit("b", 0)],
+            lines: vec![0, NOT_COMMITTED, 1, 0],
+        };
+        HeatDoc::new(map, 0, rope(text), 40_000_000)
+    }
+
+    #[test]
+    fn a_blame_works_out_each_commits_heat_and_tooltip_once() {
+        let doc = blamed("a\nb\nc\nd\n");
+        assert_eq!(doc.alpha, [1.0, 0.0]);
+        assert_eq!(doc.tips[0], "aaaaaaa  Robin  1 hour ago\nplant beans");
+        assert_eq!(doc.hide_from, usize::MAX);
+    }
+
+    #[test]
+    fn an_edit_hides_the_strip_from_its_line_down_until_undone() {
+        let mut doc = blamed("a\nb\nc\nd\n");
+        assert!(doc.follow(&rope("a\nb\nC\nd\n")));
+        assert_eq!(doc.strip().hide_from, 2);
+        // Further down changes nothing above the first edit.
+        assert!(doc.follow(&rope("a\nb\nC\nD\n")));
+        assert_eq!(doc.hide_from, 2);
+        // An edit higher up hides more.
+        assert!(doc.follow(&rope("A\nb\nC\nD\n")));
+        assert_eq!(doc.hide_from, 0);
+        // Undone, back to the text that was blamed: all of it again.
+        assert!(!doc.follow(&rope("a\nb\nc\nd\n")));
+        assert_eq!(doc.hide_from, usize::MAX);
+    }
+
+    fn heat() -> Heat {
+        Heat {
+            on: true,
+            docs: HashMap::new(),
+            dirty: HashMap::new(),
+            pending: HashSet::new(),
+            generation: 0,
+            channel: mpsc::channel(),
+        }
+    }
+
+    #[test]
+    fn a_blame_lands_only_for_the_text_and_head_it_was_asked_for() {
+        let text = rope("a\nb\n");
+        let map = || crate::project::git::BlameMap {
+            commits: Vec::new(),
+            lines: vec![crate::project::git::NOT_COMMITTED; 2],
+        };
+        let mut heat = heat();
+        heat.pending.insert(1);
+        // HEAD may have moved since it was asked.
+        assert!(!heat.land((1, 0, 0, text.clone(), map()), 1, Some(&text), 0));
+        assert!(heat.pending.is_empty() && heat.docs.is_empty());
+        // The text moved on: asked again once typing stops.
+        assert!(!heat.land((1, 0, 1, text.clone(), map()), 1, Some(&rope("a\nB\n")), 0));
+        assert!(heat.dirty.contains_key(&1));
+        heat.dirty.clear();
+        // The same text, even as another tree: drawn.
+        assert!(heat.land((1, 0, 1, text.clone(), map()), 1, Some(&rope("a\nb\n")), 0));
+        assert_eq!(heat.docs[&1].hide_from, usize::MAX);
+        // An edit since: hidden from the edit, and asked again later.
+        let edited = rope("a\nB\n");
+        assert_eq!(heat.follow(1, &edited).map(|d| d.hide_from), Some(1));
+        assert!(heat.dirty.contains_key(&1));
+        // Undone: nothing to ask.
+        assert_eq!(heat.follow(1, &text).map(|d| d.hide_from), Some(usize::MAX));
+        assert!(heat.dirty.is_empty());
+        // Off: everything dropped, and a blame from before is not taken,
+        // nor does it end one started since.
+        heat.pending.insert(2);
+        heat.turn_off();
+        assert!(!heat.on && heat.docs.is_empty() && heat.idle());
+        heat.on = true;
+        heat.pending.insert(2);
+        assert!(!heat.land((2, 0, 1, text.clone(), map()), 1, Some(&text), 0));
+        assert!(heat.pending.contains(&2));
+        assert!(heat.land((2, 1, 1, text.clone(), map()), 1, Some(&text), 0));
+        assert!(heat.idle());
     }
 
     #[test]

@@ -68,6 +68,9 @@ pub struct Settings {
     /// Whether the Claude Code crc starts runs its review hooks: each file
     /// kept as it was before Claude's first edit, for review and undo.
     pub agent_review: bool,
+    /// Whether the gutter shows how recently each line was changed, from
+    /// Git's blame. Off unless asked for: it runs `git blame` per file.
+    pub blame_heat: bool,
 }
 
 /// `word_wrap`: every document, none, or prose (Markdown and text) only.
@@ -92,6 +95,7 @@ impl Default for Settings {
             ssh_auth_sock: None,
             conflict_side_by_side: false,
             agent_review: true,
+            blame_heat: false,
         }
     }
 }
@@ -139,6 +143,11 @@ word_wrap = \"auto\"
 # conflict in the text, or \"side-by-side\", as columns. The strip above
 # the file switches between them.
 conflict_view = \"inline\"
+
+# Shade a thin strip in the gutter by how recently Git says each line was
+# changed: brightest for this week, gone after a year. Git > Blame Heat
+# flips it until crc quits.
+blame_heat = false
 
 # When crc starts Claude Code in its terminal, keep each file as it was
 # before Claude's first edit to it, so the change can be reviewed and
@@ -226,6 +235,7 @@ impl Settings {
                 "caret_blink" => set_bool(value, &mut settings.caret_blink),
                 "update_check" => set_bool(value, &mut settings.update_check),
                 "agent_review" => set_bool(value, &mut settings.agent_review),
+                "blame_heat" => set_bool(value, &mut settings.blame_heat),
                 "word_wrap" => match word {
                     "auto" => {
                         settings.word_wrap = WordWrap::Auto;
@@ -389,7 +399,7 @@ pub struct Described {
 
 /// Every key the file takes, in the page's order. A test checks this
 /// against the template, so a new key cannot ship without a sentence here.
-pub const DESCRIBED: [Described; 11] = [
+pub const DESCRIBED: [Described; 12] = [
     Described {
         key: "theme",
         group: "Appearance",
@@ -431,6 +441,11 @@ pub const DESCRIBED: [Described; 11] = [
         what: "How a file with merge conflicts opens: in the text, or as columns.",
     },
     Described {
+        key: "blame_heat",
+        group: "Git",
+        what: "Shade a strip in the gutter by how recently each line was changed. Git > Blame Heat flips it for the session.",
+    },
+    Described {
         key: "ssh_auth_sock",
         group: "Git",
         what: "The SSH agent socket for fetch, pull and push, for when crc is opened from the Dock without your shell's SSH_AUTH_SOCK.",
@@ -458,6 +473,7 @@ impl Settings {
             "caret_blink" => flag(self.caret_blink),
             "update_check" => flag(self.update_check),
             "agent_review" => flag(self.agent_review),
+            "blame_heat" => flag(self.blame_heat),
             "format_on_save" => flag(self.format_on_save),
             "organize_imports_on_save" => flag(self.organize_imports_on_save),
             "word_wrap" => quote(match self.word_wrap {
@@ -712,6 +728,22 @@ mod tests {
     }
 
     #[test]
+    fn blame_heat_defaults_off() {
+        assert!(!Settings::default().blame_heat);
+        assert!(!Settings::parse("").blame_heat);
+        assert!(!Settings::parse(TEMPLATE).blame_heat);
+        assert!(Settings::parse("blame_heat = true\n").blame_heat);
+        assert_eq!(
+            Settings::parse("blame_heat = true\n").value_of("blame_heat"),
+            "true"
+        );
+        assert_eq!(
+            Settings::parse_checked("blame_heat = on\n").1,
+            ["config.toml line 1: blame_heat takes true or false, not on"]
+        );
+    }
+
+    #[test]
     fn conflict_view_defaults_to_inline() {
         assert!(!Settings::parse("").conflict_side_by_side);
         assert!(Settings::parse("conflict_view = \"side-by-side\"\n").conflict_side_by_side);
@@ -770,6 +802,7 @@ mod tests {
             ssh_auth_sock: None,
             conflict_side_by_side: false,
             agent_review: true,
+            blame_heat: false,
         }
         .merged_into(existing);
         assert_eq!(

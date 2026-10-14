@@ -1376,6 +1376,119 @@ mod tests {
     }
 
     #[test]
+    fn heat_fades_with_age_and_ends_after_a_year() {
+        const DAY: i64 = 86_400;
+        assert_eq!(heat(-5), 1.0, "a clock behind the commit is today");
+        assert_eq!(heat(0), 1.0);
+        assert_eq!(heat(DAY - 1), 1.0);
+        assert_eq!(heat(DAY), 0.8);
+        assert_eq!(heat(7 * DAY), 0.55);
+        assert_eq!(heat(30 * DAY), 0.35);
+        assert_eq!(heat(90 * DAY), 0.18);
+        assert_eq!(heat(365 * DAY - 1), 0.18);
+        assert_eq!(heat(365 * DAY), 0.0);
+    }
+
+    #[test]
+    fn the_heat_strip_misses_the_change_bar_and_the_numbers_at_every_size() {
+        let theme = Theme::default();
+        for scale in [1.0, 2.0] {
+            for size in [
+                8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 16.0, 20.0, 24.0, 32.0,
+            ] {
+                let mut atlas = Atlas::build("SF Mono", size, scale);
+                let m = atlas.metrics;
+                let (x, width) = heat_strip(m.advance);
+                let (x, end) = (m.snap(x), m.snap(x) + width);
+                assert!(width >= 1.0, "{size}pt at {scale}x: {width} wide");
+                assert!(
+                    end <= 2.0 || x >= 5.5,
+                    "{size}pt at {scale}x: on the bar at {x}..{end}"
+                );
+                // Where the numbers are really drawn: every gutter glyph.
+                let buffer = Buffer::from_text(&"line\n".repeat(120));
+                let mut out = Vec::new();
+                build(
+                    &buffer,
+                    &mut atlas,
+                    Viewport::new(600.0, 400.0),
+                    &theme,
+                    &mut out,
+                );
+                let numbers = out
+                    .iter()
+                    .filter(|g| g.color == theme.gutter_text || g.color == theme.gutter_text_active)
+                    .map(|g| g.pos[0])
+                    .fold(f32::INFINITY, f32::min);
+                assert!(numbers.is_finite());
+                assert!(
+                    end <= numbers,
+                    "{size}pt at {scale}x: strip ends {end}, numbers at {numbers}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_heat_strip_draws_runs_of_one_commit_and_hides_edited_lines() {
+        use crate::project::git::NOT_COMMITTED;
+        let atlas = atlas();
+        let m = atlas.metrics;
+        let theme = Theme::default();
+        let buffer = Buffer::from_text("a\nb\nc\nd\ne\nf\ng\n");
+        let viewport = Viewport::new(400.0, 400.0);
+        let rows = screen_rows(&buffer, viewport, m.line_height);
+        let tips = ["one".to_string(), "two".to_string(), "old".to_string()];
+        let strip = |hide_from: usize| {
+            let mut out = Vec::new();
+            begin_frame();
+            push_blame_heat(
+                &mut out,
+                &atlas,
+                viewport,
+                &rows,
+                &theme,
+                &BlameHeat {
+                    lines: &[0, 0, NOT_COMMITTED, 1, 1, 2, 0],
+                    alpha: &[1.0, 0.35, 0.0],
+                    tips: &tips,
+                    hide_from,
+                },
+            );
+            let spots: Vec<_> = hotspots()
+                .into_iter()
+                .map(|h| {
+                    (
+                        h.rect.y / m.line_height,
+                        h.rect.height / m.line_height,
+                        h.tip,
+                    )
+                })
+                .collect();
+            (out, spots)
+        };
+        let (out, spots) = strip(usize::MAX);
+        // Lines 1-2, 4-5 and 7: line 3 is not committed and line 6 is
+        // older than a year.
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].color, faded(theme.accent, 1.0));
+        assert_eq!(out[1].color, faded(theme.accent, 0.35));
+        assert_eq!(
+            spots,
+            [
+                (0.0, 2.0, Some("one".to_string())),
+                (3.0, 2.0, Some("two".to_string())),
+                (6.0, 1.0, Some("one".to_string())),
+            ]
+        );
+        // Edited from line 5 down: only what is above it.
+        let (out, spots) = strip(4);
+        assert_eq!(out.len(), 2);
+        assert_eq!(spots[1].0..spots[1].0 + spots[1].1, 3.0..4.0);
+        assert!(strip(0).0.is_empty());
+    }
+
+    #[test]
     fn a_change_peek_shows_what_head_had() {
         use crate::project::git::MarkKind;
         let head = "one\n\ttwo\nthree\nfour\n";
