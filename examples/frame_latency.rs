@@ -12,6 +12,8 @@
 //! timer on this machine can observe. So treat it as a floor.
 //!
 //! Run with: cargo run --release --offline --example frame_latency
+//! (`-- --wrap`, `--fold` or `--chrome` for those frames, `--scrub` for
+//! steps through a file's history).
 
 use crc::project::tree::Tree;
 use crc::render::font::Atlas;
@@ -124,6 +126,19 @@ fn report(name: &str, mut samples: Vec<f64>) {
     );
 }
 
+/// PASS or FAIL on the p99 of whole frames; `what` names them when a run
+/// has more than one kind.
+fn verdict(what: &str, mut full: Vec<f64>) {
+    full.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
+    let p99 = percentile(&full, 0.99);
+    println!(
+        "\n{} {what}p99 {:.3} ms against a {:.3} ms budget",
+        if p99 < BUDGET_MS { "PASS:" } else { "FAIL:" },
+        p99,
+        BUDGET_MS
+    );
+}
+
 fn main() {
     let scale = 2.0f32;
     let (logical_w, logical_h) = (1400.0f32, 900.0f32);
@@ -136,6 +151,12 @@ fn main() {
     println!("budget      {BUDGET_MS:.3} ms per frame at 120Hz\n");
 
     let mut renderer = Renderer::new(device, atlas);
+
+    // `--scrub`: stepping through a file's history instead of typing.
+    if std::env::args().any(|arg| arg == "--scrub") {
+        scrub_steps(&mut renderer, (logical_w, logical_h), (px_w, px_h));
+        return;
+    }
 
     const MB: usize = 100 * 1024 * 1024;
     let src = synth::synth(
@@ -266,16 +287,7 @@ fn main() {
     report("edit + layout", layout_only);
     report("encode + GPU wait", gpu_only);
     report("keystroke to frame", full.clone());
-
-    let mut sorted = full;
-    sorted.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
-    let p99 = percentile(&sorted, 0.99);
-    println!(
-        "\n{} p99 {:.3} ms against a {:.3} ms budget",
-        if p99 < BUDGET_MS { "PASS:" } else { "FAIL:" },
-        p99,
-        BUDGET_MS
-    );
+    verdict("", full);
 
     // Scrolling is the other thing that has to stay smooth.
     let mut scroll = Vec::with_capacity(200);
@@ -300,4 +312,373 @@ fn main() {
 
     std::hint::black_box(&glyphs);
     std::hint::black_box(Duration::from_nanos(0));
+}
+
+// ---- --scrub ----------------------------------------------------------------
+// Git > File History steps through a file's versions in a read-only tab, and
+// a step has to be as quick as a keystroke. Each sample does what a step
+// does on the main thread: the text goes in through the neighbours' diff, an
+// edit per change, the parser goes on from the version before with those
+// edits (a full reparse would cost several frames), and the frame draws the
+// fade (washes and removed lines) over the version it lands on. Reading the
+// blobs and diffing neighbours is the history worker's, so it happens before
+// the clock starts, as it has by the time the app shows a step.
+
+/// Versions of the file the history steps through.
+const SCRUB_VERSIONS: usize = 60;
+/// Size of the oldest version.
+const SCRUB_BYTES: usize = 300 * 1024;
+
+/// A small deterministic generator, so every run steps the same history.
+struct Lcg(u64);
+
+impl Lcg {
+    fn below(&mut self, n: usize) -> usize {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((self.0 >> 33) as usize) % n.max(1)
+    }
+}
+
+/// One function of the file, varied by `i` so no two are the same.
+fn scrub_item(i: usize, out: &mut Vec<String>) {
+    out.push(format!(
+        "/// Folds the samples of channel {i} into one reading."
+    ));
+    out.push(format!(
+        "pub fn channel_{i}(input: &[u8], scale: f64) -> Result<Vec<u32>, String> {{"
+    ));
+    out.push("    let mut out = Vec::with_capacity(input.len());".into());
+    out.push("    for (n, byte) in input.iter().enumerate() {".into());
+    out.push(format!(
+        "        if *byte > {} {{ out.push((*byte as f64 * scale) as u32 + n as u32); }}",
+        i % 200
+    ));
+    out.push("    }".into());
+    out.push("    // keep going while there is room".into());
+    out.push(format!("    let label = \"channel {i}\";"));
+    out.push("    if out.is_empty() { return Err(label.to_string()); }".into());
+    out.push("    Ok(out)".into());
+    out.push("}".into());
+    out.push(String::new());
+}
+
+/// The file's versions, oldest first: each one a commit's worth of edits
+/// to the last, a few lines added, removed and changed in a few places.
+/// Every edit keeps the file valid Rust, as a real commit mostly does.
+fn scrub_versions() -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut items = 0;
+    let mut bytes = 0;
+    while bytes < SCRUB_BYTES {
+        let at = lines.len();
+        scrub_item(items, &mut lines);
+        bytes += lines[at..].iter().map(|l| l.len() + 1).sum::<usize>();
+        items += 1;
+    }
+    let mut rng = Lcg(0x5eed);
+    let mut versions = vec![lines.join("\n") + "\n"];
+    for v in 1..SCRUB_VERSIONS {
+        for e in 0..2 + rng.below(3) {
+            // A statement line somewhere in the file, at random.
+            let mut at = rng.below(lines.len());
+            while !lines[at].starts_with("    let ") {
+                at = (at + 1) % lines.len();
+            }
+            match rng.below(4) {
+                0 => {
+                    for k in 0..1 + rng.below(4) {
+                        lines.insert(
+                            at + 1,
+                            format!("    let extra_{v}_{e}_{k} = {v} * {k}; // since {v}"),
+                        );
+                    }
+                }
+                1 => {
+                    // Drop the comment of the next function along.
+                    if let Some(off) = lines[at..]
+                        .iter()
+                        .position(|l| l == "    // keep going while there is room")
+                    {
+                        lines.remove(at + off);
+                    }
+                }
+                2 => {
+                    let mut item = Vec::new();
+                    scrub_item(items, &mut item);
+                    items += 1;
+                    let start = lines[..at]
+                        .iter()
+                        .rposition(|l| l.starts_with("/// "))
+                        .unwrap_or(0);
+                    lines.splice(start..start, item);
+                }
+                _ => lines[at] = format!("{} // reviewed in {v}", lines[at]),
+            }
+        }
+        versions.push(lines.join("\n") + "\n");
+    }
+    versions
+}
+
+/// The lines a step washes, by kind, and the ghosts of those it removed.
+type ScrubFade = (
+    Vec<(std::ops::Range<usize>, crc::project::git::MarkKind)>,
+    Vec<layout::Ghost>,
+);
+
+/// What a step marks for the fade, as the scrubber's own `Fade::new` does:
+/// a wash over the lines added or changed, and the lines removed, where
+/// they were, three of them at most.
+fn scrub_fade(changes: &[crc::ide::diff::Change], old: &str) -> ScrubFade {
+    use crc::project::git::MarkKind;
+    let mut tints = Vec::new();
+    let mut ghosts = Vec::new();
+    let mut lines: Option<Vec<&str>> = None;
+    for change in changes {
+        if change.kind != MarkKind::Removed {
+            tints.push((change.new_start..change.new_end, change.kind));
+            continue;
+        }
+        let lines = lines.get_or_insert_with(|| old.split_inclusive('\n').collect());
+        let removed = change.old_end - change.old_start;
+        ghosts.push(layout::Ghost {
+            at: change.new_start,
+            lines: lines
+                .iter()
+                .skip(change.old_start)
+                .take(removed.min(3))
+                .map(|line| layout::expanded_line(line))
+                .collect(),
+            more: removed.saturating_sub(3),
+        });
+    }
+    (tints, ghosts)
+}
+
+/// `changes` from one text to the other as the changes back.
+fn scrub_reversed(changes: &[crc::ide::diff::Change]) -> Vec<crc::ide::diff::Change> {
+    use crc::project::git::MarkKind;
+    changes
+        .iter()
+        .map(|c| crc::ide::diff::Change {
+            new_start: c.old_start,
+            new_end: c.old_end,
+            old_start: c.new_start,
+            old_end: c.new_end,
+            kind: match c.kind {
+                MarkKind::Added => MarkKind::Removed,
+                MarkKind::Removed => MarkKind::Added,
+                MarkKind::Modified => MarkKind::Modified,
+            },
+        })
+        .collect()
+}
+
+fn scrub_steps(renderer: &mut Renderer, logical: (f32, f32), px: (usize, usize)) {
+    use crc::project::git::MarkKind;
+    use crc::syntax::SyntaxStore;
+
+    let t = Instant::now();
+    let versions = scrub_versions();
+    // The worker's diffs between neighbours, by the older of the two.
+    let diffs: Vec<Vec<crc::ide::diff::Change>> = versions
+        .windows(2)
+        .map(|pair| crc::ide::diff::changes(&pair[0], &pair[1]))
+        .collect();
+    let hunks: usize = diffs.iter().map(Vec::len).sum();
+    println!(
+        "history     {} versions of {} to {} KiB, {:.1} hunks a step, made in {:.1} ms",
+        versions.len(),
+        versions[0].len() / 1024,
+        versions[versions.len() - 1].len() / 1024,
+        hunks as f64 / diffs.len() as f64,
+        t.elapsed().as_secs_f64() * 1e3
+    );
+
+    // The history's tab, as the scrubber makes it: generated, frozen, Rust.
+    let mut buffer = Buffer::generated("history.rs @ 0000000", "rs", "");
+    buffer.set_frozen(true);
+    let middle = versions[0].lines().count() / 2;
+    buffer.show_text(&versions[0], None, middle, 4);
+    let mut syntax = SyntaxStore::new();
+    let budget = 2 * 1024 * 1024;
+    let t = Instant::now();
+    syntax.update(&mut buffer, budget);
+    let first_parse = t.elapsed().as_secs_f64() * 1e3;
+    println!("first parse {first_parse:.1} ms (once, as the tab opens)");
+
+    let viewport = Viewport::new(logical.0, logical.1);
+    let theme = Theme::default();
+    let line_height = renderer.atlas.metrics.line_height;
+    let rows = viewport.rows(line_height);
+    buffer.scroll_line = middle.saturating_sub(rows / 2);
+    println!("cursor      line {middle}, viewport holds {rows} lines\n");
+
+    let mut glyphs = Vec::with_capacity(16_384);
+    let mut spans = Vec::new();
+    let mut frame = |buffer: &Buffer,
+                     syntax: &SyntaxStore,
+                     spans: &mut Vec<crc::syntax::Span>,
+                     renderer: &mut Renderer,
+                     marks: &[crc::project::git::Mark],
+                     fade: Option<&ScrubFade>| {
+        // As the window draws the editor: the rows once, the spans of what
+        // is on screen, the text, the gutter marks, then the fade.
+        spans.clear();
+        let screen = layout::screen_rows(buffer, viewport, line_height);
+        if let Some(lines) = layout::lines_of(&screen) {
+            let from = buffer.rope.line_to_byte(lines.start);
+            let to = if lines.end < buffer.rope.len_lines() {
+                buffer.rope.line_to_byte(lines.end)
+            } else {
+                buffer.rope.len_bytes()
+            };
+            spans.extend(
+                syntax.spans_with(buffer.id(), from..to, |r| buffer.rope.slice_to_string(r)),
+            );
+        }
+        layout::build_full_search(
+            buffer,
+            &mut renderer.atlas,
+            viewport,
+            &screen,
+            &theme,
+            "",
+            None,
+            spans,
+            &layout::Markdown::default(),
+            true,
+            &mut glyphs,
+        );
+        layout::push_gutter_marks(
+            &mut glyphs,
+            &renderer.atlas,
+            viewport,
+            &screen,
+            &theme,
+            marks,
+        );
+        if let Some((tints, ghosts)) = fade {
+            // Drawn at its strongest, the first frame of a step.
+            let tints: Vec<_> = tints
+                .iter()
+                .map(|(lines, kind)| {
+                    let band = match kind {
+                        MarkKind::Modified => {
+                            let [r, g, b, _] = theme.diff_modified;
+                            [r, g, b, theme.diff_added_band[3]]
+                        }
+                        _ => theme.diff_added_band,
+                    };
+                    (lines.clone(), band)
+                })
+                .collect();
+            glyphs.splice(
+                0..0,
+                layout::line_tints(&screen, &renderer.atlas, viewport, &tints),
+            );
+            for ghost in ghosts {
+                layout::push_ghost(
+                    &mut glyphs,
+                    &mut renderer.atlas,
+                    buffer,
+                    viewport,
+                    &screen,
+                    ghost,
+                    1.0,
+                    &theme,
+                );
+            }
+        }
+        let quads = glyphs.len();
+        renderer.render_offscreen_frame(px.0, px.1, &glyphs, logical, theme.background);
+        quads
+    };
+
+    for _ in 0..30 {
+        frame(&buffer, &syntax, &mut spans, renderer, &[], None);
+    }
+
+    // Back and forth across the whole history: one version a step, the way
+    // Left and Right step it, then seven at a time, the way a drag along
+    // the timeline jumps. A jump's changes are the worker's, diffed while
+    // the version shown stays put, so they are worked out off the clock.
+    const N: usize = 400;
+    let mut verdicts = Vec::new();
+    for (name, stride) in [("step", 1usize), ("jump", 7)] {
+        let mut full = Vec::with_capacity(N);
+        let mut show = Vec::with_capacity(N);
+        let mut reparse = Vec::with_capacity(N);
+        let mut draw = Vec::with_capacity(N);
+        let (mut shown, mut forward) = (0usize, true);
+        let (mut tinted, mut ghosted, mut quads) = (0usize, 0usize, 0usize);
+        buffer.show_text(&versions[0], None, middle, 4);
+        syntax.update(&mut buffer, budget);
+        for _ in 0..N {
+            if shown < stride {
+                forward = true;
+            } else if shown + stride >= versions.len() {
+                forward = false;
+            }
+            let target = if forward {
+                shown + stride
+            } else {
+                shown - stride
+            };
+            let jumped =
+                (stride > 1).then(|| crc::ide::diff::changes(&versions[shown], &versions[target]));
+            let started = Instant::now();
+
+            // What `show` does: the fade from the step's changes, the caret
+            // and the view mapped through them, the text in, the gutter's
+            // marks.
+            let changes = match &jumped {
+                Some(changes) => changes.clone(),
+                None if forward => diffs[shown].clone(),
+                None => scrub_reversed(&diffs[target]),
+            };
+            let fade = scrub_fade(&changes, &versions[shown]);
+            let map = |line| crc::ide::diff::map_line(&changes, line);
+            let (line, column) = buffer.cursor_position();
+            let top = map(buffer.scroll_line);
+            buffer.show_text(&versions[target], Some(&changes), map(line), column);
+            buffer.scroll_line = top.min(buffer.rope.len_lines().saturating_sub(1));
+            let marks = crc::project::git::marks(&diffs[target.saturating_sub(1)]);
+            let shown_ms = started.elapsed().as_secs_f64() * 1e3;
+
+            let t_parse = Instant::now();
+            syntax.update(&mut buffer, budget);
+            let parse_ms = t_parse.elapsed().as_secs_f64() * 1e3;
+
+            let t_draw = Instant::now();
+            quads = frame(&buffer, &syntax, &mut spans, renderer, &marks, Some(&fade));
+            let draw_ms = t_draw.elapsed().as_secs_f64() * 1e3;
+
+            tinted += fade.0.len();
+            ghosted += fade.1.len();
+            full.push(started.elapsed().as_secs_f64() * 1e3);
+            show.push(shown_ms);
+            reparse.push(parse_ms);
+            draw.push(draw_ms);
+            shown = target;
+        }
+
+        println!(
+            "{name} {stride}: {quads} quads per frame, {:.1} washes and {:.1} ghosts a step\n",
+            tinted as f64 / N as f64,
+            ghosted as f64 / N as f64
+        );
+        report("show text", show);
+        report("syntax reparse", reparse);
+        report("layout + GPU + fade", draw);
+        report(&format!("{name} to frame"), full.clone());
+        verdicts.push((name, full));
+        println!();
+    }
+    for (name, full) in verdicts {
+        verdict(&format!("{name} "), full);
+    }
 }

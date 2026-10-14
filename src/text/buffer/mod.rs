@@ -67,6 +67,20 @@ fn common_suffix(a: &Rope, b: &Rope, limit: usize) -> usize {
     }
     limit
 }
+/// Whether `rope` over `range` holds `text`, compared a chunk at a time.
+fn rope_holds(rope: &Rope, range: std::ops::Range<usize>, text: &str) -> bool {
+    if range.len() != text.len() {
+        return false;
+    }
+    let mut rest = text.as_bytes();
+    for chunk in rope.bytes_in(range) {
+        match rest.split_at_checked(chunk.len()) {
+            Some((head, tail)) if head == chunk => rest = tail,
+            _ => return false,
+        }
+    }
+    rest.is_empty()
+}
 fn window(rope: &Rope, range: std::ops::Range<usize>) -> Vec<u8> {
     let mut out = Vec::with_capacity(range.len());
     for chunk in rope.bytes_in(range) {
@@ -285,13 +299,28 @@ impl Buffer {
     /// Shows `text` in place of the whole document, as stepping through a
     /// file's versions does, with one caret at `line` and `column`, both
     /// clamped. Unlike [`Buffer::regenerate`], the change is described as
-    /// one edit over what differs, so the parser goes on incrementally. A
-    /// frozen document takes it all the same: this is how its text moves.
-    /// Nothing is left to undo, and nothing is unsaved.
-    pub fn show_text(&mut self, text: &str, line: usize, column: usize) {
-        let before = std::mem::replace(&mut self.rope, Rope::from_text(&normalize_newlines(text)));
+    /// edits over what differs, so the parser goes on incrementally.
+    /// `changes`, the line diff from the text shown to `text`, when known
+    /// and true of the two texts, is made in place, an edit per change: a
+    /// step that changes a few places far apart costs those places, in the
+    /// text and in the parser, not the whole file. Otherwise the text is
+    /// replaced, as one edit from where the two first differ to where they
+    /// last do. A frozen document takes it all the same: this is how its
+    /// text moves. Nothing is left to undo, and nothing is unsaved.
+    pub fn show_text(
+        &mut self,
+        text: &str,
+        changes: Option<&[crate::ide::diff::Change]>,
+        line: usize,
+        column: usize,
+    ) {
+        let text = normalize_newlines(text);
+        let made = changes.is_some_and(|changes| self.make_changes(&text, changes));
+        if !made {
+            let before = std::mem::replace(&mut self.rope, Rope::from_text(&text));
+            self.record_replacement(&before);
+        }
         self.extra.clear();
-        self.record_replacement(&before);
         let line = line.min(self.rope.len_lines().saturating_sub(1));
         self.cursor = self.byte_at(line, column);
         self.anchor = self.cursor;
@@ -750,6 +779,70 @@ impl Buffer {
         let old_row = before.byte_to_line(old_end);
         let old_end_point = (old_row, old_end - before.line_to_byte(old_row));
         self.record_edit(prefix, old_end, old_end_point, new_end);
+    }
+    /// Turns the text into `text` through `changes`, a line diff from the
+    /// text to it, an edit per change, top to bottom. Nothing is touched,
+    /// and it returns false, unless the lines between the changes are the
+    /// same in both texts: a diff of some other pair is never replayed.
+    fn make_changes(&mut self, text: &str, changes: &[crate::ide::diff::Change]) -> bool {
+        // Where line `line` of `text` starts, for lines asked in order:
+        // `len_lines` is the end, as for a rope.
+        let mut scan = (0, 0);
+        let mut start_of = |line: usize| -> Option<usize> {
+            let (mut at_line, mut at) = scan;
+            if line < at_line {
+                return None;
+            }
+            while at_line < line {
+                let next = text.as_bytes()[at..].iter().position(|&b| b == b'\n');
+                at = match next {
+                    Some(i) => at + i + 1,
+                    None if at_line + 1 == line => text.len(),
+                    None => return None,
+                };
+                at_line += 1;
+            }
+            scan = (at_line, at);
+            Some(at)
+        };
+        let rope = &self.rope;
+        let old_line = |line: usize| (line <= rope.len_lines()).then(|| rope.line_to_byte(line));
+        // Each change as (old start, old end, new start, new end) bytes.
+        let mut plan = Vec::with_capacity(changes.len());
+        let (mut old_at, mut new_at) = (0, 0);
+        for change in changes {
+            let (Some(old_start), Some(old_end)) =
+                (old_line(change.old_start), old_line(change.old_end))
+            else {
+                return false;
+            };
+            let (Some(new_start), Some(new_end)) =
+                (start_of(change.new_start), start_of(change.new_end))
+            else {
+                return false;
+            };
+            if old_start < old_at
+                || old_end < old_start
+                || !rope_holds(rope, old_at..old_start, &text[new_at..new_start])
+            {
+                return false;
+            }
+            plan.push((old_start, old_end, new_start, new_end));
+            (old_at, new_at) = (old_end, new_end);
+        }
+        if !rope_holds(rope, old_at..rope.len_bytes(), &text[new_at..]) {
+            return false;
+        }
+        // Each change where the ones above it left it: the text above is
+        // the new one, so it starts where it starts in `text`.
+        for (old_start, old_end, new_start, new_end) in plan {
+            let old_end = new_start + (old_end - old_start);
+            let old_end_point = self.point_of(old_end);
+            self.rope.delete(new_start..old_end);
+            self.rope.insert(new_start, &text[new_start..new_end]);
+            self.record_edit(new_start, old_end, old_end_point, new_end);
+        }
+        true
     }
     /// After the whole rope was replaced: queued edits no longer lead from
     /// the old text to the new, so they go and the parser starts over.
@@ -2852,7 +2945,7 @@ mod tests {
         assert!(!b.has_pending_edits());
 
         b.scroll_line = 2;
-        b.show_text("one\nTWO\r\n", 2, 9);
+        b.show_text("one\nTWO\r\n", None, 2, 9);
         assert_eq!(b.rope.to_string(), "one\nTWO\n", "line breaks as kept");
         let edits = b.drain_edits().expect("an edit, not a full parse");
         assert_eq!(
@@ -2863,14 +2956,75 @@ mod tests {
         assert_eq!(b.cursor_position(), (2, 0));
         assert_eq!(b.selection(), None);
         assert_eq!(b.scroll_line, 2);
-        b.show_text("solo", 1, 3);
+        b.show_text("solo", None, 1, 3);
         assert_eq!(b.cursor_position(), (0, 3));
         assert_eq!(b.scroll_line, 0);
         b.drain_edits();
-        b.show_text("solo", 0, 2);
+        b.show_text("solo", None, 0, 2);
         assert!(!b.has_pending_edits(), "the same text is no edit");
         assert!(!b.can_undo() && !b.is_dirty());
         assert!(b.is_frozen());
+    }
+
+    /// A version that changes two places far apart, with the diff the
+    /// history worker made: an edit for each, not one across the middle.
+    #[test]
+    fn a_version_with_its_diff_is_an_edit_per_change() {
+        let old = "a\nb\n\u{65e5}\nd\ne\nf\n";
+        let new = "a\nB\n\u{65e5}\nd\ne\n";
+        let mut b = Buffer::generated("notes.txt @ abc1234", "txt", old);
+        b.set_frozen(true);
+        b.drain_edits();
+        let changes = crate::ide::diff::changes(old, new);
+        assert_eq!(changes.len(), 2);
+        b.show_text(new, Some(&changes), 0, 0);
+        assert_eq!(b.rope.to_string(), new);
+        let edits = b.drain_edits().expect("edits, not a full parse");
+        assert_eq!(
+            edits,
+            [
+                // Line 1, whole, in the text as it was.
+                Edit {
+                    start_byte: 2,
+                    old_end_byte: 4,
+                    new_end_byte: 4,
+                    start_point: (1, 0),
+                    old_end_point: (2, 0),
+                    new_end_point: (2, 0),
+                },
+                // Line 5, gone, past the three-byte character.
+                Edit {
+                    start_byte: 12,
+                    old_end_byte: 14,
+                    new_end_byte: 12,
+                    start_point: (5, 0),
+                    old_end_point: (6, 0),
+                    new_end_point: (5, 0),
+                },
+            ]
+        );
+        // A diff of other texts is not replayed: one edit over what differs.
+        b.show_text(old, Some(&changes), 0, 0);
+        assert_eq!(
+            b.drain_edits().expect("an edit"),
+            [crate::ide::diff::prefix_suffix_edit(new, old).unwrap()]
+        );
+        // Nor is a diff past either end.
+        let wrong = crate::ide::diff::changes("x\n", &format!("{old}g\nh\n"));
+        b.show_text(new, Some(&wrong), 0, 0);
+        assert_eq!(
+            b.drain_edits().expect("an edit"),
+            [crate::ide::diff::prefix_suffix_edit(old, new).unwrap()]
+        );
+        // No newline at the end, on either side.
+        let (old, new) = ("one\ntwo", "one\nTWO\nthree");
+        b.show_text(old, None, 0, 0);
+        b.drain_edits();
+        b.show_text(new, Some(&crate::ide::diff::changes(old, new)), 0, 0);
+        assert_eq!(
+            b.drain_edits().expect("an edit"),
+            [crate::ide::diff::prefix_suffix_edit(old, new).unwrap()]
+        );
     }
 
     /// The real cap, on a sparse file: refused from its size alone, so the

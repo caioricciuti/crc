@@ -22,8 +22,9 @@ use crate::project::history::{Blob, BlobReader, HISTORY_LIMIT, Version};
 /// Versions kept loaded either side of the one shown. This is the memory
 /// bound: at most `2 * RADIUS + 1` texts of up to 2 MB each (the gutter's
 /// limit, which a file must be under to have a history) and as many diffs,
-/// plus the working tree. The worker and the window share them through
-/// `Arc`, so none is held twice.
+/// plus the working tree and the version in the tab while a jump is on its
+/// way. The worker and the window share them through `Arc`, so none is
+/// held twice.
 const RADIUS: usize = 16;
 
 /// One piece of work for the worker.
@@ -33,12 +34,19 @@ pub(super) enum Job {
     Text(usize),
     /// The changes from version `n` to version `n + 1`.
     Diff(usize),
+    /// The changes from one version to another further off, for a jump.
+    Jump(usize, usize),
 }
 
 pub(super) enum Request {
     /// What to load around version `center`, in order. Replaces the last
-    /// request: whatever it still had queued is no longer wanted.
-    Want { center: usize, jobs: Vec<Job> },
+    /// request: whatever it still had queued is no longer wanted. The
+    /// version `shown` in the tab stays loaded wherever `center` is.
+    Want {
+        center: usize,
+        shown: usize,
+        jobs: Vec<Job>,
+    },
     /// The file's own text, the last version, changed.
     Worktree(Arc<str>),
 }
@@ -49,6 +57,8 @@ pub(super) enum Reply {
     Versions(Result<(Vec<Version>, bool), String>),
     Text(usize, Arc<str>),
     Diff(usize, Arc<Vec<Change>>),
+    /// The changes from one version to another, as [`Job::Jump`] asked.
+    Jump(usize, usize, Arc<Vec<Change>>),
 }
 
 /// Where a step goes.
@@ -89,6 +99,9 @@ pub(super) struct Scrub {
     start: (usize, usize, usize),
     /// What the last step changed, while it fades.
     fade: Option<Fade>,
+    /// The changes from the version shown to the one a jump waits for,
+    /// from the worker: (from, to, changes).
+    jump: Option<(usize, usize, Arc<Vec<Change>>)>,
     tx: mpsc::Sender<Request>,
     rx: mpsc::Receiver<Reply>,
     stop: Arc<AtomicBool>,
@@ -155,15 +168,16 @@ pub(super) fn jobs(
     out
 }
 
-/// Drops what is out of the window around `center`: texts but the working
-/// tree's `keep`, and diffs with either end out.
+/// Drops what is out of the window around `center`: texts but those of
+/// `keep`, the working tree and the version shown, and diffs with either
+/// end out.
 pub(super) fn evict<T, U>(
     texts: &mut HashMap<usize, T>,
     diffs: &mut HashMap<usize, U>,
     center: usize,
-    keep: usize,
+    keep: [usize; 2],
 ) {
-    texts.retain(|&slot, _| slot == keep || in_window(slot, center));
+    texts.retain(|&slot, _| keep.contains(&slot) || in_window(slot, center));
     diffs.retain(|&pair, _| in_window(pair, center) && in_window(pair + 1, center));
 }
 
@@ -238,28 +252,55 @@ impl Scrub {
     }
 
     /// Whether version `target` can be shown, coming from `from`: its text
-    /// is here, and so is the diff to it from a neighbour.
+    /// is here, and so are the changes to it, the diff from a neighbour or
+    /// the worker's for a jump. Until they are, a drag along the timeline
+    /// leaves the version shown where it is, rather than replace the whole
+    /// text and parse it again on every frame.
     fn ready(&self, from: usize, target: usize) -> bool {
         self.texts.contains_key(&target)
-            && (from.abs_diff(target) != 1
-                || self.diffs.contains_key(&from.min(target))
-                || self.gone)
+            && match from.abs_diff(target) {
+                0 => true,
+                1 => self.diffs.contains_key(&from.min(target)) || self.gone,
+                _ => self.jump_changes(from, target).is_some() || self.gone,
+            }
+    }
+
+    /// The worker's changes for a jump from `from` to `target`, if here.
+    fn jump_changes(&self, from: usize, target: usize) -> Option<&Arc<Vec<Change>>> {
+        self.jump
+            .as_ref()
+            .filter(|(a, b, _)| (*a, *b) == (from, target))
+            .map(|(_, _, changes)| changes)
     }
 
     /// Asks the worker for what the window lacks, and lets go of what
-    /// fell out of it.
+    /// fell out of it. A jump asks for its changes too, right after the
+    /// text it goes to.
     fn request(&mut self) {
         let center = self.center();
         let count = self.count();
-        evict(&mut self.texts, &mut self.diffs, center, count);
-        let jobs = jobs(
+        let shown = self.shown;
+        evict(&mut self.texts, &mut self.diffs, center, [count, shown]);
+        let mut jobs = jobs(
             center,
             count + 1,
             |slot| self.texts.contains_key(&slot),
             |pair| self.diffs.contains_key(&pair),
         );
+        let jump = self.sibling.is_some() && center.abs_diff(shown) > 1;
+        if jump && self.jump_changes(shown, center).is_none() {
+            let at = jobs
+                .iter()
+                .position(|job| *job == Job::Text(center))
+                .map_or(0, |i| i + 1);
+            jobs.insert(at, Job::Jump(shown, center));
+        }
         if !jobs.is_empty() {
-            let _ = self.tx.send(Request::Want { center, jobs });
+            let _ = self.tx.send(Request::Want {
+                center,
+                shown,
+                jobs,
+            });
         }
     }
 
@@ -350,12 +391,6 @@ pub(super) fn dump(state: &State) -> String {
 const FADE: Duration = Duration::from_millis(150);
 /// Removed lines a ghost shows; past these it says how many more.
 const GHOST_LINES: usize = 3;
-/// The most text, both versions together, a jump of several versions is
-/// diffed across for its fade. A step to a neighbour has its diff from
-/// the worker; a jump has none, and this one would run on the main
-/// thread, on every step of a drag, so it is kept to small files. A
-/// longer jump shows its version unmarked.
-const FADE_JUMP_BYTES: usize = 32 * 1024;
 
 /// What a step changed: the lines it added or changed in the version it
 /// goes to, and the ones it removed, where they were.
@@ -453,25 +488,28 @@ fn tint_colour(kind: MarkKind, theme: &Theme, alpha: f32) -> [f32; 4] {
 
 impl Scrub {
     /// What a step from version `from` to `target` changes, from the
-    /// neighbours' diff, or across a short jump between small texts;
-    /// `None` when it is not here or changes nothing.
-    fn fade_for(&self, from: usize, target: usize) -> Option<Fade> {
+    /// neighbours' diff or the worker's for a jump; `None` when it is not
+    /// here. None of it is worked out on this thread.
+    fn step_changes(&self, from: usize, target: usize) -> Option<Vec<Change>> {
+        match from.abs_diff(target) {
+            0 => Some(Vec::new()),
+            1 => {
+                let pair = self.diffs.get(&from.min(target))?;
+                Some(if target > from {
+                    pair.to_vec()
+                } else {
+                    reversed(pair)
+                })
+            }
+            _ => self.jump_changes(from, target).map(|c| c.to_vec()),
+        }
+    }
+
+    /// The fade of a step from version `from` that makes `changes`;
+    /// `None` when it changes nothing.
+    fn fade_for(&self, from: usize, changes: &[Change]) -> Option<Fade> {
         let old = self.texts.get(&from)?;
-        let changes = if from.abs_diff(target) == 1 {
-            let pair = self.diffs.get(&from.min(target))?;
-            if target > from {
-                pair.to_vec()
-            } else {
-                reversed(pair)
-            }
-        } else {
-            let new = self.texts.get(&target)?;
-            if from.abs_diff(target) > RADIUS || old.len() + new.len() > FADE_JUMP_BYTES {
-                return None;
-            }
-            crate::ide::diff::changes(old, new)
-        };
-        let fade = Fade::new(&changes, old, Instant::now());
+        let fade = Fade::new(changes, old, Instant::now());
         (!fade.tints.is_empty() || !fade.ghosts.is_empty()).then_some(fade)
     }
 
@@ -948,25 +986,29 @@ fn show(state: &mut State) -> Option<(String, bool)> {
         return None;
     }
     let text = scrub.texts.get(&target)?.clone();
-    // What the step changes, faded out over the version it shows: none for
-    // the first, which only opens the tab. A step during a fade starts
-    // its own; nothing queues.
-    let fade = if made {
-        scrub.fade_for(from, target)
+    // What the step changes, faded out over the version it shows and
+    // handed to the parser as an edit per change: none for the first,
+    // which only opens the tab. A step during a fade starts its own;
+    // nothing queues.
+    let changes = if made {
+        scrub.step_changes(from, target)
     } else {
         None
     };
+    let fade = changes.as_deref().and_then(|c| scrub.fade_for(from, c));
     let label = scrub.label(target);
     let ((line, column), top) = match scrub.sibling.and_then(|id| buffer_by_id(docs, panes, id)) {
         Some(buffer) => (buffer.cursor_position(), buffer.scroll_line),
         None => ((scrub.start.0, scrub.start.1), scrub.start.2),
     };
-    // A jump of several versions, from the timeline, maps through every
-    // diff between the two. Only the window around the version asked for
-    // is loaded, so a long jump usually finds one missing: then the caret
-    // and the view keep their line numbers, clamped to the version's
-    // length, rather than wait for every version in between to be read.
-    let map = |line| map_through(&scrub.diffs, from, target, line).unwrap_or(line);
+    // Through the step's changes. Without them, which is only when the
+    // worker stopped, through every diff between the two, and when one of
+    // those is missing the caret and the view keep their line numbers,
+    // clamped to the version's length.
+    let map = |line| match &changes {
+        Some(changes) => crate::ide::diff::map_line(changes, line),
+        None => map_through(&scrub.diffs, from, target, line).unwrap_or(line),
+    };
     let (line, top) = (map(line), map(top));
     if !made {
         // Generated: it has no path, so nothing saves it, restores it after
@@ -980,7 +1022,7 @@ fn show(state: &mut State) -> Option<(String, bool)> {
     let id = scrub.sibling?;
     let buffer = buffer_by_id_mut(docs, panes, id)?;
     buffer.label = Some(label);
-    buffer.show_text(&text, line, column);
+    buffer.show_text(&text, changes.as_deref(), line, column);
     let top = top.min(buffer.rope.len_lines().saturating_sub(1));
     if top != buffer.scroll_line {
         buffer.scroll_line = top;
@@ -991,6 +1033,7 @@ fn show(state: &mut State) -> Option<(String, bool)> {
     scrub.shown = target;
     scrub.pending = None;
     scrub.fade = fade;
+    scrub.jump = None;
     // What this commit changed, against its parent: the oldest version
     // has no parent read, and no marks rather than every line added.
     // No HEAD text: nothing here acts on the changes, and nothing reads
@@ -1122,6 +1165,7 @@ impl EditorView {
             worktree,
             start,
             fade: None,
+            jump: None,
             tx,
             rx,
             stop,
@@ -1318,6 +1362,12 @@ impl EditorView {
                         }
                         scrub.diffs.insert(pair, changes);
                     }
+                    // Only for the jump still waited for.
+                    Ok(Reply::Jump(from, to, changes)) => {
+                        if from == scrub.shown && scrub.pending == Some(to) {
+                            scrub.jump = Some((from, to, changes));
+                        }
+                    }
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
                         if !scrub.gone
@@ -1369,11 +1419,19 @@ fn work(
     tx: &mpsc::Sender<Reply>,
     stop: &AtomicBool,
 ) {
+    // Its folder and the root as the file system resolves them, as Git
+    // gives the root: a file opened through a linked folder is still
+    // inside it, and so is one gone from the disk since it was opened.
+    let path = &match (path.parent(), path.file_name()) {
+        (Some(dir), Some(name)) => crate::platform::canonical(dir).join(name),
+        _ => path.to_path_buf(),
+    };
     let listed = path
         .parent()
         .ok_or_else(|| "no parent directory".to_string())
         .and_then(crate::project::git::toplevel)
         .map_err(|_| "this file is not in a Git repository".to_string())
+        .map(|root| crate::platform::canonical(&root))
         .and_then(|root| {
             let relative = path
                 .strip_prefix(&root)
@@ -1429,9 +1487,13 @@ fn work(
         };
         if let Some(request) = request {
             match request {
-                Request::Want { center, jobs } => {
+                Request::Want {
+                    center,
+                    shown,
+                    jobs,
+                } => {
                     let mut none: HashMap<usize, ()> = HashMap::new();
-                    evict(&mut texts, &mut none, center, worktree_slot);
+                    evict(&mut texts, &mut none, center, [worktree_slot, shown]);
                     queue = jobs.into();
                 }
                 Request::Worktree(text) => {
@@ -1454,6 +1516,10 @@ fn work(
             Job::Diff(pair) if pair < worktree_slot => {
                 let (old, new) = (load(pair), load(pair + 1));
                 Reply::Diff(pair, Arc::new(crate::ide::diff::changes(&old, &new)))
+            }
+            Job::Jump(from, to) if from.max(to) <= worktree_slot => {
+                let (old, new) = (load(from), load(to));
+                Reply::Jump(from, to, Arc::new(crate::ide::diff::changes(&old, &new)))
             }
             _ => continue,
         };
@@ -1549,11 +1615,11 @@ mod tests {
     fn eviction_keeps_the_window_and_the_working_tree() {
         let mut texts: HashMap<usize, ()> = (0..=60).map(|s| (s, ())).collect();
         let mut diffs: HashMap<usize, ()> = (0..60).map(|s| (s, ())).collect();
-        evict(&mut texts, &mut diffs, 10, 60);
+        evict(&mut texts, &mut diffs, 10, [60, 50]);
         let mut kept: Vec<usize> = texts.into_keys().collect();
         kept.sort_unstable();
         let mut expected: Vec<usize> = (0..=10 + RADIUS).collect();
-        expected.push(60);
+        expected.extend([50, 60]);
         assert_eq!(kept, expected);
         let mut pairs: Vec<usize> = diffs.into_keys().collect();
         pairs.sort_unstable();
@@ -1677,5 +1743,252 @@ mod tests {
         let b = static_ext(&String::from("scrubtest"));
         assert!(std::ptr::eq(a, b));
         assert_eq!(a, "scrubtest");
+    }
+
+    /// `git` in `dir`, which has to succeed.
+    fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A repository whose `ledger.rs`, about 200 KB, changed in each of
+    /// `commits` commits, made in one `git fast-import`; and the file's
+    /// last text.
+    fn long_history(name: &str, commits: usize) -> (crate::project::TempTree, String) {
+        use std::io::Write;
+        let tree = crate::project::TempTree::new(name, &[]);
+        let dir = tree.0.as_path();
+        git(dir, &["init", "--quiet", "--initial-branch=main"]);
+        git(dir, &["config", "commit.gpgsign", "false"]);
+        let mut lines: Vec<String> = (0..4000)
+            .map(|i| {
+                format!(
+                    "    let entry_{i} = ledger.post({i}, Amount::cents({}));",
+                    i * 7
+                )
+            })
+            .collect();
+        let mut child = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["fast-import", "--quiet"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("git fast-import");
+        let mut stream = std::io::BufWriter::new(child.stdin.take().expect("stdin"));
+        let mut seed = 1u64;
+        let mut text = String::new();
+        for n in 0..commits {
+            // A few lines changed a commit, and now and then one added.
+            for _ in 0..3 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let at = (seed >> 33) as usize % lines.len();
+                lines[at] = format!("    let entry_{at} = ledger.post({at}, Amount::cents({n}));");
+            }
+            if n % 10 == 0 {
+                lines.push(format!("    ledger.close({n});"));
+            }
+            text = lines.join("\n") + "\n";
+            let message = format!("Post revision {n}");
+            write!(
+                stream,
+                "commit refs/heads/main\n\
+                 author Sam Example <sam@example.invalid> {time} +0000\n\
+                 committer Sam Example <sam@example.invalid> {time} +0000\n\
+                 data {}\n{message}\n\
+                 M 100644 inline ledger.rs\ndata {}\n{text}\n",
+                message.len(),
+                text.len(),
+                time = 1_700_000_000 + n * 60,
+            )
+            .expect("write");
+        }
+        drop(stream);
+        assert!(child.wait().expect("fast-import").success());
+        (tree, text)
+    }
+
+    /// A thousand versions of a 200 KB file through the real worker,
+    /// stepped from the newest to the oldest as Left steps them: the texts
+    /// held, by the window and the worker together, stay within the window
+    /// and the working tree all the way, and the list and the first
+    /// version come quickly.
+    #[test]
+    fn a_long_history_holds_no_more_than_the_window() {
+        const COMMITS: usize = 1000;
+        let made = Instant::now();
+        let (tree, last) = long_history("scrub-long-history", COMMITS);
+        let made = made.elapsed();
+
+        let started = Instant::now();
+        let (tx, worker_rx) = mpsc::channel();
+        let (worker_tx, rx) = mpsc::channel();
+        let halt = Arc::new(AtomicBool::new(false));
+        let worktree: Arc<str> = Arc::from(last);
+        // Through the temporary folder's link (`/var` to `/private/var`):
+        // the worker resolves it.
+        let path = tree.0.join("ledger.rs");
+        let held = worktree.clone();
+        let worker = std::thread::spawn(move || work(&path, held, &worker_rx, &worker_tx, &halt));
+        let wait = Duration::from_secs(60);
+        let (versions, capped) = match rx.recv_timeout(wait) {
+            Ok(Reply::Versions(listed)) => listed.expect("versions"),
+            _ => panic!("no versions"),
+        };
+        let listed = started.elapsed();
+        let count = versions.len();
+        assert_eq!(count, COMMITS);
+        assert!(capped, "the list stops at the limit");
+
+        // The window's side, as `poll_scrub` keeps it, and every text that
+        // came, to see which are still held anywhere.
+        let mut texts: HashMap<usize, Arc<str>> = HashMap::from([(count, worktree)]);
+        let mut diffs: HashMap<usize, Arc<Vec<Change>>> = HashMap::new();
+        let mut seen: Vec<std::sync::Weak<str>> = Vec::new();
+        let mut first = None;
+        let mut most = 0;
+        let mut shown = count;
+        for target in (0..count).rev() {
+            evict(&mut texts, &mut diffs, target, [count, shown]);
+            let want = jobs(
+                target,
+                count + 1,
+                |slot| texts.contains_key(&slot),
+                |pair| diffs.contains_key(&pair),
+            );
+            if !want.is_empty() {
+                tx.send(Request::Want {
+                    center: target,
+                    shown,
+                    jobs: want,
+                })
+                .unwrap();
+            }
+            // Ready as `show` waits for it: the text, and the diff from the
+            // version before, but for the first.
+            let first_step = target + 1 == count;
+            while !(texts.contains_key(&target) && (first_step || diffs.contains_key(&target))) {
+                match rx.recv_timeout(wait).expect("the worker answers") {
+                    Reply::Text(slot, text) => {
+                        seen.push(Arc::downgrade(&text));
+                        if in_window(slot, target) {
+                            texts.insert(slot, text);
+                        }
+                    }
+                    Reply::Diff(pair, changes) => {
+                        if in_window(pair, target) && in_window(pair + 1, target) {
+                            diffs.insert(pair, changes);
+                        }
+                    }
+                    Reply::Versions(_) | Reply::Jump(..) => panic!("not asked for"),
+                }
+            }
+            shown = target;
+            first.get_or_insert_with(|| started.elapsed());
+            assert!(texts.len() <= 2 * RADIUS + 2, "{} texts", texts.len());
+            assert!(diffs.len() <= 2 * RADIUS, "{} diffs", diffs.len());
+            // Window and worker together: the window, the working tree,
+            // and the edge of the window the worker may not have moved yet.
+            seen.retain(|text| text.strong_count() > 0);
+            most = most.max(seen.len());
+            assert!(seen.len() <= 2 * RADIUS + 3, "{} texts held", seen.len());
+        }
+        let stepped = started.elapsed();
+
+        // A jump from the oldest to the middle, as the timeline asks for it:
+        // its changes come from the worker, and lead from one text to the
+        // other an edit each.
+        let target = count / 2;
+        evict(&mut texts, &mut diffs, target, [count, shown]);
+        let mut want = jobs(target, count + 1, |s| texts.contains_key(&s), |_| true);
+        want.insert(1, Job::Jump(shown, target));
+        tx.send(Request::Want {
+            center: target,
+            shown,
+            jobs: want,
+        })
+        .unwrap();
+        let mut jump = None;
+        while jump.is_none() || !texts.contains_key(&target) {
+            match rx.recv_timeout(wait).expect("the worker answers") {
+                Reply::Text(slot, text) => {
+                    seen.push(Arc::downgrade(&text));
+                    texts.insert(slot, text);
+                }
+                Reply::Jump(from, to, changes) => {
+                    assert_eq!((from, to), (shown, target));
+                    jump = Some(changes);
+                }
+                _ => {}
+            }
+        }
+        let changes = jump.unwrap();
+        assert!(!changes.is_empty());
+        let mut buffer = crate::text::buffer::Buffer::generated("ledger.rs", "rs", "");
+        buffer.show_text(&texts[&shown], None, 0, 0);
+        buffer.drain_edits();
+        buffer.show_text(&texts[&target], Some(&changes), 0, 0);
+        assert!(buffer.rope.to_string() == *texts[&target]);
+        let edits = buffer.drain_edits().expect("edits, not a full parse");
+        assert_eq!(edits.len(), changes.len(), "an edit per change");
+        seen.retain(|text| text.strong_count() > 0);
+        assert!(seen.len() <= 2 * RADIUS + 4, "{} texts held", seen.len());
+
+        drop(tx);
+        worker.join().unwrap();
+        eprintln!(
+            "{COMMITS} versions of {} KB: made in {:.2} s, listed in {:.0} ms, \
+             first version at {:.0} ms, all stepped in {:.2} s, at most {most} texts held",
+            texts[&count].len() / 1024,
+            made.as_secs_f64(),
+            listed.as_secs_f64() * 1e3,
+            first.unwrap_or_default().as_secs_f64() * 1e3,
+            stepped.as_secs_f64(),
+        );
+        // Generous, so a slow or busy machine does not fail it.
+        assert!(listed < Duration::from_secs(5), "listed in {listed:?}");
+        assert!(
+            first.unwrap_or_default() < Duration::from_secs(5),
+            "first version at {first:?}"
+        );
+    }
+
+    /// A file opened through a linked folder has its history: the worker
+    /// resolves the path, as Git resolves the repository's.
+    #[test]
+    fn a_file_through_a_linked_folder_has_its_history() {
+        let (tree, last) = long_history("scrub-linked-history", 3);
+        let link = std::env::temp_dir().join(format!("crc-scrub-link-{}", std::process::id()));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&tree.0, &link).unwrap();
+        let (tx, worker_rx) = mpsc::channel::<Request>();
+        let (worker_tx, rx) = mpsc::channel();
+        let halt = Arc::new(AtomicBool::new(false));
+        let path = link.join("ledger.rs");
+        let worker =
+            std::thread::spawn(move || work(&path, Arc::from(last), &worker_rx, &worker_tx, &halt));
+        let listed = rx.recv_timeout(Duration::from_secs(60));
+        drop(tx);
+        worker.join().unwrap();
+        let _ = std::fs::remove_file(&link);
+        match listed {
+            Ok(Reply::Versions(Ok((versions, capped)))) => {
+                assert_eq!(versions.len(), 3);
+                assert!(!capped);
+                assert_eq!(versions[2].path, Path::new("ledger.rs"));
+            }
+            Ok(Reply::Versions(Err(why))) => panic!("no history: {why}"),
+            _ => panic!("no versions"),
+        }
     }
 }

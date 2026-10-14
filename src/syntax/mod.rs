@@ -1782,9 +1782,39 @@ mod tests {
         ] {
             // The buffer's own tests check this is one edit, not a full
             // parse; here, that the parse it leads to is right.
-            buffer.show_text(version, 1, 4);
+            buffer.show_text(version, None, 1, 4);
             store.update(&mut buffer, BUDGET);
             assert_store_matches_a_full_parse(&store, &buffer);
+        }
+    }
+
+    /// The same with the history's diffs: an edit per change, several in
+    /// one step, and the tree still the one a full parse gives.
+    #[test]
+    fn a_version_shown_with_its_diff_parses_to_the_same_tree() {
+        let versions = [
+            "fn a() {}\nfn b() { let 日本 = 1; }\nfn c() {}\n",
+            "struct S;\nfn a() {}\nfn b() { let 日本 = 2; }\nfn c() {}\nfn d() {}\n",
+            "struct S;\nfn b() { let 日本 = 2; }\nfn c() { /* 本 */ }\nfn d() {}",
+            "fn b() {}\nfn c() { /* 本 */ }\n",
+            "",
+            "fn e(x: u8) -> u8 { x }\n",
+        ];
+        let mut store = SyntaxStore::new();
+        let mut buffer = rust_buffer(versions[0], "v.rs");
+        buffer.set_frozen(true);
+        store.update(&mut buffer, BUDGET);
+        // Forward through them, then back, as the scrubber steps.
+        let order: Vec<usize> = (1..versions.len())
+            .chain((0..versions.len() - 1).rev())
+            .collect();
+        let mut shown = 0;
+        for next in order {
+            let changes = crate::ide::diff::changes(versions[shown], versions[next]);
+            buffer.show_text(versions[next], Some(&changes), 0, 0);
+            store.update(&mut buffer, BUDGET);
+            assert_store_matches_a_full_parse(&store, &buffer);
+            shown = next;
         }
     }
 
