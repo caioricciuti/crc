@@ -4,6 +4,17 @@ One entry per tag, written for people who use the editor.
 
 ## Unreleased
 
+- Git > Blame Heat (off by default, also `blame_heat` in the settings)
+  draws a thin violet strip beside the line numbers: strongest for lines
+  changed in the last day, fading over a year, nothing for older or
+  uncommitted lines. It follows your edits and is worked out again a
+  second after typing stops. Hovering a run shows its commit, author, age
+  and summary, and whether it is signed; the first time a signed commit's
+  tooltip shows, its signature is checked in the background ("signed,
+  verified", "signature bad" or "signed, cannot verify here"). Unsigned
+  commits draw dashed. Cmd-click the strip, or click it where no change
+  mark is, to open File History at the commit that last changed the line,
+  with the caret where the line was then.
 - Terminal: `Cmd-F` finds text in what a session printed, history and
   screen, with the same find bar as documents laid over the terminal
   (case, word and regex options; `Cmd-G` and `Cmd-Shift-G` or Return

@@ -1452,6 +1452,7 @@ mod tests {
                     lines: &[0, 0, NOT_COMMITTED, 1, 1, 2, 0],
                     alpha: &[1.0, 0.35, 0.0],
                     tips: &tips,
+                    dashed: &[],
                     hide_from,
                 },
             );
@@ -1471,8 +1472,8 @@ mod tests {
         // Lines 1-2, 4-5 and 7: line 3 is not committed and line 6 is
         // older than a year.
         assert_eq!(out.len(), 3);
-        assert_eq!(out[0].color, faded(theme.accent, 1.0));
-        assert_eq!(out[1].color, faded(theme.accent, 0.35));
+        assert_eq!(out[0].color, faded(theme.blame_heat, 1.0));
+        assert_eq!(out[1].color, faded(theme.blame_heat, 0.35));
         assert_eq!(
             spots,
             [
@@ -1486,6 +1487,99 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(spots[1].0..spots[1].0 + spots[1].1, 3.0..4.0);
         assert!(strip(0).0.is_empty());
+    }
+
+    #[test]
+    fn an_unsigned_commits_strip_is_dashed() {
+        assert_eq!(heat_pieces(10.0, 20.0, false), [(10.0, 20.0)]);
+        assert_eq!(
+            heat_pieces(10.0, 20.0, true),
+            [(10.0, 13.0), (15.0, 18.0)],
+            "the last gap reaches the bottom"
+        );
+        assert_eq!(
+            heat_pieces(0.0, 12.0, true),
+            [(0.0, 3.0), (5.0, 8.0), (10.0, 12.0)]
+        );
+        assert!(heat_pieces(5.0, 5.0, true).is_empty());
+
+        let atlas = atlas();
+        let m = atlas.metrics;
+        let theme = Theme::default();
+        let buffer = Buffer::from_text("a\nb\nc\nd\n");
+        let viewport = Viewport::new(400.0, 400.0);
+        let rows = screen_rows(&buffer, viewport, m.line_height);
+        let tips = ["signed".to_string(), "unsigned".to_string()];
+        let mut out = Vec::new();
+        begin_frame();
+        push_blame_heat(
+            &mut out,
+            &atlas,
+            viewport,
+            &rows,
+            &theme,
+            &BlameHeat {
+                lines: &[0, 0, 1, 1],
+                alpha: &[1.0, 0.55],
+                tips: &tips,
+                dashed: &[false, true],
+                hide_from: usize::MAX,
+            },
+        );
+        let (solid, dashes) = out.split_at(1);
+        let height = |q: &GlyphInstance| q.size[1];
+        assert_eq!(height(&solid[0]), 2.0 * m.line_height);
+        let want = heat_pieces(2.0 * m.line_height, 4.0 * m.line_height, true);
+        assert_eq!(dashes.len(), want.len());
+        for (quad, (top, bottom)) in dashes.iter().zip(&want) {
+            assert_eq!(quad.pos[1], *top);
+            assert_eq!(height(quad), bottom - top);
+            assert_eq!(quad.color, faded(theme.blame_heat, 0.55), "same colour");
+            assert_eq!(quad.pos[0], solid[0].pos[0], "same place");
+        }
+        // Still one hotspot per run.
+        assert_eq!(hotspots().len(), 2);
+    }
+
+    #[test]
+    fn clicking_the_heat_strip_finds_its_line() {
+        use crate::project::git::NOT_COMMITTED;
+        let atlas = atlas();
+        let m = atlas.metrics;
+        let buffer = Buffer::from_text("a\nb\nc\nd\ne\n");
+        let tips = ["one".to_string()];
+        let heat = |hide_from| BlameHeat {
+            lines: &[0, NOT_COMMITTED, 0, 0],
+            alpha: &[1.0],
+            tips: &tips,
+            dashed: &[],
+            hide_from,
+        };
+        let middle = |line: usize| (line as f32 + 0.5) * m.line_height;
+        let (strip, width) = heat_strip(m.advance);
+        let on = strip + width / 2.0;
+        let all = heat(usize::MAX);
+        assert_eq!(heat_strip_at(&buffer, &atlas, &all, on, middle(0)), Some(0));
+        assert_eq!(heat_strip_at(&buffer, &atlas, &all, on, middle(2)), Some(2));
+        // A line not committed yet is still found: the click says so.
+        assert_eq!(heat_strip_at(&buffer, &atlas, &all, on, middle(1)), Some(1));
+        // Anywhere in the first cell, as the pointer says, but no further.
+        assert_eq!(
+            heat_strip_at(&buffer, &atlas, &all, 0.0, middle(3)),
+            Some(3)
+        );
+        assert_eq!(
+            heat_strip_at(&buffer, &atlas, &all, m.advance + 1.0, middle(0)),
+            None
+        );
+        // Past what was blamed, and from an edit down.
+        assert_eq!(heat_strip_at(&buffer, &atlas, &all, on, middle(4)), None);
+        let edited = heat(2);
+        assert_eq!(heat_strip_at(&buffer, &atlas, &edited, on, middle(2)), None);
+        assert_eq!(
+            heat_strip_at(&buffer, &atlas, &edited, on, middle(0)),
+            Some(0)
+        );
     }
 
     #[test]

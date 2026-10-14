@@ -59,7 +59,7 @@ impl EditorView {
                     let Some(mut state) = self.state_mut() else {
                         return;
                     };
-                    frame_of(&mut state).named(name)
+                    region_named(&mut state, name)
                 };
                 let Some(rect) = target else {
                     eprintln!("selftest: no region named {name} in this frame");
@@ -839,8 +839,10 @@ impl EditorView {
                                 .filter_map(|h| h.tip.as_deref())
                                 .filter(|t| strip.tips.iter().any(|tip| tip == t))
                                 .collect();
+                            // Commits known to be unsigned, drawn dashed.
+                            let unsigned = strip.dashed.iter().filter(|&&d| d).count();
                             format!(
-                                "on lines={} commits={} shown={shown} hidden_from={} spots={} tip={}",
+                                "on lines={} commits={} unsigned={unsigned} shown={shown} hidden_from={} spots={} tip={}",
                                 strip.lines.len(),
                                 doc.map.commits.len(),
                                 match strip.hide_from {
@@ -950,6 +952,26 @@ fn region_named(state: &mut State, name: &str) -> Option<Viewport> {
                 x: text.x,
                 y: row.y,
                 width: m.advance,
+                height: m.line_height,
+            })
+        }
+        // The blame heat strip beside a line, by its number: `heat.2`.
+        _ if name.starts_with("heat.") => {
+            let line = name["heat.".len()..]
+                .parse::<usize>()
+                .ok()?
+                .checked_sub(1)?;
+            let text = chrome_of(state).text;
+            let buffer = state.docs.active();
+            let m = state.renderer.atlas.metrics;
+            let row = layout::screen_rows(buffer, text, m.line_height)
+                .into_iter()
+                .find(|r| r.line == line && r.first)?;
+            let (dx, width) = layout::heat_strip(m.advance);
+            Some(Viewport {
+                x: m.snap(text.x + dx),
+                y: row.y,
+                width,
                 height: m.line_height,
             })
         }

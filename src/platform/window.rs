@@ -1505,6 +1505,9 @@ define_class!(
                     state.hotspots[at].tip.clone()
                 })
                 .unwrap_or_default();
+            // A signed commit on the blame heat strip is checked the first
+            // time its tooltip shows.
+            self.check_heat_tip(&text);
             NSString::from_str(&text)
         }
 
@@ -1779,6 +1782,15 @@ define_class!(
                     self.click_change_bar(line);
                     return;
                 }
+                // And the blame heat strip, where no change bar took it.
+                Some(Hit::SidebarDivider)
+                    if let Some(line) = self
+                        .state()
+                        .and_then(|state| git_menu::heat_under(&state, event, x, y)) =>
+                {
+                    self.click_heat(line);
+                    return;
+                }
                 // Grabbing the divider starts a resize rather than anything else.
                 Some(Hit::SidebarDivider) => {
                     if let Some(mut state) = self.state_mut() {
@@ -2038,6 +2050,15 @@ define_class!(
                         .and_then(|state| changes::change_bar_under(&state, event, x, y));
                     if let Some(line) = bar {
                         self.click_change_bar(line);
+                        return;
+                    }
+                    // The blame heat strip beside it: File History at the
+                    // commit, for a Command click or where no bar was.
+                    let heat = self
+                        .state()
+                        .and_then(|state| git_menu::heat_under(&state, event, x, y));
+                    if let Some(line) = heat {
+                        self.click_heat(line);
                         return;
                     }
                 }
@@ -9312,6 +9333,9 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
             pending: HashSet::new(),
             generation: 0,
             channel: mpsc::channel(),
+            checks: HashMap::new(),
+            checking: HashSet::new(),
+            checked: mpsc::channel(),
         },
         lsp: Lsp {
             servers: HashMap::new(),

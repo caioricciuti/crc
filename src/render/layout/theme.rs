@@ -61,6 +61,10 @@ pub struct Theme {
     /// The incoming side of a merge conflict; the current side is drawn in
     /// `diff_added`, the way Git's own tools pair them.
     pub conflict_incoming: [f32; 4],
+    /// The blame heat strip beside the change bars, faded by age. Violet:
+    /// the accent is mint like `diff_added`, and amber is taken by
+    /// `diff_modified`, so a strip in either read as a change bar.
+    pub blame_heat: [f32; 4],
     pub tab_bar: [f32; 4],
     pub tab_active: [f32; 4],
     pub tab_text: [f32; 4],
@@ -170,6 +174,7 @@ impl Theme {
             diff_added_band: [0.184, 0.561, 0.306, 0.14],
             diff_removed_band: [0.784, 0.271, 0.231, 0.12],
             conflict_incoming: [0.149, 0.400, 0.780, 1.0],
+            blame_heat: [0.545, 0.247, 0.859, 1.0],
 
             text,
             gutter_text: [0.541, 0.592, 0.576, 1.0],
@@ -240,6 +245,7 @@ impl Default for Theme {
             diff_added_band: [0.353, 0.702, 0.451, 0.13],
             diff_removed_band: [0.867, 0.396, 0.365, 0.13],
             conflict_incoming: [0.537, 0.706, 0.918, 1.0],
+            blame_heat: [0.765, 0.565, 1.000, 1.0],
             cursor: [0.651, 0.867, 0.761, 1.0],
 
             // Text
@@ -333,6 +339,7 @@ mod theme_tests {
                 theme.diff_removed,
                 theme.diff_modified,
                 theme.conflict_incoming,
+                theme.blame_heat,
             ];
             for fg in foregrounds {
                 assert!(
@@ -343,5 +350,44 @@ mod theme_tests {
         }
         assert!(Theme::dark().is_dark());
         assert!(!Theme::light().is_dark());
+    }
+
+    /// The blame heat strip sits beside the change bars: its hue has to
+    /// be far from every bar's, and from the accent, or a bright strip
+    /// reads as one more bar.
+    #[test]
+    fn the_blame_heat_is_its_own_hue() {
+        fn hue(c: [f32; 4]) -> f32 {
+            let (r, g, b) = (c[0], c[1], c[2]);
+            let max = r.max(g).max(b);
+            let d = max - r.min(g).min(b);
+            let h = if d == 0.0 {
+                0.0
+            } else if max == r {
+                ((g - b) / d).rem_euclid(6.0)
+            } else if max == g {
+                (b - r) / d + 2.0
+            } else {
+                (r - g) / d + 4.0
+            };
+            h * 60.0
+        }
+        for theme in [Theme::dark(), Theme::light()] {
+            for other in [
+                theme.accent,
+                theme.diff_added,
+                theme.diff_modified,
+                theme.diff_removed,
+                theme.conflict_incoming,
+            ] {
+                let apart = (hue(theme.blame_heat) - hue(other)).abs();
+                let apart = apart.min(360.0 - apart);
+                assert!(
+                    apart > 45.0,
+                    "{:?} is {apart} degrees from {other:?}",
+                    theme.blame_heat
+                );
+            }
+        }
     }
 }

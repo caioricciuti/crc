@@ -952,14 +952,37 @@ pub struct BlameHeat<'a> {
     pub alpha: &'a [f32],
     /// Per commit, what the strip's tooltip says.
     pub tips: &'a [String],
+    /// Per commit, whether it is known to be unsigned: its strip is
+    /// dashed. A commit missing here is drawn solid.
+    pub dashed: &'a [bool],
     /// Lines from here down were edited since the blame and are not drawn.
     pub hide_from: usize,
 }
 
+/// The dashes of an unsigned commit's strip: this long, this far apart.
+pub const HEAT_DASH: f32 = 3.0;
+pub const HEAT_GAP: f32 = 2.0;
+
+/// The pieces a strip from `top` to `bottom` is drawn as: one, or dashes
+/// from the top down, the last cut at the bottom.
+pub fn heat_pieces(top: f32, bottom: f32, dashed: bool) -> Vec<(f32, f32)> {
+    if !dashed {
+        return vec![(top, bottom)];
+    }
+    let mut out = Vec::new();
+    let mut y = top;
+    while y < bottom {
+        out.push((y, (y + HEAT_DASH).min(bottom)));
+        y += HEAT_DASH + HEAT_GAP;
+    }
+    out
+}
+
 /// Draws the blame heat strip down the gutter's first cell: per line, the
-/// accent colour as strong as its commit is recent, nothing for a line not
-/// committed yet or older than a year. A run of rows blamed to one commit
-/// is one rectangle, and one hotspot whose tooltip names the commit.
+/// heat colour as strong as its commit is recent, nothing for a line not
+/// committed yet or older than a year; dashed for an unsigned commit. A
+/// run of rows blamed to one commit is one strip, and one hotspot whose
+/// tooltip names the commit.
 pub fn push_blame_heat(
     out: &mut Vec<GlyphInstance>,
     atlas: &Atlas,
@@ -979,14 +1002,11 @@ pub fn push_blame_heat(
             .filter(|&c| heat.alpha.get(c as usize).is_some_and(|&a| a > 0.0))
     };
     let flush = |out: &mut Vec<GlyphInstance>, (commit, top, bottom): (u32, f32, f32)| {
-        let alpha = heat.alpha[commit as usize];
-        push_rect(
-            out,
-            atlas,
-            [x, top],
-            [width, bottom - top],
-            faded(theme.accent, alpha),
-        );
+        let color = faded(theme.blame_heat, heat.alpha[commit as usize]);
+        let dashed = heat.dashed.get(commit as usize).copied().unwrap_or(false);
+        for (from, to) in heat_pieces(top, bottom, dashed) {
+            push_rect(out, atlas, [x, from], [width, to - from], color);
+        }
         hotspot(
             Viewport {
                 x: viewport.x,
@@ -1121,6 +1141,26 @@ pub fn change_bar_at(
     }
     (row.last && y >= row.y + m.line_height * 0.75 && kind(row.line + 1) == Some(MarkKind::Removed))
         .then_some(row.line + 1)
+}
+
+/// The line whose blame heat a click at `(x, y)` in the text area is on:
+/// anywhere in the gutter's first cell, where the strip and its pointer
+/// are, beside a line the blame still holds (not one edited since). The
+/// line may not be committed yet, or too old to draw; the caller says so.
+pub fn heat_strip_at(
+    buffer: &Buffer,
+    atlas: &Atlas,
+    heat: &BlameHeat,
+    x: f32,
+    y: f32,
+) -> Option<usize> {
+    let m = atlas.metrics;
+    if !(0.0..m.advance).contains(&x) {
+        return None;
+    }
+    let rows = rows_down_to(buffer, y, m.line_height);
+    let row = rows.iter().find(|r| r.y <= y && y < r.y + m.line_height)?;
+    (row.line < heat.hide_from && row.line < heat.lines.len()).then_some(row.line)
 }
 
 /// What the peek at one change says: a title, and the lines HEAD had where

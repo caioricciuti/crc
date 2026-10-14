@@ -448,6 +448,11 @@ impl EditorView {
                 }
             }
         }
+        // Signatures checked: the tooltips say what was found.
+        while let Ok((sha, check)) = state.heat.checked.1.try_recv() {
+            state.heat.land_check(sha, check, now);
+            self.ivars().needs_redraw.set(true);
+        }
         if !state.heat.on {
             return;
         }
@@ -494,6 +499,108 @@ impl EditorView {
             }
         }
     }
+}
+
+impl EditorView {
+    /// The tooltip `tip` is about to show: when it is the heat strip's for
+    /// a signed commit not checked yet, the signature is checked on a
+    /// worker, and the tooltip says what was found the next time it shows.
+    pub(super) fn check_heat_tip(&self, tip: &str) {
+        {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            let state = &mut *state;
+            let Some((id, sha)) = state.heat.check_for_tip(tip) else {
+                return;
+            };
+            let path = buffer_by_id(&state.docs, &state.panes, id).and_then(|b| b.path.clone());
+            let tx = state.heat.checked.0.clone();
+            std::thread::spawn(move || {
+                let check = path
+                    .as_deref()
+                    .and_then(Path::parent)
+                    .ok_or_else(|| "no parent directory".to_string())
+                    .and_then(crate::project::git::toplevel)
+                    .and_then(|root| crate::project::git::signature_check(&root, &sha))
+                    .ok();
+                let _ = tx.send((sha, check));
+            });
+        }
+        self.resume_display_link();
+    }
+
+    /// A click on the blame heat strip beside `line` of the active
+    /// document: File History at the commit that last changed the line,
+    /// the caret where the line was then.
+    pub(super) fn click_heat(&self, line: usize) {
+        let goto = {
+            let Some(state) = self.state() else {
+                return;
+            };
+            let buffer = state.docs.active();
+            let Some(doc) = state.heat.docs.get(&buffer.id()) else {
+                return;
+            };
+            match doc
+                .map
+                .lines
+                .get(line)
+                .map(|&c| doc.map.commits.get(c as usize))
+            {
+                Some(Some(commit)) => {
+                    let origin = doc.map.origins.get(line).map_or(line, |&o| o as usize);
+                    // The line stays where it is on screen.
+                    let offset = line.saturating_sub(buffer.scroll_line);
+                    Ok(super::scrub::Goto {
+                        commit: commit.sha.clone(),
+                        line: origin,
+                        top: origin.saturating_sub(offset),
+                    })
+                }
+                _ => Err(format!("line {} is not committed yet", line + 1)),
+            }
+        };
+        match goto {
+            Ok(goto) => self.open_history_at(Some(goto)),
+            Err(said) => {
+                if let Some(mut state) = self.state_mut() {
+                    state.message = Some((said, Instant::now()));
+                }
+                self.resume_display_link();
+                self.request_redraw();
+            }
+        }
+    }
+}
+
+/// The line of the active document whose blame heat a click at `(x, y)`
+/// in the view is on, if it opens File History: a Command click anywhere
+/// in the strip's cell beside a line the blame holds, a plain one only
+/// where the strip is drawn (a change bar there was offered the click
+/// first). Shift and Option clicks select from there, as elsewhere.
+pub(super) fn heat_under(state: &State, event: &NSEvent, x: f32, y: f32) -> Option<usize> {
+    let flags = event.modifierFlags();
+    if !state.heat.on
+        || flags.intersects(NSEventModifierFlags::Shift | NSEventModifierFlags::Option)
+    {
+        return None;
+    }
+    let chrome = chrome_of(state);
+    if !chrome.text.contains(x, y) {
+        return None;
+    }
+    let (tx, ty) = chrome.to_text(x, y);
+    let buffer = state.docs.active();
+    let doc = state.heat.docs.get(&buffer.id())?;
+    let strip = doc.strip();
+    let line = layout::heat_strip_at(buffer, &state.renderer.atlas, &strip, tx, ty)?;
+    let drawn = strip
+        .lines
+        .get(line)
+        .and_then(|&c| strip.alpha.get(c as usize))
+        .is_some_and(|&a| a > 0.0);
+    (drawn || flags.contains(NSEventModifierFlags::Command)).then_some(line)
 }
 
 /// Whether `buffer` gets a blame heat strip: a saved file Git tracks, of

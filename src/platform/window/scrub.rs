@@ -97,6 +97,14 @@ pub(super) struct Scrub {
     /// The file's caret (line, column) and first line when the history
     /// opened, which the first version shown starts from.
     start: (usize, usize, usize),
+    /// Opened at a commit, from the blame heat strip: where to go once
+    /// the versions are listed.
+    goto: Option<Goto>,
+    /// `start` is already in the first version's lines, and is not
+    /// mapped from the working tree's.
+    placed: bool,
+    /// Said before the first version's own line, once it shows.
+    note: Option<String>,
     /// What the last step changed, while it fades.
     fade: Option<Fade>,
     /// The changes from the version shown to the one a jump waits for,
@@ -218,6 +226,46 @@ fn static_ext(ext: &str) -> &'static str {
 
 fn short(commit: &str) -> &str {
     commit.get(..7).unwrap_or(commit)
+}
+
+/// Where a history opened from the blame heat strip goes: a commit, by
+/// its hash or a prefix of it, and the caret's line and the first line
+/// shown in the file as that commit left it.
+pub(super) struct Goto {
+    pub(super) commit: String,
+    pub(super) line: usize,
+    pub(super) top: usize,
+}
+
+/// The version of `versions` made by `commit` (a hash, or a prefix of
+/// one), and what to say when there is none: the list was cut short
+/// before it, and the oldest read stands in, or the file's history does
+/// not have it, and the newest does.
+pub(super) fn goto_slot(
+    versions: &[Version],
+    commit: &str,
+    capped: bool,
+) -> (usize, Option<String>) {
+    let found = versions.iter().position(|v| {
+        !commit.is_empty() && (v.commit.starts_with(commit) || commit.starts_with(&v.commit))
+    });
+    match found {
+        Some(slot) => (slot, None),
+        None if capped => (
+            0,
+            Some(format!(
+                "commit {} is past the loaded history",
+                short(commit)
+            )),
+        ),
+        None => (
+            versions.len().saturating_sub(1),
+            Some(format!(
+                "commit {} is not in this file's history",
+                short(commit)
+            )),
+        ),
+    }
 }
 
 impl Scrub {
@@ -981,7 +1029,13 @@ fn show(state: &mut State) -> Option<(String, bool)> {
     let made = scrub
         .sibling
         .is_some_and(|id| buffer_by_id(docs, panes, id).is_some());
-    let from = if made { scrub.shown } else { count };
+    // The first version comes from the working tree, unless the history
+    // was opened at it with its lines already.
+    let from = match (made, scrub.placed) {
+        (true, _) => scrub.shown,
+        (false, true) => target,
+        (false, false) => count,
+    };
     if !scrub.ready(from, target) {
         return None;
     }
@@ -1053,7 +1107,11 @@ fn show(state: &mut State) -> Option<(String, bool)> {
         },
     );
     scrub.request();
-    Some((scrub.describe(target), !made))
+    let said = match scrub.note.take() {
+        Some(note) => format!("{note}: {}", scrub.describe(target)),
+        None => scrub.describe(target),
+    };
+    Some((said, !made))
 }
 
 /// Closes the history: its tab goes, wherever it is, and with `back` the
@@ -1081,7 +1139,12 @@ fn close(state: &mut State, back: bool) {
 impl EditorView {
     /// Git > File History.
     pub(super) fn open_history(&self) {
-        let opened = self.start_history();
+        self.open_history_at(None);
+    }
+
+    /// File History, at the version `goto` names when there is one.
+    pub(super) fn open_history_at(&self, goto: Option<Goto>) {
+        let opened = self.start_history_at(goto);
         if let Err(why) = opened
             && let Some(mut state) = self.state_mut()
         {
@@ -1094,7 +1157,7 @@ impl EditorView {
         self.pump();
     }
 
-    fn start_history(&self) -> Result<(), String> {
+    fn start_history_at(&self, goto: Option<Goto>) -> Result<(), String> {
         let Some(mut state) = self.state_mut() else {
             return Ok(());
         };
@@ -1105,7 +1168,9 @@ impl EditorView {
             if scrub.sibling == Some(id) {
                 return Err("Escape goes back to the file".into());
             }
-            if scrub.live == id {
+            // Open already: to the tab as it is, unless asked for a commit,
+            // when it is opened again there.
+            if scrub.live == id && goto.is_none() {
                 let index = scrub
                     .sibling
                     .and_then(|sibling| state.docs.iter().position(|b| b.id() == sibling));
@@ -1164,6 +1229,9 @@ impl EditorView {
             diffs: HashMap::new(),
             worktree,
             start,
+            placed: goto.is_some(),
+            goto,
+            note: None,
             fade: None,
             jump: None,
             tx,
@@ -1328,13 +1396,30 @@ impl EditorView {
                             break;
                         }
                         let count = versions.len();
+                        // Opened at a commit: that version first, the caret
+                        // where the line was. One the list lacks stands in
+                        // with the file's caret, clamped.
+                        let first = match scrub.goto.take() {
+                            Some(goto) => {
+                                let (slot, note) = goto_slot(&versions, &goto.commit, capped);
+                                if note.is_none() {
+                                    scrub.start = (goto.line, 0, goto.top);
+                                }
+                                scrub.note = note;
+                                slot
+                            }
+                            None => count - 1,
+                        };
                         scrub.versions = Some(versions);
                         scrub.capped = capped;
                         scrub.shown = count;
                         scrub
                             .texts
                             .insert(count, Arc::from(scrub.worktree.to_string()));
-                        scrub.pending = Some(count - 1);
+                        scrub.pending = Some(first);
+                        if first != count - 1 {
+                            scrub.request();
+                        }
                     }
                     Ok(Reply::Versions(Err(why))) => {
                         said = Some(why);
@@ -1565,6 +1650,44 @@ fn read_version(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_history_opened_at_a_commit_finds_it_by_any_prefix() {
+        let version = |commit: &str| Version {
+            commit: commit.repeat(40),
+            author: "Robin".into(),
+            time: 0,
+            summary: "plant beans".into(),
+            blob: "0".repeat(40),
+            path: std::path::PathBuf::from("garden.txt"),
+        };
+        let versions = [version("a"), version("b"), version("c")];
+        let b = "b".repeat(40);
+        assert_eq!(goto_slot(&versions, &b, false), (1, None));
+        assert_eq!(goto_slot(&versions, "bbbbbbb", true), (1, None));
+        assert_eq!(goto_slot(&versions, "c", false), (2, None));
+        // Cut short before it: the oldest read, and why.
+        assert_eq!(
+            goto_slot(&versions, &"d".repeat(40), true),
+            (
+                0,
+                Some("commit ddddddd is past the loaded history".to_string())
+            )
+        );
+        // Not cut short: the file's history does not have it.
+        assert_eq!(
+            goto_slot(&versions, "dddd", false),
+            (
+                2,
+                Some("commit dddd is not in this file's history".to_string())
+            )
+        );
+        assert_eq!(
+            goto_slot(&versions, "", false).0,
+            2,
+            "nothing matches nothing"
+        );
+    }
 
     #[test]
     fn the_window_is_nearest_first_and_older_first() {

@@ -51,7 +51,18 @@ pub(super) struct Heat {
     /// Bumped when it is turned off, so a blame started before is dropped.
     pub(super) generation: u64,
     pub(super) channel: (mpsc::Sender<HeatBlame>, mpsc::Receiver<HeatBlame>),
+    /// Git's `%G?` for each signed commit whose tooltip has been shown,
+    /// by hash: checked once, on a worker, as it runs the signature's
+    /// checker.
+    pub(super) checks: HashMap<String, char>,
+    /// Signed commits being checked.
+    pub(super) checking: HashSet<String>,
+    pub(super) checked: (mpsc::Sender<HeatCheck>, mpsc::Receiver<HeatCheck>),
 }
+
+/// A signature check that landed: the commit, and Git's `%G?` letter, or
+/// `None` when Git could not say.
+pub(super) type HeatCheck = (String, Option<char>);
 
 /// A blame worked out on a worker: document, generation, the gutter's
 /// epoch and the text it was asked for, and Git's answer.
@@ -71,10 +82,12 @@ pub(super) struct HeatDoc {
     pub(super) epoch: u64,
     /// The text it was blamed for.
     pub(super) text: crate::text::rope::Rope,
-    /// Per commit, how strongly it shows and what its tooltip says,
-    /// worked out once rather than every frame.
+    /// Per commit, how strongly it shows, what its tooltip says and
+    /// whether it is dashed as unsigned, worked out once rather than
+    /// every frame.
     pub(super) alpha: Vec<f32>,
     pub(super) tips: Vec<String>,
+    pub(super) dashed: Vec<bool>,
     /// The text `hide_from` was worked out for.
     pub(super) seen: crate::text::rope::Rope,
     /// The first line edited since the blame: from it down, lines may
@@ -88,34 +101,41 @@ impl HeatDoc {
         epoch: u64,
         text: crate::text::rope::Rope,
         now: i64,
+        checks: &HashMap<String, char>,
     ) -> HeatDoc {
         let alpha = map
             .commits
             .iter()
             .map(|c| layout::heat(now - c.time))
             .collect();
-        let tips = map
+        let dashed = map
             .commits
             .iter()
-            .map(|c| {
-                format!(
-                    "{}  {}  {}\n{}",
-                    c.sha.get(..7).unwrap_or(&c.sha),
-                    c.author,
-                    crate::project::git::ago(c.time, now),
-                    c.summary
-                )
-            })
+            .map(|c| c.signed == Some(false))
             .collect();
-        HeatDoc {
+        let mut doc = HeatDoc {
             map: Arc::new(map),
             epoch,
             seen: text.clone(),
             text,
             alpha,
-            tips,
+            tips: Vec::new(),
+            dashed,
             hide_from: usize::MAX,
-        }
+        };
+        doc.retip(now, checks);
+        doc
+    }
+
+    /// Works the tooltips out again, with what `checks` now says of the
+    /// signatures.
+    pub(super) fn retip(&mut self, now: i64, checks: &HashMap<String, char>) {
+        self.tips = self
+            .map
+            .commits
+            .iter()
+            .map(|c| heat_tip(c, now, checks.get(&c.sha).copied()))
+            .collect();
     }
 
     /// Catches up with `rope`, the document's text now: `true` when it
@@ -134,9 +154,33 @@ impl HeatDoc {
             lines: &self.map.lines,
             alpha: &self.alpha,
             tips: &self.tips,
+            dashed: &self.dashed,
             hide_from: self.hide_from,
         }
     }
+}
+
+/// What the strip says of commit `c`: who, when and what, its signature
+/// as far as `check` (Git's `%G?`, once asked) knows, and where a click
+/// takes it.
+pub(super) fn heat_tip(
+    c: &crate::project::git::CommitInfo,
+    now: i64,
+    check: Option<char>,
+) -> String {
+    let mut tip = format!(
+        "{}  {}  {}\n{}",
+        c.sha.get(..7).unwrap_or(&c.sha),
+        c.author,
+        crate::project::git::ago(c.time, now),
+        c.summary
+    );
+    if let Some(note) = crate::project::git::signature_note(c.signed, check) {
+        tip.push('\n');
+        tip.push_str(note);
+    }
+    tip.push_str("\nCmd-click: open in File History");
+    tip
 }
 
 /// The first line where `b` differs from `a`, or `None` for the same text.
@@ -302,9 +346,39 @@ impl Blame {
 }
 
 impl Heat {
-    /// No document waits for typing to stop or for its blame.
+    /// No document waits for typing to stop or for its blame, and no
+    /// signature is being checked.
     pub(super) fn idle(&self) -> bool {
-        self.dirty.is_empty() && self.pending.is_empty()
+        self.dirty.is_empty() && self.pending.is_empty() && self.checking.is_empty()
+    }
+
+    /// The document and the signed commit the strip's tooltip `tip` is
+    /// for, when that commit's signature has not been checked yet: it is
+    /// marked as being checked. `None` for an unsigned commit, one checked
+    /// or being checked, or a tip that is not the strip's.
+    pub(super) fn check_for_tip(&mut self, tip: &str) -> Option<(u64, String)> {
+        let (id, sha) = self.docs.iter().find_map(|(&id, doc)| {
+            let at = doc.tips.iter().position(|t| t == tip)?;
+            let commit = doc.map.commits.get(at)?;
+            (commit.signed == Some(true)).then(|| (id, commit.sha.clone()))
+        })?;
+        if self.checks.contains_key(&sha) || !self.checking.insert(sha.clone()) {
+            return None;
+        }
+        Some((id, sha))
+    }
+
+    /// Takes a signature check that landed: every strip showing the commit
+    /// says what it found. A check Git could not make counts as one that
+    /// cannot be made here, and is not asked again.
+    pub(super) fn land_check(&mut self, sha: String, check: Option<char>, now: i64) {
+        self.checking.remove(&sha);
+        self.checks.insert(sha.clone(), check.unwrap_or('?'));
+        for doc in self.docs.values_mut() {
+            if doc.map.commits.iter().any(|c| c.sha == sha) {
+                doc.retip(now, &self.checks);
+            }
+        }
     }
 
     /// The blame to draw for `id`, caught up with `rope`, its text now.
@@ -365,7 +439,7 @@ impl Heat {
             self.dirty.insert(id, Instant::now());
             return false;
         }
-        let mut doc = HeatDoc::new(map, epoch, text, now);
+        let mut doc = HeatDoc::new(map, epoch, text, now, &self.checks);
         doc.follow(rope);
         self.docs.insert(id, doc);
         true
@@ -544,25 +618,73 @@ mod tests {
 
     fn blamed(text: &str) -> HeatDoc {
         use crate::project::git::{BlameMap, CommitInfo, NOT_COMMITTED};
-        let commit = |sha: &str, time: i64| CommitInfo {
+        let commit = |sha: &str, time: i64, signed| CommitInfo {
             sha: sha.repeat(40),
             author: "Robin".into(),
             time,
             summary: "plant beans".into(),
+            signed,
         };
         let map = BlameMap {
-            commits: vec![commit("a", 40_000_000 - 3600), commit("b", 0)],
+            commits: vec![
+                commit("a", 40_000_000 - 3600, Some(false)),
+                commit("b", 0, Some(true)),
+                commit("c", 0, None),
+            ],
             lines: vec![0, NOT_COMMITTED, 1, 0],
+            origins: vec![0, 1, 0, 3],
         };
-        HeatDoc::new(map, 0, rope(text), 40_000_000)
+        HeatDoc::new(map, 0, rope(text), 40_000_000, &HashMap::new())
     }
 
     #[test]
     fn a_blame_works_out_each_commits_heat_and_tooltip_once() {
         let doc = blamed("a\nb\nc\nd\n");
-        assert_eq!(doc.alpha, [1.0, 0.0]);
-        assert_eq!(doc.tips[0], "aaaaaaa  Robin  1 hour ago\nplant beans");
+        assert_eq!(doc.alpha, [1.0, 0.0, 0.0]);
+        assert_eq!(
+            doc.tips[0],
+            "aaaaaaa  Robin  1 hour ago\nplant beans\nunsigned\nCmd-click: open in File History"
+        );
+        assert!(doc.tips[1].contains("\nsigned\n"));
+        assert!(
+            !doc.tips[2].contains("signed"),
+            "nothing said when it is not known"
+        );
+        assert_eq!(doc.dashed, [true, false, false]);
+        assert_eq!(doc.strip().dashed, [true, false, false]);
         assert_eq!(doc.hide_from, usize::MAX);
+    }
+
+    #[test]
+    fn a_signed_commit_is_checked_once_when_its_tip_shows() {
+        let mut heat = heat();
+        heat.docs.insert(7, blamed("a\nb\nc\nd\n"));
+        let tips = heat.docs[&7].tips.clone();
+        // Unsigned, unknown, or not the strip's: nothing to check.
+        assert_eq!(heat.check_for_tip(&tips[0]), None);
+        assert_eq!(heat.check_for_tip(&tips[2]), None);
+        assert_eq!(heat.check_for_tip("Refresh"), None);
+        let b = "b".repeat(40);
+        assert_eq!(heat.check_for_tip(&tips[1]), Some((7, b.clone())));
+        assert!(!heat.idle(), "the display link waits for it");
+        assert_eq!(heat.check_for_tip(&tips[1]), None, "asked once");
+        heat.land_check(b.clone(), Some('G'), 40_000_000);
+        assert!(heat.idle());
+        let tip = heat.docs[&7].tips[1].clone();
+        assert!(tip.contains("\nsigned, verified\n"), "{tip}");
+        assert_eq!(heat.check_for_tip(&tip), None, "and not again");
+        // A blame landing later knows it already.
+        let doc = HeatDoc::new(
+            (*heat.docs[&7].map).clone(),
+            0,
+            rope("x\n"),
+            40_000_000,
+            &heat.checks,
+        );
+        assert!(doc.tips[1].contains("signed, verified"));
+        // Git could not say: not unsigned.
+        heat.land_check(b, None, 40_000_000);
+        assert!(heat.docs[&7].tips[1].contains("\nsigned, cannot verify here\n"));
     }
 
     #[test]
@@ -589,6 +711,9 @@ mod tests {
             pending: HashSet::new(),
             generation: 0,
             channel: mpsc::channel(),
+            checks: HashMap::new(),
+            checking: HashSet::new(),
+            checked: mpsc::channel(),
         }
     }
 
@@ -598,6 +723,7 @@ mod tests {
         let map = || crate::project::git::BlameMap {
             commits: Vec::new(),
             lines: vec![crate::project::git::NOT_COMMITTED; 2],
+            origins: vec![0, 1],
         };
         let mut heat = heat();
         heat.pending.insert(1);

@@ -1573,6 +1573,10 @@ pub struct CommitInfo {
     /// Seconds since the epoch.
     pub time: i64,
     pub summary: String,
+    /// Whether the commit object carries a signature (`gpgsig` or
+    /// `gpgsig-sha256`), whoever made it; `None` when that could not be
+    /// read. Says nothing of whether the signature checks out.
+    pub signed: Option<bool>,
 }
 
 /// In [`BlameMap::lines`], a line not committed yet.
@@ -1585,6 +1589,9 @@ pub struct BlameMap {
     pub commits: Vec<CommitInfo>,
     /// Per line, zero-based: an index into `commits`, or [`NOT_COMMITTED`].
     pub lines: Vec<u32>,
+    /// Per line, zero-based: where the line was in the file as its commit
+    /// left it.
+    pub origins: Vec<u32>,
 }
 
 /// Blames every line of `path` as the editor has it: `contents` is the
@@ -1601,7 +1608,105 @@ pub fn blame_file(root: &Path, path: &Path, contents: &str) -> Result<BlameMap, 
     // the editor one more, empty, line, which no commit changed.
     let lines = contents.bytes().filter(|&b| b == b'\n').count() + 1;
     map.lines.truncate(lines);
+    map.origins.truncate(lines);
+    // Which commits are signed: one read of every commit object. Without
+    // it the strip still draws, saying nothing of signatures.
+    if !map.commits.is_empty() {
+        let shas: Vec<&str> = map.commits.iter().map(|c| c.sha.as_str()).collect();
+        if let Ok(signed) = commit_signatures(root, &shas) {
+            for (commit, signed) in map.commits.iter_mut().zip(signed) {
+                commit.signed = signed;
+            }
+        }
+    }
     Ok(map)
+}
+
+/// Whether each of `shas` is a signed commit, read through one
+/// `git cat-file --batch`; `None` for one Git does not have.
+pub fn commit_signatures(root: &Path, shas: &[&str]) -> Result<Vec<Option<bool>>, String> {
+    // Anything but an object id would be read as another request.
+    if shas
+        .iter()
+        .any(|sha| sha.is_empty() || !sha.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return Err("not an object id".into());
+    }
+    let mut input = shas.join("\n");
+    input.push('\n');
+    let output = run_with_stdin(
+        command(root).args(["cat-file", "--batch"]),
+        input.into_bytes(),
+    )?;
+    Ok(parse_signatures(&output, shas.len()))
+}
+
+/// `git cat-file --batch` for `count` commits: per object, whether its
+/// header has a signature. The header is everything before the first
+/// blank line; a `gpgsig` further down, in the message, is not one.
+pub fn parse_signatures(output: &[u8], count: usize) -> Vec<Option<bool>> {
+    let mut out = Vec::with_capacity(count);
+    let mut rest = output;
+    while out.len() < count {
+        let Some(end) = rest.iter().position(|&b| b == b'\n') else {
+            break;
+        };
+        let header = String::from_utf8_lossy(&rest[..end]).into_owned();
+        rest = &rest[end + 1..];
+        let mut words = header.split(' ');
+        let (kind, size) = (
+            words.nth(1),
+            words.next().and_then(|n| n.parse::<usize>().ok()),
+        );
+        let Some(size) = size else {
+            // `<sha> missing`, or worse: nothing to skip.
+            out.push(None);
+            continue;
+        };
+        let Some(body) = rest.get(..size) else {
+            break;
+        };
+        rest = rest.get(size + 1..).unwrap_or(&[]);
+        if kind != Some("commit") {
+            out.push(None);
+            continue;
+        }
+        let signed = body
+            .split(|&b| b == b'\n')
+            .take_while(|line| !line.is_empty())
+            .any(|line| line.starts_with(b"gpgsig ") || line.starts_with(b"gpgsig-sha256 "));
+        out.push(Some(signed));
+    }
+    out.resize(count, None);
+    out
+}
+
+/// Git's `%G?` for `sha`: one letter saying whether its signature checks
+/// out here. Runs the signature's checker, so only on demand.
+pub fn signature_check(root: &Path, sha: &str) -> Result<char, String> {
+    if sha.is_empty() || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("not an object id".into());
+    }
+    let output = run(root, &["log", "-1", "--format=%G?", sha])?;
+    String::from_utf8_lossy(&output)
+        .trim()
+        .chars()
+        .next()
+        .ok_or_else(|| "no answer".into())
+}
+
+/// What a tooltip says of a commit's signature: whether it has one, and
+/// once `check` (Git's `%G?`) is in, whether it holds. A signed commit
+/// that cannot be checked here is never called unsigned.
+pub fn signature_note(signed: Option<bool>, check: Option<char>) -> Option<&'static str> {
+    match (signed, check) {
+        (Some(true), Some('G')) => Some("signed, verified"),
+        (Some(true), Some('B')) => Some("signature bad"),
+        (Some(true), Some(_)) => Some("signed, cannot verify here"),
+        (Some(true), None) => Some("signed"),
+        (Some(false), _) => Some("unsigned"),
+        (None, _) => None,
+    }
 }
 
 /// `git blame --porcelain` for a whole file. A commit's details come with
@@ -1623,8 +1728,9 @@ pub fn parse_blame_file(text: &str) -> BlameMap {
         let first = words.next().unwrap_or("");
         let is_header = first.len() >= 40 && first.bytes().all(|b| b.is_ascii_hexdigit());
         if is_header {
+            let origin = words.next().and_then(|n| n.parse::<u32>().ok());
             let Some(final_line) = words
-                .nth(1)
+                .next()
                 .and_then(|n| n.parse::<usize>().ok())
                 .filter(|n| (1..=most).contains(n))
             else {
@@ -1643,6 +1749,7 @@ pub fn parse_blame_file(text: &str) -> BlameMap {
                         author: String::new(),
                         time: 0,
                         summary: String::new(),
+                        signed: None,
                     });
                 }
                 current = Some(at);
@@ -1650,8 +1757,11 @@ pub fn parse_blame_file(text: &str) -> BlameMap {
             };
             if map.lines.len() < final_line {
                 map.lines.resize(final_line, NOT_COMMITTED);
+                map.origins.resize(final_line, 0);
             }
             map.lines[final_line - 1] = at;
+            map.origins[final_line - 1] =
+                origin.map_or(final_line as u32 - 1, |n| n.saturating_sub(1));
             continue;
         }
         let Some(commit) = current.and_then(|at| map.commits.get_mut(at as usize)) else {
@@ -1922,10 +2032,64 @@ mod tests {
         assert_eq!(map.commits[1].author, "Bo Bloggs");
         assert_eq!(map.commits[1].summary, "second");
         assert_eq!(map.lines, vec![0, 0, NOT_COMMITTED, 1, 0]);
+        assert_eq!(
+            map.origins,
+            vec![0, 1, 2, 2, 3],
+            "where each line came from"
+        );
+        assert!(map.commits.iter().all(|c| c.signed.is_none()));
         // A line number past what the answer holds is not believed.
         let wild = format!("{a} 1 9999999 1\nauthor X\n\tone\n");
         assert!(parse_blame_file(&wild).lines.is_empty());
         assert_eq!(parse_blame_file(""), BlameMap::default());
+    }
+
+    #[test]
+    fn a_signature_is_read_from_the_commit_header_only() {
+        let object = |body: &str| format!("{} commit {}\n{body}\n", "c".repeat(40), body.len());
+        let signed = "tree t\nparent p\nauthor A <a@x> 1 +0000\ncommitter A <a@x> 1 +0000\ngpgsig -----BEGIN SSH SIGNATURE-----\n U1NIU0lH\n -----END SSH SIGNATURE-----\n\nsigned work\n";
+        let sha256 = "tree t\nauthor A <a@x> 1 +0000\ngpgsig-sha256 -----BEGIN PGP SIGNATURE-----\n \n iQ\n -----END PGP SIGNATURE-----\n\nnewer hash\n";
+        // Only in the message: not a signature.
+        let plain = "tree t\nauthor A <a@x> 1 +0000\n\nmention\ngpgsig in the message\n";
+        let output = format!(
+            "{}{}{}{} missing\n{}",
+            object(signed),
+            object(plain),
+            object(sha256),
+            "d".repeat(40),
+            format_args!("{} tree 4\nabcd\n", "e".repeat(40)),
+        );
+        assert_eq!(
+            parse_signatures(output.as_bytes(), 5),
+            vec![Some(true), Some(false), Some(true), None, None]
+        );
+        // Cut short: what is missing is not known.
+        let cut = object(plain);
+        assert_eq!(
+            parse_signatures(&cut.as_bytes()[..cut.len() - 5], 2),
+            vec![None, None]
+        );
+        assert_eq!(parse_signatures(b"", 1), vec![None]);
+    }
+
+    #[test]
+    fn a_signature_check_never_calls_a_signed_commit_unsigned() {
+        assert_eq!(
+            signature_note(Some(true), Some('G')),
+            Some("signed, verified")
+        );
+        assert_eq!(signature_note(Some(true), Some('B')), Some("signature bad"));
+        for code in ['E', 'U', 'X', 'Y', 'R', 'N', '?'] {
+            assert_eq!(
+                signature_note(Some(true), Some(code)),
+                Some("signed, cannot verify here"),
+                "{code}"
+            );
+        }
+        assert_eq!(signature_note(Some(true), None), Some("signed"));
+        assert_eq!(signature_note(Some(false), None), Some("unsigned"));
+        assert_eq!(signature_note(Some(false), Some('N')), Some("unsigned"));
+        assert_eq!(signature_note(None, Some('G')), None);
     }
 
     #[test]
@@ -1974,6 +2138,11 @@ mod tests {
         assert_eq!(summary(2), "add kale");
         assert_eq!(map.commits[map.lines[2] as usize].time, 1_717_200_000);
         assert_eq!(map.commits[0].author, "Robin Example");
+        assert_eq!(map.origins, vec![0, 1, 2]);
+        assert!(
+            map.commits.iter().all(|c| c.signed == Some(false)),
+            "made without signing"
+        );
         assert!(blame_file(&dir, Path::new("missing.txt"), "x\n").is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }

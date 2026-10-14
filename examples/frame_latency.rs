@@ -110,11 +110,13 @@ impl ChromeFrame {
 }
 
 /// `--heat`: the blame heat strip as the window draws it, over a blame
-/// that names one of five commits of every age for each line.
+/// that names one of five commits of every age for each line, the
+/// unsigned ones dashed.
 struct HeatFrame {
     lines: Vec<u32>,
     alpha: Vec<f32>,
     tips: Vec<String>,
+    dashed: Vec<bool>,
 }
 
 impl HeatFrame {
@@ -125,6 +127,7 @@ impl HeatFrame {
             tips: (0..5)
                 .map(|n| format!("{n}abcdef  Robin Example  {n} days ago\nplant beans"))
                 .collect(),
+            dashed: vec![true, false, true, false, true],
         }
     }
 
@@ -150,6 +153,7 @@ impl HeatFrame {
                 lines: &self.lines,
                 alpha: &self.alpha,
                 tips: &self.tips,
+                dashed: &self.dashed,
                 hide_from: usize::MAX,
             },
         );

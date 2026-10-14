@@ -90,7 +90,12 @@ the size and write it back.
   read-only tab beside it: Left and Right step, Home and End go to the
   oldest version and back to your working text, or drag along the
   timeline above it; each step washes in what changed and fades out what
-  went. Escape returns.
+  went. Escape returns. Git > Blame Heat (off by default, `blame_heat` in
+  the settings) draws a thin strip beside the line numbers, strongest for
+  lines changed today and fading out past a year; hover it for the commit,
+  and Cmd-click it (or click where no change mark is) to open File History
+  at that commit. Unsigned commits draw it dashed; a signed commit's
+  signature is checked the first time its tooltip shows.
 - **Completion that learns, in every language**: the best guess appears as
   ghost text at the caret (Tab takes it) and the alternatives as a single
   row of chips under the line, with a line saying why the picked one is
