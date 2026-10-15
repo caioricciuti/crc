@@ -831,6 +831,7 @@ impl EditorView {
                 let issues = crate::platform::inspector::Issues {
                     read: &agents.issues,
                     asked: agents.github_asked(),
+                    loaded: &agents.arrangement.issues,
                     now: crate::platform::unix_seconds(),
                 };
                 agents.inspector.draw(
@@ -841,6 +842,7 @@ impl EditorView {
                     pull_request.as_ref().map(Option::as_ref),
                     github,
                     issues,
+                    &agents.arrangement.folded_repos,
                     &mut renderer.atlas,
                     rect,
                     theme,

@@ -6,7 +6,8 @@
 //! workspace shows every repository in it: the folder itself and its direct
 //! children, each with a strip per worktree of it: where its branch stands
 //! against the base, and buttons to open it or start a shell in it. Under
-//! each repository's card, its open issues on GitHub. The Git status is
+//! each repository's card, its open issues on GitHub, once you load them;
+//! a repository's name row folds its card away. The Git status is
 //! read on a worker; the pull request comes with the workspace list's own
 //! read, the issues with the panel's.
 
@@ -59,6 +60,12 @@ pub enum Action {
     OpenIssue(u64),
     /// Under a repository's issues: all of them, or the first few again.
     ToggleIssues,
+    /// Load Issues, where a repository's issues go until you ask for them.
+    LoadIssues,
+    /// Beside a repository's issues: hidden again, no longer read.
+    HideIssues,
+    /// A repository's name row: its card folded to that row, or opened.
+    FoldRepo,
 }
 
 impl Action {
@@ -79,6 +86,9 @@ impl Action {
             Action::CleanUpWorktree => "worktree_cleanup",
             Action::OpenIssue(_) => "issue_open",
             Action::ToggleIssues => "issues_toggle",
+            Action::LoadIssues => "issues_load",
+            Action::HideIssues => "issues_hide",
+            Action::FoldRepo => "repo_fold",
         }
     }
 }
@@ -89,12 +99,14 @@ const ISSUES_SHOWN: usize = 10;
 const TITLE_ROOM: f32 = 140.0;
 
 /// What the issue lists are drawn from: what was read per repository,
-/// whether `gh` is asked at all (a list not read yet is on its way), and
+/// whether `gh` is asked at all (a list not read yet is on its way), the
+/// repositories whose issues you loaded (the others have Load Issues), and
 /// now, in Unix seconds, for their ages.
 #[derive(Clone, Copy)]
 pub struct Issues<'a> {
     pub read: &'a HashMap<RepoKey, IssueSet>,
     pub asked: bool,
+    pub loaded: &'a HashSet<RepoKey>,
     pub now: u64,
 }
 
@@ -148,6 +160,15 @@ pub struct Inspector {
     /// repositories are not known: set before each draw. Its body says so
     /// instead of waiting.
     pub unreachable: bool,
+    /// Per repository, by host and folder, its branch and uncommitted
+    /// file count when last read: a folded card shows them, unread.
+    known: HashMap<RepoKey, (Option<String>, usize)>,
+    /// Per repository, by host and folder, how many times its status was
+    /// asked for this run, for the self-test.
+    reads: HashMap<RepoKey, usize>,
+    /// The repositories whose cards were folded last frame, for the
+    /// self-test.
+    shown_folded: Vec<PathBuf>,
 }
 
 impl Inspector {
@@ -169,6 +190,14 @@ impl Inspector {
             self.read_for.clear();
             self.read_host.clone_from(&host);
         }
+        for path in &paths {
+            *self.reads.entry((host.clone(), path.clone())).or_default() += 1;
+        }
+        // A card folded or opened keeps the place you scrolled to; another
+        // workspace starts at the top.
+        if !paths.iter().any(|p| self.read_for.contains(p)) {
+            self.scroll = 0.0;
+        }
         let (tx, rx) = mpsc::channel();
         let wanted = wanted.to_vec();
         std::thread::spawn(move || {
@@ -183,9 +212,6 @@ impl Inspector {
                 .collect();
             let _ = tx.send((host, read));
         });
-        if !same {
-            self.scroll = 0.0;
-        }
         self.rx = Some(rx);
         self.reading = Some(key);
     }
@@ -205,6 +231,12 @@ impl Inspector {
                 // A read for a workspace no longer selected still counts:
                 // the next `want` reads the one that is.
                 self.read_for = read.iter().map(|(p, _)| p.clone()).collect();
+                for (path, status) in &read {
+                    if let Ok(s) = status {
+                        self.known
+                            .insert((host.clone(), path.clone()), (s.branch.clone(), s.dirty));
+                    }
+                }
                 self.read_host = host;
                 self.status = read;
                 self.read_at = Some(Instant::now());
@@ -243,7 +275,7 @@ impl Inspector {
         };
         // A worktree strip's button, or an issue row, by its place: `.1`
         // the second.
-        if rest.starts_with("worktree_") || rest.starts_with("issue") {
+        if rest.starts_with("worktree_") || rest.starts_with("issue") || rest.starts_with("repo_") {
             return self
                 .hits
                 .iter()
@@ -290,6 +322,16 @@ impl Inspector {
     /// [`Inspector::report`] for the repositories shown.
     fn report_repos(&self, repos: &[PathBuf]) -> String {
         let one = |path: &Path| {
+            // Folded: how often its status was read this run, which stays
+            // put while it is.
+            if self.shown_folded.iter().any(|p| p == path) {
+                let reads = self
+                    .reads
+                    .get(&(self.read_host.clone(), path.to_path_buf()))
+                    .copied()
+                    .unwrap_or(0);
+                return format!("folded reads={reads}");
+            }
             let status = match self.status_of(path) {
                 None => "reading".to_owned(),
                 Some(Err(e)) => format!("error={e}"),
@@ -320,6 +362,9 @@ impl Inspector {
                             | Action::Refresh
                             | Action::OpenIssue(_)
                             | Action::ToggleIssues
+                            | Action::LoadIssues
+                            | Action::HideIssues
+                            | Action::FoldRepo
                     ) && r.as_deref().is_none_or(|r| r == path)
                 })
                 .map(|(_, a, _)| a.name())
@@ -376,7 +421,8 @@ impl Inspector {
 
     /// `worktrees`: for a folder workspace, the worktrees of its
     /// repositories, each with the name its row has, what it has been
-    /// doing, and whether it is merged.
+    /// doing, and whether it is merged. `folded`: the repositories whose
+    /// cards are folded to their name row.
     #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &mut self,
@@ -387,6 +433,7 @@ impl Inspector {
         pull_request: Option<Option<&PullRequest>>,
         github: bool,
         issues: Issues,
+        folded: &HashSet<RepoKey>,
         atlas: &mut Atlas,
         rect: Viewport,
         theme: &Theme,
@@ -394,6 +441,7 @@ impl Inspector {
     ) {
         self.hits.clear();
         self.shown_issues.clear();
+        self.shown_folded.clear();
         self.shown_remote = remote.map(|r| r.login());
         self.shown_host = workspace
             .filter(|_| remote.is_none())
@@ -445,6 +493,7 @@ impl Inspector {
             pull_request,
             github,
             issues,
+            folded,
             atlas,
             rect,
             top - self.scroll,
@@ -495,6 +544,7 @@ impl Inspector {
         pull_request: Option<Option<&PullRequest>>,
         github: bool,
         issues: Issues,
+        folded: &HashSet<RepoKey>,
         atlas: &mut Atlas,
         rect: Viewport,
         y: f32,
@@ -612,10 +662,7 @@ impl Inspector {
             );
             return;
         }
-        // A folder workspace with repositories in it names each over its
-        // card; a worktree, or a folder that is itself the only one, needs
-        // no name.
-        let named = repos.len() > 1 || repos[0] != workspace.path;
+        let named = names_repos(workspace, repos);
         let mut single = None;
         for (n, repo) in repos.iter().enumerate() {
             if y + ROW > bottom {
@@ -640,9 +687,13 @@ impl Inspector {
                         |n| n.to_string_lossy().into_owned(),
                     ),
                 };
-                let label = fit(atlas, &label, width);
-                layout::push_title(out, atlas, x, y + 4.0, 13.0, &label, theme.text, width);
-                y += ROW;
+                let key = (workspace.host.clone(), repo.clone());
+                let shut = folded.contains(&key);
+                y = self.repo_heading(repo, &key, &label, shut, x, y, width, atlas, theme, out);
+                if shut {
+                    self.shown_folded.push(repo.clone());
+                    continue;
+                }
             }
             match self.status_of(repo) {
                 None => {
@@ -1123,6 +1174,102 @@ impl Inspector {
         y + height + 14.0
     }
 
+    /// A repository's name over its card, a chevron before it: a click
+    /// folds the card to this row or opens it. Folded, the row says the
+    /// branch and, with a dot, uncommitted work, as last read. Returns the
+    /// y under it.
+    #[allow(clippy::too_many_arguments)]
+    fn repo_heading(
+        &mut self,
+        repo: &Path,
+        key: &RepoKey,
+        label: &str,
+        folded: bool,
+        x: f32,
+        y: f32,
+        width: f32,
+        atlas: &mut Atlas,
+        theme: &Theme,
+        out: &mut Vec<GlyphInstance>,
+    ) -> f32 {
+        let row = Viewport {
+            x: x - 4.0,
+            y,
+            width: width + 8.0,
+            height: ROW,
+        };
+        let over = layout::hovered(row);
+        if over {
+            layout::push_rounded_rect(out, row, layout::UI_RADIUS_SM, theme.row_hover);
+        }
+        layout::hotspot(
+            row,
+            layout::Cursor::Pointing,
+            Some(if folded {
+                "Show this repository"
+            } else {
+                "Fold this repository to one row"
+            }),
+        );
+        self.hits
+            .push((row, Action::FoldRepo, Some(repo.to_path_buf())));
+        layout::push_icon_centered(
+            out,
+            atlas,
+            Viewport {
+                x,
+                y: y + 3.0,
+                width: 16.0,
+                height: 20.0,
+            },
+            if folded {
+                icons::CHEVRON_RIGHT
+            } else {
+                icons::CHEVRON_DOWN
+            },
+            if over { theme.text } else { theme.gutter_text },
+        );
+        let left = x + 20.0;
+        let mut room = (width - 20.0).max(0.0);
+        // Folded: the branch at the right, and a dot for uncommitted work,
+        // from the last read; nothing read yet says nothing.
+        let known = if folded { self.known.get(key) } else { None };
+        if let Some((branch, dirty)) = known {
+            let mut right = x + width;
+            if *dirty > 0 {
+                right -= 8.0;
+                layout::push_rounded_rect(
+                    out,
+                    Viewport {
+                        x: right,
+                        y: y + 9.0,
+                        width: 8.0,
+                        height: 8.0,
+                    },
+                    4.0,
+                    theme.diff_modified,
+                );
+                right -= 8.0;
+            }
+            let branch = branch.as_deref().unwrap_or("detached HEAD");
+            let branch = fit(atlas, branch, (room * 0.5).max(0.0));
+            let bw = layout::ui_text_width(atlas, &branch);
+            text(
+                out,
+                atlas,
+                right - bw,
+                y + 3.0,
+                bw + 2.0,
+                &branch,
+                theme.gutter_text,
+            );
+            room = (right - bw - 8.0 - left).max(0.0);
+        }
+        let label = fit(atlas, label, room);
+        layout::push_title(out, atlas, left, y + 4.0, 13.0, &label, theme.text, room);
+        y + if folded { ROW + 4.0 } else { ROW }
+    }
+
     /// Shows all of the issues of the repository `main`, or the first few
     /// again.
     pub fn toggle_issues(&mut self, main: &Path) {
@@ -1158,14 +1305,51 @@ impl Inspector {
         }
         let mut y = y;
         text(out, atlas, x, y, width, "ISSUES", theme.status_text);
-        // The count over a list; none over a note.
+        // Not asked for: a button to, and nothing read.
+        if !issues.loaded.contains(key) {
+            y += ROW;
+            let b = Viewport {
+                x,
+                y,
+                width: 0.0,
+                height: layout::UI_CONTROL_SM,
+            };
+            let button = layout::Button::new(b)
+                .label("Load Issues")
+                .icon(icons::CLOUD_DOWNLOAD)
+                .tip("Read this repository's open issues from GitHub, now and every few minutes");
+            let b = Viewport {
+                width: button.content_width(atlas, 10.0),
+                ..b
+            };
+            layout::Button { rect: b, ..button }.draw(out, atlas, theme);
+            self.hits.push((b, Action::LoadIssues, Some(key.1.clone())));
+            self.shown_issues
+                .push((repo.to_path_buf(), "unloaded".into()));
+            return y + layout::UI_CONTROL_SM + 14.0;
+        }
+        // Hide, at the right; the count over a list beside it, none over a
+        // note.
+        let hide = Viewport {
+            x: x + width - layout::UI_CONTROL_SM,
+            y: y - 1.0,
+            width: layout::UI_CONTROL_SM,
+            height: layout::UI_CONTROL_SM,
+        };
+        layout::Button::new(hide)
+            .icon(icons::CLOSE)
+            .tone(layout::Tone::Ghost)
+            .tip("Hide this repository's issues and stop reading them")
+            .draw(out, atlas, theme);
+        self.hits
+            .push((hide, Action::HideIssues, Some(key.1.clone())));
         if let Some(set) = set.filter(|s| !s.list.is_empty()) {
             let open = format!("{} open", set.count());
             let ow = layout::ui_text_width(atlas, &open);
             text(
                 out,
                 atlas,
-                x + width - ow,
+                hide.x - 6.0 - ow,
                 y,
                 ow + 2.0,
                 &open,
@@ -1596,6 +1780,13 @@ fn note(
     text(out, atlas, x, y + 3.0, width, s, theme.gutter_text);
 }
 
+/// Whether `workspace`'s inspector names each of `repos` over its card,
+/// on a row that folds it: a folder workspace with repositories in it does;
+/// a worktree, or a folder that is itself the only one, needs no name.
+pub fn names_repos(workspace: &Workspace, repos: &[PathBuf]) -> bool {
+    repos.len() > 1 || repos.first().is_some_and(|r| *r != workspace.path)
+}
+
 fn plural(n: usize, word: &str) -> String {
     if n == 1 {
         format!("1 {word}")
@@ -1796,11 +1987,23 @@ mod tests {
     }
 
     /// The inspector of a repository at `/r` on this Mac, its status read,
-    /// drawn with `read` as its issues.
+    /// drawn with `read` as its issues, loaded.
     fn drawn(
         inspector: &mut Inspector,
         read: &HashMap<RepoKey, IssueSet>,
         asked: bool,
+    ) -> Vec<GlyphInstance> {
+        let loaded = HashSet::from([(None, PathBuf::from("/r"))]);
+        drawn_loaded(inspector, read, asked, &loaded)
+    }
+
+    /// [`drawn`], with the repositories in `loaded` the ones whose issues
+    /// were asked for.
+    fn drawn_loaded(
+        inspector: &mut Inspector,
+        read: &HashMap<RepoKey, IssueSet>,
+        asked: bool,
+        loaded: &HashSet<RepoKey>,
     ) -> Vec<GlyphInstance> {
         let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
         let workspace = Workspace {
@@ -1835,9 +2038,11 @@ mod tests {
             Issues {
                 read,
                 asked,
+                loaded,
                 // Twelve days after the issues were opened.
                 now: 1_790_856_000 + 12 * 86_400,
             },
+            &HashSet::new(),
             &mut atlas,
             Viewport {
                 x: 0.0,
@@ -1976,8 +2181,10 @@ mod tests {
             Issues {
                 read: &read,
                 asked: true,
+                loaded: &HashSet::from([(None, PathBuf::from("/main"))]),
                 now: 0,
             },
+            &HashSet::new(),
             &mut atlas,
             Viewport {
                 x: 0.0,
@@ -1997,6 +2204,125 @@ mod tests {
             inspector
                 .report(Some(&[PathBuf::from("/w/feat")]))
                 .ends_with(" issues=1:rows=1")
+        );
+    }
+
+    #[test]
+    fn issues_wait_for_load_issues_and_hide_again() {
+        let key: RepoKey = (None, PathBuf::from("/r"));
+        let read = HashMap::from([(key.clone(), set(vec![issue(1)], None))]);
+        let mut inspector = Inspector::default();
+        // Not loaded: Load Issues and nothing else, even with a list in hand.
+        drawn_loaded(&mut inspector, &HashMap::new(), true, &HashSet::new());
+        assert!(report(&inspector).ends_with(" issues=unloaded"));
+        assert!(rows(&inspector).is_empty());
+        let load = inspector.named("inspector.issues_load").unwrap();
+        assert_eq!(
+            inspector.hit(load.x + 1.0, load.y + 1.0),
+            Some((Action::LoadIssues, Some(PathBuf::from("/r"))))
+        );
+        assert!(inspector.named("inspector.issues_hide").is_none());
+        // `gh` not asked: no button either.
+        drawn_loaded(&mut inspector, &HashMap::new(), false, &HashSet::new());
+        assert!(inspector.named("inspector.issues_load").is_none());
+        // Loaded: the list, and the control that hides it again.
+        drawn_loaded(&mut inspector, &read, true, &HashSet::from([key]));
+        assert!(report(&inspector).ends_with(" issues=1:rows=1"));
+        assert!(inspector.named("inspector.issues_load").is_none());
+        let hide = inspector.named("inspector.issues_hide").unwrap();
+        assert_eq!(
+            inspector.hit(hide.x + 1.0, hide.y + 1.0),
+            Some((Action::HideIssues, Some(PathBuf::from("/r"))))
+        );
+        // Neither is one of the card's buttons.
+        assert!(!report(&inspector).contains("issues_"));
+    }
+
+    #[test]
+    fn a_folded_repository_is_one_row_from_its_last_read() {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let workspace = Workspace {
+            name: "desk".into(),
+            path: PathBuf::from("/desk"),
+            branch: None,
+            main: false,
+            folder: true,
+            key: "ws:1".into(),
+            repo: None,
+            base: None,
+            commit: None,
+            merged: false,
+            host: None,
+            github: None,
+        };
+        let repos = [PathBuf::from("/desk/alpha"), PathBuf::from("/desk/beta")];
+        let mut inspector = Inspector::default();
+        let (tx, rx) = mpsc::channel();
+        let dirty = Status {
+            branch: Some("seedlings".into()),
+            dirty: 2,
+            ..Default::default()
+        };
+        tx.send((
+            None,
+            vec![
+                (repos[0].clone(), Ok(dirty)),
+                (repos[1].clone(), Ok(Status::default())),
+            ],
+        ))
+        .unwrap();
+        inspector.rx = Some(rx);
+        assert!(inspector.poll());
+        let mut draw = |inspector: &mut Inspector, folded: &HashSet<RepoKey>| {
+            inspector.draw(
+                Some(&workspace),
+                Some(&repos),
+                &[],
+                None,
+                None,
+                true,
+                Issues {
+                    read: &HashMap::new(),
+                    asked: true,
+                    loaded: &HashSet::new(),
+                    now: 0,
+                },
+                folded,
+                &mut atlas,
+                Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: WIDTH,
+                    height: 4000.0,
+                },
+                &Theme::dark(),
+                &mut Vec::new(),
+            );
+        };
+        draw(&mut inspector, &HashSet::new());
+        let open_load = inspector.named("inspector.issues_load.1").unwrap();
+        // Alpha folded: its name row alone, beta's card under it moves up.
+        let folded = HashSet::from([(None, repos[0].clone())]);
+        // Its read from before stays; the reads it gets stop.
+        inspector.status.retain(|(p, _)| *p != repos[0]);
+        draw(&mut inspector, &folded);
+        let said = inspector.report(Some(&repos));
+        assert!(
+            said.starts_with("alpha: folded reads=0 | beta: branch="),
+            "{said}"
+        );
+        let fold = inspector.named("inspector.repo_fold.0").unwrap();
+        assert_eq!(
+            inspector.hit(fold.x + 1.0, fold.y + 1.0),
+            Some((Action::FoldRepo, Some(repos[0].clone())))
+        );
+        // One Load Issues now, beta's, higher than it was.
+        assert!(inspector.named("inspector.issues_load.1").is_none());
+        let load = inspector.named("inspector.issues_load").unwrap();
+        assert!(load.y < open_load.y);
+        assert_eq!(
+            inspector.known.get(&(None, repos[0].clone())),
+            Some(&(Some("seedlings".to_owned()), 2))
         );
     }
 

@@ -29,16 +29,43 @@ impl EditorView {
             return;
         };
         let (action, repo) = action;
-        // An issue row, and Show all: in the repository (a main checkout)
-        // on the host of the workspace shown.
-        if let (Action::OpenIssue(_) | Action::ToggleIssues, Some(main)) = (action, &repo) {
+        // An issue row, Show all, Load Issues and its hide, and a
+        // repository's fold: in the repository (for the issues a main
+        // checkout) on the host of the workspace shown.
+        if let (
+            Action::OpenIssue(_)
+            | Action::ToggleIssues
+            | Action::LoadIssues
+            | Action::HideIssues
+            | Action::FoldRepo,
+            Some(main),
+        ) = (action, &repo)
+        {
+            let host = self.state().and_then(|state| {
+                let i = state.agents.selected_index()?;
+                state.agents.tasks[i].host.clone()
+            });
+            let key = (host, main.clone());
             match action {
-                Action::OpenIssue(number) => {
-                    let host = self.state().and_then(|state| {
-                        let i = state.agents.selected_index()?;
-                        state.agents.tasks[i].host.clone()
-                    });
-                    self.open_issue((host, main.clone()), number);
+                Action::OpenIssue(number) => self.open_issue(key, number),
+                Action::LoadIssues => {
+                    if let Some(mut state) = self.state_mut() {
+                        state.agents.load_issues(key);
+                    }
+                    self.resume_display_link();
+                }
+                Action::HideIssues => {
+                    if let Some(mut state) = self.state_mut() {
+                        state.agents.hide_issues(&key);
+                    }
+                }
+                // Opened, it is read again now; folded, it is left out.
+                Action::FoldRepo => {
+                    if let Some(mut state) = self.state_mut() {
+                        state.agents.toggle_repo_folded(key);
+                    }
+                    self.want_inspector();
+                    self.resume_display_link();
                 }
                 _ => {
                     if let Some(mut state) = self.state_mut() {
@@ -101,7 +128,10 @@ impl EditorView {
             | Action::ReviewWorktree
             | Action::CleanUpWorktree
             | Action::OpenIssue(_)
-            | Action::ToggleIssues => {}
+            | Action::ToggleIssues
+            | Action::LoadIssues
+            | Action::HideIssues
+            | Action::FoldRepo => {}
         }
         self.request_redraw();
         self.pump();
@@ -131,7 +161,8 @@ impl EditorView {
 
     /// Reads the selected workspace's status for the inspector, when it is
     /// showing and the one in hand is old or another workspace's, and its
-    /// issues when they are due.
+    /// loaded issues when they are due. A folded repository's card, and
+    /// its worktrees' strips, are not read.
     pub(super) fn want_inspector(&self) {
         let Some(mut state) = self.state_mut() else {
             return;
@@ -149,7 +180,7 @@ impl EditorView {
         else {
             return;
         };
-        let Some(repos) = state.agents.repos_of(&task) else {
+        let Some(repos) = state.agents.read_repos_of(&task) else {
             return;
         };
         // A worktree is compared with its main checkout's branch; a folder's
@@ -240,7 +271,8 @@ impl EditorView {
 
     /// The periodic read while Agents mode is on: worktrees and the
     /// inspector's status every minute, when nothing else is reading them;
-    /// the pull requests that are due, and the selected workspace's issues.
+    /// the pull requests that are due, and, with the inspector showing,
+    /// the selected workspace's loaded issues.
     pub(super) fn agents_tick(&self) {
         let on = {
             let Some(mut state) = self.state_mut() else {
@@ -256,7 +288,9 @@ impl EditorView {
             }
             if state.agents.on {
                 state.agents.refresh_pull_requests();
-                state.agents.refresh_issues();
+                if !state.agents.inspector.hidden {
+                    state.agents.refresh_issues();
+                }
             }
             state.agents.on
         };

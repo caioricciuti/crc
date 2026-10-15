@@ -924,9 +924,7 @@ impl EditorView {
         if let Some(mut state) = self.state_mut() {
             state.agents.refresh();
             state.agents.refresh_all_pull_requests();
-            for repo in state.agents.selected_repos() {
-                state.agents.want_issues_now(repo);
-            }
+            state.agents.want_issues_now();
         }
         self.resume_display_link();
     }

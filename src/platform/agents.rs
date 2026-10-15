@@ -521,12 +521,20 @@ pub struct Arrangement {
     /// Folder workspaces whose merged worktrees are shown; folded is the
     /// default.
     pub merged_open: std::collections::HashSet<String>,
+    /// Repositories whose GitHub issues the inspector reads: only those
+    /// you asked for.
+    pub issues: std::collections::HashSet<RepoKey>,
+    /// Repositories whose inspector card is folded to its name row.
+    pub folded_repos: std::collections::HashSet<RepoKey>,
 }
 
 impl Arrangement {
     /// One per line: the flags (`pin`, `fold`, `merged`, comma-separated)
     /// or `-`, a tab, the id, a tab, the name (maybe empty). A file from
-    /// before folding has `pin` or `-` alone.
+    /// before folding has `pin` or `-` alone. A repository's line has no id:
+    /// its flags (`issues`, `fold`), two tabs, its host (empty for this
+    /// Mac's), a tab and its main checkout; a build from before them skips
+    /// it.
     pub fn parse(text: &str) -> Arrangement {
         let mut out = Arrangement::default();
         for line in text.lines() {
@@ -535,6 +543,7 @@ impl Arrangement {
                 continue;
             };
             if id.is_empty() {
+                out.parse_repo(flag, parts.next().unwrap_or(""));
                 continue;
             }
             out.order.push(id.to_owned());
@@ -559,7 +568,44 @@ impl Arrangement {
         out
     }
 
+    /// A repository's line after its flags and the empty id: `host\tpath`.
+    fn parse_repo(&mut self, flags: &str, rest: &str) {
+        let Some((host, path)) = rest.split_once('\t').filter(|(_, p)| !p.is_empty()) else {
+            return;
+        };
+        let key: RepoKey = (
+            Some(host.to_owned()).filter(|h| !h.is_empty()),
+            PathBuf::from(path),
+        );
+        for flag in flags.split(',') {
+            match flag {
+                "issues" => {
+                    self.issues.insert(key.clone());
+                }
+                "fold" => {
+                    self.folded_repos.insert(key.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+
     pub fn text(&self) -> String {
+        let mut repos: Vec<&RepoKey> = self.issues.union(&self.folded_repos).collect();
+        repos.sort();
+        let repos = repos.into_iter().map(|key| {
+            let flags: Vec<&str> = [(&self.issues, "issues"), (&self.folded_repos, "fold")]
+                .into_iter()
+                .filter(|(set, _)| set.contains(key))
+                .map(|(_, flag)| flag)
+                .collect();
+            format!(
+                "{}\t\t{}\t{}\n",
+                flags.join(","),
+                key.0.as_deref().unwrap_or(""),
+                key.1.display()
+            )
+        });
         self.order
             .iter()
             .map(|id| {
@@ -582,6 +628,7 @@ impl Arrangement {
                     self.titles.get(id).map_or("", String::as_str)
                 )
             })
+            .chain(repos)
             .collect()
     }
 
@@ -1621,10 +1668,22 @@ impl Panel {
         }
     }
 
-    /// The selected workspace's repositories whose issues are due at
-    /// `now`: never read, or read [`ISSUES_EVERY`] ago.
-    fn issues_due(&self, now: std::time::Instant) -> Vec<RepoKey> {
+    /// The selected workspace's repositories whose issues are read: those
+    /// you loaded, their cards not folded.
+    fn selected_issue_repos(&self) -> Vec<RepoKey> {
+        let selected = self.selected_index().map(|i| &self.tasks[i]);
         self.selected_repos()
+            .into_iter()
+            .filter(|repo| self.issues_loaded(repo))
+            .filter(|repo| selected.is_none_or(|w| !self.folded_in(w, &repo.1)))
+            .collect()
+    }
+
+    /// The selected workspace's repositories whose issues are due at
+    /// `now`: loaded, not folded, and never read or read [`ISSUES_EVERY`]
+    /// ago.
+    fn issues_due(&self, now: std::time::Instant) -> Vec<RepoKey> {
+        self.selected_issue_repos()
             .into_iter()
             .filter(|repo| {
                 self.issues
@@ -1632,6 +1691,65 @@ impl Panel {
                     .is_none_or(|set| now.saturating_duration_since(set.read_at) >= ISSUES_EVERY)
             })
             .collect()
+    }
+
+    /// Whether you asked for the issues of `repo`: until then `gh` is not
+    /// asked about them.
+    pub fn issues_loaded(&self, repo: &RepoKey) -> bool {
+        self.arrangement.issues.contains(repo)
+    }
+
+    /// Load Issues: the issues of `repo` are read now, and from now on.
+    pub fn load_issues(&mut self, repo: RepoKey) {
+        if self.arrangement.issues.insert(repo.clone()) {
+            self.save_arrangement();
+        }
+        self.read_issues(vec![repo]);
+    }
+
+    /// The issues of `repo` hidden again: no longer read, and what was read
+    /// dropped.
+    pub fn hide_issues(&mut self, repo: &RepoKey) {
+        if self.arrangement.issues.remove(repo) {
+            self.save_arrangement();
+        }
+        self.issues.remove(repo);
+        self.issues_wanted.retain(|r| r != repo);
+    }
+
+    /// Whether the inspector card of `repo` is folded to its name row: its
+    /// status and issues are not read while it is.
+    pub fn repo_folded(&self, repo: &RepoKey) -> bool {
+        self.arrangement.folded_repos.contains(repo)
+    }
+
+    /// Whether `repo`'s card is folded in `workspace`'s inspector: only a
+    /// card with a name row folds, so a worktree, or a folder that is
+    /// itself the one repository, always shows.
+    fn folded_in(&self, workspace: &Workspace, repo: &Path) -> bool {
+        self.repos_of(workspace)
+            .is_some_and(|repos| crate::platform::inspector::names_repos(workspace, &repos))
+            && self.repo_folded(&(workspace.host.clone(), repo.to_path_buf()))
+    }
+
+    /// The repositories of `workspace` whose status the inspector reads:
+    /// those of [`Panel::repos_of`] whose card is not folded.
+    pub fn read_repos_of(&self, workspace: &Workspace) -> Option<Vec<PathBuf>> {
+        let repos = self.repos_of(workspace)?;
+        Some(
+            repos
+                .into_iter()
+                .filter(|repo| !self.folded_in(workspace, repo))
+                .collect(),
+        )
+    }
+
+    /// Folds the inspector card of `repo`, or opens it.
+    pub fn toggle_repo_folded(&mut self, repo: RepoKey) {
+        if !self.arrangement.folded_repos.remove(&repo) {
+            self.arrangement.folded_repos.insert(repo);
+        }
+        self.save_arrangement();
     }
 
     /// Reads the issues of the selected workspace's repositories that are
@@ -1645,10 +1763,11 @@ impl Panel {
         self.read_issues(due);
     }
 
-    /// Reads the issues of `repo` now, due or not: on selecting it, or
+    /// Reads the selected workspace's loaded issues now, due or not: on
     /// Refresh.
-    pub fn want_issues_now(&mut self, repo: RepoKey) {
-        self.read_issues(vec![repo]);
+    pub fn want_issues_now(&mut self) {
+        let repos = self.selected_issue_repos();
+        self.read_issues(repos);
     }
 
     /// Asks `gh` for the open issues of `repos`, one after another on a
@@ -1727,6 +1846,8 @@ impl Panel {
         let mut changed = false;
         while let Some(rx) = &self.issues_rx {
             match rx.try_recv() {
+                // Hidden while `gh` was asked: dropped.
+                Ok((repo, _)) if !self.issues_loaded(&repo) => {}
                 Ok((repo, answer)) => changed |= self.take_issues(repo, answer),
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -4207,6 +4328,7 @@ mod tests {
     #[test]
     fn issues_are_read_every_five_minutes_for_the_selected_workspace_only() {
         let mut panel = nested();
+        panel.arrangement.issues = [here("/r"), here("/o")].into();
         assert!(panel.selected_repos().is_empty());
         assert!(panel.issues_due(std::time::Instant::now()).is_empty());
         // A folder workspace: the repositories found in it.
@@ -4230,6 +4352,94 @@ mod tests {
         // A folder with no repository in it reads nothing.
         panel.selected = Some("folder:notes".into());
         assert!(panel.issues_due(at + ISSUES_EVERY).is_empty());
+    }
+
+    #[test]
+    fn issues_are_read_only_once_you_load_them() {
+        let mut panel = nested();
+        // No `gh` here: Load Issues marks the repository, nothing runs.
+        panel.github = Some(false);
+        panel.selected = Some("folder:garden-log".into());
+        let now = std::time::Instant::now();
+        // Not asked for: never due, however long it waits.
+        assert_eq!(panel.selected_repos(), vec![here("/r")]);
+        assert!(panel.issues_due(now).is_empty());
+        assert!(panel.issues_due(now + ISSUES_EVERY * 3).is_empty());
+        assert!(panel.selected_issue_repos().is_empty());
+        // Loaded: due now, for its worktrees too, and kept.
+        panel.load_issues(here("/r"));
+        assert!(panel.issues_loaded(&here("/r")));
+        assert_eq!(panel.issues_due(now), vec![here("/r")]);
+        panel.selected = Some("/w/a".into());
+        assert_eq!(panel.issues_due(now), vec![here("/r")]);
+        // Hidden again: what was read goes, and nothing is due.
+        panel.take_issues(here("/r"), Ok((vec![issue(1)], false)));
+        panel.issues_wanted = vec![here("/r")];
+        panel.hide_issues(&here("/r"));
+        assert!(panel.issues_of(&here("/r")).is_none());
+        assert!(panel.issues_wanted.is_empty());
+        assert!(panel.issues_due(now + ISSUES_EVERY).is_empty());
+    }
+
+    #[test]
+    fn a_folded_repository_is_not_read() {
+        let mut panel = nested();
+        panel.repos.insert(
+            "folder:garden-log".into(),
+            vec![PathBuf::from("/r"), PathBuf::from("/r/seeds")],
+        );
+        panel.arrangement.issues = [here("/r"), here("/r/seeds")].into();
+        panel.selected = Some("folder:garden-log".into());
+        let garden = panel.tasks[panel.by_id("folder:garden-log").unwrap()].clone();
+        let now = std::time::Instant::now();
+        assert_eq!(panel.issues_due(now), vec![here("/r"), here("/r/seeds")]);
+        panel.toggle_repo_folded(here("/r/seeds"));
+        assert!(panel.repo_folded(&here("/r/seeds")));
+        // Folded: no status read, no issues read.
+        assert_eq!(
+            panel.read_repos_of(&garden),
+            Some(vec![PathBuf::from("/r")])
+        );
+        assert_eq!(panel.issues_due(now), vec![here("/r")]);
+        // A folded main checkout still shows in its worktree's inspector,
+        // which has no name row to fold.
+        panel.toggle_repo_folded(here("/r"));
+        assert_eq!(panel.read_repos_of(&garden), Some(Vec::new()));
+        assert!(panel.issues_due(now).is_empty());
+        let a = panel.tasks[panel.by_id("/w/a").unwrap()].clone();
+        assert_eq!(panel.read_repos_of(&a), Some(vec![PathBuf::from("/w/a")]));
+        panel.selected = Some("/w/a".into());
+        assert_eq!(panel.issues_due(now), vec![here("/r")]);
+        // Opened again: read again.
+        panel.toggle_repo_folded(here("/r/seeds"));
+        assert_eq!(
+            panel.read_repos_of(&garden),
+            Some(vec![PathBuf::from("/r/seeds")])
+        );
+    }
+
+    #[test]
+    fn loaded_issues_and_folded_cards_survive_the_arrangement_file() {
+        let mut a = Arrangement {
+            order: vec!["ws:1".into()],
+            ..Arrangement::default()
+        };
+        a.pinned.insert("ws:1".into());
+        let host = (Some("box".to_owned()), PathBuf::from("/srv/app"));
+        a.issues = [here("/r"), host.clone()].into();
+        a.folded_repos = [here("/r/seeds"), host.clone()].into();
+        let text = a.text();
+        assert_eq!(
+            text,
+            "pin\tws:1\t\nissues\t\t\t/r\nfold\t\t\t/r/seeds\nissues,fold\t\tbox\t/srv/app\n"
+        );
+        assert_eq!(Arrangement::parse(&text), a);
+        // A build from before them reads past the repositories' lines: no
+        // id, so no workspace.
+        assert_eq!(Arrangement::parse(&text).order, ["ws:1"]);
+        // A file from before them has none.
+        let old = Arrangement::parse("pin\tws:1\t\n");
+        assert!(old.issues.is_empty() && old.folded_repos.is_empty());
     }
 
     #[test]

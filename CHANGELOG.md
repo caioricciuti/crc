@@ -4,6 +4,17 @@ One entry per tag, written for people who use the editor.
 
 ## Unreleased
 
+- Agents mode: the inspector no longer reads a repository's GitHub
+  issues until you ask. Each repository card has Load Issues where its
+  issues were; once clicked they are read then and every five minutes,
+  and crc remembers it for that repository. The button beside the list
+  hides it again and stops the reads. Issues are also no longer read
+  while the inspector is hidden.
+- Agents mode: in a folder of several repositories, a click on a
+  repository's name in the inspector folds its card to one row with its
+  branch and a dot for uncommitted work, as last read. A folded
+  repository's Git status is not read until you open it again, and the
+  fold is kept across launches.
 - Agents mode no longer lags with several repositories and their issues
   in the inspector. Cutting a long issue title to fit measured it once
   per character and overflowed the text cache, which then emptied

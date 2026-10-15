@@ -191,3 +191,44 @@ expect "$T/inspector-many.out" inspector "alpha: branch=main base=- ahead=0 behi
     || failed "inspector: Commit All in beta did not commit there: $(testgit "$M/beta" log -1 --format=%s)"
 [ "$(testgit "$M/alpha" log -1 --format=%s)" = one ] \
     || failed "inspector: Commit All in beta committed in alpha"
+
+# ---- A repository's card folds to its name row ----------------------------
+# A click on alpha's name folds its card: no status read for it from then
+# on, Refresh included, and the next launch remembers it. A click opens it
+# again, and it is read.
+cat > "$T/inspector-fold.script" <<SCRIPT
+wait 500
+key 0 cmd,shift A
+wait 700
+wait 700
+click @inspector.repo_fold
+wait 500
+dump $T/inspector-folded.out
+quit
+SCRIPT
+HOME="$T/home/inspector-many" CRC_TERMINAL_SHELL=/bin/sh CRC_SELFTEST="$T/inspector-fold.script" \
+    "$BIN" "$M" 2> "$T/inspector-fold.err"
+inspector_beta="beta: branch=main base=- ahead=0 behind=0 upstream=- push=0 pull=0 dirty=0 changes=+0-0 tag=- buttons=push"
+expect_prefix "$T/inspector-folded.out" inspector "alpha: folded reads="
+case "$(grep -m1 '^inspector: ' "$T/inspector-folded.out")" in
+*" | $inspector_beta") ;;
+*) failed "inspector: beta is not read beside folded alpha: $(grep -m1 '^inspector: ' "$T/inspector-folded.out")" ;;
+esac
+cat > "$T/inspector-fold-kept.script" <<SCRIPT
+wait 500
+key 0 cmd,shift A
+wait 700
+click @inspector.refresh
+wait 700
+wait 700
+dump $T/inspector-fold-kept.out
+click @inspector.repo_fold
+wait 700
+wait 700
+dump $T/inspector-unfolded.out
+quit
+SCRIPT
+HOME="$T/home/inspector-many" CRC_TERMINAL_SHELL=/bin/sh CRC_SELFTEST="$T/inspector-fold-kept.script" \
+    "$BIN" "$M" 2> "$T/inspector-fold-kept.err"
+expect "$T/inspector-fold-kept.out" inspector "alpha: folded reads=0 | $inspector_beta"
+expect "$T/inspector-unfolded.out" inspector "alpha: branch=main base=- ahead=0 behind=0 upstream=- push=0 pull=0 dirty=0 changes=+0-0 tag=- buttons=push | $inspector_beta"

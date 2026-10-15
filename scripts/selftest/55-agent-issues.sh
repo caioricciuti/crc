@@ -4,14 +4,17 @@
 # ---- A repository's open issues in the workspace inspector -----------------
 # A stand-in `gh` on PATH answers `gh issue list` from a state file the
 # script rewrites; it knows no pull requests. A test instance asks `gh` only
-# with CRC_SELFTEST_GH set. The list comes slowly the first time (the
+# with CRC_SELFTEST_GH set. Until Load Issues is clicked `gh` is not asked
+# about issues at all. The list comes slowly the first time (the
 # inspector shows skeletons), then twelve issues: ten show, Show all shows
 # twelve, and a click on one asks `gh` for it whole: it opens in a read-only
 # tab with Start Task and Open on GitHub above it. Start Task makes the
 # issue's worktree and starts a stand-in Claude there, told only the 0600
 # file the issue is written to; again, it goes back to that worktree. Back
-# in Agents, Refresh reads again: no issues, then `gh` not signed in.
-# SELFTEST_FRAMES, when set, is a folder to keep the frames in.
+# in Agents, Refresh reads again: no issues, then `gh` not signed in; the
+# hide control beside them puts Load Issues back, and a new launch
+# remembers it. SELFTEST_FRAMES, when set, is a folder to keep the frames
+# in.
 ID="$T/issuedesk"
 IR="$ID/garden-log"
 mkdir -p "$IR" "$T/issuebin" "$T/home/issuedesk"
@@ -70,11 +73,16 @@ sleep 30
 AGENT
 chmod +x "$T/issue-agent.sh"
 : > "$T/issue-agent.log"
-printf 'SLOW\n' > "$T/issue-state"
+printf 'UNASKED\n' > "$T/issue-state"
 : > "$T/issue-gh.log"
 cat > "$T/issue.script" <<SCRIPT
 wait 500
 key 0 cmd,shift A
+idle 1500
+frame $T/issue-unloaded.bmp
+dump $T/issue-unloaded.out
+write $T/issue-state SLOW
+click @inspector.issues_load
 idle 1500
 frame $T/issue-loading.bmp
 dump $T/issue-loading.out
@@ -112,6 +120,13 @@ click @inspector.refresh
 idle 1500
 frame $T/issue-auth.bmp
 dump $T/issue-auth.out
+write $T/issue-state HIDDEN
+click @inspector.issues_hide
+idle 300
+dump $T/issue-hidden.out
+click @inspector.refresh
+idle 1500
+dump $T/issue-hidden-refresh.out
 quit
 SCRIPT
 HOME="$T/home/issuedesk" PATH="$T/issuebin:$PATH" ISSUE_GH_STATE="$T/issue-state" \
@@ -127,6 +142,10 @@ expect_issues() {
     got=$(issues_of "$1")
     [ "$got" = "$2" ] || failed "agent-issues $(basename "$1"): issues=[$got], expected [$2]: $(grep -m1 '^inspector: ' "$1")"
 }
+# Before Load Issues: the button, and not one `gh issue list`.
+expect_issues "$T/issue-unloaded.out" unloaded
+! grep -q '^UNASKED issue list' "$T/issue-gh.log" \
+    || failed "agent-issues: gh listed issues before Load Issues: $(cat "$T/issue-gh.log")"
 expect_issues "$T/issue-loading.out" loading
 expect_issues "$T/issue-list.out" "12:rows=10"
 expect_issues "$T/issue-all.out" "12:rows=12"
@@ -176,6 +195,38 @@ grep -q "^agents: on .*selected=$issue_branch" "$T/issue-again.out" \
     || failed "agent-issues: the task is not selected again: $(grep -m1 '^agents: ' "$T/issue-again.out")"
 expect_issues "$T/issue-none.out" 0
 expect_issues "$T/issue-auth.out" auth
-[ -z "${SELFTEST_FRAMES:-}" ] || cp -f "$T/issue-loading.bmp" "$T/issue-list.bmp" \
-    "$T/issue-all.bmp" "$T/issue-tab.bmp" "$T/issue-none.bmp" "$T/issue-auth.bmp" \
-    "$SELFTEST_FRAMES/"
+# Hidden again: Load Issues, and Refresh does not ask `gh` for them.
+expect_issues "$T/issue-hidden.out" unloaded
+expect_issues "$T/issue-hidden-refresh.out" unloaded
+! grep -q '^HIDDEN issue list' "$T/issue-gh.log" \
+    || failed "agent-issues: gh listed hidden issues: $(cat "$T/issue-gh.log")"
+# Both are remembered: a new launch has Load Issues again, and once it is
+# clicked, the launch after that reads them without a click.
+printf 'TWELVE\n' > "$T/issue-state"
+cat > "$T/issue-relaunch.script" <<SCRIPT
+wait 500
+key 0 cmd,shift A
+idle 1500
+dump $T/issue-relaunch.out
+click @inspector.issues_load
+idle 300
+quit
+SCRIPT
+HOME="$T/home/issuedesk" PATH="$T/issuebin:$PATH" ISSUE_GH_STATE="$T/issue-state" \
+    ISSUE_GH_LOG="$T/issue-gh.log" CRC_SELFTEST_GH=1 CRC_TERMINAL_SHELL=/bin/sh \
+    CRC_SELFTEST="$T/issue-relaunch.script" "$BIN" "$IR" 2> "$T/issue-relaunch.err"
+expect_issues "$T/issue-relaunch.out" unloaded
+cat > "$T/issue-kept.script" <<SCRIPT
+wait 500
+key 0 cmd,shift A
+idle 2000
+dump $T/issue-kept.out
+quit
+SCRIPT
+HOME="$T/home/issuedesk" PATH="$T/issuebin:$PATH" ISSUE_GH_STATE="$T/issue-state" \
+    ISSUE_GH_LOG="$T/issue-gh.log" CRC_SELFTEST_GH=1 CRC_TERMINAL_SHELL=/bin/sh \
+    CRC_SELFTEST="$T/issue-kept.script" "$BIN" "$IR" 2> "$T/issue-kept.err"
+expect_issues "$T/issue-kept.out" "12:rows=10"
+[ -z "${SELFTEST_FRAMES:-}" ] || cp -f "$T/issue-unloaded.bmp" "$T/issue-loading.bmp" \
+    "$T/issue-list.bmp" "$T/issue-all.bmp" "$T/issue-tab.bmp" "$T/issue-none.bmp" \
+    "$T/issue-auth.bmp" "$SELFTEST_FRAMES/"

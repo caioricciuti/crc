@@ -293,6 +293,7 @@ impl Scene {
         let issues = Issues {
             read: &agents.issues,
             asked: self.issues,
+            loaded: &agents.arrangement.issues,
             now: NOW,
         };
         agents.inspector.draw(
@@ -303,6 +304,7 @@ impl Scene {
             None,
             self.issues,
             issues,
+            &agents.arrangement.folded_repos,
             &mut renderer.atlas,
             self.inspector,
             &self.theme,
@@ -436,6 +438,8 @@ fn main() {
         for (n, repo) in repos.iter().enumerate() {
             let name = repo_name(n);
             let key: RepoKey = (None, repo.clone());
+            // Asked for, so they draw as a list, not Load Issues.
+            panel.arrangement.issues.insert(key.clone());
             let set = IssueSet {
                 list: (1..=15).map(|i| issue(&name, i)).collect(),
                 capped: false,

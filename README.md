@@ -181,10 +181,15 @@ the size and write it back.
   installed it shows the branch's pull request (title, author, commits,
   lines, each check) and opens one, or merges it on GitHub: squash,
   merge commit or rebase, chosen each time and confirmed. Under each
-  card of a repository on GitHub are its open issues (the newest ten,
-  Show all for the rest), read with `gh` every five minutes. Click one
-  to read it in a tab; Start Task there makes an `issue-N-title`
-  worktree and starts Claude in it on that issue. The same
+  card of a repository on GitHub, Load Issues shows its open issues
+  (the newest ten, Show all for the rest), read with `gh` then and
+  every five minutes after; the choice is kept per repository, and the
+  button beside them hides them again. Click one to read it in a tab;
+  Start Task there makes an `issue-N-title` worktree and starts Claude
+  in it on that issue. In a folder of several repositories, a click on
+  a repository's name folds its card to one row (its branch, and a dot
+  for uncommitted work, as last read); a folded card is not read until
+  you open it again, and stays folded across launches. The same
   operations are on a workspace's right-click menu, with opening it in
   the editor, merging its branch into the main checkout, removing it
   (refused while it has uncommitted changes), and renaming or forgetting
