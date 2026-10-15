@@ -80,6 +80,17 @@ pub fn commit_type_suggestion(message: &str, cursor: usize) -> Option<&'static s
         .map(|kind| &kind[message.len()..])
 }
 
+/// The subject line length the message field counts against.
+pub const SUBJECT_LIMIT: usize = 50;
+
+/// The length of the message's subject, its first line, in characters.
+pub fn subject_len(message: &str) -> usize {
+    message
+        .lines()
+        .next()
+        .map_or(0, |line| line.chars().count())
+}
+
 /// An operation on the worker.
 struct InFlight {
     rx: Receiver<Result<Reply, String>>,
@@ -1239,9 +1250,18 @@ impl Panel {
         );
         layout::hotspot(g.message, layout::Cursor::Text, None);
         let full = self.message.rope.to_string();
+        // The subject's length, right-aligned in the field once there is
+        // a message; the text clips short of it.
+        let counter = (!full.is_empty()).then(|| {
+            let length = subject_len(&full);
+            let label = format!("{length}/{SUBJECT_LIMIT}");
+            let width = layout::ui_text_width(atlas, &label).ceil();
+            (length, label, width)
+        });
+        let counter_room = counter.as_ref().map_or(0.0, |(_, _, width)| width + 6.0);
         let text_rect = Viewport {
             x: g.message.x + MESSAGE_PAD,
-            width: (g.message.width - MESSAGE_PAD * 2.0).max(0.0),
+            width: (g.message.width - MESSAGE_PAD * 2.0 - counter_room).max(0.0),
             ..g.message
         };
         let band = ((g.message.height - 18.0) * 0.5).floor();
@@ -1278,6 +1298,30 @@ impl Panel {
                 },
                 rest,
                 theme.status_text,
+            );
+        }
+        if let Some((length, label, width)) = &counter {
+            let rect = Viewport {
+                x: g.message.x + g.message.width - MESSAGE_PAD - width,
+                width: *width,
+                ..g.message
+            };
+            let over = *length > SUBJECT_LIMIT;
+            layout::push_ui_text(
+                out,
+                atlas,
+                rect,
+                label,
+                if over {
+                    theme.diff_modified
+                } else {
+                    theme.status_text
+                },
+            );
+            layout::hotspot(
+                rect,
+                layout::Cursor::Arrow,
+                Some("Subject lines read best at 50 characters or fewer"),
             );
         }
 
@@ -2035,6 +2079,21 @@ mod tests {
         assert_eq!(commit_type_suggestion("fe", 99), None);
         assert_eq!(at_end("feat: x\nfe"), None);
         assert_eq!(at_end("\nfe"), None);
+    }
+
+    #[test]
+    fn the_subject_length_counts_characters_of_the_first_line() {
+        assert_eq!(subject_len(""), 0);
+        assert_eq!(subject_len("fix: typo"), 9);
+        // One each, not their UTF-8 bytes.
+        assert_eq!(subject_len("caf\u{e9}"), 4);
+        assert_eq!(subject_len("ship it \u{1f680}"), 9);
+        assert_eq!(
+            subject_len("feat: x\n\nA body line that is much longer."),
+            7
+        );
+        assert_eq!(subject_len("\nbody"), 0);
+        assert_eq!(subject_len("a\r\nb"), 1);
     }
 
     #[test]
