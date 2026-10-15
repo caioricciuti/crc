@@ -5818,6 +5818,8 @@ impl EditorView {
 /// Holds the view so the delegate can route opened documents to it.
 pub struct DelegateIvars {
     view: Retained<EditorView>,
+    /// Agents mode once launching is done, unless a document opens first.
+    agents_at_launch: Cell<bool>,
 }
 
 define_class!(
@@ -5838,6 +5840,8 @@ define_class!(
         /// but silently ignore the file it was asked to open.
         #[unsafe(method(application:openFile:))]
         fn open_file(&self, _app: &NSApplication, filename: &NSString) -> bool {
+            // A launch to open a document shows it in the editor.
+            self.ivars().agents_at_launch.set(false);
             let view = &self.ivars().view;
             let opened = view.load_path(&filename.to_string());
             if let Some(mut state) = view.state_mut()
@@ -5852,6 +5856,18 @@ define_class!(
             view.request_redraw();
             view.pump();
             opened
+        }
+
+        /// A plain launch opens on Agents mode, as the switch does. Called
+        /// after `application:openFile:` for a document the app was
+        /// launched to open, which keeps the editor.
+        #[unsafe(method(applicationDidFinishLaunching:))]
+        fn did_finish_launching(&self, _notification: &NSNotification) {
+            if self.ivars().agents_at_launch.take() {
+                let view = &self.ivars().view;
+                view.set_agents_mode(true);
+                view.request_redraw();
+            }
         }
 
         /// One window, and closing it means you are done.
@@ -7455,6 +7471,14 @@ fn with_recent(
     }
     recent.truncate(crate::platform::session::RECENT_LIMIT);
     recent
+}
+
+/// Whether the window opens on Agents mode rather than the editor. A plain
+/// launch does; one given a file or folder opens the editor on it, and so
+/// does one that brought back unsaved work from a crash, so it is in view.
+/// A test instance keeps the editor its scenarios expect unless it asks.
+fn launches_in_agents(target: bool, recovered: bool, testing: bool, test_asks: bool) -> bool {
+    !target && !recovered && (!testing || test_asks)
 }
 
 /// Asks whether to bring back documents written out by the panic hook.
@@ -9195,10 +9219,12 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
     }
 
     // Work that outlived a crash, offered back before anything else happens.
+    let mut recovered = false;
     if let Some(dir) = recovery::default_dir() {
         let mut found = recovery::pending(&dir);
         if !found.documents.is_empty() {
             if ask_to_restore(mtm, &found.documents) {
+                recovered = true;
                 for document in std::mem::take(&mut found.documents) {
                     docs.restore(Buffer::recovered(
                         document.path,
@@ -9445,7 +9471,16 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
     // The delegate must outlive this function; NSApplication only holds a
     // weak reference to it, so it is leaked deliberately rather than dropped
     // at the end of `run` while AppKit still calls into it.
-    let delegate = AppDelegate::alloc(mtm).set_ivars(DelegateIvars { view: view.clone() });
+    let agents_at_launch = launches_in_agents(
+        launched_with_target,
+        recovered,
+        std::env::var_os("CRC_SELFTEST").is_some(),
+        std::env::var_os("CRC_SELFTEST_PLAIN_LAUNCH").is_some(),
+    );
+    let delegate = AppDelegate::alloc(mtm).set_ivars(DelegateIvars {
+        view: view.clone(),
+        agents_at_launch: Cell::new(agents_at_launch),
+    });
     let delegate: Retained<AppDelegate> = unsafe { msg_send![super(delegate), init] };
     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
     std::mem::forget(delegate);
@@ -9534,6 +9569,21 @@ mod tests {
         spawn_project_refresh, typed_text,
     };
     use std::time::Duration;
+
+    #[test]
+    fn a_plain_launch_opens_on_agents() {
+        use super::launches_in_agents;
+        // Nothing named: Agents.
+        assert!(launches_in_agents(false, false, false, false));
+        // A file or folder named: the editor on it.
+        assert!(!launches_in_agents(true, false, false, false));
+        // Unsaved work brought back from a crash: the editor, showing it.
+        assert!(!launches_in_agents(false, true, false, false));
+        // A test instance only when its scenario asks.
+        assert!(!launches_in_agents(false, false, true, false));
+        assert!(launches_in_agents(false, false, true, true));
+        assert!(!launches_in_agents(true, false, true, true));
+    }
 
     #[test]
     fn one_line_fields_share_the_editing_keys() {

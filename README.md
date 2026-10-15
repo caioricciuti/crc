@@ -130,7 +130,8 @@ the size and write it back.
   `~/Library/Application Support/crc/sessions/` for 14 days, and Claude's
   questions mark its tab. `agent_review = false` turns them off.
 - **Agents mode** (`Cmd-Shift-A`, or the Editor / Agents switch in the
-  toolbar): the terminal takes the editor column, the activity bar goes,
+  toolbar; crc opens on it unless launched on a file or folder): the
+  terminal takes the editor column, the activity bar goes,
   and the sidebar lists workspaces, one row each: its name, and under it
   what a session waiting on you asks, what a working agent says, or its
   terminals and branch; at the right how many wait on you and its pull

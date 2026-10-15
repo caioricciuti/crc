@@ -4,6 +4,8 @@ One entry per tag, written for people who use the editor.
 
 ## Unreleased
 
+- crc opens on Agents mode, with a shell ready in the selected
+  workspace. Opening a file or folder with it still opens the editor.
 - Source Control: the commit message completes conventional-commit
   types. Type the start of one (`fe`, `re`) and the rest shows dimmed
   after the caret; Tab takes it. Where several types match, the more
