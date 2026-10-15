@@ -352,6 +352,36 @@ impl Session {
         })
     }
 
+    /// A session with no program behind it, for the benchmarks: output
+    /// comes in through [`Session::feed`], input goes nowhere, and dropping
+    /// it ends nothing.
+    #[doc(hidden)]
+    pub fn offline(cols: usize, rows: usize) -> std::io::Result<Session> {
+        let (socket, _) = UnixStream::pair()?;
+        Ok(Session {
+            term: Arc::new(Mutex::new(Term::new(cols, rows))),
+            input: std::sync::mpsc::channel::<Vec<u8>>().0,
+            control: Control::Held {
+                socket: Arc::new(Mutex::new(socket)),
+                detached: true,
+            },
+            status: Arc::new(Status::default()),
+        })
+    }
+
+    /// Output, as the reader thread takes it from the program: the screen
+    /// advanced and a wake-up queued. Returns whether the reader would have
+    /// woken the window (none was queued yet).
+    #[doc(hidden)]
+    pub fn feed(&self, bytes: &[u8]) -> bool {
+        {
+            let mut term = self.term.lock().unwrap_or_else(|e| e.into_inner());
+            term.advance(bytes);
+            term.take_replies();
+        }
+        self.status.queue_wake()
+    }
+
     /// Sends input, as typed or pasted, through the writer thread.
     pub fn write(&mut self, bytes: &[u8]) {
         let _ = self.input.send(bytes.to_vec());

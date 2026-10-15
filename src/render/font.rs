@@ -649,6 +649,9 @@ pub struct Atlas {
     font: CFRetained<CTFont>,
     ui_font: CFRetained<CTFont>,
     ui_lines: RecentCache<String>,
+    /// UI labels shaped because `ui_lines` did not have them, for
+    /// the benchmarks.
+    ui_shaped: u64,
     /// Proportional faces for the Markdown view, built on first use and kept
     /// for the life of the atlas. A preview drawn in one monospace weight
     /// cannot show a heading as a heading or bold as bold; it reads as a
@@ -759,6 +762,7 @@ impl Atlas {
                 )
             },
             ui_lines: RecentCache::new(512),
+            ui_shaped: 0,
             prose_fonts: HashMap::new(),
             code_faces: HashMap::new(),
             face_slots: HashMap::new(),
@@ -1104,6 +1108,7 @@ impl Atlas {
         if let Some(line) = self.ui_lines.get(text, self.frame) {
             return Some(line);
         }
+        self.ui_shaped += 1;
         let line = Rc::new(shape(
             &self.ui_font,
             text,
@@ -1115,6 +1120,13 @@ impl Atlas {
         self.ui_lines
             .insert(text.to_owned(), line.clone(), self.frame);
         Some(line)
+    }
+
+    /// How many UI labels have been shaped, not found in the cache, since
+    /// the atlas was built.
+    #[doc(hidden)]
+    pub fn ui_shapes(&self) -> u64 {
+        self.ui_shaped
     }
 
     /// Rasterize only glyphs the layout actually emits. Shaping a long line
