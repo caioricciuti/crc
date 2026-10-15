@@ -58,6 +58,28 @@ struct Reply {
 /// The commit message's text inset inside its box, for drawing and clicks.
 pub const MESSAGE_PAD: f32 = 9.0;
 
+/// Conventional-commit types the message field completes, most used first:
+/// a prefix several of them share completes to the earliest.
+pub const COMMIT_TYPES: [&str; 11] = [
+    "feat", "fix", "chore", "docs", "refactor", "perf", "test", "build", "ci", "style", "revert",
+];
+
+/// The rest of the commit type `message` starts to spell, offered while the
+/// caret sits at the end of a lowercase word on the first line. Nothing once
+/// a scope, a colon, a `!` or a space follows, or the word is a whole type.
+pub fn commit_type_suggestion(message: &str, cursor: usize) -> Option<&'static str> {
+    if cursor != message.len()
+        || message.is_empty()
+        || !message.bytes().all(|b| b.is_ascii_lowercase())
+    {
+        return None;
+    }
+    COMMIT_TYPES
+        .iter()
+        .find(|kind| kind.len() > message.len() && kind.starts_with(message))
+        .map(|kind| &kind[message.len()..])
+}
+
 /// An operation on the worker.
 struct InFlight {
     rx: Receiver<Result<Reply, String>>,
@@ -727,6 +749,14 @@ impl Panel {
         (self.can_act_on_hunk(index) && Self::hunk_action_rect(row_rect).contains(x, y))
             .then_some(index)
     }
+    /// The commit type completion for the message as it stands, if any; a
+    /// selection would be replaced by typing, so it offers none.
+    pub fn commit_type_hint(&self) -> Option<&'static str> {
+        if self.message.selection().is_some() {
+            return None;
+        }
+        commit_type_suggestion(&self.message.rope.to_string(), self.message.cursor())
+    }
     pub fn commit(&mut self) {
         let message = self.message.rope.to_string();
         // A second click while the first commit runs is the same commit.
@@ -1233,6 +1263,23 @@ impl Panel {
             },
             theme,
         );
+        // The rest of a commit type being typed, dimmed after the caret;
+        // Tab takes it.
+        if focused && let Some(rest) = self.commit_type_hint() {
+            let (shown, start) = layout::ui_input_window(&full, self.message.cursor());
+            let caret = layout::ui_caret_x(atlas, &shown, self.message.cursor() - start);
+            layout::push_ui_text(
+                out,
+                atlas,
+                Viewport {
+                    x: text_rect.x + caret,
+                    width: (text_rect.width - caret).max(0.0),
+                    ..text_rect
+                },
+                rest,
+                theme.status_text,
+            );
+        }
 
         // The button says what it will commit. "Commit" alone next to a list
         // that mixes staged and unstaged files does not.
@@ -1965,6 +2012,29 @@ mod tests {
         assert_eq!(headline(said), "Could not read from remote repository.");
         assert_eq!(headline("nothing to commit"), "Nothing to commit");
         assert_eq!(headline(""), "");
+    }
+
+    #[test]
+    fn the_message_completes_a_commit_type() {
+        let at_end = |text: &str| commit_type_suggestion(text, text.len());
+        assert_eq!(at_end("fe"), Some("at"));
+        // Several types match: the first in the list wins.
+        assert_eq!(at_end("re"), Some("factor"));
+        assert_eq!(at_end("c"), Some("hore"));
+        assert_eq!(at_end("feat"), None);
+        assert_eq!(at_end("ci"), None);
+        assert_eq!(at_end("feat:"), None);
+        assert_eq!(at_end("fix("), None);
+        assert_eq!(at_end("fix!"), None);
+        assert_eq!(at_end("fe "), None);
+        assert_eq!(at_end("Fe"), None);
+        assert_eq!(at_end("FE"), None);
+        assert_eq!(at_end("xyz"), None);
+        assert_eq!(at_end(""), None);
+        assert_eq!(commit_type_suggestion("fe", 1), None);
+        assert_eq!(commit_type_suggestion("fe", 99), None);
+        assert_eq!(at_end("feat: x\nfe"), None);
+        assert_eq!(at_end("\nfe"), None);
     }
 
     #[test]

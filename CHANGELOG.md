@@ -4,6 +4,10 @@ One entry per tag, written for people who use the editor.
 
 ## Unreleased
 
+- Source Control: the commit message completes conventional-commit
+  types. Type the start of one (`fe`, `re`) and the rest shows dimmed
+  after the caret; Tab takes it. Where several types match, the more
+  common one is offered (`re` gives `refactor`).
 - Terminal: a program can copy to the clipboard through OSC 52. Since
   programs that ask for the mouse get it, a drag in Claude Code selects
   its text and copies it this way, and crc dropped the copy, so the paste

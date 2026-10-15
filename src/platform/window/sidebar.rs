@@ -341,7 +341,18 @@ impl EditorView {
             return false;
         };
         match event.keyCode() {
-            key::RETURN | key::TAB => return true,
+            // Tab takes a commit type the field is offering, typed in as
+            // if by hand; without one it does nothing.
+            key::TAB => {
+                let hint = state.git.commit_type_hint();
+                drop(state);
+                if let Some(rest) = hint {
+                    self.commit_text(rest, NSRange::new(NSNotFound as usize, 0));
+                    self.resume_display_link();
+                }
+                return true;
+            }
+            key::RETURN => return true,
             code if field_key(&mut state.git.message, code, flags) => {}
             _ => {
                 drop(state);
