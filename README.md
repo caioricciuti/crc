@@ -265,7 +265,8 @@ the size and write it back.
   bar saying what it asked, until you type into it; Home lists the
   waiting ones first.
 - **Local Git** (`Cmd-Option-G`): branch and status, changed files, staged
-  and working-tree diffs, whole-file and hunk stage/unstage, Stage All and
+  and working-tree diffs, whole-file, hunk and line stage/unstage (Space in
+  the diff stages the hunk under the cursor or the selected lines), Stage All and
   Unstage All per section, commit, amending the last commit while it is
   not yet pushed, and a right-click menu on every change.
   Git runs on workers and reads saved disk state; hooks and signing stay
@@ -327,7 +328,7 @@ the size and write it back.
   file's commits; there is no log of the whole repository or commit
   graph, and no merge or
   rebase of your own branches from the menus (start one in the terminal;
-  crc resolves, aborts and continues it). Hunk staging covers tracked text
+  crc resolves, aborts and continues it). Hunk and line staging cover tracked text
   changes; other change types use whole-file actions. Gutter marks compare
   with HEAD, not the index. Conflict markers must be Git's default seven
   characters.

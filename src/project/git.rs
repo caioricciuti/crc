@@ -1054,6 +1054,139 @@ pub fn stage_hunk(root: &Path, change: &Change, hunk: &Hunk) -> Result<(), Strin
     apply_index_patch(root, &patch, hunk.staged, false)
 }
 
+/// Applies chosen lines of hunks of one file to the index, as `git add -p`
+/// does with an edited hunk: each hunk as the preview showed it, and the
+/// indexes of the chosen lines among the lines under its header. Staging
+/// drops the additions not chosen and keeps the removals not chosen as
+/// context; unstaging (the hunks are staged ones) does the opposite. Every
+/// hunk is checked against a fresh diff first, as [`stage_hunk`] does, and
+/// the worktree is never changed.
+pub fn stage_hunk_lines(
+    root: &Path,
+    change: &Change,
+    picks: &[(Hunk, Vec<usize>)],
+) -> Result<(), String> {
+    let staged = picks.first().ok_or("No lines are selected")?.0.staged;
+    if picks.iter().any(|(hunk, _)| hunk.staged != staged) {
+        return Err("Select lines from the staged or the unstaged change, not both".into());
+    }
+    if !can_stage_hunk(change, staged) {
+        return Err("Hunk action supports tracked text modifications only".into());
+    }
+    let mut cmd = diff_command(root, &change.path, staged);
+    let (bytes, truncated) = diff_output_bytes(&mut cmd, false)?;
+    if truncated {
+        return Err("Diff is too large for a safe hunk action".into());
+    }
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| "Hunk action requires a UTF-8 text diff".to_string())?;
+    let (header, hunks) = split_text_patch(text)?;
+    let mut sorted: Vec<&(Hunk, Vec<usize>)> = picks.iter().collect();
+    sorted.sort_by_key(|(hunk, _)| hunk.ordinal);
+    sorted.dedup_by_key(|(hunk, _)| hunk.ordinal);
+    let mut patch = header.to_owned();
+    let mut chosen = false;
+    for (hunk, selected) in sorted {
+        let fresh = hunks
+            .get(hunk.ordinal)
+            .ok_or("This hunk changed; refresh Source Control")?;
+        if *fresh != hunk.raw {
+            return Err("This hunk changed; refresh Source Control".into());
+        }
+        let (part, any) = partial_hunk(fresh, selected, staged)?;
+        if any {
+            patch.push_str(&part);
+            chosen = true;
+        }
+    }
+    if !chosen {
+        return Err("No added or removed line is selected".into());
+    }
+    apply_index_patch(root, patch.as_bytes(), staged, true)?;
+    apply_index_patch(root, patch.as_bytes(), staged, false)
+}
+
+/// One hunk cut down to the `selected` lines (indexes among the lines under
+/// its header), with its header counted again, and whether any added or
+/// removed line is left. `reverse` is for a patch applied backwards, to
+/// unstage: there the additions not chosen stay as context instead of the
+/// removals. A `\ No newline at end of file` goes with the line before it.
+fn partial_hunk(raw: &str, selected: &[usize], reverse: bool) -> Result<(String, bool), String> {
+    const STALE: &str = "This hunk changed; refresh Source Control";
+    let mut lines = raw.split_inclusive('\n');
+    let header = lines.next().ok_or(STALE)?;
+    let counts = header.strip_prefix("@@ -").ok_or(STALE)?;
+    let (counts, caption) = counts.split_once(" @@").ok_or(STALE)?;
+    let (old, new) = counts.split_once(" +").ok_or(STALE)?;
+    let old_start = old.split(',').next().unwrap_or(old);
+    let new_start = new.split(',').next().unwrap_or(new);
+    let mut selected = selected.to_vec();
+    selected.sort_unstable();
+    let mut body = String::new();
+    let (mut old_len, mut new_len) = (0usize, 0usize);
+    let mut any = false;
+    // The prefix of the line last written, and whether a `\` line said
+    // it ends its side without a newline: then only an addition may follow
+    // a removal, and nothing may follow anything else.
+    let mut last = None;
+    let mut ended = false;
+    for (index, line) in lines.enumerate() {
+        let first = line.as_bytes().first().copied();
+        if first == Some(b'\\') {
+            // With the line before it, written or dropped.
+            if last.is_some() {
+                body.push_str(line);
+                ended = true;
+            }
+            continue;
+        }
+        let chosen = selected.binary_search(&index).is_ok();
+        let prefix = match first {
+            Some(b'+' | b'-') if chosen => first,
+            // Not chosen: the side the patch starts from keeps the line.
+            Some(b'+') if reverse => Some(b' '),
+            Some(b'-') if !reverse => Some(b' '),
+            Some(b'+' | b'-') => None,
+            _ => Some(b' '),
+        };
+        let Some(prefix) = prefix else {
+            last = None;
+            continue;
+        };
+        if ended && !(last == Some(b'-') && prefix == b'+') {
+            return Err(
+                "These lines cannot be split from the end of the file; stage the whole hunk".into(),
+            );
+        }
+        ended = false;
+        match prefix {
+            b'+' => new_len += 1,
+            b'-' => old_len += 1,
+            _ => {
+                old_len += 1;
+                new_len += 1;
+            }
+        }
+        any |= prefix != b' ';
+        if first == Some(prefix) {
+            body.push_str(line);
+        } else {
+            // A changed line kept as context, or one written without its
+            // space by something that stripped it.
+            body.push(' ');
+            body.push_str(
+                line.get(usize::from(matches!(first, Some(b'+' | b'-')))..)
+                    .unwrap_or(""),
+            );
+        }
+        last = Some(prefix);
+    }
+    Ok((
+        format!("@@ -{old_start},{old_len} +{new_start},{new_len} @@{caption}{body}"),
+        any,
+    ))
+}
+
 /// Lines of context around a change staged from the editor, as `git diff`
 /// writes them.
 const TEXT_HUNK_CONTEXT: usize = 3;
@@ -2896,6 +3029,137 @@ mod tests {
         stage_hunk(&root, &change, &preview.hunks[0]).unwrap();
         assert!(run(&root, &["diff"]).unwrap().is_empty());
         assert_eq!(std::fs::read(&path).unwrap(), b"alpha\nchanged");
+    }
+
+    /// The lines under a hunk's header in the preview, by their text with
+    /// the `+`, `-` or space it starts with.
+    fn pick(diff: &Diff, hunk: usize, wanted: &[&str]) -> (Hunk, Vec<usize>) {
+        let hunk = diff.hunks[hunk].clone();
+        let lines = hunk
+            .raw
+            .split_inclusive('\n')
+            .skip(1)
+            .enumerate()
+            .filter(|(_, line)| wanted.contains(&line.trim_end_matches(['\n', '\r'])))
+            .map(|(index, _)| index)
+            .collect();
+        (hunk, lines)
+    }
+
+    #[test]
+    fn stages_selected_lines_of_one_hunk() {
+        let (repo, root) = committed("line-pick", "garden.txt", "beans\npeas\nmint\n");
+        let path = root.join("garden.txt");
+        std::fs::write(&path, "beans\ncarrots\npeas\nleeks\nchard\n").unwrap();
+        let change = snapshot(&root).unwrap().changes.remove(0);
+        let preview = Diff::parse(&diff(&root, &change).unwrap());
+        assert_eq!(preview.hunks.len(), 1);
+        stage_hunk_lines(
+            &root,
+            &change,
+            &[pick(&preview, 0, &["+carrots", "+chard"])],
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(run(&root, &["show", ":garden.txt"]).unwrap()).unwrap(),
+            "beans\ncarrots\npeas\nmint\nchard\n"
+        );
+        let staged = cached(&root);
+        assert!(staged.contains("+carrots") && staged.contains("+chard"));
+        assert!(!staged.contains("leeks") && !staged.contains("-mint"));
+        let working = String::from_utf8(run(&root, &["diff"]).unwrap()).unwrap();
+        assert!(working.contains("+leeks") && working.contains("-mint"));
+        assert!(!working.contains("+carrots") && !working.contains("+chard"));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "beans\ncarrots\npeas\nleeks\nchard\n"
+        );
+
+        // One line back out of the index.
+        let change = snapshot(&root).unwrap().changes.remove(0);
+        let preview = Diff::parse(&diff(&root, &change).unwrap());
+        let index = preview.hunks.iter().position(|h| h.staged).unwrap();
+        stage_hunk_lines(&root, &change, &[pick(&preview, index, &["+carrots"])]).unwrap();
+        assert_eq!(
+            String::from_utf8(run(&root, &["show", ":garden.txt"]).unwrap()).unwrap(),
+            "beans\npeas\nmint\nchard\n"
+        );
+
+        // A removal on its own, and nothing chosen is refused.
+        let change = snapshot(&root).unwrap().changes.remove(0);
+        let preview = Diff::parse(&diff(&root, &change).unwrap());
+        let index = preview.hunks.iter().position(|h| !h.staged).unwrap();
+        stage_hunk_lines(&root, &change, &[pick(&preview, index, &["-mint"])]).unwrap();
+        assert_eq!(
+            String::from_utf8(run(&root, &["show", ":garden.txt"]).unwrap()).unwrap(),
+            "beans\npeas\nchard\n"
+        );
+        let change = snapshot(&root).unwrap().changes.remove(0);
+        let preview = Diff::parse(&diff(&root, &change).unwrap());
+        let index = preview.hunks.iter().position(|h| !h.staged).unwrap();
+        assert!(stage_hunk_lines(&root, &change, &[pick(&preview, index, &[" peas"])]).is_err());
+        drop(repo);
+    }
+
+    #[test]
+    fn selected_lines_of_a_stale_hunk_stage_nothing() {
+        let (_repo, root) = committed("line-stale", "garden.txt", "beans\npeas\n");
+        let path = root.join("garden.txt");
+        std::fs::write(&path, "beans\ncarrots\npeas\n").unwrap();
+        let change = snapshot(&root).unwrap().changes.remove(0);
+        let preview = Diff::parse(&diff(&root, &change).unwrap());
+        std::fs::write(&path, "beans\nradish\npeas\n").unwrap();
+        assert!(stage_hunk_lines(&root, &change, &[pick(&preview, 0, &["+carrots"])]).is_err());
+        assert!(cached(&root).is_empty());
+    }
+
+    #[test]
+    fn selected_lines_keep_crlf_bytes() {
+        let (_repo, root) = committed("line-crlf", "crlf.txt", "one\r\ntwo\r\n");
+        run(&root, &["config", "core.autocrlf", "false"]).unwrap();
+        let path = root.join("crlf.txt");
+        std::fs::write(&path, "one\r\nleft\r\ntwo\r\nright\r\n").unwrap();
+        let change = snapshot(&root).unwrap().changes.remove(0);
+        let preview = Diff::parse(&diff(&root, &change).unwrap());
+        stage_hunk_lines(&root, &change, &[pick(&preview, 0, &["+right"])]).unwrap();
+        assert_eq!(
+            run(&root, &["show", ":crlf.txt"]).unwrap(),
+            b"one\r\ntwo\r\nright\r\n"
+        );
+    }
+
+    #[test]
+    fn selected_lines_keep_missing_final_newline() {
+        let (_repo, root) = committed("line-eof", "eof.txt", "alpha\nbeta\n");
+        let path = root.join("eof.txt");
+        std::fs::write(&path, "alpha\nbeta\ngamma\ndelta").unwrap();
+        let change = snapshot(&root).unwrap().changes.remove(0);
+        let preview = Diff::parse(&diff(&root, &change).unwrap());
+        stage_hunk_lines(&root, &change, &[pick(&preview, 0, &["+delta"])]).unwrap();
+        assert_eq!(
+            run(&root, &["show", ":eof.txt"]).unwrap(),
+            b"alpha\nbeta\ndelta"
+        );
+        // The other way round: the line without a newline stays behind.
+        run(&root, &["reset", "--quiet"]).unwrap();
+        let change = snapshot(&root).unwrap().changes.remove(0);
+        let preview = Diff::parse(&diff(&root, &change).unwrap());
+        stage_hunk_lines(&root, &change, &[pick(&preview, 0, &["+gamma"])]).unwrap();
+        assert_eq!(
+            run(&root, &["show", ":eof.txt"]).unwrap(),
+            b"alpha\nbeta\ngamma\n"
+        );
+
+        // A last line without a newline cannot be kept as context with
+        // lines after it: refused, nothing staged.
+        let (_repo, root) = committed("line-eof-old", "eof.txt", "alpha\nbeta");
+        std::fs::write(root.join("eof.txt"), "alpha\nbeta\ngamma\n").unwrap();
+        let change = snapshot(&root).unwrap().changes.remove(0);
+        let preview = Diff::parse(&diff(&root, &change).unwrap());
+        assert!(stage_hunk_lines(&root, &change, &[pick(&preview, 0, &["+gamma"])]).is_err());
+        assert!(cached(&root).is_empty());
+        stage_hunk_lines(&root, &change, &[pick(&preview, 0, &["-beta", "+beta"])]).unwrap();
+        assert_eq!(run(&root, &["show", ":eof.txt"]).unwrap(), b"alpha\nbeta\n");
     }
 
     /// A repository with `file` committed as `head`, and its root.

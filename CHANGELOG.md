@@ -4,6 +4,14 @@ One entry per tag, written for people who use the editor.
 
 ## Unreleased
 
+- Source Control: the diff has a cursor. Click a line, or move with Up
+  and Down; shift-click, Shift-Up or Shift-Down or a drag selects lines.
+  Space stages the selected added and removed lines, or the whole hunk
+  when the cursor is on its header or no changed line is selected. In the
+  staged part of the diff Space unstages them. Lines not chosen stay as
+  they were, and the cursor stays where you were. A selection that would
+  cut a file's last line from its missing final newline is refused; stage
+  that hunk whole.
 - Agents mode runs far less Git when left alone. The inspector reads
   its status once a minute instead of every twenty seconds, and sooner
   when a file it shows changes, its repository's refs move, or you

@@ -244,6 +244,7 @@ pub fn draw_review(
         review.scroll,
         "No change: the proposal matches the file",
         &|_| None,
+        None,
         atlas,
         rect,
         theme,

@@ -446,7 +446,7 @@ impl EditorView {
                     )
                     .is_some();
                 let report = format!(
-                    "git_open: {}\ngit_focus: {}\ngit_diff: {}\ngit_pending: {}\ngit_changes: {}\ngit_staged: {}\ngit_hunks_staged: {}\ngit_hunks_working: {}\ngit_message: {}\ngit_subject_len: {}\ngit_amend: {}\nproject_menu_requested: {}\ncrumb_menu: {}\nlast_click_ms: {:.3}\nfinder_entries: {}\nsidebar_edit: {}\npalette_query: {}\npalette_first: {}\npalette_scroll: {}\npanes: {}\nfocused_pane: {}\nlsp: {}\ndiagnostics: {}\ncompletion: {}\nkey_handler_draws: {}\nwindow_title: {}\nshaping_pending: {}\ncaret_shaped: {}\nclaude: {}\nterminal: {}\n{}",
+                    "git_open: {}\ngit_focus: {}\ngit_diff: {}\ngit_pending: {}\ngit_changes: {}\ngit_staged: {}\ngit_hunks_staged: {}\ngit_hunks_working: {}\ngit_message: {}\ngit_subject_len: {}\ngit_amend: {}\ngit_diff_selection: {}\nproject_menu_requested: {}\ncrumb_menu: {}\nlast_click_ms: {:.3}\nfinder_entries: {}\nsidebar_edit: {}\npalette_query: {}\npalette_first: {}\npalette_scroll: {}\npanes: {}\nfocused_pane: {}\nlsp: {}\ndiagnostics: {}\ncompletion: {}\nkey_handler_draws: {}\nwindow_title: {}\nshaping_pending: {}\ncaret_shaped: {}\nclaude: {}\nterminal: {}\n{}",
                     state.git_open,
                     state.git_focus,
                     diffing(&state),
@@ -462,6 +462,15 @@ impl EditorView {
                     state.git.message.rope,
                     crate::platform::git_panel::subject_len(&state.git.message.rope.to_string()),
                     state.git.amend_state(),
+                    {
+                        let lines = state.git.diff_selection();
+                        format!(
+                            "{}-{} cursor {}",
+                            lines.start(),
+                            lines.end(),
+                            state.git.diff_cursor
+                        )
+                    },
                     state.project_menu_requested,
                     state.crumb_menu_requested.as_deref().unwrap_or("none"),
                     state.last_selftest_click_ms,
@@ -1009,6 +1018,12 @@ fn region_named(state: &mut State, name: &str) -> Option<Viewport> {
                 width,
                 height: m.line_height,
             })
+        }
+        // A row of the Source Control diff, by its line index: `git.diff.3`.
+        _ if name.starts_with("git.diff.") => {
+            let line = name["git.diff.".len()..].parse::<usize>().ok()?;
+            let text = chrome_of(state).text;
+            state.git.diff_line_rect(text, line)
         }
         _ if name.starts_with("inspector.") => state.agents.inspector.named(name),
         _ if name == "home.review" => state

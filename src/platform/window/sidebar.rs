@@ -337,6 +337,33 @@ impl EditorView {
             self.request_redraw();
             return true;
         }
+        // The diff has the column and the field does not have the keyboard:
+        // Space stages the hunk or the selected lines, Up and Down move the
+        // cursor, with Shift selecting. In a document Space types as ever.
+        let code = event.keyCode();
+        if matches!(code, key::SPACE | key::UP | key::DOWN)
+            && !flags.contains(NSEventModifierFlags::Option)
+            && !flags.contains(NSEventModifierFlags::Control)
+            && self
+                .state()
+                .is_some_and(|state| !state.git_focus && column_of(&state) == Column::GitDiff)
+        {
+            let visible = (self.chrome().text.height / crate::platform::git_panel::DIFF_LINE)
+                .max(1.0) as usize;
+            let Some(mut state) = self.state_mut() else {
+                return false;
+            };
+            let extend = flags.contains(NSEventModifierFlags::Shift);
+            match code {
+                key::SPACE => state.git.stage_selection(),
+                key::UP => state.git.move_diff_cursor(-1, extend, visible),
+                _ => state.git.move_diff_cursor(1, extend, visible),
+            }
+            drop(state);
+            self.request_redraw();
+            self.resume_display_link();
+            return true;
+        }
         if !self.state().is_some_and(|state| state.git_focus) {
             return false;
         }

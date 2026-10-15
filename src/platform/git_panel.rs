@@ -19,6 +19,8 @@ enum Operation {
     /// Every change of a section, staged or unstaged together.
     StageAll(Vec<Change>, bool),
     StageHunk(Change, git::Hunk),
+    /// Chosen lines of hunks, each with the indexes of its lines.
+    StageLines(Change, Vec<(git::Hunk, Vec<usize>)>),
     /// One change the editor's gutter marks, staged from the editor's text.
     StageText(StageText),
     /// The message, and whether it replaces HEAD.
@@ -101,6 +103,12 @@ struct InFlight {
     submitted: Option<String>,
     /// Whether its outcome is said in the status line.
     announces: bool,
+    /// Whether the diff keeps its scroll and cursor once it is read again,
+    /// when it is still the same file's: a refresh, or a hunk or lines
+    /// staged from it, where the reader carries on.
+    keeps_place: bool,
+    /// A hunk or lines were staged: the selection is gone from where it was.
+    stages_from_diff: bool,
 }
 
 pub struct Panel {
@@ -115,6 +123,10 @@ pub struct Panel {
     pub selected: usize,
     pub list_scroll: usize,
     pub diff_scroll: usize,
+    /// The diff line the keyboard is on, and where a selection of lines
+    /// started: Space stages the hunk or the lines between them.
+    pub diff_cursor: usize,
+    pub diff_anchor: Option<usize>,
     pub message: Buffer,
     /// Commit replaces HEAD instead of adding a commit.
     pub amend: bool,
@@ -389,6 +401,8 @@ impl Panel {
             selected: 0,
             list_scroll: 0,
             diff_scroll: 0,
+            diff_cursor: 0,
+            diff_anchor: None,
             message: Buffer::new(),
             amend: false,
             amend_prefill: None,
@@ -860,6 +874,138 @@ impl Panel {
         (self.can_act_on_hunk(index) && Self::hunk_action_rect(row_rect).contains(x, y))
             .then_some(index)
     }
+
+    /// The diff line drawn at `y`, if there is one.
+    pub fn diff_line_at(&self, diff: Viewport, y: f32) -> Option<usize> {
+        if y < diff.y || y >= diff.y + diff.height {
+            return None;
+        }
+        let line = self.diff_scroll + ((y - diff.y) / DIFF_LINE) as usize;
+        (line < self.diff.lines.len()).then_some(line)
+    }
+
+    /// Where diff line `line` is drawn, while it is in view.
+    pub fn diff_line_rect(&self, diff: Viewport, line: usize) -> Option<Viewport> {
+        let row = line.checked_sub(self.diff_scroll)?;
+        let visible = (diff.height / DIFF_LINE).max(0.0) as usize;
+        (line < self.diff.lines.len() && row < visible).then_some(Viewport {
+            x: diff.x,
+            y: diff.y + row as f32 * DIFF_LINE,
+            width: diff.width,
+            height: DIFF_LINE,
+        })
+    }
+
+    /// Puts the diff's cursor on a line; `extend` keeps where the
+    /// selection started (a shift-click, a drag), otherwise it starts over.
+    pub fn set_diff_cursor(&mut self, line: usize, extend: bool) {
+        let last = self.diff.lines.len().saturating_sub(1);
+        if extend {
+            self.diff_anchor.get_or_insert(self.diff_cursor);
+        } else {
+            self.diff_anchor = None;
+        }
+        self.diff_cursor = line.min(last);
+    }
+
+    /// Up or Down in the diff, by `delta` lines, keeping the cursor among
+    /// the `visible` rows drawn.
+    pub fn move_diff_cursor(&mut self, delta: isize, extend: bool, visible: usize) {
+        let line = self.diff_cursor.saturating_add_signed(delta);
+        self.set_diff_cursor(line, extend);
+        let visible = visible.max(1);
+        if self.diff_cursor < self.diff_scroll {
+            self.diff_scroll = self.diff_cursor;
+        } else if self.diff_cursor >= self.diff_scroll + visible {
+            self.diff_scroll = self.diff_cursor + 1 - visible;
+        }
+    }
+
+    /// The lines a selection covers, first to last: the cursor's line alone
+    /// without one.
+    pub fn diff_selection(&self) -> std::ops::RangeInclusive<usize> {
+        let anchor = self.diff_anchor.unwrap_or(self.diff_cursor);
+        anchor.min(self.diff_cursor)..=anchor.max(self.diff_cursor)
+    }
+
+    /// For every diff line under a hunk's header, the hunk and the line's
+    /// index among the lines under it, as [`git::stage_hunk_lines`] takes it.
+    fn line_owners(&self) -> Vec<Option<(usize, usize)>> {
+        let mut owners = Vec::with_capacity(self.diff.lines.len());
+        // The hunk being read: its index, header line and how many lines
+        // its text has under the header.
+        let mut current: Option<(usize, usize, usize)> = None;
+        for (index, line) in self.diff.lines.iter().enumerate() {
+            if let Some(hunk) = line.hunk {
+                let lines = self.diff.hunks[hunk].raw.split_terminator('\n').count();
+                current = Some((hunk, index, lines.saturating_sub(1)));
+                owners.push(None);
+                continue;
+            }
+            if line.kind == git::DiffKind::Section {
+                current = None;
+            }
+            owners.push(current.and_then(|(hunk, header, lines)| {
+                let offset = index - header - 1;
+                (offset < lines).then_some((hunk, offset))
+            }));
+        }
+        owners
+    }
+
+    /// Space in the diff: the selected added and removed lines, or the
+    /// whole hunk the cursor is in (or on the header of) when none are
+    /// selected. Staged lines are unstaged. A selection running into the
+    /// other section keeps to the side its first changed line is on.
+    pub fn stage_selection(&mut self) {
+        let owners = self.line_owners();
+        let range = self.diff_selection();
+        let changed: Vec<(usize, usize)> = range
+            .clone()
+            .filter(|&i| {
+                matches!(
+                    self.diff.lines.get(i).map(|l| l.kind),
+                    Some(git::DiffKind::Added | git::DiffKind::Removed)
+                )
+            })
+            .filter_map(|i| owners.get(i).copied().flatten())
+            .collect();
+        let Some(&(first, _)) = changed.first() else {
+            // On a header, or a selection of unchanged lines: the hunk.
+            let cursor = self.diff_cursor;
+            let hunk = self
+                .diff
+                .lines
+                .get(cursor)
+                .and_then(|l| l.hunk)
+                .or_else(|| owners.get(cursor).copied().flatten().map(|(h, _)| h));
+            if let Some(hunk) = hunk
+                && self.can_act_on_hunk(hunk)
+            {
+                self.stage_hunk(hunk);
+            }
+            return;
+        };
+        let staged = self.diff.hunks[first].staged;
+        let mut picks: Vec<(git::Hunk, Vec<usize>)> = Vec::new();
+        for (hunk, offset) in changed {
+            if self.diff.hunks[hunk].staged != staged || !self.can_act_on_hunk(hunk) {
+                continue;
+            }
+            match picks.last_mut() {
+                Some((last, lines)) if last.ordinal == self.diff.hunks[hunk].ordinal => {
+                    lines.push(offset)
+                }
+                _ => picks.push((self.diff.hunks[hunk].clone(), vec![offset])),
+            }
+        }
+        if picks.is_empty() {
+            return;
+        }
+        if let Some(change) = self.selected_change().cloned() {
+            self.start(Operation::StageLines(change, picks));
+        }
+    }
     /// The commit type completion for the message as it stands, if any; a
     /// selection would be replaced by typing, so it offers none.
     pub fn commit_type_hint(&self) -> Option<&'static str> {
@@ -908,6 +1054,12 @@ impl Panel {
                 | Operation::StageText(_)
                 | Operation::Commit(..)
         );
+        let stages_from_diff = matches!(
+            operation,
+            Operation::StageHunk(..) | Operation::StageLines(..)
+        );
+        // The refresh the watcher starts after a stage included.
+        let keeps_place = stages_from_diff || matches!(operation, Operation::Refresh);
         let directory = self.directory.clone();
         let guard = self.guard.clone();
         let previous = self.selected_change().map(|c| c.path.clone());
@@ -916,6 +1068,8 @@ impl Panel {
             rx,
             submitted,
             announces,
+            keeps_place,
+            stages_from_diff,
         });
         self.note = "Working…".into();
         self.note_success = false;
@@ -1027,6 +1181,9 @@ impl Panel {
                     Operation::StageHunk(change, hunk) => {
                         git::stage_hunk(&root, &change, &hunk).err()
                     }
+                    Operation::StageLines(change, picks) => {
+                        git::stage_hunk_lines(&root, &change, &picks).err()
+                    }
                     Operation::StageText(job) => {
                         // The file's own repository, which in a workspace
                         // of several need not be the panel's.
@@ -1137,10 +1294,31 @@ impl Panel {
                         })
                     });
                 }
+                let before = self.selected_change().map(|c| c.path.clone());
                 self.snapshot = Some(reply.snapshot);
                 self.selected = reply.selected;
                 self.diff = git::Diff::parse(&reply.diff);
-                self.diff_scroll = 0;
+                // The same file read again keeps the reader's place.
+                // Staged from the diff, the cursor goes to where the
+                // selection started, on what moved up into its place.
+                let last = self.diff.lines.len().saturating_sub(1);
+                if flight.keeps_place
+                    && reply.error.is_none()
+                    && before.is_some()
+                    && before.as_ref() == self.selected_change().map(|c| &c.path)
+                {
+                    if flight.stages_from_diff {
+                        self.diff_cursor = *self.diff_selection().start();
+                        self.diff_anchor = None;
+                    }
+                    self.diff_cursor = self.diff_cursor.min(last);
+                    self.diff_anchor = self.diff_anchor.map(|a| a.min(last));
+                    self.diff_scroll = self.diff_scroll.min(last);
+                } else {
+                    self.diff_cursor = 0;
+                    self.diff_anchor = None;
+                    self.diff_scroll = 0;
+                }
                 // The list may be shorter now (a commit took most of it):
                 // scrolled past its end, it drew as "No changes".
                 self.list_scroll = self.list_scroll.min(self.entries().len().saturating_sub(1));
@@ -1867,6 +2045,12 @@ impl Panel {
     }
 }
 
+/// The diff view's cursor line and the lines selected with it.
+pub struct DiffMarks {
+    pub cursor: usize,
+    pub selection: std::ops::RangeInclusive<usize>,
+}
+
 /// Row height in the diff view, matching the editor's own line height closely
 /// enough that the two columns do not look like different applications.
 pub const DIFF_LINE: f32 = 20.0;
@@ -1913,11 +2097,16 @@ impl Panel {
                 }
             })
         };
+        let marks = DiffMarks {
+            cursor: self.diff_cursor,
+            selection: self.diff_selection(),
+        };
         draw_diff_lines(
             &self.diff.lines,
             self.diff_scroll,
             empty,
             &action,
+            Some(&marks),
             atlas,
             rect,
             theme,
@@ -1928,14 +2117,16 @@ impl Panel {
 
 /// Diff lines in a column: old and new line numbers in a gutter, additions
 /// and removals on their own bands, and hunk headers as separators. `action`
-/// names the button a hunk header carries, if any. Shared by Source Control
-/// and the review of a change proposed by Claude.
+/// names the button a hunk header carries, if any, and `marks` the cursor
+/// and selected lines where the diff has them. Shared by Source Control and
+/// the review of a change proposed by Claude.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_diff_lines(
     lines: &[git::DiffLine],
     scroll: usize,
     empty: &str,
     action: &dyn Fn(usize) -> Option<&'static str>,
+    marks: Option<&DiffMarks>,
     atlas: &mut Atlas,
     rect: Viewport,
     theme: &Theme,
@@ -1968,6 +2159,32 @@ pub fn draw_diff_lines(
         };
         if let Some(colour) = band {
             layout::push_rect(out, atlas, [rect.x, y], [rect.width, DIFF_LINE], colour);
+        }
+        if let Some(marks) = marks {
+            let index = scroll + row;
+            // The selection over the change's own band, as the editor
+            // draws one; a lone cursor is the current line.
+            if marks.selection.start() != marks.selection.end() && marks.selection.contains(&index)
+            {
+                layout::push_rect(
+                    out,
+                    atlas,
+                    [rect.x, y],
+                    [rect.width, DIFF_LINE],
+                    theme.selection,
+                );
+            } else if index == marks.cursor {
+                layout::push_rect(
+                    out,
+                    atlas,
+                    [rect.x, y],
+                    [rect.width, DIFF_LINE],
+                    theme.current_line,
+                );
+            }
+            if index == marks.cursor {
+                layout::push_rect(out, atlas, [rect.x, y], [2.0, DIFF_LINE], theme.cursor);
+            }
         }
         if line.kind == git::DiffKind::Hunk {
             // A rule across the column, with the context git named sitting
@@ -2028,9 +2245,9 @@ pub fn draw_diff_lines(
                     })
                     .radius(layout::UI_RADIUS_SM)
                     .tip(if label == "Stage" {
-                        "Stage this hunk"
+                        "Stage this hunk (Space stages the hunk or the selected lines)"
                     } else {
-                        "Unstage this hunk"
+                        "Unstage this hunk (Space unstages the hunk or the selected lines)"
                     })
                     .draw(out, atlas, theme);
             }
@@ -2196,6 +2413,54 @@ mod tests {
         let mut panel = Panel::idle(PathBuf::from("/tmp"), Some(snapshot));
         panel.note = String::new();
         panel
+    }
+
+    #[test]
+    fn diff_lines_know_their_hunk_and_place_under_it() {
+        let mut panel = panel(vec![change("garden.txt", b'M', b'M')]);
+        panel.diff = git::Diff::parse(
+            "STAGED\n\ndiff --git a/garden.txt b/garden.txt\n--- a/garden.txt\n+++ b/garden.txt\n\
+             @@ -1,2 +1,3 @@\n beans\n+carrots\n peas\n\
+             WORKING TREE\n\ndiff --git a/garden.txt b/garden.txt\n--- a/garden.txt\n+++ b/garden.txt\n\
+             @@ -2,2 +2,2 @@ fn plant\n-peas\n+leeks\n\\ No newline at end of file\n",
+        );
+        let owners = panel.line_owners();
+        let kinds: Vec<_> = panel.diff.lines.iter().map(|l| l.kind).collect();
+        use git::DiffKind::*;
+        assert_eq!(
+            kinds,
+            [
+                Section, Hunk, Context, Added, Context, Section, Hunk, Removed, Added, Note
+            ]
+        );
+        assert_eq!(
+            owners,
+            [
+                None,
+                None,
+                Some((0, 0)),
+                Some((0, 1)),
+                Some((0, 2)),
+                None,
+                None,
+                Some((1, 0)),
+                Some((1, 1)),
+                Some((1, 2)),
+            ]
+        );
+
+        // Shift-Down from the addition selects into the next section; the
+        // view scrolls to keep the cursor in it.
+        panel.set_diff_cursor(3, false);
+        panel.move_diff_cursor(1, true, 3);
+        panel.move_diff_cursor(1, true, 3);
+        assert_eq!(panel.diff_selection(), 3..=5);
+        assert_eq!(panel.diff_scroll, 3);
+        panel.move_diff_cursor(-9, false, 3);
+        assert_eq!(panel.diff_selection(), 0..=0);
+        assert_eq!(panel.diff_scroll, 0);
+        panel.move_diff_cursor(99, false, 3);
+        assert_eq!(panel.diff_cursor, 9);
     }
 
     #[test]

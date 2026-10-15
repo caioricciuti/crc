@@ -1357,6 +1357,8 @@ enum Drag {
     Tab(usize),
     /// A sidebar row onto a folder.
     Tree(TreeDrag),
+    /// Across the Source Control diff, selecting its lines.
+    DiffLines,
     /// A press that began in the text, the only kind of drag that selects.
     Select {
         /// What it selects in.
@@ -2145,6 +2147,13 @@ define_class!(
                 };
                 if let Some(hunk) = state.git.hunk_action_at(chrome.text, x, y) {
                     state.git.stage_hunk(hunk);
+                } else if let Some(line) = state.git.diff_line_at(chrome.text, y) {
+                    // A row puts the cursor on it; shift-click or a drag
+                    // selects the lines between, for Space to stage.
+                    let extend = event.modifierFlags().contains(NSEventModifierFlags::Shift);
+                    state.git.set_diff_cursor(line, extend);
+                    state.git_focus = false;
+                    state.drag = Some(Drag::DiffLines);
                 }
                 drop(state);
                 self.request_redraw();
@@ -2263,6 +2272,20 @@ define_class!(
             if self.state().is_some_and(|state| matches!(state.drag, Some(Drag::Tab(_)))) { return; }
             if self.state().is_some_and(|state| matches!(state.drag, Some(Drag::Timeline))) {
                 self.scrub_track_at(point.x as f32);
+                return;
+            }
+            if self.state().is_some_and(|state| matches!(state.drag, Some(Drag::DiffLines))) {
+                let chrome = self.chrome();
+                if let Some(mut state) = self.state_mut() {
+                    let y = (point.y as f32).clamp(chrome.text.y, chrome.text.y + chrome.text.height - 1.0);
+                    if let Some(line) = state.git.diff_line_at(chrome.text, y)
+                        && line != state.git.diff_cursor
+                    {
+                        state.git.set_diff_cursor(line, true);
+                    }
+                }
+                self.request_redraw();
+                self.pump();
                 return;
             }
 

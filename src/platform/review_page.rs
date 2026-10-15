@@ -780,6 +780,7 @@ pub fn draw(
             "No changes left in this file."
         },
         &|_| None,
+        None,
         atlas,
         diff_rect,
         theme,
