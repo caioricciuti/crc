@@ -252,7 +252,9 @@ the size and write it back.
   documents, `Cmd-G` steps through the matches, and `Cmd-K` clears the
   screen and history without sending anything to the program. A program
   that asks for the mouse gets clicks, drags, the wheel and focus
-  changes; hold Option or Shift to select text in it instead. A session that sends a notification
+  changes; hold Option or Shift to select text in it instead. A program
+  can copy to the clipboard (OSC 52, as Claude Code does with what you
+  drag over it), but never read it. A session that sends a notification
   (OSC 9, 777 or 99) or rings the bell gets a dot and a line in the status
   bar saying what it asked, until you type into it; Home lists the
   waiting ones first.

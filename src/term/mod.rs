@@ -81,6 +81,12 @@ impl Cell {
 const SCROLLBACK: usize = 10_000;
 /// The longest OSC string kept; the rest is dropped.
 const MAX_OSC: usize = 4096;
+/// The most text a program may copy through OSC 52, decoded; a longer
+/// copy is dropped whole.
+const MAX_CLIPBOARD: usize = 1 << 20;
+/// The longest OSC 52 string kept: its base64 at the cap, with room for
+/// the number and the selection.
+const MAX_OSC_CLIPBOARD: usize = MAX_CLIPBOARD.div_ceil(3) * 4 + 64;
 /// Parameters beyond this many in one sequence are ignored.
 const MAX_PARAMS: usize = 32;
 
@@ -178,11 +184,16 @@ pub struct Term {
     /// What the program says it is doing, through OSC 7501 (Claude
     /// Code does): the root record is its own state, the rest its tasks.
     pub status: status::Records,
+    /// Text the program copied through OSC 52, the newest only, until
+    /// taken for the pasteboard.
+    clipboard: Option<String>,
     state: State,
     params: Vec<Vec<u16>>,
     private: Option<u8>,
     intermediate: Option<u8>,
     osc: Vec<u8>,
+    /// The OSC string ran past its limit and lost bytes.
+    osc_overflow: bool,
     /// ESC seen inside an OSC or ignored string, which may be ST.
     string_escape: bool,
     /// Bytes of a UTF-8 character split across reads.
@@ -222,11 +233,13 @@ impl Term {
             replies: Vec::new(),
             notices: Vec::new(),
             status: status::Records::default(),
+            clipboard: None,
             state: State::Ground,
             params: Vec::new(),
             private: None,
             intermediate: None,
             osc: Vec::new(),
+            osc_overflow: false,
             string_escape: false,
             utf8: Vec::new(),
             generation: 0,
@@ -273,6 +286,11 @@ impl Term {
     /// What the program has asked to be told, to write back to it.
     pub fn take_replies(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.replies)
+    }
+
+    /// The text the program last copied through OSC 52, once.
+    pub fn take_clipboard(&mut self) -> Option<String> {
+        self.clipboard.take()
     }
 
     /// The notifications since the last call, oldest first.
@@ -993,6 +1011,54 @@ mod tests {
             t.advance(b"\x07");
         }
         assert_eq!(t.take_notices().len(), 8);
+    }
+
+    #[test]
+    fn osc_52_copies_to_the_clipboard() {
+        let mut t = Term::new(40, 5);
+        // BEL and ST both end it; every selection is the one pasteboard.
+        t.advance(b"\x1b]52;c;aGVsbG8=\x07");
+        assert_eq!(t.take_clipboard().as_deref(), Some("hello"));
+        assert_eq!(t.take_clipboard(), None);
+        for selection in ["", "p", "s", "cs"] {
+            t.advance(format!("\x1b]52;{selection};d29ybGQ=\x1b\\").as_bytes());
+            assert_eq!(
+                t.take_clipboard().as_deref(),
+                Some("world"),
+                "{selection:?}"
+            );
+        }
+        // Split across reads anywhere, ST included; the newest copy wins.
+        t.advance(b"\x1b]52;c;Zmly");
+        t.advance(b"c3Q=\x07\x1b]5");
+        t.advance(b"2;c;bGluZSBvbmUK");
+        t.advance(b"bGluZSB0d28=\x1b");
+        t.advance(b"\\");
+        assert_eq!(t.take_clipboard().as_deref(), Some("line one\nline two"));
+        // A read is refused and answered with nothing; an empty payload
+        // does not clear what the person copied.
+        t.advance(b"\x1b]52;c;?\x07\x1b]52;c;\x07\x1b]52;c;====\x07");
+        assert_eq!(t.take_clipboard(), None);
+        assert!(t.take_replies().is_empty());
+        // Bad base64, bad UTF-8 and an unknown selection are dropped.
+        t.advance(b"\x1b]52;c;not base64!\x07");
+        let bad_utf8 = crate::base64::encode(&[0xff, 0xfe]);
+        t.advance(format!("\x1b]52;c;{bad_utf8}\x07").as_bytes());
+        t.advance(b"\x1b]52;x;aGVsbG8=\x07\x1b]52;aGVsbG8=\x07");
+        assert_eq!(t.take_clipboard(), None);
+        // Up to the cap is copied whole; past it, nothing is.
+        let full = "a".repeat(MAX_CLIPBOARD);
+        t.advance(format!("\x1b]52;c;{}\x07", crate::base64::encode(full.as_bytes())).as_bytes());
+        assert_eq!(t.take_clipboard().map(|s| s.len()), Some(MAX_CLIPBOARD));
+        let over = "a".repeat(MAX_CLIPBOARD + 1);
+        t.advance(format!("\x1b]52;c;{}\x07", crate::base64::encode(over.as_bytes())).as_bytes());
+        assert_eq!(t.take_clipboard(), None);
+        // The parser is back on the ground after each, and other strings
+        // keep their own limit.
+        t.advance(b"\x1b]2;title\x07ok");
+        assert_eq!(t.title, "title");
+        assert_eq!(t.visible_row(0, 0)[0].ch, 'o');
+        assert_eq!(t.take_clipboard(), None);
     }
 
     #[test]

@@ -35,7 +35,7 @@ impl Term {
                 0x07 => self.end_string(),
                 0x1B => self.string_escape = true,
                 0x18 | 0x1A => self.state = State::Ground,
-                _ if self.state == State::Osc && self.osc.len() < MAX_OSC => self.osc.push(byte),
+                _ if self.state == State::Osc => self.osc_byte(byte),
                 _ => {}
             }
             return;
@@ -132,6 +132,7 @@ impl Term {
             }
             b']' => {
                 self.osc.clear();
+                self.osc_overflow = false;
                 self.state = State::Osc;
             }
             b'P' | b'X' | b'^' | b'_' => self.state = State::Ignore,
@@ -213,6 +214,20 @@ impl Term {
             Some(&n) => n as usize,
         }
     }
+    /// Keeps a byte of an OSC string. A clipboard copy may be long; any
+    /// other string stops at a few kilobytes.
+    fn osc_byte(&mut self, byte: u8) {
+        let limit = if self.osc.starts_with(b"52;") {
+            MAX_OSC_CLIPBOARD
+        } else {
+            MAX_OSC
+        };
+        if self.osc.len() < limit {
+            self.osc.push(byte);
+        } else {
+            self.osc_overflow = true;
+        }
+    }
     pub(super) fn end_string(&mut self) {
         if self.state == State::Osc {
             let text = String::from_utf8_lossy(&self.osc).into_owned();
@@ -258,6 +273,13 @@ impl Term {
                     ("133", rest) if rest.starts_with('A') => {
                         self.status.end_of_command();
                     }
+                    // A copy: kept for the pasteboard. One cut short is
+                    // not the text the program sent.
+                    ("52", body) if !self.osc_overflow => {
+                        if let Some(text) = clipboard_text(body) {
+                            self.clipboard = Some(text);
+                        }
+                    }
                     // A query: answered, or the program waits out its timeout.
                     ("10" | "11", "?") => {
                         let [r, g, b] = if kind == "10" {
@@ -274,7 +296,28 @@ impl Term {
                 }
             }
         }
+        // A long copy's buffer goes rather than stay with the session.
+        if self.osc.capacity() > MAX_OSC {
+            self.osc = Vec::new();
+        }
         self.osc.clear();
         self.state = State::Ground;
     }
+}
+
+/// The text an OSC 52 body (`selection;base64`) copies, or `None` for one
+/// to ignore. Every selection is the one pasteboard. A read (`?`) is
+/// refused: a program, maybe on another machine over ssh, has no business
+/// with what was copied. An empty copy would clear the pasteboard, and is
+/// ignored too, as is anything not base64 of UTF-8 or past the cap.
+fn clipboard_text(body: &str) -> Option<String> {
+    let (selection, payload) = body.split_once(';')?;
+    if !selection.bytes().all(|b| matches!(b, b'c' | b'p' | b's')) || payload == "?" {
+        return None;
+    }
+    let bytes = crate::base64::decode(payload)?;
+    if bytes.is_empty() || bytes.len() > MAX_CLIPBOARD {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
 }

@@ -2,6 +2,15 @@
 
 One entry per tag, written for people who use the editor.
 
+## Unreleased
+
+- Terminal: a program can copy to the clipboard through OSC 52. Since
+  programs that ask for the mouse get it, a drag in Claude Code selects
+  its text and copies it this way, and crc dropped the copy, so the paste
+  that followed had nothing. The text now lands on the clipboard. A
+  program asking to read the clipboard gets nothing back, an empty copy
+  leaves the clipboard alone, and copies over 1 MiB are ignored.
+
 ## v0.2.0-alpha.24, 2026-10-15
 
 - Terminal: programs that ask for the mouse now get it. crc read the

@@ -25,11 +25,15 @@ impl EditorView {
         };
         let mut changed = false;
         let mut noticed = Vec::new();
+        let mut copied = None;
         for (index, tab) in state.terminal.tabs.iter().enumerate() {
             if tab.session.drain_wake() {
                 changed = true;
                 let (notices, status) = {
                     let mut term = tab.session.term.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(text) = term.take_clipboard() {
+                        copied = Some(text);
+                    }
                     (term.take_notices(), term.status.root().cloned())
                 };
                 noticed.push(Noticed {
@@ -41,6 +45,11 @@ impl EditorView {
             }
         }
         drop(state);
+        // A program copied (OSC 52, as Claude Code does on a drag it was
+        // sent): onto the pasteboard, as Cmd-C would.
+        if let Some(text) = copied {
+            clipboard::write_text(&text);
+        }
         let printed: Vec<usize> = noticed.iter().map(|n| n.index).collect();
         if !noticed.is_empty() {
             self.take_notices(noticed);
