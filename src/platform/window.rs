@@ -4163,6 +4163,11 @@ define_class!(
             self.sessions_tick();
         }
 
+        #[unsafe(method(terminalSettle:))]
+        fn action_terminal_settle(&self, _sender: Option<&AnyObject>) {
+            self.terminal_settle();
+        }
+
         #[unsafe(method(agentOpenPullRequest:))]
         fn action_agent_open_pull_request(&self, _sender: Option<&AnyObject>) {
             self.agent_open_pull_request();

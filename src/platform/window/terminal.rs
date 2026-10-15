@@ -2,6 +2,7 @@
 //! selection, and what it does after each frame.
 
 use super::*;
+use crate::platform::terminal::When;
 
 impl EditorView {
     /// Whether keys go to the terminal: it is open with the keyboard, and
@@ -17,18 +18,27 @@ impl EditorView {
         self.wake(EditorView::poll_terminal)
     }
 
-    /// A session printed something, or its program exited.
+    /// A session printed something, or its program exited. Output on
+    /// screen draws; output off screen draws only for what it changed in
+    /// the tab's row, title or status, at most ten times a second.
     pub(super) fn poll_terminal(&self) {
         let Some(state) = self.state() else {
             self.resume_display_link();
             return;
         };
-        let mut changed = false;
+        let now = Instant::now();
+        let visible = state
+            .terminal
+            .visible(state.agents.on || state.terminal.open);
+        let mut shown_printed = false;
+        // What each tab that printed was doing before.
+        let mut was = Vec::new();
         let mut noticed = Vec::new();
         let mut copied = None;
         for (index, tab) in state.terminal.tabs.iter().enumerate() {
             if tab.session.drain_wake() {
-                changed = true;
+                shown_printed |= visible.contains(&index);
+                was.push((index, tab.activity()));
                 let (notices, status) = {
                     let mut term = tab.session.term.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(text) = term.take_clipboard() {
@@ -51,26 +61,38 @@ impl EditorView {
             clipboard::write_text(&text);
         }
         let printed: Vec<usize> = noticed.iter().map(|n| n.index).collect();
-        if !noticed.is_empty() {
-            self.take_notices(noticed);
-        }
+        let told = !noticed.is_empty() && self.take_notices(noticed);
         // A prompt after a `cd`: where the terminal showing is now. Read on
-        // every burst it prints, so the prompt right after the `cd` is
-        // never missed.
+        // a burst it prints, twice a second at most; one held back is read
+        // when its time comes, so the prompt right after the `cd` is never
+        // missed.
+        let mut owed = None;
+        let mut changed = told;
         let moved = self.state_mut().is_some_and(|mut state| {
-            // Into or out of ssh, any tab: its row and title say so.
+            let active = state.terminal.active;
+            let mut moved = false;
             for index in &printed {
-                if let Some(tab) = state.terminal.tabs.get_mut(*index) {
-                    tab.read_remote();
+                let Some(tab) = state.terminal.tabs.get_mut(*index) else {
+                    continue;
+                };
+                match tab.probe(now) {
+                    // Into or out of ssh, any tab: its row and title say so.
+                    When::Now => {
+                        tab.read_remote();
+                        moved |= *index == active && tab.read_cwd();
+                    }
+                    When::At(at) => owed = Some(owed.map_or(at, |o: Instant| o.min(at))),
+                    When::Never => {}
                 }
             }
-            let active = state.terminal.active;
-            printed.contains(&active)
-                && state
-                    .terminal
-                    .tabs
-                    .get_mut(active)
-                    .is_some_and(|tab| tab.read_cwd())
+            // Off screen, what its row, title or status shows; looked at
+            // on screen too, so it is current when the tab goes off.
+            for (index, activity) in &was {
+                if let Some(tab) = state.terminal.tabs.get_mut(*index) {
+                    changed |= tab.face_changed(*activity) && !visible.contains(index);
+                }
+            }
+            moved
         });
         if moved {
             self.follow_cwd();
@@ -120,9 +142,87 @@ impl EditorView {
             self.after_terminal_layout();
             return;
         }
-        if changed {
+        let when = self.state_mut().map(|mut state| {
+            state
+                .terminal
+                .pace
+                .decide(shown_printed || moved, changed, now)
+        });
+        match when {
+            Some(When::Now) => {
+                self.request_redraw();
+                self.pump();
+            }
+            Some(When::At(at)) => self.arm_terminal_settle(at),
+            Some(When::Never) | None => {}
+        }
+        if let Some(at) = owed {
+            self.arm_terminal_settle(at);
+        }
+    }
+
+    /// Schedules [`EditorView::terminal_settle`] for `at`, unless one runs
+    /// sooner.
+    fn arm_terminal_settle(&self, at: Instant) {
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
+        if !state.terminal.pace.arm(at) {
+            return;
+        }
+        drop(state);
+        let delay = at.saturating_duration_since(Instant::now()).as_secs_f64();
+        let _: () = unsafe {
+            msg_send![self, performSelector: sel!(terminalSettle:),
+                withObject: None::<&AnyObject>, afterDelay: delay]
+        };
+    }
+
+    /// What output held back is owed: the redraw for a change in a tab off
+    /// screen, and the reads of where a tab is and whether it runs ssh.
+    pub(super) fn terminal_settle(&self) {
+        let now = Instant::now();
+        let (mut redraw, moved, next) = {
+            // Busy: again shortly, as the one scheduled is still marked.
+            let Some(mut state) = self.state_mut() else {
+                let _: () = unsafe {
+                    msg_send![self, performSelector: sel!(terminalSettle:),
+                        withObject: None::<&AnyObject>,
+                        afterDelay: crate::platform::terminal::BACKGROUND_EVERY.as_secs_f64()]
+                };
+                return;
+            };
+            let panel = &mut state.terminal;
+            panel.pace.armed = None;
+            let redraw = panel.pace.take_due(now);
+            let mut next = panel.pace.due;
+            let active = panel.active;
+            let (mut remote, mut moved) = (false, false);
+            for (index, tab) in panel.tabs.iter_mut().enumerate() {
+                if !tab.probe_owed {
+                    continue;
+                }
+                match tab.probe(now) {
+                    When::Now => {
+                        remote |= tab.read_remote();
+                        moved |= index == active && tab.read_cwd();
+                    }
+                    When::At(at) => next = Some(next.map_or(at, |n: Instant| n.min(at))),
+                    When::Never => {}
+                }
+            }
+            (redraw || remote, moved, next)
+        };
+        if moved {
+            self.follow_cwd();
+            redraw = true;
+        }
+        if redraw {
             self.request_redraw();
             self.pump();
+        }
+        if let Some(at) = next {
+            self.arm_terminal_settle(at);
         }
     }
 
@@ -476,6 +576,9 @@ impl EditorView {
                     program_pid: None,
                     remote: None,
                     told_focus: false,
+                    last_probe: None,
+                    probe_owed: false,
+                    seen: None,
                     launch,
                     held,
                     status: None,
@@ -625,6 +728,9 @@ impl EditorView {
                     program_pid: None,
                     remote: None,
                     told_focus: false,
+                    last_probe: None,
+                    probe_owed: false,
+                    seen: None,
                     launch,
                     held: Some(id),
                 },
@@ -1046,11 +1152,13 @@ impl EditorView {
     /// Output arrived in these tabs, or their hooks wrote, with the newest
     /// notification each carried and what the program says of itself. A
     /// notification or a block marks its tab; the status line says it when
-    /// the tab is not the one being typed into.
-    fn take_notices(&self, noticed: Vec<Noticed>) {
+    /// the tab is not the one being typed into. Returns whether the
+    /// window says something of it beyond the tabs' own rows: the status
+    /// line, a workspace written in, a team's tasks.
+    fn take_notices(&self, noticed: Vec<Noticed>) -> bool {
         use crate::term::status::State;
         let Some(mut state) = self.state_mut() else {
-            return;
+            return false;
         };
         let now = Instant::now();
         let mut said = None;
@@ -1131,6 +1239,7 @@ impl EditorView {
                 }
             }
         }
+        let told = said.is_some() || wrote || asked || !team_events.is_empty();
         for (review, event) in team_events {
             state.agents.teams.entry(review).or_default().apply(&event);
         }
@@ -1154,6 +1263,7 @@ impl EditorView {
                 app.requestUserAttention(NSRequestUserAttentionType::InformationalRequest);
             }
         }
+        told
     }
 
     /// The active session's screen rect and grid size, for mapping points.

@@ -11,6 +11,10 @@ One entry per tag, written for people who use the editor.
   Titles are now measured once, the cache keeps half when it overflows,
   and it learns when a frame starts in every mode. The same frame takes
   under 3 ms.
+- Terminals you cannot see no longer redraw the window for every bit of
+  output. A hidden tab redraws only when something shown for it changes
+  (its status, title or a bell), at most ten times a second, and its
+  process and folder are read at most twice a second.
 - crc opens on Agents mode, with a shell ready in the selected
   workspace. Opening a file or folder with it still opens the editor.
 - Source Control: the commit message completes conventional-commit

@@ -20,7 +20,9 @@
 //! Run with: cargo run --release --offline --example agents_latency
 //! (`-- --repos N` repositories in the selected workspace, `--no-issues`,
 //! `--workspaces N`, `--hidden-streaming N` for that many background
-//! terminals printing between samples).
+//! terminals printing between samples, every tenth line retitling its tab
+//! as an agent's spinner does; the redraws they ask for are counted under
+//! the window's rule, [`terminal::Pace::decide`]).
 
 use crc::platform::agents::{self, IssueSet, Panel, RepoKey, Workspace};
 use crc::platform::inspector::{self, Issues};
@@ -202,6 +204,9 @@ fn tab(title: &str, workspace: &Workspace, cols: usize, rows: usize) -> Tab {
         program_pid: None,
         remote: None,
         told_focus: false,
+        last_probe: None,
+        probe_owed: false,
+        seen: None,
     }
 }
 
@@ -331,16 +336,27 @@ impl Scene {
     }
 
     /// What `poll_terminal` does on a wake, as far as drawing goes: every
-    /// session's wake drained, and a redraw asked for when any printed,
-    /// whether or not its screen is the one showing.
-    fn poll_terminal(&self) -> bool {
-        let mut changed = false;
-        for tab in &self.terminal.tabs {
-            if tab.session.drain_wake() {
-                changed = true;
+    /// session's wake drained; output on screen redraws, output off screen
+    /// only for a change in what is shown of its tab, paced as the window
+    /// paces it. A change held back is drawn here once due, where the
+    /// window has a timer for it. Returns whether a frame is drawn.
+    fn poll_terminal(&mut self) -> bool {
+        let now = Instant::now();
+        let visible = self.terminal.visible(true);
+        let (mut shown, mut changed) = (false, false);
+        for (index, tab) in self.terminal.tabs.iter_mut().enumerate() {
+            if !tab.session.drain_wake() {
+                continue;
             }
+            let was = tab.activity();
+            tab.last_output = Some(now);
+            let on_screen = visible.contains(&index);
+            shown |= on_screen;
+            changed |= tab.face_changed(was) && !on_screen;
         }
-        changed
+        let pace = &mut self.terminal.pace;
+        let due = pace.take_due(now);
+        pace.decide(shown, changed, now) == terminal::When::Now || due
     }
 }
 
@@ -495,9 +511,12 @@ fn main() {
     for i in 0..N {
         // Between keystrokes, each background terminal prints a line on
         // its own, and each wake is a `poll_terminal`; every redraw it asks
-        // for is a frame drawn, nothing on it changed.
+        // for is a frame drawn. Before the pace, each wake asked for one.
         for (n, &index) in scene.streaming.clone().iter().enumerate() {
-            let line = format!("   Compiling sprout-{n} v0.{i}.0\r\n");
+            let mut line = format!("   Compiling sprout-{n} v0.{i}.0\r\n");
+            if i % 10 == 0 {
+                line.push_str(&format!("\x1b]0;sprout-{n} step {i}\x07"));
+            }
             if scene.terminal.tabs[index].session.feed(line.as_bytes()) {
                 wakes += 1;
                 if scene.poll_terminal() {
@@ -545,9 +564,13 @@ fn main() {
     report("encode + GPU wait", gpu);
     report("keystroke to frame", full.clone());
     if options.hidden_streaming > 0 {
+        // A change still held back at the end is drawn when its time comes.
+        if scene.terminal.pace.due.is_some() {
+            redraws += 1;
+        }
         println!(
-            "\nbackground  {wakes} wakes from {} hidden terminals, {redraws} redraws asked \
-             for by poll_terminal ({:.1} per keystroke), none of them visible",
+            "\nbackground  {wakes} wakes from {} hidden terminals: {wakes} redraws asked for \
+             before the pace (one a wake), {redraws} now ({:.2} per keystroke)",
             options.hidden_streaming,
             redraws as f64 / N as f64
         );

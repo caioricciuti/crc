@@ -7,6 +7,7 @@
 //! lines, so box drawing joins up: `claude` draws its input in a box.
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use crate::project::icons;
 use crate::render::font::Atlas;
@@ -78,6 +79,14 @@ pub struct Tab {
     /// Whether its program was last told it has the keyboard, for focus
     /// reports (mode 1004) on a change only.
     pub told_focus: bool,
+    /// When its process was last read for where it is and whether it runs
+    /// ssh; see [`Tab::probe`].
+    pub last_probe: Option<Instant>,
+    /// It printed while a read was held back: one is owed.
+    pub probe_owed: bool,
+    /// What was shown of it when its output was last looked at; see
+    /// [`Tab::face_changed`].
+    pub seen: Option<Face>,
 }
 
 /// What a session is doing, as the Agents sidebar shows it.
@@ -197,6 +206,45 @@ impl Tab {
         label(self)
     }
 
+    /// What the sidebar, the inspector, Home and the tab strip show of it.
+    pub fn face(&self) -> Face {
+        Face {
+            activity: self.activity(),
+            attention: self.attention.is_some(),
+            status: self.status.as_ref().map(|s| (s.state, s.text())),
+            state: self.state(),
+            name: self.name(),
+        }
+    }
+
+    /// Whether what is shown of it changed since its output was last
+    /// looked at, `was` its activity before its newest output: a title,
+    /// a status or a ring arrives with the output, so what came before is
+    /// what was remembered. Remembered again for the next look.
+    pub fn face_changed(&mut self, was: Activity) -> bool {
+        let face = self.face();
+        let changed = was != face.activity || self.seen.as_ref() != Some(&face);
+        self.seen = Some(face);
+        changed
+    }
+
+    /// Whether its process may be read now (its cwd, its ssh): at most
+    /// every [`PROBE_EVERY`], as output can wake the window hundreds of
+    /// times a second. One held back is owed, at the time returned.
+    pub fn probe(&mut self, now: Instant) -> When {
+        match self.last_probe {
+            Some(at) if now.saturating_duration_since(at) < PROBE_EVERY => {
+                self.probe_owed = true;
+                When::At(at + PROBE_EVERY)
+            }
+            _ => {
+                self.last_probe = Some(now);
+                self.probe_owed = false;
+                When::Now
+            }
+        }
+    }
+
     /// The title without the review count, for naming its session.
     pub fn base_name(&self) -> String {
         title_of(self)
@@ -234,6 +282,8 @@ pub struct Panel {
     /// Two sessions side by side, left and right, in Agents mode. The
     /// active one is the pane with the keyboard.
     pub pair: Option<(usize, usize)>,
+    /// Redraws asked for by tabs not on screen, paced.
+    pub pace: Pace,
     /// A press reported to a program that asked for the mouse: its tab,
     /// the button, and the cell (row, column) last reported, which motion
     /// and the release follow wherever the pointer goes.
@@ -259,6 +309,7 @@ impl Default for Panel {
             drag_point: None,
             shown: None,
             pair: None,
+            pace: Pace::default(),
             mouse_press: None,
             mouse_cell: None,
         }
@@ -330,6 +381,18 @@ impl Panel {
         self.selection = None;
     }
 
+    /// The tabs whose screens are drawn: none while the panel is not
+    /// `on_screen`, else the active one, or both of a pair.
+    pub fn visible(&self, on_screen: bool) -> Vec<usize> {
+        if !on_screen || self.tabs.is_empty() {
+            return Vec::new();
+        }
+        match self.shown_pair() {
+            Some((left, right)) => vec![left, right],
+            None => vec![self.active],
+        }
+    }
+
     /// The other pane of the pair gets the keyboard.
     pub fn focus_other(&mut self) {
         if let Some((left, right)) = self.shown_pair() {
@@ -376,6 +439,93 @@ impl Panel {
         }
         self.back = 0;
         self.selection = None;
+    }
+}
+
+/// The least time between redraws that only tabs off screen ask for.
+pub const BACKGROUND_EVERY: Duration = Duration::from_millis(100);
+/// The least time between two reads of a tab's process.
+pub const PROBE_EVERY: Duration = Duration::from_millis(500);
+
+/// What is shown of a tab when its screen is not: a change in it is what
+/// output off screen redraws for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Face {
+    pub activity: Activity,
+    pub attention: bool,
+    pub status: Option<(term::status::State, String)>,
+    pub state: String,
+    pub name: String,
+}
+
+/// When something is done: now, at a time, or not at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum When {
+    Now,
+    At(Instant),
+    Never,
+}
+
+/// The pace of redraws for output in tabs off screen: one at most every
+/// [`BACKGROUND_EVERY`], and one held back drawn when its time comes.
+#[derive(Default, Debug)]
+pub struct Pace {
+    /// When a change off screen last drew.
+    drew: Option<Instant>,
+    /// A change held back, to draw then.
+    pub due: Option<Instant>,
+    /// When the settle scheduled runs, while one is.
+    pub armed: Option<Instant>,
+}
+
+impl Pace {
+    /// Whether output draws now, later or not at all: `visible` when a tab
+    /// on screen printed, `changed` when one off screen changed its
+    /// [`Face`] or what the window says of it. Output off screen that
+    /// changed nothing shown draws nothing.
+    pub fn decide(&mut self, visible: bool, changed: bool, now: Instant) -> When {
+        if visible {
+            // The frame shows every change held back too.
+            self.due = None;
+            return When::Now;
+        }
+        if !changed {
+            return When::Never;
+        }
+        match self.drew {
+            Some(at) if now.saturating_duration_since(at) < BACKGROUND_EVERY => {
+                let due = at + BACKGROUND_EVERY;
+                self.due = Some(self.due.map_or(due, |d| d.min(due)));
+                When::At(due)
+            }
+            _ => {
+                self.drew = Some(now);
+                self.due = None;
+                When::Now
+            }
+        }
+    }
+
+    /// Whether a held-back change is due by `now`, once.
+    pub fn take_due(&mut self, now: Instant) -> bool {
+        match self.due {
+            Some(due) if due <= now => {
+                self.due = None;
+                self.drew = Some(now);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a settle at `at` has to be scheduled: none is, or the one
+    /// that is runs later.
+    pub fn arm(&mut self, at: Instant) -> bool {
+        if self.armed.is_some_and(|armed| armed <= at) {
+            return false;
+        }
+        self.armed = Some(at);
+        true
     }
 }
 
@@ -1183,6 +1333,129 @@ mod tests {
         let after = find(&t, "needle", Options::default());
         assert!(after[0].start.0 > line);
         assert_eq!(after[0].start.0, t.view_line(0, 0));
+    }
+
+    fn tab() -> Tab {
+        Tab {
+            session: Session::offline(20, 4).expect("a socket pair"),
+            title: "plot".into(),
+            claude: false,
+            launch: Launch {
+                program: "/bin/sh".into(),
+                args: Vec::new(),
+                cwd: PathBuf::from("/srv/plot"),
+                env: Vec::new(),
+                unset: Vec::new(),
+            },
+            attention: None,
+            last_output: None,
+            review: PathBuf::new(),
+            events_read: 0,
+            review_files: 0,
+            folder: PathBuf::from("/srv/plot"),
+            workspace: None,
+            alive: std::sync::Arc::new(()),
+            held: None,
+            status: None,
+            cwd: PathBuf::from("/srv/plot"),
+            program_pid: None,
+            remote: None,
+            told_focus: false,
+            last_probe: None,
+            probe_owed: false,
+            seen: None,
+        }
+    }
+
+    /// Output in `tab` as the window takes it: the screen has it, then
+    /// the window looks.
+    fn print(tab: &mut Tab, bytes: &[u8], now: Instant) -> bool {
+        tab.session.feed(bytes);
+        let was = tab.activity();
+        tab.last_output = Some(now);
+        tab.face_changed(was)
+    }
+
+    #[test]
+    fn output_off_screen_draws_only_what_it_changed() {
+        let now = Instant::now();
+        let mut tab = tab();
+        let mut pace = Pace::default();
+        // Idle to working is shown in its row.
+        let changed = print(&mut tab, b"   Compiling turnip v0.1.0\r\n", now);
+        assert!(changed);
+        assert_eq!(pace.decide(false, changed, now), When::Now);
+        // More output while it works: nothing shown changed.
+        let later = now + BACKGROUND_EVERY * 2;
+        let changed = print(&mut tab, b"   Compiling turnip v0.2.0\r\n", later);
+        assert!(!changed);
+        assert_eq!(pace.decide(false, changed, later), When::Never);
+        // A title that came with the output is a change, and so is a ring.
+        assert!(print(&mut tab, b"\x1b]0;radish\x07", later));
+        assert!(!print(&mut tab, b"radish\r\n", later));
+        tab.attention = Some(String::new());
+        assert!(print(&mut tab, b"\x07", later));
+        // Working again after it went quiet, with nothing else new.
+        tab.attention = None;
+        tab.face_changed(tab.activity());
+        tab.last_output = Some(now - Duration::from_secs(10));
+        assert!(print(&mut tab, b"x", later));
+    }
+
+    #[test]
+    fn output_on_screen_always_draws() {
+        let now = Instant::now();
+        let mut pace = Pace::default();
+        assert_eq!(pace.decide(false, true, now), When::Now);
+        assert_eq!(
+            pace.decide(true, false, now + Duration::from_millis(1)),
+            When::Now
+        );
+        let mut panel = Panel {
+            tabs: vec![tab(), tab(), tab()],
+            active: 1,
+            ..Panel::default()
+        };
+        assert_eq!(panel.visible(false), Vec::<usize>::new());
+        assert_eq!(panel.visible(true), vec![1]);
+        panel.pair = Some((0, 1));
+        assert_eq!(panel.visible(true), vec![0, 1]);
+    }
+
+    #[test]
+    fn changes_off_screen_draw_ten_times_a_second_and_the_last_is_kept() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut pace = Pace::default();
+        assert_eq!(pace.decide(false, true, t0), When::Now);
+        // Within the interval: held back, to the end of it.
+        assert_eq!(pace.decide(false, true, at(30)), When::At(at(100)));
+        assert_eq!(pace.decide(false, true, at(60)), When::At(at(100)));
+        assert_eq!(pace.due, Some(at(100)));
+        assert!(!pace.take_due(at(99)));
+        assert!(pace.take_due(at(100)), "the change held back draws");
+        assert!(!pace.take_due(at(101)), "once");
+        assert_eq!(pace.decide(false, true, at(150)), When::At(at(200)));
+        // A frame for a tab on screen draws it too.
+        assert_eq!(pace.decide(true, false, at(160)), When::Now);
+        assert_eq!(pace.due, None);
+        assert_eq!(pace.decide(false, true, at(210)), When::Now);
+        // A settle already scheduled earlier covers a later one.
+        assert!(pace.arm(at(300)));
+        assert!(!pace.arm(at(400)));
+        assert!(pace.arm(at(250)));
+    }
+
+    #[test]
+    fn a_process_is_read_twice_a_second_at_most() {
+        let t0 = Instant::now();
+        let mut tab = tab();
+        assert_eq!(tab.probe(t0), When::Now);
+        let later = tab.probe(t0 + Duration::from_millis(100));
+        assert_eq!(later, When::At(t0 + PROBE_EVERY));
+        assert!(tab.probe_owed);
+        assert_eq!(tab.probe(t0 + PROBE_EVERY), When::Now);
+        assert!(!tab.probe_owed);
     }
 
     fn hit(line: u64, col: usize) -> Hit {
