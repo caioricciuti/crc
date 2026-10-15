@@ -4,6 +4,13 @@ One entry per tag, written for people who use the editor.
 
 ## Unreleased
 
+- Agents mode no longer lags with several repositories and their issues
+  in the inspector. Cutting a long issue title to fit measured it once
+  per character and overflowed the text cache, which then emptied
+  itself every frame: with six repositories a frame took about 186 ms.
+  Titles are now measured once, the cache keeps half when it overflows,
+  and it learns when a frame starts in every mode. The same frame takes
+  under 3 ms.
 - crc opens on Agents mode, with a shell ready in the selected
   workspace. Opening a file or folder with it still opens the editor.
 - Source Control: the commit message completes conventional-commit

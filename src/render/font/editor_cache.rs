@@ -33,8 +33,18 @@ impl<K: std::hash::Hash + Eq> RecentCache<K> {
         if self.lines.len() >= self.limit {
             self.lines.retain(|_, (_, used)| *used + 1 >= frame);
             // Everything is in use: a page with more than the limit on it.
+            // What was used only last frame goes, then any half; clearing
+            // it all made one crowded frame shape everything again.
             if self.lines.len() >= self.limit {
-                self.lines.clear();
+                self.lines.retain(|_, (_, used)| *used >= frame);
+            }
+            if self.lines.len() >= self.limit {
+                let mut kept = 0;
+                let keep = self.limit / 2;
+                self.lines.retain(|_, _| {
+                    kept += 1;
+                    kept <= keep
+                });
             }
         }
         self.lines.insert(key, (line, frame));
@@ -242,5 +252,32 @@ impl Atlas {
         }
         self.cached_utf16 += shaped.offsets.len();
         shaped
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_frame_over_the_limit_keeps_half_rather_than_nothing() {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let line = atlas.shape_ui("x").expect("shaped");
+        let mut cache = RecentCache::new(8);
+        for n in 0..8 {
+            cache.insert(n, line.clone(), 5);
+        }
+        // All eight used this frame: room is made without forgetting all.
+        cache.insert(8, line.clone(), 5);
+        assert_eq!(cache.lines.len(), 5);
+        assert!(cache.get(&8, 5).is_some());
+        // What a later frame did not use goes first, whole.
+        for n in 0..3 {
+            cache.insert(100 + n, line.clone(), 7);
+        }
+        assert_eq!(cache.lines.len(), 8);
+        cache.insert(200, line.clone(), 7);
+        assert_eq!(cache.lines.len(), 4);
+        assert!((100..103).all(|n| cache.get(&n, 7).is_some()));
     }
 }

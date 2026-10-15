@@ -145,6 +145,10 @@ impl EditorView {
         if viewport.width <= 0.0 || viewport.height <= 0.0 {
             return None;
         }
+        // The atlas's frame, once, whatever the window shows. Left to the
+        // editor's build, Agents mode and the full-column pages never
+        // advanced it, and every cached label looked used this frame.
+        renderer.atlas.begin_frame();
 
         let query = find
             .as_ref()
@@ -359,7 +363,9 @@ impl EditorView {
                 .as_ref()
                 .map(|found| found.iter().map(|m| m.range.clone()).collect())
                 .unwrap_or_default();
-            let stats = layout::build_full_search(
+            // build_full_search less its begin_frame: the frame began above.
+            glyphs.clear();
+            let stats = layout::build_text_appending(
                 buffer,
                 &mut renderer.atlas,
                 editor_rect,
@@ -369,6 +375,7 @@ impl EditorView {
                 find.as_ref().map(|_| ranges.as_slice()),
                 spans,
                 &markdown,
+                true,
                 carets_on,
                 glyphs,
             );

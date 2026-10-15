@@ -1613,15 +1613,21 @@ pub(crate) fn fit(atlas: &mut Atlas, s: &str, width: f32) -> String {
         return s.to_owned();
     }
     let chars: Vec<char> = s.chars().collect();
-    let mut n = chars.len();
-    while n > 0 {
-        n -= 1;
-        let cut: String = chars[..n].iter().collect::<String>() + "\u{2026}";
-        if layout::ui_text_width(atlas, &cut) <= width {
-            return cut;
-        }
+    if chars.is_empty() {
+        return String::new();
     }
-    String::new()
+    // A UI width counts 120 characters, so a longer cut measures as the
+    // whole string did, and does not fit either.
+    let top = (chars.len() - 1).min(119);
+    let ellipsis = layout::ui_text_width(atlas, "\u{2026}");
+    let guess: Vec<f32> = match caret_xs(atlas, &chars[..=top]) {
+        Some(x) => (0..=top).rev().map(|n| x[n].0 + ellipsis).collect(),
+        None => vec![f32::NEG_INFINITY; top + 1],
+    };
+    first_fitting(atlas, width, &guess, |i| {
+        chars[..top - i].iter().collect::<String>() + "\u{2026}"
+    })
+    .unwrap_or_default()
 }
 
 /// `s`, cut from its start with an ellipsis to fit `width`: for a path,
@@ -1632,13 +1638,106 @@ pub(crate) fn fit_start(atlas: &mut Atlas, s: &str, width: f32) -> String {
         return s.to_owned();
     }
     let chars: Vec<char> = s.chars().collect();
-    for n in 1..chars.len() {
-        let cut: String = "\u{2026}".to_owned() + &chars[n..].iter().collect::<String>();
-        if layout::ui_text_width(atlas, &cut) <= width {
-            return cut;
+    if chars.len() < 2 {
+        return String::new();
+    }
+    let ellipsis = layout::ui_text_width(atlas, "\u{2026}");
+    // What is measured of a cut is its first 120 characters, the ellipsis
+    // and 119 of the rest.
+    let guess: Vec<f32> = match caret_xs(atlas, &chars) {
+        Some(x) => (1..chars.len())
+            .map(|n| ellipsis + x[(n + 119).min(chars.len())].0 - x[n].1)
+            .collect(),
+        None => vec![f32::NEG_INFINITY; chars.len() - 1],
+    };
+    first_fitting(atlas, width, &guess, |i| {
+        "\u{2026}".to_owned() + &chars[i + 1..].iter().collect::<String>()
+    })
+    .unwrap_or_default()
+}
+
+/// The caret x before each of `chars` and after the last, from the string
+/// shaped once, if it can be. Inside a grapheme (an emoji sequence, a
+/// base and its marks) a cut shapes as something else, often narrower, so
+/// there it is a range: the x where the grapheme starts and where the next
+/// one does.
+///
+/// Not for right-to-left text: a UI width is the caret x at the end,
+/// which there is not the width at all, so every cut is measured.
+fn caret_xs(atlas: &mut Atlas, chars: &[char]) -> Option<Vec<(f32, f32)>> {
+    let rtl = |c: &char| {
+        matches!(*c as u32,
+            0x0590..=0x08ff | 0xfb1d..=0xfdff | 0xfe70..=0xfeff | 0x10800..=0x10fff
+            | 0x1e800..=0x1efff | 0x200f | 0x202b | 0x202e | 0x2067)
+    };
+    if chars.iter().any(rtl) {
+        return None;
+    }
+    let s: String = chars.iter().collect();
+    let line = atlas.shape_ui(&s)?;
+    let composed = objc2_foundation::NSString::from_str(&s);
+    let mut utf16 = 0;
+    let mut x = Vec::with_capacity(chars.len() + 1);
+    let mut start = 0.0;
+    for c in chars {
+        let at = line.caret_offset(utf16);
+        if composed
+            .rangeOfComposedCharacterSequenceAtIndex(utf16)
+            .location
+            == utf16
+        {
+            start = at;
+            x.push((at, at));
+        } else {
+            x.push((start, f32::NAN));
+        }
+        utf16 += c.len_utf16();
+    }
+    let mut next = line.caret_offset(utf16);
+    x.push((next, next));
+    for edge in x.iter_mut().rev() {
+        if edge.1.is_nan() {
+            edge.1 = next;
+        } else {
+            next = edge.1;
         }
     }
-    String::new()
+    Some(x)
+}
+
+/// The first of the cuts `cut(0)`, `cut(1)`, ... that measures no wider
+/// than `width`, as measuring each in turn finds it, measuring few: the
+/// search starts at the first whose `guess`, its width from the whole
+/// string's glyph advances, fits, and steps from there while measured
+/// widths disagree. The guess is off only by kerning and shaping across
+/// the cut, well under `SLACK`; a guess of minus infinity measures every
+/// cut in turn.
+fn first_fitting(
+    atlas: &mut Atlas,
+    width: f32,
+    guess: &[f32],
+    cut: impl Fn(usize) -> String,
+) -> Option<String> {
+    const SLACK: f32 = 2.0;
+    let fits = |atlas: &mut Atlas, i: usize| {
+        let c = cut(i);
+        (layout::ui_text_width(atlas, &c) <= width).then_some(c)
+    };
+    let mut i = guess
+        .iter()
+        .position(|&w| w <= width)
+        .unwrap_or(guess.len().checked_sub(1)?);
+    match fits(atlas, i) {
+        Some(mut found) => {
+            while i > 0 && guess[i - 1] <= width + SLACK {
+                let Some(c) = fits(atlas, i - 1) else { break };
+                found = c;
+                i -= 1;
+            }
+            Some(found)
+        }
+        None => (i + 1..guess.len()).find_map(|j| fits(atlas, j)),
+    }
 }
 
 /// `s` in lines no wider than `width`, broken between words; a word wider
@@ -1898,6 +1997,129 @@ mod tests {
             inspector
                 .report(Some(&[PathBuf::from("/w/feat")]))
                 .ends_with(" issues=1:rows=1")
+        );
+    }
+
+    /// `fit` as it was, measuring every shorter cut in turn: the oracle.
+    fn fit_by_measuring(atlas: &mut Atlas, s: &str, width: f32) -> String {
+        let width = width + 0.5;
+        if layout::ui_text_width(atlas, s) <= width {
+            return s.to_owned();
+        }
+        let chars: Vec<char> = s.chars().collect();
+        let mut n = chars.len();
+        while n > 0 {
+            n -= 1;
+            let cut: String = chars[..n].iter().collect::<String>() + "\u{2026}";
+            if layout::ui_text_width(atlas, &cut) <= width {
+                return cut;
+            }
+        }
+        String::new()
+    }
+
+    /// `fit_start` as it was: the oracle.
+    fn fit_start_by_measuring(atlas: &mut Atlas, s: &str, width: f32) -> String {
+        let width = width + 0.5;
+        if layout::ui_text_width(atlas, s) <= width {
+            return s.to_owned();
+        }
+        let chars: Vec<char> = s.chars().collect();
+        for n in 1..chars.len() {
+            let cut: String = "\u{2026}".to_owned() + &chars[n..].iter().collect::<String>();
+            if layout::ui_text_width(atlas, &cut) <= width {
+                return cut;
+            }
+        }
+        String::new()
+    }
+
+    const SAMPLES: [&str; 12] = [
+        "Seed tray 12 drains too slowly after a long watering",
+        "/srv/garden/seedling/src/beds/north/tray-watering-schedule.rs",
+        "trellis: the harvest log loses the weights it was given after a long dry week, \
+         seen again on bed 13, and again on bed 40 when the frost came early that year",
+        "\u{82d7}\u{5e8a}\u{306e}\u{6c34}\u{306f}\u{3051}\u{304c}\u{9045}\u{3059}\u{304e}\
+         \u{308b}\u{554f}\u{984c}\u{3092}\u{9577}\u{3044}\u{4e7e}\u{71e5}\u{306e}\u{5f8c}",
+        "Harvest \u{1f345}\u{1f955}\u{1f33d} log \u{1f469}\u{200d}\u{1f33e} and \
+         \u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467} flags \u{1f1f5}\u{1f1f9}\u{1f1e7}\u{1f1f7} \
+         thumbs \u{1f44d}\u{1f3fd} sun \u{2600}\u{fe0f} done",
+        "Cafe\u{301} compost tempe\u{301}rature nai\u{308}ve reads stay at zero \
+         a\u{30a}\u{301}\u{323} stacked",
+        "office affluent flowers ffl ligatures in the trellis report",
+        "\u{915}\u{94d}\u{937}\u{947}\u{924}\u{94d}\u{930} \u{938}\u{93f}\u{902}\u{91a}\u{93e}\
+         \u{908} \u{915}\u{93e} \u{938}\u{92e}\u{92f}",
+        "mulch \u{5d2}\u{5df}\u{20}\u{5d4}\u{5d9}\u{5e8}\u{5e7} bed \u{633}\u{62c}\u{644} \
+         \u{627}\u{644}\u{62d}\u{635}\u{627}\u{62f} twelve",
+        "x",
+        "",
+        "AVAVAVA WAWAWA To Ty Yo kerning pairs and more text after them",
+    ];
+
+    /// Every width a cut of `s` lands exactly on, a hair either side, and a
+    /// coarse sweep.
+    fn widths(atlas: &mut Atlas, s: &str) -> Vec<f32> {
+        let chars: Vec<char> = s.chars().collect();
+        let mut out: Vec<f32> = (-2..60).map(|n| n as f32 * 5.0).collect();
+        for n in 0..=chars.len() {
+            let head: String = chars[..n].iter().collect::<String>() + "\u{2026}";
+            let tail: String = "\u{2026}".to_owned() + &chars[n..].iter().collect::<String>();
+            for cut in [head, tail] {
+                let w = layout::ui_text_width(atlas, &cut);
+                out.extend([w - 0.5, w - 0.501, w - 0.499]);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn fit_cuts_where_measuring_every_cut_did() {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        // Past the 120 characters a UI width counts, and a sidebar line.
+        let long = [
+            "\u{82d7}\u{5e8a}\u{306e}\u{6c34}".repeat(34),
+            format!("/srv/garden/{}/tray.rs", "north-bed/".repeat(14)),
+            "4 terminals \u{b7} 2 ahead \u{b7} garden-watering-schedule-rework".to_owned(),
+        ];
+        for s in SAMPLES.into_iter().chain(long.iter().map(String::as_str)) {
+            for width in widths(&mut atlas, s) {
+                atlas.begin_frame();
+                assert_eq!(
+                    fit(&mut atlas, s, width),
+                    fit_by_measuring(&mut atlas, s, width),
+                    "fit {s:?} into {width}"
+                );
+                assert_eq!(
+                    fit_start(&mut atlas, s, width),
+                    fit_start_by_measuring(&mut atlas, s, width),
+                    "fit_start {s:?} into {width}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fit_shapes_a_label_a_few_times_not_once_a_character() {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let title = SAMPLES[2];
+        let before = atlas.ui_shapes();
+        let cut = fit(&mut atlas, title, 180.0);
+        assert!(
+            cut.ends_with('\u{2026}') && cut.len() < title.len(),
+            "{cut}"
+        );
+        assert!(
+            atlas.ui_shapes() - before <= 4,
+            "{}",
+            atlas.ui_shapes() - before
+        );
+        let before = atlas.ui_shapes();
+        let cut = fit_start(&mut atlas, SAMPLES[1], 120.0);
+        assert!(cut.starts_with('\u{2026}'), "{cut}");
+        assert!(
+            atlas.ui_shapes() - before <= 4,
+            "{}",
+            atlas.ui_shapes() - before
         );
     }
 }
