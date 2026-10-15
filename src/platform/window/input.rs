@@ -896,6 +896,7 @@ impl EditorView {
                 Focus::Document => inserted_text(text),
                 Focus::Goto => text.chars().filter(char::is_ascii_digit).collect(),
                 Focus::FindQuery | Focus::Field => single_line(text),
+                Focus::Message => message_text(text),
             };
             if text.is_empty() {
                 return;
@@ -924,7 +925,7 @@ impl EditorView {
                 self.lsp_after_key(true);
                 self.lsp_typed(text);
             }
-            Focus::Goto => {}
+            Focus::Goto | Focus::Message => {}
         }
         focus
     }
@@ -976,7 +977,7 @@ impl EditorView {
             Keys::Rename => rename
                 .as_mut()
                 .map(|rename| (&mut rename.field, Focus::Field)),
-            Keys::GitMessage => Some((&mut git.message, Focus::Field)),
+            Keys::GitMessage => Some((&mut git.message, Focus::Message)),
             Keys::Goto => goto.as_mut().map(|field| (field, Focus::Goto)),
             Keys::Palette => palette.as_mut().map(|(query, _)| (query, Focus::Field)),
             Keys::FindQuery => find.as_mut().map(|bar| (&mut bar.query, Focus::FindQuery)),
@@ -998,7 +999,7 @@ impl EditorView {
         match focus {
             Focus::Document => return self.after_edit(),
             Focus::FindQuery => self.refresh_find(),
-            Focus::Goto => {}
+            Focus::Goto | Focus::Message => {}
             Focus::Field => {
                 // A different palette query invalidates the selected row.
                 let Some(mut state) = self.state_mut() else {

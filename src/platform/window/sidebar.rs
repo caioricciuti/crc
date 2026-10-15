@@ -180,11 +180,11 @@ impl EditorView {
     /// A click inside the source-control column. Returns whether it landed on
     /// something; the caller falls through to the file tree otherwise.
     pub(super) fn git_click(&self, column: Viewport, x: f32, y: f32) -> bool {
-        use crate::platform::git_panel::{Entry, Group, Sidebar};
+        use crate::platform::git_panel::{Entry, Group};
         let Some(mut state) = self.state_mut() else {
             return false;
         };
-        let g = Sidebar::new(column);
+        let g = state.git.sidebar(column);
         let mut handled = true;
         let mut conflict_file = None;
         let mut open_file = None;
@@ -225,11 +225,8 @@ impl EditorView {
         } else if g.message.contains(x, y) {
             state.git_focus = true;
             let State { git, renderer, .. } = &mut *state;
-            place_field_caret(
-                &mut renderer.atlas,
-                &mut git.message,
-                x - g.message.x - crate::platform::git_panel::MESSAGE_PAD,
-            );
+            let at = git.message_byte_at(&mut renderer.atlas, g, x, y);
+            git.message.place_cursor(at, Motion::Move);
         } else if let Some((entry, rect)) = state.git.entry_at(g, x, y) {
             match entry {
                 // A conflict is resolved in the file, not read as a diff.
@@ -382,7 +379,29 @@ impl EditorView {
                 }
                 return true;
             }
-            key::RETURN => return true,
+            // Return and Shift-Return break the line, typed in like any
+            // other text; Cmd-Return committed above.
+            key::RETURN => {
+                drop(state);
+                self.commit_text("\n", NSRange::new(NSNotFound as usize, 0));
+                self.resume_display_link();
+                return true;
+            }
+            key::UP | key::DOWN
+                if !flags.contains(NSEventModifierFlags::Option)
+                    && !flags.contains(NSEventModifierFlags::Control) =>
+            {
+                let motion = if flags.contains(NSEventModifierFlags::Shift) {
+                    Motion::Extend
+                } else {
+                    Motion::Move
+                };
+                if code == key::UP {
+                    state.git.message.move_up(motion);
+                } else {
+                    state.git.message.move_down(motion);
+                }
+            }
             code if field_key(&mut state.git.message, code, flags) => {}
             _ => {
                 drop(state);

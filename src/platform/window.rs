@@ -242,6 +242,15 @@ fn single_line(text: &str) -> String {
     typed_text(text.lines().next().unwrap_or(""))
 }
 
+/// Text for the commit message: its lines kept, without control
+/// characters. A lone line break is Return.
+fn message_text(text: &str) -> String {
+    text.split('\n')
+        .map(typed_text)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Makes a held key repeat, rather than open the accent menu.
 ///
 /// Being a real text input client is what makes dead keys and input methods
@@ -596,6 +605,8 @@ enum Focus {
     Goto,
     /// The replacement field or the palette query.
     Field,
+    /// The commit message, which holds several lines.
+    Message,
 }
 
 /// Whether to log scroll events. Checked once: an env lookup per scroll
@@ -2768,7 +2779,7 @@ define_class!(
                     let Some(mut state) = self.state_mut() else {
                         return;
                     };
-                    let g = crate::platform::git_panel::Sidebar::new(chrome.sidebar.unwrap_or(chrome.text));
+                    let g = state.git.sidebar(chrome.sidebar.unwrap_or(chrome.text));
                     if lines != 0 {
                         state.git.scroll(lines, g.list.contains(x, y), g, chrome.text);
                     }
@@ -4474,6 +4485,7 @@ define_class!(
                     Focus::Document => text,
                     Focus::Goto => text.chars().filter(char::is_ascii_digit).collect(),
                     Focus::FindQuery | Focus::Field => single_line(&text),
+                    Focus::Message => message_text(&text),
                 };
                 if !text.is_empty() {
                     b.insert(&text);
@@ -7228,7 +7240,7 @@ fn frame_of(state: &mut State) -> Frame {
             },
         );
         if *git_open && extensions.is_none() && !agents.on {
-            let g = crate::platform::git_panel::Sidebar::new(rect);
+            let g = git.sidebar(rect);
             frame.push(Hit::GitBranch, g.branch);
             if git.repo.is_some() {
                 frame.push(Hit::GitRepo, g.repo);
@@ -9608,7 +9620,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
 #[cfg(test)]
 mod tests {
     use super::{
-        caret_phase, inserted_text, rename_field, single_line, spawn_project_index,
+        caret_phase, inserted_text, message_text, rename_field, single_line, spawn_project_index,
         spawn_project_refresh, typed_text,
     };
     use std::time::Duration;
@@ -9784,6 +9796,12 @@ mod tests {
         assert_eq!(single_line("tab\there\r\n"), "tabhere");
         assert_eq!(single_line(""), "");
         assert_eq!(single_line("\nsecond"), "");
+        assert_eq!(message_text("\n"), "\n");
+        assert_eq!(
+            message_text("feat: x\r\n\nbody\tline"),
+            "feat: x\n\nbodyline"
+        );
+        assert_eq!(message_text("plain"), "plain");
     }
 
     /// A borrow written as the scrutinee of `if let`, `while let` or `match`

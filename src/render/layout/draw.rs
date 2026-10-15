@@ -225,6 +225,55 @@ pub fn push_ui_text(
     }
 }
 
+/// Draws a line shaped with [`Atlas::shape_ui`] in `rect`, moved `scroll`
+/// points left and clipped to it, each glyph coloured by `color` of the
+/// source byte it came from: a field wider than its box, tinted in parts.
+pub fn push_ui_line(
+    out: &mut Vec<GlyphInstance>,
+    atlas: &mut Atlas,
+    rect: Viewport,
+    line: &crate::render::font::ShapedLine,
+    scroll: f32,
+    color: impl Fn(usize) -> [f32; 4],
+) {
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
+    }
+    let m = atlas.metrics;
+    let (cw, ch) = atlas.cell_size();
+    for glyph in &line.glyphs {
+        let x = glyph.x - scroll;
+        // Two cells of slack on the left for a glyph that starts out of
+        // view and ends in it.
+        if x > rect.width || x < -cw * 2.0 {
+            continue;
+        }
+        let Some(slot) = atlas.slot_for_shaped(line, glyph) else {
+            continue;
+        };
+        let byte = line
+            .source_bytes
+            .get(glyph.source_utf16)
+            .copied()
+            .unwrap_or(0);
+        let mut quad = GlyphInstance {
+            pos: [
+                m.snap(rect.x + x + slot.dx),
+                rect.y + m.glyph_dy(rect.height),
+            ],
+            size: [cw * slot.cells as f32, ch],
+            uv: slot.uv,
+            flags: slot.flags(),
+            color: color(byte),
+            ..Default::default()
+        };
+        clip_horizontal(&mut quad, rect.x, rect.x + rect.width);
+        if quad.size[0] > 0.0 {
+            out.push(quad);
+        }
+    }
+}
+
 /// The advance width of a UI label, in points.
 pub fn ui_text_width(atlas: &mut Atlas, text: &str) -> f32 {
     let bounded: String = text.chars().take(120).collect();

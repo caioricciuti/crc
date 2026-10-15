@@ -4,6 +4,17 @@ One entry per tag, written for people who use the editor.
 
 ## Unreleased
 
+- Source Control: the commit message can have a body. Return or
+  Shift-Return starts a new line, and Cmd-Return still commits. The
+  field grows a line at a time up to eight lines, then scrolls, and the
+  buttons and the file list move down with it. Up and Down move between
+  lines and a click puts the caret on the line clicked. A long line
+  scrolls sideways by its measured width, so the caret at the end of a
+  long subject now shows the end of it. Once there is a body, a faint
+  line marks the 72nd column and body lines longer than 72 characters
+  turn amber past it; a body written straight under the subject, with no
+  blank line between, is marked too. Amend fills in HEAD's whole
+  message, body included.
 - Source Control: the diff has a cursor. Click a line, or move with Up
   and Down; shift-click, Shift-Up or Shift-Down or a drag selects lines.
   Space stages the selected added and removed lines, or the whole hunk

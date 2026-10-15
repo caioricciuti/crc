@@ -96,6 +96,111 @@ pub fn subject_len(message: &str) -> usize {
         .map_or(0, |line| line.chars().count())
 }
 
+/// The column body lines are wrapped at by convention; the field marks it
+/// and tints what runs past it.
+pub const BODY_LIMIT: usize = 72;
+/// Height of one line of the message field.
+pub const MESSAGE_LINE: f32 = 18.0;
+/// Lines the message field grows to before it scrolls.
+pub const MESSAGE_MAX_LINES: usize = 8;
+
+/// The byte ranges of the message's lines, line breaks left out. A
+/// trailing break opens an empty last line, where the caret then sits.
+pub fn message_lines(message: &str) -> Vec<std::ops::Range<usize>> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    for (at, _) in message.match_indices('\n') {
+        lines.push(start..at);
+        start = at + 1;
+    }
+    lines.push(start..message.len());
+    lines
+}
+
+/// The line of `lines` that holds byte `at`.
+pub fn message_line_of(lines: &[std::ops::Range<usize>], at: usize) -> usize {
+    lines
+        .iter()
+        .position(|line| at <= line.end)
+        .unwrap_or(lines.len().saturating_sub(1))
+}
+
+/// How many lines the field shows for `message`: one at least, then one
+/// per line up to [`MESSAGE_MAX_LINES`].
+pub fn message_rows(message: &str) -> usize {
+    (message.matches('\n').count() + 1).min(MESSAGE_MAX_LINES)
+}
+
+/// The first line shown, moved as little as it takes to keep the caret's
+/// line among the `rows` shown and no blank rows below the last line.
+pub fn message_top(top: usize, caret_line: usize, rows: usize, lines: usize) -> usize {
+    let rows = rows.max(1);
+    let top = if caret_line < top {
+        caret_line
+    } else if caret_line >= top + rows {
+        caret_line + 1 - rows
+    } else {
+        top
+    };
+    top.min(lines.saturating_sub(rows))
+}
+
+/// The caret line's sideways scroll, moved to keep the caret at `caret` in
+/// a `width` wide view, and no further right than a line `widest` wide
+/// needs. Past
+/// the right edge it moves as little as it takes; past the left, back to
+/// the lines' starts when the caret fits there, else a quarter in.
+pub fn message_scroll_x(scroll: f32, caret: f32, width: f32, widest: f32) -> f32 {
+    let scroll = if caret < scroll {
+        if caret <= width - 1.0 {
+            0.0
+        } else {
+            caret - width * 0.25
+        }
+    } else if caret > scroll + width - 1.0 {
+        caret - width + 1.0
+    } else {
+        scroll
+    };
+    scroll.min((widest - width + 1.0).max(0.0)).max(0.0)
+}
+
+/// The bytes of body line `line` past [`BODY_LIMIT`] characters, which the
+/// field tints. The subject has its own limit and counter.
+pub fn past_body_limit(message: &str, line: usize) -> Option<std::ops::Range<usize>> {
+    if line == 0 {
+        return None;
+    }
+    let range = message_lines(message).get(line)?.clone();
+    let (at, _) = message[range.clone()].char_indices().nth(BODY_LIMIT)?;
+    Some(range.start + at..range.end)
+}
+
+/// Whether a body follows the subject without the blank line Git and
+/// most tools expect between them.
+pub fn body_needs_blank_line(message: &str) -> bool {
+    message_lines(message)
+        .get(1)
+        .is_some_and(|second| !message[second.clone()].trim().is_empty())
+}
+
+/// The top of the message's first line inside its box, centred in a
+/// one-line field.
+const MESSAGE_BAND: f32 = (layout::UI_CONTROL - MESSAGE_LINE) * 0.5;
+
+/// A message line shaped in the UI font, which shapes 512 bytes at most:
+/// a longer line is shaped up to there and the rest is not drawn.
+fn shape_message_line(
+    atlas: &mut Atlas,
+    line: &str,
+) -> Option<std::rc::Rc<crate::render::font::ShapedLine>> {
+    let mut end = line.len().min(500);
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    atlas.shape_ui(&line[..end])
+}
+
 /// An operation on the worker.
 struct InFlight {
     rx: Receiver<Result<Reply, String>>,
@@ -133,6 +238,11 @@ pub struct Panel {
     /// HEAD's message as Amend put it in the field, so turning Amend off
     /// takes it back out unless it was edited.
     amend_prefill: Option<String>,
+    /// The message field's first line shown, and the line the caret was
+    /// on with its sideways scroll in points, as last drawn: a click lands
+    /// on what is on screen. Only the caret's line scrolls sideways.
+    message_top: std::cell::Cell<usize>,
+    message_scroll: std::cell::Cell<(usize, f32)>,
     pub note: String,
     /// The note says something went right (a commit), not wrong.
     note_success: bool,
@@ -237,7 +347,9 @@ impl Entry {
 /// The header row is the Explorer's: the panel's name (or, in a workspace,
 /// the repository menu) with Refresh and the Git menu at its right. Below
 /// it, one control-height row each: the branch with Pull and Push beside
-/// it, the message, Commit. Then the list, and a status line at the bottom.
+/// it, the message, Commit. The message grows a line at a time with what
+/// is written in it, up to [`MESSAGE_MAX_LINES`], and pushes the rest
+/// down. Then the list, and a status line at the bottom.
 #[derive(Clone, Copy)]
 pub struct Sidebar {
     /// The repository menu, in the title row, in a workspace of several.
@@ -262,7 +374,9 @@ const SYNC_WIDTH: f32 = 44.0;
 const AMEND_WIDTH: f32 = 80.0;
 
 impl Sidebar {
-    pub fn new(column: Viewport) -> Self {
+    /// The layout for a message field showing `message_rows` lines (see
+    /// [`message_rows`]); [`Panel::sidebar`] passes the panel's own.
+    pub fn new(column: Viewport, message_rows: usize) -> Self {
         let x = column.x + layout::UI_INSET;
         let width = (column.width - layout::UI_INSET * 2.0).max(0.0);
         let [refresh, more] = layout::sidebar_header_buttons::<2>(column);
@@ -294,7 +408,7 @@ impl Sidebar {
             x,
             y: branch.y + control + 8.0,
             width,
-            height: control,
+            height: control + MESSAGE_LINE * message_rows.saturating_sub(1) as f32,
         };
         // A narrow column keeps the pencil alone, so Commit keeps its room.
         let amend_width = if width >= AMEND_WIDTH * 2.5 {
@@ -304,7 +418,7 @@ impl Sidebar {
         };
         let amend = Viewport {
             x: x + width - amend_width,
-            y: message.y + control + layout::UI_GAP,
+            y: message.y + message.height + layout::UI_GAP,
             width: amend_width,
             height: control,
         };
@@ -385,6 +499,12 @@ impl Sidebar {
 }
 
 impl Panel {
+    /// Where the panel draws in `column`, with the message field as tall
+    /// as what is written in it.
+    pub fn sidebar(&self, column: Viewport) -> Sidebar {
+        Sidebar::new(column, message_rows(&self.message.rope.to_string()))
+    }
+
     pub fn new(directory: PathBuf) -> Self {
         let mut panel = Self::idle(directory, None);
         panel.refresh();
@@ -406,6 +526,8 @@ impl Panel {
             message: Buffer::new(),
             amend: false,
             amend_prefill: None,
+            message_top: Default::default(),
+            message_scroll: Default::default(),
             note: "Reading repository…".into(),
             note_success: false,
             collapsed: [false; 3],
@@ -1407,6 +1529,234 @@ impl Panel {
         }
     }
 
+    /// The commit message inside its `field`: each line on its row, the
+    /// subject's length at the right of the first, a hairline at the body's
+    /// 72nd column with what runs past it tinted, and the caret kept in
+    /// view both ways.
+    fn draw_message(
+        &self,
+        atlas: &mut Atlas,
+        field: Viewport,
+        focused: bool,
+        theme: &Theme,
+        out: &mut Vec<GlyphInstance>,
+    ) {
+        let full = self.message.rope.to_string();
+        let lines = message_lines(&full);
+        let rows = message_rows(&full);
+        let cursor = self.message.cursor();
+        let caret_line = message_line_of(&lines, cursor);
+        let top = message_top(self.message_top.get(), caret_line, rows, lines.len());
+        self.message_top.set(top);
+        let shown = top..(top + rows).min(lines.len());
+
+        // The subject's length, right-aligned on the first line once there
+        // is a message; the subject clips short of it.
+        let counter = (!full.is_empty()).then(|| {
+            let length = subject_len(&full);
+            let label = format!("{length}/{SUBJECT_LIMIT}");
+            let width = layout::ui_text_width(atlas, &label).ceil();
+            (length, label, width)
+        });
+        let counter_room = counter.as_ref().map_or(0.0, |(_, _, width)| width + 6.0);
+        let body_width = (field.width - MESSAGE_PAD * 2.0).max(0.0);
+        let cut = |line: usize| if line == 0 { counter_room } else { 0.0 };
+        let row = |line: usize| Viewport {
+            x: field.x + MESSAGE_PAD,
+            y: field.y + MESSAGE_BAND + (line - top) as f32 * MESSAGE_LINE,
+            width: (body_width - cut(line)).max(0.0),
+            height: MESSAGE_LINE,
+        };
+        let shaped: Vec<_> = shown
+            .clone()
+            .map(|line| shape_message_line(atlas, &full[lines[line].clone()]))
+            .collect();
+        let x_of = |line: usize, byte: usize| {
+            shaped[line - top]
+                .as_ref()
+                .map_or(0.0, |shaped| shaped.x_of_byte(byte - lines[line].start))
+        };
+        // Sideways by measured width, the caret's line alone, so a long
+        // line shows its end with the caret there and every other line
+        // still reads from its start.
+        let caret_x = x_of(caret_line, cursor);
+        let (scrolled, previous) = self.message_scroll.get();
+        let scroll = message_scroll_x(
+            if scrolled == caret_line {
+                previous
+            } else {
+                0.0
+            },
+            caret_x,
+            row(caret_line).width,
+            x_of(caret_line, lines[caret_line].end),
+        );
+        self.message_scroll.set((caret_line, scroll));
+        let scroll_of = |line: usize| if line == caret_line { scroll } else { 0.0 };
+
+        // A body straight under the subject: Git and most tools read the
+        // first paragraph as the subject. Said, not fixed.
+        if body_needs_blank_line(&full) && shown.contains(&1) {
+            let band = Viewport {
+                x: field.x + 3.0,
+                width: (field.width - 6.0).max(0.0),
+                ..row(1)
+            };
+            let amber = theme.diff_modified;
+            layout::push_rounded_rect(out, band, 3.0, [amber[0], amber[1], amber[2], 0.12]);
+            layout::hotspot(
+                band,
+                layout::Cursor::Text,
+                Some("Leave a blank line between the subject and the body"),
+            );
+        }
+        // The 72nd column, once there is a body to measure against: a
+        // hairline on each body row, where that row's scroll puts it. The
+        // font is proportional, so the column is 72 average advances of
+        // ordinary prose: near the 72nd character of a sentence, while the
+        // tint counts characters exactly.
+        if lines[1..].iter().any(|line| !line.is_empty()) {
+            const PROSE: &str = "the quick brown fox jumps over the lazy dog";
+            let at = layout::ui_text_width(atlas, PROSE) / PROSE.len() as f32 * BODY_LIMIT as f32;
+            for line in shown.start.max(1)..shown.end {
+                let rect = row(line);
+                let x = at - scroll_of(line);
+                if (0.0..rect.width).contains(&x) {
+                    layout::push_rect(
+                        out,
+                        atlas,
+                        [(rect.x + x).round(), rect.y],
+                        [1.0, rect.height],
+                        theme.hairline,
+                    );
+                }
+            }
+        }
+
+        // Behind the glyphs, so the text stays readable on top of the band.
+        // A selection that runs on past a line's end takes its break too.
+        if let Some(selection) = self.message.selection() {
+            for line in shown.clone() {
+                let range = lines[line].clone();
+                if selection.end <= range.start || selection.start > range.end {
+                    continue;
+                }
+                let rect = row(line);
+                let x0 = x_of(line, selection.start.max(range.start)) - scroll_of(line);
+                let mut x1 = x_of(line, selection.end.min(range.end)) - scroll_of(line);
+                if selection.end > range.end {
+                    x1 += 4.0;
+                }
+                let (x0, x1) = (x0.clamp(0.0, rect.width), x1.clamp(0.0, rect.width));
+                if x1 > x0 {
+                    layout::push_rect(
+                        out,
+                        atlas,
+                        [rect.x + x0, rect.y],
+                        [x1 - x0, rect.height],
+                        theme.selection,
+                    );
+                }
+            }
+        }
+        if full.is_empty() {
+            let placeholder = if focused {
+                "Message"
+            } else if self.amend {
+                "Message (\u{2318}\u{21a9} to amend)"
+            } else {
+                "Message (\u{2318}\u{21a9} to commit)"
+            };
+            layout::push_ui_text(out, atlas, row(0), placeholder, theme.status_text);
+        }
+        for line in shown.clone() {
+            let Some(shaped) = &shaped[line - top] else {
+                continue;
+            };
+            let past = past_body_limit(&full, line);
+            let start = lines[line].start;
+            layout::push_ui_line(out, atlas, row(line), shaped, scroll_of(line), |byte| {
+                if past
+                    .as_ref()
+                    .is_some_and(|past| past.contains(&(start + byte)))
+                {
+                    theme.diff_modified
+                } else {
+                    theme.text
+                }
+            });
+        }
+        if focused {
+            let rect = row(caret_line);
+            let x = (caret_x - scroll).clamp(0.0, rect.width);
+            layout::push_rect(
+                out,
+                atlas,
+                [rect.x + x, rect.y],
+                [1.0, rect.height],
+                theme.cursor,
+            );
+            // The rest of a commit type being typed, dimmed after the
+            // caret; Tab takes it.
+            if let Some(rest) = self.commit_type_hint() {
+                layout::push_ui_text(
+                    out,
+                    atlas,
+                    Viewport {
+                        x: rect.x + x,
+                        width: (rect.width - x).max(0.0),
+                        ..rect
+                    },
+                    rest,
+                    theme.status_text,
+                );
+            }
+        }
+        if let Some((length, label, width)) = &counter
+            && top == 0
+        {
+            let rect = Viewport {
+                x: field.x + field.width - MESSAGE_PAD - width,
+                width: *width,
+                height: layout::UI_CONTROL,
+                ..field
+            };
+            let over = *length > SUBJECT_LIMIT;
+            layout::push_ui_text(
+                out,
+                atlas,
+                rect,
+                label,
+                if over {
+                    theme.diff_modified
+                } else {
+                    theme.status_text
+                },
+            );
+            layout::hotspot(
+                rect,
+                layout::Cursor::Arrow,
+                Some("Subject lines read best at 50 characters or fewer"),
+            );
+        }
+    }
+
+    /// The byte of the message a click at (`x`, `y`) in the field lands
+    /// on, the field scrolled as it was last drawn.
+    pub fn message_byte_at(&self, atlas: &mut Atlas, g: Sidebar, x: f32, y: f32) -> usize {
+        let full = self.message.rope.to_string();
+        let lines = message_lines(&full);
+        let rows = message_rows(&full);
+        let top = self.message_top.get().min(lines.len().saturating_sub(rows));
+        let row = ((y - g.message.y - MESSAGE_BAND) / MESSAGE_LINE).max(0.0) as usize;
+        let line = (top + row.min(rows - 1)).min(lines.len() - 1);
+        let range = lines[line].clone();
+        let (scrolled, scroll) = self.message_scroll.get();
+        let at = x - g.message.x - MESSAGE_PAD + if scrolled == line { scroll } else { 0.0 };
+        shape_message_line(atlas, &full[range.clone()])
+            .map_or(range.start, |shaped| range.start + shaped.byte_at_x(at))
+    }
+
     /// Source control down the sidebar column: the header's actions, the
     /// branch with Pull and Push, the commit box, then the changes grouped
     /// by whether they are staged, each row carrying the controls that act
@@ -1419,7 +1769,7 @@ impl Panel {
         theme: &Theme,
         out: &mut Vec<GlyphInstance>,
     ) {
-        let g = Sidebar::new(column);
+        let g = self.sidebar(column);
         let busy = self.busy();
 
         // The title row: the panel's name, or in a workspace of several
@@ -1524,7 +1874,8 @@ impl Panel {
             .tip(&push_tip)
             .draw(out, atlas, theme);
 
-        // The message: a field, ringed while it has the keyboard.
+        // The message: a field, ringed while it has the keyboard, a line
+        // tall per line written until it scrolls.
         if focused {
             layout::push_focus_ring(out, g.message, layout::UI_RADIUS, 1.5, theme);
         }
@@ -1539,83 +1890,7 @@ impl Panel {
             },
         );
         layout::hotspot(g.message, layout::Cursor::Text, None);
-        let full = self.message.rope.to_string();
-        // The subject's length, right-aligned in the field once there is
-        // a message; the text clips short of it.
-        let counter = (!full.is_empty()).then(|| {
-            let length = subject_len(&full);
-            let label = format!("{length}/{SUBJECT_LIMIT}");
-            let width = layout::ui_text_width(atlas, &label).ceil();
-            (length, label, width)
-        });
-        let counter_room = counter.as_ref().map_or(0.0, |(_, _, width)| width + 6.0);
-        let text_rect = Viewport {
-            x: g.message.x + MESSAGE_PAD,
-            width: (g.message.width - MESSAGE_PAD * 2.0 - counter_room).max(0.0),
-            ..g.message
-        };
-        let band = ((g.message.height - 18.0) * 0.5).floor();
-        layout::push_ui_field(
-            out,
-            atlas,
-            text_rect,
-            (band, 18.0),
-            &layout::UiField {
-                text: &full,
-                cursor: self.message.cursor(),
-                selection: self.message.selection(),
-                placeholder: if focused {
-                    "Message"
-                } else if self.amend {
-                    "Message (\u{2318}\u{21a9} to amend)"
-                } else {
-                    "Message (\u{2318}\u{21a9} to commit)"
-                },
-                focused,
-            },
-            theme,
-        );
-        // The rest of a commit type being typed, dimmed after the caret;
-        // Tab takes it.
-        if focused && let Some(rest) = self.commit_type_hint() {
-            let (shown, start) = layout::ui_input_window(&full, self.message.cursor());
-            let caret = layout::ui_caret_x(atlas, &shown, self.message.cursor() - start);
-            layout::push_ui_text(
-                out,
-                atlas,
-                Viewport {
-                    x: text_rect.x + caret,
-                    width: (text_rect.width - caret).max(0.0),
-                    ..text_rect
-                },
-                rest,
-                theme.status_text,
-            );
-        }
-        if let Some((length, label, width)) = &counter {
-            let rect = Viewport {
-                x: g.message.x + g.message.width - MESSAGE_PAD - width,
-                width: *width,
-                ..g.message
-            };
-            let over = *length > SUBJECT_LIMIT;
-            layout::push_ui_text(
-                out,
-                atlas,
-                rect,
-                label,
-                if over {
-                    theme.diff_modified
-                } else {
-                    theme.status_text
-                },
-            );
-            layout::hotspot(
-                rect,
-                layout::Cursor::Arrow,
-                Some("Subject lines read best at 50 characters or fewer"),
-            );
-        }
+        self.draw_message(atlas, g.message, focused, theme, out);
 
         // The button says what it will commit. "Commit" alone next to a list
         // that mixes staged and unstaged files does not.
@@ -2509,6 +2784,108 @@ mod tests {
         assert_eq!(subject_len("a\r\nb"), 1);
     }
 
+    #[test]
+    fn the_message_splits_into_lines_and_bytes_map_to_them() {
+        assert_eq!(message_lines(""), vec![0..0]);
+        assert_eq!(message_lines("fix: x"), vec![0..6]);
+        // Return at the end opens an empty line for the caret.
+        assert_eq!(message_lines("fix: x\n"), vec![0..6, 7..7]);
+        assert_eq!(message_lines("a\n\nbody"), vec![0..1, 2..2, 3..7]);
+        let lines = message_lines("a\n\nbody");
+        assert_eq!(message_line_of(&lines, 0), 0);
+        // The end of a line, before its break, is still that line.
+        assert_eq!(message_line_of(&lines, 1), 0);
+        assert_eq!(message_line_of(&lines, 2), 1);
+        assert_eq!(message_line_of(&lines, 3), 2);
+        assert_eq!(message_line_of(&lines, 7), 2);
+        assert_eq!(message_line_of(&lines, 99), 2);
+        assert_eq!(message_rows(""), 1);
+        assert_eq!(message_rows("fix: x"), 1);
+        assert_eq!(message_rows("fix: x\n"), 2);
+        assert_eq!(message_rows(&"line\n".repeat(20)), MESSAGE_MAX_LINES);
+    }
+
+    /// Past eight lines the field scrolls, as little as keeps the caret's
+    /// line shown, and never leaves blank rows under the last line.
+    #[test]
+    fn the_message_scrolls_to_keep_the_caret_in_view() {
+        assert_eq!(message_top(0, 0, 1, 1), 0);
+        assert_eq!(message_top(0, 7, 8, 12), 0);
+        assert_eq!(message_top(0, 8, 8, 12), 1);
+        assert_eq!(message_top(0, 11, 8, 12), 4);
+        assert_eq!(message_top(4, 6, 8, 12), 4);
+        assert_eq!(message_top(4, 2, 8, 12), 2);
+        // Lines deleted under a scrolled field.
+        assert_eq!(message_top(4, 3, 8, 9), 1);
+        assert_eq!(message_top(4, 0, 1, 1), 0);
+        // Sideways, by measured width rather than a count of characters:
+        // a caret at the end of a long line shows the end.
+        assert_eq!(message_scroll_x(0.0, 50.0, 100.0, 50.0), 0.0);
+        assert_eq!(message_scroll_x(0.0, 300.0, 100.0, 300.0), 201.0);
+        assert_eq!(message_scroll_x(201.0, 250.0, 100.0, 300.0), 201.0);
+        assert_eq!(message_scroll_x(201.0, 120.0, 100.0, 300.0), 95.0);
+        // Back to a line that fits: its start shows too.
+        assert_eq!(message_scroll_x(201.0, 60.0, 100.0, 300.0), 0.0);
+        // The text got shorter: no blank run at the right.
+        assert_eq!(message_scroll_x(201.0, 40.0, 100.0, 40.0), 0.0);
+    }
+
+    #[test]
+    fn body_lines_past_seventy_two_characters_are_tinted_from_there() {
+        let body = "b".repeat(80);
+        let message = format!("feat: x\n\n{body}\nshort");
+        let start = "feat: x\n\n".len();
+        assert_eq!(
+            past_body_limit(&message, 2),
+            Some(start + BODY_LIMIT..start + 80)
+        );
+        assert_eq!(past_body_limit(&message, 1), None);
+        assert_eq!(past_body_limit(&message, 3), None);
+        assert_eq!(past_body_limit(&message, 9), None);
+        // The subject has its own limit.
+        let long_subject = "s".repeat(90);
+        assert_eq!(past_body_limit(&long_subject, 0), None);
+        // Exactly at the limit is fine; counted in characters, cut on one.
+        assert_eq!(past_body_limit(&format!("s\n{}", "b".repeat(72)), 1), None);
+        let wide = format!("s\n{}\u{e9}\u{e9}", "b".repeat(71));
+        assert_eq!(past_body_limit(&wide, 1), Some(2 + 71 + 2..2 + 71 + 4));
+    }
+
+    /// A taller message moves everything under it by the same amount, and
+    /// the panel sizes the field from what is written in it.
+    #[test]
+    fn the_message_field_grows_with_its_lines_and_pushes_the_list_down() {
+        let one = Sidebar::new(column(), 1);
+        let three = Sidebar::new(column(), 3);
+        let grown = MESSAGE_LINE * 2.0;
+        assert_eq!(three.message.y, one.message.y);
+        assert_eq!(three.message.height, one.message.height + grown);
+        assert_eq!(three.commit.y, one.commit.y + grown);
+        assert_eq!(three.amend.y, one.amend.y + grown);
+        assert_eq!(three.list.y, one.list.y + grown);
+        assert_eq!(three.list.height, one.list.height - grown);
+        assert_eq!(three.note.y, one.note.y);
+        let mut p = panel(Vec::new());
+        assert_eq!(p.sidebar(column()).message.height, one.message.height);
+        p.message.insert("feat: x\n\nbody");
+        assert_eq!(p.sidebar(column()).message.height, three.message.height);
+        p.message.insert(&"\nmore".repeat(20));
+        assert_eq!(
+            p.sidebar(column()).message.height,
+            Sidebar::new(column(), MESSAGE_MAX_LINES).message.height
+        );
+    }
+
+    #[test]
+    fn a_body_straight_under_the_subject_is_flagged() {
+        assert!(!body_needs_blank_line(""));
+        assert!(!body_needs_blank_line("feat: x"));
+        assert!(!body_needs_blank_line("feat: x\n"));
+        assert!(!body_needs_blank_line("feat: x\n\nbody"));
+        assert!(!body_needs_blank_line("feat: x\n  \nbody"));
+        assert!(body_needs_blank_line("feat: x\nbody"));
+    }
+
     /// Amend is offered only for a HEAD that is still this branch's own,
     /// rewords with nothing staged, and takes back the message it put in.
     #[test]
@@ -2689,7 +3066,7 @@ mod tests {
     #[test]
     fn the_row_toggle_and_the_row_body_are_different_targets() {
         let panel = panel(vec![change("dirty.rs", b' ', b'M')]);
-        let g = Sidebar::new(column());
+        let g = Sidebar::new(column(), 1);
         let rows = panel.rows(g);
         let (entry, rect) = rows
             .iter()
@@ -2715,9 +3092,12 @@ mod tests {
     /// column has to stay inside the sidebar it is given, at any height.
     #[test]
     fn the_column_contents_stay_inside_the_sidebar_at_any_height() {
-        for height in [180.0, 320.0, 700.0, 1400.0] {
+        for (height, lines) in [180.0, 320.0, 700.0, 1400.0]
+            .into_iter()
+            .flat_map(|h| [1, 3, MESSAGE_MAX_LINES].map(|n| (h, n)))
+        {
             let column = Viewport { height, ..column() };
-            let g = Sidebar::new(column);
+            let g = Sidebar::new(column, lines);
             for (name, rect) in [
                 ("repo", g.repo),
                 ("branch", g.branch),
@@ -2749,6 +3129,13 @@ mod tests {
             assert!(g.pull.x + g.pull.width <= g.push.x);
             assert!(g.commit.x + g.commit.width <= g.amend.x);
             assert_eq!(g.commit.y, g.amend.y);
+            // The message grows down and pushes Commit and the list with it.
+            assert_eq!(
+                g.message.height,
+                layout::UI_CONTROL + MESSAGE_LINE * (lines - 1) as f32
+            );
+            assert!(g.message.y + g.message.height < g.commit.y);
+            assert!(g.commit.y + g.commit.height < g.list.y);
             assert!(
                 g.note.y + g.note.height <= column.y + column.height,
                 "the note falls out of the bottom at height {height}"
@@ -2761,7 +3148,7 @@ mod tests {
     #[test]
     fn the_empty_space_below_the_last_change_is_not_a_row() {
         let panel = panel(vec![change("dirty.rs", b' ', b'M')]);
-        let g = Sidebar::new(column());
+        let g = Sidebar::new(column(), 1);
         let rows = panel.rows(g);
         let last = rows.last().expect("a row").1;
         let below = last.y + last.height + 40.0;
@@ -2777,10 +3164,13 @@ mod tests {
             .map(|i| change(&format!("file{i}.rs"), b' ', b'M'))
             .collect();
         let panel = panel(changes);
-        let g = Sidebar::new(Viewport {
-            height: 300.0,
-            ..column()
-        });
+        let g = Sidebar::new(
+            Viewport {
+                height: 300.0,
+                ..column()
+            },
+            1,
+        );
         let rows = panel.rows(g);
         assert!(rows.len() < panel.entries().len(), "the fixture overflows");
         for (_, rect) in &rows {

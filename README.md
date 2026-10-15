@@ -267,7 +267,9 @@ the size and write it back.
 - **Local Git** (`Cmd-Option-G`): branch and status, changed files, staged
   and working-tree diffs, whole-file, hunk and line stage/unstage (Space in
   the diff stages the hunk under the cursor or the selected lines), Stage All and
-  Unstage All per section, commit, amending the last commit while it is
+  Unstage All per section, commit with a message that can have a body
+  (the subject counted against 50 characters, body lines against 72),
+  amending the last commit while it is
   not yet pushed, and a right-click menu on every change.
   Git runs on workers and reads saved disk state; hooks and signing stay
   as Git has them. Branches switched, created, renamed and deleted from

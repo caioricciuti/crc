@@ -247,12 +247,12 @@ impl EditorView {
 
     /// A right-click in Source Control: the row's menu, or the Git menu.
     pub(super) fn git_context_menu(&self, column: Viewport, x: f32, y: f32) -> Retained<NSMenu> {
-        use crate::platform::git_panel::{Entry, Group, Sidebar};
+        use crate::platform::git_panel::{Entry, Group};
         let mtm = MainThreadMarker::from(self);
-        let g = Sidebar::new(column);
-        let entry = self
-            .state()
-            .and_then(|state| state.git.entry_at(g, x, y).map(|(e, _)| e));
+        let entry = self.state().and_then(|state| {
+            let g = state.git.sidebar(column);
+            state.git.entry_at(g, x, y).map(|(e, _)| e)
+        });
         match entry {
             Some(Entry::File { change, group }) => {
                 if let Some(mut state) = self.state_mut() {
