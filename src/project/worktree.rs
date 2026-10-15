@@ -1126,18 +1126,121 @@ pub fn parse_numstat(text: &str) -> (usize, u64, u64) {
     )
 }
 
-/// Reads `dir`'s status, comparing with `base` when it is another branch.
-pub fn status(dir: &Path, base: Option<&str>, tags: bool) -> Result<Status, String> {
-    run(dir, &["rev-parse", "--git-dir"])?;
-    let branch = run(dir, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+/// What `git status --porcelain=v2 --branch -z` says of a checkout: its
+/// branch (`None` detached), its HEAD commit (`None` before the first), its
+/// upstream with the commits to push and to pull when that branch is there
+/// to compare with, and how many files are touched, untracked ones too.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Porcelain {
+    pub branch: Option<String>,
+    pub head: Option<String>,
+    pub upstream: Option<(String, usize, usize)>,
+    pub touched: usize,
+}
+
+/// Reads [`Porcelain`] from what `git status --porcelain=v2 --branch -z`
+/// printed: the `# branch.*` headers, then a record per file, a rename's
+/// with its old path as the record after it.
+pub fn parse_porcelain(text: &str) -> Porcelain {
+    let mut out = Porcelain::default();
+    let mut upstream = None;
+    let mut records = text.split('\0').filter(|r| !r.is_empty());
+    while let Some(record) = records.next() {
+        if let Some(header) = record.strip_prefix("# ") {
+            let (key, value) = header.split_once(' ').unwrap_or((header, ""));
+            match key {
+                "branch.oid" if value != "(initial)" => out.head = Some(value.to_owned()),
+                "branch.head" if value != "(detached)" => out.branch = Some(value.to_owned()),
+                "branch.upstream" => upstream = Some(value.to_owned()),
+                "branch.ab" => {
+                    let mut counts = value
+                        .split_whitespace()
+                        .map(|w| w.get(1..).and_then(|n| n.parse().ok()).unwrap_or(0));
+                    let (push, pull) = (counts.next().unwrap_or(0), counts.next().unwrap_or(0));
+                    out.upstream = upstream.take().map(|u| (u, push, pull));
+                }
+                _ => {}
+            }
+            continue;
+        }
+        match record.as_bytes().first() {
+            Some(b'1' | b'u' | b'?') => out.touched += 1,
+            Some(b'2') => {
+                out.touched += 1;
+                records.next();
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The newest tag reachable from HEAD and the commits since it, per
+/// repository, with what it was read for: the HEAD commit and when the
+/// tags last changed. A read with the same key is not asked of Git again.
+type TagRead = (
+    (String, Option<std::time::SystemTime>),
+    Option<(String, usize)>,
+);
+
+static TAGS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<PathBuf, TagRead>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// When the tags of the repository checked out at `dir` last changed, as
+/// far as its folders say: a tag made or deleted touches `refs/tags`, a
+/// pack rewrites `packed-refs`. `None` when its Git directory is elsewhere.
+fn tags_changed(dir: &Path) -> Option<std::time::SystemTime> {
+    let git_dir = dir.join(".git");
+    let at = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    [
+        at(&git_dir.join("refs/tags")),
+        at(&git_dir.join("packed-refs")),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+}
+
+/// The newest tag reachable from `head`, `dir`'s HEAD commit, and the
+/// commits since it; read again only when HEAD moved or the tags changed.
+fn latest_tag(dir: &Path, head: Option<&str>) -> Option<(String, usize)> {
+    let key = (head?.to_owned(), tags_changed(dir));
+    if let Some((had, tag)) = TAGS.lock().ok()?.get(dir)
+        && *had == key
+    {
+        return tag.clone();
+    }
+    let tag = run(dir, &["describe", "--tags", "--long"])
         .ok()
-        .map(|b| b.trim().to_owned())
-        .filter(|b| !b.is_empty());
+        .and_then(|d| parse_describe(d.trim()));
+    if let Ok(mut tags) = TAGS.lock() {
+        tags.insert(dir.to_path_buf(), (key, tag.clone()));
+    }
+    tag
+}
+
+/// Reads `dir`'s status, comparing with `base` when it is another branch:
+/// the branch, its upstream and what is uncommitted in one `git status`,
+/// then the base's comparison, the uncommitted lines when there are any,
+/// and the latest tag when HEAD or the tags moved since it was last read.
+pub fn status(dir: &Path, base: Option<&str>, tags: bool) -> Result<Status, String> {
+    let said = run(
+        dir,
+        &[
+            "status",
+            "--porcelain=v2",
+            "--branch",
+            "--ahead-behind",
+            "-z",
+        ],
+    )?;
+    let read = parse_porcelain(&said);
     let mut out = Status {
-        branch: branch.clone(),
+        branch: read.branch.clone(),
+        dirty: read.touched,
         ..Status::default()
     };
-    if let Some(base) = base.filter(|b| branch.as_deref() != Some(*b)) {
+    if let Some(base) = base.filter(|b| read.branch.as_deref() != Some(*b)) {
         let range = format!("{base}...HEAD");
         if let Ok(counts) = run(dir, &["rev-list", "--left-right", "--count", &range]) {
             (out.behind, out.ahead) = parse_left_right(&counts);
@@ -1147,31 +1250,17 @@ pub fn status(dir: &Path, base: Option<&str>, tags: bool) -> Result<Status, Stri
             }
         }
     }
-    if let Ok(upstream) = run(
-        dir,
-        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
-    ) {
-        out.upstream = Some(upstream.trim().to_owned());
-        if let Ok(counts) = run(dir, &["rev-list", "--left-right", "--count", "@{u}...HEAD"]) {
-            (out.to_pull, out.to_push) = parse_left_right(&counts);
-        }
+    if let Some((upstream, push, pull)) = read.upstream {
+        (out.upstream, out.to_push, out.to_pull) = (Some(upstream), push, pull);
     }
-    out.dirty = run(dir, &["status", "--porcelain"])
-        .map(|s| s.lines().filter(|l| !l.is_empty()).count())
-        .unwrap_or(0);
     if out.dirty > 0
         && let Ok(stat) = run(dir, &["diff", "HEAD", "--numstat"])
     {
         let (_, a, r) = parse_numstat(&stat);
         (out.dirty_added, out.dirty_removed) = (a, r);
     }
-    if tags && let Ok(tag) = run(dir, &["describe", "--tags", "--abbrev=0"]) {
-        let tag = tag.trim().to_owned();
-        let since = run(dir, &["rev-list", "--count", &format!("{tag}..HEAD")])
-            .ok()
-            .and_then(|n| n.trim().parse().ok())
-            .unwrap_or(0);
-        out.tag = Some((tag, since));
+    if tags {
+        out.tag = latest_tag(dir, read.head.as_deref());
     }
     Ok(out)
 }
@@ -2531,6 +2620,177 @@ mod tests {
         // Not a repository: the first answer says so.
         let said = [Err("git exited with 128".to_owned())];
         assert!(parse_status(&said, None, false).is_err());
+    }
+
+    /// [`status`] as it was before it read `git status --porcelain=v2`:
+    /// a Git command per fact, the latest tag read every time.
+    fn status_one_by_one(dir: &Path, base: Option<&str>, tags: bool) -> Result<Status, String> {
+        run(dir, &["rev-parse", "--git-dir"])?;
+        let branch = run(dir, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+            .ok()
+            .map(|b| b.trim().to_owned())
+            .filter(|b| !b.is_empty());
+        let mut out = Status {
+            branch: branch.clone(),
+            ..Status::default()
+        };
+        if let Some(base) = base.filter(|b| branch.as_deref() != Some(*b)) {
+            let range = format!("{base}...HEAD");
+            if let Ok(counts) = run(dir, &["rev-list", "--left-right", "--count", &range]) {
+                (out.behind, out.ahead) = parse_left_right(&counts);
+                out.base = Some(base.to_owned());
+                if let Ok(stat) = run(dir, &["diff", "--numstat", &range]) {
+                    (out.files, out.added, out.removed) = parse_numstat(&stat);
+                }
+            }
+        }
+        if let Ok(upstream) = run(
+            dir,
+            &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+        ) {
+            out.upstream = Some(upstream.trim().to_owned());
+            if let Ok(counts) = run(dir, &["rev-list", "--left-right", "--count", "@{u}...HEAD"]) {
+                (out.to_pull, out.to_push) = parse_left_right(&counts);
+            }
+        }
+        out.dirty = run(dir, &["status", "--porcelain"])
+            .map(|s| s.lines().filter(|l| !l.is_empty()).count())
+            .unwrap_or(0);
+        if out.dirty > 0
+            && let Ok(stat) = run(dir, &["diff", "HEAD", "--numstat"])
+        {
+            let (_, a, r) = parse_numstat(&stat);
+            (out.dirty_added, out.dirty_removed) = (a, r);
+        }
+        if tags && let Ok(tag) = run(dir, &["describe", "--tags", "--abbrev=0"]) {
+            let tag = tag.trim().to_owned();
+            let since = run(dir, &["rev-list", "--count", &format!("{tag}..HEAD")])
+                .ok()
+                .and_then(|n| n.trim().parse().ok())
+                .unwrap_or(0);
+            out.tag = Some((tag, since));
+        }
+        Ok(out)
+    }
+
+    #[test]
+    fn status_in_one_read_says_what_a_command_per_fact_said() {
+        let tree = fixture("status-porcelain", "main", &["old"]);
+        let repo = &tree.0;
+        let commit = |message: &str| ok_in(repo, &["commit", "-qm", message]);
+        let same = |what: &str| {
+            for base in [None, Some("old"), Some("main"), Some("nowhere")] {
+                for tags in [false, true] {
+                    assert_eq!(
+                        status(repo, base, tags),
+                        status_one_by_one(repo, base, tags),
+                        "{what}, base {base:?}, tags {tags}"
+                    );
+                }
+            }
+        };
+        // Clean, no upstream, no tag.
+        same("clean");
+        // An upstream on a remote that is never fetched: its branch set by
+        // hand, one commit behind HEAD, then ahead of it too.
+        ok_in(repo, &["remote", "add", "origin", "/nowhere/garden.git"]);
+        ok_in(repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        ok_in(repo, &["branch", "-q", "--set-upstream-to=origin/main"]);
+        same("level with its upstream");
+        std::fs::write(repo.join("b.txt"), "two\nthree\n").unwrap();
+        std::fs::write(repo.join("d.txt"), "four\n").unwrap();
+        ok_in(repo, &["add", "b.txt", "d.txt"]);
+        commit("two");
+        same("ahead of its upstream");
+        ok_in(repo, &["checkout", "-q", "-b", "elsewhere", "old"]);
+        std::fs::write(repo.join("c.txt"), "seed\n").unwrap();
+        ok_in(repo, &["add", "c.txt"]);
+        commit("seed");
+        let theirs = run(repo, &["rev-parse", "HEAD"]).unwrap();
+        ok_in(repo, &["checkout", "-q", "main"]);
+        ok_in(
+            repo,
+            &["update-ref", "refs/remotes/origin/main", theirs.trim()],
+        );
+        same("ahead and behind");
+        let read = status(repo, None, false).unwrap();
+        assert_eq!(
+            (read.upstream.as_deref(), read.to_push, read.to_pull),
+            (Some("origin/main"), 1, 1)
+        );
+        // Tags: one two commits back, then one on HEAD made after a read.
+        ok_in(repo, &["-c", "tag.gpgsign=false", "tag", "v0.1-rc"]);
+        commit_empty(repo, "three");
+        commit_empty(repo, "four");
+        same("a tag two commits back");
+        ok_in(
+            repo,
+            &["-c", "tag.gpgsign=false", "tag", "-a", "v0.2", "-m", "v0.2"],
+        );
+        same("a tag made on HEAD");
+        assert_eq!(
+            status(repo, None, true).unwrap().tag,
+            Some(("v0.2".to_owned(), 0))
+        );
+        // Uncommitted: staged, unstaged, untracked, a rename and a
+        // deletion.
+        std::fs::write(repo.join("a.txt"), "one\nchanged\n").unwrap();
+        std::fs::write(repo.join("staged.txt"), "staged\n").unwrap();
+        ok_in(repo, &["add", "staged.txt"]);
+        std::fs::write(repo.join("new notes.txt"), "untracked\n").unwrap();
+        std::fs::create_dir_all(repo.join("sketches")).unwrap();
+        std::fs::write(repo.join("sketches/kite.txt"), "kite\n").unwrap();
+        ok_in(repo, &["mv", "b.txt", "moved.txt"]);
+        ok_in(repo, &["rm", "-q", "d.txt"]);
+        same("dirty");
+        assert_eq!(status(repo, None, false).unwrap().dirty, 6);
+        ok_in(repo, &["add", "-A"]);
+        commit("five");
+        // An upstream whose branch is gone from the remote.
+        ok_in(repo, &["config", "branch.main.merge", "refs/heads/gone"]);
+        same("upstream gone");
+        assert_eq!(status(repo, None, false).unwrap().upstream, None);
+        ok_in(repo, &["branch", "-q", "--unset-upstream"]);
+        same("no upstream");
+        // Detached HEAD, clean and then dirty.
+        ok_in(repo, &["checkout", "-q", "--detach", "HEAD~1"]);
+        same("detached");
+        std::fs::write(repo.join("a.txt"), "detached\n").unwrap();
+        same("detached and dirty");
+        // A folder that is not a repository.
+        let away = repo.with_extension("not-a-repo");
+        std::fs::create_dir_all(&away).unwrap();
+        assert_eq!(
+            status(&away, None, true).is_err(),
+            status_one_by_one(&away, None, true).is_err()
+        );
+        let _ = std::fs::remove_dir_all(&away);
+    }
+
+    fn commit_empty(repo: &Path, message: &str) {
+        ok_in(repo, &["commit", "-q", "--allow-empty", "-m", message]);
+    }
+
+    #[test]
+    fn reads_porcelain_v2_records() {
+        let said = "# branch.oid 1234\0# branch.head feat/kite\0\
+                    # branch.upstream origin/feat/kite\0# branch.ab +2 -3\0\
+                    1 .M N... 100644 100644 100644 aa bb a.txt\0\
+                    2 R. N... 100644 100644 100644 aa bb R100 new.txt\0old.txt\0\
+                    ? notes/\0";
+        assert_eq!(
+            parse_porcelain(said),
+            Porcelain {
+                branch: Some("feat/kite".into()),
+                head: Some("1234".into()),
+                upstream: Some(("origin/feat/kite".into(), 2, 3)),
+                touched: 3,
+            }
+        );
+        // Detached, before the first commit, an upstream gone.
+        let said = "# branch.oid (initial)\0# branch.head (detached)\0\
+                    # branch.upstream origin/gone\0";
+        assert_eq!(parse_porcelain(said), Porcelain::default());
     }
 
     #[test]

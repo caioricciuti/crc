@@ -4846,6 +4846,13 @@ define_class!(
             self.pump();
         }
 
+        /// Uncovered: Agents mode reads what came due while it was not
+        /// seen.
+        #[unsafe(method(windowDidChangeOcclusionState:))]
+        fn window_did_change_occlusion(&self, _notification: &NSNotification) {
+            self.came_to_front();
+        }
+
     }
 );
 
@@ -5873,6 +5880,13 @@ define_class!(
                 view.set_agents_mode(true);
                 view.request_redraw();
             }
+        }
+
+        /// Back from another app: Agents mode reads what came due while
+        /// crc was behind it.
+        #[unsafe(method(applicationDidBecomeActive:))]
+        fn did_become_active(&self, _notification: &NSNotification) {
+            self.ivars().view.came_to_front();
         }
 
         /// One window, and closing it means you are done.

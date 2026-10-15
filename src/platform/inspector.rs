@@ -31,8 +31,13 @@ pub const WIDTH: f32 = 300.0;
 pub const TERMINAL_MIN: f32 = 420.0;
 const PAD: f32 = 12.0;
 pub const ROW: f32 = 26.0;
-/// A status read this old is read again when the panel is drawn.
-const STALE: Duration = Duration::from_secs(15);
+/// A status read this old is read again when the panel is drawn. Sooner
+/// when something it shows was written to (see [`Inspector::touch`]).
+const STALE: Duration = Duration::from_secs(60);
+/// A status read is at least this old before a write to what it shows
+/// reads it again: an agent writing all the time reads it every few
+/// seconds, not after every file.
+const TOUCHED_WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -134,6 +139,8 @@ pub struct Inspector {
     read_for: Vec<PathBuf>,
     read_host: Option<String>,
     read_at: Option<Instant>,
+    /// Something the statuses show was written to since they were read.
+    touched: bool,
     rx: Option<mpsc::Receiver<(Option<String>, Vec<Read>)>>,
     /// The repositories being read, and their host.
     reading: Option<(Option<String>, Vec<PathBuf>)>,
@@ -179,11 +186,13 @@ impl Inspector {
         let paths: Vec<PathBuf> = wanted.iter().map(|w| w.0.clone()).collect();
         let host = host.map(str::to_owned);
         let same = self.read_for == paths && self.read_host == host;
-        let have = same && self.read_at.is_some_and(|at| at.elapsed() < STALE);
+        let fresh = if self.touched { TOUCHED_WAIT } else { STALE };
+        let have = same && self.read_at.is_some_and(|at| at.elapsed() < fresh);
         let key = (host.clone(), paths.clone());
         if have || self.reading.as_ref() == Some(&key) {
             return;
         }
+        self.touched = false;
         // Another machine's paths are other folders, even named the same.
         if self.read_host != host {
             self.status.clear();
@@ -221,13 +230,31 @@ impl Inspector {
         self.read_at = None;
     }
 
-    /// Takes a finished read. Returns whether anything changed.
+    /// A folder whose status is shown was written to, or its repository's
+    /// refs moved: it is read again once the last read is
+    /// [`TOUCHED_WAIT`] old. Returns whether `path` is shown.
+    pub fn touch(&mut self, path: &Path) -> bool {
+        let shown = self.read_for.iter().any(|p| p == path);
+        self.touched |= shown;
+        shown
+    }
+
+    /// Every status shown is read again soon, as if written to: crc is back
+    /// in front after a while behind other apps.
+    pub fn touch_all(&mut self) {
+        self.touched = true;
+    }
+
+    /// Takes a finished read. Returns whether anything shown changed: a
+    /// read that says what the last one did is taken without a redraw.
     pub fn poll(&mut self) -> bool {
         let Some(rx) = &self.rx else {
             return false;
         };
+        let mut changed = true;
         match rx.try_recv() {
             Ok((host, read)) => {
+                changed = host != self.read_host || read != self.status;
                 // A read for a workspace no longer selected still counts:
                 // the next `want` reads the one that is.
                 self.read_for = read.iter().map(|(p, _)| p.clone()).collect();
@@ -246,7 +273,7 @@ impl Inspector {
         }
         self.rx = None;
         self.reading = None;
-        true
+        changed
     }
 
     pub fn busy(&self) -> bool {
@@ -2236,6 +2263,37 @@ mod tests {
         );
         // Neither is one of the card's buttons.
         assert!(!report(&inspector).contains("issues_"));
+    }
+
+    #[test]
+    fn a_read_saying_the_same_is_taken_without_a_redraw() {
+        let mut inspector = Inspector::default();
+        let status = |dirty| Status {
+            branch: Some("main".into()),
+            dirty,
+            ..Status::default()
+        };
+        let mut land = |read: Vec<Read>| {
+            let (tx, rx) = mpsc::channel();
+            tx.send((None, read)).unwrap();
+            inspector.rx = Some(rx);
+            inspector.poll()
+        };
+        let path = PathBuf::from("/desk/kite");
+        assert!(land(vec![(path.clone(), Ok(status(0)))]));
+        assert!(!land(vec![(path.clone(), Ok(status(0)))]));
+        assert!(land(vec![(path.clone(), Ok(status(2)))]));
+        assert!(land(vec![(path, Err("gone".into()))]));
+        // Written to: read again once the last read is a few seconds old,
+        // not at once; a folder it does not show is not its business.
+        assert!(!inspector.touch(Path::new("/desk/other")));
+        assert!(inspector.touch(Path::new("/desk/kite")));
+        let wanted = vec![(PathBuf::from("/desk/kite"), None, false)];
+        inspector.want(None, &wanted);
+        assert!(!inspector.busy());
+        inspector.read_at = Some(Instant::now() - TOUCHED_WAIT);
+        inspector.want(None, &wanted);
+        assert!(inspector.busy());
     }
 
     #[test]

@@ -156,10 +156,17 @@ impl EditorView {
         state.agents.ref_watched = mains;
     }
 
-    /// Main thread, from a main checkout's Git directory watcher: if a
-    /// worktree's branch was pushed, its pull request is read once the
-    /// push settles.
+    /// Main thread, from a main checkout's Git directory watcher: the
+    /// inspector reads it again soon when it shows it, and if a worktree's
+    /// branch was pushed, its pull request is read once the push settles.
     fn refs_changed(&self, main: &std::path::Path) {
+        let shown = self
+            .state_mut()
+            .is_some_and(|mut state| state.agents.refs_moved(main));
+        if shown {
+            self.want_inspector();
+            self.resume_display_link();
+        }
         let Some(mut state) = self.state_mut() else {
             return;
         };
@@ -202,7 +209,13 @@ impl EditorView {
             .unwrap_or_else(std::time::Instant::now);
         state.agents.touched_at(tree, at);
         let on = state.agents.on;
+        // Its status, when the inspector shows it, is read again soon:
+        // within seconds, however often it is written to.
+        let shown = state.agents.inspector.touch(tree);
         drop(state);
+        if on && shown {
+            self.want_inspector();
+        }
         // A repaint when the row turns to writing; the spinner keeps
         // frames coming while it stays so.
         if on && was.is_none_or(|at| at.elapsed() >= crate::platform::agents::WRITING) {
@@ -212,10 +225,17 @@ impl EditorView {
     }
 
     pub(super) fn poll_agents(&self) {
+        let front = self.in_front();
         let Some(mut state) = self.state_mut() else {
             return;
         };
         let mut changed = state.agents.poll();
+        // The selected workspace's folder, once a minute in front, and one
+        // just selected whose last read is older: read here, not only at
+        // the tick, so selecting it reads it at once.
+        if front && state.agents.on && state.agents.listed() {
+            state.agents.refresh_due(true);
+        }
         let coming = selection_coming(&state);
         if changed && !coming && state.agents.selected_index().is_none() {
             // Nothing selected that the list knows: the workspace of the

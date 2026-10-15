@@ -60,6 +60,9 @@ pub enum Action {
 struct Listing {
     /// The host whose folder workspaces were read; `None` for this Mac's.
     host: Option<String>,
+    /// The folder workspaces it read, by id: every one on its host, or
+    /// only those the periodic read was for.
+    folders: Vec<String>,
     repos: Vec<(String, Vec<PathBuf>)>,
     worktrees: Vec<Workspace>,
     /// Per main checkout (on the host read), the worktrees Git records
@@ -286,14 +289,41 @@ pub fn discover_line(dir: &Path) -> String {
     )
 }
 
-/// [`discover`], by `runner`. `Err` when the host did not answer, or the
-/// folder is not there.
-fn discover_on(runner: &Runner, dir: &Path) -> Result<Vec<PathBuf>, String> {
+/// What [`discover`] found in a folder of this Mac, by folder, with the
+/// folder's modification time then: a repository added, removed or renamed
+/// in it changes that time.
+type Found = std::collections::HashMap<PathBuf, (std::time::SystemTime, Vec<PathBuf>)>;
+
+static FOUND: std::sync::LazyLock<std::sync::Mutex<Found>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// [`discover`] of a folder of this Mac, canonical, taken from what was
+/// found last when the folder has not changed since, unless `fresh`.
+fn discover_here(dir: &Path, fresh: bool) -> Vec<PathBuf> {
+    let modified = std::fs::metadata(dir).and_then(|m| m.modified()).ok();
+    if !fresh
+        && let Some(modified) = modified
+        && let Some((at, found)) = FOUND.lock().ok().and_then(|f| f.get(dir).cloned())
+        && at == modified
+    {
+        return found;
+    }
+    let found: Vec<PathBuf> = discover(dir)
+        .iter()
+        .map(|p| crate::platform::canonical(p))
+        .collect();
+    if let (Some(modified), Ok(mut cache)) = (modified, FOUND.lock()) {
+        cache.insert(dir.to_path_buf(), (modified, found.clone()));
+    }
+    found
+}
+
+/// [`discover`], by `runner`; on this Mac from what was found last when
+/// the folder has not changed, unless `fresh`. `Err` when the host did not
+/// answer, or the folder is not there.
+fn discover_on(runner: &Runner, dir: &Path, fresh: bool) -> Result<Vec<PathBuf>, String> {
     let Runner::Ssh { host, control } = runner else {
-        return Ok(discover(dir)
-            .iter()
-            .map(|p| crate::platform::canonical(p))
-            .collect());
+        return Ok(discover_here(dir, fresh));
     };
     let text = crate::project::worktree::ssh_output(host, control.as_deref(), &discover_line(dir))?;
     let mut found: Vec<PathBuf> = Vec::new();
@@ -331,8 +361,10 @@ fn linked_worktree(dir: &Path) -> bool {
 /// Reads what the folder workspaces on `host` hold (this Mac's for
 /// `None`), on the calling thread: their repositories, and each
 /// repository's worktrees once. A remote one whose host does not answer is
-/// left out, and named in [`Listing::unreachable`].
-fn scan(folders: &[(String, PathBuf)], host: Option<&str>) -> Listing {
+/// left out, and named in [`Listing::unreachable`]. Unless `fresh`, a
+/// folder of this Mac that has not changed is not looked through again
+/// for its repositories (their worktrees are still read).
+fn scan(folders: &[(String, PathBuf)], host: Option<&str>, fresh: bool) -> Listing {
     let runner = runner(host);
     let mut repos = Vec::new();
     let mut worktrees: Vec<Workspace> = Vec::new();
@@ -347,7 +379,7 @@ fn scan(folders: &[(String, PathBuf)], host: Option<&str>) -> Listing {
             unreachable.push(id.clone());
             continue;
         }
-        let found = match discover_on(&runner, dir) {
+        let found = match discover_on(&runner, dir, fresh) {
             Ok(found) => found,
             Err(e) if e == crate::project::worktree::UNREACHABLE => {
                 unreachable.push(id.clone());
@@ -384,6 +416,7 @@ fn scan(folders: &[(String, PathBuf)], host: Option<&str>) -> Listing {
     }
     Listing {
         host: host.map(str::to_owned),
+        folders: folders.iter().map(|(id, _)| id.clone()).collect(),
         repos,
         worktrees,
         prunable,
@@ -925,6 +958,12 @@ pub fn pr_due(
     }
 }
 
+/// How often the periodic read reads the selected workspace's folder
+/// again, with crc in front.
+pub const SCAN_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+/// How often it reads every folder workspace again, in front or not.
+pub const FULL_SCAN: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// The shortest wait, which the periodic read ticks at; a self-test may
 /// make it shorter with `CRC_SELFTEST_PR_EVERY` (seconds).
 pub fn pr_tick() -> std::time::Duration {
@@ -1216,8 +1255,18 @@ pub struct Panel {
     pub menu_task: Option<String>,
     /// The column at the right: the selected workspace's Git state.
     pub inspector: crate::platform::inspector::Inspector,
-    /// When the worktrees and pull requests were last read.
+    /// When every folder workspace's worktrees were last read.
     pub refreshed_at: Option<std::time::Instant>,
+    /// Per folder workspace, by id, when its worktrees were last read: the
+    /// periodic read reads the selected one's more often than the rest.
+    scanned_at: std::collections::HashMap<String, std::time::Instant>,
+    /// crc was seen in the background (another app active, or its window
+    /// covered) since it was last in front: the periodic reads wait
+    /// longer, and coming back reads what is due at once.
+    pub away: bool,
+    /// For a self-test, which is never the active app: whether crc counts
+    /// as in front, by the script's `front` step; in front until it says.
+    pub front: Option<bool>,
     /// Whether `gh` is installed, looked up once.
     pub github: Option<bool>,
     /// The periodic refresh is scheduled.
@@ -1377,35 +1426,108 @@ impl Panel {
     /// is. Pull requests are read on their own (see
     /// [`Panel::refresh_pull_requests`]): this is only Git.
     pub fn refresh(&mut self) {
-        self.refreshed_at = Some(std::time::Instant::now());
         self.inspector.invalidate();
+        self.scan_folders(None);
+    }
+
+    /// The periodic read: every folder workspace when [`FULL_SCAN`] has
+    /// passed since they were all read, else, with crc in `front`, the
+    /// selected workspace's folder when [`SCAN_EVERY`] has passed since it
+    /// was. The inspector's status is not read again for it: that has its
+    /// own wait. Returns whether a read started.
+    pub fn refresh_due(&mut self, front: bool) -> bool {
+        if !self.loaded {
+            self.refresh();
+            return true;
+        }
+        if self.reading_list() {
+            return false;
+        }
+        let due = |at: Option<&std::time::Instant>, every: std::time::Duration| {
+            at.is_none_or(|at| at.elapsed() + std::time::Duration::from_secs(1) >= every)
+        };
+        if due(self.refreshed_at.as_ref(), FULL_SCAN) {
+            self.scan_folders(None);
+            return true;
+        }
+        if !front {
+            return false;
+        }
+        let selected: Vec<String> = self
+            .selected_folder()
+            .filter(|id| due(self.scanned_at.get(id), SCAN_EVERY))
+            .into_iter()
+            .collect();
+        if selected.is_empty() {
+            return false;
+        }
+        self.scan_folders(Some(selected));
+        true
+    }
+
+    /// The folder workspace whose repositories the selected workspace
+    /// shows, by id: itself, or the one a worktree's row sits under.
+    fn selected_folder(&self) -> Option<String> {
+        let task = &self.tasks[self.selected_index()?];
+        if task.folder {
+            (!task.folderless()).then(|| task.id())
+        } else {
+            self.parent_of(task)
+        }
+    }
+
+    /// Reads, on workers, the folder workspaces `only` names, or all of
+    /// them for `None`. All of them are looked through for repositories
+    /// again; only some, a folder that has not changed is not.
+    fn scan_folders(&mut self, only: Option<Vec<String>>) {
+        let now = std::time::Instant::now();
+        if only.is_none() {
+            self.refreshed_at = Some(now);
+        }
         if self.github.is_none() {
             self.github = Some(crate::project::worktree::has_gh());
         }
         if !self.loaded {
             self.load();
         }
+        let fresh = only.is_none();
+        let wanted = |f: &Workspace| {
+            !f.folderless() && only.as_ref().is_none_or(|ids| ids.contains(&f.id()))
+        };
+        for folder in self.folders.iter().filter(|f| wanted(f)) {
+            self.scanned_at.insert(folder.id(), now);
+        }
         let (tx, rx) = mpsc::channel();
         let (info_tx, info_rx) = mpsc::channel();
         // This Mac's folders on one worker, each host's on its own: a host
         // that is slow or gone holds back only its own rows. A remote
-        // folder's Git is read on its host, over ssh.
-        let mut hosts: Vec<Option<String>> = vec![None];
-        for host in self.folders.iter().filter_map(|f| f.host.clone()) {
-            if !hosts.contains(&Some(host.clone())) {
-                hosts.push(Some(host));
+        // folder's Git is read on its host, over ssh. The periodic read of
+        // one folder asks only its own host.
+        let mut hosts: Vec<Option<String>> = Vec::new();
+        if fresh {
+            hosts.push(None);
+        }
+        for host in self
+            .folders
+            .iter()
+            .filter(|f| wanted(f))
+            .map(|f| f.host.clone())
+        {
+            if !hosts.contains(&host) {
+                hosts.push(host);
             }
         }
+        self.reading_local = hosts.contains(&None);
         for host in hosts {
             let folders: Vec<(String, PathBuf)> = self
                 .folders
                 .iter()
-                .filter(|f| f.host == host && !f.folderless())
+                .filter(|f| f.host == host && wanted(f))
                 .map(|f| (f.id(), f.path.clone()))
                 .collect();
             let (tx, info_tx) = (tx.clone(), info_tx.clone());
             std::thread::spawn(move || {
-                let listing = scan(&folders, host.as_deref());
+                let listing = scan(&folders, host.as_deref(), fresh);
                 let tasks = listing.worktrees.clone();
                 if tx.send(listing).is_err() {
                     return;
@@ -1446,7 +1568,6 @@ impl Panel {
             });
         }
         self.rx = Some(rx);
-        self.reading_local = true;
         self.info_rx = Some(info_rx);
     }
 
@@ -2010,8 +2131,8 @@ impl Panel {
             loop {
                 match rx.try_recv() {
                     Ok((id, ahead)) => {
+                        changed |= self.info.get(&id).is_none_or(|i| i.ahead != ahead);
                         self.info.entry(id).or_default().ahead = ahead;
-                        changed = true;
                     }
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
@@ -2044,13 +2165,29 @@ impl Panel {
         changed
     }
 
+    /// Takes the parts of a list read that came in. Returns whether the
+    /// list changed: a read that found what the last one did, the periodic
+    /// one most of the time, leaves the rows, their watchers and the
+    /// window as they were.
     fn poll_list(&mut self) -> bool {
         let mut changed = false;
+        let was_listed = self.listed();
         while let Some(rx) = &self.rx {
             match rx.try_recv() {
                 Ok(listing) => {
+                    let before = (
+                        self.repos.clone(),
+                        self.worktrees.clone(),
+                        self.unreachable.clone(),
+                        self.prunable.clone(),
+                        self.github_repos.clone(),
+                    );
                     self.take_listing(listing);
-                    changed = true;
+                    changed |= before.0 != self.repos
+                        || before.1 != self.worktrees
+                        || before.2 != self.unreachable
+                        || before.3 != self.prunable
+                        || before.4 != self.github_repos;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -2061,6 +2198,8 @@ impl Panel {
                 }
             }
         }
+        // The first read in: the list is known now, even if empty.
+        changed |= !was_listed && self.listed();
         if changed {
             self.rebuild();
             self.prune();
@@ -2071,35 +2210,37 @@ impl Panel {
     }
 
     /// Takes one part of a read: this Mac's folder workspaces, or one
-    /// host's. The rows of the folders it did not read are kept, and so
-    /// are those of a folder whose host did not answer.
+    /// host's, all of them or only some (the periodic read's). The rows of
+    /// the folders it did not read are kept, and so are those of a folder
+    /// whose host did not answer.
     fn take_listing(&mut self, listing: Listing) {
-        // The folders and rows this part read again: those on its host.
         let covers = |host: &Option<String>| *host == listing.host;
-        let ids: Vec<String> = self
+        let on_host: Vec<String> = self
             .folders
             .iter()
             .filter(|f| covers(&f.host))
             .map(Workspace::id)
             .collect();
-        let mut kept: Vec<Workspace> = Vec::new();
-        let mut kept_mains: Vec<PathBuf> = Vec::new();
-        for id in &listing.unreachable {
-            let (Some(old), Some(folder)) = (
-                self.repos.get(id),
-                self.folders.iter().find(|f| f.id() == *id),
-            ) else {
-                continue;
-            };
-            kept_mains.extend(old.iter().cloned());
-            kept.extend(
-                self.worktrees
-                    .iter()
-                    .filter(|w| w.host == folder.host)
-                    .filter(|w| w.repo.as_ref().is_some_and(|r| old.contains(r)))
-                    .cloned(),
-            );
-        }
+        // The folders this part read again; of the others on its host, and
+        // those whose host did not answer, the repositories and rows stay.
+        let (ids, others): (Vec<String>, Vec<String>) = on_host
+            .into_iter()
+            .partition(|id| listing.folders.contains(id));
+        let partial = !others.is_empty();
+        let kept_mains: Vec<PathBuf> = others
+            .iter()
+            .chain(&listing.unreachable)
+            .filter_map(|id| self.repos.get(id))
+            .flatten()
+            .cloned()
+            .collect();
+        let kept: Vec<Workspace> = self
+            .worktrees
+            .iter()
+            .filter(|w| covers(&w.host))
+            .filter(|w| w.repo.as_ref().is_some_and(|r| kept_mains.contains(r)))
+            .cloned()
+            .collect();
         for id in &ids {
             if listing.unreachable.contains(id) {
                 self.unreachable.insert(id.clone());
@@ -2109,13 +2250,26 @@ impl Panel {
             }
         }
         self.repos.extend(listing.repos);
-        let mut rows: Vec<Workspace> = std::mem::take(&mut self.worktrees)
-            .into_iter()
-            .filter(|w| !covers(&w.host))
-            .collect();
-        for row in listing.worktrees.into_iter().chain(kept) {
-            if !rows.iter().any(|r| r.id() == row.id()) {
-                rows.push(row);
+        let old = std::mem::take(&mut self.worktrees);
+        let mut rows: Vec<Workspace> = Vec::new();
+        if partial {
+            // Rows keep their places, each as read now when it was; new
+            // ones go last.
+            let mut fresh = listing.worktrees;
+            for w in old {
+                if let Some(at) = fresh.iter().position(|r| r.id() == w.id()) {
+                    rows.push(fresh.remove(at));
+                } else if !covers(&w.host) || kept.contains(&w) {
+                    rows.push(w);
+                }
+            }
+            rows.extend(fresh);
+        } else {
+            rows.extend(old.into_iter().filter(|w| !covers(&w.host)));
+            for row in listing.worktrees.into_iter().chain(kept) {
+                if !rows.iter().any(|r| r.id() == row.id()) {
+                    rows.push(row);
+                }
             }
         }
         // This Mac's first, then each host's, whichever answered first.
@@ -2193,6 +2347,22 @@ impl Panel {
     /// [`Panel::parent_of`] the workspace `id`.
     pub fn parent_of_id(&self, id: &str) -> Option<String> {
         self.parent_of(&self.tasks[self.by_id(id)?])
+    }
+
+    /// Something in the Git directory of the main checkout `main` changed
+    /// (a commit, a checkout, a ref moved): the inspector reads it and its
+    /// worktrees again soon, when it shows them. Returns whether it does.
+    pub fn refs_moved(&mut self, main: &Path) -> bool {
+        let trees: Vec<PathBuf> = self
+            .worktrees
+            .iter()
+            .filter(|w| w.host.is_none() && w.repo.as_deref() == Some(main))
+            .map(|w| w.path.clone())
+            .chain([main.to_path_buf()])
+            .collect();
+        trees
+            .iter()
+            .fold(false, |shown, tree| self.inspector.touch(tree) | shown)
     }
 
     /// The worktrees in the list, for their watchers: this Mac's, as a
@@ -4513,6 +4683,7 @@ mod tests {
         let box_ = |path: &str| (Some("box".to_owned()), PathBuf::from(path));
         let listing = |names: &[(&str, &str)]| Listing {
             host: Some("box".into()),
+            folders: vec!["folder:srv".into()],
             repos: vec![(
                 "folder:srv".into(),
                 vec![PathBuf::from("/srv/app"), PathBuf::from("/srv/tool")],
@@ -5114,6 +5285,11 @@ mod tests {
         let listing =
             |host: Option<&str>, repos: Vec<(&str, &[&str])>, rows, unreachable: &[&str]| Listing {
                 host: host.map(str::to_owned),
+                folders: repos
+                    .iter()
+                    .map(|(id, _)| (*id).to_owned())
+                    .chain(unreachable.iter().map(|s| (*s).to_owned()))
+                    .collect(),
                 repos: repos
                     .into_iter()
                     .map(|(id, r)| (id.to_owned(), r.iter().map(PathBuf::from).collect()))
@@ -5170,6 +5346,131 @@ mod tests {
         );
         assert_eq!(panel.report_tree(), "srv,app,>next");
         assert!(panel.unreachable.is_empty());
+    }
+
+    #[test]
+    fn a_read_of_one_folder_keeps_the_others_rows() {
+        let mut panel = Panel {
+            folders: vec![folder("garden", "/d/garden"), folder("kites", "/d/kites")],
+            ..Panel::default()
+        };
+        let row = |path: &str, repo: &str| {
+            let mut w = tree(path, false);
+            w.branch = Some(path.rsplit('/').next().unwrap().into());
+            w.name = w.branch.clone().unwrap();
+            w.repo = Some(PathBuf::from(repo));
+            w
+        };
+        let here = |main: &str| (None, PathBuf::from(main));
+        let listing = |folders: &[&str], repos: Vec<(&str, &str)>, rows: Vec<Workspace>| Listing {
+            host: None,
+            folders: folders.iter().map(|f| (*f).to_owned()).collect(),
+            repos: repos
+                .iter()
+                .map(|(id, repo)| ((*id).to_owned(), vec![PathBuf::from(repo)]))
+                .collect(),
+            worktrees: rows,
+            prunable: repos.iter().map(|(_, repo)| (here(repo), 1)).collect(),
+            github: repos
+                .iter()
+                .map(|(_, repo)| (here(repo), format!("me/{}", &repo[3..])))
+                .collect(),
+            unreachable: Vec::new(),
+        };
+        let take = |panel: &mut Panel, l: Listing| {
+            panel.take_listing(l);
+            panel.rebuild();
+        };
+        take(
+            &mut panel,
+            listing(
+                &["folder:garden", "folder:kites"],
+                vec![
+                    ("folder:garden", "/d/garden/beds"),
+                    ("folder:kites", "/d/kites/box"),
+                ],
+                vec![
+                    row("/w/kites/tail", "/d/kites/box"),
+                    row("/w/garden/mulch", "/d/garden/beds"),
+                    row("/w/kites/spar", "/d/kites/box"),
+                ],
+            ),
+        );
+        assert_eq!(panel.report_tree(), "garden,>mulch,kites,>tail,>spar");
+        let order = |panel: &Panel| -> Vec<String> {
+            panel.worktrees.iter().map(|w| w.name.clone()).collect()
+        };
+        assert_eq!(order(&panel), ["tail", "mulch", "spar"]);
+        // The periodic read of the selected folder alone: a worktree new in
+        // it, one gone. The other folder's rows, repositories, missing
+        // worktrees and GitHub names stay, and every row keeps its place.
+        take(
+            &mut panel,
+            listing(
+                &["folder:garden"],
+                vec![("folder:garden", "/d/garden/beds")],
+                vec![row("/w/garden/seeds", "/d/garden/beds")],
+            ),
+        );
+        assert_eq!(panel.report_tree(), "garden,>seeds,kites,>tail,>spar");
+        assert_eq!(order(&panel), ["tail", "spar", "seeds"]);
+        assert_eq!(
+            panel.repos.get("folder:kites"),
+            Some(&vec![PathBuf::from("/d/kites/box")])
+        );
+        assert!(panel.prunable.contains_key(&here("/d/kites/box")));
+        assert!(panel.github_repos.contains_key(&here("/d/kites/box")));
+        // A row read again keeps its place too.
+        take(
+            &mut panel,
+            listing(
+                &["folder:kites"],
+                vec![("folder:kites", "/d/kites/box")],
+                vec![
+                    row("/w/kites/spar", "/d/kites/box"),
+                    row("/w/kites/tail", "/d/kites/box"),
+                ],
+            ),
+        );
+        assert_eq!(order(&panel), ["tail", "spar", "seeds"]);
+        // A read of every folder is Git's order again, and drops what a
+        // folder no longer holds.
+        take(
+            &mut panel,
+            listing(
+                &["folder:garden", "folder:kites"],
+                vec![
+                    ("folder:garden", "/d/garden/beds"),
+                    ("folder:kites", "/d/kites/box"),
+                ],
+                vec![row("/w/kites/spar", "/d/kites/box")],
+            ),
+        );
+        assert_eq!(panel.report_tree(), "garden,kites,>spar");
+        // A read that finds what the last one did changes nothing.
+        let again = |panel: &mut Panel, rows: Vec<Workspace>| {
+            let (tx, rx) = mpsc::channel();
+            tx.send(listing(
+                &["folder:garden", "folder:kites"],
+                vec![
+                    ("folder:garden", "/d/garden/beds"),
+                    ("folder:kites", "/d/kites/box"),
+                ],
+                rows,
+            ))
+            .unwrap();
+            panel.rx = Some(rx);
+            panel.poll_list()
+        };
+        assert!(!again(
+            &mut panel,
+            vec![row("/w/kites/spar", "/d/kites/box")]
+        ));
+        assert!(again(
+            &mut panel,
+            vec![row("/w/kites/tail", "/d/kites/box")]
+        ));
+        assert_eq!(panel.report_tree(), "garden,kites,>tail");
     }
 
     #[test]

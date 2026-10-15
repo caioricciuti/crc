@@ -285,6 +285,14 @@ impl EditorView {
                 }
             }
             Step::Idle(_) => {}
+            Step::Front(front) => {
+                if let Some(mut state) = self.state_mut() {
+                    state.agents.front = Some(*front);
+                }
+                if *front {
+                    self.came_to_front();
+                }
+            }
             Step::Reenter => {
                 let held = self.ivars().state.borrow_mut();
                 let x = NSString::from_str("x");

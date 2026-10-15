@@ -4,6 +4,20 @@ One entry per tag, written for people who use the editor.
 
 ## Unreleased
 
+- Agents mode runs far less Git when left alone. The inspector reads
+  its status once a minute instead of every twenty seconds, and sooner
+  when a file it shows changes, its repository's refs move, or you
+  select a workspace, open a card or press Read Again. Each read is one
+  `git status` where it took up to ten Git commands, and the latest tag
+  is looked up again only when HEAD or the tags move. The worktree list
+  reads the selected workspace's folder each minute and every folder
+  every five. A read that finds nothing new no longer redraws the
+  window. Left alone with a folder of five repositories, a minute went
+  from about 106 Git commands to about 30.
+- Agents mode rests while crc is behind other apps or its window is
+  covered: no status reads, and the worktree list and pull requests are
+  read every five minutes instead of every twenty seconds, so badges
+  still move. Coming back reads what is due at once.
 - Agents mode: the inspector no longer reads a repository's GitHub
   issues until you ask. Each repository card has Load Issues where its
   issues were; once clicked they are read then and every five minutes,

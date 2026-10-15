@@ -143,6 +143,10 @@ pub enum Step {
     /// Evaluates an expression in the preview page; the next dump's
     /// `preview:` line carries the answer.
     WebJs(String),
+    /// crc as the active app with its window in sight (`front on`), or
+    /// behind another app (`front off`); a test instance is never really
+    /// either, and counts as in front until this says.
+    Front(bool),
     /// Holds the state, as a caller up the stack would, and drives the entry
     /// points AppKit can re-enter through: each must skip, none may abort.
     Reenter,
@@ -383,6 +387,7 @@ pub fn parse(script: &str) -> Result<Vec<Step>, String> {
             "idle" => steps.push(Step::Idle(rest.parse().map_err(|_| bad())?)),
             "webjs" if !rest.is_empty() => steps.push(Step::WebJs(rest.to_string())),
             "wheel" => steps.push(Step::Wheel(rest.trim().parse().map_err(|_| bad())?)),
+            "front" if rest == "on" || rest == "off" => steps.push(Step::Front(rest == "on")),
             "reenter" => steps.push(Step::Reenter),
             "quit" => steps.push(Step::Quit),
             "panic" => steps.push(Step::Panic),

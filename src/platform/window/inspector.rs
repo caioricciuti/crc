@@ -10,10 +10,10 @@ use crate::platform::inspector::Action;
 use crate::project::worktree::MergeStrategy;
 use std::path::PathBuf;
 
-/// How often the workspace list is read again while Agents mode is on.
-/// Pull requests have their own cadence (`agents::pr_wait`), which the
-/// tick runs at the shortest of.
-const REFRESH_EVERY: f64 = 60.0;
+/// How often the periodic read ticks with crc in the background: the
+/// list, and the pull requests that are due, every five minutes instead of
+/// every few seconds, so badges still move on.
+const AWAY_EVERY: f64 = 300.0;
 /// How long after a push is noticed its pull request is read: a push
 /// moves several refs, and GitHub needs a moment to see it.
 const PUSH_SETTLE: f64 = 2.0;
@@ -163,11 +163,18 @@ impl EditorView {
     /// showing and the one in hand is old or another workspace's, and its
     /// loaded issues when they are due. A folded repository's card, and
     /// its worktrees' strips, are not read.
+    /// Nothing is read with crc in the background: coming back reads what
+    /// is due (see [`Self::came_to_front`]).
     pub(super) fn want_inspector(&self) {
+        let front = self.in_front();
         let Some(mut state) = self.state_mut() else {
             return;
         };
         if !state.agents.on || state.agents.inspector.hidden {
+            return;
+        }
+        if !front {
+            state.agents.away = true;
             return;
         }
         // Its issues, once a workspace is selected or its repositories are
@@ -252,8 +259,10 @@ impl EditorView {
         }
     }
 
-    /// Schedules the periodic read of the list, once.
+    /// Schedules the periodic read of the list, once: in a few seconds
+    /// with crc in front, in [`AWAY_EVERY`] behind other apps.
     pub(super) fn arm_agents_tick(&self) {
+        let front = self.in_front();
         let Some(mut state) = self.state_mut() else {
             return;
         };
@@ -262,31 +271,80 @@ impl EditorView {
         }
         state.agents.ticking = true;
         drop(state);
-        let every = crate::platform::agents::pr_tick().as_secs_f64();
+        let every = if front {
+            crate::platform::agents::pr_tick().as_secs_f64()
+        } else {
+            AWAY_EVERY
+        };
         let _: () = unsafe {
             msg_send![self, performSelector: sel!(agentsTick:),
                 withObject: None::<&AnyObject>, afterDelay: every]
         };
     }
 
-    /// The periodic read while Agents mode is on: worktrees and the
-    /// inspector's status every minute, when nothing else is reading them;
-    /// the pull requests that are due, and, with the inspector showing,
-    /// the selected workspace's loaded issues.
+    /// Whether crc is in front: the active app, its window not covered. A
+    /// self-test instance is never the active app; it counts as in front
+    /// unless its script says otherwise (`front off`).
+    pub(super) fn in_front(&self) -> bool {
+        if std::env::var_os("CRC_SELFTEST").is_some() {
+            return self.state().is_none_or(|s| s.agents.front != Some(false));
+        }
+        let app = NSApplication::sharedApplication(MainThreadMarker::from(self));
+        app.isActive()
+            && self.window().is_some_and(|w| {
+                w.occlusionState()
+                    .contains(objc2_app_kit::NSWindowOcclusionState::Visible)
+            })
+    }
+
+    /// crc came to the front: activated, or its window uncovered. After
+    /// time in the background, what came due meanwhile is read now, not
+    /// at the next tick, and the inspector's status soon after.
+    pub(super) fn came_to_front(&self) {
+        if !self.in_front() {
+            return;
+        }
+        {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            if !state.agents.on || !std::mem::take(&mut state.agents.away) {
+                return;
+            }
+            state.agents.inspector.touch_all();
+            state.agents.ticking = false;
+        }
+        // The tick waiting out the background's long wait goes; this one
+        // arms the next at the usual one.
+        let _: () = unsafe {
+            msg_send![
+                objc2::class!(NSObject),
+                cancelPreviousPerformRequestsWithTarget: self,
+                selector: sel!(agentsTick:),
+                object: None::<&AnyObject>
+            ]
+        };
+        self.agents_tick();
+    }
+
+    /// The periodic read while Agents mode is on. In front: the selected
+    /// workspace's worktrees every minute and every folder's every five,
+    /// when nothing else is reading them; the pull requests that are due,
+    /// and, with the inspector showing, the selected workspace's loaded
+    /// issues. In the background the same at [`AWAY_EVERY`], every folder
+    /// read each time, and no status for the inspector.
     pub(super) fn agents_tick(&self) {
+        let front = self.in_front();
         let on = {
             let Some(mut state) = self.state_mut() else {
                 return;
             };
             state.agents.ticking = false;
-            let due = state
-                .agents
-                .refreshed_at
-                .is_none_or(|at| at.elapsed().as_secs_f64() >= REFRESH_EVERY - 1.0);
-            if state.agents.on && due && !state.agents.reading_list() {
-                state.agents.refresh();
-            }
             if state.agents.on {
+                if !front {
+                    state.agents.away = true;
+                }
+                state.agents.refresh_due(front);
                 state.agents.refresh_pull_requests();
                 if !state.agents.inspector.hidden {
                     state.agents.refresh_issues();
