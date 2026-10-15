@@ -7217,6 +7217,7 @@ fn frame_of(state: &mut State) -> Frame {
                 ("push", g.push),
                 ("message", g.message),
                 ("commit", g.commit),
+                ("amend", g.amend),
             ] {
                 frame.push(Hit::Git(name), rect);
             }

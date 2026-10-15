@@ -266,7 +266,8 @@ the size and write it back.
   waiting ones first.
 - **Local Git** (`Cmd-Option-G`): branch and status, changed files, staged
   and working-tree diffs, whole-file and hunk stage/unstage, Stage All and
-  Unstage All per section, commit, and a right-click menu on every change.
+  Unstage All per section, commit, amending the last commit while it is
+  not yet pushed, and a right-click menu on every change.
   Git runs on workers and reads saved disk state; hooks and signing stay
   as Git has them. Branches switched, created, renamed and deleted from
   Source Control's branch menu, the palette or the branch in the status

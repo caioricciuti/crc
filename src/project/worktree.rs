@@ -1425,7 +1425,7 @@ pub fn commit_all(dir: &Path, message: &str) -> Result<String, String> {
         return Err("Nothing to commit".into());
     }
     run(dir, &["add", "--all"])?;
-    crate::project::git::commit(dir, message)?;
+    crate::project::git::commit(dir, message, false)?;
     Ok(committed(files))
 }
 

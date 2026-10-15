@@ -45,6 +45,11 @@ pub struct Snapshot {
     pub changes: Vec<Change>,
     /// A merge, rebase, cherry-pick or revert that stopped for the user.
     pub in_progress: Option<InProgress>,
+    /// HEAD's full message, for Amend to start from; `None` before the
+    /// first commit, or until [`read_head`] has asked.
+    pub head_message: Option<String>,
+    /// Whether HEAD is already on its upstream (see [`head_is_pushed`]).
+    pub head_pushed: bool,
 }
 
 /// An operation Git left half done, read from the files it keeps in the
@@ -789,7 +794,35 @@ fn parse_status(root: PathBuf, bytes: &[u8]) -> Result<Snapshot, String> {
         branch,
         changes,
         in_progress: None,
+        head_message: None,
+        head_pushed: false,
     })
+}
+
+/// Fills in what Amend needs to know about HEAD: its message, and whether
+/// it is already pushed. Asked only where Source Control refreshes, and
+/// only what the status header leaves open: no HEAD commit means no
+/// message, no live upstream means not pushed.
+pub fn read_head(snapshot: &mut Snapshot) {
+    let header = &snapshot.branch;
+    if header.starts_with("No commits yet on ") || header.starts_with("Initial commit on ") {
+        return;
+    }
+    snapshot.head_message = head_message(&snapshot.root).ok();
+    snapshot.head_pushed =
+        header.contains("...") && !header.ends_with("[gone]") && head_is_pushed(&snapshot.root);
+}
+
+/// HEAD's full message, without the newline Git ends it with.
+pub fn head_message(root: &Path) -> Result<String, String> {
+    let out = run(root, &["log", "-1", "--format=%B"])?;
+    Ok(String::from_utf8_lossy(&out).trim_end().to_owned())
+}
+
+/// Whether HEAD is already in its upstream, so amending it would rewrite a
+/// published commit. No upstream, or one whose branch is gone, is not.
+pub fn head_is_pushed(root: &Path) -> bool {
+    run(root, &["merge-base", "--is-ancestor", "HEAD", "@{u}"]).is_ok()
 }
 
 /// Lines of a diff that name the command's arguments, not the change.
@@ -1186,15 +1219,18 @@ pub fn stage(root: &Path, change: &Change, staged: bool) -> Result<(), String> {
     checked(cmd.output().map_err(|e| e.to_string())?).map(|_| ())
 }
 
-pub fn commit(root: &Path, message: &str) -> Result<(), String> {
+/// Commits what is staged with `message`; with `amend`, replaces HEAD
+/// instead, which with nothing staged rewords it.
+pub fn commit(root: &Path, message: &str, amend: bool) -> Result<(), String> {
     if message.trim().is_empty() {
         return Err("Write a commit message first".into());
     }
-    run_with_stdin(
-        command(root).args(["commit", "--file=-"]),
-        message.as_bytes().to_vec(),
-    )
-    .map(|_| ())
+    let mut cmd = command(root);
+    cmd.args(["commit", "--file=-"]);
+    if amend {
+        cmd.arg("--amend");
+    }
+    run_with_stdin(&mut cmd, message.as_bytes().to_vec()).map(|_| ())
 }
 
 /// A local branch.
@@ -1886,6 +1922,90 @@ mod tests {
         assert_eq!(commits_since(dir, at - 1, 5).unwrap(), ["plant the beans"]);
         // A visit in the same second as the commit came after it.
         assert!(commits_since(dir, at, 5).unwrap().is_empty());
+    }
+
+    fn count(dir: &Path) -> String {
+        String::from_utf8(run(dir, &["rev-list", "--count", "HEAD"]).unwrap())
+            .unwrap()
+            .trim()
+            .to_owned()
+    }
+
+    #[test]
+    fn amend_rewrites_head_without_a_new_commit() {
+        let base = TempRepo::new("amend");
+        let dir = base.path();
+        std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+        run(dir, &["add", "a.txt"]).unwrap();
+        commit(dir, "plant the beans\n\nA body line.", false).unwrap();
+        assert_eq!(
+            head_message(dir).unwrap(),
+            "plant the beans\n\nA body line."
+        );
+        std::fs::write(dir.join("b.txt"), "b\n").unwrap();
+        run(dir, &["add", "b.txt"]).unwrap();
+        commit(dir, "plant the beans and water them", true).unwrap();
+        assert_eq!(count(dir), "1", "amended, not added");
+        assert_eq!(head_message(dir).unwrap(), "plant the beans and water them");
+        let files = run(dir, &["show", "--name-only", "--format=", "HEAD"]).unwrap();
+        assert_eq!(String::from_utf8_lossy(&files).trim(), "a.txt\nb.txt");
+        // Nothing staged: a reword.
+        commit(dir, "water the beans", true).unwrap();
+        assert_eq!(count(dir), "1");
+        assert_eq!(head_message(dir).unwrap(), "water the beans");
+    }
+
+    #[test]
+    fn head_is_pushed_only_when_its_upstream_has_it() {
+        let base = TempRepo::new("pushed");
+        let dir = base.path();
+        run(dir, &["init", "--quiet", "--bare", "origin.git"]).unwrap();
+        let work = dir.join("work");
+        run(dir, &["clone", "--quiet", "origin.git", "work"]).unwrap_or_default();
+        for (key, value) in [
+            ("user.name", "caio test"),
+            ("user.email", "test@example.invalid"),
+            ("commit.gpgsign", "false"),
+        ] {
+            run(&work, &["config", key, value]).unwrap();
+        }
+        let add = |file: &str| {
+            std::fs::write(work.join(file), file).unwrap();
+            run(&work, &["add", file]).unwrap();
+            commit(&work, file, false).unwrap();
+        };
+        let read = || {
+            let mut snapshot = snapshot(&work).unwrap();
+            read_head(&mut snapshot);
+            snapshot
+        };
+        assert_eq!(read().head_message, None, "no commits yet");
+        add("one.txt");
+        assert!(!head_is_pushed(&work), "no upstream");
+        assert!(!read().head_pushed);
+        run(&work, &["push", "--quiet", "-u", "origin", "HEAD"]).unwrap();
+        assert!(head_is_pushed(&work), "level with its upstream");
+        let level = read();
+        assert!(level.head_pushed);
+        assert_eq!(level.head_message.as_deref(), Some("one.txt"));
+        add("two.txt");
+        assert!(!head_is_pushed(&work), "ahead of its upstream");
+        assert!(!read().head_pushed);
+        run(&work, &["push", "--quiet"]).unwrap();
+        assert!(read().head_pushed);
+        // The upstream's branch deleted on the remote, then pruned.
+        let origin = dir.join("origin.git");
+        run(&origin, &["config", "receive.denyDeleteCurrent", "ignore"]).unwrap();
+        let branch = String::from_utf8(run(&work, &["branch", "--show-current"]).unwrap())
+            .unwrap()
+            .trim()
+            .to_owned();
+        run(&work, &["push", "--quiet", "origin", "--delete", &branch]).unwrap();
+        run(&work, &["fetch", "--quiet", "--prune"]).unwrap();
+        let gone = read();
+        assert!(gone.branch.ends_with("[gone]"), "{}", gone.branch);
+        assert!(!head_is_pushed(&work), "gone upstream");
+        assert!(!gone.head_pushed);
     }
 
     #[test]
@@ -2606,7 +2726,7 @@ mod tests {
         stage(&root, &s.changes[0], false).unwrap();
         assert!(!snapshot(&root).unwrap().changes[0].staged());
         stage(&root, &snapshot(&root).unwrap().changes[0], true).unwrap();
-        commit(&root, "Initial personal sample").unwrap();
+        commit(&root, "Initial personal sample", false).unwrap();
         assert!(snapshot(&root).unwrap().changes.is_empty());
         std::fs::write(root.join("a file.txt"), "hello again\n").unwrap();
         let s = snapshot(&root).unwrap();
@@ -2644,11 +2764,11 @@ mod tests {
         run(&root, &["add", "-A"]).unwrap();
         // A message several times a pipe's buffer goes in whole.
         let body = "a long commit message line\n".repeat(12_000);
-        commit(&root, &format!("Everything\n\n{body}")).unwrap();
+        commit(&root, &format!("Everything\n\n{body}"), false).unwrap();
         let logged = run(&root, &["log", "-1", "--format=%B"]).unwrap();
         assert!(logged.len() > body.len(), "{} bytes", logged.len());
         // Nothing staged: Git's own refusal, not a broken pipe.
-        let error = commit(&root, &body).unwrap_err();
+        let error = commit(&root, &body, false).unwrap_err();
         assert!(!error.to_lowercase().contains("pipe"), "{error}");
         run(&root, &["mv", "a file.txt", "moved.txt"]).unwrap();
         std::fs::write(root.join("moved.txt"), "moved and edited\n").unwrap();

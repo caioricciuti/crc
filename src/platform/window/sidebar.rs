@@ -219,6 +219,9 @@ impl EditorView {
             return true;
         } else if g.commit.contains(x, y) {
             state.git.commit();
+        } else if g.amend.contains(x, y) {
+            let on = !state.git.amend;
+            state.git.set_amend(on);
         } else if g.message.contains(x, y) {
             state.git_focus = true;
             let State { git, renderer, .. } = &mut *state;

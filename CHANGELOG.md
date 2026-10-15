@@ -42,6 +42,13 @@ One entry per tag, written for people who use the editor.
   process and folder are read at most twice a second.
 - crc opens on Agents mode, with a shell ready in the selected
   workspace. Opening a file or folder with it still opens the editor.
+- Source Control: Amend, beside Commit, replaces the last commit
+  instead of adding one. Turned on with an empty message, it fills in
+  the last commit's message; Commit then reads Amend and folds in what
+  is staged, or with nothing staged just rewords it. It turns itself off
+  after the amend. It cannot be turned on before the first commit,
+  during a merge, rebase, cherry-pick or revert, or once the commit is already on its
+  upstream branch, and its tooltip says which.
 - Source Control: the commit message completes conventional-commit
   types. Type the start of one (`fe`, `re`) and the rest shows dimmed
   after the caret; Tab takes it. Where several types match, the more

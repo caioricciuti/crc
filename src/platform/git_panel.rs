@@ -21,7 +21,8 @@ enum Operation {
     StageHunk(Change, git::Hunk),
     /// One change the editor's gutter marks, staged from the editor's text.
     StageText(StageText),
-    Commit(String),
+    /// The message, and whether it replaces HEAD.
+    Commit(String, bool),
     Switch(String),
     CreateBranch(String),
     /// A branch, and whether to delete it unmerged.
@@ -50,6 +51,8 @@ struct Reply {
     selected: usize,
     diff: String,
     committed: bool,
+    /// The commit replaced HEAD.
+    amended: bool,
     error: Option<String>,
     /// What a branch or remote command did, for the status line.
     done: Option<String>,
@@ -113,6 +116,11 @@ pub struct Panel {
     pub list_scroll: usize,
     pub diff_scroll: usize,
     pub message: Buffer,
+    /// Commit replaces HEAD instead of adding a commit.
+    pub amend: bool,
+    /// HEAD's message as Amend put it in the field, so turning Amend off
+    /// takes it back out unless it was edited.
+    amend_prefill: Option<String>,
     pub note: String,
     /// The note says something went right (a commit), not wrong.
     note_success: bool,
@@ -230,12 +238,16 @@ pub struct Sidebar {
     pub push: Viewport,
     pub message: Viewport,
     pub commit: Viewport,
+    /// The Amend toggle, at the trailing end of Commit's row.
+    pub amend: Viewport,
     pub list: Viewport,
     pub note: Viewport,
 }
 
 /// Width of the Pull and Push buttons: an arrow and a count.
 const SYNC_WIDTH: f32 = 44.0;
+/// Width of the Amend toggle: a pencil and its name.
+const AMEND_WIDTH: f32 = 80.0;
 
 impl Sidebar {
     pub fn new(column: Viewport) -> Self {
@@ -272,10 +284,22 @@ impl Sidebar {
             width,
             height: control,
         };
+        // A narrow column keeps the pencil alone, so Commit keeps its room.
+        let amend_width = if width >= AMEND_WIDTH * 2.5 {
+            AMEND_WIDTH
+        } else {
+            control.min(width)
+        };
+        let amend = Viewport {
+            x: x + width - amend_width,
+            y: message.y + control + layout::UI_GAP,
+            width: amend_width,
+            height: control,
+        };
         let commit = Viewport {
             x,
-            y: message.y + control + layout::UI_GAP,
-            width,
+            y: amend.y,
+            width: (amend.x - layout::UI_GAP - x).max(0.0),
             height: control,
         };
         let note_height = 24.0;
@@ -295,6 +319,7 @@ impl Sidebar {
             push,
             message,
             commit,
+            amend,
             list: Viewport {
                 x: column.x,
                 y: list_top,
@@ -365,6 +390,8 @@ impl Panel {
             list_scroll: 0,
             diff_scroll: 0,
             message: Buffer::new(),
+            amend: false,
+            amend_prefill: None,
             note: "Reading repository…".into(),
             note_success: false,
             collapsed: [false; 3],
@@ -638,6 +665,15 @@ impl Panel {
     pub fn commit_blocker(&self) -> Option<&'static str> {
         if self.busy() {
             Some("Git is busy")
+        } else if self.amend {
+            // Amending with nothing staged rewords HEAD.
+            match self.amend_blocker() {
+                Some(why) => Some(why),
+                None if self.message.rope.to_string().trim().is_empty() => {
+                    Some("Write a commit message first")
+                }
+                None => None,
+            }
         } else if self.staged_count() == 0 {
             Some("Stage a change to commit it")
         } else if self.message.rope.to_string().trim().is_empty() {
@@ -659,10 +695,74 @@ impl Panel {
     }
 
     pub fn can_commit(&self) -> bool {
-        self.snapshot
-            .as_ref()
-            .is_some_and(|s| s.changes.iter().any(Change::staged))
-            && !self.message.rope.to_string().trim().is_empty()
+        let ready = if self.amend {
+            self.snapshot.is_some() && self.amend_blocker().is_none()
+        } else {
+            self.snapshot
+                .as_ref()
+                .is_some_and(|s| s.changes.iter().any(Change::staged))
+        };
+        ready && !self.message.rope.to_string().trim().is_empty()
+    }
+
+    /// Why Amend cannot be turned on, for its tooltip; `None` when it can.
+    pub fn amend_blocker(&self) -> Option<&'static str> {
+        let snapshot = self.snapshot.as_ref()?;
+        if snapshot.head_message.is_none() {
+            Some("Nothing to amend: no commits yet")
+        } else if let Some(what) = snapshot.in_progress {
+            Some(match what {
+                git::InProgress::Merge => "A merge is in progress: finish or abort it first",
+                git::InProgress::Rebase => "A rebase is in progress: finish or abort it first",
+                git::InProgress::CherryPick => {
+                    "A cherry-pick is in progress: finish or abort it first"
+                }
+                git::InProgress::Revert => "A revert is in progress: finish or abort it first",
+            })
+        } else if snapshot.head_pushed {
+            Some("Already pushed: amending would rewrite a published commit")
+        } else {
+            None
+        }
+    }
+
+    /// Turns Amend on or off. On, an empty message field starts from
+    /// HEAD's message; off, that message goes again unless it was edited.
+    pub fn set_amend(&mut self, on: bool) {
+        if on == self.amend || (on && self.amend_state() == "blocked") {
+            return;
+        }
+        self.amend = on;
+        if on {
+            let head = self.snapshot.as_ref().and_then(|s| s.head_message.clone());
+            if let Some(head) = head
+                && self.message.rope.len_bytes() == 0
+            {
+                self.message = Buffer::new();
+                self.message.insert(&head);
+                self.amend_prefill = Some(head);
+            }
+        } else {
+            if self
+                .amend_prefill
+                .as_deref()
+                .is_some_and(|prefill| self.message.rope.to_string() == prefill)
+            {
+                self.message = Buffer::new();
+            }
+            self.amend_prefill = None;
+        }
+    }
+
+    /// Whether the dump and the toggle read Amend as off, on or blocked.
+    pub fn amend_state(&self) -> &'static str {
+        if self.amend {
+            "on"
+        } else if self.snapshot.is_none() || self.amend_blocker().is_some() {
+            "blocked"
+        } else {
+            "off"
+        }
     }
     pub fn refresh(&mut self) {
         self.start(Operation::Refresh);
@@ -779,7 +879,7 @@ impl Panel {
             return;
         }
         if self.can_commit() {
-            self.start(Operation::Commit(message));
+            self.start(Operation::Commit(message, self.amend));
         }
     }
     fn start(&mut self, operation: Operation) {
@@ -789,7 +889,7 @@ impl Panel {
             }
             return;
         }
-        let submitted = if let Operation::Commit(message) = &operation {
+        let submitted = if let Operation::Commit(message, _) = &operation {
             Some(message.clone())
         } else {
             None
@@ -806,7 +906,7 @@ impl Panel {
                 | Operation::Resolve(_)
                 | Operation::StageAll(..)
                 | Operation::StageText(_)
-                | Operation::Commit(_)
+                | Operation::Commit(..)
         );
         let directory = self.directory.clone();
         let guard = self.guard.clone();
@@ -825,6 +925,7 @@ impl Panel {
                 let root = git::toplevel(&directory)?;
                 let mut selected_path = previous;
                 let mut committed = false;
+                let mut amended = false;
                 let mut done = None;
                 let error = match operation {
                     Operation::Switch(name) => match git::switch(&root, &name) {
@@ -955,7 +1056,7 @@ impl Panel {
                             Err(error) => Some(error),
                         }
                     }
-                    Operation::Commit(message) => {
+                    Operation::Commit(message, amend) => {
                         // The workspace's private markers, checked
                         // against exactly what would be committed.
                         let leaked = if guard.is_empty() {
@@ -968,11 +1069,13 @@ impl Panel {
                                 "{REFUSED}{hit}, which this workspace keeps out of its repositories. \
                                  Remove it from the staged change, or change private_markers in .crc/workspace.toml."
                             )),
-                            None => match git::commit(&root, &message) {
+                            None => match git::commit(&root, &message, amend) {
                                 Ok(()) => {
                                     committed = true;
+                                    amended = amend;
                                     let subject = message.lines().next().unwrap_or("").trim();
-                                    done = Some(format!("committed \u{201c}{subject}\u{201d}"));
+                                    let verb = if amend { "amended" } else { "committed" };
+                                    done = Some(format!("{verb} \u{201c}{subject}\u{201d}"));
                                     None
                                 }
                                 Err(error) => Some(error),
@@ -980,7 +1083,8 @@ impl Panel {
                         }
                     }
                 };
-                let snapshot = git::snapshot(&root)?;
+                let mut snapshot = git::snapshot(&root)?;
+                git::read_head(&mut snapshot);
                 let selected = selected_path
                     .and_then(|p| snapshot.changes.iter().position(|c| c.path == p))
                     .unwrap_or(0);
@@ -995,6 +1099,7 @@ impl Panel {
                     selected,
                     diff,
                     committed,
+                    amended,
                     error,
                     done,
                 })
@@ -1044,6 +1149,11 @@ impl Panel {
                 {
                     self.message = Buffer::new();
                 }
+                // Amend is for the one commit it was turned on for, and
+                // goes off once HEAD can no longer be amended: pushed, say.
+                if reply.amended || (self.amend && self.amend_blocker().is_some()) {
+                    self.set_amend(false);
+                }
                 // A failure is shown where the diff would be, as a note rather
                 // than as diff lines, so git's stderr is never mistaken for
                 // part of the change.
@@ -1073,7 +1183,9 @@ impl Panel {
                 }
                 self.note_success = reply.error.is_none() && reply.committed;
                 self.note = reply.error.unwrap_or_else(|| {
-                    if reply.committed {
+                    if reply.amended {
+                        "Commit amended".into()
+                    } else if reply.committed {
                         "Commit created".into()
                     } else {
                         String::new()
@@ -1276,6 +1388,8 @@ impl Panel {
                 selection: self.message.selection(),
                 placeholder: if focused {
                     "Message"
+                } else if self.amend {
+                    "Message (\u{2318}\u{21a9} to amend)"
                 } else {
                     "Message (\u{2318}\u{21a9} to commit)"
                 },
@@ -1329,6 +1443,7 @@ impl Panel {
         // that mixes staged and unstaged files does not.
         let staged = self.staged_count();
         let commit_label = match staged {
+            _ if self.amend => "Amend".to_owned(),
             0 => "Commit".to_owned(),
             1 => "Commit 1 File".to_owned(),
             n => format!("Commit {n} Files"),
@@ -1341,9 +1456,40 @@ impl Panel {
             .enabled(blocker.is_none());
         commit = match blocker {
             Some(why) => commit.tip(why),
-            None => commit.hint("\u{2318}\u{21a9}"),
+            // The shortcut, where the button has room for it.
+            None if commit.hint("\u{2318}\u{21a9}").content_width(atlas, 8.0) <= g.commit.width => {
+                commit.hint("\u{2318}\u{21a9}")
+            }
+            None => commit.tip("\u{2318}\u{21a9}"),
         };
         commit.draw(out, atlas, theme);
+        // Amend: a toggle that turns Commit into a rewrite of HEAD, off
+        // with its reason once HEAD is not this branch's own to rewrite.
+        let amend_blocker = if self.amend {
+            None
+        } else {
+            self.amend_blocker()
+        };
+        // While amending, the primary button already reads Amend, so this
+        // one is the way back out.
+        let amend = Button::new(g.amend)
+            .label(match (g.amend.width >= AMEND_WIDTH, self.amend) {
+                (false, _) => "",
+                (true, true) => "Cancel",
+                (true, false) => "Amend",
+            })
+            .icon(if self.amend {
+                icons::CLOSE
+            } else {
+                icons::EDIT
+            })
+            .enabled(amend_blocker.is_none());
+        match amend_blocker {
+            Some(why) => amend.tip(why),
+            None if self.amend => amend.tip("Stop amending: commit as a new commit"),
+            None => amend.tip("Amend the last commit instead of adding one"),
+        }
+        .draw(out, atlas, theme);
 
         let rows = self.rows(g);
         if rows.is_empty() && !busy {
@@ -1501,7 +1647,7 @@ impl Panel {
         if self.busy() {
             // The panel's own shape, sketched, while Git is first asked:
             // the branch, the message and Commit, then a few rows.
-            for rect in [g.branch, g.message, g.commit] {
+            for rect in [g.branch, g.message, g.commit, g.amend] {
                 layout::push_skeleton_row(out, rect, 0.0, (1.0, 0.0), false, theme);
             }
             let mut row_y = g.list.y + 4.0;
@@ -2044,6 +2190,8 @@ mod tests {
             branch: "main".into(),
             changes,
             in_progress: None,
+            head_message: Some("plant the beans".into()),
+            head_pushed: false,
         };
         let mut panel = Panel::idle(PathBuf::from("/tmp"), Some(snapshot));
         panel.note = String::new();
@@ -2094,6 +2242,60 @@ mod tests {
         );
         assert_eq!(subject_len("\nbody"), 0);
         assert_eq!(subject_len("a\r\nb"), 1);
+    }
+
+    /// Amend is offered only for a HEAD that is still this branch's own,
+    /// rewords with nothing staged, and takes back the message it put in.
+    #[test]
+    fn amend_is_blocked_with_a_reason_and_rewords_with_nothing_staged() {
+        let mut p = panel(Vec::new());
+        assert_eq!(p.amend_state(), "off");
+        assert!(!p.can_commit());
+        assert_eq!(p.commit_blocker(), Some("Stage a change to commit it"));
+
+        p.set_amend(true);
+        assert_eq!(p.amend_state(), "on");
+        assert_eq!(p.message.rope.to_string(), "plant the beans");
+        assert!(p.can_commit(), "a reword needs nothing staged");
+        assert_eq!(p.commit_blocker(), None);
+        // Unedited, it goes again with Amend.
+        p.set_amend(false);
+        assert_eq!(p.message.rope.to_string(), "");
+        // Edited, it stays.
+        p.set_amend(true);
+        p.message.insert(" and water them");
+        p.set_amend(false);
+        assert_eq!(p.message.rope.to_string(), "plant the beans and water them");
+        // A message already there is not replaced.
+        p.set_amend(true);
+        assert_eq!(p.message.rope.to_string(), "plant the beans and water them");
+        p.message = Buffer::new();
+        assert_eq!(p.commit_blocker(), Some("Write a commit message first"));
+        assert!(!p.can_commit());
+        p.set_amend(false);
+
+        let snapshot = p.snapshot.as_mut().unwrap();
+        snapshot.head_pushed = true;
+        assert_eq!(
+            p.amend_blocker(),
+            Some("Already pushed: amending would rewrite a published commit")
+        );
+        assert_eq!(p.amend_state(), "blocked");
+        p.set_amend(true);
+        assert!(!p.amend, "a blocked toggle stays off");
+
+        let snapshot = p.snapshot.as_mut().unwrap();
+        snapshot.head_pushed = false;
+        snapshot.in_progress = Some(git::InProgress::Merge);
+        assert_eq!(
+            p.amend_blocker(),
+            Some("A merge is in progress: finish or abort it first")
+        );
+
+        let snapshot = p.snapshot.as_mut().unwrap();
+        snapshot.in_progress = None;
+        snapshot.head_message = None;
+        assert_eq!(p.amend_blocker(), Some("Nothing to amend: no commits yet"));
     }
 
     #[test]
@@ -2257,6 +2459,7 @@ mod tests {
                 ("refresh", g.refresh),
                 ("message", g.message),
                 ("commit", g.commit),
+                ("amend", g.amend),
                 ("list", g.list),
                 ("note", g.note),
             ] {
@@ -2279,6 +2482,8 @@ mod tests {
             assert!(g.repo.y + g.repo.height <= g.branch.y);
             assert!(g.branch.x + g.branch.width <= g.pull.x);
             assert!(g.pull.x + g.pull.width <= g.push.x);
+            assert!(g.commit.x + g.commit.width <= g.amend.x);
+            assert_eq!(g.commit.y, g.amend.y);
             assert!(
                 g.note.y + g.note.height <= column.y + column.height,
                 "the note falls out of the bottom at height {height}"
