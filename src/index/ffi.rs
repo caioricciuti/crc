@@ -36,6 +36,7 @@ pub struct Stmt {
 pub const SQLITE_OK: c_int = 0;
 pub const SQLITE_ROW: c_int = 100;
 pub const SQLITE_DONE: c_int = 101;
+pub const SQLITE_TOOBIG: c_int = 18;
 
 // Flags for sqlite3_open_v2.
 pub const SQLITE_OPEN_READWRITE: c_int = 0x0000_0002;
@@ -49,6 +50,8 @@ pub const SQLITE_OPEN_FULLMUTEX: c_int = 0x0001_0000;
 pub const SQLITE_INTEGER: c_int = 1;
 #[allow(dead_code)]
 pub const SQLITE_TEXT: c_int = 3;
+#[allow(dead_code)]
+pub const SQLITE_BLOB: c_int = 4;
 pub const SQLITE_NULL: c_int = 5;
 
 /// Configuration verbs for `sqlite3_db_config`.
@@ -60,7 +63,7 @@ pub const SQLITE_NULL: c_int = 5;
 pub const SQLITE_DBCONFIG_DQS_DML: c_int = 1013;
 pub const SQLITE_DBCONFIG_DQS_DDL: c_int = 1014;
 
-/// Tells SQLite to copy a bound string rather than borrow it.
+/// Tells SQLite to copy a bound string or blob rather than borrow it.
 ///
 /// The sentinel is `(void*)-1`, not null. Passing null means
 /// `SQLITE_STATIC`, under which SQLite keeps the caller's pointer and reads
@@ -115,6 +118,15 @@ unsafe extern "C" {
         n_byte: c_int,
         destructor: *const c_void,
     ) -> c_int;
+    /// A null `value` binds SQL NULL, not an empty blob. A Rust slice
+    /// pointer is never null, so an empty `&[u8]` binds a zero-length blob.
+    pub fn sqlite3_bind_blob(
+        stmt: *mut Stmt,
+        index: c_int,
+        value: *const c_void,
+        n_byte: c_int,
+        destructor: *const c_void,
+    ) -> c_int;
     pub fn sqlite3_bind_null(stmt: *mut Stmt, index: c_int) -> c_int;
 
     pub fn sqlite3_column_count(stmt: *mut Stmt) -> c_int;
@@ -123,6 +135,9 @@ unsafe extern "C" {
     /// Must be called before `sqlite3_column_bytes` for the length to match
     /// the UTF-8 encoding rather than some other representation.
     pub fn sqlite3_column_text(stmt: *mut Stmt, col: c_int) -> *const u8;
+    /// Returns null for a zero-length blob as well as for SQL NULL; use
+    /// `sqlite3_column_type` to tell those apart.
+    pub fn sqlite3_column_blob(stmt: *mut Stmt, col: c_int) -> *const c_void;
     pub fn sqlite3_column_bytes(stmt: *mut Stmt, col: c_int) -> c_int;
 
     pub fn sqlite3_last_insert_rowid(db: *mut Sqlite3) -> i64;

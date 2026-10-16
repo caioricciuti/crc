@@ -287,6 +287,26 @@ impl Statement<'_> {
                         ffi::SQLITE_TRANSIENT,
                     )
                 },
+                Value::Blob(b) => {
+                    // The cast below would silently truncate a length past
+                    // i32::MAX, storing the wrong bytes rather than failing.
+                    let Ok(len) = c_int::try_from(b.len()) else {
+                        return Err(err(
+                            ffi::SQLITE_TOOBIG,
+                            format!("blob of {} bytes is too big to bind", b.len()),
+                        ));
+                    };
+                    // SQLITE_TRANSIENT for the same reason as Text above.
+                    unsafe {
+                        ffi::sqlite3_bind_blob(
+                            self.handle.as_ptr(),
+                            index,
+                            b.as_ptr() as *const c_void,
+                            len,
+                            ffi::SQLITE_TRANSIENT,
+                        )
+                    }
+                }
                 Value::Null => unsafe { ffi::sqlite3_bind_null(self.handle.as_ptr(), index) },
             };
             if rc != ffi::SQLITE_OK {
@@ -341,6 +361,21 @@ impl Statement<'_> {
             String::from_utf8_lossy(std::slice::from_raw_parts(ptr, len)).into_owned()
         }
     }
+
+    /// The column's bytes. A zero-length blob and SQL NULL both read as
+    /// empty; `is_null` tells them apart.
+    pub fn blob(&self, col: i32) -> Vec<u8> {
+        // SAFETY: column_blob must come first, as with text. A zero-length
+        // blob comes back as a null pointer, which from_raw_parts forbids.
+        unsafe {
+            let ptr = ffi::sqlite3_column_blob(self.handle.as_ptr(), col as c_int);
+            if ptr.is_null() {
+                return Vec::new();
+            }
+            let len = ffi::sqlite3_column_bytes(self.handle.as_ptr(), col as c_int) as usize;
+            std::slice::from_raw_parts(ptr as *const u8, len).to_vec()
+        }
+    }
 }
 
 impl Drop for Statement<'_> {
@@ -354,6 +389,7 @@ impl Drop for Statement<'_> {
 pub enum Value<'a> {
     Int(i64),
     Text(&'a str),
+    Blob(&'a [u8]),
     Null,
 }
 
@@ -372,6 +408,12 @@ impl<'a> From<usize> for Value<'a> {
 impl<'a> From<&'a str> for Value<'a> {
     fn from(v: &'a str) -> Self {
         Value::Text(v)
+    }
+}
+
+impl<'a> From<&'a [u8]> for Value<'a> {
+    fn from(v: &'a [u8]) -> Self {
+        Value::Blob(v)
     }
 }
 
@@ -563,6 +605,105 @@ mod tests {
             !e.message.is_empty(),
             "the error should say something useful"
         );
+        std::fs::remove_file(&path).ok();
+    }
+
+    fn blob_table(name: &str) -> (std::path::PathBuf, Db) {
+        let path = temp(name);
+        let db = Db::open(&path).expect("open");
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, b BLOB) STRICT")
+            .expect("create");
+        (path, db)
+    }
+
+    fn read_blob(db: &Db, id: i64) -> (bool, Vec<u8>) {
+        let mut q = db
+            .prepare("SELECT b FROM t WHERE id = ?1")
+            .expect("prepare");
+        q.bind(&[id.into()]).expect("bind");
+        assert!(q.step().expect("step"), "row {id} should exist");
+        (q.is_null(0), q.blob(0))
+    }
+
+    #[test]
+    fn blobs_round_trip_empty_large_and_binary() {
+        let (path, db) = blob_table("blob-roundtrip");
+        let large: Vec<u8> = (0..2 * 1024 * 1024).map(|i| (i * 31 % 251) as u8).collect();
+        let binary: &[u8] = &[0x00, 0xff, 0xfe, 0x00, 0xc3, 0x28, 0x80, 0x00];
+        let mut insert = db
+            .prepare("INSERT INTO t (id, b) VALUES (?1, ?2)")
+            .expect("prepare");
+        insert.run(&[1i64.into(), Value::Blob(&[])]).expect("empty");
+        insert
+            .run(&[2i64.into(), large.as_slice().into()])
+            .expect("large");
+        insert.run(&[3i64.into(), binary.into()]).expect("binary");
+
+        assert_eq!(read_blob(&db, 1), (false, Vec::new()));
+        let (null, got) = read_blob(&db, 2);
+        assert!(!null);
+        assert!(
+            got == large,
+            "the 2 MiB blob should come back byte for byte"
+        );
+        assert_eq!(read_blob(&db, 3), (false, binary.to_vec()));
+
+        let mut ty = db
+            .prepare("SELECT typeof(b) FROM t ORDER BY id")
+            .expect("prepare");
+        ty.bind(&[]).expect("bind");
+        let mut types = Vec::new();
+        while ty.step().expect("step") {
+            types.push(ty.text(0));
+        }
+        assert_eq!(types, ["blob", "blob", "blob"], "stored as BLOB, not TEXT");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_null_blob_is_not_an_empty_blob() {
+        let (path, db) = blob_table("blob-null");
+        let mut insert = db
+            .prepare("INSERT INTO t (id, b) VALUES (?1, ?2)")
+            .expect("prepare");
+        insert.run(&[1i64.into(), Value::Null]).expect("null");
+        insert.run(&[2i64.into(), Value::Blob(&[])]).expect("empty");
+
+        assert_eq!(read_blob(&db, 1), (true, Vec::new()));
+        assert_eq!(read_blob(&db, 2), (false, Vec::new()));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn blobs_match_in_a_where_clause() {
+        let path = temp("blob-where");
+        let db = Db::open(&path).expect("open");
+        db.execute("CREATE TABLE blobs (hash BLOB PRIMARY KEY, size INTEGER NOT NULL) STRICT")
+            .expect("create");
+        let a = [0xabu8; 32];
+        let mut b = a;
+        b[31] = 0x00;
+        let mut insert = db
+            .prepare("INSERT INTO blobs (hash, size) VALUES (?1, ?2)")
+            .expect("prepare");
+        insert.run(&[a.as_slice().into(), 10i64.into()]).expect("a");
+        insert.run(&[b.as_slice().into(), 20i64.into()]).expect("b");
+
+        let mut find = db
+            .prepare("SELECT size, hash FROM blobs WHERE hash = ?1")
+            .expect("prepare");
+        find.bind(&[b.as_slice().into()]).expect("bind");
+        assert!(find.step().expect("step"));
+        assert_eq!(find.int(0), 20);
+        assert_eq!(find.blob(1), b.to_vec());
+        assert!(!find.step().expect("step"), "exactly one row should match");
+
+        find.bind(&[[0u8; 32].as_slice().into()]).expect("bind");
+        assert!(
+            !find.step().expect("step"),
+            "an unknown hash matches nothing"
+        );
+
         std::fs::remove_file(&path).ok();
     }
 
