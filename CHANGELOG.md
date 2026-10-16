@@ -4,6 +4,14 @@ One entry per tag, written for people who use the editor.
 
 ## Unreleased
 
+- Terminal: links open with a Cmd-click. A web address a program
+  prints (such as the pull request link Claude Code shows) opens in your
+  browser, found whole even when it wraps onto the next row, without the
+  full stop, comma or closing bracket after it. A link a program marks
+  with OSC 8 opens its own target, whatever text it shows; only http,
+  https and file links are followed. Hold Cmd over a link to see it
+  underlined, with the pointing hand. Cmd-click works in programs that
+  take the mouse, and paths open in crc as before.
 - Source Control: the commit message can have a body. Return or
   Shift-Return starts a new line, and Cmd-Return still commits. The
   field grows a line at a time up to eight lines, then scrolls, and the

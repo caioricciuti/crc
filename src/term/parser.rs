@@ -273,6 +273,19 @@ impl Term {
                     ("133", rest) if rest.starts_with('A') => {
                         self.status.end_of_command();
                     }
+                    // A hyperlink, `8;params;target`, round the text that
+                    // follows until one with no target; a second one before
+                    // that replaces the first. Only web and file targets
+                    // are kept; any other, or one cut short, ends the link
+                    // as an empty one does.
+                    ("8", rest) => {
+                        let target = rest.split_once(';').map_or("", |(_, t)| t);
+                        self.pen.link = if self.osc_overflow || !followed(target) {
+                            0
+                        } else {
+                            self.link_id(target)
+                        };
+                    }
                     // A copy: kept for the pasteboard. One cut short is
                     // not the text the program sent.
                     ("52", body) if !self.osc_overflow => {
@@ -303,6 +316,16 @@ impl Term {
         self.osc.clear();
         self.state = State::Ground;
     }
+}
+
+/// Whether an OSC 8 target is one a Command-click may open: a web page or
+/// a file, by its scheme, with nothing in it a URI may not hold as is.
+fn followed(target: &str) -> bool {
+    let lower = target.get(..8).unwrap_or(target).to_ascii_lowercase();
+    ["http://", "https://", "file://"]
+        .iter()
+        .any(|scheme| lower.starts_with(scheme) && target.len() > scheme.len())
+        && !target.chars().any(|c| c.is_control() || c.is_whitespace())
 }
 
 /// The text an OSC 52 body (`selection;base64`) copies, or `None` for one

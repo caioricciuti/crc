@@ -23,6 +23,10 @@
 //!                             a click at an offset from a region's top-left
 //!                             corner, with modifiers as for `key`
 //! down @<region>              press and hold on the centre of a region
+//! movein @<region> <dx> <dy> [mods]
+//!                             the pointer moved, no button down, to an
+//!                             offset into a region, with modifiers held
+//! flags <mods>                the modifiers held changed, the pointer still
 //! drag <x> <y>                a drag to a point, mouse still down
 //! dragby <dx> <dy>            a drag to a point relative to the press
 //! up <x> <y>                  release
@@ -78,6 +82,15 @@ pub enum Step {
     DownNamed {
         name: String,
     },
+    /// The pointer moved to an offset into a named region, with modifiers.
+    MoveIn {
+        name: String,
+        dx: f64,
+        dy: f64,
+        mods: Mods,
+    },
+    /// The modifiers held changed, the pointer where it last moved.
+    Flags(Mods),
     /// A drag or release relative to where the last press was.
     DragBy {
         dx: f64,
@@ -297,6 +310,15 @@ pub fn parse(script: &str) -> Result<Vec<Step>, String> {
                     mods,
                 })
             }
+            "movein" if rest.starts_with('@') => {
+                let name = args.word().ok_or_else(bad)?.to_string();
+                let (dx, dy) = (args.num().ok_or_else(bad)?, args.num().ok_or_else(bad)?);
+                let mods = Mods::parse(args.word().unwrap_or("-")).ok_or_else(bad)?;
+                Some(Step::MoveIn { name, dx, dy, mods })
+            }
+            "flags" => Some(Step::Flags(
+                Mods::parse(args.word().unwrap_or("-")).ok_or_else(bad)?,
+            )),
             "down" if rest.starts_with('@') => Some(Step::DownNamed {
                 name: args.word().ok_or_else(bad)?.to_string(),
             }),
@@ -478,7 +500,26 @@ mod tests {
                 dy: -40.0
             }]
         );
+        let cmd = Mods {
+            command: true,
+            ..Mods::default()
+        };
+        assert_eq!(
+            parse("movein @terminal 84 8 cmd\nflags -\n").unwrap(),
+            [
+                Step::MoveIn {
+                    name: "terminal".into(),
+                    dx: 84.0,
+                    dy: 8.0,
+                    mods: cmd
+                },
+                Step::Flags(Mods::default())
+            ]
+        );
         for junk in [
+            "movein @terminal 84",
+            "movein @terminal 84 8 hyper",
+            "flags cmd 2",
             "clickat scrub.track 0 0.5",
             "upat @scrub.track 0",
             "downat @scrub.track 0 0.5 2",

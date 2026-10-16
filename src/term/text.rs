@@ -147,6 +147,78 @@ impl Term {
         hay
     }
 
+    /// The link under column `col` of line `line`, for a Command-click:
+    /// the one the program marked there with OSC 8, or else a web address
+    /// in the text, either found whole across lines the terminal wrapped.
+    pub fn link_at(&self, line: u64, col: usize) -> Option<Link> {
+        let chars = self.logical_line(line);
+        let at = chars
+            .iter()
+            .position(|c| c.line == line && (c.from..c.to).contains(&col))?;
+        let (from, to, url) = match chars[at].link {
+            0 => {
+                let text: Vec<char> = chars.iter().map(|c| c.ch).collect();
+                let (from, to) = url_span(&text, at)?;
+                (from, to, text[from..to].iter().collect())
+            }
+            id => {
+                let (from, to) = span_while(chars.len(), at, |i| chars[i].link == id);
+                (from, to, self.link_url(id)?.to_owned())
+            }
+        };
+        let mut spans: Vec<(u64, usize, usize)> = Vec::new();
+        for c in &chars[from..to] {
+            match spans.last_mut() {
+                Some(span) if span.0 == c.line => span.2 = c.to,
+                _ => spans.push((c.line, c.from, c.to)),
+            }
+        }
+        Some(Link { url, spans })
+    }
+
+    /// The characters of line `line` joined with the lines the terminal
+    /// wrapped it from and onto, a few rows each way at most, so a long
+    /// wrapped line is no slower than a short one.
+    fn logical_line(&self, line: u64) -> Vec<LineChar> {
+        const REACH: u64 = 16;
+        let wrapped = |n: u64| {
+            self.line(n)
+                .and_then(|cells| cells.last())
+                .is_some_and(|c| c.flags & WRAPPED != 0)
+        };
+        let mut first = line;
+        while line - first < REACH && first > 0 && wrapped(first - 1) {
+            first -= 1;
+        }
+        let mut last = line;
+        while last - line < REACH && wrapped(last) {
+            last += 1;
+        }
+        let mut chars: Vec<LineChar> = Vec::new();
+        for number in first..=last {
+            let Some(cells) = self.line(number) else {
+                continue;
+            };
+            for (col, cell) in cells.iter().enumerate() {
+                if cell.flags & WIDE_TAIL != 0 {
+                    // The left half's character spans this column too.
+                    if let Some(c) = chars.last_mut().filter(|c| c.line == number) {
+                        c.to = col + 1;
+                    }
+                    continue;
+                }
+                chars.push(LineChar {
+                    ch: cell.ch,
+                    line: number,
+                    from: col,
+                    to: col + 1,
+                    link: cell.link,
+                });
+            }
+        }
+        chars
+    }
+
     /// Line `line` as text, with the column each character starts at.
     pub fn line_chars(&self, line: u64) -> Vec<(usize, char)> {
         self.line(line)
@@ -208,6 +280,24 @@ impl Haystack {
         }
         spans
     }
+}
+
+/// A link on screen, from [`Term::link_at`]: where it goes, and the
+/// columns `[from, to)` it covers on each line it is on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Link {
+    pub url: String,
+    pub spans: Vec<(u64, usize, usize)>,
+}
+
+/// A character of a line, from [`Term::logical_line`]: its line, the
+/// columns it covers and its OSC 8 link.
+struct LineChar {
+    ch: char,
+    line: u64,
+    from: usize,
+    to: usize,
+    link: u16,
 }
 
 /// One line's part of a selection.
@@ -297,6 +387,62 @@ pub fn path_at(text: &[char], index: usize) -> Option<(String, Option<usize>, Op
         .filter(|&n: &usize| n > 0);
     Some((path.to_owned(), line, column))
 }
+/// The web address (`http://` or `https://`) under character `index` of
+/// `text`, as linkifiers find one: punctuation that ends a sentence after
+/// it is not part of it, nor is a closing bracket or quote it did not open,
+/// so `(see https://example.com/a_(b))` gives `https://example.com/a_(b)`.
+pub fn url_at(text: &[char], index: usize) -> Option<String> {
+    let (from, to) = url_span(text, index)?;
+    Some(text[from..to].iter().collect())
+}
+
+/// The characters `[from, to)` of the address [`url_at`] finds.
+fn url_span(text: &[char], index: usize) -> Option<(usize, usize)> {
+    let allowed = |c: char| {
+        (c.is_ascii_graphic() && !"\"<>`{}|\\^".contains(c))
+            || (!c.is_ascii() && c.is_alphanumeric())
+    };
+    if index >= text.len() || !allowed(text[index]) {
+        return None;
+    }
+    let (start, end) = span_while(text.len(), index, |i| allowed(text[i]));
+    let scheme_at = |i: usize| {
+        ["https://", "http://"].into_iter().find_map(|scheme| {
+            let found = text.get(i..i + scheme.len())?;
+            found
+                .iter()
+                .zip(scheme.chars())
+                .all(|(a, b)| a.to_ascii_lowercase() == b)
+                .then_some(scheme.len())
+        })
+    };
+    // The nearest address starting at or before the click; another one
+    // right after it in the same run ends it.
+    let (from, scheme) = (start..=index)
+        .rev()
+        .find_map(|i| scheme_at(i).map(|len| (i, len)))?;
+    let mut to = (from + 1..end)
+        .find(|&i| scheme_at(i).is_some())
+        .unwrap_or(end);
+    let count = |range: &[char], c: char| range.iter().filter(|&&x| x == c).count();
+    while to > from + scheme {
+        let url = &text[from..to];
+        let last = url[url.len() - 1];
+        let unbalanced = match last {
+            '.' | ',' | ';' | ':' | '!' | '?' => true,
+            ')' => count(url, ')') > count(url, '('),
+            ']' => count(url, ']') > count(url, '['),
+            '\'' => count(url, '\'') % 2 == 1,
+            _ => false,
+        };
+        if !unbalanced {
+            break;
+        }
+        to -= 1;
+    }
+    (to > from + scheme && index < to).then_some((from, to))
+}
+
 /// The colour of a palette entry, 0 to 255, for the 16 named colours given
 /// by the theme and the rest computed as xterm does.
 pub fn palette(index: u8, named: &[[f32; 4]; 16]) -> [f32; 4] {

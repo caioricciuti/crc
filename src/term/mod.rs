@@ -54,6 +54,9 @@ pub struct Cell {
     pub fg: Color,
     pub bg: Color,
     pub flags: u16,
+    /// The link the program put this cell in with OSC 8, by its number in
+    /// the terminal's table ([`Term::link_url`]); 0 for none.
+    pub link: u16,
 }
 
 impl Default for Cell {
@@ -63,6 +66,7 @@ impl Default for Cell {
             fg: Color::Default,
             bg: Color::Default,
             flags: 0,
+            link: 0,
         }
     }
 }
@@ -89,6 +93,9 @@ const MAX_CLIPBOARD: usize = 1 << 20;
 const MAX_OSC_CLIPBOARD: usize = MAX_CLIPBOARD.div_ceil(3) * 4 + 64;
 /// Parameters beyond this many in one sequence are ignored.
 const MAX_PARAMS: usize = 32;
+/// The most text OSC 8 link targets may take, all told; links past it
+/// show as plain text.
+const MAX_LINK_BYTES: usize = 4 << 20;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct Saved {
@@ -187,6 +194,12 @@ pub struct Term {
     /// Text the program copied through OSC 52, the newest only, until
     /// taken for the pasteboard.
     clipboard: Option<String>,
+    /// The targets of OSC 8 links, each once: a cell's `link` is its
+    /// place here plus one. Kept for the life of the session, as cells in
+    /// history may still name them.
+    links: Vec<String>,
+    link_ids: std::collections::HashMap<String, u16>,
+    link_bytes: usize,
     state: State,
     params: Vec<Vec<u16>>,
     private: Option<u8>,
@@ -234,6 +247,9 @@ impl Term {
             notices: Vec::new(),
             status: status::Records::default(),
             clipboard: None,
+            links: Vec::new(),
+            link_ids: std::collections::HashMap::new(),
+            link_bytes: 0,
             state: State::Ground,
             params: Vec::new(),
             private: None,
@@ -307,6 +323,30 @@ impl Term {
         }
         let text: String = text.chars().filter(|c| !c.is_control()).take(300).collect();
         self.notices.push(text.trim().to_owned());
+    }
+
+    /// The target of OSC 8 link `id`, as a cell holds it.
+    pub fn link_url(&self, id: u16) -> Option<&str> {
+        self.links
+            .get(usize::from(id).checked_sub(1)?)
+            .map(String::as_str)
+    }
+
+    /// The number a link to `url` goes by, a new one for a new target, or
+    /// 0 once the table is full.
+    fn link_id(&mut self, url: &str) -> u16 {
+        if let Some(&id) = self.link_ids.get(url) {
+            return id;
+        }
+        if self.links.len() >= usize::from(u16::MAX) || self.link_bytes + url.len() > MAX_LINK_BYTES
+        {
+            return 0;
+        }
+        self.links.push(url.to_owned());
+        self.link_bytes += url.len();
+        let id = self.links.len() as u16;
+        self.link_ids.insert(url.to_owned(), id);
+        id
     }
 
     /// The number of screen row 0, counting from the first line kept.
@@ -908,6 +948,10 @@ impl Term {
     fn reset(&mut self) {
         let mut fresh = Term::new(self.cols, self.rows);
         std::mem::swap(&mut fresh.scrollback, &mut self.scrollback);
+        // History keeps its links.
+        std::mem::swap(&mut fresh.links, &mut self.links);
+        std::mem::swap(&mut fresh.link_ids, &mut self.link_ids);
+        fresh.link_bytes = self.link_bytes;
         fresh.dropped = self.dropped;
         fresh.generation = self.generation;
         *self = fresh;
@@ -1499,6 +1543,134 @@ mod tests {
         assert_eq!(path_at(&text, 26), Some(("x/y.txt".into(), None, None)));
         let url: Vec<char> = "file:///p/a.rs:7".chars().collect();
         assert_eq!(path_at(&url, 9), Some(("/p/a.rs".into(), Some(7), None)));
+    }
+
+    #[test]
+    fn web_addresses_in_text() {
+        let at = |text: &str, index: usize| {
+            let chars: Vec<char> = text.chars().collect();
+            url_at(&chars, index)
+        };
+        let pr = "https://example.com/owner/repo/pull/341";
+        assert_eq!(
+            at(pr, 0).as_deref(),
+            Some(pr),
+            "plain, from its first character"
+        );
+        assert_eq!(at(&format!("PR: {pr}"), 30).as_deref(), Some(pr));
+        // Punctuation that ends a sentence is not part of it.
+        assert_eq!(at(&format!("Opened {pr}."), 10).as_deref(), Some(pr));
+        assert_eq!(at(&format!("{pr}, then {pr}?!"), 5).as_deref(), Some(pr));
+        // Brackets and quotes it did not open are not part of it.
+        assert_eq!(at(&format!("(see {pr})"), 10).as_deref(), Some(pr));
+        assert_eq!(at(&format!("[{pr}]"), 3).as_deref(), Some(pr));
+        assert_eq!(at(&format!("'{pr}'"), 3).as_deref(), Some(pr));
+        assert_eq!(at(&format!("\"{pr}\""), 3).as_deref(), Some(pr));
+        assert_eq!(at(&format!("<{pr}>"), 3).as_deref(), Some(pr));
+        // Ones it did open are.
+        let wiki = "https://example.com/wiki/Crab_(food)";
+        assert_eq!(at(&format!("({wiki})."), 4).as_deref(), Some(wiki));
+        assert_eq!(
+            at(wiki, 33).as_deref(),
+            Some(wiki),
+            "from inside the brackets"
+        );
+        // A query and a fragment.
+        let query = "http://example.com/search?q=a+b&page=2#results";
+        assert_eq!(at(&format!("go {query}"), 20).as_deref(), Some(query));
+        // Two back to back are two.
+        let two = "https://example.com/a,https://example.com/b";
+        assert_eq!(at(two, 25).as_deref(), Some("https://example.com/b"));
+        assert_eq!(at(two, 3).as_deref(), Some("https://example.com/a"));
+        // Not one: no address, a scheme alone, a blank, the text before.
+        assert_eq!(at("see src/main.rs:42", 6), None);
+        assert_eq!(at("https:// and", 2), None);
+        assert_eq!(at(&format!("x {pr}"), 1), None);
+        assert_eq!(at(&format!("see:{pr}"), 1), None);
+        assert_eq!(at("ftp://example.com/file", 4), None);
+        assert_eq!(at("", 0), None);
+        assert_eq!(at(pr, 99), None);
+    }
+
+    #[test]
+    fn a_web_address_is_found_across_a_wrap() {
+        let mut t = Term::new(20, 4);
+        // 39 characters at 20 columns: the terminal wraps it once.
+        let pr = "https://example.com/owner/repo/pull/341";
+        t.advance(format!("{pr} ok\r\nnext").as_bytes());
+        let first = t.view_line(0, 0);
+        let whole = Link {
+            url: pr.to_owned(),
+            spans: vec![(first, 0, 20), (first + 1, 0, 19)],
+        };
+        assert_eq!(t.link_at(first, 3), Some(whole.clone()));
+        assert_eq!(t.link_at(first + 1, 10), Some(whole));
+        assert_eq!(t.link_at(first + 1, 20), None, "past it, on the blank");
+        assert_eq!(t.link_at(first + 2, 1), None, "a newline ends the line");
+        // A hard newline is not a wrap: each row is its own line.
+        let mut t = Term::new(20, 4);
+        t.advance(b"https://example.com/\r\nowner/repo");
+        let first = t.view_line(0, 0);
+        assert_eq!(
+            t.link_at(first, 3).map(|l| l.url),
+            Some("https://example.com/".to_owned())
+        );
+        assert_eq!(t.link_at(first + 1, 3), None);
+    }
+
+    #[test]
+    fn osc_8_links_are_kept_per_cell() {
+        let mut t = Term::new(20, 4);
+        // BEL and ST both end it; the link is the text between the two.
+        t.advance(b"a \x1b]8;;https://example.com/one\x07here\x1b]8;;\x07 b");
+        t.advance(b"\r\n\x1b]8;id=x;https://example.com/two\x1b\\there\x1b]8;;\x1b\\");
+        let first = t.view_line(0, 0);
+        assert_eq!(t.screen_text(), "a here b\nthere");
+        let link = t.link_at(first, 3).expect("osc 8 link");
+        assert_eq!(link.url, "https://example.com/one");
+        assert_eq!(link.spans, vec![(first, 2, 6)]);
+        assert_eq!(t.link_at(first, 7), None, "after it closed");
+        assert_eq!(
+            t.link_at(first + 1, 0).map(|l| l.url).as_deref(),
+            Some("https://example.com/two")
+        );
+        // The same target twice is one entry.
+        t.advance(b"\x1b]8;;https://example.com/one\x07x\x1b]8;;\x07");
+        assert_eq!(t.links.len(), 2);
+        // A link wins over an address in its visible text.
+        let mut t = Term::new(40, 4);
+        t.advance(b"\x1b]8;;https://example.com/real\x07https://example.com/shown\x1b]8;;\x07");
+        assert_eq!(
+            t.link_at(t.view_line(0, 0), 5).map(|l| l.url).as_deref(),
+            Some("https://example.com/real")
+        );
+        // A second link before the first ends replaces it; one never
+        // closed runs on, across a wrap, until a reset.
+        let mut t = Term::new(10, 4);
+        t.advance(b"\x1b]8;;https://example.com/a\x07ab\x1b]8;;https://example.com/b\x07cd");
+        let first = t.view_line(0, 0);
+        assert_eq!(
+            t.link_at(first, 0).map(|l| l.spans),
+            Some(vec![(first, 0, 2)])
+        );
+        t.advance(b"efghijklmn\x1b[0m");
+        let b = t.link_at(first + 1, 1).expect("still open across the wrap");
+        assert_eq!(b.url, "https://example.com/b");
+        assert_eq!(b.spans, vec![(first, 2, 10), (first + 1, 0, 4)]);
+        t.advance(b"\x1bco");
+        assert_eq!(t.visible_row(0, 0)[0].link, 0, "a reset ends it");
+        // Other schemes, and a target with a blank, are not followed.
+        let mut t = Term::new(20, 4);
+        t.advance(b"\x1b]8;;javascript:alert(1)\x07x\x1b]8;;mailto:a@example.com\x07y");
+        t.advance(b"\x1b]8;;https://example.com/a b\x07z\x1b]8;;\x07");
+        assert!(t.visible_row(0, 0)[..3].iter().all(|c| c.link == 0));
+        assert!(t.links.is_empty());
+        // File targets are.
+        t.advance(b"\x1b]8;;file:///tmp/notes.txt\x07f\x1b]8;;\x07");
+        assert_eq!(
+            t.link_url(t.visible_row(0, 0)[3].link),
+            Some("file:///tmp/notes.txt")
+        );
     }
 
     #[test]

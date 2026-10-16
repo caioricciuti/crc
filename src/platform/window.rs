@@ -1493,12 +1493,35 @@ define_class!(
             if self.ivars().testing && event.timestamp() != 0.0 { return; }
             let point = self.convertPoint_fromView(event.locationInWindow(), None);
             self.note_hover(point.x as f32, point.y as f32);
+            self.terminal_link_hover(point.x as f32, point.y as f32, event.modifierFlags());
             self.terminal_mouse_hover(event, point.x as f32, point.y as f32);
         }
 
         #[unsafe(method(mouseExited:))]
         fn mouse_exited(&self, _event: &NSEvent) {
             self.note_hover(f32::NAN, f32::NAN);
+            self.terminal_link_hover(f32::NAN, f32::NAN, NSEventModifierFlags::empty());
+        }
+
+        /// Command pressed or let go over a terminal: the link under the
+        /// pointer shows, or stops showing, without the pointer moving.
+        #[unsafe(method(flagsChanged:))]
+        fn flags_changed(&self, event: &NSEvent) {
+            // A test instance's pointer is where its script last put it.
+            let point = if self.ivars().testing {
+                (event.timestamp() == 0.0)
+                    .then(|| self.state().map(|state| state.selftest_pointer))
+                    .flatten()
+            } else {
+                self.window().map(|window| {
+                    let at = self.convertPoint_fromView(window.mouseLocationOutsideOfEventStream(), None);
+                    (at.x, at.y)
+                })
+            };
+            if let Some((x, y)) = point {
+                self.terminal_link_hover(x as f32, y as f32, event.modifierFlags());
+            }
+            let _: () = unsafe { msg_send![super(self), flagsChanged: event] };
         }
 
         /// The tooltip of the control under `point`, asked by AppKit once

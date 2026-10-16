@@ -163,6 +163,45 @@ impl EditorView {
                 }
                 send(NSEventType::LeftMouseDown, x, y, 1);
             }
+            Step::MoveIn { name, dx, dy, mods } => {
+                let target = {
+                    let Some(mut state) = self.state_mut() else {
+                        return;
+                    };
+                    region_named(&mut state, name)
+                };
+                let Some(rect) = target else {
+                    eprintln!("selftest: no region named {name} in this frame");
+                    return;
+                };
+                let (x, y) = (f64::from(rect.x) + dx, f64::from(rect.y) + dy);
+                if let Some(mut state) = self.state_mut() {
+                    state.selftest_pointer = (x, y);
+                }
+                let event = mouse_with(NSEventType::MouseMoved, x, y, 0, modifier_flags(mods));
+                if let Some(event) = event {
+                    let _: () = unsafe { msg_send![self, mouseMoved: &*event] };
+                }
+            }
+            Step::Flags(mods) => {
+                let empty = NSString::from_str("");
+                let event = NSEvent::keyEventWithType_location_modifierFlags_timestamp_windowNumber_context_characters_charactersIgnoringModifiers_isARepeat_keyCode(
+                    NSEventType::FlagsChanged,
+                    NSPoint::new(0.0, 0.0),
+                    modifier_flags(mods),
+                    0.0,
+                    window.windowNumber(),
+                    None,
+                    &empty,
+                    &empty,
+                    false,
+                    // kVK_Command: the key that changed, whichever it was.
+                    55,
+                );
+                if let Some(event) = event {
+                    let _: () = unsafe { msg_send![self, flagsChanged: &*event] };
+                }
+            }
             Step::DragBy { dx, dy } => {
                 let Some((x, y)) = self.state().map(|state| state.selftest_pointer) else {
                     return;
@@ -540,7 +579,7 @@ impl EditorView {
                         c.reviews.values().filter(|r| r.decided.is_none()).count()
                     )),
                     format_args!(
-                        "open={} focus={} height={} tabs={} selection={:?} screen={:?} scrollback={} back={} find={}",
+                        "open={} focus={} height={} tabs={} selection={:?} screen={:?} scrollback={} back={} find={} link={} opened={}",
                         state.terminal.open,
                         state.terminal.focus,
                         state.terminal.height,
@@ -591,6 +630,19 @@ impl EditorView {
                                 None => format!("{query} target=document keys={}", bar.has_keys),
                             }
                         }),
+                        state
+                            .terminal
+                            .link
+                            .as_ref()
+                            .map_or("none".to_string(), |(_, link)| {
+                                let spans: Vec<String> = link
+                                    .spans
+                                    .iter()
+                                    .map(|(_, from, to)| format!("{from}-{to}"))
+                                    .collect();
+                                format!("{}@{}", link.url, spans.join(","))
+                            }),
+                        state.terminal.opened.join("|"),
                     ),
                     selftest::report(
                         state.docs.active(),

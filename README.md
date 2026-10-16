@@ -251,7 +251,9 @@ the size and write it back.
   running: the next crc on the same project takes its sessions back with
   what they printed, agents included; closing a tab ends its session.
   `Cmd`-click a path such as `src/main.rs:42:7` in the output to open it
-  at that line. Drag to select (past the top or bottom scrolls the
+  at that line, or a web address or a link a program marks (OSC 8) to
+  open it in your browser; with `Cmd` held, the link under the pointer
+  is underlined. Drag to select (past the top or bottom scrolls the
   history under the pointer), `Cmd-A` selects everything the session
   printed, `Cmd-C` copies, `Cmd-V` pastes. `Cmd-F` searches what the
   session printed (history and screen) with the same find bar as

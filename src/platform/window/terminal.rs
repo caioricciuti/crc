@@ -1332,12 +1332,17 @@ impl EditorView {
             let term = tab.session.term.lock().unwrap_or_else(|e| e.into_inner());
             let line = term.view_line(row, back);
             if command {
-                let chars = term.line_chars(line);
-                let index = chars.iter().rposition(|(col, _)| *col <= cell).unwrap_or(0);
-                let text: Vec<char> = chars.iter().map(|(_, c)| *c).collect();
-                let cwd = tab.launch.cwd.clone();
-                drop(term);
-                crate::term::path_at(&text, index).map(|found| (found, cwd))
+                if let Some(link) = term.link_at(line, cell) {
+                    drop(term);
+                    Some(Opened::Url(link.url))
+                } else {
+                    let chars = term.line_chars(line);
+                    let index = chars.iter().rposition(|(col, _)| *col <= cell).unwrap_or(0);
+                    let text: Vec<char> = chars.iter().map(|(_, c)| *c).collect();
+                    let cwd = tab.launch.cwd.clone();
+                    drop(term);
+                    crate::term::path_at(&text, index).map(|found| Opened::Path(found, cwd))
+                }
             } else {
                 let selection = match clicks {
                     2 => term
@@ -1352,11 +1357,108 @@ impl EditorView {
                 None
             }
         };
-        if let Some(((path, line, column), cwd)) = target {
-            self.open_reference(&path, line, column, &cwd);
+        match target {
+            Some(Opened::Path((path, line, column), cwd)) => {
+                self.open_reference(&path, line, column, &cwd);
+            }
+            Some(Opened::Url(url)) => self.open_terminal_link(url),
+            None => {}
         }
         self.request_redraw();
         self.pump();
+    }
+
+    /// A link Command-clicked in a terminal, in the browser, or for a
+    /// `file://` one in the app for its kind. A self-test opens nothing
+    /// and keeps what it would have opened.
+    fn open_terminal_link(&self, url: String) {
+        if self.ivars().testing {
+            if let Some(mut state) = self.state_mut() {
+                state.terminal.opened.push(url);
+            }
+            return;
+        }
+        if let Err(e) = self.open(false, std::ffi::OsStr::new(&url))
+            && let Some(mut state) = self.state_mut()
+        {
+            state.say(
+                layout::Feedback::Failure,
+                format!("Could not open {url}: {e}"),
+            );
+        }
+    }
+
+    /// With Command held, the link under the pointer, underlined and with
+    /// the pointing hand, as other terminals show what a Command-click
+    /// opens. Worked out when the pointer moves or the modifiers change,
+    /// never per frame; without Command, or off the screen, there is none.
+    pub(super) fn terminal_link_hover(&self, x: f32, y: f32, flags: NSEventModifierFlags) {
+        let found = (flags.contains(NSEventModifierFlags::Command) && x.is_finite())
+            .then(|| self.link_under(x, y))
+            .flatten();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
+        if state.terminal.link == found {
+            return;
+        }
+        let shown = found.is_some();
+        let was = std::mem::replace(&mut state.terminal.link, found).is_some();
+        drop(state);
+        // The cursor rectangles follow with the frame's hotspots; the
+        // cursor itself is set now, as the pointer may not move again.
+        if shown {
+            NSCursor::pointingHandCursor().set();
+        } else if was && self.mouse_screen(x, y).is_some() {
+            NSCursor::arrowCursor().set();
+        }
+        self.request_redraw();
+        self.pump();
+    }
+
+    /// The link under a point in a terminal's screen, and its tab.
+    fn link_under(&self, x: f32, y: f32) -> Option<(usize, crate::term::Link)> {
+        let (tab, screen) = self.mouse_screen(x, y)?;
+        let state = self.state()?;
+        let session = state.terminal.tabs.get(tab)?;
+        let term = session.session.term.lock();
+        let term = term.unwrap_or_else(|e| e.into_inner());
+        let (row, _, col) = crate::platform::terminal::point(
+            &state.renderer.atlas,
+            screen,
+            x,
+            y,
+            term.cols(),
+            term.rows(),
+        );
+        let back = if tab == state.terminal.active {
+            state.terminal.back
+        } else {
+            0
+        };
+        let link = term.link_at(term.view_line(row, back), col)?;
+        Some((tab, link))
+    }
+
+    /// The tab whose screen is under a point, and that screen, when the
+    /// terminal shows one there.
+    fn mouse_screen(&self, x: f32, y: f32) -> Option<(usize, Viewport)> {
+        let chrome = self.chrome();
+        let rect = chrome.terminal?;
+        let state = self.state()?;
+        if state.palette.is_some()
+            || !state.terminal.showing()
+            || super::agents::active_hidden(&state)
+            || find_rect(&state, &chrome).is_some_and(|r| r.contains(x, y))
+        {
+            return None;
+        }
+        let (_, screen) = crate::platform::terminal::split(rect);
+        state
+            .terminal
+            .screens(screen)
+            .into_iter()
+            .find(|(_, s)| s.contains(x, y))
     }
 
     /// The pane under a point whose program asked for the mouse: its tab,
@@ -1810,6 +1912,13 @@ impl EditorView {
         }
         true
     }
+}
+
+/// What a Command-click in a terminal opens: a link, or a file reference
+/// and the folder it is relative to.
+enum Opened {
+    Url(String),
+    Path((String, Option<usize>, Option<usize>), std::path::PathBuf),
 }
 
 /// The find bar over the terminal, while it searches the terminal and the

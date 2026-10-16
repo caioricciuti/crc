@@ -291,6 +291,12 @@ pub struct Panel {
     /// The tab and cell the pointer was last reported over, so motion is
     /// reported only when it reaches another cell.
     pub mouse_cell: Option<(usize, (usize, usize))>,
+    /// The link under the pointer while Command is held, and its tab:
+    /// underlined, as what a Command-click there opens.
+    pub link: Option<(usize, term::Link)>,
+    /// What Command-clicks on links opened, under a self-test, which
+    /// opens nothing.
+    pub opened: Vec<String>,
 }
 
 impl Default for Panel {
@@ -312,6 +318,8 @@ impl Default for Panel {
             pace: Pace::default(),
             mouse_press: None,
             mouse_cell: None,
+            link: None,
+            opened: Vec::new(),
         }
     }
 }
@@ -1212,6 +1220,37 @@ fn draw_screen(
                 let through = m.snap(baseline - m.ascent * 0.3 - line * 0.5);
                 layout::push_rect(out, atlas, [x, through], [width, line], fg);
             }
+        }
+        // The link a Command-click would open, underlined in the accent,
+        // with the pointing hand over it.
+        let link = panel.link.as_ref().filter(|(tab, _)| *tab == index);
+        for &(_, from, to) in link
+            .iter()
+            .flat_map(|(_, l)| &l.spans)
+            .filter(|s| s.0 == line)
+        {
+            let to = to.min(cols);
+            if to <= from {
+                continue;
+            }
+            let x = screen.x + from as f32 * advance;
+            let width = (to - from) as f32 * advance;
+            let thickness = m.underline_thickness;
+            let baseline = y + text_dy + m.glyph_dy(m.line_height) + m.ascent;
+            let under = m
+                .snap(baseline + m.underline_position - thickness * 0.5)
+                .min(y + row_h - thickness);
+            layout::push_rect(out, atlas, [x, under], [width, thickness], theme.accent);
+            layout::hotspot(
+                Viewport {
+                    x,
+                    y,
+                    width,
+                    height: row_h,
+                },
+                layout::Cursor::Pointing,
+                None,
+            );
         }
     }
     // The cursor, where the program left it, when it is showing.
