@@ -3021,6 +3021,8 @@ pub enum Hit {
     /// button, and the timeline of the versions.
     ScrubOlder,
     ScrubNewer,
+    /// The filter: All, Commits or Local versions.
+    ScrubFilter,
     ScrubClose,
     ScrubTrack,
     /// Above a document with merge conflicts: the inline or side-by-side
@@ -3095,6 +3097,7 @@ impl Hit {
             Hit::ScrubOlder => "scrub.older".into(),
             Hit::ScrubNewer => "scrub.newer".into(),
             Hit::ScrubClose => "scrub.close".into(),
+            Hit::ScrubFilter => "scrub.filter".into(),
             Hit::ScrubTrack => "scrub.track".into(),
             Hit::ConflictMode(side) => if *side {
                 "conflict.side"

@@ -11,23 +11,127 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 
 use super::git::command;
+use crate::history::store::{Entry, Reason, SnapshotId};
 use crate::platform::path_from_bytes;
 
 /// Commits [`file_history`] reads when the caller has no reason to pick.
 pub const HISTORY_LIMIT: usize = 1000;
 
-/// One version of a file: the commit that made it and the blob it left.
+/// One version of a file: the commit that made it and the blob it left,
+/// or a version crc kept of it in local history.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Version {
     pub commit: String,
     pub author: String,
-    /// Author time, Unix seconds.
+    /// Author time, or when a local version was taken, Unix seconds.
     pub time: i64,
     pub summary: String,
     pub blob: String,
     /// Where the file was in that commit, relative to the repository: it
-    /// changes across a rename.
+    /// changes across a rename. A local version's is the file's own path.
     pub path: PathBuf,
+    pub source: Source,
+}
+
+/// Where a version's text comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    /// The blob a commit left, read through Git.
+    Commit,
+    /// A version kept in local history, read from its store.
+    Local { id: SnapshotId, reason: Reason },
+}
+
+impl Version {
+    /// The local version `entry` of the file at `path`.
+    pub fn local(entry: &Entry, path: &Path) -> Version {
+        Version {
+            commit: String::new(),
+            author: String::new(),
+            time: entry.at.div_euclid(1000),
+            summary: String::new(),
+            blob: String::new(),
+            path: path.to_path_buf(),
+            source: Source::Local {
+                id: entry.id,
+                reason: entry.reason,
+            },
+        }
+    }
+
+    pub fn is_local(&self) -> bool {
+        matches!(self.source, Source::Local { .. })
+    }
+}
+
+/// Commits and local versions of one file in one timeline, oldest first.
+/// `commits` come oldest first, as [`file_history`] lists them, and keep
+/// their order; `local` in any order, and go by when they were taken, then
+/// by id. Commit times are whole seconds: a local version taken in the
+/// second of a commit goes before it, as a file is saved before it is
+/// committed.
+pub fn merge(commits: Vec<Version>, mut local: Vec<Version>) -> Vec<Version> {
+    let id = |v: &Version| match v.source {
+        Source::Local { id, .. } => id,
+        Source::Commit => SnapshotId(0),
+    };
+    local.sort_by_key(|v| (v.time, id(v)));
+    let mut out = Vec::with_capacity(commits.len() + local.len());
+    let mut local = local.into_iter().peekable();
+    for commit in commits {
+        while let Some(next) = local.next_if(|l| l.time <= commit.time) {
+            out.push(next);
+        }
+        out.push(commit);
+    }
+    out.extend(local);
+    out
+}
+
+/// Leaves out the local versions whose text is a commit's beside them in
+/// `versions` (from [`merge`]): the save before a commit, or the file as
+/// opened at the commit checked out. `same(local, commit)` says whether
+/// the two hold the same text; it is asked at most `checks` times, newest
+/// first, and past that a local version is kept.
+pub fn drop_duplicates(
+    versions: &mut Vec<Version>,
+    mut checks: usize,
+    mut same: impl FnMut(&Version, &Version) -> bool,
+) {
+    let mut drop = vec![false; versions.len()];
+    for at in (0..versions.len()).rev() {
+        if !versions[at].is_local() {
+            continue;
+        }
+        let neighbours = [at.checked_sub(1), Some(at + 1)];
+        for commit in neighbours.into_iter().flatten() {
+            let Some(commit) = versions.get(commit).filter(|v| !v.is_local()) else {
+                continue;
+            };
+            if checks == 0 {
+                break;
+            }
+            checks -= 1;
+            if same(&versions[at], commit) {
+                drop[at] = true;
+                break;
+            }
+        }
+    }
+    let mut at = 0;
+    versions.retain(|_| {
+        at += 1;
+        !drop[at - 1]
+    });
+}
+
+/// The object id Git gives a blob of `bytes`, in hex: what a commit's
+/// version names, so a text is matched to one without reading it.
+pub fn blob_id(bytes: &[u8]) -> Option<String> {
+    let mut object = format!("blob {}\0", bytes.len()).into_bytes();
+    object.extend_from_slice(bytes);
+    let hash = crate::ext::verify::sha1(&object)?;
+    Some(hash.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// The versions of `relative` (a path inside `root`), oldest first, from
@@ -131,6 +235,7 @@ fn parse(bytes: &[u8]) -> (Vec<Version>, usize) {
             summary: summary.clone(),
             blob: blob.to_owned(),
             path: path_from_bytes(path),
+            source: Source::Commit,
         });
     }
     // Git lists the newest first.
@@ -452,6 +557,147 @@ mod tests {
         assert_eq!(parse(&log).1, 6, "every commit counts toward the limit");
         assert!(parse_file_log(b"").is_empty());
         assert!(parse_file_log(b"\x01abc\0trunc").is_empty());
+    }
+
+    fn commit_at(name: &str, time: i64) -> Version {
+        Version {
+            commit: name.repeat(40),
+            author: "Robin".into(),
+            time,
+            summary: name.into(),
+            blob: name.repeat(40),
+            path: PathBuf::from("garden.txt"),
+            source: Source::Commit,
+        }
+    }
+
+    fn local_at(id: i64, at_ms: i64, reason: Reason) -> Version {
+        let entry = Entry {
+            id: SnapshotId(id),
+            at: at_ms,
+            reason,
+            size: 1,
+        };
+        Version::local(&entry, Path::new("/garden/garden.txt"))
+    }
+
+    /// Each version as `c:<summary>` or `l:<id>`, oldest first.
+    fn names(versions: &[Version]) -> Vec<String> {
+        versions
+            .iter()
+            .map(|v| match v.source {
+                Source::Commit => format!("c:{}", v.summary),
+                Source::Local { id, .. } => format!("l:{}", id.0),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn local_versions_go_between_commits_by_time() {
+        let commits = vec![
+            commit_at("a", 100),
+            commit_at("b", 200),
+            commit_at("c", 300),
+        ];
+        // Newest first, as the store lists them; two in one second, and
+        // one in the very second of a commit, which it goes before.
+        let local = vec![
+            local_at(6, 400_000, Reason::Idle),
+            local_at(5, 300_500, Reason::Saved),
+            local_at(4, 150_900, Reason::Idle),
+            local_at(3, 150_100, Reason::Saved),
+            local_at(2, 150_100, Reason::Opened),
+            local_at(1, 50_000, Reason::Opened),
+        ];
+        let merged = merge(commits.clone(), local);
+        assert_eq!(
+            names(&merged),
+            [
+                "l:1", "c:a", "l:2", "l:3", "l:4", "c:b", "l:5", "c:c", "l:6"
+            ]
+        );
+        assert_eq!(merged[0].time, 50, "milliseconds to seconds");
+        assert!(merged[0].is_local() && !merged[1].is_local());
+        // Either kind alone is itself.
+        assert_eq!(merge(commits.clone(), Vec::new()), commits);
+        let only = merge(
+            Vec::new(),
+            vec![
+                local_at(2, 2_000, Reason::Saved),
+                local_at(1, 1_000, Reason::Opened),
+            ],
+        );
+        assert_eq!(names(&only), ["l:1", "l:2"]);
+        // A clock set back: by time all the same, the id breaking ties.
+        let back = merge(
+            Vec::new(),
+            vec![
+                local_at(1, 9_000, Reason::Saved),
+                local_at(2, 1_000, Reason::Saved),
+            ],
+        );
+        assert_eq!(names(&back), ["l:2", "l:1"]);
+    }
+
+    #[test]
+    fn a_local_version_equal_to_a_commit_beside_it_is_dropped() {
+        // Opened at a, saved twice, the second save committed as b.
+        let mut versions = merge(
+            vec![commit_at("a", 100), commit_at("b", 300)],
+            vec![
+                local_at(1, 150_000, Reason::Opened),
+                local_at(2, 200_000, Reason::Saved),
+                local_at(3, 250_000, Reason::Saved),
+                local_at(4, 400_000, Reason::Idle),
+            ],
+        );
+        // Texts by local id; a commit's text is its summary.
+        let text = |id: i64| ["", "a", "a and more", "b", "b and more"][id as usize];
+        let mut asked = Vec::new();
+        let same = |l: &Version, c: &Version| {
+            let Source::Local { id, .. } = l.source else {
+                panic!("asked about two commits");
+            };
+            text(id.0) == c.summary
+        };
+        drop_duplicates(&mut versions, 64, |l, c| {
+            asked.push((names(std::slice::from_ref(l)), c.summary.clone()));
+            same(l, c)
+        });
+        assert_eq!(names(&versions), ["c:a", "l:2", "c:b", "l:4"]);
+        // Newest first, each local only against the commits beside it.
+        assert_eq!(asked[0], (vec!["l:4".to_string()], "b".to_string()));
+        assert!(!asked.iter().any(|(l, _)| l[0] == "l:2"), "{asked:?}");
+        // Out of checks: kept, newest dropped first.
+        let mut versions = merge(
+            vec![commit_at("a", 100), commit_at("b", 300)],
+            vec![
+                local_at(1, 150_000, Reason::Opened),
+                local_at(3, 250_000, Reason::Saved),
+            ],
+        );
+        drop_duplicates(&mut versions, 1, same);
+        assert_eq!(names(&versions), ["c:a", "l:1", "c:b"]);
+        // Outside Git there is nothing to compare with.
+        let mut alone = merge(Vec::new(), vec![local_at(1, 1_000, Reason::Saved)]);
+        drop_duplicates(&mut alone, 64, |_, _| panic!("nothing to compare"));
+        assert_eq!(names(&alone), ["l:1"]);
+    }
+
+    #[test]
+    fn blob_ids_are_gits() {
+        assert_eq!(
+            blob_id(b"").as_deref(),
+            Some("e69de29bb2d1d6434b8b29ae775ad8c2e48c5391")
+        );
+        let tree = repo("history-blob-id");
+        let dir = tree.0.as_path();
+        std::fs::write(dir.join("a.txt"), "hello\nworld\n").unwrap();
+        let hash = commit(dir, "a");
+        assert_eq!(
+            blob_id(b"hello\nworld\n"),
+            Some(blob(dir, &format!("{hash}:a.txt")))
+        );
     }
 
     #[test]

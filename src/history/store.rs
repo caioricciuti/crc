@@ -317,6 +317,20 @@ impl Store {
         })
     }
 
+    /// Opens the history at `path` only to read it, as File History does on
+    /// its own thread while the history thread writes: no check, no
+    /// migration, nothing created. `None` when there is no file yet.
+    pub fn open_to_read(path: &Path) -> Result<Option<Store>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(Store {
+            db: Db::open_readonly(path)?,
+            read_only: true,
+            quarantined: None,
+        }))
+    }
+
     /// Where a damaged file was moved on open, once.
     pub fn take_quarantined(&mut self) -> Option<PathBuf> {
         self.quarantined.take()
@@ -1048,6 +1062,39 @@ mod tests {
         assert_eq!(store.read(b).unwrap().as_deref(), Some("beta\u{e9}"));
         assert_eq!(store.read(SnapshotId(9999)).unwrap(), None);
         assert!(store.list(Path::new("/notes/none.md")).unwrap().is_empty());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_reader_sees_the_writers_versions_and_creates_nothing() {
+        let path = temp("reader");
+        assert!(Store::open_to_read(&path).unwrap().is_none());
+        assert!(!path.exists(), "a reader creates no file");
+        let store = Store::open(&path).unwrap();
+        let a = put(&store, "/notes/plan.md", "alpha", NOW);
+        // While the writer has it open, and what it writes after.
+        let reader = Store::open_to_read(&path).unwrap().unwrap();
+        assert!(reader.read_only());
+        assert_eq!(
+            ids(&reader.list(Path::new("/notes/plan.md")).unwrap()),
+            [a.0]
+        );
+        let b = put(&store, "/notes/plan.md", "beta", NOW + 1);
+        assert_eq!(reader.read(b).unwrap().as_deref(), Some("beta"));
+        assert!(
+            reader
+                .put_snapshot(Path::new("/x"), "x", Reason::Saved, NOW)
+                .is_err()
+        );
+        drop(reader);
+        // And once the writer has closed it.
+        drop(store);
+        let reader = Store::open_to_read(&path).unwrap().unwrap();
+        assert_eq!(
+            ids(&reader.list(Path::new("/notes/plan.md")).unwrap()),
+            [b.0, a.0]
+        );
+        assert_eq!(reader.read(a).unwrap().as_deref(), Some("alpha"));
         cleanup(&path);
     }
 

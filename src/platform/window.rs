@@ -685,6 +685,9 @@ struct State {
     issue_tabs: HashMap<u64, issues::IssueTab>,
     /// Git > File History: a file's versions in a read-only tab beside it.
     scrub: Option<scrub::Scrub>,
+    /// The versions File History last showed (All, Commits, Local): the
+    /// next history opens with them.
+    scrub_filter: scrub::Filter,
     /// Whether the commit message field has the keyboard. Source control is
     /// docked, not modal, so it only takes typing when it is asked to.
     git_focus: bool,
@@ -2009,6 +2012,10 @@ define_class!(
                     self.close_history();
                     return;
                 }
+                Some(Hit::ScrubFilter) => {
+                    self.cycle_history_filter();
+                    return;
+                }
                 Some(Hit::ScrubTrack) => {
                     if let Some(mut state) = self.state_mut() {
                         state.drag = Some(Drag::Timeline);
@@ -2590,6 +2597,7 @@ define_class!(
                         | Hit::ScrubOlder
                         | Hit::ScrubNewer
                         | Hit::ScrubClose
+                        | Hit::ScrubFilter
                         | Hit::ScrubTrack
                         | Hit::ConflictMode(_)
                         | Hit::ConflictStep(_)
@@ -9412,6 +9420,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         diff_tab: None,
         issue_tabs: HashMap::new(),
         scrub: None,
+        scrub_filter: scrub::Filter::default(),
         git_focus: false,
         hovered_tab: None,
         tree,

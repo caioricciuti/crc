@@ -1,12 +1,17 @@
-//! Git > File History: the file at each commit that changed it, in a
-//! read-only tab beside the file's own. Left and Right step to the older
-//! and the newer version, Home and End to the oldest and to the working
-//! tree, Escape goes back to the file. The file's own tab is never touched.
+//! Git > File History: the file at each commit that changed it, and the
+//! versions local history kept between them, in a read-only tab beside the
+//! file's own. Left and Right step to the older and the newer version,
+//! Home and End to the oldest and to the working tree, Escape goes back to
+//! the file. The file's own tab is never touched. A file Git does not
+//! track has its local versions alone.
 //!
-//! One worker per open history lists the versions, then reads them through
-//! one `git cat-file --batch`, nearest the version shown first, with the
-//! diff between each pair of neighbours: it moves the caret from one
-//! version to the next and draws the gutter marks.
+//! One worker per open history lists the versions, then reads them, a
+//! commit's through one `git cat-file --batch` and a local one's from the
+//! history database on a read-only connection of its own, nearest the
+//! version shown first, with the diff between each pair of neighbours: it
+//! moves the caret from one version to the next and draws the gutter
+//! marks. The filter (All, Commits, Local) picks which versions are
+//! neighbours.
 //!
 //! A step marks what it changed for a moment: a wash behind the lines it
 //! added or changed, and the lines it removed drawn where they were, all
@@ -15,9 +20,10 @@
 use std::collections::VecDeque;
 
 use super::*;
+use crate::history::store::{Reason, Store};
 use crate::ide::diff::Change;
 use crate::project::git::MarkKind;
-use crate::project::history::{Blob, BlobReader, HISTORY_LIMIT, Version};
+use crate::project::history::{Blob, BlobReader, HISTORY_LIMIT, Source, Version};
 
 /// Versions kept loaded either side of the one shown. This is the memory
 /// bound: at most `2 * RADIUS + 1` texts of up to 2 MB each (the gutter's
@@ -49,11 +55,19 @@ pub(super) enum Request {
     },
     /// The file's own text, the last version, changed.
     Worktree(Arc<str>),
+    /// The filter changed: these are the versions now, oldest first, and
+    /// every reply from here goes to `tx`. What was loaded is numbered the
+    /// old way and goes, but for the working tree.
+    Filter {
+        versions: Vec<Version>,
+        tx: mpsc::Sender<Reply>,
+    },
 }
 
 pub(super) enum Reply {
-    /// The versions, oldest first, and whether the list was cut short; or
-    /// why there are none.
+    /// Every version, commits and local ones, oldest first, and whether
+    /// the commits were cut short; or why there are none. The filter picks
+    /// from these on both sides, through [`visible`].
     Versions(Result<(Vec<Version>, bool), String>),
     Text(usize, Arc<str>),
     Diff(usize, Arc<Vec<Change>>),
@@ -81,12 +95,19 @@ pub(super) struct Scrub {
     /// The file's name, for the tab's title and the messages.
     name: String,
     ext: &'static str,
-    /// Oldest first; `None` while they are listed. The slot past the last
-    /// commit is the working tree, the text in the file's own tab.
+    /// The versions the filter keeps, oldest first; `None` while they are
+    /// listed. The slot past the last is the working tree, the text in the
+    /// file's own tab.
     versions: Option<Vec<Version>>,
+    /// Every version, whatever the filter.
+    all: Vec<Version>,
+    filter: Filter,
     capped: bool,
     /// The version the tab shows.
     shown: usize,
+    /// The tab's text is not version `shown`'s: the filter left out the
+    /// one it shows, and the next to show replaces it whole.
+    refill: bool,
     /// The version a step goes to, while its text is read.
     pending: Option<usize>,
     texts: HashMap<usize, Arc<str>>,
@@ -228,6 +249,114 @@ fn short(commit: &str) -> &str {
     commit.get(..7).unwrap_or(commit)
 }
 
+/// A version in the self-test dump: its short hash, or `local:` and why
+/// it was kept.
+fn tag(version: &Version) -> String {
+    match version.source {
+        Source::Commit => short(&version.commit).to_owned(),
+        Source::Local { reason, .. } => format!("local:{}", reason_words(reason)),
+    }
+}
+
+/// Why a local version was kept, as the strip says it.
+pub(super) fn reason_words(reason: Reason) -> &'static str {
+    match reason {
+        Reason::Opened => "opened",
+        Reason::Saved => "saved",
+        Reason::Idle => "idle",
+        Reason::Reloaded => "before reload",
+        Reason::ClosedUnsaved => "closed without saving",
+        Reason::Quit => "at quit",
+        Reason::BeforeRestore => "before restore",
+        Reason::EditedOnDisk => "edited on disk",
+    }
+}
+
+/// How many versions `versions` are, by kind: "5 commits", "2 local
+/// versions", "7 versions". `more` follows the number.
+fn counted(versions: &[Version], more: &str) -> String {
+    let n = versions.len();
+    let local = versions.iter().filter(|v| v.is_local()).count();
+    let kind = match local {
+        0 => "commit",
+        _ if local == n => "local version",
+        _ => "version",
+    };
+    format!("{n}{more} {kind}{}", if n == 1 { "" } else { "s" })
+}
+
+/// Which versions a history steps through. The window keeps the last one
+/// picked for the next history it opens.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum Filter {
+    #[default]
+    All,
+    Commits,
+    Local,
+}
+
+impl Filter {
+    fn keeps(self, version: &Version) -> bool {
+        match self {
+            Filter::All => true,
+            Filter::Commits => !version.is_local(),
+            Filter::Local => version.is_local(),
+        }
+    }
+
+    /// The next one the control goes to.
+    fn next(self) -> Filter {
+        match self {
+            Filter::All => Filter::Commits,
+            Filter::Commits => Filter::Local,
+            Filter::Local => Filter::All,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Filter::All => "All",
+            Filter::Commits => "Commits",
+            Filter::Local => "Local",
+        }
+    }
+}
+
+/// The versions of `all` that `filter` keeps, and the filter that kept
+/// them: every version when it would keep none, so a history never opens
+/// on nothing. The window and the worker both pick through this, so their
+/// slots agree.
+pub(super) fn visible(all: &[Version], filter: Filter) -> (Vec<Version>, Filter) {
+    let kept: Vec<Version> = all.iter().filter(|v| filter.keeps(v)).cloned().collect();
+    if kept.is_empty() && filter != Filter::All {
+        (all.to_vec(), Filter::All)
+    } else {
+        (kept, filter)
+    }
+}
+
+/// Where a filter change leaves the version the tab shows, `shown` of
+/// `before`, in `after`: its own slot when kept, and whether it was. One
+/// left out gives way to the next newer one kept, or the working tree.
+pub(super) fn reslot(
+    all: &[Version],
+    before: &[Version],
+    after: &[Version],
+    shown: usize,
+) -> (usize, bool) {
+    let Some(version) = before.get(shown) else {
+        return (after.len(), true);
+    };
+    if let Some(slot) = after.iter().position(|v| v == version) {
+        return (slot, true);
+    }
+    let from = all.iter().position(|v| v == version).unwrap_or(0);
+    let newer = all[from..]
+        .iter()
+        .find_map(|v| after.iter().position(|a| a == v));
+    (newer.unwrap_or(after.len()), false)
+}
+
 /// Where a history opened from the blame heat strip goes: a commit, by
 /// its hash or a prefix of it, and the caret's line and the first line
 /// shown in the file as that commit left it.
@@ -247,7 +376,9 @@ pub(super) fn goto_slot(
     capped: bool,
 ) -> (usize, Option<String>) {
     let found = versions.iter().position(|v| {
-        !commit.is_empty() && (v.commit.starts_with(commit) || commit.starts_with(&v.commit))
+        !commit.is_empty()
+            && !v.is_local()
+            && (v.commit.starts_with(commit) || commit.starts_with(&v.commit))
     });
     match found {
         Some(slot) => (slot, None),
@@ -368,8 +499,56 @@ impl Scrub {
         let _ = self.tx.send(Request::Worktree(text));
     }
 
+    /// Steps through the versions `filter` keeps from here on. The version
+    /// shown stays when kept; else the next newer one kept replaces it.
+    /// What was loaded is numbered the old way, and goes but for the
+    /// working tree and the version shown; the worker starts again on a
+    /// channel of its own, so nothing numbered the old way arrives after.
+    fn set_filter(&mut self, filter: Filter) {
+        let Some(before) = self.versions.take() else {
+            return;
+        };
+        let (after, filter) = visible(&self.all, filter);
+        self.filter = filter;
+        let (slot, kept) = reslot(&self.all, &before, &after, self.shown);
+        let text = self.texts.remove(&self.shown);
+        let worktree = self.texts.remove(&before.len());
+        self.texts.clear();
+        self.diffs.clear();
+        if let Some(worktree) = worktree {
+            self.texts.insert(after.len(), worktree);
+        }
+        self.shown = slot;
+        self.pending = None;
+        self.fade = None;
+        self.jump = None;
+        if self.sibling.is_none() {
+            // The first version was still on its way: the newest now.
+            self.pending = Some(after.len().saturating_sub(1));
+        } else if kept {
+            if let Some(text) = text {
+                self.texts.insert(slot, text);
+            }
+        } else {
+            self.refill = true;
+            self.pending = Some(slot);
+        }
+        let (tx, rx) = mpsc::channel();
+        self.rx = rx;
+        let _ = self.tx.send(Request::Filter {
+            versions: after.clone(),
+            tx,
+        });
+        self.versions = Some(after);
+        self.request();
+    }
+
     fn label(&self, slot: usize) -> String {
         match self.versions.as_ref().and_then(|v| v.get(slot)) {
+            Some(Version {
+                source: Source::Local { reason, .. },
+                ..
+            }) => format!("{} @ {}", self.name, reason_words(*reason)),
             Some(version) => format!("{} @ {}", self.name, short(&version.commit)),
             None => format!("{} @ working tree", self.name),
         }
@@ -379,19 +558,30 @@ impl Scrub {
     fn describe(&self, slot: usize) -> String {
         let count = self.count();
         let more = if self.capped { "+" } else { "" };
+        let now = crate::platform::unix_seconds() as i64;
         match self.versions.as_ref().and_then(|v| v.get(slot)) {
-            Some(version) => {
-                let now = crate::platform::unix_seconds() as i64;
-                format!(
-                    "{} {}, {}: {} ({} of {count}{more})",
-                    short(&version.commit),
-                    version.author,
-                    crate::project::git::ago(version.time, now),
-                    version.summary,
-                    slot + 1,
-                )
-            }
-            None => format!("working tree, after {count}{more} commits"),
+            Some(Version {
+                source: Source::Local { reason, .. },
+                time,
+                ..
+            }) => format!(
+                "local version, {}, {} ({} of {count}{more})",
+                reason_words(*reason),
+                crate::project::git::ago(*time, now),
+                slot + 1,
+            ),
+            Some(version) => format!(
+                "{} {}, {}: {} ({} of {count}{more})",
+                short(&version.commit),
+                version.author,
+                crate::project::git::ago(version.time, now),
+                version.summary,
+                slot + 1,
+            ),
+            None => format!(
+                "working tree, after {}",
+                counted(self.versions.as_deref().unwrap_or_default(), more)
+            ),
         }
     }
 }
@@ -411,12 +601,7 @@ pub(super) fn dump(state: &State) -> String {
         return format!("opening pending={:?}", scrub.pending);
     };
     let at = match versions.get(scrub.shown) {
-        Some(version) => format!(
-            "{}/{}@{}",
-            scrub.shown + 1,
-            versions.len(),
-            short(&version.commit)
-        ),
+        Some(version) => format!("{}/{}@{}", scrub.shown + 1, versions.len(), tag(version)),
         None => format!("worktree/{}", versions.len()),
     };
     let first = sibling
@@ -427,6 +612,25 @@ pub(super) fn dump(state: &State) -> String {
         scrub.texts.len(),
         scrub.pending,
         first.trim_end_matches('\n')
+    )
+}
+
+/// What the self-test dump says of the filter: which, how many versions it
+/// keeps of how many, and each kept one's tag, oldest first.
+pub(super) fn dump_filter(state: &State) -> String {
+    let Some(scrub) = &state.scrub else {
+        return "closed".into();
+    };
+    let Some(versions) = &scrub.versions else {
+        return format!("{} listing", scrub.filter.label().to_lowercase());
+    };
+    let tags: Vec<String> = versions.iter().map(tag).collect();
+    format!(
+        "{} {}/{} {}",
+        scrub.filter.label().to_lowercase(),
+        versions.len(),
+        scrub.all.len(),
+        tags.join(",")
     )
 }
 
@@ -650,8 +854,11 @@ pub(super) fn strip_scrub(state: &State) -> Option<&Scrub> {
 pub(super) struct StripRects {
     pub(super) older: Viewport,
     pub(super) newer: Viewport,
+    /// All, Commits or Local; as wide as the widest, so the timeline does
+    /// not move when it changes.
+    pub(super) filter: Viewport,
     pub(super) close: Viewport,
-    /// The rest of the second row, right of Newer.
+    /// The rest of the second row, right of the filter.
     pub(super) track: Viewport,
 }
 
@@ -664,6 +871,23 @@ pub(super) fn strip_rects(atlas: &mut Atlas, strip: Viewport) -> StripRects {
         NEWER,
         24.0,
     );
+    let widest = [Filter::All, Filter::Commits, Filter::Local]
+        .into_iter()
+        .max_by(|a, b| {
+            let (a, b) = (
+                layout::ui_text_width(atlas, a.label()),
+                layout::ui_text_width(atlas, b.label()),
+            );
+            a.total_cmp(&b)
+        })
+        .unwrap_or_default();
+    let filter = layout::strip_button(
+        atlas,
+        strip,
+        newer.x + newer.width + layout::UI_GAP,
+        widest.label(),
+        24.0,
+    );
     // On the first row, level with the pill.
     let close = Viewport {
         x: strip.x + strip.width - 16.0 - layout::UI_CONTROL,
@@ -671,7 +895,7 @@ pub(super) fn strip_rects(atlas: &mut Atlas, strip: Viewport) -> StripRects {
         width: layout::UI_CONTROL,
         height: layout::UI_CONTROL,
     };
-    let left = newer.x + newer.width + layout::UI_INSET;
+    let left = filter.x + filter.width + layout::UI_INSET;
     let track = Viewport {
         x: left,
         width: (strip.x + strip.width - 16.0 - left).max(0.0),
@@ -680,6 +904,7 @@ pub(super) fn strip_rects(atlas: &mut Atlas, strip: Viewport) -> StripRects {
     StripRects {
         older,
         newer,
+        filter,
         close,
         track,
     }
@@ -690,6 +915,14 @@ fn steps_open(scrub: &Scrub) -> (bool, bool) {
     let at = scrub.center();
     let listed = scrub.versions.is_some();
     (listed && at > 0, listed && at < scrub.count())
+}
+
+/// Whether the filter has a choice to make: the history has commits and
+/// local versions both.
+fn filter_open(scrub: &Scrub) -> bool {
+    scrub.versions.is_some()
+        && scrub.all.iter().any(|v| v.is_local())
+        && scrub.all.iter().any(|v| !v.is_local())
 }
 
 /// The strip's clickable parts: the close button always, the rest once
@@ -705,6 +938,7 @@ pub(super) fn strip_hits(
         hits.extend([
             (Hit::ScrubOlder, rects.older),
             (Hit::ScrubNewer, rects.newer),
+            (Hit::ScrubFilter, rects.filter),
             (Hit::ScrubTrack, rects.track),
         ]);
     }
@@ -733,6 +967,19 @@ fn strip_text(scrub: &Scrub, now: i64) -> StripText {
     let count = versions.len();
     let at = scrub.center();
     match versions.get(at) {
+        Some(Version {
+            source: Source::Local { reason, .. },
+            time,
+            ..
+        }) => StripText {
+            lead: format!(
+                "{}, {}   ",
+                reason_words(*reason),
+                crate::project::git::ago(*time, now)
+            ),
+            summary: String::new(),
+            right: format!("{} of {count}{more}", at + 1),
+        },
         Some(version) => StripText {
             lead: format!(
                 "{}   {}, {}   ",
@@ -745,8 +992,9 @@ fn strip_text(scrub: &Scrub, now: i64) -> StripText {
         },
         None => StripText {
             lead: format!(
-                "{} as open in its tab, after {count}{more} commits",
-                scrub.name
+                "{} as open in its tab, after {}",
+                scrub.name,
+                counted(versions, more)
             ),
             summary: String::new(),
             right: "working tree".into(),
@@ -757,6 +1005,15 @@ fn strip_text(scrub: &Scrub, now: i64) -> StripText {
 /// What the pointer resting on slot `slot` of the timeline is told.
 fn slot_tip(scrub: &Scrub, slot: usize, now: i64) -> String {
     match scrub.versions.as_ref().and_then(|v| v.get(slot)) {
+        Some(Version {
+            source: Source::Local { reason, .. },
+            time,
+            ..
+        }) => format!(
+            "Local version  {}, {}",
+            reason_words(*reason),
+            crate::project::git::ago(*time, now)
+        ),
         Some(version) => format!(
             "{}  {}, {}\n{}",
             short(&version.commit),
@@ -777,7 +1034,17 @@ pub(super) fn draw_strip(
     out: &mut Vec<GlyphInstance>,
 ) {
     let now = crate::platform::unix_seconds() as i64;
-    let pill = layout::strip_pill(out, atlas, strip, "History", theme.accent);
+    // A local version has a pill of its own, in the local ticks' colour.
+    let local = scrub
+        .versions
+        .as_ref()
+        .and_then(|v| v.get(scrub.center()))
+        .is_some_and(Version::is_local);
+    let pill = if local {
+        layout::strip_pill(out, atlas, strip, "Local", theme.diff_modified)
+    } else {
+        layout::strip_pill(out, atlas, strip, "History", theme.accent)
+    };
     let rects = strip_rects(atlas, strip);
     let text = strip_text(scrub, now);
     let left = pill.x + pill.width + 12.0;
@@ -815,6 +1082,13 @@ pub(super) fn draw_strip(
         .label(NEWER)
         .enabled(newer)
         .tip("Newer Version  \u{2192}")
+        .draw(out, atlas, theme);
+    // Lit while it leaves some versions out.
+    Button::new(rects.filter)
+        .label(scrub.filter.label())
+        .enabled(filter_open(scrub))
+        .on(scrub.filter != Filter::All)
+        .tip("Show All Versions, Commits or Local Versions")
         .draw(out, atlas, theme);
     Button::new(rects.close)
         .icon(crate::project::icons::CLOSE)
@@ -897,18 +1171,22 @@ fn draw_timeline(
             [last - first, 2.0],
             layout::faded(ink, 0.22),
         );
+        // A local version's tick is shorter and fainter than a commit's,
+        // in the colour of its pill.
+        let versions = scrub.versions.as_deref().unwrap_or_default();
         for slot in 0..count {
-            let alpha = if scrub.texts.contains_key(&slot) {
-                0.85
+            let read = scrub.texts.contains_key(&slot);
+            let (colour, alpha, half) = if versions.get(slot).is_some_and(Version::is_local) {
+                (theme.diff_modified, if read { 0.6 } else { 0.3 }, 3.0)
             } else {
-                0.4
+                (ink, if read { 0.85 } else { 0.4 }, 5.0)
             };
             layout::push_rect(
                 out,
                 atlas,
-                [m.snap(x_of(slot) - 0.5), mid - 5.0],
-                [1.0, 10.0],
-                layout::faded(ink, alpha),
+                [m.snap(x_of(slot) - 0.5), mid - half],
+                [1.0, 2.0 * half],
+                layout::faded(colour, alpha),
             );
         }
     }
@@ -1044,7 +1322,9 @@ fn show(state: &mut State) -> Option<(String, bool)> {
     // handed to the parser as an edit per change: none for the first,
     // which only opens the tab. A step during a fade starts its own;
     // nothing queues.
-    let changes = if made {
+    // Nor any after a filter change took the version shown away: the tab's
+    // text is no version here, and is replaced whole.
+    let changes = if made && !scrub.refill {
         scrub.step_changes(from, target)
     } else {
         None
@@ -1086,6 +1366,7 @@ fn show(state: &mut State) -> Option<(String, bool)> {
     let rope = buffer.rope.clone();
     scrub.shown = target;
     scrub.pending = None;
+    scrub.refill = false;
     scrub.fade = fade;
     scrub.jump = None;
     // What this commit changed, against its parent: the oldest version
@@ -1196,10 +1477,8 @@ impl EditorView {
         if buffer.rope.len_bytes() > GUTTER_MAX_BYTES {
             return Err("no history for files over 2 MB".into());
         }
-        // The gutter already found it outside any repository.
-        if state.gutter.docs.get(&id).is_some_and(|g| g.head.is_none()) {
-            return Err("this file is not in a Git repository".into());
-        }
+        // A file outside any repository may still have local versions:
+        // the worker finds out, off this thread, and says so if not.
         let name = path.file_name().map_or_else(
             || path.display().to_string(),
             |n| n.to_string_lossy().into_owned(),
@@ -1215,15 +1494,29 @@ impl EditorView {
         let (worker_tx, rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let halt = stop.clone();
-        std::thread::spawn(move || work(&path, text, &worker_rx, &worker_tx, &halt));
+        // Opened at a commit from blame: not among the local versions.
+        let filter = match state.scrub_filter {
+            Filter::Local if goto.is_some() => Filter::All,
+            filter => filter,
+        };
+        std::thread::spawn(move || {
+            let from = Lister {
+                db: crate::history::store::default_path(),
+                filter,
+            };
+            work(&path, text, &from, &worker_rx, &worker_tx, &halt)
+        });
         state.scrub = Some(Scrub {
             live: id,
             sibling: None,
             name: name.clone(),
             ext,
             versions: None,
+            all: Vec::new(),
+            filter,
             capped: false,
             shown: 0,
+            refill: false,
             pending: None,
             texts: HashMap::new(),
             diffs: HashMap::new(),
@@ -1335,6 +1628,47 @@ impl EditorView {
         self.step_history(Step::To(slot));
     }
 
+    /// The filter control: All, then Commits, then Local, and round again.
+    /// The window keeps it for the next history it opens.
+    pub(super) fn cycle_history_filter(&self) {
+        {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            let state = &mut *state;
+            let Some(scrub) = state.scrub.as_mut() else {
+                return;
+            };
+            let said = if scrub.versions.is_none() {
+                format!("reading the history of {}", scrub.name)
+            } else if !filter_open(scrub) {
+                let kind = if scrub.all.iter().any(|v| v.is_local()) {
+                    "commits"
+                } else {
+                    "local versions"
+                };
+                format!("{} has no {kind} to filter by", scrub.name)
+            } else {
+                scrub.set_filter(scrub.filter.next());
+                state.scrub_filter = scrub.filter;
+                // Its marks are against a version the filter may have
+                // left out: they come again with the diff.
+                if let Some(entry) = scrub.sibling.and_then(|id| state.gutter.docs.get_mut(&id)) {
+                    entry.marks.clear();
+                    entry.changes.clear();
+                }
+                format!(
+                    "{}: {}",
+                    scrub.filter.label(),
+                    counted(scrub.versions.as_deref().unwrap_or_default(), "")
+                )
+            };
+            state.message = Some((said, Instant::now()));
+        }
+        self.show_pending();
+        self.resume_display_link();
+    }
+
     /// Shows the version a step waits for if it is here, else says it is
     /// on its way.
     fn show_pending(&self) {
@@ -1386,8 +1720,8 @@ impl EditorView {
             let mut end = false;
             loop {
                 match scrub.rx.try_recv() {
-                    Ok(Reply::Versions(Ok((versions, capped)))) => {
-                        if versions.is_empty() {
+                    Ok(Reply::Versions(Ok((all, capped)))) => {
+                        if all.is_empty() {
                             said = Some(format!(
                                 "{} has no history: Git does not track it",
                                 scrub.name
@@ -1395,6 +1729,10 @@ impl EditorView {
                             end = true;
                             break;
                         }
+                        // As the worker picks them.
+                        let (versions, filter) = visible(&all, scrub.filter);
+                        scrub.all = all;
+                        scrub.filter = filter;
                         let count = versions.len();
                         // Opened at a commit: that version first, the caret
                         // where the line was. One the list lacks stands in
@@ -1495,23 +1833,32 @@ impl EditorView {
     }
 }
 
-/// The worker: lists the versions of `path`, then loads what is asked for,
-/// the newest commit's neighbourhood until a request says otherwise.
-fn work(
+/// Local versions a listing compares with the commits beside them, at
+/// most: each is a read and a hash of up to 2 MB, and the list waits on
+/// them.
+const DUPLICATE_CHECKS: usize = 64;
+
+/// Where the worker lists versions from besides Git: the local history
+/// database, when there is one to read, and the filter the history opens
+/// with.
+pub(super) struct Lister {
+    pub(super) db: Option<std::path::PathBuf>,
+    pub(super) filter: Filter,
+}
+
+/// Every version of the file at `opened` (as its tab has the path) and
+/// `path` (its folder resolved): the commits that changed it, cut short at
+/// [`HISTORY_LIMIT`], and its local versions, in one timeline, with a local
+/// one equal to a commit beside it left out; whether the commits were cut
+/// short; and the repository's root when it is in one. Outside Git, or
+/// untracked, the local versions alone; with none of those either, why
+/// there is no history.
+fn list_versions(
+    opened: &Path,
     path: &Path,
-    worktree: Arc<str>,
-    rx: &mpsc::Receiver<Request>,
-    tx: &mpsc::Sender<Reply>,
-    stop: &AtomicBool,
-) {
-    // Its folder and the root as the file system resolves them, as Git
-    // gives the root: a file opened through a linked folder is still
-    // inside it, and so is one gone from the disk since it was opened.
-    let path = &match (path.parent(), path.file_name()) {
-        (Some(dir), Some(name)) => crate::platform::canonical(dir).join(name),
-        _ => path.to_path_buf(),
-    };
-    let listed = path
+    store: Option<&Store>,
+) -> Result<(Vec<Version>, bool, Option<std::path::PathBuf>), String> {
+    let git = path
         .parent()
         .ok_or_else(|| "no parent directory".to_string())
         .and_then(crate::project::git::toplevel)
@@ -1526,14 +1873,84 @@ fn work(
                 crate::project::history::file_history(&root, &relative, HISTORY_LIMIT)?;
             Ok((root, versions, capped))
         });
-    let (root, versions) = match listed {
-        Ok((root, versions, capped)) => {
-            let empty = versions.is_empty();
-            if tx
-                .send(Reply::Versions(Ok((versions.clone(), capped))))
-                .is_err()
-                || empty
-            {
+    let local = store.map_or_else(Vec::new, |store| local_versions(store, [opened, path]));
+    let (root, commits, capped) = match git {
+        Ok((root, commits, capped)) => (Some(root), commits, capped),
+        Err(_) if !local.is_empty() => (None, Vec::new(), false),
+        Err(why) => return Err(why),
+    };
+    let mut all = crate::project::history::merge(commits, local);
+    if let Some(store) = store {
+        crate::project::history::drop_duplicates(&mut all, DUPLICATE_CHECKS, |local, commit| {
+            same_text(store, local, commit)
+        });
+    }
+    Ok((all, capped, root))
+}
+
+/// The local versions kept under any of `paths`, each once. The history
+/// thread keys a file by the path its tab has, which a linked folder makes
+/// differ from the resolved one. A history that cannot be read has none.
+fn local_versions<'a>(store: &Store, paths: impl IntoIterator<Item = &'a Path>) -> Vec<Version> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    let mut listed: Vec<&Path> = Vec::new();
+    for path in paths {
+        if listed.contains(&path) {
+            continue;
+        }
+        listed.push(path);
+        for entry in store.list(path).unwrap_or_default() {
+            if seen.insert(entry.id) {
+                out.push(Version::local(&entry, path));
+            }
+        }
+    }
+    out
+}
+
+/// Whether local version `local` holds the text `commit` left: its Git
+/// object id is the commit's blob. A file Git keeps with other line breaks
+/// or another encoding than the buffer's never matches, and is kept.
+fn same_text(store: &Store, local: &Version, commit: &Version) -> bool {
+    let Source::Local { id, .. } = local.source else {
+        return false;
+    };
+    let Ok(Some(text)) = store.read(id) else {
+        return false;
+    };
+    crate::project::history::blob_id(text.as_bytes()).is_some_and(|blob| blob == commit.blob)
+}
+
+/// The worker: lists the versions of `path`, then loads what is asked for,
+/// the newest version's neighbourhood until a request says otherwise.
+fn work(
+    path: &Path,
+    worktree: Arc<str>,
+    from: &Lister,
+    rx: &mpsc::Receiver<Request>,
+    tx: &mpsc::Sender<Reply>,
+    stop: &AtomicBool,
+) {
+    let opened = path;
+    // Its folder and the root as the file system resolves them, as Git
+    // gives the root: a file opened through a linked folder is still
+    // inside it, and so is one gone from the disk since it was opened.
+    let path = &match (path.parent(), path.file_name()) {
+        (Some(dir), Some(name)) => crate::platform::canonical(dir).join(name),
+        _ => path.to_path_buf(),
+    };
+    // Read-only, and this thread's own: the history thread goes on
+    // writing through its connection, and nothing here waits on it.
+    let store = from
+        .db
+        .as_deref()
+        .and_then(|db| Store::open_to_read(db).ok().flatten());
+    let (root, mut versions) = match list_versions(opened, path, store.as_ref()) {
+        Ok((all, capped, root)) => {
+            let empty = all.is_empty();
+            let (versions, _) = visible(&all, from.filter);
+            if tx.send(Reply::Versions(Ok((all, capped)))).is_err() || empty {
                 return;
             }
             (root, versions)
@@ -1543,7 +1960,8 @@ fn work(
             return;
         }
     };
-    let worktree_slot = versions.len();
+    let mut tx = tx.clone();
+    let mut worktree_slot = versions.len();
     let mut texts: HashMap<usize, Arc<str>> = HashMap::from([(worktree_slot, worktree)]);
     let mut queue: VecDeque<Job> = jobs(
         worktree_slot - 1,
@@ -1584,6 +2002,20 @@ fn work(
                 Request::Worktree(text) => {
                     texts.insert(worktree_slot, text);
                 }
+                Request::Filter {
+                    versions: kept,
+                    tx: to,
+                } => {
+                    let worktree = texts.remove(&worktree_slot);
+                    texts.clear();
+                    versions = kept;
+                    worktree_slot = versions.len();
+                    if let Some(worktree) = worktree {
+                        texts.insert(worktree_slot, worktree);
+                    }
+                    queue.clear();
+                    tx = to;
+                }
             }
             continue;
         }
@@ -1593,7 +2025,14 @@ fn work(
         let mut load = |slot: usize| -> Arc<str> {
             texts
                 .entry(slot)
-                .or_insert_with(|| read_version(&root, versions.get(slot), &mut reader))
+                .or_insert_with(|| {
+                    read_version(
+                        root.as_deref(),
+                        store.as_ref(),
+                        versions.get(slot),
+                        &mut reader,
+                    )
+                })
                 .clone()
         };
         let reply = match job {
@@ -1608,21 +2047,35 @@ fn work(
             }
             _ => continue,
         };
-        if tx.send(reply).is_err() {
-            return;
-        }
+        // Not an end: a filter change drops the receiver this reply was
+        // for, and the request with the next one is on its way. A closed
+        // history stops the loop through `stop` and its request channel.
+        let _ = tx.send(reply);
     }
 }
 
 /// The text of `version`, or a line saying why there is none, so a step
 /// onto it still shows something.
 fn read_version(
-    root: &Path,
+    root: Option<&Path>,
+    store: Option<&Store>,
     version: Option<&Version>,
     reader: &mut Option<BlobReader>,
 ) -> Arc<str> {
     let Some(version) = version else {
         return Arc::from("");
+    };
+    if let Source::Local { id, .. } = version.source {
+        let text = match store.map(|store| store.read(id)) {
+            Some(Ok(Some(text))) => return Arc::from(text),
+            Some(Ok(None)) => "(this local version is gone from local history)\n".to_string(),
+            Some(Err(why)) => format!("(could not read this version: {why})\n"),
+            None => "(local history is not open)\n".to_string(),
+        };
+        return Arc::from(text);
+    }
+    let Some(root) = root else {
+        return Arc::from("(not in a repository)\n");
     };
     if reader.is_none() {
         match BlobReader::open(root) {
@@ -1651,6 +2104,12 @@ fn read_version(
 mod tests {
     use super::*;
 
+    /// Git alone: no test reads the local history in Application Support.
+    const GIT_ONLY: Lister = Lister {
+        db: None,
+        filter: Filter::All,
+    };
+
     #[test]
     fn a_history_opened_at_a_commit_finds_it_by_any_prefix() {
         let version = |commit: &str| Version {
@@ -1660,6 +2119,7 @@ mod tests {
             summary: "plant beans".into(),
             blob: "0".repeat(40),
             path: std::path::PathBuf::from("garden.txt"),
+            source: Source::Commit,
         };
         let versions = [version("a"), version("b"), version("c")];
         let b = "b".repeat(40);
@@ -1962,7 +2422,8 @@ mod tests {
         // the worker resolves it.
         let path = tree.0.join("ledger.rs");
         let held = worktree.clone();
-        let worker = std::thread::spawn(move || work(&path, held, &worker_rx, &worker_tx, &halt));
+        let worker =
+            std::thread::spawn(move || work(&path, held, &GIT_ONLY, &worker_rx, &worker_tx, &halt));
         let wait = Duration::from_secs(60);
         let (versions, capped) = match rx.recv_timeout(wait) {
             Ok(Reply::Versions(listed)) => listed.expect("versions"),
@@ -2098,8 +2559,16 @@ mod tests {
         let (worker_tx, rx) = mpsc::channel();
         let halt = Arc::new(AtomicBool::new(false));
         let path = link.join("ledger.rs");
-        let worker =
-            std::thread::spawn(move || work(&path, Arc::from(last), &worker_rx, &worker_tx, &halt));
+        let worker = std::thread::spawn(move || {
+            work(
+                &path,
+                Arc::from(last),
+                &GIT_ONLY,
+                &worker_rx,
+                &worker_tx,
+                &halt,
+            )
+        });
         let listed = rx.recv_timeout(Duration::from_secs(60));
         drop(tx);
         worker.join().unwrap();
@@ -2113,5 +2582,290 @@ mod tests {
             Ok(Reply::Versions(Err(why))) => panic!("no history: {why}"),
             _ => panic!("no versions"),
         }
+    }
+
+    fn commit_v(name: &str) -> Version {
+        Version {
+            commit: name.repeat(40),
+            author: "Robin".into(),
+            time: 0,
+            summary: name.into(),
+            blob: name.repeat(40),
+            path: std::path::PathBuf::from("garden.txt"),
+            source: Source::Commit,
+        }
+    }
+
+    fn local_v(id: i64, reason: Reason) -> Version {
+        let entry = crate::history::store::Entry {
+            id: crate::history::store::SnapshotId(id),
+            at: id * 1000,
+            reason,
+            size: 1,
+        };
+        Version::local(&entry, Path::new("/garden/garden.txt"))
+    }
+
+    #[test]
+    fn the_filter_keeps_one_kind_and_never_nothing() {
+        let all = [
+            commit_v("a"),
+            local_v(1, Reason::Saved),
+            local_v(2, Reason::Idle),
+            commit_v("b"),
+        ];
+        let tags = |v: &[Version]| v.iter().map(tag).collect::<Vec<_>>();
+        assert_eq!(visible(&all, Filter::All), (all.to_vec(), Filter::All));
+        let (commits, filter) = visible(&all, Filter::Commits);
+        assert_eq!(
+            (tags(&commits), filter),
+            (
+                vec!["aaaaaaa".to_string(), "bbbbbbb".into()],
+                Filter::Commits
+            )
+        );
+        let (local, filter) = visible(&all, Filter::Local);
+        assert_eq!(
+            (tags(&local), filter),
+            (
+                vec!["local:saved".to_string(), "local:idle".into()],
+                Filter::Local
+            )
+        );
+        // Nothing of the kind: every version, and the filter says so.
+        let only = [commit_v("a"), commit_v("b")];
+        assert_eq!(visible(&only, Filter::Local), (only.to_vec(), Filter::All));
+        assert_eq!(Filter::All.next(), Filter::Commits);
+        assert_eq!(Filter::Commits.next(), Filter::Local);
+        assert_eq!(Filter::Local.next(), Filter::All);
+        assert_eq!(counted(&all, ""), "4 versions");
+        assert_eq!(counted(&commits, "+"), "2+ commits");
+        assert_eq!(counted(&local[..1], ""), "1 local version");
+    }
+
+    #[test]
+    fn a_filter_change_keeps_the_version_shown_or_the_next_newer() {
+        let all = [
+            commit_v("a"),
+            local_v(1, Reason::Saved),
+            commit_v("b"),
+            local_v(2, Reason::Idle),
+        ];
+        let commits = visible(&all, Filter::Commits).0;
+        let local = visible(&all, Filter::Local).0;
+        // Kept: its slot among the commits.
+        assert_eq!(reslot(&all, &all, &commits, 2), (1, true));
+        // Left out: the next commit after it, or the working tree.
+        assert_eq!(reslot(&all, &all, &commits, 1), (1, false));
+        assert_eq!(reslot(&all, &all, &commits, 3), (2, false));
+        assert_eq!(reslot(&all, &all, &local, 0), (0, false));
+        // The working tree stays the working tree.
+        assert_eq!(reslot(&all, &all, &local, 4), (2, true));
+        assert_eq!(reslot(&all, &commits, &all, 1), (2, true));
+    }
+
+    #[test]
+    fn local_versions_are_named_by_why_they_were_kept() {
+        let words: Vec<&str> = Reason::ALL.into_iter().map(reason_words).collect();
+        assert_eq!(
+            words,
+            [
+                "opened",
+                "saved",
+                "idle",
+                "before reload",
+                "closed without saving",
+                "at quit",
+                "before restore",
+                "edited on disk"
+            ]
+        );
+        // From blame: a local version is no commit, whatever the prefix.
+        let versions = [local_v(1, Reason::Saved), commit_v("b")];
+        assert_eq!(goto_slot(&versions, "bbbb", false), (1, None));
+        assert_eq!(goto_slot(&versions, "cccc", false).0, 1);
+    }
+
+    /// `git commit -am` in `dir` at a fixed date, with a test identity and
+    /// no signing.
+    fn commit_at(dir: &Path, message: &str, when: i64) {
+        let date = format!("@{when} +0000");
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=Robin",
+                "-c",
+                "user.email=robin@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-am",
+                message,
+            ])
+            .env("GIT_AUTHOR_DATE", &date)
+            .env("GIT_COMMITTER_DATE", &date)
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// What [`start`] gives back: the list, the requests, the replies and
+    /// the worker.
+    type Started = (
+        Result<(Vec<Version>, bool), String>,
+        mpsc::Sender<Request>,
+        mpsc::Receiver<Reply>,
+        std::thread::JoinHandle<()>,
+    );
+
+    /// A worker on `path` reading local history from `db`; its list, and
+    /// the channels to ask it for more.
+    fn start(path: &Path, db: &Path, worktree: &str, filter: Filter) -> Started {
+        let (tx, worker_rx) = mpsc::channel();
+        let (worker_tx, rx) = mpsc::channel();
+        let halt = Arc::new(AtomicBool::new(false));
+        let (path, worktree) = (path.to_path_buf(), Arc::<str>::from(worktree));
+        let from = Lister {
+            db: Some(db.to_path_buf()),
+            filter,
+        };
+        let worker =
+            std::thread::spawn(move || work(&path, worktree, &from, &worker_rx, &worker_tx, &halt));
+        let listed = match rx.recv_timeout(Duration::from_secs(60)) {
+            Ok(Reply::Versions(listed)) => listed,
+            _ => panic!("no versions"),
+        };
+        (listed, tx, rx, worker)
+    }
+
+    /// Asks for version `slot`'s text and waits for it.
+    fn text_of(tx: &mpsc::Sender<Request>, rx: &mpsc::Receiver<Reply>, slot: usize) -> String {
+        tx.send(Request::Want {
+            center: slot,
+            shown: slot,
+            jobs: vec![Job::Text(slot)],
+        })
+        .unwrap();
+        loop {
+            match rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("the worker answers")
+            {
+                Reply::Text(at, text) if at == slot => return text.to_string(),
+                _ => {}
+            }
+        }
+    }
+
+    /// Two commits with local versions between and after them: one
+    /// timeline by time, the save that was committed left out, each local
+    /// version read from the store, and a filter change numbering them
+    /// again on a channel of its own.
+    #[test]
+    fn local_versions_join_the_commits_in_one_timeline() {
+        use crate::history::store::Store;
+        let tree = crate::project::TempTree::new("scrub-local-history", &[("plan.txt", "one\n")]);
+        let dir = tree.0.as_path();
+        git(dir, &["init", "--quiet"]);
+        git(dir, &["add", "plan.txt"]);
+        commit_at(dir, "first", 1_700_000_000);
+        std::fs::write(dir.join("plan.txt"), "one\ntwo\nthree\n").unwrap();
+        commit_at(dir, "second", 1_700_000_100);
+        let db = tree.0.join("history").join("history.db");
+        let path = dir.join("plan.txt");
+        {
+            let store = Store::open(&db).unwrap();
+            let at = |s: i64| s * 1000;
+            for (text, reason, when) in [
+                ("one\n", Reason::Opened, at(1_700_000_010)),
+                ("one\ntwo\n", Reason::Saved, at(1_700_000_050)),
+                ("one\ntwo\nthree\n", Reason::Saved, at(1_700_000_090)),
+                ("one\ntwo\nthree\nfour\n", Reason::Idle, at(1_700_000_200)),
+            ] {
+                store.put_snapshot(&path, text, reason, when).unwrap();
+            }
+            // Another file's versions are not this one's.
+            store
+                .put_snapshot(
+                    &dir.join("other.txt"),
+                    "x",
+                    Reason::Saved,
+                    at(1_700_000_020),
+                )
+                .unwrap();
+        }
+        let worktree = "one\ntwo\nthree\nfour\nfive\n";
+        let (listed, tx, rx, worker) = start(&path, &db, worktree, Filter::All);
+        let (all, capped) = listed.expect("versions");
+        assert!(!capped);
+        let tags: Vec<String> = all.iter().map(tag).collect();
+        // Opened at the first commit and saved as the second: those two
+        // add nothing to the commits beside them.
+        assert_eq!(tags[1], "local:saved");
+        assert_eq!(tags[3], "local:idle");
+        assert_eq!(all.len(), 4, "{tags:?}");
+        assert_eq!(all[0].summary, "first");
+        assert_eq!(all[2].summary, "second");
+        assert_eq!(text_of(&tx, &rx, 1), "one\ntwo\n");
+        assert_eq!(text_of(&tx, &rx, 3), "one\ntwo\nthree\nfour\n");
+        assert_eq!(text_of(&tx, &rx, 0), "one\n", "a commit through Git");
+        // Local alone: slot 0 is the save now, and replies come on the new
+        // channel.
+        let (local, _) = visible(&all, Filter::Local);
+        let (to, from) = mpsc::channel();
+        tx.send(Request::Filter {
+            versions: local,
+            tx: to,
+        })
+        .unwrap();
+        assert_eq!(text_of(&tx, &from, 0), "one\ntwo\n");
+        assert_eq!(text_of(&tx, &from, 2), worktree, "the working tree kept");
+        drop(tx);
+        worker.join().unwrap();
+    }
+
+    /// Outside Git a file has its local versions alone; with none, the
+    /// history says why there is nothing.
+    #[test]
+    fn a_file_outside_git_has_its_local_versions() {
+        use crate::history::store::Store;
+        let tree = crate::project::TempTree::new("scrub-local-only", &[("loose.txt", "c\n")]);
+        let db = tree.0.join("history").join("history.db");
+        let path = tree.0.join("loose.txt");
+        {
+            let store = Store::open(&db).unwrap();
+            store
+                .put_snapshot(&path, "a\n", Reason::Opened, 1_000)
+                .unwrap();
+            store
+                .put_snapshot(&path, "b\n", Reason::Saved, 2_000)
+                .unwrap();
+        }
+        let (listed, tx, rx, worker) = start(&path, &db, "c\n", Filter::Commits);
+        let (all, capped) = listed.expect("local versions");
+        assert!(!capped);
+        let tags: Vec<String> = all.iter().map(tag).collect();
+        assert_eq!(tags, ["local:opened", "local:saved"]);
+        // No commits to keep: the worker steps through every version.
+        assert_eq!(text_of(&tx, &rx, 0), "a\n");
+        drop(tx);
+        worker.join().unwrap();
+
+        let none = tree.0.join("none.txt");
+        std::fs::write(&none, "n\n").unwrap();
+        let (listed, tx, _rx, worker) = start(&none, &db, "n\n", Filter::All);
+        assert_eq!(
+            listed,
+            Err("this file is not in a Git repository".to_string())
+        );
+        drop(tx);
+        worker.join().unwrap();
     }
 }

@@ -4,6 +4,15 @@ One entry per tag, written for people who use the editor.
 
 ## Unreleased
 
+- File History shows local history too. The versions crc kept of a file
+  sit between its commits by time, as smaller ticks on the timeline, and
+  one shows a Local pill with why it was kept (saved, idle, before
+  reload, closed without saving, at quit, opened, edited on disk) and
+  when. A version equal to the commit beside it, such as the save you
+  then committed, is left out. A filter beside Older and Newer steps
+  through all versions, commits alone or local versions alone, and the
+  window remembers it for the next history. A file outside Git, or one
+  Git does not track, opens File History with its local versions alone.
 - Local history: crc now keeps past versions of the files you edit, in
   `~/Library/Application Support/crc/history.db`. A version is kept when
   a file is opened (once, before its first change), at every save, before
@@ -19,8 +28,7 @@ One entry per tag, written for people who use the editor.
   after a week. `local_history = false` in the settings turns it off and
   `local_history_exclude` leaves out more files by glob. Typing never
   waits on it, and a full disk pauses it with one message without
-  touching saving. Viewing and restoring versions comes in a later
-  change.
+  touching saving. Restoring a version comes in a later change.
 - Replace in the find bar replaces only the current match when there are
   several cursors. With selections from Cmd-D, it used to put the
   replacement at every cursor. Now it replaces the match, goes back to
