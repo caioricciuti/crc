@@ -40,9 +40,22 @@ else
     BIN=target/release/crc
 fi
 T=$(mktemp -d)
+# A Mac that sleeps mid-run (a closed lid) goes on only in short dark
+# wakes with the display off: no frames are drawn and every wait runs
+# long, so the scenarios then fail for no fault of their own. Say so.
+started=$(date '+%Y-%m-%d %H:%M:%S')
+slept_note() {
+    local slept
+    slept=$(pmset -g log 2>/dev/null \
+        | awk -v since="$started" 'substr($0, 1, 19) >= since && $4 == "Sleep" { print $2; exit }' \
+        || true)
+    if [ -n "$slept" ]; then
+        echo "Note: the Mac went to sleep during this run (at $slept); failures after that may be the sleep's. Run again with it awake."
+    fi
+}
 # Terminals run in helper processes that outlive each app launch (see
 # src/term/hold.rs); the run's are ended with it.
-trap 'result=$?; pkill -f -- "--hold $T/home/" 2>/dev/null || true; if [ "$result" -eq 0 ]; then rm -rf "$T"; else echo "Self-test failure artifacts: $T (what failed: $T/selftest.log)"; fi' EXIT
+trap 'result=$?; pkill -f -- "--hold $T/home/" 2>/dev/null || true; if [ "$result" -eq 0 ]; then rm -rf "$T"; else slept_note; echo "Self-test failure artifacts: $T (what failed: $T/selftest.log)"; fi' EXIT
 # Everything said from here is also kept with the artifacts, so a failure
 # seen once can still be named after the terminal has scrolled past it.
 exec > >(tee "$T/selftest.log") 2>&1

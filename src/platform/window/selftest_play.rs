@@ -412,6 +412,9 @@ impl EditorView {
                 self.poll_completion();
                 self.poll_claude();
                 self.poll_syntax();
+                // File History's replies too: the display link that takes
+                // them does not fire while the display sleeps.
+                self.poll_scrub();
                 if let Some(mut state) = self.state_mut() {
                     state.git.poll();
                 }

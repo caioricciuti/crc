@@ -132,6 +132,13 @@ impl Db {
         Ok(db)
     }
 
+    /// How long a statement waits on another connection's lock before it
+    /// fails with SQLITE_BUSY. Five seconds from `open`.
+    pub fn set_busy_timeout(&self, ms: i32) {
+        // SAFETY: the handle is open for as long as `self` is.
+        unsafe { ffi::sqlite3_busy_timeout(self.handle.as_ptr(), ms) };
+    }
+
     pub fn version() -> i32 {
         unsafe { ffi::sqlite3_libversion_number() as i32 }
     }

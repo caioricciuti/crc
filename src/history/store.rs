@@ -65,6 +65,10 @@ const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = ["
 /// step never holds the write lock for long.
 const VACUUM_SLICE: i64 = 512;
 
+/// How long a reader's query waits on another connection's lock, in
+/// milliseconds; a writer waits the default five seconds.
+const READ_BUSY_MS: i32 = 200;
+
 const HOUR_MS: i64 = 60 * 60 * 1000;
 const DAY_MS: i64 = 24 * HOUR_MS;
 
@@ -319,13 +323,17 @@ impl Store {
 
     /// Opens the history at `path` only to read it, as File History does on
     /// its own thread while the history thread writes: no check, no
-    /// migration, nothing created. `None` when there is no file yet.
+    /// migration, nothing created. `None` when there is no file yet. A
+    /// lock another crc holds fails a read after [`READ_BUSY_MS`], so a
+    /// reader is never kept waiting on a writer.
     pub fn open_to_read(path: &Path) -> Result<Option<Store>> {
         if !path.exists() {
             return Ok(None);
         }
+        let db = Db::open_readonly(path)?;
+        db.set_busy_timeout(READ_BUSY_MS);
         Ok(Some(Store {
-            db: Db::open_readonly(path)?,
+            db,
             read_only: true,
             quarantined: None,
         }))
@@ -1095,6 +1103,31 @@ mod tests {
             [b.0, a.0]
         );
         assert_eq!(reader.read(a).unwrap().as_deref(), Some("alpha"));
+        cleanup(&path);
+    }
+
+    /// A reader held off by another connection's lock gives up at once,
+    /// rather than after the writer's five seconds a query.
+    #[test]
+    fn a_reader_held_off_by_a_lock_gives_up_quickly() {
+        let path = temp("reader-locked");
+        let store = Store::open(&path).unwrap();
+        put(&store, "/notes/plan.md", "alpha", NOW);
+        drop(store);
+        let holder = Db::open(&path).unwrap();
+        holder
+            .execute("PRAGMA locking_mode = EXCLUSIVE; BEGIN EXCLUSIVE;")
+            .unwrap();
+        let started = std::time::Instant::now();
+        let listed = Store::open_to_read(&path)
+            .and_then(|reader| reader.unwrap().list(Path::new("/notes/plan.md")));
+        assert!(listed.is_err(), "{listed:?}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "waited {:?}",
+            started.elapsed()
+        );
+        drop(holder);
         cleanup(&path);
     }
 

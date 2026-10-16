@@ -65,10 +65,11 @@ pub(super) enum Request {
 }
 
 pub(super) enum Reply {
-    /// Every version, commits and local ones, oldest first, and whether
-    /// the commits were cut short; or why there are none. The filter picks
-    /// from these on both sides, through [`visible`].
-    Versions(Result<(Vec<Version>, bool), String>),
+    /// Every version, commits and local ones, oldest first, whether the
+    /// commits were cut short, and whether local history could not be
+    /// read; or why there are none. The filter picks from these on both
+    /// sides, through [`visible`].
+    Versions(Result<(Vec<Version>, bool, bool), String>),
     Text(usize, Arc<str>),
     Diff(usize, Arc<Vec<Change>>),
     /// The changes from one version to another, as [`Job::Jump`] asked.
@@ -1764,11 +1765,12 @@ impl EditorView {
             let mut end = false;
             loop {
                 match scrub.rx.try_recv() {
-                    Ok(Reply::Versions(Ok((all, capped)))) => {
+                    Ok(Reply::Versions(Ok((all, capped, unavailable)))) => {
                         if all.is_empty() {
                             said = Some(format!(
-                                "{} has no history: Git does not track it",
-                                scrub.name
+                                "{} has no history: Git does not track it{}",
+                                scrub.name,
+                                if unavailable { UNAVAILABLE_TAIL } else { "" }
                             ));
                             end = true;
                             break;
@@ -1792,6 +1794,14 @@ impl EditorView {
                             }
                             None => count - 1,
                         };
+                        // Said once, with the first version: the commits
+                        // are listed without the local versions.
+                        if unavailable {
+                            scrub.note = Some(match scrub.note.take() {
+                                Some(note) => format!("{note}{UNAVAILABLE_TAIL}"),
+                                None => UNAVAILABLE.to_string(),
+                            });
+                        }
                         scrub.versions = Some(versions);
                         scrub.capped = capped;
                         scrub.shown = count;
@@ -1882,6 +1892,11 @@ impl EditorView {
 /// them.
 const DUPLICATE_CHECKS: usize = 64;
 
+/// Said when local history is there but cannot be read (locked by another
+/// crc past its short wait, damaged, or not permitted): the commits alone.
+const UNAVAILABLE: &str = "local history unavailable";
+const UNAVAILABLE_TAIL: &str = "; local history unavailable";
+
 /// Where the worker lists versions from besides Git: the local history
 /// database, when there is one to read, and the filter the history opens
 /// with.
@@ -1896,11 +1911,12 @@ pub(super) struct Lister {
 /// one equal to a commit beside it left out; whether the commits were cut
 /// short; and the repository's root when it is in one. Outside Git, or
 /// untracked, the local versions alone; with none of those either, why
-/// there is no history.
+/// there is no history. A `store` that fails to list is taken away, so
+/// nothing else waits on it, and the commits are listed alone.
 fn list_versions(
     opened: &Path,
     path: &Path,
-    store: Option<&Store>,
+    store: &mut Option<Store>,
 ) -> Result<(Vec<Version>, bool, Option<std::path::PathBuf>), String> {
     let git = path
         .parent()
@@ -1917,16 +1933,33 @@ fn list_versions(
                 crate::project::history::file_history(&root, &relative, HISTORY_LIMIT)?;
             Ok((root, versions, capped))
         });
-    let local = store.map_or_else(Vec::new, |store| local_versions(store, [opened, path]));
+    let local = match store
+        .as_ref()
+        .map(|store| local_versions(store, [opened, path]))
+    {
+        Some(Ok(local)) => local,
+        Some(Err(_)) => {
+            *store = None;
+            Vec::new()
+        }
+        None => Vec::new(),
+    };
     let (root, commits, capped) = match git {
         Ok((root, commits, capped)) => (Some(root), commits, capped),
         Err(_) if !local.is_empty() => (None, Vec::new(), false),
         Err(why) => return Err(why),
     };
     let mut all = crate::project::history::merge(commits, local);
-    if let Some(store) = store {
+    if let Some(store) = store.as_ref() {
+        // The first read that fails ends the checks: each would wait on
+        // the same lock again.
+        let failed = std::cell::Cell::new(false);
         crate::project::history::drop_duplicates(&mut all, DUPLICATE_CHECKS, |local, commit| {
-            same_text(store, local, commit)
+            !failed.get()
+                && same_text(store, local, commit).unwrap_or_else(|_| {
+                    failed.set(true);
+                    false
+                })
         });
     }
     Ok((all, capped, root))
@@ -1934,8 +1967,11 @@ fn list_versions(
 
 /// The local versions kept under any of `paths`, each once. The history
 /// thread keys a file by the path its tab has, which a linked folder makes
-/// differ from the resolved one. A history that cannot be read has none.
-fn local_versions<'a>(store: &Store, paths: impl IntoIterator<Item = &'a Path>) -> Vec<Version> {
+/// differ from the resolved one.
+fn local_versions<'a>(
+    store: &Store,
+    paths: impl IntoIterator<Item = &'a Path>,
+) -> crate::history::store::Result<Vec<Version>> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     let mut listed: Vec<&Path> = Vec::new();
@@ -1944,26 +1980,30 @@ fn local_versions<'a>(store: &Store, paths: impl IntoIterator<Item = &'a Path>) 
             continue;
         }
         listed.push(path);
-        for entry in store.list(path).unwrap_or_default() {
+        for entry in store.list(path)? {
             if seen.insert(entry.id) {
                 out.push(Version::local(&entry, path));
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// Whether local version `local` holds the text `commit` left: its Git
 /// object id is the commit's blob. A file Git keeps with other line breaks
 /// or another encoding than the buffer's never matches, and is kept.
-fn same_text(store: &Store, local: &Version, commit: &Version) -> bool {
+fn same_text(
+    store: &Store,
+    local: &Version,
+    commit: &Version,
+) -> crate::history::store::Result<bool> {
     let Source::Local { id, .. } = local.source else {
-        return false;
+        return Ok(false);
     };
-    let Ok(Some(text)) = store.read(id) else {
-        return false;
+    let Some(text) = store.read(id)? else {
+        return Ok(false);
     };
-    crate::project::history::blob_id(text.as_bytes()).is_some_and(|blob| blob == commit.blob)
+    Ok(crate::project::history::blob_id(text.as_bytes()).is_some_and(|blob| blob == commit.blob))
 }
 
 /// The worker: lists the versions of `path`, then loads what is asked for,
@@ -1985,19 +2025,33 @@ fn work(
         _ => path.to_path_buf(),
     };
     // Read-only, and this thread's own: the history thread goes on
-    // writing through its connection, and nothing here waits on it.
-    let store = from
-        .db
-        .as_deref()
-        .and_then(|db| Store::open_to_read(db).ok().flatten());
-    let (root, mut versions) = match list_versions(opened, path, store.as_ref()) {
+    // writing through its connection, and a lock it or another crc holds
+    // fails a read after a moment rather than holding the list up.
+    // One there that cannot be read leaves the commits to stand alone.
+    let (mut store, mut unavailable) = match from.db.as_deref().map(Store::open_to_read) {
+        Some(Ok(store)) => (store, false),
+        Some(Err(_)) => (None, true),
+        None => (None, false),
+    };
+    let open = store.is_some();
+    let listed = list_versions(opened, path, &mut store);
+    unavailable |= open && store.is_none();
+    let (root, mut versions) = match listed {
         Ok((all, capped, root)) => {
             let empty = all.is_empty();
             let (versions, _) = visible(&all, from.filter);
-            if tx.send(Reply::Versions(Ok((all, capped)))).is_err() || empty {
+            if tx
+                .send(Reply::Versions(Ok((all, capped, unavailable))))
+                .is_err()
+                || empty
+            {
                 return;
             }
             (root, versions)
+        }
+        Err(why) if unavailable => {
+            let _ = tx.send(Reply::Versions(Err(format!("{why}{UNAVAILABLE_TAIL}"))));
+            return;
         }
         Err(why) => {
             let _ = tx.send(Reply::Versions(Err(why)));
@@ -2470,7 +2524,10 @@ mod tests {
             std::thread::spawn(move || work(&path, held, &GIT_ONLY, &worker_rx, &worker_tx, &halt));
         let wait = Duration::from_secs(60);
         let (versions, capped) = match rx.recv_timeout(wait) {
-            Ok(Reply::Versions(listed)) => listed.expect("versions"),
+            Ok(Reply::Versions(listed)) => {
+                let (versions, capped, _) = listed.expect("versions");
+                (versions, capped)
+            }
             _ => panic!("no versions"),
         };
         let listed = started.elapsed();
@@ -2618,7 +2675,7 @@ mod tests {
         worker.join().unwrap();
         let _ = std::fs::remove_file(&link);
         match listed {
-            Ok(Reply::Versions(Ok((versions, capped)))) => {
+            Ok(Reply::Versions(Ok((versions, capped, _)))) => {
                 assert_eq!(versions.len(), 3);
                 assert!(!capped);
                 assert_eq!(versions[2].path, Path::new("ledger.rs"));
@@ -2763,7 +2820,7 @@ mod tests {
     /// What [`start`] gives back: the list, the requests, the replies and
     /// the worker.
     type Started = (
-        Result<(Vec<Version>, bool), String>,
+        Result<(Vec<Version>, bool, bool), String>,
         mpsc::Sender<Request>,
         mpsc::Receiver<Reply>,
         std::thread::JoinHandle<()>,
@@ -2847,8 +2904,8 @@ mod tests {
         }
         let worktree = "one\ntwo\nthree\nfour\nfive\n";
         let (listed, tx, rx, worker) = start(&path, &db, worktree, Filter::All);
-        let (all, capped) = listed.expect("versions");
-        assert!(!capped);
+        let (all, capped, unavailable) = listed.expect("versions");
+        assert!(!capped && !unavailable);
         let tags: Vec<String> = all.iter().map(tag).collect();
         // Opened at the first commit and saved as the second: those two
         // add nothing to the commits beside them.
@@ -2893,8 +2950,8 @@ mod tests {
                 .unwrap();
         }
         let (listed, tx, rx, worker) = start(&path, &db, "c\n", Filter::Commits);
-        let (all, capped) = listed.expect("local versions");
-        assert!(!capped);
+        let (all, capped, unavailable) = listed.expect("local versions");
+        assert!(!capped && !unavailable);
         let tags: Vec<String> = all.iter().map(tag).collect();
         assert_eq!(tags, ["local:opened", "local:saved"]);
         // No commits to keep: the worker steps through every version.
@@ -2909,6 +2966,70 @@ mod tests {
             listed,
             Err("this file is not in a Git repository".to_string())
         );
+        drop(tx);
+        worker.join().unwrap();
+    }
+
+    /// A local history another connection holds locked, or whose shared
+    /// memory file cannot be opened: the commits alone, at once, and a
+    /// word that local history could not be read.
+    #[test]
+    fn a_local_history_that_cannot_be_read_lists_the_commits_at_once() {
+        use crate::history::store::Store;
+        let tree = crate::project::TempTree::new("scrub-local-locked", &[("plan.txt", "one\n")]);
+        let dir = tree.0.as_path();
+        git(dir, &["init", "--quiet"]);
+        git(dir, &["add", "plan.txt"]);
+        commit_at(dir, "first", 1_700_000_000);
+        let db = tree.0.join("history").join("history.db");
+        let path = dir.join("plan.txt");
+        {
+            let store = Store::open(&db).unwrap();
+            store
+                .put_snapshot(&path, "one\ntwo\n", Reason::Saved, 1_700_000_050_000)
+                .unwrap();
+        }
+        // Its shared memory file there and not readable, as another user's
+        // or a damaged one would be. (One this process has open would be
+        // shared with the reader, so the writer is closed first.)
+        let shm = tree.0.join("history").join("history.db-shm");
+        std::fs::write(&shm, []).unwrap();
+        let mode = |bits: u32| {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shm, std::fs::Permissions::from_mode(bits)).unwrap();
+        };
+        mode(0o000);
+        let started = Instant::now();
+        let (listed, tx, _rx, worker) = start(&path, &db, "one\ntwo\n", Filter::All);
+        mode(0o600);
+        let (all, _, unavailable) = listed.expect("the commits");
+        assert!(all.len() == 1 && matches!(all[0].source, Source::Commit));
+        assert!(unavailable, "an unreadable history is said");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(tx);
+        worker.join().unwrap();
+
+        // Locked by another connection: no waiting out its busy timeout.
+        let holder = crate::index::db::Db::open(&db).unwrap();
+        holder
+            .execute("PRAGMA locking_mode = EXCLUSIVE; BEGIN EXCLUSIVE;")
+            .unwrap();
+        let started = Instant::now();
+        let (listed, tx, _rx, worker) = start(&path, &db, "one\ntwo\n", Filter::All);
+        let elapsed = started.elapsed();
+        let (all, _, unavailable) = listed.expect("the commits");
+        assert!(all.len() == 1 && matches!(all[0].source, Source::Commit));
+        assert!(unavailable, "a locked history is said");
+        assert!(elapsed < Duration::from_secs(2), "waited {elapsed:?}");
+        drop(tx);
+        worker.join().unwrap();
+
+        // Readable again: the local version is back, and nothing is said.
+        drop(holder);
+        let (listed, tx, _rx, worker) = start(&path, &db, "one\ntwo\n", Filter::All);
+        let (all, _, unavailable) = listed.expect("the versions");
+        assert_eq!(all.len(), 2);
+        assert!(!unavailable);
         drop(tx);
         worker.join().unwrap();
     }

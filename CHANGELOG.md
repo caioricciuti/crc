@@ -14,6 +14,9 @@ One entry per tag, written for people who use the editor.
   through all versions, commits alone or local versions alone, and the
   window remembers it for the next history. A file outside Git, or one
   Git does not track, opens File History with its local versions alone.
+  If local history cannot be read (another crc holding it locked, a
+  damaged file), File History lists the commits at once and says local
+  history is unavailable, instead of waiting.
 - Local history: crc now keeps past versions of the files you edit, in
   `~/Library/Application Support/crc/history.db`. A version is kept when
   a file is opened (once, before its first change), at every save, before
