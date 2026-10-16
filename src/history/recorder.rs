@@ -475,6 +475,22 @@ impl Recorder {
         self.keep(buffer, Reason::ClosedUnsaved);
     }
 
+    /// `buffer`'s text was just replaced by a version from its history:
+    /// `before`, what it held, is kept.
+    pub fn before_restore(&mut self, buffer: &Buffer, before: &Rope) {
+        let Some(path) = buffer.path.as_deref() else {
+            return;
+        };
+        if keepable(buffer) && before.len_bytes() <= MAX_BYTES && self.filter.allows(path) {
+            self.send(Job::Snapshot {
+                path: path.to_owned(),
+                rope: before.clone(),
+                reason: Reason::BeforeRestore,
+                at: now_ms(),
+            });
+        }
+    }
+
     /// `path` is about to be written by an edit made without opening it
     /// (a project-wide replace, a rename symbol): `before` is its text.
     pub fn edited_on_disk(&mut self, path: &Path, before: &Rope) {
@@ -1189,6 +1205,52 @@ mod tests {
         recorder.finish(std::iter::empty(), secs(10));
         assert_eq!(reasons(&db, &file), [Reason::EditedOnDisk]);
         assert_eq!(reasons(&db, &dir.join(".env")), []);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A restore keeps the text it replaced, typed and unsaved; the text
+    /// the file was opened with, when that is the one, comes after it the
+    /// same, and is not stored twice.
+    #[test]
+    fn a_restore_keeps_the_text_it_replaces() {
+        let dir = temp("restore");
+        let db = dir.join("history.db");
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "a\n").unwrap();
+        let file = crate::platform::canonical(&file);
+        let mut buffer = open(&file);
+        let mut recorder = recorder(&db, "", Timing::default());
+        let t0 = Instant::now();
+        recorder.observe(std::iter::once(&buffer), t0);
+        buffer.insert("typed ");
+        recorder.observe(std::iter::once(&buffer), t0);
+        let before = buffer.rope.clone();
+        assert!(buffer.restore_text("then\n", 0, 0));
+        recorder.before_restore(&buffer, &before);
+        recorder.observe(std::iter::once(&buffer), t0 + secs(1));
+        // Untouched since it was opened: what it was opened with is the
+        // text before the restore.
+        let mut other = open(&{
+            let other = dir.join("b.txt");
+            std::fs::write(&other, "b\n").unwrap();
+            crate::platform::canonical(&other)
+        });
+        recorder.observe(std::iter::once(&other), t0);
+        let before = other.rope.clone();
+        assert!(other.restore_text("older\n", 0, 0));
+        recorder.before_restore(&other, &before);
+        recorder.observe(std::iter::once(&other), t0 + secs(1));
+        // Not one that is not kept.
+        let mut frozen = Buffer::generated("a.txt @ abc", "txt", "x\n");
+        frozen.set_frozen(true);
+        recorder.before_restore(&frozen, &Rope::from_text("y\n"));
+        recorder.finish(std::iter::empty(), secs(10));
+        assert_eq!(reasons(&db, &file), [Reason::Opened, Reason::BeforeRestore]);
+        let store = Store::open(&db).unwrap();
+        let latest = store.list(&file).unwrap()[0].id;
+        assert_eq!(store.read(latest).unwrap().as_deref(), Some("typed a\n"));
+        let other = other.path.clone().unwrap();
+        assert_eq!(reasons(&db, &other), [Reason::BeforeRestore]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

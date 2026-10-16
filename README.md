@@ -95,7 +95,11 @@ the size and write it back.
   was kept (saved, idle, before reload, closed without saving and the
   like); the filter beside Newer steps through All, Commits or Local
   alone, and the window keeps it for the next history. A file Git does
-  not track has its local versions alone. Git > Blame Heat (off by default, `blame_heat` in
+  not track has its local versions alone. Restore (or Git > Restore This
+  Version) puts the version shown into the file's own tab as one edit: Undo takes it back, nothing is
+  written until you save, and the text it replaced is kept in local
+  history first. vs Working Tree marks what a version changed against
+  your text instead of against the version before it. Git > Blame Heat (off by default, `blame_heat` in
   the settings) draws a thin strip beside the line numbers, strongest for
   lines changed today and fading out past a year; hover it for the commit,
   and Cmd-click it (or click where no change mark is) to open File History
@@ -340,9 +344,9 @@ the size and write it back.
   (OAuth), and shows interactive MCP Apps as nothing: their results show
   as text. `crc --mcp` has no live editor state yet, only what is on disk
   and in the index.
-- **Local history can be looked at, not yet restored.** File History
-  shows the versions kept; restoring one, comparing it with your text and
-  recovering a deleted file come in later changes.
+- **A deleted file cannot be recovered from local history yet.** File
+  History shows, compares and restores the versions kept of an open
+  file; recovering one that is gone comes in a later change.
 - **Git history is per file.** File History and Blame Heat walk one
   file's commits; there is no log of the whole repository or commit
   graph, and no merge or

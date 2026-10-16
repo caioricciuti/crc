@@ -349,6 +349,33 @@ impl Buffer {
             .min(self.rope.len_lines().saturating_sub(1));
         self.dirty = false;
     }
+    /// Replaces the whole text with `text`, a version from the file's
+    /// history, as one undoable edit: undo brings back the text it had. The
+    /// caret goes to `line` and `column`, both clamped. Nothing is written,
+    /// and the document is unsaved unless `text` is what the file holds.
+    /// Returns false, and changes nothing, when edits are refused or the
+    /// text is `text` already.
+    pub fn restore_text(&mut self, text: &str, line: usize, column: usize) -> bool {
+        if self.is_locked() {
+            return false;
+        }
+        let text = normalize_newlines(text);
+        if rope_holds(&self.rope, 0..self.rope.len_bytes(), &text) {
+            return false;
+        }
+        // Its own step, never folded into the typing before it.
+        self.last_edit = None;
+        self.checkpoint(EditKind::Insert);
+        let before = std::mem::replace(&mut self.rope, Rope::from_text(&text));
+        self.record_replacement(&before);
+        let line = line.min(self.rope.len_lines().saturating_sub(1));
+        self.cursor = self.byte_at(line, column);
+        self.anchor = self.cursor;
+        self.goal_column = None;
+        self.last_edit = None;
+        self.dirty = !self.matches_saved();
+        true
+    }
     /// The lowercase file extension, from the path or the display hint.
     pub fn extension(&self) -> Option<String> {
         self.path
@@ -3910,6 +3937,81 @@ mod tests {
             b.drain_edits().expect("an edit"),
             [crate::ide::diff::prefix_suffix_edit(old, new).unwrap()]
         );
+    }
+
+    /// A version restored from history: one undo step whatever was typed
+    /// just before it, unsaved, nothing written, the caret where it was
+    /// asked for, and undo and redo between the two texts.
+    #[test]
+    fn a_restored_version_is_one_undo_step_and_writes_nothing() {
+        let dir = std::env::temp_dir().join(format!(
+            "crc-restore-{}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("menu.txt");
+        std::fs::write(&path, b"soup\r\nsalad\r\n").unwrap();
+        let mut b = Buffer::open(&path).unwrap();
+        b.goto_line(1);
+        b.insert("x");
+        b.insert("y");
+        b.drain_edits();
+        let typed = b.rope.to_string();
+        assert_eq!(typed, "soup\nxysalad\n");
+        // A commit's text with Windows line breaks and wide characters.
+        let version = "soup\r\n\u{65e5}\u{672c} bread\r\nsalad\r\ncr\u{e8}me\r\n";
+        assert!(b.restore_text(version, 1, 2));
+        assert_eq!(
+            b.rope.to_string(),
+            "soup\n\u{65e5}\u{672c} bread\nsalad\ncr\u{e8}me\n"
+        );
+        assert!(b.is_dirty());
+        assert_eq!(std::fs::read(&path).unwrap(), b"soup\r\nsalad\r\n");
+        // Two characters into the line, past the three-byte ones.
+        assert_eq!(b.cursor_position(), (1, 2));
+        assert_eq!(b.cursor(), "soup\n".len() + 6);
+        assert_eq!(b.selection(), None);
+        let edits = b.drain_edits().expect("an edit, not a full parse");
+        assert_eq!(edits.len(), 1);
+        // Typing after it is a step of its own.
+        b.insert("z");
+        assert!(b.undo());
+        assert!(b.undo(), "the restore");
+        assert_eq!(b.rope.to_string(), typed, "the text from before it");
+        assert!(b.is_dirty(), "still the typed text, not the file's");
+        assert!(b.redo());
+        assert_eq!(
+            b.rope.to_string(),
+            "soup\n\u{65e5}\u{672c} bread\nsalad\ncr\u{e8}me\n"
+        );
+        // A line and a column past the end are clamped.
+        assert!(b.restore_text("one", 9, 9));
+        assert_eq!(b.cursor_position(), (0, 3));
+        // The text it already has is no edit, and not an undo step.
+        b.drain_edits();
+        let steps = b.undo_stack.len();
+        assert!(!b.restore_text("one", 0, 0));
+        assert_eq!(b.undo_stack.len(), steps);
+        assert!(!b.has_pending_edits());
+        assert_eq!(std::fs::read(&path).unwrap(), b"soup\r\nsalad\r\n");
+        // The file's own text again: nothing unsaved, saved with its CRLF.
+        assert!(b.restore_text("soup\r\nsalad\r\n", 0, 0));
+        assert!(!b.is_dirty(), "the file's own text");
+        assert!(b.restore_text("soup\nbread\n", 1, 0));
+        b.save(None).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"soup\r\nbread\r\n");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Edits refused, a version is refused too.
+    #[test]
+    fn a_locked_document_takes_no_restore() {
+        let mut b = Buffer::generated("notes.txt @ abc1234", "txt", "one\n");
+        b.set_frozen(true);
+        assert!(!b.restore_text("two\n", 0, 0));
+        assert_eq!(b.rope.to_string(), "one\n");
+        assert!(!b.can_undo() && !b.is_dirty());
     }
 
     /// The real cap, on a sparse file: refused from its size alone, so the

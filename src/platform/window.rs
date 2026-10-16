@@ -688,6 +688,9 @@ struct State {
     /// The versions File History last showed (All, Commits, Local): the
     /// next history opens with them.
     scrub_filter: scrub::Filter,
+    /// File History last marked a version's changes against the working
+    /// tree, not the version before: the next history does too.
+    scrub_compare: bool,
     /// Whether the commit message field has the keyboard. Source control is
     /// docked, not modal, so it only takes typing when it is asked to.
     git_focus: bool,
@@ -2016,6 +2019,14 @@ define_class!(
                     self.cycle_history_filter();
                     return;
                 }
+                Some(Hit::ScrubCompare) => {
+                    self.toggle_history_compare();
+                    return;
+                }
+                Some(Hit::ScrubRestore) => {
+                    self.restore_version();
+                    return;
+                }
                 Some(Hit::ScrubTrack) => {
                     if let Some(mut state) = self.state_mut() {
                         state.drag = Some(Drag::Timeline);
@@ -2598,6 +2609,8 @@ define_class!(
                         | Hit::ScrubNewer
                         | Hit::ScrubClose
                         | Hit::ScrubFilter
+                        | Hit::ScrubCompare
+                        | Hit::ScrubRestore
                         | Hit::ScrubTrack
                         | Hit::ConflictMode(_)
                         | Hit::ConflictStep(_)
@@ -3354,6 +3367,16 @@ define_class!(
         #[unsafe(method(newerVersion:))]
         fn action_newer_version(&self, _sender: Option<&AnyObject>) {
             self.step_history(scrub::Step::Newer);
+        }
+
+        #[unsafe(method(restoreVersion:))]
+        fn action_restore_version(&self, _sender: Option<&AnyObject>) {
+            self.restore_version();
+        }
+
+        #[unsafe(method(compareWithWorkingTree:))]
+        fn action_compare_with_working_tree(&self, _sender: Option<&AnyObject>) {
+            self.toggle_history_compare();
         }
 
         #[unsafe(method(stageChange:))]
@@ -4574,6 +4597,14 @@ define_class!(
                 active.path.is_some() && !active.is_preview_file()
             } else if action == sel!(olderVersion:) || action == sel!(newerVersion:) {
                 scrub::has_keys(&state)
+            } else if action == sel!(restoreVersion:) {
+                scrub::has_keys(&state)
+                    && state.scrub.as_ref().is_some_and(|s| s.restorable().is_ok())
+            } else if action == sel!(compareWithWorkingTree:) {
+                // Checked while the marks are against the working tree.
+                let on: isize = if state.scrub_compare { 1 } else { 0 };
+                let _: () = unsafe { msg_send![item, setState: on] };
+                scrub::has_keys(&state)
             } else if action == sel!(toggleBlameHeat:) {
                 // Checked while it is on; it can always be flipped.
                 let on: isize = if state.heat.on { 1 } else { 0 };
@@ -5621,6 +5652,7 @@ impl EditorView {
         self.claude_after_frame();
         self.terminal_after_frame();
         self.history_after_frame();
+        self.scrub_after_frame();
     }
 
     /// Creates the display link on first use and unpauses it.
@@ -9110,6 +9142,18 @@ fn install_menu(mtm: MainThreadMarker, app: &NSApplication) {
     git_menu.addItem(&history);
     git_menu.addItem(&item("Older Version", sel!(olderVersion:), "", false));
     git_menu.addItem(&item("Newer Version", sel!(newerVersion:), "", false));
+    git_menu.addItem(&item(
+        "Restore This Version",
+        sel!(restoreVersion:),
+        "",
+        false,
+    ));
+    git_menu.addItem(&item(
+        "Compare with Working Tree",
+        sel!(compareWithWorkingTree:),
+        "",
+        false,
+    ));
     git_menu.addItem(&item("Blame Heat", sel!(toggleBlameHeat:), "", false));
     git_menu.addItem(&NSMenuItem::separatorItem(mtm));
     git_menu.addItem(&item("Next Conflict", sel!(nextConflict:), "", false));
@@ -9421,6 +9465,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         issue_tabs: HashMap::new(),
         scrub: None,
         scrub_filter: scrub::Filter::default(),
+        scrub_compare: false,
         git_focus: false,
         hovered_tab: None,
         tree,

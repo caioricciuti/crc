@@ -42,6 +42,9 @@ pub(super) enum Job {
     Diff(usize),
     /// The changes from one version to another further off, for a jump.
     Jump(usize, usize),
+    /// The changes from the working tree to a version, for its marks when
+    /// they are against the working tree.
+    Tree(usize),
 }
 
 pub(super) enum Request {
@@ -53,8 +56,9 @@ pub(super) enum Request {
         shown: usize,
         jobs: Vec<Job>,
     },
-    /// The file's own text, the last version, changed.
-    Worktree(Arc<str>),
+    /// The file's own text, the last version, changed: the `n`th text it
+    /// has had, which the replies against it carry.
+    Worktree(Arc<str>, u64),
     /// The filter changed: these are the versions now, oldest first, and
     /// every reply from here goes to `tx`. What was loaded is numbered the
     /// old way and goes, but for the working tree.
@@ -74,6 +78,12 @@ pub(super) enum Reply {
     Diff(usize, Arc<Vec<Change>>),
     /// The changes from one version to another, as [`Job::Jump`] asked.
     Jump(usize, usize, Arc<Vec<Change>>),
+    /// The changes from the working tree, the `n`th text it has had, to a
+    /// version, as [`Job::Tree`] asked.
+    Tree(usize, u64, Arc<Vec<Change>>),
+    /// The version's text could not be read: the text sent next is a line
+    /// saying why, and it is no version to restore.
+    Unreadable(usize),
 }
 
 /// Where a step goes.
@@ -132,6 +142,16 @@ pub(super) struct Scrub {
     /// The changes from the version shown to the one a jump waits for,
     /// from the worker: (from, to, changes).
     jump: Option<(usize, usize, Arc<Vec<Change>>)>,
+    /// The versions whose text could not be read, by slot.
+    unreadable: std::collections::HashSet<usize>,
+    /// The gutter marks what a version changed against the working tree,
+    /// not against the version before it.
+    against_tree: bool,
+    /// The changes from the working tree to version `n`, by `n`, for those
+    /// marks; kept like the diffs, and gone when the working tree changes.
+    tree_diffs: HashMap<usize, Arc<Vec<Change>>>,
+    /// How many texts the working tree has had, as the worker counts them.
+    tree_generation: u64,
     tx: mpsc::Sender<Request>,
     rx: mpsc::Receiver<Reply>,
     stop: Arc<AtomicBool>,
@@ -419,7 +439,36 @@ impl Scrub {
                 || self.pending.is_some()
                 || (self.sibling.is_some()
                     && self.shown > 0
-                    && !self.diffs.contains_key(&(self.shown - 1))))
+                    && !self.diffs.contains_key(&(self.shown - 1)))
+                || self.wants_tree_diff())
+    }
+
+    /// The marks are against the working tree, and the version shown's
+    /// changes from it are not here yet.
+    fn wants_tree_diff(&self) -> bool {
+        self.against_tree
+            && self.sibling.is_some()
+            && self.pending.is_none()
+            && self.shown < self.count()
+            && !self.tree_diffs.contains_key(&self.shown)
+    }
+
+    /// What the gutter marks on the version shown: what it changed against
+    /// the version before it, or against the working tree; `None` while
+    /// that is on its way. The oldest version has no parent read, and no
+    /// marks rather than every line added; the working tree none against
+    /// itself.
+    fn shown_marks(&self) -> Option<Vec<Change>> {
+        if self.against_tree {
+            if self.shown >= self.count() {
+                return Some(Vec::new());
+            }
+            return self.tree_diffs.get(&self.shown).map(|c| c.to_vec());
+        }
+        match self.shown.checked_sub(1) {
+            None => Some(Vec::new()),
+            Some(pair) => self.diffs.get(&pair).map(|c| c.to_vec()),
+        }
     }
 
     fn count(&self) -> usize {
@@ -461,6 +510,10 @@ impl Scrub {
         let count = self.count();
         let shown = self.shown;
         evict(&mut self.texts, &mut self.diffs, center, [count, shown]);
+        let texts = &self.texts;
+        self.unreadable.retain(|slot| texts.contains_key(slot));
+        self.tree_diffs
+            .retain(|&slot, _| slot == shown || in_window(slot, center));
         let mut jobs = jobs(
             center,
             count + 1,
@@ -474,6 +527,10 @@ impl Scrub {
                 .position(|job| *job == Job::Text(center))
                 .map_or(0, |i| i + 1);
             jobs.insert(at, Job::Jump(shown, center));
+        }
+        // The version shown is here: its marks come first.
+        if self.wants_tree_diff() {
+            jobs.insert(0, Job::Tree(shown));
         }
         if !jobs.is_empty() {
             let _ = self.tx.send(Request::Want {
@@ -497,7 +554,9 @@ impl Scrub {
         if let Some(pair) = count.checked_sub(1) {
             self.diffs.remove(&pair);
         }
-        let _ = self.tx.send(Request::Worktree(text));
+        self.tree_diffs.clear();
+        self.tree_generation += 1;
+        let _ = self.tx.send(Request::Worktree(text, self.tree_generation));
     }
 
     /// Steps through the versions `filter` keeps from here on. The version
@@ -513,9 +572,12 @@ impl Scrub {
         self.filter = filter;
         let (slot, kept) = reslot(&self.all, &before, &after, self.shown);
         let text = self.texts.remove(&self.shown);
+        let unreadable = self.unreadable.contains(&self.shown);
         let worktree = self.texts.remove(&before.len());
         self.texts.clear();
         self.diffs.clear();
+        self.unreadable.clear();
+        self.tree_diffs.clear();
         if let Some(worktree) = worktree {
             self.texts.insert(after.len(), worktree);
         }
@@ -529,6 +591,9 @@ impl Scrub {
         } else if kept {
             if let Some(text) = text {
                 self.texts.insert(slot, text);
+            }
+            if unreadable {
+                self.unreadable.insert(slot);
             }
         } else {
             self.refill = true;
@@ -559,6 +624,27 @@ impl Scrub {
             Some(version) => format!("{} @ {}", self.name, short(&version.commit)),
             None => format!("{} @ working tree", self.name),
         }
+    }
+
+    /// Whether the version shown can be restored, and why not.
+    pub(super) fn restorable(&self) -> Result<(), String> {
+        if self.versions.is_none() || self.sibling.is_none() {
+            return Err(format!("reading the history of {}", self.name));
+        }
+        if let Some(target) = self.pending {
+            return Err(format!(
+                "version {} of {} is still loading",
+                target + 1,
+                self.count()
+            ));
+        }
+        if self.shown >= self.count() {
+            return Err("this is the working tree: there is nothing to restore".into());
+        }
+        if self.unreadable.contains(&self.shown) || !self.texts.contains_key(&self.shown) {
+            return Err("this version could not be read, so it cannot be restored".into());
+        }
+        Ok(())
     }
 
     /// What the status line says of version `slot`.
@@ -639,6 +725,29 @@ pub(super) fn dump_filter(state: &State) -> String {
         scrub.all.len(),
         tags.join(",")
     )
+}
+
+/// What the self-test dump says of the marks: what they are against, and
+/// whether the version shown can be restored or why not.
+pub(super) fn dump_compare(state: &State) -> String {
+    let Some(scrub) = &state.scrub else {
+        return "closed".into();
+    };
+    let against = if scrub.against_tree {
+        "working tree"
+    } else {
+        "previous"
+    };
+    let ready = if scrub.against_tree {
+        !scrub.wants_tree_diff()
+    } else {
+        scrub.shown_marks().is_some()
+    };
+    let restore = match scrub.restorable() {
+        Ok(()) => "ready".to_string(),
+        Err(why) => why,
+    };
+    format!("{against} marks={ready} restore={restore}")
 }
 
 // ---- the fade ---------------------------------------------------------------
@@ -844,12 +953,14 @@ pub(super) fn freeze_fade(state: &mut State, ms: u64) {
 }
 
 // ---- the strip --------------------------------------------------------------
-// Above the history's tab: which version it is, Older and Newer, and a
-// timeline of every version with the working tree at its right end, to
-// click or drag along.
+// Above the history's tab: which version it is, Older and Newer, the
+// filter, what the gutter marks against, a timeline of every version with
+// the working tree at its right end, to click or drag along, and Restore.
 
 const OLDER: &str = "Older";
 const NEWER: &str = "Newer";
+const COMPARE: &str = "vs Working Tree";
+const RESTORE: &str = "Restore";
 
 /// The history whose strip is above the active tab.
 pub(super) fn strip_scrub(state: &State) -> Option<&Scrub> {
@@ -864,8 +975,12 @@ pub(super) struct StripRects {
     /// All, Commits or Local; as wide as the widest, so the timeline does
     /// not move when it changes.
     pub(super) filter: Viewport,
+    /// Lit while the gutter marks against the working tree.
+    pub(super) compare: Viewport,
+    /// At the second row's right end.
+    pub(super) restore: Viewport,
     pub(super) close: Viewport,
-    /// The rest of the second row, right of the filter.
+    /// The rest of the second row, between the toggle and Restore.
     pub(super) track: Viewport,
 }
 
@@ -895,6 +1010,18 @@ pub(super) fn strip_rects(atlas: &mut Atlas, strip: Viewport) -> StripRects {
         widest.label(),
         24.0,
     );
+    let compare = layout::strip_button(
+        atlas,
+        strip,
+        filter.x + filter.width + layout::UI_GAP,
+        COMPARE,
+        24.0,
+    );
+    let restore = layout::strip_button(atlas, strip, 0.0, RESTORE, 24.0);
+    let restore = Viewport {
+        x: strip.x + strip.width - 16.0 - restore.width,
+        ..restore
+    };
     // On the first row, level with the pill.
     let close = Viewport {
         x: strip.x + strip.width - 16.0 - layout::UI_CONTROL,
@@ -902,16 +1029,18 @@ pub(super) fn strip_rects(atlas: &mut Atlas, strip: Viewport) -> StripRects {
         width: layout::UI_CONTROL,
         height: layout::UI_CONTROL,
     };
-    let left = filter.x + filter.width + layout::UI_INSET;
+    let left = compare.x + compare.width + layout::UI_INSET;
     let track = Viewport {
         x: left,
-        width: (strip.x + strip.width - 16.0 - left).max(0.0),
+        width: (restore.x - layout::UI_INSET - left).max(0.0),
         ..older
     };
     StripRects {
         older,
         newer,
         filter,
+        compare,
+        restore,
         close,
         track,
     }
@@ -946,6 +1075,8 @@ pub(super) fn strip_hits(
             (Hit::ScrubOlder, rects.older),
             (Hit::ScrubNewer, rects.newer),
             (Hit::ScrubFilter, rects.filter),
+            (Hit::ScrubCompare, rects.compare),
+            (Hit::ScrubRestore, rects.restore),
             (Hit::ScrubTrack, rects.track),
         ]);
     }
@@ -1096,6 +1227,22 @@ pub(super) fn draw_strip(
         .enabled(filter_open(scrub))
         .on(scrub.filter != Filter::All)
         .tip("Show All Versions, Commits or Local Versions")
+        .draw(out, atlas, theme);
+    Button::new(rects.compare)
+        .label(COMPARE)
+        .enabled(scrub.versions.is_some())
+        .on(scrub.against_tree)
+        .tip(if scrub.against_tree {
+            "Marking Changes Against the Working Tree"
+        } else {
+            "Mark Changes Against the Working Tree, Not the Version Before"
+        })
+        .draw(out, atlas, theme);
+    Button::new(rects.restore)
+        .label(RESTORE)
+        .tone(Tone::Primary)
+        .enabled(scrub.restorable().is_ok())
+        .tip("Restore This Version")
         .draw(out, atlas, theme);
     Button::new(rects.close)
         .icon(crate::project::icons::CLOSE)
@@ -1414,15 +1561,10 @@ fn show(state: &mut State) -> Option<(String, bool)> {
     scrub.refill = false;
     scrub.fade = fade;
     scrub.jump = None;
-    // What this commit changed, against its parent: the oldest version
-    // has no parent read, and no marks rather than every line added.
+    // What this version changed, against its parent or the working tree.
     // No HEAD text: nothing here acts on the changes, and nothing reads
     // HEAD for a document without a path.
-    let changes = target
-        .checked_sub(1)
-        .and_then(|pair| scrub.diffs.get(&pair))
-        .map(|c| c.to_vec())
-        .unwrap_or_default();
+    let changes = scrub.shown_marks().unwrap_or_default();
     gutter.docs.insert(
         id,
         GutterState {
@@ -1438,6 +1580,51 @@ fn show(state: &mut State) -> Option<(String, bool)> {
         None => scrub.describe(target),
     };
     Some((said, !made))
+}
+
+/// Restore This Version: the version shown replaces the text of the file's
+/// own tab, as one edit that Undo takes back, and is not saved. What the
+/// tab held is kept in local history. The caret and the view go where they
+/// are in the history's tab, which holds the same text: the line looked at
+/// is the line landed on. Then the history closes and the file's tab is in
+/// front, as after Escape: the restore ends the look back, and a history
+/// left open would show a working tree that is no longer the file's.
+/// Returns what to say, or why nothing was restored.
+fn restore(state: &mut State) -> Result<String, String> {
+    let active = state.docs.active().id();
+    let scrub = state
+        .scrub
+        .as_ref()
+        .filter(|s| s.sibling == Some(active))
+        .ok_or("File History is not open in this tab")?;
+    scrub.restorable()?;
+    let unread = || "this version could not be read, so it cannot be restored".to_string();
+    let text = scrub.texts.get(&scrub.shown).cloned().ok_or_else(unread)?;
+    let (label, name, live) = (scrub.label(scrub.shown), scrub.name.clone(), scrub.live);
+    let ((line, column), top) = buffer_by_id(&state.docs, &state.panes, active)
+        .map(|b| (b.cursor_position(), b.scroll_line))
+        .ok_or_else(unread)?;
+    let State {
+        docs,
+        panes,
+        history,
+        ..
+    } = &mut *state;
+    let buffer =
+        buffer_by_id_mut(docs, panes, live).ok_or_else(|| format!("{name} is no longer open"))?;
+    if buffer.is_read_only() {
+        return Err(format!("{name} is open read-only, so nothing was restored"));
+    }
+    let before = buffer.rope.clone();
+    if !buffer.restore_text(&text, line, column) {
+        return Err(format!("{name} already has this version's text"));
+    }
+    history.before_restore(buffer, &before);
+    buffer.scroll_line = top.min(buffer.rope.len_lines().saturating_sub(1));
+    buffer.scroll_fraction = 0.0;
+    buffer.scroll_row = 0;
+    close(state, true);
+    Ok(format!("restored {label}, not saved: Undo takes it back"))
 }
 
 /// Closes the history: its tab goes, wherever it is, and with `back` the
@@ -1572,6 +1759,10 @@ impl EditorView {
             note: None,
             fade: None,
             jump: None,
+            unreadable: std::collections::HashSet::new(),
+            against_tree: state.scrub_compare,
+            tree_diffs: HashMap::new(),
+            tree_generation: 0,
             tx,
             rx,
             stop,
@@ -1714,6 +1905,119 @@ impl EditorView {
         self.resume_display_link();
     }
 
+    /// The compare control: the gutter marks what the version shown changed
+    /// against the working tree, or against the version before it, again.
+    /// The window keeps it for the next history it opens.
+    pub(super) fn toggle_history_compare(&self) {
+        'toggle: {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            let State {
+                scrub,
+                docs,
+                panes,
+                gutter,
+                scrub_compare,
+                message,
+                ..
+            } = &mut *state;
+            let Some(scrub) = scrub.as_mut() else {
+                return;
+            };
+            if scrub.versions.is_none() {
+                let said = format!("reading the history of {}", scrub.name);
+                *message = Some((said, Instant::now()));
+                break 'toggle;
+            }
+            scrub.against_tree = !scrub.against_tree;
+            *scrub_compare = scrub.against_tree;
+            if scrub.against_tree
+                && let Some(live) = buffer_by_id(docs, panes, scrub.live)
+            {
+                let live = live.rope.clone();
+                scrub.refresh_worktree(&live);
+            }
+            // The marks there are already, or none until they come.
+            let marks = scrub.shown_marks().unwrap_or_default();
+            if let Some(entry) = scrub.sibling.and_then(|id| gutter.docs.get_mut(&id)) {
+                entry.marks = crate::project::git::marks(&marks);
+                entry.changes = marks;
+            }
+            scrub.request();
+            let said = if scrub.against_tree {
+                "marking changes against the working tree"
+            } else {
+                "marking changes against the version before"
+            };
+            *message = Some((said.to_string(), Instant::now()));
+        }
+        self.resume_display_link();
+        self.request_redraw();
+        self.pump();
+    }
+
+    /// Restore This Version, from the strip or the Git menu. No key: Return
+    /// in the history's tab does nothing, so a stray one replaces nothing,
+    /// and Cmd-Return is Send Request's when the text looks like a call.
+    pub(super) fn restore_version(&self) {
+        let restored = {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            match restore(&mut state) {
+                Ok(said) => {
+                    state.message = Some((said, Instant::now()));
+                    true
+                }
+                Err(why) => {
+                    state.say(layout::Feedback::Failure, why);
+                    false
+                }
+            }
+        };
+        if restored {
+            self.after_edit();
+        } else {
+            self.request_redraw();
+            self.pump();
+        }
+    }
+
+    /// After every frame: marks against the working tree are worked out
+    /// again when the file's text changed since (edited in its own tab, or
+    /// reloaded). Two pointer compares when it did not.
+    pub(super) fn scrub_after_frame(&self) {
+        let asked = {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            let State {
+                scrub, docs, panes, ..
+            } = &mut *state;
+            let active = docs.active().id();
+            let Some(scrub) = scrub
+                .as_mut()
+                .filter(|s| s.against_tree && s.versions.is_some() && s.sibling == Some(active))
+            else {
+                return;
+            };
+            let Some(live) = buffer_by_id(docs, panes, scrub.live) else {
+                return;
+            };
+            if scrub.worktree.same_as(&live.rope) {
+                return;
+            }
+            let live = live.rope.clone();
+            scrub.refresh_worktree(&live);
+            scrub.request();
+            true
+        };
+        if asked {
+            self.resume_display_link();
+        }
+    }
+
     /// Shows the version a step waits for if it is here, else says it is
     /// on its way.
     fn show_pending(&self) {
@@ -1830,6 +2134,7 @@ impl EditorView {
                         }
                         // The marks of the version shown, which came first.
                         if pair + 1 == scrub.shown
+                            && !scrub.against_tree
                             && let Some(entry) =
                                 scrub.sibling.and_then(|id| state.gutter.docs.get_mut(&id))
                         {
@@ -1843,6 +2148,29 @@ impl EditorView {
                     Ok(Reply::Jump(from, to, changes)) => {
                         if from == scrub.shown && scrub.pending == Some(to) {
                             scrub.jump = Some((from, to, changes));
+                        }
+                    }
+                    // Only against the working tree as it is now.
+                    Ok(Reply::Tree(slot, generation, changes)) => {
+                        if !scrub.against_tree
+                            || generation != scrub.tree_generation
+                            || !(slot == scrub.shown || in_window(slot, scrub.center()))
+                        {
+                            continue;
+                        }
+                        if slot == scrub.shown
+                            && let Some(entry) =
+                                scrub.sibling.and_then(|id| state.gutter.docs.get_mut(&id))
+                        {
+                            entry.marks = crate::project::git::marks(&changes);
+                            entry.changes = changes.to_vec();
+                            redraw = true;
+                        }
+                        scrub.tree_diffs.insert(slot, changes);
+                    }
+                    Ok(Reply::Unreadable(slot)) => {
+                        if slot == scrub.shown || in_window(slot, scrub.center()) {
+                            scrub.unreadable.insert(slot);
                         }
                     }
                     Err(mpsc::TryRecvError::Empty) => break,
@@ -2061,6 +2389,9 @@ fn work(
     let mut tx = tx.clone();
     let mut worktree_slot = versions.len();
     let mut texts: HashMap<usize, Arc<str>> = HashMap::from([(worktree_slot, worktree)]);
+    // The slots whose text is a line saying why there is none.
+    let mut bad: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut generation = 0;
     let mut queue: VecDeque<Job> = jobs(
         worktree_slot - 1,
         worktree_slot + 1,
@@ -2095,10 +2426,12 @@ fn work(
                 } => {
                     let mut none: HashMap<usize, ()> = HashMap::new();
                     evict(&mut texts, &mut none, center, [worktree_slot, shown]);
+                    bad.retain(|slot| texts.contains_key(slot));
                     queue = jobs.into();
                 }
-                Request::Worktree(text) => {
+                Request::Worktree(text, n) => {
                     texts.insert(worktree_slot, text);
+                    generation = n;
                 }
                 Request::Filter {
                     versions: kept,
@@ -2106,6 +2439,7 @@ fn work(
                 } => {
                     let worktree = texts.remove(&worktree_slot);
                     texts.clear();
+                    bad.clear();
                     versions = kept;
                     worktree_slot = versions.len();
                     if let Some(worktree) = worktree {
@@ -2130,11 +2464,21 @@ fn work(
                         versions.get(slot),
                         &mut reader,
                     )
+                    .unwrap_or_else(|why| {
+                        bad.insert(slot);
+                        why
+                    })
                 })
                 .clone()
         };
         let reply = match job {
-            Job::Text(slot) if slot <= worktree_slot => Reply::Text(slot, load(slot)),
+            Job::Text(slot) if slot <= worktree_slot => {
+                let text = load(slot);
+                if bad.contains(&slot) {
+                    let _ = tx.send(Reply::Unreadable(slot));
+                }
+                Reply::Text(slot, text)
+            }
             Job::Diff(pair) if pair < worktree_slot => {
                 let (old, new) = (load(pair), load(pair + 1));
                 Reply::Diff(pair, Arc::new(crate::ide::diff::changes(&old, &new)))
@@ -2142,6 +2486,11 @@ fn work(
             Job::Jump(from, to) if from.max(to) <= worktree_slot => {
                 let (old, new) = (load(from), load(to));
                 Reply::Jump(from, to, Arc::new(crate::ide::diff::changes(&old, &new)))
+            }
+            Job::Tree(slot) if slot < worktree_slot => {
+                let (old, new) = (load(worktree_slot), load(slot));
+                let changes = crate::ide::diff::changes(&old, &new);
+                Reply::Tree(slot, generation, Arc::new(changes))
             }
             _ => continue,
         };
@@ -2159,33 +2508,33 @@ fn read_version(
     store: Option<&Store>,
     version: Option<&Version>,
     reader: &mut Option<BlobReader>,
-) -> Arc<str> {
+) -> Result<Arc<str>, Arc<str>> {
     let Some(version) = version else {
-        return Arc::from("");
+        return Err(Arc::from(""));
     };
     if let Source::Local { id, .. } = version.source {
         let text = match store.map(|store| store.read(id)) {
-            Some(Ok(Some(text))) => return Arc::from(text),
+            Some(Ok(Some(text))) => return Ok(Arc::from(text)),
             Some(Ok(None)) => "(this local version is gone from local history)\n".to_string(),
             Some(Err(why)) => format!("(could not read this version: {why})\n"),
             None => "(local history is not open)\n".to_string(),
         };
-        return Arc::from(text);
+        return Err(Arc::from(text));
     }
     let Some(root) = root else {
-        return Arc::from("(not in a repository)\n");
+        return Err(Arc::from("(not in a repository)\n"));
     };
     if reader.is_none() {
         match BlobReader::open(root) {
             Ok(opened) => *reader = Some(opened),
-            Err(why) => return Arc::from(format!("(could not read this version: {why})\n")),
+            Err(why) => return Err(Arc::from(format!("(could not read this version: {why})\n"))),
         }
     }
     let Some(open) = reader.as_mut() else {
-        return Arc::from("");
+        return Err(Arc::from(""));
     };
     let text = match open.read(&version.blob, GUTTER_MAX_BYTES) {
-        Ok(Blob::Text(text)) => return Arc::from(text),
+        Ok(Blob::Text(text)) => return Ok(Arc::from(text)),
         Ok(Blob::Binary) => "(binary at this commit)\n".to_string(),
         Ok(Blob::TooLarge) => "(over 2 MB at this commit)\n".to_string(),
         Ok(Blob::Missing) => "(not in the repository)\n".to_string(),
@@ -2195,7 +2544,7 @@ fn read_version(
             format!("(could not read this version: {why})\n")
         }
     };
-    Arc::from(text)
+    Err(Arc::from(text))
 }
 
 #[cfg(test)]
@@ -2575,7 +2924,10 @@ mod tests {
                             diffs.insert(pair, changes);
                         }
                     }
-                    Reply::Versions(_) | Reply::Jump(..) => panic!("not asked for"),
+                    Reply::Versions(_) | Reply::Jump(..) | Reply::Tree(..) => {
+                        panic!("not asked for")
+                    }
+                    Reply::Unreadable(slot) => panic!("version {slot} unreadable"),
                 }
             }
             shown = target;
@@ -2930,6 +3282,220 @@ mod tests {
         assert_eq!(text_of(&tx, &from, 2), worktree, "the working tree kept");
         drop(tx);
         worker.join().unwrap();
+    }
+
+    /// Against the working tree, through the real worker: the changes from
+    /// the working tree's text to a version, tagged with which text that
+    /// was, and a version gone from local history said to be unreadable
+    /// before the line that says why.
+    #[test]
+    fn the_worker_diffs_a_version_against_the_working_tree() {
+        use crate::history::store::Store;
+        let tree = crate::project::TempTree::new("scrub-against-tree", &[("menu.txt", "c\n")]);
+        let db = tree.0.join("history").join("history.db");
+        let path = tree.0.join("menu.txt");
+        {
+            let store = Store::open(&db).unwrap();
+            store
+                .put_snapshot(&path, "soup\nbread\n", Reason::Opened, 1_000)
+                .unwrap();
+            store
+                .put_snapshot(&path, "soup\n", Reason::Saved, 2_000)
+                .unwrap();
+        }
+        let (listed, tx, rx, worker) = start(&path, &db, "soup\nsalad\n", Filter::All);
+        assert_eq!(listed.expect("local versions").0.len(), 2);
+        let tree_of = |slot: usize| {
+            tx.send(Request::Want {
+                center: slot,
+                shown: slot,
+                jobs: vec![Job::Tree(slot)],
+            })
+            .unwrap();
+            loop {
+                match rx.recv_timeout(Duration::from_secs(60)).expect("an answer") {
+                    Reply::Tree(at, generation, changes) if at == slot => {
+                        return (generation, changes.to_vec());
+                    }
+                    _ => {}
+                }
+            }
+        };
+        assert_eq!(
+            tree_of(0),
+            (
+                0,
+                crate::ide::diff::changes("soup\nsalad\n", "soup\nbread\n")
+            )
+        );
+        // The working tree changed: the next diff is against its new text.
+        tx.send(Request::Worktree(Arc::from("soup\nsalad\nbread\n"), 1))
+            .unwrap();
+        let (generation, changes) = tree_of(0);
+        assert_eq!(generation, 1);
+        assert_eq!(
+            changes,
+            crate::ide::diff::changes("soup\nsalad\nbread\n", "soup\nbread\n")
+        );
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].kind, MarkKind::Removed);
+        // A version gone from local history: one the store never had.
+        let (to, rx) = mpsc::channel();
+        tx.send(Request::Filter {
+            versions: vec![local_v(1_000_000, Reason::Saved)],
+            tx: to,
+        })
+        .unwrap();
+        tx.send(Request::Want {
+            center: 0,
+            shown: 0,
+            jobs: vec![Job::Text(0)],
+        })
+        .unwrap();
+        let mut said = Vec::new();
+        while said.len() < 2 {
+            match rx.recv_timeout(Duration::from_secs(60)).expect("an answer") {
+                Reply::Unreadable(slot) => said.push(format!("unreadable {slot}")),
+                Reply::Text(slot, text) => said.push(format!("{slot}: {}", text.trim_end())),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            said,
+            [
+                "unreadable 0",
+                "0: (this local version is gone from local history)"
+            ]
+        );
+        drop(tx);
+        worker.join().unwrap();
+    }
+
+    /// A history over two versions and the working tree, with no worker:
+    /// what is asked of it goes to the receiver given back.
+    fn scrub_of(versions: Vec<Version>) -> (Scrub, mpsc::Receiver<Request>) {
+        let (tx, requests) = mpsc::channel();
+        let (_, rx) = mpsc::channel();
+        let scrub = Scrub {
+            live: 1,
+            sibling: Some(2),
+            name: "menu.txt".into(),
+            ext: "txt",
+            versions: Some(versions.clone()),
+            all: versions,
+            filter: Filter::All,
+            capped: false,
+            shown: 0,
+            refill: false,
+            pending: None,
+            texts: HashMap::new(),
+            diffs: HashMap::new(),
+            worktree: crate::text::rope::Rope::from_text("w\n"),
+            start: (0, 0, 0),
+            goto: None,
+            placed: false,
+            note: None,
+            fade: None,
+            jump: None,
+            unreadable: std::collections::HashSet::new(),
+            against_tree: false,
+            tree_diffs: HashMap::new(),
+            tree_generation: 0,
+            tx,
+            rx,
+            stop: Arc::new(AtomicBool::new(false)),
+            gone: false,
+        };
+        (scrub, requests)
+    }
+
+    /// The marks come from the diff with the version before, or from the
+    /// worker's diff with the working tree, which is asked for first and
+    /// asked again when the working tree changes; and a version restores
+    /// only once it is read and shown.
+    #[test]
+    fn marks_come_from_the_version_before_or_the_working_tree() {
+        let (mut scrub, requests) = scrub_of(vec![commit_v("a"), local_v(1, Reason::Saved)]);
+        let previous = Arc::new(crate::ide::diff::changes("a\n", "b\n"));
+        let tree = Arc::new(crate::ide::diff::changes("w\n", "b\nw\n"));
+        scrub.texts = HashMap::from([
+            (0, Arc::from("a\n")),
+            (1, Arc::from("b\n")),
+            (2, Arc::from("w\n")),
+        ]);
+        scrub.diffs.insert(0, previous.clone());
+        scrub.shown = 1;
+        assert_eq!(scrub.shown_marks(), Some(previous.to_vec()));
+        assert!(!scrub.wants_tree_diff());
+        assert_eq!(scrub.restorable(), Ok(()));
+
+        scrub.against_tree = true;
+        assert_eq!(scrub.shown_marks(), None, "on its way");
+        assert!(scrub.wants_tree_diff() && scrub.busy());
+        scrub.request();
+        let jobs = requests
+            .try_iter()
+            .find_map(|r| match r {
+                Request::Want { jobs, .. } => Some(jobs),
+                _ => None,
+            })
+            .expect("a request");
+        assert_eq!(jobs[0], Job::Tree(1));
+        scrub.tree_diffs.insert(1, tree.clone());
+        assert_eq!(scrub.shown_marks(), Some(tree.to_vec()));
+        assert!(!scrub.wants_tree_diff());
+
+        // The file's text changed: its diffs go, and it is sent again.
+        scrub.refresh_worktree(&crate::text::rope::Rope::from_text("w\nx\n"));
+        assert!(scrub.tree_diffs.is_empty());
+        let sent: Vec<u64> = requests
+            .try_iter()
+            .filter_map(|r| match r {
+                Request::Worktree(text, n) => Some((text.len(), n)),
+                _ => None,
+            })
+            .map(|(len, n)| {
+                assert_eq!(len, 4);
+                n
+            })
+            .collect();
+        assert_eq!(sent, [1]);
+        assert_eq!(scrub.tree_generation, 1);
+
+        // The working tree has no marks against itself, and nothing to
+        // restore; nor has a version on its way or one that was not read.
+        scrub.shown = 2;
+        assert_eq!(scrub.shown_marks(), Some(Vec::new()));
+        assert!(scrub.restorable().unwrap_err().contains("working tree"));
+        scrub.shown = 1;
+        scrub.unreadable.insert(1);
+        assert!(
+            scrub
+                .restorable()
+                .unwrap_err()
+                .contains("could not be read")
+        );
+        scrub.unreadable.clear();
+        scrub.pending = Some(0);
+        assert_eq!(
+            scrub.restorable(),
+            Err("version 1 of 2 is still loading".into())
+        );
+    }
+
+    #[test]
+    fn a_version_that_cannot_be_read_is_an_error_with_a_line_saying_why() {
+        let mut reader = None;
+        let local = local_v(1, Reason::Saved);
+        assert_eq!(
+            read_version(None, None, Some(&local), &mut reader),
+            Err(Arc::from("(local history is not open)\n"))
+        );
+        assert_eq!(
+            read_version(None, None, Some(&commit_v("a")), &mut reader),
+            Err(Arc::from("(not in a repository)\n"))
+        );
+        assert!(read_version(None, None, None, &mut reader).is_err());
     }
 
     /// Outside Git a file has its local versions alone; with none, the

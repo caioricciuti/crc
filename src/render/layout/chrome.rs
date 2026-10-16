@@ -3023,6 +3023,10 @@ pub enum Hit {
     ScrubNewer,
     /// The filter: All, Commits or Local versions.
     ScrubFilter,
+    /// What the gutter marks against: the version before, or the working
+    /// tree; and Restore This Version.
+    ScrubCompare,
+    ScrubRestore,
     ScrubClose,
     ScrubTrack,
     /// Above a document with merge conflicts: the inline or side-by-side
@@ -3098,6 +3102,8 @@ impl Hit {
             Hit::ScrubNewer => "scrub.newer".into(),
             Hit::ScrubClose => "scrub.close".into(),
             Hit::ScrubFilter => "scrub.filter".into(),
+            Hit::ScrubCompare => "scrub.compare".into(),
+            Hit::ScrubRestore => "scrub.restore".into(),
             Hit::ScrubTrack => "scrub.track".into(),
             Hit::ConflictMode(side) => if *side {
                 "conflict.side"

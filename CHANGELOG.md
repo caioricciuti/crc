@@ -4,6 +4,16 @@ One entry per tag, written for people who use the editor.
 
 ## Unreleased
 
+- File History can restore a version. Restore at the right of its strip,
+  or Git > Restore This Version, puts the version shown, a commit's or a
+  local one, into the file's own tab as one edit: Undo brings back the
+  text you had, nothing is written to disk until you save, and that text
+  is kept in local history first ("before restore"). The caret lands on the line you were looking at,
+  and the history closes. A file open read-only, or a version that could
+  not be read, is refused with a message. vs Working Tree, beside the
+  filter, marks in the gutter what a version changed against your text
+  instead of against the version before it, and the window remembers it
+  for the next history; Git > Compare with Working Tree does the same.
 - File History shows local history too. The versions crc kept of a file
   sit between its commits by time, as dots on the timeline, and one
   shows a Local pill with why it was kept (saved, idle, before reload,
@@ -32,7 +42,7 @@ One entry per tag, written for people who use the editor.
   after a week. `local_history = false` in the settings turns it off and
   `local_history_exclude` leaves out more files by glob. Typing never
   waits on it, and a full disk pauses it with one message without
-  touching saving. Restoring a version comes in a later change.
+  touching saving.
 - Replace in the find bar replaces only the current match when there are
   several cursors. With selections from Cmd-D, it used to put the
   replacement at every cursor. Now it replaces the match, goes back to
