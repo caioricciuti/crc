@@ -7,4 +7,5 @@ pub mod file_format;
 mod grapheme;
 pub mod indent;
 pub mod rope;
+pub mod undo_journal;
 pub mod wrap;
