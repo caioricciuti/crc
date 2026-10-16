@@ -60,7 +60,7 @@ impl EditorView {
 
     /// The timer fired: the recorder looks again, as a frame would.
     pub(super) fn history_tick(&self) {
-        {
+        let adopted = {
             let Some(mut state) = self.state_mut() else {
                 // Busy: a moment later.
                 self.arm_history_tick(Duration::from_millis(250));
@@ -77,24 +77,49 @@ impl EditorView {
                 docs.iter().chain(panes.iter().flat_map(|p| p.docs.iter())),
                 Instant::now(),
             );
+            history.adopt(
+                docs.iter_mut()
+                    .chain(panes.iter_mut().flat_map(|p| p.docs.iter_mut())),
+            )
+        };
+        if adopted {
+            self.request_redraw();
         }
         self.history_after_frame();
     }
 
     /// What the history thread said: a full disk, a damaged file set
-    /// aside, a failure. Each once, in the status line.
+    /// aside, a failure, each once in the status line; and the undo
+    /// journals it found, taken by the documents still untouched.
     pub(super) fn poll_history(&self) {
         let Some(mut state) = self.state_mut() else {
+            // Busy: a moment later, so a journal found does not wait for
+            // the next frame.
+            self.arm_history_tick(Duration::from_millis(250));
             return;
+        };
+        let adopted = {
+            let State {
+                docs,
+                panes,
+                history,
+                ..
+            } = &mut *state;
+            history.adopt(
+                docs.iter_mut()
+                    .chain(panes.iter_mut().flat_map(|p| p.docs.iter_mut())),
+            )
         };
         let mut said = None;
         while let Some(sentence) = state.history.poll() {
             said = Some(sentence);
         }
-        let Some(said) = said else {
+        if !adopted && said.is_none() {
             return;
-        };
-        state.say(layout::Feedback::Failure, said);
+        }
+        if let Some(said) = said {
+            state.say(layout::Feedback::Failure, said);
+        }
         drop(state);
         self.request_redraw();
         self.pump();

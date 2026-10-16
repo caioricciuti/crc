@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use crate::text::file_format::{self, DiskFormat};
 use crate::text::rope::Rope;
+use crate::text::undo_journal::{Cursors, Journal, Step};
 use crate::text::wrap;
 
 mod cursors;
@@ -42,6 +43,12 @@ fn is_continuation(b: u8) -> bool {
 }
 /// Bytes `a` and `b` share at the start, up to `limit`, compared a window
 /// at a time.
+/// Whether two ropes hold the same text: by tree identity when they share
+/// it, else byte by byte.
+fn same_text(a: &Rope, b: &Rope) -> bool {
+    a.same_as(b)
+        || (a.len_bytes() == b.len_bytes() && common_prefix(a, b, a.len_bytes()) == a.len_bytes())
+}
 fn common_prefix(a: &Rope, b: &Rope, limit: usize) -> usize {
     const WINDOW: usize = 64 * 1024;
     let mut at = 0;
@@ -236,6 +243,9 @@ pub struct Buffer {
     /// it only fills from undo.
     undo_stack: std::collections::VecDeque<Snapshot>,
     redo_stack: Vec<Snapshot>,
+    /// Moves with every change to either stack, so local history can tell
+    /// a journal that is out of date with one compare.
+    undo_rev: u64,
     last_edit: Option<(EditKind, Instant)>,
 
     /// What the syntax layer needs to catch up with the text.
@@ -310,6 +320,7 @@ impl Buffer {
         self.invalidate_edits();
         self.undo_stack.clear();
         self.redo_stack.clear();
+        self.undo_rev += 1;
         self.dirty = false;
     }
     /// Shows `text` in place of the whole document, as stepping through a
@@ -344,6 +355,7 @@ impl Buffer {
         self.last_edit = None;
         self.undo_stack.clear();
         self.redo_stack.clear();
+        self.undo_rev += 1;
         self.scroll_line = self
             .scroll_line
             .min(self.rope.len_lines().saturating_sub(1));
@@ -568,10 +580,12 @@ impl Buffer {
         }
         self.last_edit = Some((kind, now));
         self.redo_stack.clear();
+        self.undo_rev += 1;
         self.dirty = true;
     }
     /// Pushes an undo step, dropping the oldest past [`UNDO_LIMIT`].
     fn push_undo(&mut self, snapshot: Snapshot) {
+        self.undo_rev += 1;
         self.undo_stack.push_back(snapshot);
         if self.undo_stack.len() > UNDO_LIMIT {
             self.undo_stack.pop_front();
@@ -723,6 +737,7 @@ impl Buffer {
         let Some(snapshot) = taken else {
             return false;
         };
+        self.undo_rev += 1;
         let now = self.snapshot();
         if undo {
             self.redo_stack.push(now);
@@ -744,14 +759,68 @@ impl Buffer {
     /// Whether the text is the one last read or written: back there by
     /// undo or redo, a document has nothing unsaved.
     fn matches_saved(&self) -> bool {
-        self.saved.as_ref().is_some_and(|saved| {
-            saved.same_as(&self.rope)
-                || (saved.len_bytes() == self.rope.len_bytes()
-                    && common_prefix(saved, &self.rope, saved.len_bytes()) == saved.len_bytes())
-        })
+        self.saved
+            .as_ref()
+            .is_some_and(|saved| same_text(saved, &self.rope))
     }
     pub fn redo(&mut self) -> bool {
         self.step_history(false)
+    }
+    /// Steps on the undo stack.
+    pub fn undo_len(&self) -> usize {
+        self.undo_stack.len()
+    }
+    /// Steps on the redo stack.
+    pub fn redo_len(&self) -> usize {
+        self.redo_stack.len()
+    }
+    /// A count that moves whenever either stack changes.
+    pub fn undo_rev(&self) -> u64 {
+        self.undo_rev
+    }
+    /// Both stacks as journal steps: undo oldest first, redo with its top
+    /// last. Rope clones, so this costs a pointer per step.
+    pub fn undo_steps(&self) -> (Vec<Step>, Vec<Step>) {
+        let step = |s: &Snapshot| Step {
+            rope: s.rope.clone(),
+            cursors: Cursors {
+                cursor: s.cursor,
+                anchor: s.anchor,
+                extra: s.extra.clone(),
+            },
+        };
+        (
+            self.undo_stack.iter().map(step).collect(),
+            self.redo_stack.iter().map(step).collect(),
+        )
+    }
+    /// Takes `journal`, decoded against `base`, as this document's undo and
+    /// redo stacks. Only for a document nothing has happened to: no
+    /// unsaved changes, nothing to undo or redo, its text `base`'s. The
+    /// text, the saved state and the caret stay as they are. Returns
+    /// whether it took it.
+    pub fn adopt_undo(&mut self, journal: Journal, base: &Rope) -> bool {
+        if self.dirty
+            || self.is_locked()
+            || !self.undo_stack.is_empty()
+            || !self.redo_stack.is_empty()
+            || !same_text(&self.rope, base)
+        {
+            return false;
+        }
+        let snapshot = |step: Step| Snapshot {
+            rope: step.rope,
+            cursor: step.cursors.cursor,
+            anchor: step.cursors.anchor,
+            extra: step.cursors.extra,
+        };
+        let Journal { undo, redo } = journal;
+        let skip = undo.len().saturating_sub(UNDO_LIMIT);
+        self.undo_stack = undo.into_iter().skip(skip).map(snapshot).collect();
+        self.redo_stack = redo.into_iter().map(snapshot).collect();
+        self.undo_rev += 1;
+        self.last_edit = None;
+        true
     }
 
     // ---- multiple cursors ------------------------------------------------
@@ -3359,6 +3428,103 @@ mod tests {
         assert_eq!(b.rope.to_string(), "a");
         b.redo();
         assert_eq!(b.rope.to_string(), "a日本語");
+    }
+
+    /// What a save leaves: the text on disk, nothing unsaved.
+    fn mark_saved(b: &mut Buffer) {
+        b.saved = Some(b.rope.clone());
+        b.dirty = false;
+    }
+
+    #[test]
+    fn undo_and_redo_survive_a_journal_round_trip() {
+        use crate::text::undo_journal::{decode, encode};
+        let mut b = Buffer::from_text("one\n");
+        b.insert("été ");
+        b.last_edit = None;
+        b.place_cursor(b.rope.len_bytes(), Move);
+        b.insert("two\n");
+        b.last_edit = None;
+        b.insert("three\n");
+        b.undo();
+        mark_saved(&mut b);
+        let (undo, redo) = b.undo_steps();
+        assert_eq!((undo.len(), redo.len()), (2, 1));
+        let bytes = encode(&b.rope, &undo, &redo);
+
+        // Opened again: its own rope, the same text.
+        let mut fresh = Buffer::from_text(&b.rope.to_string());
+        mark_saved(&mut fresh);
+        let base = fresh.rope.clone();
+        let journal = decode(&bytes, &base).unwrap();
+        let rev = fresh.undo_rev();
+        assert!(fresh.adopt_undo(journal, &base));
+        assert_ne!(fresh.undo_rev(), rev, "taking a journal moves the count");
+        assert_eq!((fresh.undo_len(), fresh.redo_len()), (2, 1));
+        assert!(!fresh.is_dirty());
+        assert_eq!(fresh.rope.to_string(), b.rope.to_string());
+        // The caret is the document's own, not the journal's.
+        assert_eq!(fresh.cursor(), 0);
+        fresh.place_cursor(b.cursor(), Move);
+
+        for _ in 0..2 {
+            assert!(b.undo() && fresh.undo());
+            assert_eq!(fresh.rope.to_string(), b.rope.to_string());
+            assert_eq!(fresh.cursor(), b.cursor());
+            assert!(fresh.is_dirty());
+        }
+        assert_eq!(fresh.rope.to_string(), "one\n");
+        for _ in 0..3 {
+            assert!(b.redo() && fresh.redo());
+            assert_eq!(fresh.rope.to_string(), b.rope.to_string());
+            assert_eq!(fresh.cursor(), b.cursor());
+        }
+        assert_eq!(fresh.rope.to_string(), "été one\ntwo\nthree\n");
+        assert!(fresh.undo());
+        assert!(!fresh.is_dirty(), "back at the saved text");
+    }
+
+    #[test]
+    fn a_journal_is_only_taken_by_an_untouched_document() {
+        let journal = || Journal {
+            undo: vec![Step {
+                rope: Rope::from_text("before"),
+                cursors: Cursors::default(),
+            }],
+            redo: Vec::new(),
+        };
+        let mut b = Buffer::from_text("text");
+        mark_saved(&mut b);
+        let base = b.rope.clone();
+        assert!(
+            !b.adopt_undo(journal(), &Rope::from_text("other")),
+            "a different text"
+        );
+        b.insert("x");
+        assert!(!b.adopt_undo(journal(), &base), "unsaved changes");
+        b.undo();
+        assert!(!b.is_dirty());
+        assert!(!b.adopt_undo(journal(), &base), "something to redo");
+        let mut b = Buffer::from_text("text");
+        b.insert("x");
+        mark_saved(&mut b);
+        let base = b.rope.clone();
+        assert!(!b.adopt_undo(journal(), &base), "something to undo");
+        let mut frozen = Buffer::from_text("text");
+        frozen.set_frozen(true);
+        let base = frozen.rope.clone();
+        assert!(
+            !frozen.adopt_undo(journal(), &base),
+            "a version from history"
+        );
+        assert_eq!(frozen.undo_len(), 0);
+        let mut b = Buffer::from_text("text");
+        let base = Rope::from_text("text");
+        assert!(
+            b.adopt_undo(journal(), &base),
+            "the same text, another rope"
+        );
+        assert_eq!(b.undo_len(), 1);
     }
 
     #[test]

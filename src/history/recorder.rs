@@ -16,6 +16,13 @@
 //! Never: untitled and generated documents, previews, versions from File
 //! History, files too big to edit or over [`MAX_BYTES`], and secrets by
 //! name (`.env`, keys, `~/.ssh` and the like) or by the user's own globs.
+//!
+//! Undo too: a clean document's undo and redo stacks, each time they or
+//! its file move, as a journal against the saved text. A document dirty
+//! at quit keeps its quit snapshot and no journal. A file opened clean
+//! and untouched asks the thread for its journal; the answer is taken
+//! only if the document is still untouched and the text on disk is the
+//! one the journal was written against. Opening never waits for it.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -26,6 +33,7 @@ use crate::complete::glob::{self, Pattern};
 use crate::platform::dispatch::Wake;
 use crate::text::buffer::{Buffer, DiskEvent};
 use crate::text::rope::Rope;
+use crate::text::undo_journal::{self, Journal};
 
 /// Larger documents are not kept.
 pub const MAX_BYTES: usize = 2 * 1024 * 1024;
@@ -291,6 +299,22 @@ pub enum Job {
         old: PathBuf,
         new: PathBuf,
     },
+    /// A clean document's undo and redo stacks, against its text `base`.
+    Undo {
+        path: PathBuf,
+        base: Rope,
+        undo: Vec<undo_journal::Step>,
+        redo: Vec<undo_journal::Step>,
+        at: i64,
+    },
+    /// The journal kept for `path`, wanted by document `id` while its text
+    /// is `base` and its disk event count `event`.
+    LoadUndo {
+        id: u64,
+        path: PathBuf,
+        base: Rope,
+        event: u64,
+    },
     /// Answered once everything before it is written.
     Flush(mpsc::Sender<()>),
 }
@@ -326,9 +350,19 @@ impl Notice {
     }
 }
 
+/// A journal found for a document that asked, as [`Job::LoadUndo`] asked.
+pub struct Restored {
+    pub id: u64,
+    pub path: PathBuf,
+    pub event: u64,
+    pub base: Rope,
+    pub journal: Journal,
+}
+
 struct Worker {
     jobs: mpsc::Sender<Job>,
     notices: mpsc::Receiver<Notice>,
+    restored: mpsc::Receiver<Restored>,
 }
 
 /// One document as the recorder last saw it.
@@ -338,6 +372,33 @@ struct Track {
     /// The path may be kept, by [`Filter::allows`].
     allowed: bool,
     policy: Policy,
+    /// The undo count and disk event count as of the last journal sent,
+    /// or as first seen.
+    journaled: (u64, u64),
+}
+
+/// Whether `buffer`'s journal is to be sent: it is clean, its stacks or its
+/// file moved since `journaled`, which it updates, and the stacks hold
+/// something.
+fn undo_due(journaled: &mut (u64, u64), buffer: &Buffer) -> bool {
+    let now = (buffer.undo_rev(), buffer.disk_event().0);
+    if buffer.is_dirty() || now == *journaled {
+        return false;
+    }
+    *journaled = now;
+    buffer.undo_len() > 0 || buffer.redo_len() > 0
+}
+
+/// `buffer`'s journal, as of now.
+fn undo_job(buffer: &Buffer, path: &Path) -> Job {
+    let (undo, redo) = buffer.undo_steps();
+    Job::Undo {
+        path: path.to_owned(),
+        base: buffer.rope.clone(),
+        undo,
+        redo,
+        at: now_ms(),
+    }
 }
 
 pub struct Recorder {
@@ -360,6 +421,10 @@ pub struct Recorder {
     /// Scratch for one document's snapshots, and for a frame's jobs.
     out: Vec<(Reason, Rope)>,
     jobs: Vec<Job>,
+    /// Whether `db` was there when a journal was first asked for, before
+    /// anything started the history thread: without it there is none to
+    /// load, and asking would create it.
+    db_exists: Option<bool>,
 }
 
 impl Recorder {
@@ -379,6 +444,7 @@ impl Recorder {
             armed: None,
             out: Vec::new(),
             jobs: Vec::new(),
+            db_exists: None,
         }
     }
 
@@ -409,9 +475,11 @@ impl Recorder {
         let mut due: Option<Instant> = None;
         for buffer in buffers {
             let view = Seen::of(buffer);
+            let mut fresh = false;
             let at = match self.tracks[seen..].iter().position(|t| t.id == buffer.id()) {
                 Some(at) => seen + at,
                 None => {
+                    fresh = true;
                     self.tracks.push(Track {
                         id: buffer.id(),
                         path: buffer.path.clone(),
@@ -420,6 +488,7 @@ impl Recorder {
                             .as_deref()
                             .is_some_and(|p| self.filter.allows(p)),
                         policy: Policy::new(&view, now),
+                        journaled: (buffer.undo_rev(), buffer.disk_event().0),
                     });
                     self.tracks.len() - 1
                 }
@@ -442,17 +511,34 @@ impl Recorder {
             if let Some(at) = track.policy.due(&self.timing) {
                 due = Some(due.map_or(at, |d| d.min(at)));
             }
-            if self.out.is_empty() {
-                continue;
-            }
-            let at = now_ms();
-            for (reason, rope) in self.out.drain(..) {
-                self.jobs.push(Job::Snapshot {
+            if fresh
+                && !buffer.is_dirty()
+                && buffer.undo_len() == 0
+                && buffer.redo_len() == 0
+                && let Some(saved) = buffer.saved_rope()
+            {
+                self.jobs.push(Job::LoadUndo {
+                    id: buffer.id(),
                     path: path.clone(),
-                    rope,
-                    reason,
-                    at,
+                    base: saved.clone(),
+                    event: buffer.disk_event().0,
                 });
+            }
+            if !self.out.is_empty() {
+                let at = now_ms();
+                for (reason, rope) in self.out.drain(..) {
+                    self.jobs.push(Job::Snapshot {
+                        path: path.clone(),
+                        rope,
+                        reason,
+                        at,
+                    });
+                }
+            }
+            // After the save's snapshot: the journal and the version share
+            // one blob for the text.
+            if undo_due(&mut track.journaled, buffer) {
+                self.jobs.push(undo_job(buffer, path));
             }
         }
         // Everything past `seen` was closed since the last frame.
@@ -473,6 +559,65 @@ impl Recorder {
     /// `buffer` is closing with changes the user chose not to save.
     pub fn closed_unsaved(&mut self, buffer: &Buffer) {
         self.keep(buffer, Reason::ClosedUnsaved);
+    }
+
+    /// `buffer`'s tab closed: its journal, when it moved since the last
+    /// frame looked.
+    pub fn closed(&mut self, buffer: &Buffer) {
+        // Its path now, not as of the last frame: a Save As may be newer.
+        let Some(path) = buffer.path.as_deref() else {
+            return;
+        };
+        if !self.on || self.paused || !keepable(buffer) || !self.filter.allows(path) {
+            return;
+        }
+        let Some(track) = self.tracks.iter_mut().find(|t| t.id == buffer.id()) else {
+            return;
+        };
+        if undo_due(&mut track.journaled, buffer) {
+            let job = undo_job(buffer, path);
+            self.send(job);
+        }
+    }
+
+    /// Takes the journals the history thread found, for the documents still
+    /// as they were when they asked: same file, same text on disk, nothing
+    /// unsaved, nothing to undo or redo. Returns whether any was taken.
+    pub fn adopt<'a>(&mut self, buffers: impl Iterator<Item = &'a mut Buffer>) -> bool {
+        let Some(worker) = &self.worker else {
+            return false;
+        };
+        let mut found: Vec<Restored> = worker.restored.try_iter().collect();
+        if found.is_empty() {
+            return false;
+        }
+        let mut adopted = false;
+        for buffer in buffers {
+            let Some(at) = found.iter().position(|r| r.id == buffer.id()) else {
+                continue;
+            };
+            let restored = found.swap_remove(at);
+            let untouched = buffer.path.as_deref() == Some(restored.path.as_path())
+                && !buffer.is_dirty()
+                && buffer.undo_len() == 0
+                && buffer.redo_len() == 0
+                && buffer.disk_event().0 == restored.event
+                && buffer
+                    .saved_rope()
+                    .is_some_and(|saved| saved.same_as(&restored.base));
+            if !untouched || !buffer.adopt_undo(restored.journal, &restored.base) {
+                continue;
+            }
+            adopted = true;
+            // Taken, not changed: nothing new to write.
+            if let Some(track) = self.tracks.iter_mut().find(|t| t.id == buffer.id()) {
+                track.journaled = (buffer.undo_rev(), restored.event);
+            }
+            if found.is_empty() {
+                break;
+            }
+        }
+        adopted
     }
 
     /// `buffer`'s text was just replaced by a version from its history:
@@ -523,8 +668,12 @@ impl Recorder {
     /// Quitting: what is still unsaved is kept, then everything queued is
     /// written, waiting at most `wait` for it.
     pub fn finish<'a>(&mut self, buffers: impl Iterator<Item = &'a Buffer>, wait: Duration) {
-        for buffer in buffers.filter(|b| b.is_dirty()) {
-            self.keep(buffer, Reason::Quit);
+        for buffer in buffers {
+            if buffer.is_dirty() {
+                self.keep(buffer, Reason::Quit);
+            } else {
+                self.closed(buffer);
+            }
         }
         let Some(worker) = &self.worker else {
             return;
@@ -567,6 +716,11 @@ impl Recorder {
             let Some(db) = self.db.clone() else {
                 return;
             };
+            if matches!(job, Job::LoadUndo { .. })
+                && !*self.db_exists.get_or_insert_with(|| db.exists())
+            {
+                return;
+            }
             self.worker = start(db, self.wake.take());
         }
         let Some(worker) = &self.worker else {
@@ -589,23 +743,39 @@ fn home() -> Option<PathBuf> {
 fn start(db: PathBuf, wake: Option<Wake>) -> Option<Worker> {
     let (jobs, queue) = mpsc::channel();
     let (say, notices) = mpsc::channel();
+    let (found, restored) = mpsc::channel();
     std::thread::Builder::new()
         .name("crc-history".into())
         .spawn(move || {
-            run(&db, &queue, &|notice| {
-                let _ = say.send(notice);
+            let wake = || {
                 if let Some(wake) = &wake {
                     wake();
                 }
-            })
+            };
+            run(
+                &db,
+                &queue,
+                &|notice| {
+                    let _ = say.send(notice);
+                    wake();
+                },
+                &|journal| {
+                    let _ = found.send(journal);
+                    wake();
+                },
+            )
         })
         .ok()?;
-    Some(Worker { jobs, notices })
+    Some(Worker {
+        jobs,
+        notices,
+        restored,
+    })
 }
 
 /// The history thread: opens the store, then writes what it is sent until
-/// the recorder goes.
-pub fn run(db: &Path, queue: &mpsc::Receiver<Job>, say: &dyn Fn(Notice)) {
+/// the recorder goes. Journals it finds go to `found`.
+pub fn run(db: &Path, queue: &mpsc::Receiver<Job>, say: &dyn Fn(Notice), found: &dyn Fn(Restored)) {
     let mut writer = Writer {
         store: match Store::open(db) {
             Ok(store) => Some(store),
@@ -643,23 +813,25 @@ pub fn run(db: &Path, queue: &mpsc::Receiver<Job>, say: &dyn Fn(Notice)) {
         let mut batch = vec![job];
         batch.extend(queue.try_iter());
         for job in coalesce(batch) {
-            writer.handle(job, say);
+            writer.handle(job, say, found);
         }
     }
 }
 
 /// `batch` without the idle snapshots a later idle snapshot of the same
-/// file replaces. Nothing is dropped across a rename.
+/// file replaces, and the journals a later journal of it replaces.
+/// Nothing is dropped across a rename.
 fn coalesce(batch: Vec<Job>) -> Vec<Job> {
     let keep: Vec<bool> = (0..batch.len())
         .map(|i| {
-            let Job::Snapshot {
-                path,
-                reason: Reason::Idle,
-                ..
-            } = &batch[i]
-            else {
-                return true;
+            let (path, journal) = match &batch[i] {
+                Job::Snapshot {
+                    path,
+                    reason: Reason::Idle,
+                    ..
+                } => (path, false),
+                Job::Undo { path, .. } => (path, true),
+                _ => return true,
             };
             for later in &batch[i + 1..] {
                 match later {
@@ -668,7 +840,8 @@ fn coalesce(batch: Vec<Job>) -> Vec<Job> {
                         path: other,
                         reason: Reason::Idle,
                         ..
-                    } if other == path => return false,
+                    } if !journal && other == path => return false,
+                    Job::Undo { path: other, .. } if journal && other == path => return false,
                     _ => {}
                 }
             }
@@ -700,7 +873,7 @@ impl Writer {
             .filter(|store| !store.read_only() && !self.paused)
     }
 
-    fn handle(&mut self, job: Job, say: &dyn Fn(Notice)) {
+    fn handle(&mut self, job: Job, say: &dyn Fn(Notice), found: &dyn Fn(Restored)) {
         match job {
             Job::Snapshot {
                 path,
@@ -720,10 +893,50 @@ impl Writer {
                     self.check(result, say);
                 }
             }
+            Job::Undo {
+                path,
+                base,
+                undo,
+                redo,
+                at,
+            } => {
+                if let Some(store) = self.writable() {
+                    let journal = undo_journal::encode(&base, &undo, &redo);
+                    let result = store.put_undo(&path, &base.to_string(), &journal, at);
+                    self.check(result, say);
+                }
+            }
+            Job::LoadUndo {
+                id,
+                path,
+                base,
+                event,
+            } => {
+                if let Some(journal) = self.load_undo(&path, &base) {
+                    found(Restored {
+                        id,
+                        path,
+                        event,
+                        base,
+                        journal,
+                    });
+                }
+            }
             Job::Flush(done) => {
                 let _ = done.send(());
             }
         }
+    }
+
+    /// `path`'s journal, when one was written against `base`'s text and
+    /// reads back whole.
+    fn load_undo(&self, path: &Path, base: &Rope) -> Option<Journal> {
+        let undo = self.store.as_ref()?.get_undo(path).ok()??;
+        let text = base.to_string();
+        if crate::ext::verify::sha256(text.as_bytes())? != undo.base {
+            return None;
+        }
+        undo_journal::decode(&undo.journal, base)
     }
 
     fn put(&mut self, path: &Path, rope: &Rope, reason: Reason, at: i64, say: &dyn Fn(Notice)) {
@@ -1254,6 +1467,185 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// `path`'s journal as kept, decoded against `base`: (undo, redo).
+    fn journal(db: &Path, path: &Path, base: &str) -> Option<(usize, usize)> {
+        let undo = Store::open(db).unwrap().get_undo(path).unwrap()?;
+        assert_eq!(
+            undo.base,
+            crate::ext::verify::sha256(base.as_bytes()).unwrap()
+        );
+        let journal = undo_journal::decode(&undo.journal, &Rope::from_text(base))?;
+        Some((journal.undo.len(), journal.redo.len()))
+    }
+
+    #[test]
+    fn a_clean_document_keeps_its_undo_and_a_dirty_one_does_not() {
+        let dir = temp("undo-kept");
+        let db = dir.join("history.db");
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "a\n").unwrap();
+        let file = crate::platform::canonical(&file);
+        let mut buffer = open(&file);
+        let mut recorder = recorder(&db, "", Timing::default());
+        let t0 = Instant::now();
+        recorder.observe(std::iter::once(&buffer), t0);
+        buffer.insert("one ");
+        recorder.observe(std::iter::once(&buffer), t0);
+        buffer.save(None).unwrap();
+        recorder.observe(std::iter::once(&buffer), t0 + secs(1));
+        recorder.finish(std::iter::empty(), secs(10));
+        assert_eq!(journal(&db, &file, "one a\n"), Some((1, 0)), "after a save");
+
+        // Undone: unsaved, nothing written; redone, clean again with the
+        // stacks moved, written again.
+        buffer.undo();
+        recorder.observe(std::iter::once(&buffer), t0 + secs(2));
+        buffer.redo();
+        buffer.place_cursor(0, crate::text::buffer::Motion::Move);
+        buffer.insert("two ");
+        recorder.observe(std::iter::once(&buffer), t0 + secs(3));
+        assert!(buffer.is_dirty());
+        recorder.finish(std::iter::once(&buffer), secs(10));
+        assert_eq!(
+            journal(&db, &file, "one a\n"),
+            Some((1, 0)),
+            "dirty at quit: the journal of the last clean text stays"
+        );
+        assert_eq!(*reasons(&db, &file).last().unwrap(), Reason::Quit);
+
+        buffer.undo();
+        assert!(!buffer.is_dirty());
+        recorder.observe(std::iter::once(&buffer), t0 + secs(4));
+        recorder.finish(std::iter::empty(), secs(10));
+        assert_eq!(journal(&db, &file, "one a\n"), Some((1, 1)));
+
+        // Closing a clean tab writes what moved since the last frame.
+        buffer.undo();
+        buffer.redo();
+        recorder.closed(&buffer);
+        recorder.finish(std::iter::empty(), secs(10));
+        assert_eq!(journal(&db, &file, "one a\n"), Some((1, 1)));
+
+        // A secret keeps no journal.
+        let env = dir.join(".env");
+        std::fs::write(&env, "A=1\n").unwrap();
+        let env = crate::platform::canonical(&env);
+        let mut secret = open(&env);
+        recorder.observe(std::iter::once(&secret), t0);
+        secret.insert("B=2\n");
+        secret.save(None).unwrap();
+        recorder.observe(std::iter::once(&secret), t0 + secs(1));
+        recorder.finish(std::iter::once(&secret), secs(10));
+        assert_eq!(journal(&db, &env, "B=2\nA=1\n"), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_untouched_document_takes_its_journal_back() {
+        let dir = temp("undo-back");
+        let db = dir.join("history.db");
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "a\n").unwrap();
+        let file = crate::platform::canonical(&file);
+        let mut buffer = open(&file);
+        let mut recorder = recorder(&db, "", Timing::default());
+        let t0 = Instant::now();
+        recorder.observe(std::iter::once(&buffer), t0);
+        buffer.insert("one ");
+        buffer.save(None).unwrap();
+        recorder.finish(std::iter::once(&buffer), secs(10));
+        drop(recorder);
+
+        // Opened again, twice: one tab left alone, one typed in before the
+        // answer came.
+        let mut recorder = self::recorder(&db, "", Timing::default());
+        let mut docs = [open(&file), open(&file)];
+        recorder.observe(docs.iter(), t0);
+        docs[1].insert("x");
+        recorder.finish(std::iter::empty(), secs(10));
+        assert!(recorder.adopt(docs.iter_mut()));
+        assert_eq!((docs[0].undo_len(), docs[0].redo_len()), (1, 0));
+        assert!(!docs[0].is_dirty());
+        assert_eq!(docs[1].undo_len(), 1, "its own typing, not the journal");
+        assert!(!recorder.adopt(docs.iter_mut()), "once");
+        // Taken, nothing to write back.
+        recorder.observe(docs.iter(), t0 + secs(1));
+        assert!(docs[0].undo());
+        assert_eq!(docs[0].rope.to_string(), "a\n");
+        assert!(docs[0].is_dirty());
+
+        // Changed on disk since: no journal for that text.
+        std::fs::write(&file, "two\n").unwrap();
+        let mut changed = [open(&file)];
+        recorder.observe(changed.iter(), t0);
+        recorder.finish(std::iter::empty(), secs(10));
+        assert!(!recorder.adopt(changed.iter_mut()));
+        assert_eq!(changed[0].undo_len(), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_journal_is_found_only_for_the_text_it_was_written_against() {
+        let dir = temp("undo-load");
+        let db = dir.join("history.db");
+        let (old, new) = (dir.join("old.txt"), dir.join("new.txt"));
+        let base = Rope::from_text("same\n");
+        let step = undo_journal::Step {
+            rope: Rope::from_text("before\n"),
+            cursors: undo_journal::Cursors::default(),
+        };
+        let bytes = undo_journal::encode(&base, &[step], &[]);
+        Store::open(&db)
+            .unwrap()
+            .put_undo(&old, "same\n", &bytes, 0)
+            .unwrap();
+        let (jobs, queue) = mpsc::channel();
+        let load = |id, path: &Path, text: &str| Job::LoadUndo {
+            id,
+            path: path.to_owned(),
+            base: Rope::from_text(text),
+            event: 0,
+        };
+        jobs.send(load(1, &old, "same\n")).unwrap();
+        // The same length, so only the hash tells them apart.
+        jobs.send(load(2, &old, "sane\n")).unwrap();
+        jobs.send(Job::Rename {
+            old: old.clone(),
+            new: new.clone(),
+        })
+        .unwrap();
+        jobs.send(load(3, &old, "same\n")).unwrap();
+        jobs.send(load(4, &new, "same\n")).unwrap();
+        drop(jobs);
+        let found = std::sync::Mutex::new(Vec::new());
+        run(&db, &queue, &|_| {}, &|restored| {
+            found.lock().unwrap().push((
+                restored.id,
+                restored.journal.undo.len(),
+                restored.journal.undo[0].rope.to_string(),
+            ))
+        });
+        assert_eq!(
+            found.into_inner().unwrap(),
+            [(1, 1, "before\n".into()), (4, 1, "before\n".into())]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn opening_with_no_history_starts_nothing() {
+        let dir = temp("undo-none");
+        let db = dir.join("history.db");
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "a\n").unwrap();
+        let buffer = open(&file);
+        let mut recorder = recorder(&db, "", Timing::default());
+        recorder.observe(std::iter::once(&buffer), Instant::now());
+        assert!(recorder.worker.is_none());
+        assert!(!db.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn off_records_nothing() {
         let dir = temp("off");
@@ -1273,17 +1665,27 @@ mod tests {
     }
 
     #[test]
-    fn queued_idle_snapshots_of_a_file_are_coalesced() {
+    fn queued_idle_snapshots_and_journals_of_a_file_are_coalesced() {
         let snap = |path: &str, reason| Job::Snapshot {
             path: PathBuf::from(path),
             rope: Rope::new(),
             reason,
             at: 0,
         };
+        let undo = |path: &str| Job::Undo {
+            path: PathBuf::from(path),
+            base: Rope::new(),
+            undo: Vec::new(),
+            redo: Vec::new(),
+            at: 0,
+        };
         let batch = vec![
             snap("/a", Reason::Idle),
+            undo("/a"),
             snap("/b", Reason::Idle),
+            undo("/b"),
             snap("/a", Reason::Idle),
+            undo("/a"),
             snap("/a", Reason::Saved),
             snap("/b", Reason::Idle),
             Job::Rename {
@@ -1291,24 +1693,29 @@ mod tests {
                 new: "/c".into(),
             },
             snap("/b", Reason::Idle),
+            undo("/b"),
         ];
         let kept: Vec<(String, i64)> = coalesce(batch)
             .into_iter()
             .map(|job| match job {
                 Job::Snapshot { path, reason, .. } => (path.display().to_string(), reason.id()),
                 Job::Rename { .. } | Job::RenameFolder { .. } => ("rename".into(), 0),
-                Job::Flush(_) => ("flush".into(), 0),
+                Job::Undo { path, .. } => (format!("undo {}", path.display()), 0),
+                Job::LoadUndo { .. } | Job::Flush(_) => ("other".into(), 0),
             })
             .collect();
         let idle = Reason::Idle.id();
         assert_eq!(
             kept,
             [
+                ("undo /b".into(), 0),
                 ("/a".into(), idle),
+                ("undo /a".into(), 0),
                 ("/a".into(), Reason::Saved.id()),
                 ("/b".into(), idle),
                 ("rename".into(), 0),
                 ("/b".into(), idle),
+                ("undo /b".into(), 0),
             ]
         );
     }
@@ -1332,7 +1739,12 @@ mod tests {
             .unwrap();
         }
         drop(jobs);
-        run(&db, &queue, &|notice| said.lock().unwrap().push(notice));
+        run(
+            &db,
+            &queue,
+            &|notice| said.lock().unwrap().push(notice),
+            &|_| {},
+        );
         let said = said.into_inner().unwrap();
         assert_eq!(said.len(), 1, "{said:?}");
         assert!(matches!(said[0], Notice::Failed(_)));

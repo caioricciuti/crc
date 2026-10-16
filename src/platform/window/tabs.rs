@@ -141,6 +141,10 @@ impl EditorView {
                 return;
             };
             let closed = state.docs.close(index);
+            if let Some(buffer) = closed.as_ref() {
+                // A clean tab's undo, as of the moment it closed.
+                state.history.closed(buffer);
+            }
             if let Some(path) = closed.as_ref().and_then(|b| b.path.clone()) {
                 for server in state.lsp.servers.values_mut() {
                     server.did_close(&path);

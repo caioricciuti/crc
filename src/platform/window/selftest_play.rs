@@ -415,6 +415,8 @@ impl EditorView {
                 // File History's replies too: the display link that takes
                 // them does not fire while the display sleeps.
                 self.poll_scrub();
+                // And local history: an undo journal found for a file.
+                self.poll_history();
                 if let Some(mut state) = self.state_mut() {
                     state.git.poll();
                 }

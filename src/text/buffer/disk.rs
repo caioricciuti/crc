@@ -689,6 +689,7 @@ impl Buffer {
             goal_column: None,
             undo_stack: std::collections::VecDeque::new(),
             redo_stack: Vec::new(),
+            undo_rev: 0,
             last_edit: None,
             syntax_sync: SyntaxSync::Edits(Vec::new()),
             path: None,

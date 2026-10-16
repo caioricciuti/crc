@@ -475,6 +475,11 @@ pub fn report(
     ));
     out.push_str(&format!("marked: {:?}\n", marked.unwrap_or("")));
     out.push_str(&format!("dirty: {}\n", buffer.is_dirty()));
+    out.push_str(&format!(
+        "undo: {}/{}\n",
+        buffer.undo_len(),
+        buffer.redo_len()
+    ));
     out.push_str("text:\n");
     out.push_str(&buffer.rope.to_string());
     out
