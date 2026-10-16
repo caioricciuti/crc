@@ -1376,6 +1376,10 @@ enum Drag {
         unit: SelectUnit,
         /// What the press itself selected, which a drag never shrinks below.
         pressed: std::ops::Range<usize>,
+        /// An Option-press: the corner a box selection starts from, and
+        /// whether the pointer has left that cell yet. Until it has, the
+        /// press is a click that added a caret.
+        boxed: Option<(crate::text::buffer::BoxCorner, bool)>,
         /// Where the pointer last was. Kept because a pointer held still
         /// past the edge sends no events, and the view still has to keep
         /// scrolling under it.

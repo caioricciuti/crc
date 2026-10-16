@@ -6,6 +6,16 @@ use super::*;
 /// how far into that text its caret lands.
 pub(super) type CursorEdit = (std::ops::Range<usize>, String, usize);
 
+/// A corner of a box selection: a screen row, as its line and its row
+/// within that line (0 unless wrapping), and a column on that row in
+/// display columns, tabs to their stops and wide characters as two.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BoxCorner {
+    pub line: usize,
+    pub row: usize,
+    pub column: usize,
+}
+
 fn changes_text((range, text, _): &CursorEdit) -> bool {
     !range.is_empty() || !text.is_empty()
 }
@@ -256,6 +266,95 @@ impl Buffer {
                 }
             }
         }
+    }
+    /// Where `at` is as a corner of a box selection: its screen row and its
+    /// column on that row.
+    pub fn box_corner_of(&self, at: usize) -> BoxCorner {
+        let at = self.char_floor(at);
+        let line = self.rope.byte_to_line(at);
+        let starts = self.row_starts(line);
+        let row = wrap::row_of(&starts, at);
+        let start = starts
+            .get(row)
+            .copied()
+            .unwrap_or_else(|| self.rope.line_to_byte(line));
+        BoxCorner {
+            line,
+            row,
+            column: wrap::column_in_row(&self.rope, start, at),
+        }
+    }
+    /// The bytes screen row `row` of `line` covers, and how far a caret on
+    /// it can go: the end of a row that continues is the next row's start,
+    /// so a caret stops before its last character instead.
+    fn row_span(&self, line: usize, row: usize) -> Option<(usize, usize, usize)> {
+        let starts = self.row_starts(line);
+        let start = *starts.get(row)?;
+        Some(match starts.get(row + 1) {
+            Some(&end) => (start, end, self.prev_boundary(end).max(start)),
+            None => {
+                let end = wrap::line_end(&self.rope, line);
+                (start, end, end)
+            }
+        })
+    }
+    /// The cursors of a box selection dragged from `from` to `to`: one per
+    /// screen row between them, in that order, each from `from`'s column to
+    /// `to`'s, so the last is the row under the pointer.
+    ///
+    /// A row that ends before the box's left edge gets no cursor, unless
+    /// none reaches it: then every row gets a caret at its end, so a box
+    /// drawn past the end of every line still gives a caret per row. A row
+    /// ending exactly at the left edge gets a caret there.
+    pub fn box_cursors(&self, from: BoxCorner, to: BoxCorner) -> Vec<(usize, usize)> {
+        let target = (to.line, to.row);
+        let step = if target < (from.line, from.row) {
+            -1
+        } else {
+            1
+        };
+        let mut at = (from.line, from.row);
+        let mut rows = vec![at];
+        while at != target {
+            let next = self.step_rows(at, step);
+            if next == at || (step > 0 && next > target) || (step < 0 && next < target) {
+                break;
+            }
+            at = next;
+            rows.push(at);
+        }
+        let spans: Vec<_> = rows
+            .into_iter()
+            .filter_map(|(line, row)| self.row_span(line, row))
+            .collect();
+        let left = from.column.min(to.column);
+        let reaches = |&&(start, end, _): &&(usize, usize, usize)| {
+            wrap::column_in_row(&self.rope, start, end) >= left
+        };
+        if !spans.iter().any(|s| reaches(&s)) {
+            return spans.iter().map(|&(_, _, cap)| (cap, cap)).collect();
+        }
+        spans
+            .iter()
+            .filter(reaches)
+            .map(|&(start, end, cap)| {
+                let at = |column| wrap::byte_at_column(&self.rope, start, end, column).min(cap);
+                (at(from.column), at(to.column))
+            })
+            .collect()
+    }
+    /// Replaces every cursor with a box selection, as Option-drag makes
+    /// one; the primary is the row under the pointer.
+    pub fn select_box(&mut self, from: BoxCorner, to: BoxCorner) {
+        let mut cursors = self.box_cursors(from, to);
+        let Some((anchor, head)) = cursors.pop() else {
+            return;
+        };
+        (self.anchor, self.cursor) = (anchor, head);
+        self.extra = cursors;
+        self.goal_column = None;
+        self.extra_goals.clear();
+        self.last_edit = None;
     }
     /// Replaces every selection with `replacement`; every cursor lands at
     /// the end of its replacement.

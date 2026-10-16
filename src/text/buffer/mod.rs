@@ -24,6 +24,7 @@ mod cursors;
 mod disk;
 mod lines;
 mod view;
+pub use cursors::BoxCorner;
 pub use disk::*;
 
 /// Fold All reads every line; past this many it is refused.
@@ -510,14 +511,16 @@ impl Buffer {
         self.extra = snapshot.extra;
         self.extra_goals.clear();
     }
-    /// Checkpoint for an edit made at the primary cursor only. Typing, the
-    /// deletes, Return and Tab edit at every cursor instead; the line and
-    /// block operations and replace still come through here.
+    /// Checkpoint for an edit that is not made at the cursors. Typing, the
+    /// deletes, Return, Tab and the line commands edit at every cursor
+    /// instead; what still comes through here is replace all and replace
+    /// ranges, which edit the whole document, and the single-cursor paths,
+    /// which have no others to drop.
     ///
     /// Such an edit shifts the text under the other cursors without moving
     /// them, so they are dropped here, after the snapshot has recorded them.
-    /// Losing them is a limitation; keeping them was a crash on the next
-    /// keystroke, or an edit in the middle of somebody else's character.
+    /// Keeping them was a crash on the next keystroke, or an edit in the
+    /// middle of somebody else's character.
     fn checkpoint(&mut self, kind: EditKind) {
         self.checkpoint_keeping_cursors(kind);
         self.extra.clear();
@@ -1614,14 +1617,14 @@ mod tests {
     }
 
     #[test]
-    fn an_edit_at_one_cursor_drops_the_others() {
+    fn a_document_wide_edit_drops_the_other_cursors() {
         type Op = fn(&mut Buffer);
-        let ops: [(&str, Op); 4] = [
-            ("indent", |b| b.indent()),
-            ("toggle_comment", |b| b.toggle_comment("//")),
-            ("duplicate_lines", |b| b.duplicate_lines()),
+        let ops: [(&str, Op); 2] = [
             ("replace_all", |b| {
                 b.replace_all("ab", "a");
+            }),
+            ("replace_ranges", |b| {
+                b.replace_ranges(&[(0..2, "a".into()), (6..8, "a".into())]);
             }),
         ];
         for (name, op) in ops {
@@ -1636,6 +1639,40 @@ mod tests {
             b.undo();
             assert_eq!(b.rope.to_string(), "ab cd\nab cd", "{name}");
             assert_eq!(b.cursor_count(), 2, "{name}: undo restores both cursors");
+        }
+    }
+
+    #[test]
+    fn line_commands_keep_every_cursor() {
+        type Op = fn(&mut Buffer);
+        let ops: [(&str, Op); 6] = [
+            ("indent", |b| b.indent()),
+            ("outdent", |b| b.outdent()),
+            ("toggle_comment", |b| b.toggle_comment("//")),
+            ("duplicate_lines", |b| b.duplicate_lines()),
+            ("move_lines down", |b| b.move_lines(true)),
+            ("move_lines up", |b| b.move_lines(false)),
+        ];
+        for (name, op) in ops {
+            let text = "x\n    ab cd\ny\n    ab cd\nz";
+            let mut b = Buffer::from_text(text);
+            b.place_cursor(8, Move);
+            b.add_cursor(20, 20);
+            op(&mut b);
+            assert_eq!(b.cursor_count(), 2, "{name} dropped a cursor");
+            // Each caret is still in its `ab cd`, after the `ab`.
+            let at: Vec<String> = b
+                .caret_positions()
+                .iter()
+                .map(|&c| b.rope.slice_to_string(c - 2..c))
+                .collect();
+            assert_eq!(at, ["ab", "ab"], "{name}");
+            b.insert("Q");
+            assert_eq!(b.rope.to_string().matches("abQ").count(), 2, "{name}");
+            b.undo();
+            b.undo();
+            assert_eq!(b.rope.to_string(), text, "{name}: one undo step");
+            assert_eq!(b.caret_positions(), vec![8, 20], "{name}");
         }
     }
 
@@ -2236,6 +2273,220 @@ mod tests {
         b.add_cursor(17, 17);
         b.move_down(Move);
         assert_eq!(b.caret_positions(), vec![15, 20]);
+    }
+
+    // ---- box selection ---------------------------------------------------
+
+    fn corner(line: usize, column: usize) -> BoxCorner {
+        BoxCorner {
+            line,
+            row: 0,
+            column,
+        }
+    }
+
+    #[test]
+    fn a_box_selects_the_same_columns_on_every_row() {
+        let b = Buffer::from_text("abcdef\nabcdef\nabcdef");
+        assert_eq!(
+            b.box_cursors(corner(0, 1), corner(2, 4)),
+            [(1, 4), (8, 11), (15, 18)]
+        );
+        // Dragged up and to the left: the press row comes first, every
+        // anchor at the press column, every head at the pointer's.
+        assert_eq!(
+            b.box_cursors(corner(2, 4), corner(0, 1)),
+            [(18, 15), (11, 8), (4, 1)]
+        );
+        // Without moving across: a caret per row.
+        assert_eq!(b.box_cursors(corner(0, 2), corner(1, 2)), [(2, 2), (9, 9)]);
+    }
+
+    #[test]
+    fn box_columns_are_display_columns() {
+        // A tab reaches column 4, so columns 4 to 6 are `ab` after it and
+        // `ef` on a line with no tab.
+        let b = Buffer::from_text("\tabc\nabcdefgh");
+        assert_eq!(b.box_cursors(corner(0, 4), corner(1, 6)), [(1, 3), (9, 11)]);
+        // Wide characters are two columns: 2 to 4 is the second of them.
+        let b = Buffer::from_text("\u{65e5}\u{672c}\u{8a9e}x\nabcdefg");
+        assert_eq!(
+            b.box_cursors(corner(0, 2), corner(1, 4)),
+            [(3, 6), (13, 15)]
+        );
+        // A column inside a wide character rounds to its nearer edge, the
+        // same rule as a click.
+        assert_eq!(b.box_cursors(corner(0, 1), corner(0, 3)), [(3, 6)]);
+    }
+
+    #[test]
+    fn a_box_skips_rows_that_end_before_it() {
+        // `ab` ends before column 3: no cursor there.
+        let b = Buffer::from_text("abcdef\nab\nabcdef");
+        assert_eq!(
+            b.box_cursors(corner(0, 3), corner(2, 5)),
+            [(3, 5), (13, 15)]
+        );
+        // A row that ends at the left edge gets a caret at its end.
+        let b = Buffer::from_text("abcdef\nabc\nabcdef");
+        assert_eq!(
+            b.box_cursors(corner(0, 3), corner(2, 5)),
+            [(3, 5), (10, 10), (14, 16)]
+        );
+        // Past the end of every row, a caret at the end of each.
+        let b = Buffer::from_text("a\nbc\n\nd");
+        assert_eq!(
+            b.box_cursors(corner(0, 6), corner(3, 9)),
+            [(1, 1), (4, 4), (5, 5), (7, 7)]
+        );
+    }
+
+    #[test]
+    fn a_box_follows_screen_rows_while_wrapping() {
+        // Rows: "the quick brown fox " | "jumps over the lazy " | "dog", "end".
+        let b = wrapped("the quick brown fox jumps over the lazy dog\nend");
+        let from = BoxCorner {
+            line: 0,
+            row: 1,
+            column: 0,
+        };
+        assert_eq!(b.box_corner_of(23), BoxCorner { column: 3, ..from });
+        assert_eq!(
+            b.box_cursors(from, corner(1, 3)),
+            [(20, 23), (40, 43), (44, 47)]
+        );
+        // Past the end of a row that continues, the box stops before its
+        // last character, where a caret on that row can be.
+        let from = BoxCorner {
+            line: 0,
+            row: 0,
+            column: 18,
+        };
+        assert_eq!(
+            b.box_cursors(
+                from,
+                BoxCorner {
+                    row: 1,
+                    column: 30,
+                    ..from
+                }
+            ),
+            [(18, 19), (38, 39)]
+        );
+    }
+
+    #[test]
+    fn select_box_makes_the_pointer_row_primary_and_types_at_every_row() {
+        let mut b = with_carets("abcdef\nabcdef\nabcdef", &[0]);
+        b.add_cursor(3, 3);
+        b.select_box(corner(2, 4), corner(0, 1));
+        assert_eq!(b.cursor_count(), 3);
+        assert_eq!(b.selection(), Some(1..4));
+        assert_eq!(b.cursor(), 1);
+        assert_eq!(b.copied_text().as_deref(), Some("bcd\nbcd\nbcd"));
+        b.insert("X");
+        assert_eq!(b.rope.to_string(), "aXef\naXef\naXef");
+        b.undo();
+        assert_eq!(b.rope.to_string(), "abcdef\nabcdef\nabcdef");
+        assert_eq!(b.cursor_count(), 3);
+    }
+
+    // ---- line commands at every cursor ------------------------------------
+
+    #[test]
+    fn indent_and_outdent_take_every_cursors_lines_once() {
+        // Two carets on line 1, one on line 3: line 1 gets one level, not two.
+        let mut b = with_carets("a\nb\nc\nd", &[2, 3, 6]);
+        b.indent();
+        assert_eq!(b.rope.to_string(), "a\n    b\nc\n    d");
+        assert_eq!(b.caret_positions(), vec![6, 7, 14]);
+        assert_eq!(b.cursor_count(), 3);
+        b.outdent();
+        assert_eq!(b.rope.to_string(), "a\nb\nc\nd");
+        assert_eq!(b.caret_positions(), vec![2, 3, 6]);
+        b.undo();
+        assert_eq!(b.rope.to_string(), "a\n    b\nc\n    d");
+        b.undo();
+        assert_eq!(b.rope.to_string(), "a\nb\nc\nd", "one undo step each");
+        assert_eq!(b.caret_positions(), vec![2, 3, 6]);
+
+        // Two carets inside the same removed indent land together, as one.
+        let mut b = with_carets("        a", &[2, 5]);
+        b.outdent();
+        assert_eq!(b.rope.to_string(), "    a");
+        assert_eq!(b.caret_positions(), vec![0, 1]);
+    }
+
+    #[test]
+    fn comment_toggles_the_lines_of_every_cursor_as_one_block() {
+        let mut b = with_carets("a\nb\nc", &[0, 1, 4]);
+        b.toggle_comment("//");
+        assert_eq!(b.rope.to_string(), "// a\nb\n// c");
+        assert_eq!(b.cursor_count(), 3);
+        b.toggle_comment("//");
+        assert_eq!(b.rope.to_string(), "a\nb\nc");
+        assert_eq!(b.caret_positions(), vec![0, 1, 4]);
+        b.undo();
+        assert_eq!(b.rope.to_string(), "// a\nb\n// c", "one undo step");
+
+        // A partly commented set is commented whole.
+        let mut b = with_carets("// a\nb", &[0, 5]);
+        b.toggle_comment("//");
+        assert_eq!(b.rope.to_string(), "// // a\n// b");
+        assert_eq!(b.cursor_count(), 2);
+    }
+
+    #[test]
+    fn duplicate_copies_each_run_of_cursor_lines() {
+        // Two carets on line 0 and one on line 2: two copies, each caret on
+        // the copy of its own line.
+        let mut b = with_carets("a\nb\nc\n", &[0, 1, 4]);
+        b.duplicate_lines();
+        assert_eq!(b.rope.to_string(), "a\na\nb\nc\nc\n");
+        assert_eq!(b.caret_positions(), vec![2, 3, 8]);
+        b.undo();
+        assert_eq!(b.rope.to_string(), "a\nb\nc\n", "one undo step");
+        assert_eq!(b.caret_positions(), vec![0, 1, 4]);
+
+        // Adjacent lines from different cursors are one block.
+        let mut b = with_carets("a\nb\nc", &[0, 2]);
+        b.duplicate_lines();
+        assert_eq!(b.rope.to_string(), "a\nb\na\nb\nc");
+        assert_eq!(b.caret_positions(), vec![4, 6]);
+
+        // The last line without a newline still gets one between.
+        let mut b = with_carets("a\nx\nb", &[0, 4]);
+        b.duplicate_lines();
+        assert_eq!(b.rope.to_string(), "a\na\nx\nb\nb");
+        assert_eq!(b.caret_positions(), vec![2, 8]);
+    }
+
+    #[test]
+    fn move_lines_moves_every_cursors_lines() {
+        let mut b = with_carets("a\nb\nc\nd\ne", &[0, 1, 4]);
+        b.move_lines(true);
+        assert_eq!(b.rope.to_string(), "b\na\nd\nc\ne");
+        assert_eq!(b.caret_positions(), vec![2, 3, 6]);
+        b.move_lines(false);
+        assert_eq!(b.rope.to_string(), "a\nb\nc\nd\ne");
+        assert_eq!(b.caret_positions(), vec![0, 1, 4]);
+        b.move_lines(true);
+        b.undo();
+        assert_eq!(b.rope.to_string(), "a\nb\nc\nd\ne", "one undo step");
+        assert_eq!(b.caret_positions(), vec![0, 1, 4]);
+
+        // Adjacent lines move as one block.
+        let mut b = with_carets("a\nb\nc", &[0, 2]);
+        b.move_lines(true);
+        assert_eq!(b.rope.to_string(), "c\na\nb");
+        assert_eq!(b.caret_positions(), vec![2, 4]);
+
+        // One block at the edge holds them all back.
+        let mut b = with_carets("a\nb\nc", &[0, 4]);
+        b.move_lines(true);
+        assert_eq!(b.rope.to_string(), "a\nb\nc");
+        assert_eq!(b.caret_positions(), vec![0, 4]);
+        assert!(!b.can_undo());
     }
 
     // ---- brackets and replace --------------------------------------------

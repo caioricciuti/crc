@@ -31,6 +31,11 @@
 //! dragby <dx> <dy>            a drag to a point relative to the press
 //! up <x> <y>                  release
 //! upby <dx> <dy>              release relative to the press
+//! clickat|downat|dragat|upat @<region> <fx> <fy> [mods]
+//!                             a click, press, drag or release at a fraction
+//!                             of a region's width and height, with modifiers
+//!                             as for `key`; `cell.<line>.<column>` is a cell
+//!                             of the text, line from 1, column from 0
 //! trackpad <x> <y> <dy> [dx]  a trackpad scroll of <dy> (and <dx>) points at
 //!                             a point; negative moves the text up or left
 //! wheelat @<region> <fx> <fy> <dy>
@@ -104,12 +109,14 @@ pub enum Step {
     },
     /// A click, press, drag or release at a fraction of a named region's
     /// width and height, resolved when it runs: `0 0.5` is the middle of
-    /// its left edge, `1 0.5` of its right, kept just inside it.
+    /// its left edge, `1 0.5` of its right, kept just inside it. With
+    /// modifiers held.
     At {
         mouse: Mouse,
         name: String,
         fx: f64,
         fy: f64,
+        mods: Mods,
     },
     Drag {
         x: f64,
@@ -343,11 +350,13 @@ pub fn parse(script: &str) -> Result<Vec<Step>, String> {
                 };
                 let name = args.word().ok_or_else(bad)?.to_string();
                 let (fx, fy) = (args.num().ok_or_else(bad)?, args.num().ok_or_else(bad)?);
+                let mods = Mods::parse(args.word().unwrap_or("-")).ok_or_else(bad)?;
                 Some(Step::At {
                     mouse,
                     name,
                     fx,
                     fy,
+                    mods,
                 })
             }
             "wheelat" if rest.starts_with('@') => {
@@ -486,14 +495,18 @@ mod tests {
             })
             .collect();
         assert_eq!(mods, vec![(1, true, false), (2, false, true)]);
-        let at = parse("clickat @scrub.track 0 0.5\ndragat @scrub.track 0.25 0.5\n").unwrap();
+        let at = parse("clickat @scrub.track 0 0.5\ndragat @scrub.track 0.25 0.5 opt\n").unwrap();
         assert_eq!(
             at[1],
             Step::At {
                 mouse: Mouse::Drag,
                 name: "scrub.track".into(),
                 fx: 0.25,
-                fy: 0.5
+                fy: 0.5,
+                mods: Mods {
+                    option: true,
+                    ..Mods::default()
+                },
             }
         );
         assert_eq!(parse("fade 40\n").unwrap(), [Step::Fade(40)]);

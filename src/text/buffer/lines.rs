@@ -312,55 +312,84 @@ impl Buffer {
         });
         self.last_edit = None;
     }
-    /// Lines touched by the selection, or the cursor's line.
-    pub(super) fn selected_lines(&self) -> std::ops::RangeInclusive<usize> {
-        match self.selection() {
-            Some(range) => {
-                let first = self.rope.byte_to_line(range.start);
-                // A selection ending exactly at a line start does not include
-                // that line; otherwise selecting a whole line by dragging to
-                // the next one would indent two.
-                let mut last = self.rope.byte_to_line(range.end);
-                if last > first && range.end == self.rope.line_to_byte(last) {
-                    last -= 1;
-                }
-                first..=last
-            }
-            None => {
-                let (line, _) = self.cursor_position();
-                line..=line
+    /// The lines a selection from `start` to `end` touches; a caret's own.
+    fn lines_between(&self, start: usize, end: usize) -> std::ops::RangeInclusive<usize> {
+        let first = self.rope.byte_to_line(start);
+        // A selection ending exactly at a line start does not include that
+        // line; otherwise selecting a whole line by dragging to the next one
+        // would indent two.
+        let mut last = self.rope.byte_to_line(end);
+        if last > first && end == self.rope.line_to_byte(last) {
+            last -= 1;
+        }
+        first..=last
+    }
+    /// Every line any cursor touches, each once, as runs of adjacent lines
+    /// `(first, last)`, ascending. The line commands work on these, so two
+    /// cursors on one line indent it once.
+    fn cursor_line_runs(&self) -> Vec<(usize, usize)> {
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        for (start, end) in self.all_selections() {
+            let lines = self.lines_between(start, end);
+            let (first, last) = (*lines.start(), *lines.end());
+            match runs.last_mut() {
+                Some(run) if first <= run.1 + 1 => run.1 = run.1.max(last),
+                _ => runs.push((first, last)),
             }
         }
+        runs
     }
-    /// Adds one indent level to every selected line.
+    /// Every line any cursor touches, each once, ascending.
+    fn cursor_lines(&self) -> Vec<usize> {
+        self.cursor_line_runs()
+            .into_iter()
+            .flat_map(|(first, last)| first..=last)
+            .collect()
+    }
+    /// Applies a line command's `edits` as one undo step of its own, every
+    /// cursor moving with the text around it. Nothing to apply, no step.
+    fn edit_lines(
+        &mut self,
+        kind: EditKind,
+        edits: &[(std::ops::Range<usize>, &str)],
+        at_insert: AtInsert,
+    ) {
+        if edits.is_empty() {
+            return;
+        }
+        self.last_edit = None;
+        self.checkpoint_keeping_cursors(kind);
+        self.apply_edits(edits, at_insert);
+        self.last_edit = None;
+        // Carets in an indent that went away now share its edge.
+        self.merge_cursors();
+    }
+    /// Adds one indent level to every line a cursor touches.
     pub fn indent(&mut self) {
         if self.is_locked() {
             return;
         }
-        let lines = self.selected_lines();
-        let unit = self.indent_unit(*lines.start());
-        self.checkpoint(EditKind::Insert);
-
+        let lines = self.cursor_lines();
+        let unit = self.indent_unit(lines[0]);
         // A caret at a line's start moves with the line's text.
         let edits: Vec<_> = lines
-            .map(|line| {
+            .iter()
+            .map(|&line| {
                 let at = self.rope.line_to_byte(line);
                 (at..at, unit.as_str())
             })
             .collect();
-        self.apply_edits(&edits, AtInsert::After);
+        self.edit_lines(EditKind::Insert, &edits, AtInsert::After);
     }
-    /// Removes one indent level from every selected line that has one.
+    /// Removes one indent level from every line a cursor touches that has
+    /// one.
     pub fn outdent(&mut self) {
         if self.is_locked() {
             return;
         }
-        let lines = self.selected_lines();
-        self.checkpoint(EditKind::Delete);
-
         let level = self.indent_style.map_or(4, |s| s.width.max(1));
         let mut edits = Vec::new();
-        for line in lines {
+        for line in self.cursor_lines() {
             let at = self.rope.line_to_byte(line);
             let indent = self.indent_of(line);
             // Take a tab, or up to one level of spaces: a line indented by
@@ -376,20 +405,20 @@ impl Buffer {
         }
         // A caret inside the removed indentation stops at the line's new
         // start rather than being pulled back onto the line above.
-        self.apply_edits(&edits, AtInsert::After);
+        self.edit_lines(EditKind::Delete, &edits, AtInsert::After);
     }
-    /// Comments or uncomments the selected lines with `token`.
+    /// Comments or uncomments the lines the cursors touch with `token`.
     ///
-    /// Toggling on the whole block rather than per line: if any selected line
+    /// Toggling on the whole block rather than per line: if any of the lines
     /// is uncommented, the whole block gets commented, which is what makes a
     /// second press restore exactly what you started with.
     pub fn toggle_comment(&mut self, token: &str) {
         if self.is_locked() {
             return;
         }
-        let lines = self.selected_lines();
-        let non_empty: Vec<usize> = lines
-            .clone()
+        let non_empty: Vec<usize> = self
+            .cursor_lines()
+            .into_iter()
             .filter(|&l| {
                 let start = self.rope.line_to_byte(l);
                 let end = self.line_end(l);
@@ -407,12 +436,6 @@ impl Buffer {
                 .slice_to_string(start..end)
                 .trim_start()
                 .starts_with(token)
-        });
-
-        self.checkpoint(if all_commented {
-            EditKind::Delete
-        } else {
-            EditKind::Insert
         });
 
         let insert = format!("{token} ");
@@ -435,50 +458,58 @@ impl Buffer {
                 }
             })
             .collect();
+        let kind = if all_commented {
+            EditKind::Delete
+        } else {
+            EditKind::Insert
+        };
         // A selection that starts where the token goes takes it in, so a
         // second toggle restores exactly what was there.
-        self.apply_edits(&edits, AtInsert::Before);
+        self.edit_lines(kind, &edits, AtInsert::Before);
     }
-    /// Duplicates the selected lines below themselves.
+    /// Duplicates each run of lines the cursors touch below itself.
+    ///
+    /// The copy goes in at the run's start, which is the same text as one
+    /// below it, so every cursor in the run moves down onto the copy, which
+    /// is what makes repeated presses stack.
     pub fn duplicate_lines(&mut self) {
         if self.is_locked() {
             return;
         }
-        let lines = self.selected_lines();
-        let start = self.rope.line_to_byte(*lines.start());
-        let last = *lines.end();
-        let end = self.rope.line_range(last).end;
-
-        // On a last line with no trailing newline the separator has to go
-        // *before* the copy, or the two lines run together.
-        let source = self.rope.slice_to_string(start..end);
-        let text = if source.ends_with('\n') {
-            source
-        } else {
-            format!("\n{source}")
-        };
-
-        self.checkpoint(EditKind::Insert);
-        let old_end_point = self.point_of(end);
-        self.rope.insert(end, &text);
-        self.record_edit(end, end, old_end_point, end + text.len());
-
-        // Move onto the copy, which is what makes repeated presses stack.
-        self.cursor += text.len();
-        self.anchor += text.len();
-        self.clamp_positions();
+        let copies: Vec<(usize, String)> = self
+            .cursor_line_runs()
+            .into_iter()
+            .map(|(first, last)| {
+                let start = self.rope.line_to_byte(first);
+                let mut text = self
+                    .rope
+                    .slice_to_string(start..self.rope.line_range(last).end);
+                // A last line with no trailing newline still needs one
+                // between it and its copy.
+                if !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                (start, text)
+            })
+            .collect();
+        let edits: Vec<_> = copies
+            .iter()
+            .map(|(at, text)| (*at..*at, text.as_str()))
+            .collect();
+        self.edit_lines(EditKind::Insert, &edits, AtInsert::After);
     }
-    /// Moves the selected lines up or down by one.
+    /// Moves each run of lines the cursors touch up or down by one. When a
+    /// run is already at the edge none of them moves, so the runs never
+    /// change places with each other.
     ///
-    /// Implemented as a swap of two adjacent spans rather than a delete and
-    /// a re-insert elsewhere, so it stays one edit for undo and for the
+    /// Each is a swap of two adjacent spans rather than a delete and a
+    /// re-insert elsewhere, so it stays one edit for undo and for the
     /// incremental parser.
     pub fn move_lines(&mut self, down: bool) {
         if self.is_locked() {
             return;
         }
-        let lines = self.selected_lines();
-        let (first, last) = (*lines.start(), *lines.end());
+        let runs = self.cursor_line_runs();
         let total = self.rope.len_lines();
         // The empty "line" after a final newline is not one to swap with:
         // doing so moved the newline instead and grew the file a line per
@@ -489,53 +520,77 @@ impl Buffer {
         } else {
             total - 1
         };
-        if (down && last + 1 > last_text) || (!down && (first == 0 || first > last_text)) {
+        let stuck = |&(first, last): &(usize, usize)| {
+            (down && last + 1 > last_text) || (!down && (first == 0 || first > last_text))
+        };
+        if runs.iter().any(stuck) {
             return;
         }
 
-        // The span covering the block plus the line it swaps with, and the
-        // offset where one ends and the other begins.
-        let (span_first, span_last) = if down {
-            (first, last + 1)
-        } else {
-            (first - 1, last)
+        // Per run: the span it swaps across, the swapped text, and how far
+        // the run's cursors move with it.
+        let swaps: Vec<(std::ops::Range<usize>, String, isize)> = runs
+            .iter()
+            .map(|&(first, last)| {
+                // The span covering the block plus the line it swaps with,
+                // and the offset where one ends and the other begins.
+                let (span_first, span_last) = if down {
+                    (first, last + 1)
+                } else {
+                    (first - 1, last)
+                };
+                let start = self.rope.line_to_byte(span_first);
+                let end = self.rope.line_range(span_last).end;
+                let split = self.rope.line_to_byte(if down { last + 1 } else { first });
+
+                let head = self.rope.slice_to_string(start..split);
+                let tail = self.rope.slice_to_string(split..end);
+
+                // After the swap `tail` comes first and must end in a
+                // newline, while `head` comes last and must only keep one if
+                // the span originally did. The last line of a file with no
+                // trailing newline is what makes this fiddly rather than a
+                // plain concatenation. Either way the span keeps its length.
+                let mut leading = tail;
+                if !leading.ends_with('\n') {
+                    leading.push('\n');
+                }
+                let mut trailing = head;
+                if !self.rope.slice_to_string(start..end).ends_with('\n') {
+                    trailing = trailing.strip_suffix('\n').unwrap_or(&trailing).to_string();
+                }
+                // Follow the block: moving down it now begins after
+                // `leading`, moving up it begins where the span does.
+                let delta = if down {
+                    leading.len() as isize
+                } else {
+                    start as isize - split as isize
+                };
+                (start..end, format!("{leading}{trailing}"), delta)
+            })
+            .collect();
+
+        // Each cursor follows the run its selection starts in.
+        let follow = |b: &Self, (anchor, head): (usize, usize)| {
+            let line = b.rope.byte_to_line(anchor.min(head));
+            let run = runs.partition_point(|r| r.1 < line);
+            let delta = swaps.get(run).map_or(0, |s| s.2);
+            let shift = |p: usize| (p as isize + delta).max(0) as usize;
+            (shift(anchor), shift(head))
         };
-        let start = self.rope.line_to_byte(span_first);
-        let end = self.rope.line_range(span_last).end;
-        let split = self.rope.line_to_byte(if down { last + 1 } else { first });
+        let primary = follow(self, (self.anchor, self.cursor));
+        let extra: Vec<_> = self.extra.iter().map(|&c| follow(self, c)).collect();
 
-        let head = self.rope.slice_to_string(start..split);
-        let tail = self.rope.slice_to_string(split..end);
-
-        // After the swap `tail` comes first and must end in a newline, while
-        // `head` comes last and must only keep one if the span originally did.
-        // The last line of a file with no trailing newline is what makes this
-        // fiddly rather than a plain concatenation.
-        let mut leading = tail;
-        if !leading.ends_with('\n') {
-            leading.push('\n');
-        }
-        let mut trailing = head;
-        if !self.rope.slice_to_string(start..end).ends_with('\n') {
-            trailing = trailing.strip_suffix('\n').unwrap_or(&trailing).to_string();
-        }
-        let swapped = format!("{leading}{trailing}");
-
-        self.checkpoint(EditKind::Insert);
-        let old_end_point = self.point_of(end);
-        self.rope.delete(start..end);
-        self.rope.insert(start, &swapped);
-        self.record_edit(start, end, old_end_point, start + swapped.len());
-
-        // Follow the block: moving down it now begins after `leading`,
-        // moving up it begins where the span does.
-        let delta = if down {
-            leading.len() as isize
-        } else {
-            start as isize - split as isize
-        };
-        self.cursor = (self.cursor as isize + delta).max(0) as usize;
-        self.anchor = (self.anchor as isize + delta).max(0) as usize;
+        let edits: Vec<_> = swaps
+            .iter()
+            .map(|(range, text, _)| (range.clone(), text.as_str()))
+            .collect();
+        self.last_edit = None;
+        self.checkpoint_keeping_cursors(EditKind::Insert);
+        self.apply_edits(&edits, AtInsert::After);
+        self.last_edit = None;
+        (self.anchor, self.cursor) = primary;
+        self.extra = extra;
         self.clamp_positions();
     }
     /// Places the cursor at the start of `line`, 0-based and clamped.

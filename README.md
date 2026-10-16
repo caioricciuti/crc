@@ -313,7 +313,8 @@ the size and write it back.
 - **A native, themed UI**: system-font chrome, light and dark following the
   system or your setting, a home screen with recent projects, overlay
   scrollbars, font zoom, and the right pointer for every control.
-- Everything an editor needs: multiple cursors (`Cmd-D`, Option-click), find
+- Everything an editor needs: multiple cursors (`Cmd-D`, Option-click,
+  Option-drag for a box), find
   and replace with regex, go to line, comment toggle, line move and
   duplicate, auto-indent and auto-close, word-wise and Emacs motions, full
   Unicode with emoji and CJK, session restore, Dock and Finder integration.
@@ -411,6 +412,7 @@ the size and write it back.
 | `Cmd-L` | go to line |
 | `Cmd-D` | select word, then next occurrence as another cursor |
 | Option-click | add a cursor |
+| Option-drag | select a box: the same columns on every row, a cursor each |
 | Escape | back to one cursor |
 | `Cmd-O` / `Cmd-Shift-O` | open file / open folder |
 | `Cmd-S` / `Cmd-Shift-S` | save / save as; File > Revert to Saved goes back to disk |

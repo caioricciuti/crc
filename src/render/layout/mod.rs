@@ -917,6 +917,44 @@ mod tests {
     }
 
     #[test]
+    fn a_box_corner_counts_cells_past_a_line_end_with_the_scroll() {
+        let atlas = atlas();
+        let m = atlas.metrics;
+        let mut buffer = Buffer::from_text(&format!("{}\nab", "x".repeat(200)));
+        buffer.scroll_column = 10;
+        buffer.scroll_x_fraction = 0.5;
+        let text_x = gutter_width(&buffer, &atlas);
+        let at = |column: f32, line: f32| {
+            let x = text_x + (column - buffer.scroll_x()) * m.advance;
+            box_corner_at(
+                &buffer,
+                &atlas,
+                &Markdown::default(),
+                x,
+                (line + 0.5) * m.line_height,
+            )
+        };
+        // Over text: the column a click there puts the caret at.
+        let over = at(80.3, 0.0);
+        assert_eq!((over.line, over.column), (0, 80));
+        assert_eq!(
+            buffer.offset_at(0, over.column),
+            offset_at_point(
+                &buffer,
+                &atlas,
+                &Markdown::default(),
+                text_x + (80.3 - buffer.scroll_x()) * m.advance,
+                0.5 * m.line_height
+            )
+        );
+        // Past the end of `ab`: the cell under the pointer, not column 2.
+        let past = at(30.2, 1.0);
+        assert_eq!((past.line, past.row, past.column), (1, 0, 30));
+        let past = at(30.7, 1.0);
+        assert_eq!(past.column, 31);
+    }
+
+    #[test]
     fn asynchronous_geometry_tracks_latest_rope_snapshot() {
         let mut atlas = atlas();
         let mut buffer = Buffer::from_text(&"é\t👩‍💻 שלום ".repeat(700));

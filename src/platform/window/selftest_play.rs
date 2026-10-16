@@ -219,6 +219,7 @@ impl EditorView {
                 name,
                 fx,
                 fy,
+                mods,
             } => {
                 let target = {
                     let Some(mut state) = self.state_mut() else {
@@ -240,19 +241,20 @@ impl EditorView {
                     inside(rect.y, rect.height, *fy),
                 );
                 use crate::platform::selftest::Mouse;
+                let flags = modifier_flags(mods);
                 match mouse {
                     Mouse::Click => {
-                        send(NSEventType::LeftMouseDown, x, y, 1);
-                        send(NSEventType::LeftMouseUp, x, y, 1);
+                        press(NSEventType::LeftMouseDown, x, y, 1, flags);
+                        press(NSEventType::LeftMouseUp, x, y, 1, flags);
                     }
                     Mouse::Down => {
                         if let Some(mut state) = self.state_mut() {
                             state.selftest_pointer = (x, y);
                         }
-                        send(NSEventType::LeftMouseDown, x, y, 1);
+                        press(NSEventType::LeftMouseDown, x, y, 1, flags);
                     }
-                    Mouse::Drag => send(NSEventType::LeftMouseDragged, x, y, 1),
-                    Mouse::Up => send(NSEventType::LeftMouseUp, x, y, 1),
+                    Mouse::Drag => press(NSEventType::LeftMouseDragged, x, y, 1, flags),
+                    Mouse::Up => press(NSEventType::LeftMouseUp, x, y, 1, flags),
                 }
             }
             Step::Down { x, y, count } => {
@@ -1055,6 +1057,26 @@ fn region_named(state: &mut State, name: &str) -> Option<Viewport> {
                 .find(|r| r.line == line && r.first)?;
             Some(Viewport {
                 x: text.x,
+                y: row.y,
+                width: m.advance,
+                height: m.line_height,
+            })
+        }
+        // A cell of the text, by line number and display column, scrolled
+        // as drawn: `cell.2.4` is the fifth column of the second line.
+        _ if name.starts_with("cell.") => {
+            let (line, column) = name["cell.".len()..].split_once('.')?;
+            let line = line.parse::<usize>().ok()?.checked_sub(1)?;
+            let column = column.parse::<f32>().ok()?;
+            let text = chrome_of(state).text;
+            let buffer = state.docs.active();
+            let m = state.renderer.atlas.metrics;
+            let row = layout::screen_rows(buffer, text, m.line_height)
+                .into_iter()
+                .find(|r| r.line == line && r.first)?;
+            let gutter = layout::gutter_width(buffer, &state.renderer.atlas);
+            Some(Viewport {
+                x: text.x + gutter + (column - buffer.scroll_x()) * m.advance,
                 y: row.y,
                 width: m.advance,
                 height: m.line_height,

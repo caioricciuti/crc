@@ -2194,6 +2194,34 @@ pub fn offset_at_point(
     )
 }
 
+/// The corner of a box selection under a point, in the coordinates
+/// [`offset_at_point`] takes. Over text it is the column of the character
+/// a click there lands at, by the same hit test; past the end of a line it
+/// keeps counting cells from the text's left edge, horizontal scroll and
+/// its fraction included, so a box can reach beyond a short line.
+pub fn box_corner_at(
+    buffer: &Buffer,
+    atlas: &Atlas,
+    markdown: &Markdown,
+    x: f32,
+    y: f32,
+) -> crate::text::buffer::BoxCorner {
+    let at = offset_at_point(buffer, atlas, markdown, x, y);
+    let mut corner = buffer.box_corner_of(at);
+    // Only the last row of a line has room past its end, and a rendered
+    // Markdown line has no plain cells to count there.
+    if at == crate::text::wrap::line_end(&buffer.rope, corner.line)
+        && markdown
+            .line(buffer, &touched_lines(buffer), corner.line)
+            .is_none()
+    {
+        let m = atlas.metrics;
+        let cells = (x - gutter_width(buffer, atlas)) / m.advance + buffer.scroll_x();
+        corner.column = corner.column.max(cells.round().max(0.0) as usize);
+    }
+    corner
+}
+
 /// The screen rows from the top of the text down to the one under `y`, for
 /// hit tests measured from the top of the text rather than a viewport.
 pub(super) fn rows_down_to(buffer: &Buffer, y: f32, line_height: f32) -> Vec<ScreenRow> {

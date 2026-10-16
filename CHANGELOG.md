@@ -4,6 +4,19 @@ One entry per tag, written for people who use the editor.
 
 ## Unreleased
 
+- Option-drag selects a box. Drag with Option held and every row between
+  where you pressed and the pointer gets a cursor, each selecting the
+  same columns, counted as they are drawn: a tab to its stop, a wide
+  character as two. A line that ends before the box gets no cursor,
+  unless every line does, and then each gets a caret at its end. With
+  word wrap on, the rows are the rows on screen. Typing then edits every
+  row, and Copy copies them a line each. Option-click without moving
+  still adds one caret.
+- Indent, outdent, comment, duplicate lines and move lines work at every
+  cursor. Each line any cursor is on changes once, however many cursors
+  are on it, every cursor stays with its text, and one undo puts it all
+  back. Before, these acted on the first cursor's lines and dropped the
+  others.
 - Moving the caret keeps every cursor. With several carets, the arrow
   keys, Option-Left and Option-Right, Cmd-Left and Cmd-Right, Home, End
   and Page Up and Down move each one, and with Shift they extend each

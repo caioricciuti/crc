@@ -261,6 +261,7 @@ impl EditorView {
                 state.drag = Some(Drag::Select {
                     unit,
                     pressed,
+                    boxed: None,
                     point: None,
                 });
                 drop(state);
@@ -268,9 +269,24 @@ impl EditorView {
                 self.pump();
                 return;
             }
+            // Option and a drag draws a box: its corner is the cell
+            // pressed, by the hit test a drag uses.
+            let boxed = (option && !shift && unit == SelectUnit::Character).then(|| {
+                let point = self.convertPoint_fromView(event.locationInWindow(), None);
+                let (x, y) = chrome_of(&state).to_text(point.x as f32, point.y as f32);
+                let corner = layout::box_corner_at(
+                    state.docs.active(),
+                    &state.renderer.atlas,
+                    &layout::Markdown::of(state.syntax.markdown(state.docs.active().id())),
+                    x,
+                    y,
+                );
+                (corner, false)
+            });
             state.drag = Some(Drag::Select {
                 unit,
                 pressed,
+                boxed,
                 point: None,
             });
         }
@@ -1041,12 +1057,13 @@ impl EditorView {
         let Some(Drag::Select {
             unit,
             pressed,
+            boxed,
             point: Some((x, y)),
         }) = &state.drag
         else {
             return false;
         };
-        let (unit, pressed, x, y) = (*unit, pressed.clone(), *x, *y);
+        let (unit, pressed, boxed, x, y) = (*unit, pressed.clone(), *boxed, *x, *y);
         let chrome = chrome_of(&state);
         let text = chrome.text;
         let m = state.renderer.atlas.metrics;
@@ -1079,6 +1096,24 @@ impl EditorView {
             y.clamp(text.y, text.y + (text.height - 1.0).max(0.0)),
         );
         let (tx, ty) = chrome.to_text(inside.0, inside.1);
+        if let Some((from, moved)) = boxed {
+            let to = layout::box_corner_at(
+                state.docs.active(),
+                &state.renderer.atlas,
+                &layout::Markdown::of(state.syntax.markdown(state.docs.active().id())),
+                tx,
+                ty,
+            );
+            // Still in the pressed cell: an Option-click, and its caret
+            // stays with the cursors there were.
+            if moved || to != from {
+                if let Some(Drag::Select { boxed, .. }) = &mut state.drag {
+                    *boxed = Some((from, true));
+                }
+                state.docs.active_mut().select_box(from, to);
+            }
+            return past != 0.0;
+        }
         let offset = layout::offset_at_point(
             state.docs.active(),
             &state.renderer.atlas,
