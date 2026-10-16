@@ -12,6 +12,12 @@ One entry per tag, written for people who use the editor.
   https and file links are followed. Hold Cmd over a link to see it
   underlined, with the pointing hand. Cmd-click works in programs that
   take the mouse, and paths open in crc as before.
+- Undo steps follow what you did, not only the clock. A paste, a line
+  break, and text committed by an input method each undo on their own,
+  so pasting right after typing no longer takes both away. Typing still
+  groups, but a new word starts a new step: typing "hello world" quickly
+  undoes "world" first, then "hello ". Each document keeps its last
+  1000 undo steps, so a long session no longer grows without limit.
 - Source Control: the commit message can have a body. Return or
   Shift-Return starts a new line, and Cmd-Return still commits. The
   field grows a line at a time up to eight lines, then scrolls, and the

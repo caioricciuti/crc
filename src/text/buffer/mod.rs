@@ -31,6 +31,9 @@ pub const FOLD_ALL_MAX_LINES: usize = 100_000;
 /// Consecutive edits closer together than this fold into one undo step, so
 /// undo steps back over a word rather than a character.
 const COALESCE_WINDOW: Duration = Duration::from_millis(600);
+/// Undo steps kept per document. Past this the oldest are dropped, so a
+/// long session does not hold every version of the text it ever had.
+const UNDO_LIMIT: usize = 1000;
 /// True for a UTF-8 continuation byte, the trailing bytes of a multi-byte
 /// character.
 fn is_continuation(b: u8) -> bool {
@@ -221,7 +224,9 @@ pub struct Buffer {
     /// would permanently lose the original column.
     goal_column: Option<usize>,
 
-    undo_stack: Vec<Snapshot>,
+    /// Oldest first, at most [`UNDO_LIMIT`]. Redo needs no cap of its own:
+    /// it only fills from undo.
+    undo_stack: std::collections::VecDeque<Snapshot>,
     redo_stack: Vec<Snapshot>,
     last_edit: Option<(EditKind, Instant)>,
 
@@ -517,23 +522,56 @@ impl Buffer {
             Some((prev, at)) if prev == kind && now.duration_since(at) < COALESCE_WINDOW
         );
         if !coalesce {
-            self.undo_stack.push(self.snapshot());
+            self.push_undo(self.snapshot());
         }
         self.last_edit = Some((kind, now));
         self.redo_stack.clear();
         self.dirty = true;
     }
+    /// Pushes an undo step, dropping the oldest past [`UNDO_LIMIT`].
+    fn push_undo(&mut self, snapshot: Snapshot) {
+        self.undo_stack.push_back(snapshot);
+        if self.undo_stack.len() > UNDO_LIMIT {
+            self.undo_stack.pop_front();
+        }
+    }
     pub fn insert(&mut self, text: &str) {
+        let text = normalize_newlines(text);
+        let mut chars = text.chars();
+        let typed = matches!((chars.next(), chars.next()), (Some(c), None) if c != '\n');
+        self.insert_as(&text, typed);
+    }
+    /// Inserts `text`, `typed` when it is one keystroke's worth: those
+    /// coalesce into a run, which a new word breaks. Anything else, a paste,
+    /// a line break, an input method's commit, is an undo step of its own.
+    fn insert_as(&mut self, text: &str, typed: bool) {
         if self.is_locked() {
             return;
         }
-        let text = &*normalize_newlines(text);
+        let start = self.selection().map_or(self.cursor, |r| r.start);
+        let new_word = text
+            .chars()
+            .next()
+            .is_some_and(|c| class_of(c) == CharClass::Word)
+            && self
+                .char_before(start)
+                .is_none_or(|c| class_of(c) != CharClass::Word);
+        if !typed || new_word {
+            self.last_edit = None;
+        }
         if !self.extra.is_empty() {
             self.checkpoint_keeping_cursors(EditKind::Insert);
             self.edit_at_all_cursors(text, Reach::Nothing);
-            return;
+        } else {
+            self.checkpoint(EditKind::Insert);
+            self.insert_at_cursor(text);
         }
-        self.checkpoint(EditKind::Insert);
+        if !typed {
+            self.last_edit = None;
+        }
+    }
+    /// The single-cursor half of [`Buffer::insert_as`], after the checkpoint.
+    fn insert_at_cursor(&mut self, text: &str) {
         // A selection being replaced is one edit from its start to its end,
         // not a delete followed by an insert.
         let selection = self.selection();
@@ -637,7 +675,7 @@ impl Buffer {
             return false;
         }
         let taken = if undo {
-            self.undo_stack.pop()
+            self.undo_stack.pop_back()
         } else {
             self.redo_stack.pop()
         };
@@ -648,7 +686,7 @@ impl Buffer {
         if undo {
             self.redo_stack.push(now);
         } else {
-            self.undo_stack.push(now);
+            self.push_undo(now);
         }
         let before = self.rope.clone();
         self.restore(snapshot);
@@ -2471,6 +2509,121 @@ mod tests {
             "",
             "undo stepped one character at a time"
         );
+    }
+
+    #[test]
+    fn paste_is_its_own_undo_step() {
+        let mut b = Buffer::from_text("");
+        for c in "value".chars() {
+            b.insert(&c.to_string());
+        }
+        b.insert(" = pasted;");
+        b.insert("y");
+        assert_eq!(b.rope.to_string(), "value = pasted;y");
+        b.undo();
+        assert_eq!(
+            b.rope.to_string(),
+            "value = pasted;",
+            "typing after a paste"
+        );
+        b.undo();
+        assert_eq!(b.rope.to_string(), "value", "the paste on its own");
+        b.undo();
+        assert_eq!(b.rope.to_string(), "");
+    }
+
+    #[test]
+    fn a_newline_is_its_own_undo_step() {
+        let mut b = Buffer::from_text("");
+        for c in "abc".chars() {
+            b.insert(&c.to_string());
+        }
+        b.insert_newline_indented();
+        b.insert("d");
+        assert_eq!(b.rope.to_string(), "abc\nd");
+        b.undo();
+        assert_eq!(b.rope.to_string(), "abc\n");
+        b.undo();
+        assert_eq!(b.rope.to_string(), "abc", "Return undoes on its own");
+        b.undo();
+        assert_eq!(b.rope.to_string(), "");
+    }
+
+    #[test]
+    fn a_newline_between_brackets_is_one_undo_step() {
+        let mut b = Buffer::from_text("{}");
+        b.place_cursor(1, Move);
+        b.insert_newline_indented();
+        assert_eq!(b.rope.to_string(), "{\n    \n}");
+        assert_eq!(b.cursor_position(), (1, 4));
+        b.undo();
+        assert_eq!(b.rope.to_string(), "{}");
+        assert!(!b.can_undo());
+    }
+
+    #[test]
+    fn a_new_word_starts_a_new_undo_step() {
+        let mut b = Buffer::from_text("");
+        for c in "hello world".chars() {
+            b.insert(&c.to_string());
+        }
+        b.undo();
+        assert_eq!(b.rope.to_string(), "hello ");
+        b.undo();
+        assert_eq!(b.rope.to_string(), "");
+        assert!(!b.can_undo());
+    }
+
+    #[test]
+    fn an_auto_closed_pair_types_like_one_character() {
+        let mut b = Buffer::from_text("");
+        for c in "f(".chars() {
+            b.insert_char_paired(c);
+        }
+        b.insert_char_paired('x');
+        assert_eq!(b.rope.to_string(), "f(x)");
+        b.undo();
+        assert_eq!(b.rope.to_string(), "f()", "x starts a word");
+        b.undo();
+        assert_eq!(b.rope.to_string(), "", "f and the pair are one run");
+    }
+
+    #[test]
+    fn an_input_method_commit_is_one_undo_step() {
+        // A composition lives outside the buffer until it is committed, and
+        // then arrives as one insert.
+        let mut b = Buffer::from_text("");
+        b.insert("a");
+        b.insert("日本語");
+        assert_eq!(b.rope.to_string(), "a日本語");
+        b.undo();
+        assert_eq!(b.rope.to_string(), "a");
+        b.redo();
+        assert_eq!(b.rope.to_string(), "a日本語");
+    }
+
+    #[test]
+    fn undo_stack_is_capped() {
+        let dir = scratch_dir("undo-cap");
+        let path = dir.join("u.txt");
+        std::fs::write(&path, "").expect("write");
+        let mut b = Buffer::open(&path).expect("open");
+        for _ in 0..UNDO_LIMIT + 50 {
+            b.insert("\n");
+        }
+        assert_eq!(b.undo_stack.len(), UNDO_LIMIT);
+        b.save(None).expect("save");
+        let mut undone = 0;
+        while b.undo() {
+            undone += 1;
+            assert!(b.is_dirty());
+        }
+        assert_eq!(undone, UNDO_LIMIT);
+        assert_eq!(b.rope.len_bytes(), 50, "the oldest steps were dropped");
+        while b.redo() {}
+        assert!(!b.is_dirty(), "redo is back at the saved text");
+        assert_eq!(b.undo_stack.len(), UNDO_LIMIT);
+        std::fs::remove_dir_all(dir).expect("cleanup");
     }
 
     #[test]

@@ -353,7 +353,7 @@ impl Buffer {
         self.format = format;
         self.extra.clear();
         self.clamp_positions();
-        self.undo_stack.push(before);
+        self.push_undo(before);
         self.redo_stack.clear();
         self.invalidate_edits();
         self.goal_column = None;
@@ -666,7 +666,7 @@ impl Buffer {
             folds: Vec::new(),
             indent_style: None,
             goal_column: None,
-            undo_stack: Vec::new(),
+            undo_stack: std::collections::VecDeque::new(),
             redo_stack: Vec::new(),
             last_edit: None,
             syntax_sync: SyntaxSync::Edits(Vec::new()),

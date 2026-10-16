@@ -83,7 +83,8 @@ impl Buffer {
         let mut pair = String::with_capacity(2);
         pair.push(ch);
         pair.push(closer);
-        self.insert(&pair);
+        // One keystroke, so it undoes with the typing around it.
+        self.insert_as(&pair, true);
         // Every cursor typed the pair, so every cursor sits inside its own.
         self.shift_carets(-(closer.len_utf8() as isize));
     }
@@ -288,16 +289,17 @@ impl Buffer {
         if opens {
             text.push_str(&unit);
         }
-        self.insert(&text);
-
+        // Put a closer right after on its own line, then step back onto the
+        // blank line between them. One insert, so it is one undo step.
+        let mut tail = String::new();
         if opens && after_is_close {
-            // Put the closer on its own line, then step back onto the blank
-            // line between them.
-            let landing = self.cursor;
-            let mut tail = String::with_capacity(indent.len() + 1);
             tail.push('\n');
             tail.push_str(&indent);
-            self.insert(&tail);
+            text.push_str(&tail);
+        }
+        self.insert(&text);
+        if !tail.is_empty() {
+            let landing = self.cursor - tail.len();
             self.cursor = landing;
             self.anchor = landing;
         }
