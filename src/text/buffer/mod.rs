@@ -2844,6 +2844,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn replace_current_with_extra_cursors_replaces_only_the_match() {
+        // Other selections of the same word, as Cmd-D leaves them.
+        let mut b = Buffer::from_text("cat dog\ncat bird\ncat fish");
+        b.move_buffer_start(Move);
+        for _ in 0..3 {
+            b.move_right(Extend);
+        }
+        b.add_cursor(8, 11);
+        b.add_cursor(17, 20);
+        assert!(b.replace_current("cat", "x"));
+        assert_eq!(b.rope.to_string(), "x dog\ncat bird\ncat fish");
+        assert_eq!(b.cursor_count(), 1);
+        b.undo();
+        assert_eq!(b.rope.to_string(), "cat dog\ncat bird\ncat fish");
+
+        // Bare carets elsewhere get nothing typed at them either.
+        let mut b = Buffer::from_text("cat dog\ncat bird");
+        b.move_buffer_start(Move);
+        for _ in 0..3 {
+            b.move_right(Extend);
+        }
+        b.add_cursor(5, 5);
+        b.add_cursor(12, 12);
+        assert!(b.replace_current("cat", "x"));
+        assert_eq!(b.rope.to_string(), "x dog\ncat bird");
+        assert_eq!(b.cursor_count(), 1);
+    }
+
     // ---- line operations -------------------------------------------------
 
     #[test]

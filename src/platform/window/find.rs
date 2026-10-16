@@ -657,12 +657,12 @@ impl EditorView {
         let replaced = selected
             .and_then(|range| matches.iter().find(|m| m.range == range))
             .is_some_and(|found| {
-                self.ivars()
-                    .state
-                    .borrow_mut()
-                    .docs
-                    .active_mut()
-                    .insert(&found.replacement);
+                let mut state = self.ivars().state.borrow_mut();
+                let buffer = state.docs.active_mut();
+                // Only the current match: an insert with several cursors
+                // would put the replacement at every one of them.
+                buffer.collapse_cursors();
+                buffer.insert(&found.replacement);
                 true
             });
 

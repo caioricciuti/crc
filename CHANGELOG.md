@@ -4,6 +4,11 @@ One entry per tag, written for people who use the editor.
 
 ## Unreleased
 
+- Replace in the find bar replaces only the current match when there are
+  several cursors. With selections from Cmd-D, it used to put the
+  replacement at every cursor. Now it replaces the match, goes back to
+  one cursor and moves on to the next match, and a regex replacement
+  expands its groups for that match alone.
 - Option-drag selects a box. Drag with Option held and every row between
   where you pressed and the pointer gets a cursor, each selecting the
   same columns, counted as they are drawn: a tab to its stop, a wide

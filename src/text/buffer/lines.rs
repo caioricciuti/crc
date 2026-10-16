@@ -147,6 +147,9 @@ impl Buffer {
         if self.rope.slice_to_string(range.clone()) != needle {
             return false;
         }
+        // The match is the primary's selection. Other cursors would each
+        // get the replacement too, whatever they hold.
+        self.collapse_cursors();
         self.insert(text);
         true
     }
