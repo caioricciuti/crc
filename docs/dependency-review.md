@@ -115,6 +115,17 @@ bindings do not generate (`CGBitmapContextCreate`, `CGBitmapContextGetData`,
 system APIs decades old. Declaring them links against the OS; it does not add
 a dependency.
 
+`src/history/compress.rs` binds four functions of libcompression, the
+system library behind Apple's Compression framework (macOS 10.11 and
+later): `compression_encode_scratch_buffer_size`,
+`compression_encode_buffer`, `compression_decode_scratch_buffer_size` and
+`compression_decode_buffer`, used only with `COMPRESSION_LZFSE`. Local
+history stores every past version of a file, and LZFSE keeps that small at
+several times zlib's speed. The linker resolves `-lcompression` through the
+SDK stub, so there is no crate and no build script change. Both calls are
+one-shot buffer to buffer with sizes the caller passes; a decode that does
+not produce exactly the recorded size is treated as corrupt.
+
 ## Adding a dependency
 
 1. Check publish date, maintainers, download counts against crates.io.
