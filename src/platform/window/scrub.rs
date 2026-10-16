@@ -1658,10 +1658,13 @@ impl EditorView {
     /// File History, at the version `goto` names when there is one.
     pub(super) fn open_history_at(&self, goto: Option<Goto>) {
         let opened = self.start_history_at(goto);
-        if let Err(why) = opened
-            && let Some(mut state) = self.state_mut()
-        {
-            state.message = Some((why, Instant::now()));
+        if let Some(mut state) = self.state_mut() {
+            match opened {
+                Err(why) => state.message = Some((why, Instant::now())),
+                // The history's tab takes the keys, as any tab switched to
+                // does: a list open in the file would keep the arrows.
+                Ok(()) => state.completion = None,
+            }
         }
         self.sync_title();
         self.reparse();

@@ -181,6 +181,50 @@ expect_line "$T/scrub-closed.out" 7 "zeta"
 [ "$(git -C "$T/scrubproj" status --porcelain | tr '\n' ' ')" = " M journal.txt ?? untracked.txt " ] \
     || failed "scrubber: the repository changed: $(git -C "$T/scrubproj" status --porcelain)"
 
+# ---- File History over an open completion list ---------------------------------
+# "zet" typed on the last line offers zeta. Cmd-Option-Y closes the list
+# with the history open (the newest version the file as it was opened,
+# kept in local history), so Left steps to the newest commit instead of
+# moving the caret, and Escape finds the typed text and the caret as
+# they were.
+cat > "$T/scrub-comp.script" <<SCRIPT
+wait 800
+wait 600
+key 125 cmd
+text zet
+wait 300
+wait 300
+dump $T/scrub-comp-list.out
+key 16 cmd,opt y
+wait 800
+dump $T/scrub-comp-open.out
+key 123
+wait 300
+dump $T/scrub-comp-older.out
+key 53
+wait 100
+dump $T/scrub-comp-closed.out
+quit
+SCRIPT
+# Its own local history, so the typed text left unsaved at quit is in
+# no other run's versions.
+CRC_HISTORY_DB="$T/scrub-comp.db" CRC_DISCARD_ANSWER=dont-save \
+    CRC_SELFTEST="$T/scrub-comp.script" "$BIN" "$T/scrubproj/journal.txt" 2> "$T/scrub-comp.err"
+expect "$T/scrub-comp-list.out" completion "zeta"
+expect "$T/scrub-comp-open.out" completion ""
+case "$(grep -m1 '^scrub: ' "$T/scrub-comp-open.out")" in
+    "scrub: 6/6@local:opened "*) ;;
+    *) failed "scrubber: open over a list: $(grep -m1 '^scrub: ' "$T/scrub-comp-open.out")" ;;
+esac
+case "$(grep -m1 '^scrub: ' "$T/scrub-comp-older.out")" in
+    "scrub: 5/6@$(scrub_hash HEAD) "*) ;;
+    *) failed "scrubber: Left over a list: $(grep -m1 '^scrub: ' "$T/scrub-comp-older.out")" ;;
+esac
+expect "$T/scrub-comp-closed.out" scrub "closed"
+expect "$T/scrub-comp-closed.out" tabs "journal.txt"
+expect "$T/scrub-comp-closed.out" cursor "8:4"
+expect_line "$T/scrub-comp-closed.out" 8 "zet"
+
 # ---- the strip above the history ------------------------------------------------
 # Older and Newer step as the arrows do; a click on the timeline goes to
 # the version under it, the left end the oldest and the right end the
