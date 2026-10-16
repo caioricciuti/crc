@@ -91,7 +91,7 @@ the size and write it back.
   oldest version and back to your working text, or drag along the
   timeline above it; each step washes in what changed and fades out what
   went. Escape returns. The versions local history kept sit between the
-  commits by time, as smaller ticks with a Local pill that says why each
+  commits by time, as dots with a Local pill that says why and when each
   was kept (saved, idle, before reload, closed without saving and the
   like); the filter beside Newer steps through All, Commits or Local
   alone, and the window keeps it for the next history. A file Git does

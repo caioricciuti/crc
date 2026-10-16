@@ -67,6 +67,102 @@ pub fn unix_seconds() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// When `time` was on the local clock, as a person places a recent moment:
+/// "14:32" today, "Tue 14:32" in the six days before, "12 Oct 14:32"
+/// earlier this year and "12 Oct 2025 14:32" before that. 24-hour, in the
+/// user's time zone.
+pub fn clock_time(time: i64, now: i64) -> String {
+    clock_words(time, utc_offset(time), now, utc_offset(now))
+}
+
+/// [`clock_time`] with the zone's offsets from UTC given, in seconds: one
+/// for `time` and one for `now`, as daylight saving may change between.
+pub fn clock_words(time: i64, time_offset: i64, now: i64, now_offset: i64) -> String {
+    const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let at = Wall::of(time + time_offset);
+    let today = Wall::of(now + now_offset);
+    let hm = format!("{:02}:{:02}", at.hour, at.minute);
+    match today.days - at.days {
+        0 => hm,
+        1..=6 => format!("{} {hm}", DAYS[at.weekday]),
+        _ if at.year == today.year => format!("{} {} {hm}", at.day, MONTHS[at.month - 1]),
+        _ => format!("{} {} {} {hm}", at.day, MONTHS[at.month - 1], at.year),
+    }
+}
+
+/// A moment on a wall clock, from seconds since 1970 in its zone.
+struct Wall {
+    /// Days since 1 January 1970.
+    days: i64,
+    year: i64,
+    /// 1 to 12.
+    month: usize,
+    day: i64,
+    /// 0 for Sunday.
+    weekday: usize,
+    hour: i64,
+    minute: i64,
+}
+
+impl Wall {
+    fn of(seconds: i64) -> Wall {
+        let days = seconds.div_euclid(86_400);
+        let second = seconds.rem_euclid(86_400);
+        // The civil date from a day count (Howard Hinnant's algorithm): in
+        // 400-year eras of years that start in March.
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let of_era = z - era * 146_097;
+        let year_of_era = (of_era - of_era / 1460 + of_era / 36_524 - of_era / 146_096) / 365;
+        let of_year = of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+        let m = (5 * of_year + 2) / 153;
+        let month = if m < 10 { m + 3 } else { m - 9 };
+        Wall {
+            days,
+            year: year_of_era + era * 400 + i64::from(month <= 2),
+            month: month as usize,
+            day: of_year - (153 * m + 2) / 5 + 1,
+            // 1 January 1970 was a Thursday.
+            weekday: (days + 4).rem_euclid(7) as usize,
+            hour: second / 3600,
+            minute: second % 3600 / 60,
+        }
+    }
+}
+
+/// `struct tm` as macOS lays it out.
+#[repr(C)]
+struct Tm {
+    sec: i32,
+    min: i32,
+    hour: i32,
+    mday: i32,
+    mon: i32,
+    year: i32,
+    wday: i32,
+    yday: i32,
+    isdst: i32,
+    gmtoff: i64,
+    zone: *mut std::ffi::c_char,
+}
+
+/// The local zone's offset from UTC at `time`, in seconds; 0 when the
+/// system cannot say.
+pub fn utc_offset(time: i64) -> i64 {
+    let mut tm = std::mem::MaybeUninit::<Tm>::zeroed();
+    // SAFETY: `tm` is a whole `struct tm` for localtime_r to fill, and
+    // `time` lives across the call; it returns null on failure.
+    let filled = unsafe { localtime_r(&time, tm.as_mut_ptr()) };
+    if filled.is_null() {
+        return 0;
+    }
+    // SAFETY: filled, and every field is a plain integer or pointer.
+    unsafe { tm.assume_init() }.gmtoff
+}
+
 /// FNV-1a: a stable 64-bit hash for names, no crate for it. build.rs keeps
 /// its own copy, as a build script cannot use the crate it builds.
 pub fn fnv1a(bytes: &[u8]) -> u64 {
@@ -81,6 +177,7 @@ fn home() -> Option<std::path::PathBuf> {
 
 unsafe extern "C" {
     fn kill(pid: i32, signal: i32) -> i32;
+    fn localtime_r(time: *const i64, out: *mut Tm) -> *mut Tm;
     fn proc_pidinfo(pid: i32, flavor: i32, arg: u64, buffer: *mut u8, size: i32) -> i32;
     fn proc_listchildpids(pid: i32, buffer: *mut i32, size: i32) -> i32;
     fn sysctl(
@@ -243,6 +340,61 @@ pub fn write_atomically_with(
         let _ = std::fs::remove_file(&tmp);
     }
     result
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::clock_words;
+
+    /// Friday 16 October 2026, 14:32 at UTC+2.
+    const NOW: i64 = 1_792_153_920;
+    const CEST: i64 = 7200;
+
+    #[test]
+    fn today_is_the_time_alone_and_the_zone_decides_the_day() {
+        assert_eq!(clock_words(NOW - 60, CEST, NOW, CEST), "14:31");
+        assert_eq!(clock_words(NOW, CEST, NOW, CEST), "14:32");
+        // 22:10 UTC on Thursday is ten past midnight on Friday here.
+        assert_eq!(clock_words(1_792_102_200, CEST, NOW, CEST), "00:10");
+        assert_eq!(clock_words(1_792_102_200, 0, NOW, 0), "Thu 22:10");
+    }
+
+    #[test]
+    fn the_last_six_days_are_named_and_earlier_ones_dated() {
+        assert_eq!(clock_words(1_792_099_800, CEST, NOW, CEST), "Thu 23:30");
+        assert_eq!(clock_words(1_791_635_520, CEST, NOW, CEST), "Sat 14:32");
+        assert_eq!(clock_words(1_791_549_120, CEST, NOW, CEST), "9 Oct 14:32");
+        assert_eq!(
+            clock_words(1_760_272_320, CEST, NOW, CEST),
+            "12 Oct 2025 14:32"
+        );
+        assert_eq!(
+            clock_words(1_709_193_900, 0, NOW, CEST),
+            "29 Feb 2024 08:05"
+        );
+    }
+
+    #[test]
+    fn across_a_new_year_and_a_change_of_offset() {
+        // 00:30 UTC on 1 January 2026 is 23:30 on New Year's Eve at UTC-1.
+        let eve = 1_767_227_400;
+        assert_eq!(clock_words(eve, -3600, eve + 3600, -3600), "Wed 23:30");
+        assert_eq!(clock_words(eve, -3600, NOW, CEST), "31 Dec 2025 23:30");
+        // Saturday 23:30 in winter time, read on Sunday morning in summer
+        // time: each moment in its own offset.
+        assert_eq!(
+            clock_words(1_774_737_000, 3600, 1_774_771_200, CEST),
+            "Sat 23:30"
+        );
+    }
+
+    #[test]
+    fn the_local_offset_is_a_zones() {
+        let now = super::unix_seconds() as i64;
+        let offset = super::utc_offset(now);
+        assert!(offset.abs() <= 14 * 3600 && offset % 900 == 0, "{offset}");
+        assert_eq!(super::clock_time(now, now).len(), 5);
+    }
 }
 
 #[cfg(test)]

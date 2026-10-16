@@ -5,10 +5,11 @@ One entry per tag, written for people who use the editor.
 ## Unreleased
 
 - File History shows local history too. The versions crc kept of a file
-  sit between its commits by time, as smaller ticks on the timeline, and
-  one shows a Local pill with why it was kept (saved, idle, before
-  reload, closed without saving, at quit, opened, edited on disk) and
-  when. A version equal to the commit beside it, such as the save you
+  sit between its commits by time, as dots on the timeline, and one
+  shows a Local pill with why it was kept (saved, idle, before reload,
+  closed without saving, at quit, opened, edited on disk) and when, by
+  the clock: 14:32 today, Tue 14:32 this past week, 12 Oct 14:32 before
+  that. A version equal to the commit beside it, such as the save you
   then committed, is left out. A filter beside Older and Newer steps
   through all versions, commits alone or local versions alone, and the
   window remembers it for the next history. A file outside Git, or one

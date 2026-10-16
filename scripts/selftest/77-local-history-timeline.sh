@@ -21,6 +21,16 @@ GIT_AUTHOR_DATE=2024-03-01T12:00:00Z GIT_COMMITTER_DATE=2024-03-01T12:00:00Z \
 printf 'loose\n' > "$T/lhloose/memo.txt"
 printf 'bare\n' > "$T/lhloose/bare.txt"
 lh_hash() { git -C "$T/lhproj" rev-parse --short=7 "$1"; }
+# lh_clock <file> <field> <before> <after>: the field is <before>, a
+# 24-hour clock time and <after>, as a local version made today says when.
+lh_clock() {
+    local got
+    got=$(grep -m1 "^$2: " "$1" 2>/dev/null | sed "s/^$2: //" || true)
+    case "$got" in
+        "$3"[0-2][0-9]:[0-5][0-9]"$4") ;;
+        *) failed "$(basename "$1"): $2 is [$got], expected [$3HH:MM$4]" ;;
+    esac
+}
 
 # Two saves of plan.txt, and one of memo.txt, into the run's history.
 cat > "$T/lh-edit.script" <<SCRIPT
@@ -101,9 +111,9 @@ case "$(grep -m1 '^scrub: ' "$T/lh-local.out")" in
     "scrub: 3/4@local:saved "*"first=xyalpha") ;;
     *) failed "lh: the second save: $(grep -m1 '^scrub: ' "$T/lh-local.out")" ;;
 esac
-expect "$T/lh-local.out" scrub_strip "saved, just now | 3 of 4 | older=true newer=true"
-expect "$T/lh-local.out" message "local version, saved, just now (3 of 4)"
-expect "$T/lh-local.out" tabs "plan.txt | plan.txt @ saved"
+lh_clock "$T/lh-local.out" scrub_strip "saved, " " | 3 of 4 | older=true newer=true"
+lh_clock "$T/lh-local.out" message "local version, saved, " " (3 of 4)"
+lh_clock "$T/lh-local.out" tabs "plan.txt | plan.txt @ saved " ""
 expect "$T/lh-local.out" gutter "1M inactive"
 case "$(grep -m1 '^scrub: ' "$T/lh-local-older.out")" in
     "scrub: 2/4@local:saved "*"first=xalpha") ;;
@@ -167,12 +177,12 @@ case "$(grep -m1 '^scrub: ' "$T/lh-loose.out")" in
     "scrub: 2/2@local:saved "*"first=zloose") ;;
     *) failed "lh: outside Git: $(grep -m1 '^scrub: ' "$T/lh-loose.out")" ;;
 esac
-expect "$T/lh-loose.out" tabs "memo.txt | memo.txt @ saved"
+lh_clock "$T/lh-loose.out" tabs "memo.txt | memo.txt @ saved " ""
 case "$(grep -m1 '^scrub: ' "$T/lh-loose-older.out")" in
     "scrub: 1/2@local:opened "*"first=loose") ;;
     *) failed "lh: outside Git, opened: $(grep -m1 '^scrub: ' "$T/lh-loose-older.out")" ;;
 esac
-expect "$T/lh-loose-older.out" scrub_strip "opened, just now | 1 of 2 | older=false newer=true"
+lh_clock "$T/lh-loose-older.out" scrub_strip "opened, " " | 1 of 2 | older=false newer=true"
 expect "$T/lh-loose-filter.out" message "memo.txt has no commits to filter by"
 expect "$T/lh-loose-filter.out" scrub_filter "all 2/2 local:opened,local:saved"
 cat > "$T/lh-bare.script" <<SCRIPT

@@ -547,8 +547,14 @@ impl Scrub {
         match self.versions.as_ref().and_then(|v| v.get(slot)) {
             Some(Version {
                 source: Source::Local { reason, .. },
+                time,
                 ..
-            }) => format!("{} @ {}", self.name, reason_words(*reason)),
+            }) => format!(
+                "{} @ {} {}",
+                self.name,
+                reason_words(*reason),
+                crate::platform::clock_time(*time, crate::platform::unix_seconds() as i64)
+            ),
             Some(version) => format!("{} @ {}", self.name, short(&version.commit)),
             None => format!("{} @ working tree", self.name),
         }
@@ -567,7 +573,7 @@ impl Scrub {
             }) => format!(
                 "local version, {}, {} ({} of {count}{more})",
                 reason_words(*reason),
-                crate::project::git::ago(*time, now),
+                crate::platform::clock_time(*time, now),
                 slot + 1,
             ),
             Some(version) => format!(
@@ -975,7 +981,7 @@ fn strip_text(scrub: &Scrub, now: i64) -> StripText {
             lead: format!(
                 "{}, {}   ",
                 reason_words(*reason),
-                crate::project::git::ago(*time, now)
+                crate::platform::clock_time(*time, now)
             ),
             summary: String::new(),
             right: format!("{} of {count}{more}", at + 1),
@@ -1012,7 +1018,7 @@ fn slot_tip(scrub: &Scrub, slot: usize, now: i64) -> String {
         }) => format!(
             "Local version  {}, {}",
             reason_words(*reason),
-            crate::project::git::ago(*time, now)
+            crate::platform::clock_time(*time, now)
         ),
         Some(version) => format!(
             "{}  {}, {}\n{}",
@@ -1099,10 +1105,11 @@ pub(super) fn draw_strip(
     layout::strip_hairline(out, atlas, strip, theme);
 }
 
-/// The timeline: a line with a tick per version, brighter where the text
-/// is already read, a ring for the working tree at the right end, and the
-/// thumb on the version shown. Too many versions for a tick each, and it
-/// is a band instead, brighter over the versions read. While the versions
+/// The timeline: a line with a tick per commit, brighter where the text
+/// is already read, a dot per local version, a ring for the working tree
+/// at the right end, and the thumb on the version shown. Too many versions
+/// for a tick each, and it is a band instead, brighter over the versions
+/// read, with a mark over each run of local versions. While the versions
 /// are listed, a bar runs along it.
 fn draw_timeline(
     scrub: &Scrub,
@@ -1163,6 +1170,29 @@ fn draw_timeline(
         for (from, to) in runs {
             band(out, x_of(from), x_of(to), layout::faded(ink, 0.5));
         }
+        // Local versions: a mark a little taller than the band, in the
+        // colour of their pill, one per run of them side by side.
+        let versions = scrub.versions.as_deref().unwrap_or_default();
+        let mut slot = 0;
+        while slot < count {
+            if !versions[slot].is_local() {
+                slot += 1;
+                continue;
+            }
+            let from = slot;
+            while slot + 1 < count && versions[slot + 1].is_local() {
+                slot += 1;
+            }
+            let left = m.snap(x_of(from) - 0.5);
+            layout::push_rect(
+                out,
+                atlas,
+                [left, mid - 3.0],
+                [(m.snap(x_of(slot) + 0.5) - left).max(1.0), 6.0],
+                theme.diff_modified,
+            );
+            slot += 1;
+        }
     } else {
         layout::push_rect(
             out,
@@ -1171,22 +1201,36 @@ fn draw_timeline(
             [last - first, 2.0],
             layout::faded(ink, 0.22),
         );
-        // A local version's tick is shorter and fainter than a commit's,
-        // in the colour of its pill.
+        // A local version is a dot on the line in the colour of its pill,
+        // under the commits' ticks so a commit beside it keeps its height.
         let versions = scrub.versions.as_deref().unwrap_or_default();
         for slot in 0..count {
-            let read = scrub.texts.contains_key(&slot);
-            let (colour, alpha, half) = if versions.get(slot).is_some_and(Version::is_local) {
-                (theme.diff_modified, if read { 0.6 } else { 0.3 }, 3.0)
+            if versions.get(slot).is_some_and(Version::is_local) {
+                let centre = m.snap(x_of(slot) - 0.5) + 0.5;
+                let dot = Viewport {
+                    x: centre - 2.5,
+                    y: mid - 2.5,
+                    width: 5.0,
+                    height: 5.0,
+                };
+                layout::push_rounded_rect(out, dot, 2.5, theme.diff_modified);
+            }
+        }
+        for slot in 0..count {
+            if versions.get(slot).is_some_and(Version::is_local) {
+                continue;
+            }
+            let alpha = if scrub.texts.contains_key(&slot) {
+                0.85
             } else {
-                (ink, if read { 0.85 } else { 0.4 }, 5.0)
+                0.4
             };
             layout::push_rect(
                 out,
                 atlas,
-                [m.snap(x_of(slot) - 0.5), mid - half],
-                [1.0, 2.0 * half],
-                layout::faded(colour, alpha),
+                [m.snap(x_of(slot) - 0.5), mid - 5.0],
+                [1.0, 10.0],
+                layout::faded(ink, alpha),
             );
         }
     }
