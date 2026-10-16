@@ -455,8 +455,7 @@ pub fn inline_hits(
         };
         let conflict = &view.conflicts[index];
         let marker_chars = buffer.rope.line(row.line).trim_end().chars().count();
-        let mut x = (text_x
-            + (marker_chars as f32 + 3.0 - buffer.scroll_column as f32) * m.advance)
+        let mut x = (text_x + (marker_chars as f32 + 3.0 - buffer.scroll_x()) * m.advance)
             .max(text_x + 4.0);
         for take in Take::ALL {
             if !conflict.offers(take) {

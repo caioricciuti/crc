@@ -834,6 +834,89 @@ mod tests {
     }
 
     #[test]
+    fn a_part_of_a_column_scrolled_moves_text_carets_bands_and_squiggles_alike() {
+        let mut atlas = atlas();
+        let m = atlas.metrics;
+        let theme = Theme::default();
+        let mut buffer = Buffer::from_text(&format!("{}\nshort\n", "abcdefghij".repeat(30)));
+        buffer.select_range(50, 60);
+        buffer.scroll_column = 40;
+        let viewport = Viewport::new(600.0, 200.0);
+        let squiggle = [0.1, 0.9, 0.2, 1.0];
+        let frame = |buffer: &Buffer, atlas: &mut Atlas| {
+            let mut out = Vec::new();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                build_with_matches(buffer, atlas, viewport, &theme, "fgh", &mut out);
+                if !atlas.has_pending_shaping() {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline, "shaping timed out");
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            let rows = screen_rows(buffer, viewport, atlas.metrics.line_height);
+            push_underlines(
+                &mut out,
+                atlas,
+                buffer,
+                viewport,
+                &rows,
+                &[(70..74, squiggle)],
+            );
+            out
+        };
+        // Left edges of the quads of one colour, away from either clip.
+        let text_x = gutter_width(&buffer, &atlas);
+        let lefts = |out: &[GlyphInstance], color: [f32; 4]| -> Vec<f32> {
+            out.iter()
+                .filter(|q| q.color == color && q.size[0] > 1.0)
+                .map(|q| q.pos[0])
+                .filter(|x| *x > text_x + 2.0 * m.advance && *x < 560.0)
+                .collect()
+        };
+        let whole = frame(&buffer, &mut atlas);
+        let caret = caret_rect(&buffer, &atlas, &Markdown::default(), viewport).unwrap();
+        buffer.scroll_x_fraction = 0.5;
+        let part = frame(&buffer, &mut atlas);
+        let half = 0.5 * m.advance;
+
+        for color in [theme.text, theme.selection, theme.find_match, squiggle] {
+            let (before, after) = (lefts(&whole, color), lefts(&part, color));
+            assert!(!before.is_empty(), "nothing drawn in {color:?}");
+            for x in &before {
+                assert!(
+                    after.iter().any(|a| (a - (x - half)).abs() < 0.01),
+                    "{color:?} at {x} did not move half a column"
+                );
+            }
+        }
+        let moved = caret_rect(&buffer, &atlas, &Markdown::default(), viewport).unwrap();
+        assert!((moved.x - (caret.x - half)).abs() < 0.01);
+        let carets = |out: &[GlyphInstance]| -> Vec<f32> {
+            out.iter()
+                .filter(|q| q.color == theme.cursor && q.pos[0] > text_x)
+                .map(|q| q.pos[0])
+                .collect()
+        };
+        let (before, after) = (carets(&whole), carets(&part));
+        assert_eq!(before.len(), 1, "{before:?}");
+        assert!((after[0] - (before[0] - half)).abs() < 0.01);
+
+        // A click lands on what is drawn under it: the right part of the
+        // character at column 80 puts the caret after it.
+        let x = text_x + (80.0 - buffer.scroll_x() + 0.7) * m.advance;
+        assert_eq!(
+            offset_at_point(&buffer, &atlas, &Markdown::default(), x, 2.0),
+            81
+        );
+        let x = text_x + (80.0 - buffer.scroll_x() + 0.3) * m.advance;
+        assert_eq!(
+            offset_at_point(&buffer, &atlas, &Markdown::default(), x, 2.0),
+            80
+        );
+    }
+
+    #[test]
     fn asynchronous_geometry_tracks_latest_rope_snapshot() {
         let mut atlas = atlas();
         let mut buffer = Buffer::from_text(&"é\t👩‍💻 שלום ".repeat(700));

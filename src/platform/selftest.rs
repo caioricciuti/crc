@@ -31,6 +31,8 @@
 //! dragby <dx> <dy>            a drag to a point relative to the press
 //! up <x> <y>                  release
 //! upby <dx> <dy>              release relative to the press
+//! trackpad <x> <y> <dy> [dx]  a trackpad scroll of <dy> (and <dx>) points at
+//!                             a point; negative moves the text up or left
 //! wheelat @<region> <fx> <fy> <dy>
 //!                             a trackpad scroll of <dy> points at a fraction
 //!                             of a region, as for `clickat`
@@ -128,10 +130,12 @@ pub enum Step {
     Wheel(f64),
     /// A trackpad scroll at a point, `dy` in points as `scrollingDeltaY`
     /// reports them with precise deltas: positive moves the text down.
+    /// `dx` likewise sideways, positive moving the text right.
     Trackpad {
         x: f64,
         y: f64,
         dy: f64,
+        dx: f64,
     },
     /// A trackpad scroll at a fraction of a named region, as [`Step::At`]
     /// places a click.
@@ -373,6 +377,7 @@ pub fn parse(script: &str) -> Result<Vec<Step>, String> {
                 x: args.num().ok_or_else(bad)?,
                 y: args.num().ok_or_else(bad)?,
                 dy: args.num().ok_or_else(bad)?,
+                dx: args.opt_num().unwrap_or(0.0),
             }),
             _ => None,
         };
@@ -439,6 +444,7 @@ pub fn report(
     out.push_str(&format!("cursors: {}\n", buffer.cursor_count()));
     out.push_str(&format!("scroll: {}\n", buffer.scroll_line));
     out.push_str(&format!("scroll_fraction: {:.2}\n", buffer.scroll_fraction));
+    out.push_str(&format!("scroll_x: {:.2}\n", buffer.scroll_x()));
     out.push_str(&format!(
         "folds: {}\n",
         buffer

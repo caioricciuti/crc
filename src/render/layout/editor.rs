@@ -160,7 +160,7 @@ pub fn build_text_appending(
     let (cursor_line, _) = buffer.cursor_position();
     // Everything in the text area is shifted left by the horizontal scroll.
     // The gutter deliberately is not: line numbers stay pinned.
-    let scroll_x = buffer.scroll_column as f32 * m.advance;
+    let scroll_x = buffer.scroll_x() * m.advance;
     let mut stats = Stats::default();
 
     // Every selection, not just the primary: with multiple cursors each one
@@ -1629,10 +1629,24 @@ pub fn push_ghost(
     }
     let columns = ((text.x + text.width - code_x) / m.advance).max(0.0) as usize;
     let ink = faded(theme.diff_removed, words);
+    // A column a trackpad has partly scrolled past is drawn and cut at the
+    // gutter, as the text under the ghost is.
+    let shift = buffer.scroll_x_fraction * m.advance;
+    let lines_from = quads.len();
     for (i, line) in ghost.lines.iter().enumerate() {
         let shown =
-            crate::text::columns::fit_columns(line.chars().skip(buffer.scroll_column), columns);
-        push_text(&mut quads, atlas, code_x, top + i as f32 * lh, &shown, ink);
+            crate::text::columns::fit_columns(line.chars().skip(buffer.scroll_column), columns + 1);
+        push_text(
+            &mut quads,
+            atlas,
+            code_x - shift,
+            top + i as f32 * lh,
+            &shown,
+            ink,
+        );
+    }
+    for quad in &mut quads[lines_from..] {
+        clip_horizontal(quad, code_x, text.x + text.width);
     }
     if ghost.more > 0 {
         push_ui_text(
@@ -1701,7 +1715,7 @@ pub(super) fn push_underline_on(
 ) {
     let m = atlas.metrics;
     let text_x = text.x + gutter_width(buffer, atlas);
-    let scroll_x = buffer.scroll_column as f32 * m.advance;
+    let scroll_x = buffer.scroll_x() * m.advance;
     let start_line = buffer
         .rope
         .byte_to_line(range.start.min(buffer.rope.len_bytes()));
@@ -2094,7 +2108,7 @@ pub fn offset_at_point(
 
     if buffer.row_mode() {
         // Horizontal scroll only exists without wrapping.
-        let scrolled = buffer.scroll_column as f32 * m.advance;
+        let scrolled = buffer.scroll_x() * m.advance;
         // Rows from the top of the text; y is measured from there too.
         let rows = rows_down_to(buffer, y, m.line_height);
         let Some(row) = rows
@@ -2162,11 +2176,11 @@ pub fn offset_at_point(
     let text_x = gutter_width(buffer, atlas);
     let start = buffer.rope.line_to_byte(line);
     if let Some(shaped) = atlas.cached_editor_line((buffer.id(), line), &buffer.rope) {
-        let target_x = x - text_x + buffer.scroll_column as f32 * m.advance;
+        let target_x = x - text_x + buffer.scroll_x() * m.advance;
         let map = markdown.line(buffer, &touched_lines(buffer), line);
         return Placed::new(shaped, buffer, start, map, m.advance).byte_at(target_x);
     }
-    let column = ((x - text_x) / m.advance).max(0.0) + buffer.scroll_column as f32;
+    let column = ((x - text_x) / m.advance).max(0.0) + buffer.scroll_x();
     if let Some(map) = markdown.line(buffer, &touched_lines(buffer), line) {
         let end = crate::text::wrap::line_end(&buffer.rope, line);
         return map.byte_at(&buffer.rope, start, end, column);
@@ -2256,7 +2270,7 @@ pub fn caret_rect_on(
         } else {
             crate::text::wrap::column_in_row(&buffer.rope, row.start, caret) as f32 * m.advance
         };
-        let x = x - buffer.scroll_column as f32 * m.advance;
+        let x = x - buffer.scroll_x() * m.advance;
         if x < 0.0 {
             return None;
         }
@@ -2275,7 +2289,7 @@ pub fn caret_rect_on(
     if let Some(shaped) = atlas.cached_editor_line((buffer.id(), line), &buffer.rope) {
         let placed = Placed::new(shaped, buffer, line_start, map, m.advance);
         let x = text.x + gutter_width(buffer, atlas) + placed.x(buffer.cursor())
-            - buffer.scroll_column as f32 * m.advance;
+            - buffer.scroll_x() * m.advance;
         if x < text.x + gutter_width(buffer, atlas) {
             return None;
         }
@@ -2289,7 +2303,7 @@ pub fn caret_rect_on(
     let column = match &map {
         Some(map) => map.column(&buffer.rope, buffer.cursor()),
         None => buffer.rope.visual_column(line_start..buffer.cursor()) as f32,
-    } - buffer.scroll_column as f32;
+    } - buffer.scroll_x();
     if column < 0.0 {
         return None;
     }

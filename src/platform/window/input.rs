@@ -108,13 +108,12 @@ impl EditorView {
                 .docs
                 .active_mut()
                 .scroll_smooth_by((-dy / m.line_height as f64) as f32, rows);
-            state.scroll_carry.0 -= dx / per_column;
-            let columns = state.scroll_carry.0.trunc();
-            state.scroll_carry.0 -= columns;
+            // Sideways the same: the text moves by points, not columns.
+            state.scroll_carry.0 = 0.0;
             state
                 .docs
                 .active_mut()
-                .scroll_columns_by(columns as isize, rows);
+                .scroll_columns_smooth_by((-dx / per_column) as f32, rows);
             drop(state);
             self.request_redraw();
             self.pump();

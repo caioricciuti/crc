@@ -660,6 +660,7 @@ impl Buffer {
             scroll_line: 0,
             scroll_fraction: 0.0,
             scroll_column: 0,
+            scroll_x_fraction: 0.0,
             wrap: None,
             scroll_row: 0,
             wrap_choice: None,

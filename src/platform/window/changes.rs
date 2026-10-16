@@ -13,7 +13,7 @@ pub(super) struct Peek {
     /// The text it was opened on: an edit closes it.
     pub(super) text: crate::text::rope::Rope,
     /// The scroll it was first drawn at: scrolling closes it.
-    pub(super) scroll: Option<(usize, usize, f32)>,
+    pub(super) scroll: Option<(usize, f32, f32)>,
     /// Where its controls were drawn this frame; `None` when it was not.
     pub(super) hits: Option<layout::PeekHits>,
 }
@@ -66,7 +66,7 @@ pub(super) fn change_bar_under(state: &State, event: &NSEvent, x: f32, y: f32) -
 pub(super) fn check_peek(peek: &mut Option<Peek>, buffer: &Buffer) {
     let scroll = (
         buffer.scroll_line,
-        buffer.scroll_column,
+        buffer.scroll_x(),
         buffer.scroll_fraction,
     );
     let Some(open) = peek.as_mut() else {

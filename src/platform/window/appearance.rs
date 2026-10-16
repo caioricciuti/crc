@@ -79,6 +79,7 @@ impl EditorView {
         buffer.wrap_choice = Some(on);
         apply_wrap(buffer, setting, cols);
         buffer.scroll_column = 0;
+        buffer.scroll_x_fraction = 0.0;
         buffer.scroll_to_cursor(rows, cols);
         state.message = Some((
             if on { "word wrap on" } else { "word wrap off" }.into(),

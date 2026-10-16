@@ -5488,7 +5488,8 @@ impl EditorView {
             (
                 buffer.id(),
                 buffer.scroll_line,
-                buffer.scroll_column,
+                // By its bits: a trackpad moves them by parts of a column.
+                buffer.scroll_x().to_bits() as usize,
                 view.scroll,
                 view.conflicts.len(),
                 state.conflict_side,

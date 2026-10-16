@@ -4,6 +4,12 @@ One entry per tag, written for people who use the editor.
 
 ## Unreleased
 
+- Long lines scroll sideways smoothly on a trackpad. A two-finger swipe
+  moves the text by the points you swiped instead of jumping a whole
+  character at a time, the way vertical scrolling already did. The
+  caret, selection, find highlights and squiggles move with the text,
+  and a click lands on the character drawn under the pointer. A mouse
+  wheel still scrolls by whole characters.
 - Terminal: links open with a Cmd-click. A web address a program
   prints (such as the pull request link Claude Code shows) opens in your
   browser, found whole even when it wraps onto the next row, without the

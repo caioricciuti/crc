@@ -295,8 +295,8 @@ impl EditorView {
                     eprintln!("selftest: wheel only drives the palette");
                 }
             }
-            Step::Trackpad { x, y, dy } => {
-                self.scroll_at(*x as f32, *y as f32, 0.0, *dy, true);
+            Step::Trackpad { x, y, dy, dx } => {
+                self.scroll_at(*x as f32, *y as f32, *dx, *dy, true);
             }
             // Over the terminal, the way `scrollWheel:` sends it there.
             Step::WheelAt { name, fx, fy, dy } => {

@@ -207,6 +207,9 @@ pub struct Buffer {
     /// First visible column, in characters. Long lines otherwise vanish off
     /// the right edge with no way to reach them. Always 0 while wrapping.
     pub scroll_column: usize,
+    /// How much of `scroll_column` is scrolled off the left, from 0 up to
+    /// but not including 1: a trackpad moves the view sideways in points.
+    pub scroll_x_fraction: f32,
     /// Soft wrap width in columns, or `None` to scroll long lines sideways.
     /// The window sets it from the text area's width before each frame.
     pub wrap: Option<usize>,
@@ -3276,6 +3279,62 @@ mod tests {
         b.scroll_columns_by(1000, 10);
         b.clamp_scroll(10, 80);
         assert_eq!(b.scroll_column, 300 - 79);
+    }
+
+    #[test]
+    fn a_trackpad_scrolls_sideways_by_parts_of_a_column() {
+        let mut text = format!("{}\n", "x".repeat(300));
+        text.push_str(&"short\n".repeat(50));
+        let mut b = Buffer::from_text(&text);
+
+        b.scroll_columns_smooth_by(0.25, 10);
+        b.scroll_columns_smooth_by(0.5, 10);
+        assert_eq!((b.scroll_column, b.scroll_x_fraction), (0, 0.75));
+        b.scroll_columns_smooth_by(0.5, 10);
+        assert_eq!(b.scroll_column, 1);
+        assert!((b.scroll_x_fraction - 0.25).abs() < 1e-6);
+        assert!((b.scroll_x() - 1.25).abs() < 1e-6);
+
+        b.scroll_columns_smooth_by(-5.0, 10);
+        assert_eq!((b.scroll_column, b.scroll_x_fraction), (0, 0.0));
+        b.scroll_columns_smooth_by(10_000.5, 10);
+        assert_eq!(
+            (b.scroll_column, b.scroll_x_fraction),
+            (300, 0.0),
+            "the same right edge as whole columns"
+        );
+        b.scroll_columns_smooth_by(f32::NAN, 10);
+        assert_eq!((b.scroll_column, b.scroll_x_fraction), (300, 0.0));
+
+        // Whole columns keep the fraction, except at either end.
+        b.scroll_columns_by(-1000, 10);
+        b.scroll_columns_smooth_by(10.5, 10);
+        b.scroll_columns_by(3, 10);
+        assert_eq!((b.scroll_column, b.scroll_x_fraction), (13, 0.5));
+        b.scroll_columns_by(-1000, 10);
+        assert_eq!((b.scroll_column, b.scroll_x_fraction), (0, 0.0));
+
+        // The frame's clamp pulls a fraction past the reach back with it.
+        b.scroll_columns_smooth_by(250.5, 10);
+        b.clamp_scroll(10, 80);
+        assert_eq!((b.scroll_column, b.scroll_x_fraction), (300 - 79, 0.0));
+        b.scroll_columns_by(-100, 10);
+        b.scroll_columns_smooth_by(0.5, 10);
+        b.clamp_scroll(10, 80);
+        assert_eq!(
+            (b.scroll_column, b.scroll_x_fraction),
+            (121, 0.5),
+            "inside the reach"
+        );
+
+        // Bringing the caret into view lands on a whole column.
+        b.place_cursor(0, Move);
+        b.scroll_to_cursor(10, 80);
+        assert_eq!((b.scroll_column, b.scroll_x_fraction), (0, 0.0));
+        b.scroll_columns_smooth_by(20.5, 10);
+        b.wrap = Some(80);
+        b.clamp_scroll(10, 80);
+        assert_eq!((b.scroll_column, b.scroll_x_fraction), (0, 0.0));
     }
 
     #[test]

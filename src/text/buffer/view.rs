@@ -391,6 +391,7 @@ impl Buffer {
         if self.row_mode() {
             if self.wrap.is_some() {
                 self.scroll_column = 0;
+                self.scroll_x_fraction = 0.0;
             }
             let caret = self.cursor_row();
             let top = (self.scroll_line, self.scroll_row);
@@ -422,13 +423,21 @@ impl Buffer {
         const MARGIN: usize = 4;
         if column < self.scroll_column + MARGIN {
             self.scroll_column = column.saturating_sub(MARGIN);
+            self.scroll_x_fraction = 0.0;
         } else if column >= self.scroll_column + cols {
             self.scroll_column = column + 1 + MARGIN - cols;
+            self.scroll_x_fraction = 0.0;
         }
     }
-    /// Scrolls horizontally, clamped at the left edge.
+    /// How far the view is scrolled sideways, in columns: the whole ones
+    /// and the part a trackpad has moved past them. Everything that places
+    /// text by its column subtracts this times the advance.
+    pub fn scroll_x(&self) -> f32 {
+        self.scroll_column as f32 + self.scroll_x_fraction
+    }
     /// Scrolls horizontally, clamped so you cannot drift off into empty
-    /// space to the right of the longest visible line.
+    /// space to the right of the longest visible line. A fraction left by a
+    /// trackpad stays put, except where the clamp stops the scroll.
     ///
     /// The bound is the longest line *in view*, not in the document: finding
     /// the longest line of a 100MB file is a full scan, and the answer would
@@ -440,6 +449,22 @@ impl Buffer {
         let longest = self.longest_visible_line(rows);
         let next = self.scroll_column as isize + columns;
         self.scroll_column = next.clamp(0, longest as isize) as usize;
+        if next <= 0 || next >= longest as isize {
+            self.scroll_x_fraction = 0.0;
+        }
+    }
+    /// Scrolls by a part of a column, for a trackpad: `columns` is the
+    /// gesture's points over the advance. Clamped to the same range as
+    /// [`Buffer::scroll_columns_by`].
+    pub fn scroll_columns_smooth_by(&mut self, columns: f32, rows: usize) {
+        if !columns.is_finite() || columns == 0.0 {
+            return;
+        }
+        let longest = self.longest_visible_line(rows) as f64;
+        let at = (self.scroll_column as f64 + self.scroll_x_fraction as f64 + columns as f64)
+            .clamp(0.0, longest);
+        self.scroll_column = at.floor() as usize;
+        self.scroll_x_fraction = (at - at.floor()) as f32;
     }
     /// Pulls the scroll position back inside what there is to show.
     ///
@@ -451,6 +476,7 @@ impl Buffer {
         if self.row_mode() {
             if self.wrap.is_some() {
                 self.scroll_column = 0;
+                self.scroll_x_fraction = 0.0;
             }
             // A top line folded away: the view starts at the fold's head.
             let mut top = self
@@ -468,7 +494,7 @@ impl Buffer {
         }
         self.scroll_row = 0;
         self.scroll_by(0, rows);
-        if self.scroll_column == 0 {
+        if self.scroll_column == 0 && self.scroll_x_fraction == 0.0 {
             return;
         }
         // Keep the end of the longest visible line reachable, and no more:
@@ -478,9 +504,13 @@ impl Buffer {
         // The caret is allowed to hold the view out there, since typing past
         // the right edge is how it got there.
         let caret = self.cursor_position().1;
-        self.scroll_column = self
-            .scroll_column
-            .min(reach.max(caret.saturating_sub(cols.saturating_sub(1))));
+        let limit = reach.max(caret.saturating_sub(cols.saturating_sub(1)));
+        if self.scroll_column > limit
+            || (self.scroll_column == limit && self.scroll_x_fraction > 0.0)
+        {
+            self.scroll_column = limit;
+            self.scroll_x_fraction = 0.0;
+        }
     }
     /// Characters in the longest line of the current viewport.
     pub(super) fn longest_visible_line(&self, rows: usize) -> usize {
