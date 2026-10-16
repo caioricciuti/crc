@@ -653,6 +653,7 @@ impl Buffer {
             cursor: 0,
             anchor: 0,
             extra: Vec::new(),
+            extra_goals: Vec::new(),
             read_only: false,
             home_page: false,
             view_only: false,

@@ -65,6 +65,7 @@ impl Buffer {
             return;
         }
         self.extra.push((anchor, head));
+        self.extra_goals.clear();
     }
     /// Drops every cursor but the primary.
     pub fn collapse_cursors(&mut self) -> bool {
@@ -72,7 +73,135 @@ impl Buffer {
             return false;
         }
         self.extra.clear();
+        self.extra_goals.clear();
         true
+    }
+    /// The goal column of each extra cursor, in the order of `extra`.
+    pub(super) fn extra_goals(&self) -> Vec<Option<usize>> {
+        if self.extra_goals.len() == self.extra.len() {
+            self.extra_goals.clone()
+        } else {
+            vec![None; self.extra.len()]
+        }
+    }
+    /// Folds cursors that a motion brought together into one, by the rule
+    /// of [`Buffer::all_selections`]: a caret on another, or selections
+    /// that overlap. What they become keeps the primary's direction and
+    /// goal when the primary is one of them, and stays the primary.
+    pub(super) fn merge_cursors(&mut self) {
+        if self.extra.is_empty() {
+            return;
+        }
+        // (anchor, head, goal, is the primary)
+        type Cursor = (usize, usize, Option<usize>, bool);
+        let mut all: Vec<Cursor> =
+            std::iter::once((self.anchor, self.cursor, self.goal_column, true))
+                .chain(
+                    self.extra
+                        .iter()
+                        .zip(self.extra_goals())
+                        .map(|(&(a, h), goal)| (a, h, goal, false)),
+                )
+                .collect();
+        let count = all.len();
+        all.sort_by_key(|c| c.0.min(c.1));
+        let span = |c: &Cursor| (c.0.min(c.1), c.0.max(c.1));
+        let mut merged: Vec<Cursor> = Vec::with_capacity(count);
+        for next in all {
+            let (start, end) = span(&next);
+            match merged.last_mut() {
+                Some(last)
+                    if start < span(last).1
+                        || (start == span(last).1 && (start == end || span(last).0 == start)) =>
+                {
+                    // The primary decides, else whichever is a selection.
+                    let keep = if last.3 || (!next.3 && next.0 == next.1) {
+                        *last
+                    } else {
+                        next
+                    };
+                    let (from, to) = (span(last).0, span(last).1.max(end));
+                    let primary = last.3 || next.3;
+                    *last = if keep.1 < keep.0 {
+                        (to, from, keep.2, primary)
+                    } else {
+                        (from, to, keep.2, primary)
+                    };
+                }
+                _ => merged.push(next),
+            }
+        }
+        if merged.len() == count {
+            return;
+        }
+        self.extra.clear();
+        self.extra_goals.clear();
+        for (anchor, head, goal, primary) in merged {
+            if primary {
+                (self.anchor, self.cursor, self.goal_column) = (anchor, head, goal);
+            } else {
+                self.extra.push((anchor, head));
+                self.extra_goals.push(goal);
+            }
+        }
+    }
+    /// What Copy puts on the clipboard: the selection, or with several
+    /// cursors every selection in order, a line each. Bare carets add
+    /// nothing. `None` when nothing is selected anywhere.
+    pub fn copied_text(&self) -> Option<String> {
+        if self.extra.is_empty() {
+            return self.selected_text();
+        }
+        let parts: Vec<String> = self
+            .all_selections()
+            .into_iter()
+            .filter(|(start, end)| end > start)
+            .map(|(start, end)| self.rope.slice_to_string(start..end))
+            .collect();
+        (!parts.is_empty()).then(|| parts.join("\n"))
+    }
+    /// Whether any cursor has a selection, which is what Copy and Cut need.
+    pub fn has_selection(&self) -> bool {
+        self.selection().is_some() || self.extra.iter().any(|(anchor, head)| anchor != head)
+    }
+    /// Cut: [`Buffer::copied_text`], and every selection deleted as one
+    /// undo step. Bare carets stay where they are.
+    pub fn cut(&mut self) -> Option<String> {
+        let text = self.copied_text()?;
+        if self.extra.is_empty() {
+            self.backspace();
+        } else if !self.is_locked() {
+            self.last_edit = None;
+            self.edit_each_cursor(EditKind::Delete, |_, start, end| {
+                (end > start).then(|| (start..end, String::new(), 0))
+            });
+            self.last_edit = None;
+        }
+        Some(text)
+    }
+    /// Paste: with as many lines as cursors, one line at each in order,
+    /// the way a multi-cursor copy came out; otherwise all of it at every
+    /// cursor. A trailing line break does not count as a line.
+    pub fn paste(&mut self, text: &str) {
+        let text = normalize_newlines(text);
+        if self.extra.is_empty() || self.is_locked() {
+            return self.insert(&text);
+        }
+        let selections = self.all_selections();
+        let lines: Vec<&str> = text
+            .strip_suffix('\n')
+            .unwrap_or(&text)
+            .split('\n')
+            .collect();
+        if lines.len() != selections.len() {
+            return self.insert(&text);
+        }
+        self.last_edit = None;
+        self.edit_each_cursor(EditKind::Insert, |_, start, end| {
+            let line = lines[selections.binary_search_by_key(&start, |s| s.0).ok()?];
+            Some((start..end, line.to_owned(), line.len()))
+        });
+        self.last_edit = None;
     }
     /// Cmd-D: selects the word at the cursor, or adds the next occurrence of
     /// the current selection as another cursor.
@@ -237,6 +366,7 @@ impl Buffer {
         }
         self.clamp_positions();
         self.goal_column = None;
+        self.extra_goals.clear();
         // Cursors whose edits merged now share a place; keep one there.
         let mut seen = std::collections::HashSet::from([self.cursor]);
         self.extra.retain(|&(_, at)| seen.insert(at));

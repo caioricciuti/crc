@@ -4449,7 +4449,7 @@ define_class!(
                 }
                 return;
             }
-            let (text, _) = self.edit_focused(|b, _| b.selected_text());
+            let (text, _) = self.edit_focused(|b, _| b.copied_text());
             if let Some(text) = text {
                 clipboard::write_text(&text);
             }
@@ -4469,13 +4469,7 @@ define_class!(
 
         #[unsafe(method(cut:))]
         fn action_cut(&self, _sender: Option<&AnyObject>) {
-            let (text, focus) = self.edit_focused(|b, _| {
-                let text = b.selected_text();
-                if text.is_some() {
-                    b.backspace();
-                }
-                text
-            });
+            let (text, focus) = self.edit_focused(|b, _| b.cut());
             if let Some(text) = text {
                 clipboard::write_text(&text);
                 self.after_focused_edit(focus);
@@ -4512,7 +4506,8 @@ define_class!(
                     Focus::Message => message_text(&text),
                 };
                 if !text.is_empty() {
-                    b.insert(&text);
+                    // Several cursors may take a line each; a field has one.
+                    b.paste(&text);
                 }
                 !text.is_empty()
             });
@@ -4540,7 +4535,7 @@ define_class!(
             } else if terminal && (action == sel!(cut:) || action == sel!(undo:) || action == sel!(redo:)) {
                 false
             } else if action == sel!(copy:) || action == sel!(cut:) {
-                focused_buffer(&state).selection().is_some()
+                focused_buffer(&state).has_selection()
             } else if action == sel!(undo:) {
                 focused_buffer(&state).can_undo()
             } else if action == sel!(redo:) {

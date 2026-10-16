@@ -4,6 +4,15 @@ One entry per tag, written for people who use the editor.
 
 ## Unreleased
 
+- Moving the caret keeps every cursor. With several carets, the arrow
+  keys, Option-Left and Option-Right, Cmd-Left and Cmd-Right, Home, End
+  and Page Up and Down move each one, and with Shift they extend each
+  selection, where before any motion went back to a single caret. Up
+  and Down remember each caret's own column across a short line, and
+  carets that meet become one. Esc, or a click, still goes back to one.
+  Copy with several selections copies them all, a line each, and
+  pasting that into as many carets puts one line at each; any other
+  paste goes in whole at every caret.
 - Deleting, Return and Tab work at every cursor. With several carets
   (from Cmd-D), Delete, Option-Backspace, Option-Delete, Cmd-Backspace
   and Cmd-Delete act at each one, where before only the first caret

@@ -226,6 +226,10 @@ pub struct Buffer {
     /// measured in characters. Without this, moving down through a short line
     /// would permanently lose the original column.
     goal_column: Option<usize>,
+    /// The same for each of `extra`, in its order. Only the motions write
+    /// it; anything else that adds, drops or moves cursors clears it, and
+    /// a length that differs from `extra`'s means no cursor has a goal.
+    extra_goals: Vec<Option<usize>>,
 
     /// Oldest first, at most [`UNDO_LIMIT`]. Redo needs no cap of its own:
     /// it only fills from undo.
@@ -504,6 +508,7 @@ impl Buffer {
         self.cursor = snapshot.cursor;
         self.anchor = snapshot.anchor;
         self.extra = snapshot.extra;
+        self.extra_goals.clear();
     }
     /// Checkpoint for an edit made at the primary cursor only. Typing, the
     /// deletes, Return and Tab edit at every cursor instead; the line and
@@ -738,6 +743,7 @@ impl Buffer {
             .collect();
         self.extra = extra;
         self.goal_column = None;
+        self.extra_goals.clear();
     }
 
     // ---- change tracking -------------------------------------------------
@@ -982,14 +988,10 @@ impl Buffer {
         i
     }
     pub fn move_word_left(&mut self, motion: Motion) {
-        self.cursor = self.prev_word_boundary(self.cursor);
-        self.goal_column = None;
-        self.after_move(motion);
+        self.move_all(motion, |b, (_, head), _| (b.prev_word_boundary(head), None));
     }
     pub fn move_word_right(&mut self, motion: Motion) {
-        self.cursor = self.next_word_boundary(self.cursor);
-        self.goal_column = None;
-        self.after_move(motion);
+        self.move_all(motion, |b, (_, head), _| (b.next_word_boundary(head), None));
     }
     /// Option-Backspace: delete the word before the cursor.
     pub fn delete_word_backward(&mut self) {
@@ -1518,12 +1520,12 @@ mod tests {
     }
 
     #[test]
-    fn plain_movement_collapses_to_one_cursor() {
+    fn plain_movement_keeps_every_cursor() {
         let mut b = Buffer::from_text("aa\nbb\n");
         b.add_cursor(3, 3);
         assert_eq!(b.cursor_count(), 2);
         b.move_right(Move);
-        assert_eq!(b.cursor_count(), 1, "plain movement is how you get back");
+        assert_eq!(b.caret_positions(), vec![1, 4]);
     }
 
     #[test]
@@ -1695,13 +1697,13 @@ mod tests {
     }
 
     #[test]
-    fn collapsing_a_selection_or_clicking_returns_to_one_cursor() {
+    fn collapsing_selections_keeps_cursors_and_clicking_returns_to_one() {
         let mut b = Buffer::from_text("foo foo");
         b.place_cursor(0, Move);
         b.place_cursor(3, Extend);
         b.select_next_occurrence();
         b.move_left(Move);
-        assert_eq!(b.cursor_count(), 1);
+        assert_eq!(b.caret_positions(), vec![0, 4], "each to its own start");
 
         let mut b = Buffer::from_text("abc abc");
         b.add_cursor(4, 4);
@@ -1930,6 +1932,310 @@ mod tests {
         let mut b = with_carets("a\nabc", &[1, 5]);
         b.insert_tab();
         assert_eq!(b.rope.to_string(), "a\t\nabc\t");
+    }
+
+    /// Where `motion` takes a lone caret at `at`: what every caret of a
+    /// multi-cursor motion has to agree with.
+    fn alone(text: &str, wrap: Option<usize>, at: usize, motion: fn(&mut Buffer)) -> usize {
+        let mut b = Buffer::from_text(text);
+        b.wrap = wrap;
+        b.place_cursor(at, Move);
+        motion(&mut b);
+        b.cursor()
+    }
+
+    /// Every caret of `at` moved by `motion` together lands where it would
+    /// alone, and none of them is lost.
+    fn moves_like_alone(text: &str, wrap: Option<usize>, at: &[usize], motion: fn(&mut Buffer)) {
+        let mut b = with_carets(text, at);
+        b.wrap = wrap;
+        motion(&mut b);
+        let mut expected: Vec<_> = at.iter().map(|&c| alone(text, wrap, c, motion)).collect();
+        expected.sort_unstable();
+        assert_eq!(b.caret_positions(), expected, "{text:?} from {at:?}");
+        assert_eq!(b.cursor_count(), at.len(), "{text:?} from {at:?}");
+    }
+
+    type MoveFn = fn(&mut Buffer);
+    const MOTIONS: [(&str, MoveFn); 8] = [
+        ("left", |b| b.move_left(Move)),
+        ("right", |b| b.move_right(Move)),
+        ("word left", |b| b.move_word_left(Move)),
+        ("word right", |b| b.move_word_right(Move)),
+        ("line start", |b| b.move_line_start(Move)),
+        ("line end", |b| b.move_line_end(Move)),
+        ("up", |b| b.move_up(Move)),
+        ("down", |b| b.move_down(Move)),
+    ];
+
+    #[test]
+    fn motion_keeps_all_cursors() {
+        let text = "one two\nthree four\nfive six\nseven";
+        for (name, motion) in MOTIONS {
+            let mut b = with_carets(text, &[5, 14, 24]);
+            motion(&mut b);
+            assert_eq!(b.cursor_count(), 3, "{name} dropped a cursor");
+            moves_like_alone(text, None, &[5, 14, 24], motion);
+        }
+        // Up from the first line and down from the last go to their ends,
+        // as they do for one caret, and the others still move by a line.
+        let mut b = with_carets("abc\nabc\nabc", &[1, 9]);
+        b.move_up(Move);
+        assert_eq!(b.caret_positions(), vec![0, 5]);
+        let mut b = with_carets("abc\nabc\nabc", &[1, 9]);
+        b.move_down(Move);
+        assert_eq!(b.caret_positions(), vec![5, 11]);
+    }
+
+    #[test]
+    fn plain_left_and_right_collapse_each_selection_to_its_edge() {
+        let mut b = Buffer::from_text("foo foo foo");
+        b.place_cursor(1, Move);
+        b.select_next_occurrence();
+        b.select_next_occurrence();
+        b.select_next_occurrence();
+        b.move_right(Move);
+        assert_eq!(b.caret_positions(), vec![3, 7, 11]);
+        assert_eq!(b.selections(), vec![(3, 3), (7, 7), (11, 11)]);
+
+        let mut b = Buffer::from_text("foo foo foo");
+        b.place_cursor(1, Move);
+        for _ in 0..3 {
+            b.select_next_occurrence();
+        }
+        b.move_left(Move);
+        assert_eq!(b.caret_positions(), vec![0, 4, 8]);
+        b.insert("x");
+        assert_eq!(b.rope.to_string(), "xfoo xfoo xfoo");
+    }
+
+    #[test]
+    fn shift_extends_at_every_cursor() {
+        let mut b = with_carets("abc\nabc\nabc", &[0, 4, 8]);
+        b.move_right(Extend);
+        b.move_right(Extend);
+        assert_eq!(b.selections(), vec![(0, 2), (4, 6), (8, 10)]);
+        b.move_line_end(Extend);
+        assert_eq!(b.selections(), vec![(0, 3), (4, 7), (8, 11)]);
+        b.move_word_left(Extend);
+        assert_eq!(b.selections(), vec![(0, 0), (4, 4), (8, 8)]);
+        assert_eq!(b.cursor_count(), 3);
+
+        // Down with Shift grows each selection over a line of its own.
+        let mut b = with_carets("ab\ncd\nef\ngh", &[1, 7]);
+        b.move_down(Extend);
+        assert_eq!(b.selections(), vec![(1, 4), (7, 10)]);
+        b.insert("-");
+        assert_eq!(b.rope.to_string(), "a-d\ne-h");
+    }
+
+    #[test]
+    fn up_and_down_keep_each_cursors_goal_column() {
+        // Two carets at different columns, each crossing a short line.
+        let text = "abcdef\nab\nabcdef\nab\nabcdef";
+        let mut b = with_carets(text, &[5, 14]);
+        b.move_down(Move);
+        assert_eq!(b.caret_positions(), vec![9, 19], "both clamp to `ab`");
+        b.move_down(Move);
+        assert_eq!(
+            b.caret_positions(),
+            vec![15, 24],
+            "and each comes back to its own column"
+        );
+        b.move_up(Move);
+        b.move_up(Move);
+        assert_eq!(b.caret_positions(), vec![5, 14]);
+
+        // A horizontal motion forgets the goals, as for one caret.
+        let mut b = with_carets(text, &[5, 14]);
+        b.move_down(Move);
+        b.move_left(Move);
+        b.move_down(Move);
+        assert_eq!(b.caret_positions(), vec![11, 21]);
+    }
+
+    #[test]
+    fn up_and_down_move_every_cursor_by_a_screen_row_when_wrapping() {
+        // Thirty letters a line, wrapped at twenty: two rows each.
+        let line = "abcdefghijklmnopqrstuvwxyzABCD";
+        let text = format!("{line}\n{line}\nab");
+        for (_, motion) in MOTIONS {
+            moves_like_alone(&text, Some(20), &[1, 32], motion);
+        }
+        let mut b = with_carets(&text, &[1, 32]);
+        b.wrap = Some(20);
+        b.move_down(Move);
+        assert_eq!(b.caret_positions(), vec![21, 52], "one row, not one line");
+        b.move_up(Move);
+        assert_eq!(b.caret_positions(), vec![1, 32]);
+    }
+
+    #[test]
+    fn cursors_that_meet_merge() {
+        let mut b = with_carets("abc", &[1, 2]);
+        b.move_left(Move);
+        assert_eq!(b.cursor_count(), 2);
+        b.move_left(Move);
+        assert_eq!(b.cursor_count(), 1, "both at the start of the text");
+        assert_eq!(b.cursor(), 0);
+
+        let mut b = with_carets("one two\nx", &[1, 5]);
+        b.move_line_start(Move);
+        assert_eq!(b.cursor_count(), 1, "same line, same start");
+
+        // Selections that grow into each other become one, kept by the
+        // primary; ones that only touch stay apart.
+        let mut b = with_carets("abcdef", &[1, 3]);
+        b.move_right(Extend);
+        b.move_right(Extend);
+        assert_eq!(b.selections(), vec![(1, 3), (3, 5)]);
+        assert_eq!(b.cursor_count(), 2);
+        b.move_right(Extend);
+        assert_eq!(b.cursor_count(), 1);
+        assert_eq!(b.selected_text().as_deref(), Some("bcdef"));
+        b.move_left(Extend);
+        assert_eq!(b.selected_text().as_deref(), Some("bcde"));
+    }
+
+    #[test]
+    fn escape_and_a_click_still_collapse_after_moving() {
+        let mut b = with_carets("abc\nabc", &[0, 4]);
+        b.move_right(Move);
+        assert!(b.collapse_cursors());
+        assert_eq!(b.caret_positions(), vec![1]);
+
+        let mut b = with_carets("abc\nabc", &[0, 4]);
+        b.move_down(Move);
+        b.place_cursor(2, Move);
+        assert_eq!(b.cursor_count(), 1);
+        b.move_down(Move);
+        assert_eq!(b.caret_positions(), vec![6]);
+    }
+
+    #[test]
+    fn multi_cursor_motions_step_over_whole_characters() {
+        // A precomposed accent, then a joined emoji: two bytes, then eleven.
+        let text = "\u{e9}a\n\u{1f469}\u{200d}\u{1f4bb}b";
+        for (_, motion) in MOTIONS {
+            moves_like_alone(text, None, &[2, 15], motion);
+        }
+        let mut b = with_carets(text, &[0, 4]);
+        b.move_right(Move);
+        assert_eq!(b.caret_positions(), vec![2, 15]);
+
+        let text = "caf\u{e9} na\u{ef}ve\nna\u{ef}ve caf\u{e9}";
+        for (_, motion) in MOTIONS {
+            moves_like_alone(text, None, &[3, 15], motion);
+        }
+        let mut b = with_carets(text, &[0, 13]);
+        b.move_word_right(Move);
+        b.move_word_right(Move);
+        assert_eq!(b.caret_positions(), vec![12, 25]);
+        b.move_word_left(Move);
+        assert_eq!(b.caret_positions(), vec![6, 20]);
+    }
+
+    #[test]
+    fn multi_cursor_motions_keep_crlf_whole() {
+        let text = "ab\r\ncd\r\nef";
+        for (_, motion) in MOTIONS {
+            moves_like_alone(text, None, &[1, 5], motion);
+        }
+        let mut b = with_carets(text, &[2, 6]);
+        b.move_right(Move);
+        assert_eq!(b.caret_positions(), vec![4, 8], "over the CRLF in one step");
+        b.move_left(Move);
+        assert_eq!(b.caret_positions(), vec![2, 6]);
+        let mut b = with_carets(text, &[0, 4]);
+        b.move_line_end(Move);
+        assert_eq!(b.caret_positions(), vec![2, 6], "line ends stop before CR");
+    }
+
+    #[test]
+    fn copy_joins_every_selection_with_newlines() {
+        let mut b = Buffer::from_text("foo bar foo baz foo");
+        b.place_cursor(0, Move);
+        for _ in 0..3 {
+            b.select_next_occurrence();
+        }
+        assert_eq!(b.copied_text().as_deref(), Some("foo\nfoo\nfoo"));
+
+        // A bare caret has nothing to give.
+        let mut b = with_carets("one two", &[7]);
+        b.add_cursor(0, 3);
+        assert_eq!(b.copied_text().as_deref(), Some("one"));
+        let b = with_carets("one two", &[1, 5]);
+        assert_eq!(b.copied_text(), None);
+    }
+
+    #[test]
+    fn cut_takes_every_selection_and_only_selections() {
+        let mut b = Buffer::from_text("foo bar foo");
+        b.place_cursor(0, Move);
+        b.select_next_occurrence();
+        b.select_next_occurrence();
+        assert_eq!(b.cut().as_deref(), Some("foo\nfoo"));
+        assert_eq!(b.rope.to_string(), " bar ");
+        b.paste("foo\nfoo");
+        assert_eq!(b.rope.to_string(), "foo bar foo", "one line back at each");
+        b.undo();
+        assert_eq!(b.rope.to_string(), " bar ");
+        b.undo();
+        assert_eq!(b.rope.to_string(), "foo bar foo");
+
+        // A bare caret has nothing to cut and deletes nothing.
+        let mut b = with_carets("one two", &[5]);
+        b.add_cursor(0, 3);
+        assert_eq!(b.cut().as_deref(), Some("one"));
+        assert_eq!(b.rope.to_string(), " two");
+    }
+
+    #[test]
+    fn paste_distributes_lines_when_the_counts_match() {
+        let mut b = with_carets("x\nx\nx", &[1, 3, 5]);
+        b.paste("1\n2\n3");
+        assert_eq!(b.rope.to_string(), "x1\nx2\nx3");
+        assert_eq!(b.caret_positions(), vec![2, 5, 8]);
+        b.undo();
+        assert_eq!(b.rope.to_string(), "x\nx\nx", "one undo step");
+
+        // A trailing line break does not count as a line of its own.
+        let mut b = with_carets("x\nx", &[1, 3]);
+        b.paste("a\r\nb\r\n");
+        assert_eq!(b.rope.to_string(), "xa\nxb");
+
+        // Otherwise the whole text goes in at every cursor.
+        let mut b = with_carets("a\nb", &[1, 3]);
+        b.paste("p\nq\nr");
+        assert_eq!(b.rope.to_string(), "ap\nq\nr\nbp\nq\nr");
+
+        // One cursor: a paste is a paste.
+        let mut b = with_carets("a", &[1]);
+        b.paste("1\n2");
+        assert_eq!(b.rope.to_string(), "a1\n2");
+    }
+
+    #[test]
+    fn undo_after_moving_leaves_no_stale_goal_columns() {
+        let text = "abcdef\nab\nabcdef\nab\nabcdef";
+        let mut b = with_carets(text, &[5, 14]);
+        b.move_down(Move);
+        assert_eq!(b.caret_positions(), vec![9, 19]);
+        b.insert("Z");
+        b.undo();
+        assert_eq!(b.caret_positions(), vec![9, 19]);
+        // The goals went with the edit: each caret goes down from where
+        // it stands, not from the column it had before.
+        b.move_down(Move);
+        assert_eq!(b.caret_positions(), vec![12, 22]);
+
+        // A cursor added after a vertical move starts with no goal of its
+        // own, and never borrows another's.
+        let mut b = with_carets(text, &[5]);
+        b.move_down(Move);
+        b.add_cursor(17, 17);
+        b.move_down(Move);
+        assert_eq!(b.caret_positions(), vec![15, 20]);
     }
 
     // ---- brackets and replace --------------------------------------------

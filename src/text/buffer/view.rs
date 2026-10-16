@@ -3,13 +3,45 @@
 use super::*;
 
 impl Buffer {
+    /// After the primary caret was put somewhere: a click, a found match.
+    /// A plain one is how you get back to one cursor.
     pub(super) fn after_move(&mut self, motion: Motion) {
         if motion == Motion::Move {
             self.anchor = self.cursor;
-            // Plain movement is how you get back to one cursor.
             self.extra.clear();
         }
         // Any movement ends an edit run for undo purposes.
+        self.last_edit = None;
+        self.reveal_cursors();
+    }
+    /// Moves every cursor: `to` takes one's `(anchor, head)` and goal
+    /// column and gives where its caret goes and the goal it keeps. A plain
+    /// motion leaves each a bare caret there, Shift keeps each anchor and so
+    /// extends every selection. Cursors that meet become one.
+    pub(super) fn move_all(
+        &mut self,
+        motion: Motion,
+        to: impl Fn(&Self, (usize, usize), Option<usize>) -> (usize, Option<usize>),
+    ) {
+        (self.cursor, self.goal_column) = to(self, (self.anchor, self.cursor), self.goal_column);
+        if !self.extra.is_empty() {
+            let goals = self.extra_goals();
+            let moved: Vec<_> = self
+                .extra
+                .iter()
+                .zip(goals)
+                .map(|(&(anchor, head), goal)| (anchor, to(self, (anchor, head), goal)))
+                .collect();
+            self.extra = moved.iter().map(|&(a, (h, _))| (a, h)).collect();
+            self.extra_goals = moved.into_iter().map(|(_, (_, goal))| goal).collect();
+        }
+        if motion == Motion::Move {
+            self.anchor = self.cursor;
+            for cursor in &mut self.extra {
+                cursor.0 = cursor.1;
+            }
+        }
+        self.merge_cursors();
         self.last_edit = None;
         self.reveal_cursors();
     }
@@ -33,72 +65,68 @@ impl Buffer {
     pub fn move_left(&mut self, motion: Motion) {
         // Plain left with a selection collapses to its start, which is what
         // every other editor does.
-        if motion == Motion::Move
-            && let Some(range) = self.selection()
-        {
-            self.cursor = range.start;
-            self.goal_column = None;
-            self.after_move(motion);
-            return;
-        }
-        self.cursor = self.prev_boundary(self.cursor);
-        self.goal_column = None;
-        self.after_move(motion);
+        self.move_all(motion, |b, (anchor, head), _| {
+            if motion == Motion::Move && anchor != head {
+                (anchor.min(head), None)
+            } else {
+                (b.prev_boundary(head), None)
+            }
+        });
     }
     pub fn move_right(&mut self, motion: Motion) {
-        if motion == Motion::Move
-            && let Some(range) = self.selection()
-        {
-            self.cursor = range.end;
-            self.goal_column = None;
-            self.after_move(motion);
-            return;
-        }
-        self.cursor = self.next_boundary(self.cursor);
-        self.goal_column = None;
-        self.after_move(motion);
+        self.move_all(motion, |b, (anchor, head), _| {
+            if motion == Motion::Move && anchor != head {
+                (anchor.max(head), None)
+            } else {
+                (b.next_boundary(head), None)
+            }
+        });
     }
     pub fn move_up(&mut self, motion: Motion) {
-        if self.row_mode() {
-            return self.move_row(-1, motion);
-        }
-        let (line, column) = self.visual_position();
-        if line == 0 {
-            self.cursor = 0;
-        } else {
-            let goal = self.goal_column.unwrap_or(column);
-            self.cursor = self.byte_at_visual(line - 1, goal);
-            self.goal_column = Some(goal);
-        }
-        self.after_move(motion);
+        self.move_vertically(-1, motion);
     }
-    /// The caret's line and its column on screen: tabs to their stops,
+    pub fn move_down(&mut self, motion: Motion) {
+        self.move_vertically(1, motion);
+    }
+    /// Up or down a line, or a screen row while wrapping or folded, at
+    /// every cursor, each aiming for its own goal column.
+    fn move_vertically(&mut self, delta: isize, motion: Motion) {
+        if self.row_mode() {
+            // A caret on a hidden line has no row to move from.
+            self.reveal_cursors();
+            self.move_all(motion, |b, (_, head), goal| b.row_step(head, goal, delta));
+        } else {
+            self.move_all(motion, |b, (_, head), goal| b.line_step(head, goal, delta));
+        }
+    }
+    /// Where Up (`delta` -1) or Down (1) takes a caret at `at` aiming for
+    /// `goal`, by lines: to the start of the text from the first line and
+    /// to its end from the last, as everywhere on macOS.
+    fn line_step(&self, at: usize, goal: Option<usize>, delta: isize) -> (usize, Option<usize>) {
+        let (line, column) = self.visual_position(at);
+        if delta < 0 && line == 0 {
+            return (0, goal);
+        }
+        if delta > 0 && line + 1 >= self.rope.len_lines() {
+            return (self.rope.len_bytes(), goal);
+        }
+        let goal = goal.unwrap_or(column);
+        let target = if delta < 0 { line - 1 } else { line + 1 };
+        (self.byte_at_visual(target, goal), Some(goal))
+    }
+    /// The line of `at` and its column on screen: tabs to their stops,
     /// wide characters as two. The goal column of Up and Down is kept in
     /// these, as it is while wrapping, so the caret does not zig-zag past
     /// tabs and CJK and does the same with wrapping on or off.
-    pub(super) fn visual_position(&self) -> (usize, usize) {
-        let line = self.rope.byte_to_line(self.cursor);
+    pub(super) fn visual_position(&self, at: usize) -> (usize, usize) {
+        let line = self.rope.byte_to_line(at);
         let start = self.rope.line_to_byte(line);
-        (line, wrap::column_in_row(&self.rope, start, self.cursor))
+        (line, wrap::column_in_row(&self.rope, start, at))
     }
     pub(super) fn byte_at_visual(&self, line: usize, column: usize) -> usize {
         let start = self.rope.line_to_byte(line);
         let end = wrap::line_end(&self.rope, line);
         wrap::byte_at_column(&self.rope, start, end, column)
-    }
-    pub fn move_down(&mut self, motion: Motion) {
-        if self.row_mode() {
-            return self.move_row(1, motion);
-        }
-        let (line, column) = self.visual_position();
-        if line + 1 >= self.rope.len_lines() {
-            self.cursor = self.rope.len_bytes();
-        } else {
-            let goal = self.goal_column.unwrap_or(column);
-            self.cursor = self.byte_at_visual(line + 1, goal);
-            self.goal_column = Some(goal);
-        }
-        self.after_move(motion);
     }
     /// Whether screen rows differ from lines: wrapping, or lines folded away.
     pub fn row_mode(&self) -> bool {
@@ -244,41 +272,39 @@ impl Buffer {
         let line = self.rope.byte_to_line(self.cursor);
         (line, wrap::row_of(&self.row_starts(line), self.cursor))
     }
-    /// Up or down one screen row while wrapping, keeping the goal column
-    /// measured from the start of the row.
-    pub(super) fn move_row(&mut self, delta: isize, motion: Motion) {
-        let line = self.rope.byte_to_line(self.cursor);
-        if self.is_hidden(line) {
-            self.unfold(line);
-        }
+    /// Where one screen row up or down takes a caret at `at` while
+    /// wrapping or folded, keeping `goal` measured from the start of the
+    /// row. The caret's line must not be folded away.
+    fn row_step(&self, at: usize, goal: Option<usize>, delta: isize) -> (usize, Option<usize>) {
+        let line = self.rope.byte_to_line(at);
         let starts = self.row_starts(line);
-        let row = wrap::row_of(&starts, self.cursor);
-        let column = wrap::column_in_row(&self.rope, starts[row], self.cursor);
-        let goal = self.goal_column.unwrap_or(column);
+        let row = wrap::row_of(&starts, at);
+        let Some(&row_start) = starts.get(row) else {
+            return (at, goal);
+        };
+        let column = wrap::column_in_row(&self.rope, row_start, at);
         let (target_line, target_row) = self.step_rows((line, row), delta);
         if (target_line, target_row) == (line, row) {
-            self.cursor = if delta < 0 { 0 } else { self.rope.len_bytes() };
-        } else {
-            let starts = if target_line == line {
-                starts
-            } else {
-                self.row_starts(target_line)
-            };
-            let start = starts[target_row];
-            let end = starts
-                .get(target_row + 1)
-                .copied()
-                .unwrap_or_else(|| wrap::line_end(&self.rope, target_line));
-            let mut at = wrap::byte_at_column(&self.rope, start, end, goal);
-            // The end of a row that continues is the next row's start:
-            // stop before it, or the caret would jump down a row.
-            if target_row + 1 < starts.len() && at == end {
-                at = self.prev_boundary(end).max(start);
-            }
-            self.cursor = at;
-            self.goal_column = Some(goal);
+            return (if delta < 0 { 0 } else { self.rope.len_bytes() }, goal);
         }
-        self.after_move(motion);
+        let goal = goal.unwrap_or(column);
+        let starts = if target_line == line {
+            starts
+        } else {
+            self.row_starts(target_line)
+        };
+        let start = starts[target_row];
+        let end = starts
+            .get(target_row + 1)
+            .copied()
+            .unwrap_or_else(|| wrap::line_end(&self.rope, target_line));
+        let mut at = wrap::byte_at_column(&self.rope, start, end, goal);
+        // The end of a row that continues is the next row's start: stop
+        // before it, or the caret would jump down a row.
+        if target_row + 1 < starts.len() && at == end {
+            at = self.prev_boundary(end).max(start);
+        }
+        (at, Some(goal))
     }
     /// `delta` screen rows from `(line, row)`, stopping at either end of the
     /// document.
@@ -359,26 +385,22 @@ impl Buffer {
         self.step_rows(end, -(rows.max(1) as isize - 1))
     }
     pub fn move_line_start(&mut self, motion: Motion) {
-        let (line, _) = self.cursor_position();
-        self.cursor = self.rope.line_to_byte(line);
-        self.goal_column = None;
-        self.after_move(motion);
+        self.move_all(motion, |b, (_, head), _| {
+            (b.rope.line_to_byte(b.rope.byte_to_line(head)), None)
+        });
     }
     pub fn move_line_end(&mut self, motion: Motion) {
-        let (line, _) = self.cursor_position();
-        self.cursor = self.line_end(line);
-        self.goal_column = None;
-        self.after_move(motion);
+        self.move_all(motion, |b, (_, head), _| {
+            (b.line_end(b.rope.byte_to_line(head)), None)
+        });
     }
+    /// Every cursor goes, and so they all become one, unless Shift keeps
+    /// their anchors apart.
     pub fn move_buffer_start(&mut self, motion: Motion) {
-        self.cursor = 0;
-        self.goal_column = None;
-        self.after_move(motion);
+        self.move_all(motion, |_, _, _| (0, None));
     }
     pub fn move_buffer_end(&mut self, motion: Motion) {
-        self.cursor = self.rope.len_bytes();
-        self.goal_column = None;
-        self.after_move(motion);
+        self.move_all(motion, |b, _, _| (b.rope.len_bytes(), None));
     }
 
     // ---- scrolling -------------------------------------------------------
