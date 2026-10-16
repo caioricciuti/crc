@@ -2883,6 +2883,7 @@ define_class!(
             self.poll_agents();
             self.poll_review();
             self.poll_reloads();
+            self.poll_syntax();
             if self
                 .state_mut().is_some_and(|mut state| state.symbols.poll())
             {
@@ -5468,6 +5469,13 @@ impl EditorView {
                 link.setPaused(false);
             }
         }
+        // Another pane's document can send a parse from inside the frame;
+        // the link polls for it.
+        if state.syntax.busy()
+            && let Some(link) = self.ivars().display_link.get()
+        {
+            link.setPaused(false);
+        }
         state.last_draw = Some(Instant::now());
 
         // Cursor rects are AppKit's copy of the layout, and it only asks for
@@ -5723,10 +5731,10 @@ impl EditorView {
     ///
     /// Called after anything that changes the text or which document is
     /// showing. The rules, which trees belong to which document and when an
-    /// incremental parse is allowed, live in [`SyntaxStore::update`], where
-    /// they can be tested without a window. Files past [`reparse_budget`] get
-    /// no highlighting rather than a stalled editor: the first parse is
-    /// linear in file size even though later ones are incremental.
+    /// incremental parse is allowed, live in [`SyntaxStore::update_async`],
+    /// where they can be tested without a window. Files past
+    /// [`reparse_budget`] parse on the syntax worker rather than stall the
+    /// editor, and [`EditorView::poll_syntax`] takes the result in.
     fn reparse(&self) {
         let Some(mut state) = self.state_mut() else {
             return;
@@ -5739,7 +5747,7 @@ impl EditorView {
             panes,
             ..
         } = &mut *state;
-        syntax.update(docs.active_mut(), reparse_budget());
+        syntax.update_async(docs.active_mut(), reparse_budget(), first_parse_budget());
         // Closed tabs take their trees with them.
         let open = |id: u64| {
             docs.iter().any(|b| b.id() == id)
@@ -5749,6 +5757,22 @@ impl EditorView {
         responses.retain(|id, _| open(*id));
         if !syntax.has(docs.active().id()) {
             spans.clear();
+        }
+        let busy = syntax.busy();
+        drop(state);
+        // The link polls for the parse; a paused one would never see it.
+        if busy {
+            self.resume_display_link();
+        }
+    }
+
+    /// Takes in parses the syntax worker has finished, and redraws for them.
+    fn poll_syntax(&self) {
+        if self
+            .state_mut()
+            .is_some_and(|mut state| state.syntax.poll())
+        {
+            self.request_redraw();
         }
     }
 
@@ -6064,25 +6088,37 @@ define_class!(
     }
 );
 
-/// Largest file that gets syntax highlighting.
+/// Largest file whose keystrokes parse on the main thread. Past it, up to
+/// [`crate::syntax::PARSE_CAP_BYTES`], they parse on the syntax worker;
+/// a file's first parse follows [`first_parse_budget`] instead.
 ///
-/// Set from measurement, not taste. With incremental parsing an edit costs
-/// (examples/syntax_latency.rs, M2 Pro):
+/// Set from measurement, not taste. On the main thread a keystroke costs its
+/// incremental parse, several times more when keystrokes come a frame apart,
+/// as typing does, than back to back: the core has cooled in between. Handed
+/// to the worker it costs moving the tree on screen and a copy of it, and
+/// the colours near the edit catch up a few milliseconds later
+/// (examples/syntax_latency.rs, keystrokes a frame apart, M2 Pro):
 ///
 /// ```text
-///   256 KiB   0.34 ms
-///     1 MiB   1.38 ms
-///     4 MiB   9.86 ms   <- past the 8.33 ms frame budget
+///             here, mean (max)    on the worker, mean (max)   caught up
+///   128 KiB    1.29 ms (2.09)      0.057 ms (0.43)              4.6 ms
+///   256 KiB    2.50 ms (4.29)      0.053 ms (0.29)              4.3 ms
+///   512 KiB    3.51 ms (7.18)      0.028 ms (0.06)              7.1 ms
+///     1 MiB    6.88 ms (9.94)      0.019 ms (0.04)             10.6 ms
+///     4 MiB   11.2 ms (13.7)       0.012 ms (0.04)             13.5 ms
 /// ```
 ///
-/// 2 MiB keeps a keystroke comfortably inside a frame. Past that,
-/// highlighting is dropped rather than the responsiveness, because an editor
-/// that stutters is worse than one without colours.
-///
-/// The *first* parse of a file is still linear (~190 ms at 2 MiB), but that
-/// is paid once on open rather than per keystroke.
+/// Under 64 KiB a parse is about a millisecond at worst and the colours are
+/// exact on the frame that shows the keystroke.
 fn reparse_budget() -> usize {
-    2 * 1024 * 1024
+    64 * 1024
+}
+
+/// Largest file whose first parse runs on the main thread, so it opens
+/// coloured. Past this it opens plain and takes its colour when the worker's
+/// parse lands. Linear in size: ~47 ms at 512 KiB, paid once on opening.
+fn first_parse_budget() -> usize {
+    512 * 1024
 }
 
 /// Whether a document indents with spaces, and how wide a level is, from
@@ -7018,7 +7054,11 @@ fn draw_other_pane(
     // from disk): its tree follows before it is drawn, or colours land on
     // the neighbouring tokens.
     if store.docs.active().has_pending_edits() {
-        syntax.update(store.docs.active_mut(), reparse_budget());
+        syntax.update_async(
+            store.docs.active_mut(),
+            reparse_budget(),
+            first_parse_budget(),
+        );
     }
     layout::build_tab_bar_in(
         &store.docs,

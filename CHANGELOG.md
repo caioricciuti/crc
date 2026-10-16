@@ -10,6 +10,14 @@ One entry per tag, written for people who use the editor.
   caret, selection, find highlights and squiggles move with the text,
   and a click lands on the character drawn under the pointer. A mouse
   wheel still scrolls by whole characters.
+- Big files keep their syntax colours. Files over 2 MB used to open as
+  plain text; now anything up to 64 MB is highlighted. A file up to
+  512 KB opens coloured as before; a bigger one is parsed in the
+  background, so the window opens at once and the colours appear a
+  moment later. Typing in a file over 64 KB no longer waits for the
+  parse: the colours already on screen move with the text, and the ones
+  near your edit catch up a frame or two later. Before, typing in a
+  file near 2 MB could miss a frame.
 - Terminal: links open with a Cmd-click. A web address a program
   prints (such as the pull request link Claude Code shows) opens in your
   browser, found whole even when it wraps onto the next row, without the

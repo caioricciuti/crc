@@ -82,14 +82,9 @@ pub struct TSQueryMatch {
 }
 
 /// Edit applied to a tree before re-parsing, so tree-sitter can reuse the
-/// unchanged parts instead of starting over.
-///
-/// Bound but not yet used: full re-parses are comfortably inside the frame
-/// budget at the sizes this editor currently highlights, and incremental
-/// parsing means tracking every edit's byte and point deltas. Kept here
-/// because it is the documented path once a file large enough to need it
-/// turns up, and because the struct layout is part of the ABI either way.
-#[allow(dead_code)]
+/// unchanged parts instead of starting over. Applied on its own, without a
+/// parse, it moves a tree's positions so it can go on being drawn while the
+/// parse runs elsewhere.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct TSInputEdit {
@@ -158,9 +153,11 @@ unsafe extern "C" {
     ) -> *mut TSTree;
 
     pub fn ts_tree_delete(tree: *mut TSTree);
+    /// A shallow copy sharing the original's nodes, which are reference
+    /// counted atomically. A tree is not safe to use from two threads at
+    /// once; two copies of it are.
+    pub fn ts_tree_copy(tree: *const TSTree) -> *mut TSTree;
     pub fn ts_tree_root_node(tree: *const TSTree) -> TSNode;
-    /// See [`TSInputEdit`] for why this is bound but unused.
-    #[allow(dead_code)]
     pub fn ts_tree_edit(tree: *mut TSTree, edit: *const TSInputEdit);
 
     /// Restricts the next parse to `ranges`, which is how one language is

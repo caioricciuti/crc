@@ -474,6 +474,7 @@ impl State {
     /// left out of here pauses the link while its reply waits.
     pub(super) fn idle(&self) -> bool {
         self.gutter.idle()
+            && !self.syntax.busy()
             && self.blame.idle()
             && self.heat.idle()
             && self.lsp.idle()

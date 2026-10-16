@@ -409,6 +409,7 @@ impl EditorView {
                 self.poll_ignored();
                 self.poll_completion();
                 self.poll_claude();
+                self.poll_syntax();
                 if let Some(mut state) = self.state_mut() {
                     state.git.poll();
                 }
@@ -688,9 +689,11 @@ impl EditorView {
                             .map_or(0, |m| m.bands.len())
                     )
                 };
+                // Syntax spans the last frame drew the editor with.
+                let spans = state.spans.len();
                 let report = format!(
                     // First: the report ends with the document's text.
-                    "message: {}\npreview: {}\nmd: {md}\nactivity: {}\npointer_targets: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nrepo: {}\ngit_note: {}\nhome: {}\nmcp: {}\nmcp_page: {}\nsettings_page: {}\nreview_page: {}\nterminals: {}\nagents: {}\ninspector: {}\nteams: {}\nagents_tree: {}\nagents_activity: {}\nagents_prs: {}\nconflicts: {}\ngit_conflicts: {}\nblame: {}\nfind_results: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\npeek: {}\ngutter: {}\nissue_tab: {}\nscrub: {}\nscrub_strip: {}\nscrub_fade: {}\nblame_heat: {}\n{report}",
+                    "message: {}\npreview: {}\nmd: {md}\nspans: {spans}\nactivity: {}\npointer_targets: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nrepo: {}\ngit_note: {}\nhome: {}\nmcp: {}\nmcp_page: {}\nsettings_page: {}\nreview_page: {}\nterminals: {}\nagents: {}\ninspector: {}\nteams: {}\nagents_tree: {}\nagents_activity: {}\nagents_prs: {}\nconflicts: {}\ngit_conflicts: {}\nblame: {}\nfind_results: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\npeek: {}\ngutter: {}\nissue_tab: {}\nscrub: {}\nscrub_strip: {}\nscrub_fade: {}\nblame_heat: {}\n{report}",
                     state.message.as_ref().map_or("", |(text, _)| text.as_str()),
                     state.html_preview.as_ref().map_or("closed".to_string(), |p| format!(
                         "open ext={} view={} probe={}",

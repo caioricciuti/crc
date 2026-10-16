@@ -14,7 +14,8 @@
 //! Run with: cargo run --release --offline --example frame_latency
 //! (`-- --wrap`, `--fold` or `--chrome` for those frames, `--scrub` for
 //! steps through a file's history, `--heat` to add Git > Blame Heat's
-//! strip to every frame).
+//! strip to every frame, `--syntax` for typing in highlighted Rust files
+//! of 128 KiB to 4 MiB).
 
 use crc::project::tree::Tree;
 use crc::render::font::Atlas;
@@ -235,6 +236,12 @@ fn main() {
         scrub_steps(&mut renderer, (logical_w, logical_h), (px_w, px_h));
         return;
     }
+    // `--syntax`: typing with highlighting in a file past the main thread's
+    // parse budget.
+    if std::env::args().any(|arg| arg == "--syntax") {
+        syntax_typing(&mut renderer, (logical_w, logical_h), (px_w, px_h));
+        return;
+    }
 
     const MB: usize = 100 * 1024 * 1024;
     let src = synth::synth(
@@ -407,6 +414,143 @@ fn main() {
 
     std::hint::black_box(&glyphs);
     std::hint::black_box(Duration::from_nanos(0));
+}
+
+// ---- --syntax --------------------------------------------------------------
+// Typing in a highlighted Rust file, at sizes either side of the window's
+// parse budgets. A sample is what the window does for a keystroke and the
+// frame after it: the edit, `update_async`, a `poll` for whatever the worker
+// has finished, the spans on screen, layout and the GPU. Keystrokes come a
+// frame apart, as typing does, which costs a main-thread parse several times
+// what it costs back to back. Before the worker, a 4 MiB file's parse alone
+// was about 10 ms here.
+
+/// Sizes of the files typed into.
+const SYNTAX_SIZES_KIB: [usize; 5] = [128, 256, 512, 1024, 4096];
+/// The window's `reparse_budget` and `first_parse_budget`.
+const SYNTAX_EDIT_BUDGET: usize = 64 * 1024;
+const SYNTAX_OPEN_BUDGET: usize = 512 * 1024;
+
+fn syntax_typing(renderer: &mut Renderer, logical: (f32, f32), px: (usize, usize)) {
+    use crc::syntax::SyntaxStore;
+
+    let viewport = Viewport::new(logical.0, logical.1);
+    let theme = Theme::default();
+    let line_height = renderer.atlas.metrics.line_height;
+    let rows = viewport.rows(line_height);
+    let mut glyphs = Vec::with_capacity(16_384);
+    let mut spans = Vec::new();
+    let mut frame = |buffer: &Buffer,
+                     syntax: &SyntaxStore,
+                     spans: &mut Vec<crc::syntax::Span>,
+                     renderer: &mut Renderer| {
+        spans.clear();
+        let screen = layout::screen_rows(buffer, viewport, line_height);
+        if let Some(lines) = layout::lines_of(&screen) {
+            let from = buffer.rope.line_to_byte(lines.start);
+            let to = if lines.end < buffer.rope.len_lines() {
+                buffer.rope.line_to_byte(lines.end)
+            } else {
+                buffer.rope.len_bytes()
+            };
+            spans.extend(
+                syntax.spans_with(buffer.id(), from..to, |r| buffer.rope.slice_to_string(r)),
+            );
+        }
+        layout::build_full_search(
+            buffer,
+            &mut renderer.atlas,
+            viewport,
+            &screen,
+            &theme,
+            "",
+            None,
+            spans,
+            &layout::Markdown::default(),
+            true,
+            &mut glyphs,
+        );
+        renderer.render_offscreen_frame(px.0, px.1, &glyphs, logical, theme.background);
+    };
+    let settle = |syntax: &mut SyntaxStore| {
+        while syntax.busy() {
+            syntax.poll();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+
+    // The query compiles once per language, not per document.
+    let mut syntax = SyntaxStore::new();
+    let mut warm = Buffer::from_text("fn f() {}\n");
+    warm.path = Some("warm.rs".into());
+    syntax.update_async(&mut warm, SYNTAX_EDIT_BUDGET, SYNTAX_OPEN_BUDGET);
+
+    println!(
+        "{:>8}  {:>8}  {:>13}  {:>22}  {:>22}  {:>10}",
+        "size",
+        "open",
+        "colour after",
+        "update_async+poll p50/p99",
+        "keystroke-frame p99/max",
+        "caught up"
+    );
+    let mut verdicts = Vec::new();
+    for kib in SYNTAX_SIZES_KIB {
+        let src = synth::synth(kib * 1024, "    // a comment line\n");
+        let mut buffer = Buffer::from_text(&src);
+        buffer.path = Some("src/big.rs".into());
+        let middle = buffer.rope.len_lines() / 2;
+        for _ in 0..middle {
+            buffer.move_down(Motion::Move);
+        }
+        buffer.scroll_to_cursor(rows, 0);
+
+        let t = Instant::now();
+        syntax.update_async(&mut buffer, SYNTAX_EDIT_BUDGET, SYNTAX_OPEN_BUDGET);
+        let open_ms = t.elapsed().as_secs_f64() * 1e3;
+        settle(&mut syntax);
+        let coloured_ms = t.elapsed().as_secs_f64() * 1e3;
+        for _ in 0..30 {
+            frame(&buffer, &syntax, &mut spans, renderer);
+        }
+
+        const N: usize = 200;
+        let (mut full, mut parse) = (Vec::with_capacity(N), Vec::with_capacity(N));
+        for i in 0..N {
+            std::thread::sleep(Duration::from_secs_f64(BUDGET_MS / 1e3));
+            let started = Instant::now();
+            if i % 8 == 7 {
+                buffer.backspace();
+            } else {
+                buffer.insert("x");
+            }
+            buffer.scroll_to_cursor(rows, 0);
+            let t_parse = Instant::now();
+            syntax.update_async(&mut buffer, SYNTAX_EDIT_BUDGET, SYNTAX_OPEN_BUDGET);
+            syntax.poll();
+            parse.push(t_parse.elapsed().as_secs_f64() * 1e3);
+            frame(&buffer, &syntax, &mut spans, renderer);
+            full.push(started.elapsed().as_secs_f64() * 1e3);
+        }
+        let t = Instant::now();
+        settle(&mut syntax);
+        let caught_up_ms = t.elapsed().as_secs_f64() * 1e3;
+        parse.sort_by(f64::total_cmp);
+        full.sort_by(f64::total_cmp);
+        println!(
+            "{:>4} KiB  {open_ms:>5.1} ms  {coloured_ms:>10.1} ms  {:>10.3} / {:>6.3} ms  {:>10.3} / {:>6.3} ms  {caught_up_ms:>7.1} ms",
+            kib,
+            percentile(&parse, 0.50),
+            percentile(&parse, 0.99),
+            percentile(&full, 0.99),
+            full[N - 1],
+        );
+        verdicts.push((kib, full));
+        syntax.retain(|_| false);
+    }
+    for (kib, full) in verdicts {
+        verdict(&format!("{kib} KiB "), full);
+    }
 }
 
 // ---- --scrub ----------------------------------------------------------------

@@ -16,6 +16,7 @@
 pub mod defs;
 mod ffi;
 mod predicate;
+mod worker;
 
 use std::ffi::{CString, c_char, c_void};
 use std::ptr::NonNull;
@@ -470,6 +471,38 @@ impl Tree {
         // SAFETY: `raw` is a live tree for the lifetime of `self`.
         unsafe { ffi::ts_node_has_error(ffi::ts_tree_root_node(self.raw.as_ptr())) }
     }
+
+    /// A copy for another thread. Cheap: the two share every node, and
+    /// editing either one copies only the nodes the edit touches.
+    pub fn copy(&self) -> Option<Tree> {
+        // SAFETY: `raw` is live; the copy is a new tree owned by the result.
+        NonNull::new(unsafe { ffi::ts_tree_copy(self.raw.as_ptr()) }).map(|raw| Tree { raw })
+    }
+
+    /// Moves the tree's positions through `edits`, in the order they
+    /// happened, without parsing anything. What the edits touched keeps
+    /// its old shape until the next parse; everything after them keeps its
+    /// colour at its new offset.
+    pub fn edit(&mut self, edits: &[crate::text::buffer::Edit]) {
+        apply_edits(self, edits);
+    }
+}
+
+/// [`Tree::edit`] through a shared reference, which tree-sitter allows: an
+/// edit only changes what the next parse reuses and where nodes sit.
+fn apply_edits(tree: &Tree, edits: &[crate::text::buffer::Edit]) {
+    for edit in edits {
+        let raw = ffi::TSInputEdit {
+            start_byte: edit.start_byte as u32,
+            old_end_byte: edit.old_end_byte as u32,
+            new_end_byte: edit.new_end_byte as u32,
+            start_point: point(edit.start_point),
+            old_end_point: point(edit.old_end_point),
+            new_end_point: point(edit.new_end_point),
+        };
+        // SAFETY: `tree` owns a live tree, and `raw` is valid for the call.
+        unsafe { ffi::ts_tree_edit(tree.raw.as_ptr(), &raw) };
+    }
 }
 
 impl Drop for Tree {
@@ -664,35 +697,26 @@ impl Highlighter {
         old: &Tree,
         edits: &[crate::text::buffer::Edit],
     ) -> Option<Tree> {
-        for edit in edits {
-            let raw = ffi::TSInputEdit {
-                start_byte: edit.start_byte as u32,
-                old_end_byte: edit.old_end_byte as u32,
-                new_end_byte: edit.new_end_byte as u32,
-                start_point: point(edit.start_point),
-                old_end_point: point(edit.old_end_point),
-                new_end_point: point(edit.new_end_point),
-            };
-            // SAFETY: `old` owns a live tree, and `raw` is valid for the call.
-            unsafe { ffi::ts_tree_edit(old.raw.as_ptr(), &raw) };
-        }
-
-        let mut state = ReadState::new(rope);
-        let input = state.input();
-        // SAFETY: as `parse`, but handing the edited old tree back so its
-        // untouched subtrees can be reused.
-        let raw = unsafe { ffi::ts_parser_parse(self.parser.as_ptr(), old.raw.as_ptr(), input) };
-        NonNull::new(raw).map(|raw| Tree { raw })
+        apply_edits(old, edits);
+        self.parse_from(rope, Some(old))
     }
 
     /// Parses a rope into a tree.
     pub fn parse(&mut self, rope: &Rope) -> Option<Tree> {
+        self.parse_from(rope, None)
+    }
+
+    /// Parses `rope`, reusing what `old` says is unchanged. `old` has to
+    /// have been moved through every edit since it was parsed already.
+    pub fn parse_from(&mut self, rope: &Rope, old: Option<&Tree>) -> Option<Tree> {
         let mut state = ReadState::new(rope);
         let input = state.input();
+        let old = old.map_or(std::ptr::null(), |tree| tree.raw.as_ptr() as *const _);
         // SAFETY: the parser is live, the input payload outlives the call
-        // because `state` is on this stack frame, and a null old_tree means
-        // a fresh parse.
-        let raw = unsafe { ffi::ts_parser_parse(self.parser.as_ptr(), std::ptr::null(), input) };
+        // because `state` is on this stack frame, and `old` is either null,
+        // for a fresh parse, or a live tree whose untouched subtrees are
+        // reused.
+        let raw = unsafe { ffi::ts_parser_parse(self.parser.as_ptr(), old, input) };
         NonNull::new(raw).map(|raw| Tree { raw })
     }
 
@@ -893,11 +917,32 @@ pub(crate) fn flatten(mut spans: Vec<Span>) -> Vec<Span> {
 /// got that tree straight back: one file coloured with the other's offsets,
 /// and a slice through the middle of a character when the offsets disagreed.
 /// Keyed by [`Buffer::id`], a tree cannot outlive or stray from its document.
+///
+/// Small documents parse on the main thread, in [`SyntaxStore::update`].
+/// Big ones parse on a worker, through [`SyntaxStore::update_async`] and
+/// [`SyntaxStore::poll`]: the tree on screen is only moved through each
+/// edit, which costs microseconds, and the parse lands a frame or a few
+/// later.
+///
+/// [`Buffer::id`]: crate::text::buffer::Buffer::id
 #[derive(Default)]
 pub struct SyntaxStore {
     highlighters: Vec<Highlighter>,
     trees: std::collections::HashMap<u64, DocumentTrees>,
+    /// The parse thread, started by the first document too big to parse
+    /// here.
+    worker: Option<worker::Worker>,
+    /// The last generation handed to a job. Each job takes the next, so a
+    /// result can only ever be taken for the job it answers: one sent for a
+    /// document since closed, reloaded or renamed to another language finds
+    /// a different generation, or no document, and is dropped.
+    generation: u64,
 }
+
+/// Past this nothing is parsed, on any thread: a parse holds a tree about
+/// the size of the text, and a first parse of a file this size already
+/// takes seconds.
+pub const PARSE_CAP_BYTES: usize = 64 * 1024 * 1024;
 
 /// Everything parsed for one document.
 struct DocumentTrees {
@@ -910,6 +955,77 @@ struct DocumentTrees {
     /// HTML file's `<script>` elements, the CSS in its `<style>`. Each covers
     /// all of that language's pieces at once and nothing in between.
     layers: Vec<(Language, Tree)>,
+    /// The parse on the worker, when one is running.
+    pending: Option<Pending>,
+}
+
+/// A parse running on the worker for one document.
+struct Pending {
+    generation: u64,
+    /// Edits made since the job's text, in order. Already applied to the
+    /// trees on screen; owed to the result when it lands.
+    edits: Vec<crate::text::buffer::Edit>,
+    /// The text as of the last update, for the job that follows when
+    /// `edits` is not empty.
+    rope: Rope,
+}
+
+impl DocumentTrees {
+    /// Moves every tree's positions through `edits`, without parsing.
+    fn edit(&mut self, edits: &[crate::text::buffer::Edit]) {
+        if edits.is_empty() {
+            return;
+        }
+        if let Some(tree) = &mut self.tree {
+            tree.edit(edits);
+        }
+        for (_, layer) in &mut self.layers {
+            layer.edit(edits);
+        }
+    }
+}
+
+/// The highlighter for a language in `highlighters`, built on first use.
+fn highlighter_in(
+    highlighters: &mut Vec<Highlighter>,
+    language: Language,
+) -> Option<&mut Highlighter> {
+    if !highlighters.iter().any(|h| h.language == language) {
+        highlighters.push(Highlighter::new(language)?);
+    }
+    highlighters.iter_mut().find(|h| h.language == language)
+}
+
+/// Parses a document in `language`, and every language embedded in it.
+///
+/// `old` and `old_layers` are the last parse, already moved through every
+/// edit since, for an incremental parse; `None` and empty for a fresh one.
+/// The same edits apply to a layer as to the host: they are positions in the
+/// one document all the layers are parsed out of.
+fn parse_document(
+    highlighters: &mut Vec<Highlighter>,
+    language: Language,
+    rope: &Rope,
+    old: Option<&Tree>,
+    old_layers: &[(Language, Tree)],
+) -> Option<(Tree, Vec<(Language, Tree)>)> {
+    let host = highlighter_in(highlighters, language)?;
+    let tree = host.parse_from(rope, old)?;
+    let injections = host.injection_ranges(&tree);
+    let mut layers = Vec::new();
+    for (embedded, ranges) in injections {
+        let Some(highlighter) = highlighter_in(highlighters, embedded) else {
+            continue;
+        };
+        let previous = old_layers
+            .iter()
+            .find(|(l, _)| *l == embedded)
+            .map(|(_, tree)| (tree, &[][..]));
+        if let Some(layer) = highlighter.parse_ranges(rope, &ranges, previous) {
+            layers.push((embedded, layer));
+        }
+    }
+    Some((tree, layers))
 }
 
 impl SyntaxStore {
@@ -919,15 +1035,10 @@ impl SyntaxStore {
 
     /// The highlighter for a language, built on first use.
     fn highlighter(&mut self, language: Language) -> Option<&mut Highlighter> {
-        if !self.highlighters.iter().any(|h| h.language == language) {
-            self.highlighters.push(Highlighter::new(language)?);
-        }
-        self.highlighters
-            .iter_mut()
-            .find(|h| h.language == language)
+        highlighter_in(&mut self.highlighters, language)
     }
 
-    /// Brings `buffer`'s trees up to date with its text.
+    /// Brings `buffer`'s trees up to date with its text, on this thread.
     ///
     /// Always drains the buffer's edits, whatever happens next. An edit list
     /// that survives a full parse is replayed by the next incremental one
@@ -955,46 +1066,27 @@ impl SyntaxStore {
             return;
         };
 
-        // Taken out of the map for the duration, so the old trees can be read
-        // while `self` is borrowed for a highlighter. Incremental only onto
-        // this document's own trees, in the same language, with a complete
-        // account of what changed since.
-        let old = self
+        // Taken out of the map, which also drops any parse still running
+        // for it on the worker. Incremental only onto this document's own
+        // trees, in the same language, with a complete account of what
+        // changed since.
+        let mut old = self
             .trees
             .remove(&id)
-            .filter(|t| t.language == Some(language) && t.tree.is_some());
-        let old = old.as_ref().zip(edits.as_deref());
-
-        let Some(host) = self.highlighter(language) else {
-            return;
-        };
-        let tree = match old {
-            Some((trees, edits)) => match &trees.tree {
-                Some(tree) => host.parse_incremental(rope, tree, edits),
-                None => host.parse(rope),
-            },
-            None => host.parse(rope),
-        };
-        let Some(tree) = tree else {
-            return;
-        };
-
-        let mut layers = Vec::new();
-        for (embedded, ranges) in host.injection_ranges(&tree) {
-            let Some(highlighter) = self.highlighter(embedded) else {
-                continue;
-            };
-            // The same edits apply to a layer's old tree: they are positions
-            // in the one document all the layers are parsed out of.
-            let previous = old.and_then(|(trees, edits)| {
-                let (_, tree) = trees.layers.iter().find(|(l, _)| *l == embedded)?;
-                Some((tree, edits))
-            });
-            if let Some(layer) = highlighter.parse_ranges(rope, &ranges, previous) {
-                layers.push((embedded, layer));
-            }
+            .filter(|t| t.language == Some(language) && t.tree.is_some() && edits.is_some());
+        if let (Some(old), Some(edits)) = (&mut old, &edits) {
+            old.edit(edits);
         }
-
+        let parsed = parse_document(
+            &mut self.highlighters,
+            language,
+            rope,
+            old.as_ref().and_then(|t| t.tree.as_ref()),
+            old.as_ref().map_or(&[][..], |t| &t.layers),
+        );
+        let Some((tree, layers)) = parsed else {
+            return;
+        };
         self.trees.insert(
             id,
             DocumentTrees {
@@ -1002,8 +1094,202 @@ impl SyntaxStore {
                 tree: Some(tree),
                 markdown: None,
                 layers,
+                pending: None,
             },
         );
+    }
+
+    /// As [`SyntaxStore::update`], but a document past `edit_budget` parses
+    /// its edits on the worker instead of here.
+    ///
+    /// What this thread does for one is move the trees on screen through
+    /// the edits, so what is drawn until the parse lands is the last parse
+    /// at its new offsets, and hand the worker the text and a copy of those
+    /// trees. A parse already running is not interrupted: edits made while
+    /// it runs are kept, and [`SyntaxStore::poll`] replays them onto its
+    /// result and sends the next job.
+    ///
+    /// A document's first parse runs here up to `open_budget`, so a file
+    /// that size opens coloured rather than plain for a moment; past it the
+    /// first parse runs on the worker too, and the colour lands with it.
+    /// Markdown parses here whatever its size, up to its own cap.
+    pub fn update_async(
+        &mut self,
+        buffer: &mut crate::text::buffer::Buffer,
+        edit_budget: usize,
+        open_budget: usize,
+    ) {
+        let len = buffer.rope.len_bytes();
+        let extension = buffer.extension();
+        let markdown = extension
+            .as_deref()
+            .is_some_and(crate::markdown::is_markdown_extension);
+        let language = extension.as_deref().and_then(Language::from_extension);
+        // Parsed, or being parsed, in this language: what comes now is an
+        // edit, not an opening.
+        let opened = self.trees.get(&buffer.id()).is_some_and(|t| {
+            t.language.is_some()
+                && t.language == language
+                && (t.tree.is_some() || t.pending.is_some())
+        });
+        let budget = if opened {
+            edit_budget
+        } else {
+            open_budget.max(edit_budget)
+        };
+        let Some(language) =
+            language.filter(|_| !markdown && len > budget && len <= PARSE_CAP_BYTES)
+        else {
+            // Every case that parses here is within this; the rest, too
+            // big or without a grammar, lose their trees.
+            self.update(buffer, open_budget.max(edit_budget).min(PARSE_CAP_BYTES));
+            return;
+        };
+        let edits = buffer.drain_edits();
+        let id = buffer.id();
+        // The spans are queried here, so this thread needs the query too.
+        if self.highlighter(language).is_none() {
+            self.trees.remove(&id);
+            return;
+        }
+        // Another language's trees are no help, and its job is stale.
+        let mut doc = self
+            .trees
+            .remove(&id)
+            .filter(|t| t.language == Some(language))
+            .unwrap_or(DocumentTrees {
+                language: Some(language),
+                tree: None,
+                markdown: None,
+                layers: Vec::new(),
+                pending: None,
+            });
+        match edits {
+            Some(edits) => {
+                doc.edit(&edits);
+                match &mut doc.pending {
+                    Some(pending) => {
+                        pending.edits.extend(edits);
+                        pending.rope = buffer.rope.clone();
+                    }
+                    None if edits.is_empty() && doc.tree.is_some() => {}
+                    None => self.queue(id, &mut doc, &buffer.rope, false),
+                }
+            }
+            // Nothing leads from the trees to this text. They stay drawn,
+            // the nearest thing to right there is, and the parse from
+            // scratch replaces any job in flight, whose text is gone.
+            None => self.queue(id, &mut doc, &buffer.rope, true),
+        }
+        self.trees.insert(id, doc);
+    }
+
+    /// Sends `doc`'s next parse to the worker, from its trees on screen or,
+    /// `from_scratch`, from nothing. Without a worker the document keeps
+    /// what it has and nothing is pending.
+    fn queue(&mut self, id: u64, doc: &mut DocumentTrees, rope: &Rope, from_scratch: bool) {
+        doc.pending = None;
+        let Some(language) = doc.language else {
+            return;
+        };
+        let (old, old_layers) = if from_scratch {
+            (None, Vec::new())
+        } else {
+            (
+                doc.tree.as_ref().and_then(Tree::copy),
+                doc.layers
+                    .iter()
+                    .filter_map(|(l, tree)| Some((*l, tree.copy()?)))
+                    .collect(),
+            )
+        };
+        self.generation += 1;
+        let job = worker::Job {
+            id,
+            generation: self.generation,
+            language,
+            rope: rope.clone(),
+            old,
+            old_layers,
+        };
+        if self.send(job) {
+            doc.pending = Some(Pending {
+                generation: self.generation,
+                edits: Vec::new(),
+                rope: rope.clone(),
+            });
+        }
+    }
+
+    /// Hands `job` to the worker, starting one if there is none or the one
+    /// there was has gone. False when no thread could be started.
+    fn send(&mut self, job: worker::Job) -> bool {
+        let job = match &self.worker {
+            Some(worker) => match worker.send(job) {
+                Ok(()) => return true,
+                Err(job) => job,
+            },
+            None => job,
+        };
+        // None yet, or the thread is gone: a fresh one.
+        self.worker = worker::Worker::spawn();
+        self.worker.as_ref().is_some_and(|w| w.send(job).is_ok())
+    }
+
+    /// Takes in whatever the worker has finished. True when a document's
+    /// trees changed, which means a redraw. Called every refresh while
+    /// [`SyntaxStore::busy`].
+    pub fn poll(&mut self) -> bool {
+        let mut landed = false;
+        while let Some(done) = self.worker.as_ref().and_then(|w| w.done.try_recv().ok()) {
+            landed |= self.land(done);
+        }
+        landed
+    }
+
+    /// Installs one finished parse, if it is still the one its document is
+    /// waiting for, and sends the next when the text moved on meanwhile.
+    fn land(&mut self, done: worker::Done) -> bool {
+        let Some(mut doc) = self.trees.remove(&done.id) else {
+            return false;
+        };
+        let pending = match doc.pending.take() {
+            Some(pending) if pending.generation == done.generation => pending,
+            other => {
+                doc.pending = other;
+                self.trees.insert(done.id, doc);
+                return false;
+            }
+        };
+        if let Some(tree) = done.tree {
+            let replaced = doc.tree.replace(tree);
+            let replaced_layers = std::mem::replace(&mut doc.layers, done.layers);
+            if let Some(worker) = &self.worker {
+                worker.free(
+                    replaced
+                        .into_iter()
+                        .chain(replaced_layers.into_iter().map(|(_, tree)| tree))
+                        .collect(),
+                );
+            }
+            for (language, _) in &doc.layers {
+                let _ = highlighter_in(&mut self.highlighters, *language);
+            }
+            // The result describes the text the job was sent with; what was
+            // typed since moves it to now, as it moved the trees it replaces.
+            doc.edit(&pending.edits);
+        }
+        if !pending.edits.is_empty() {
+            self.queue(done.id, &mut doc, &pending.rope, false);
+        }
+        self.trees.insert(done.id, doc);
+        true
+    }
+
+    /// A parse is running on the worker, so [`SyntaxStore::poll`] has
+    /// something to wait for.
+    pub fn busy(&self) -> bool {
+        self.trees.values().any(|t| t.pending.is_some())
     }
 
     /// A Markdown document: its own styling, and a layer per language its
@@ -1059,6 +1345,7 @@ impl SyntaxStore {
                 tree: None,
                 markdown: Some(styled),
                 layers,
+                pending: None,
             },
         );
     }
@@ -1816,6 +2103,228 @@ mod tests {
             assert_store_matches_a_full_parse(&store, &buffer);
             shown = next;
         }
+    }
+
+    // ---- parsing on the worker ---------------------------------------------
+
+    /// A sync budget that sends every document to the worker.
+    const ON_WORKER: usize = 0;
+
+    /// Waits for the worker's next result and takes it in, as `poll` does
+    /// once one is there. True when it was installed.
+    fn land_next(store: &mut SyntaxStore) -> bool {
+        let done = store
+            .worker
+            .as_ref()
+            .expect("a worker")
+            .done
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the worker answers");
+        store.land(done)
+    }
+
+    /// Takes in results until nothing is waiting on the worker.
+    fn settle(store: &mut SyntaxStore) {
+        while store.busy() {
+            land_next(store);
+        }
+    }
+
+    fn kinds_at(
+        store: &SyntaxStore,
+        buffer: &crate::text::buffer::Buffer,
+        needle: &str,
+    ) -> Vec<Kind> {
+        let at = buffer.rope.to_string().find(needle).expect("present");
+        store
+            .spans_with(buffer.id(), at..at + needle.len(), |r| {
+                buffer.rope.slice_to_string(r)
+            })
+            .into_iter()
+            .filter(|s| s.start == at && s.end == at + needle.len())
+            .map(|s| s.kind)
+            .collect()
+    }
+
+    #[test]
+    fn async_parse_matches_a_full_parse() {
+        use crate::text::buffer::Motion;
+
+        let mut store = SyntaxStore::new();
+        let text = "fn alpha() { let s = \"caf\u{e9}\"; }\n".repeat(400);
+        let mut buffer = rust_buffer(&text, "big.rs");
+        store.update_async(&mut buffer, ON_WORKER, ON_WORKER);
+        assert!(store.busy(), "the first parse runs on the worker");
+        assert!(
+            kinds_at(&store, &buffer, "fn").is_empty(),
+            "plain until it lands"
+        );
+        settle(&mut store);
+        assert_store_matches_a_full_parse(&store, &buffer);
+
+        // Each keystroke is a job of its own once the last one has landed.
+        buffer.place_cursor(40, Motion::Move);
+        for piece in ["struct Typed;\n", "// note\n", "const N: u8 = 1;"] {
+            buffer.insert(piece);
+            store.update_async(&mut buffer, ON_WORKER, ON_WORKER);
+            assert!(store.busy());
+            settle(&mut store);
+            assert_store_matches_a_full_parse(&store, &buffer);
+        }
+        buffer.backspace();
+        store.update_async(&mut buffer, ON_WORKER, ON_WORKER);
+        settle(&mut store);
+        assert_store_matches_a_full_parse(&store, &buffer);
+
+        // Nothing typed, nothing sent.
+        store.update_async(&mut buffer, ON_WORKER, ON_WORKER);
+        assert!(!store.busy());
+
+        // An HTML page's embedded languages parse there as well.
+        let mut page = rust_buffer(PAGE, "index.html");
+        store.update_async(&mut page, ON_WORKER, ON_WORKER);
+        settle(&mut store);
+        assert_store_matches_a_full_parse(&store, &page);
+        let at = PAGE.find("const").expect("script body");
+        page.place_cursor(at, Motion::Move);
+        page.insert("let early = \"s\";\n");
+        store.update_async(&mut page, ON_WORKER, ON_WORKER);
+        settle(&mut store);
+        assert_store_matches_a_full_parse(&store, &page);
+    }
+
+    /// The window's budgets: edits past 64 KiB on the worker, first parses
+    /// here up to 512 KiB.
+    const EDITS: usize = 64 * 1024;
+    const OPENS: usize = 512 * 1024;
+
+    #[test]
+    fn a_mid_sized_document_opens_here_and_reparses_on_the_worker() {
+        let mut store = SyntaxStore::new();
+        let text = "fn alpha() { let s = \"caf\u{e9}\"; }\n".repeat(3300);
+        assert!(text.len() > 100 * 1024 && text.len() < OPENS);
+        let mut buffer = rust_buffer(&text, "mid.rs");
+
+        // Opened: coloured on the first frame, nothing on the worker.
+        store.update_async(&mut buffer, EDITS, OPENS);
+        assert!(!store.busy(), "the first parse is synchronous");
+        assert_store_matches_a_full_parse(&store, &buffer);
+
+        // Typed in: the parse goes to the worker.
+        buffer.insert("struct Typed;\n");
+        store.update_async(&mut buffer, EDITS, OPENS);
+        assert!(store.busy(), "a keystroke past 64 KiB parses on the worker");
+        settle(&mut store);
+        assert_store_matches_a_full_parse(&store, &buffer);
+
+        // Under 64 KiB everything stays here.
+        let mut small = rust_buffer("fn small() {}\n", "small.rs");
+        store.update_async(&mut small, EDITS, OPENS);
+        small.insert("// typed\n");
+        store.update_async(&mut small, EDITS, OPENS);
+        assert!(!store.busy());
+        assert_store_matches_a_full_parse(&store, &small);
+    }
+
+    #[test]
+    fn edits_during_a_parse_are_replayed() {
+        use crate::text::buffer::Motion;
+
+        let mut store = SyntaxStore::new();
+        let mut buffer = rust_buffer(&"fn f() { g(1); }\n".repeat(300), "typed.rs");
+        store.update_async(&mut buffer, ON_WORKER, ON_WORKER);
+        settle(&mut store);
+
+        // The first keystroke sends a job; the rest arrive while it runs,
+        // and are only applied to the tree on screen.
+        buffer.place_cursor(0, Motion::Move);
+        buffer.insert("// head\n");
+        store.update_async(&mut buffer, ON_WORKER, ON_WORKER);
+        let end = buffer.rope.len_bytes();
+        buffer.place_cursor(end, Motion::Move);
+        buffer.insert("struct Tail;\n");
+        store.update_async(&mut buffer, ON_WORKER, ON_WORKER);
+        buffer.place_cursor(8, Motion::Move);
+        buffer.delete_word_forward();
+        store.update_async(&mut buffer, ON_WORKER, ON_WORKER);
+        buffer.place_cursor(3, Motion::Move);
+        buffer.add_cursor(30, 30);
+        buffer.insert("\u{65e5}");
+        store.update_async(&mut buffer, ON_WORKER, ON_WORKER);
+
+        // What is drawn meanwhile is the old parse at its new offsets: the
+        // second function's keyword moved with the text in front of it.
+        let second = buffer.rope.to_string().find("}\nfn").expect("second fn") + 2;
+        let spans = store.spans_with(buffer.id(), second..second + 2, |r| {
+            buffer.rope.slice_to_string(r)
+        });
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.start == second && s.end == second + 2 && s.kind == Kind::Keyword),
+            "the shown tree follows the edits: {spans:?}"
+        );
+
+        assert!(land_next(&mut store), "the first job's result is taken");
+        assert!(
+            store.busy(),
+            "and the edits made since go out as the next job"
+        );
+        settle(&mut store);
+        assert_store_matches_a_full_parse(&store, &buffer);
+    }
+
+    #[test]
+    fn a_stale_result_is_dropped() {
+        let mut store = SyntaxStore::new();
+        let text = "fn f() { let s = 1; }\n".repeat(300);
+        let mut buffer = rust_buffer(&text, "stale.rs");
+
+        // Reloaded while its parse runs: no edits lead to the new text, so
+        // a parse from scratch replaces the one in flight.
+        store.update_async(&mut buffer, ON_WORKER, ON_WORKER);
+        buffer.regenerate(&"struct Reloaded { n: u8 }\n".repeat(200));
+        store.update_async(&mut buffer, ON_WORKER, ON_WORKER);
+        assert!(!land_next(&mut store), "the first job's text is gone");
+        assert!(land_next(&mut store));
+        assert!(!store.busy());
+        assert_store_matches_a_full_parse(&store, &buffer);
+
+        // Renamed to another language while it parses.
+        buffer.insert("// typed\n");
+        store.update_async(&mut buffer, ON_WORKER, ON_WORKER);
+        buffer.path = Some(std::path::PathBuf::from("stale.js"));
+        buffer.insert("const later = 1;\n");
+        store.update_async(&mut buffer, ON_WORKER, ON_WORKER);
+        assert!(!land_next(&mut store), "a Rust tree for a JavaScript file");
+        settle(&mut store);
+        assert_store_matches_a_full_parse(&store, &buffer);
+
+        // Parsed here while the worker still has it, after shrinking.
+        buffer.insert("let more = 2;\n");
+        store.update_async(&mut buffer, ON_WORKER, ON_WORKER);
+        store.update(&mut buffer, BUDGET);
+        assert!(!store.busy());
+        assert!(!land_next(&mut store), "the main thread's parse is newer");
+        assert_store_matches_a_full_parse(&store, &buffer);
+    }
+
+    #[test]
+    fn a_closed_documents_result_is_dropped() {
+        let mut store = SyntaxStore::new();
+        let mut kept = rust_buffer(&"fn kept() {}\n".repeat(300), "kept.rs");
+        let mut closed = rust_buffer(&"fn closed() {}\n".repeat(300), "closed.rs");
+        store.update_async(&mut kept, ON_WORKER, ON_WORKER);
+        store.update_async(&mut closed, ON_WORKER, ON_WORKER);
+        store.retain(|id| id == kept.id());
+        assert!(store.busy(), "the open one still waits");
+
+        // In the order they were sent.
+        assert!(land_next(&mut store));
+        assert!(!land_next(&mut store), "nothing to install it into");
+        assert!(!store.has(closed.id()));
+        assert!(!store.busy());
+        assert_store_matches_a_full_parse(&store, &kept);
     }
 
     #[test]
