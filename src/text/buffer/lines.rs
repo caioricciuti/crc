@@ -254,55 +254,63 @@ impl Buffer {
     pub fn insert_tab(&mut self) {
         match self.indent_style {
             Some(style) if !style.tabs => {
-                let (_, column) = self.cursor_position();
+                if self.is_locked() {
+                    return;
+                }
+                // Each caret to its own next stop, so it is its own undo
+                // step, like any insert of more than one character.
                 let width = style.width.max(1);
-                self.insert(&" ".repeat(width - column % width));
+                self.last_edit = None;
+                self.edit_each_cursor(EditKind::Insert, |b, start, end| {
+                    let (_, column) = b.position_of(start);
+                    let spaces = " ".repeat(width - column % width);
+                    let land = spaces.len();
+                    Some((start..end, spaces, land))
+                });
+                self.last_edit = None;
             }
             _ => self.insert("\t"),
         }
     }
-    /// Inserts a newline, carrying the current indentation, and adding a
-    /// level when the line being left ends in an opening bracket.
+    /// Inserts a newline at every cursor, carrying that cursor's line's
+    /// indentation, and adding a level when the line being left ends in an
+    /// opening bracket. One undo step of its own.
     pub fn insert_newline_indented(&mut self) {
         if self.is_locked() {
             return;
         }
-        let (line, _) = self.cursor_position();
-        let indent = self.indent_of(line);
+        self.last_edit = None;
+        self.edit_each_cursor(EditKind::Insert, |b, start, end| {
+            let line = b.rope.byte_to_line(start);
+            let indent = b.indent_of(line);
 
-        // Look at the text before the cursor, not the whole line: pressing
-        // Enter in the middle of `{ foo }` should not indent.
-        let line_start = self.rope.line_to_byte(line);
-        let before = self.rope.slice_to_string(line_start..self.cursor);
-        let opens = before.trim_end().ends_with(['{', '[', '(']);
+            // Look at the text before the cursor, not the whole line:
+            // pressing Enter in the middle of `{ foo }` should not indent.
+            let line_start = b.rope.line_to_byte(line);
+            let before = b.rope.slice_to_string(line_start..start);
+            let opens = before.trim_end().ends_with(['{', '[', '(']);
 
-        // And whether a closing bracket sits immediately after, in which case
-        // it gets a line of its own at the outer level.
-        let after_is_close = self
-            .char_at(self.cursor)
-            .is_some_and(|c| matches!(c, '}' | ']' | ')'));
+            // And whether a closing bracket sits immediately after, in which
+            // case it gets a line of its own at the outer level.
+            let after_is_close = b.char_at(end).is_some_and(|c| matches!(c, '}' | ']' | ')'));
 
-        let unit = self.indent_unit(line);
-        let mut text = String::with_capacity(indent.len() + unit.len() + 2);
-        text.push('\n');
-        text.push_str(&indent);
-        if opens {
-            text.push_str(&unit);
-        }
-        // Put a closer right after on its own line, then step back onto the
-        // blank line between them. One insert, so it is one undo step.
-        let mut tail = String::new();
-        if opens && after_is_close {
-            tail.push('\n');
-            tail.push_str(&indent);
-            text.push_str(&tail);
-        }
-        self.insert(&text);
-        if !tail.is_empty() {
-            let landing = self.cursor - tail.len();
-            self.cursor = landing;
-            self.anchor = landing;
-        }
+            let unit = b.indent_unit(line);
+            let mut text = String::with_capacity(2 * indent.len() + unit.len() + 2);
+            text.push('\n');
+            text.push_str(&indent);
+            if opens {
+                text.push_str(&unit);
+            }
+            // Put a closer right after on its own line, and land on the
+            // blank line between them.
+            let land = text.len();
+            if opens && after_is_close {
+                text.push('\n');
+                text.push_str(&indent);
+            }
+            Some((start..end, text, land))
+        });
+        self.last_edit = None;
     }
     /// Lines touched by the selection, or the cursor's line.
     pub(super) fn selected_lines(&self) -> std::ops::RangeInclusive<usize> {

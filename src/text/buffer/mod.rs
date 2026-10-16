@@ -505,8 +505,9 @@ impl Buffer {
         self.anchor = snapshot.anchor;
         self.extra = snapshot.extra;
     }
-    /// Checkpoint for an edit made at the primary cursor only, which is every
-    /// edit except plain typing and backspace.
+    /// Checkpoint for an edit made at the primary cursor only. Typing, the
+    /// deletes, Return and Tab edit at every cursor instead; the line and
+    /// block operations and replace still come through here.
     ///
     /// Such an edit shifts the text under the other cursors without moving
     /// them, so they are dropped here, after the snapshot has recorded them.
@@ -624,24 +625,23 @@ impl Buffer {
     /// Deletes the selection if there is one, otherwise the character at the
     /// cursor.
     pub fn delete_forward(&mut self) {
+        self.delete_at_each_cursor(|b, at| b.next_boundary(at));
+    }
+    /// Deletes at every cursor: its selection, or from its caret to where
+    /// `to` says, in either direction. One undo step for all of them.
+    fn delete_at_each_cursor(&mut self, to: impl Fn(&Self, usize) -> usize) {
         if self.is_locked() {
             return;
         }
-        if let Some(range) = self.selection() {
-            self.checkpoint(EditKind::Delete);
-            self.delete_range_recorded(range);
-            return;
-        }
-        if self.cursor >= self.rope.len_bytes() {
-            return;
-        }
-        self.checkpoint(EditKind::Delete);
-        let next = self.next_boundary(self.cursor);
-        let old_end_point = self.point_of(next);
-        self.rope.delete(self.cursor..next);
-        self.anchor = self.cursor;
-        self.goal_column = None;
-        self.record_edit(self.cursor, next, old_end_point, self.cursor);
+        self.edit_each_cursor(EditKind::Delete, |b, start, end| {
+            let range = if end > start {
+                start..end
+            } else {
+                let to = to(b, start);
+                to.min(start)..to.max(start)
+            };
+            Some((range, String::new(), 0))
+        });
     }
     /// Removes the selected range. Assumes a checkpoint has been taken.
     fn delete_selection_inner(&mut self) {
@@ -651,8 +651,8 @@ impl Buffer {
             self.anchor = range.start;
         }
     }
-    /// Deletes `range`, recording the edit. Used by the word and line
-    /// deletions, which all have the same shape.
+    /// Deletes `range` at the one cursor, recording the edit. Used by the
+    /// single-cursor backspaces, which all have the same shape.
     fn delete_range_recorded(&mut self, range: std::ops::Range<usize>) {
         let (start, old_end) = (range.start, range.end);
         let old_end_point = self.point_of(old_end);
@@ -993,69 +993,19 @@ impl Buffer {
     }
     /// Option-Backspace: delete the word before the cursor.
     pub fn delete_word_backward(&mut self) {
-        if self.is_locked() {
-            return;
-        }
-        if self.selection().is_some() {
-            self.backspace();
-            return;
-        }
-        let to = self.prev_word_boundary(self.cursor);
-        if to == self.cursor {
-            return;
-        }
-        self.checkpoint(EditKind::Delete);
-        self.delete_range_recorded(to..self.cursor);
+        self.delete_at_each_cursor(|b, at| b.prev_word_boundary(at));
     }
     /// Option-Delete: delete the word after the cursor.
     pub fn delete_word_forward(&mut self) {
-        if self.is_locked() {
-            return;
-        }
-        if self.selection().is_some() {
-            self.delete_forward();
-            return;
-        }
-        let to = self.next_word_boundary(self.cursor);
-        if to == self.cursor {
-            return;
-        }
-        self.checkpoint(EditKind::Delete);
-        self.delete_range_recorded(self.cursor..to);
+        self.delete_at_each_cursor(|b, at| b.next_word_boundary(at));
     }
     /// Cmd-Backspace: delete from the cursor back to the start of the line.
     pub fn delete_to_line_start(&mut self) {
-        if self.is_locked() {
-            return;
-        }
-        if self.selection().is_some() {
-            self.backspace();
-            return;
-        }
-        let (line, _) = self.cursor_position();
-        let start = self.rope.line_to_byte(line);
-        if start == self.cursor {
-            return;
-        }
-        self.checkpoint(EditKind::Delete);
-        self.delete_range_recorded(start..self.cursor);
+        self.delete_at_each_cursor(|b, at| b.rope.line_to_byte(b.rope.byte_to_line(at)));
     }
     /// Cmd-Delete: delete from the cursor to the end of the line.
     pub fn delete_to_line_end(&mut self) {
-        if self.is_locked() {
-            return;
-        }
-        if self.selection().is_some() {
-            self.delete_forward();
-            return;
-        }
-        let (line, _) = self.cursor_position();
-        let end = self.line_end(line);
-        if end == self.cursor {
-            return;
-        }
-        self.checkpoint(EditKind::Delete);
-        self.delete_range_recorded(self.cursor..end);
+        self.delete_at_each_cursor(|b, at| b.line_end(b.rope.byte_to_line(at)));
     }
 
     // ---- movement --------------------------------------------------------
@@ -1664,12 +1614,7 @@ mod tests {
     #[test]
     fn an_edit_at_one_cursor_drops_the_others() {
         type Op = fn(&mut Buffer);
-        let ops: [(&str, Op); 9] = [
-            ("delete_forward", |b| b.delete_forward()),
-            ("delete_word_backward", |b| b.delete_word_backward()),
-            ("delete_word_forward", |b| b.delete_word_forward()),
-            ("delete_to_line_start", |b| b.delete_to_line_start()),
-            ("delete_to_line_end", |b| b.delete_to_line_end()),
+        let ops: [(&str, Op); 4] = [
             ("indent", |b| b.indent()),
             ("toggle_comment", |b| b.toggle_comment("//")),
             ("duplicate_lines", |b| b.duplicate_lines()),
@@ -1790,6 +1735,201 @@ mod tests {
         assert_eq!(b.rope.to_string(), "Xa\nXa\nXa\n");
         b.undo();
         assert_eq!(b.rope.to_string(), "a\na\na\n");
+    }
+
+    /// A buffer with the primary caret at the first offset and one more
+    /// caret at each of the rest.
+    fn with_carets(text: &str, at: &[usize]) -> Buffer {
+        let mut b = Buffer::from_text(text);
+        b.place_cursor(at[0], Move);
+        for &caret in &at[1..] {
+            b.add_cursor(caret, caret);
+        }
+        b
+    }
+
+    #[test]
+    fn delete_forward_applies_at_every_cursor() {
+        let mut b = with_carets("xa\nxb\nxc\n", &[0, 3, 6]);
+        b.delete_forward();
+        assert_eq!(b.rope.to_string(), "a\nb\nc\n");
+        assert_eq!(b.caret_positions(), vec![0, 2, 4]);
+        assert_eq!(b.cursor_count(), 3);
+
+        // A selection consumes itself; a caret at the end has nothing to
+        // take and stays where it is.
+        let mut b = with_carets("one two", &[7]);
+        b.add_cursor(0, 3);
+        b.delete_forward();
+        assert_eq!(b.rope.to_string(), " two");
+        assert_eq!(b.caret_positions(), vec![0, 4]);
+    }
+
+    #[test]
+    fn word_deletes_apply_at_every_cursor() {
+        let mut b = with_carets("foo bar\nbaz qux\n", &[7, 15]);
+        b.delete_word_backward();
+        assert_eq!(b.rope.to_string(), "foo \nbaz \n");
+        assert_eq!(b.caret_positions(), vec![4, 9]);
+
+        let mut b = with_carets("ab cd\nef gh", &[0, 6]);
+        b.delete_word_forward();
+        assert_eq!(b.rope.to_string(), " cd\n gh");
+        assert_eq!(b.caret_positions(), vec![0, 4]);
+    }
+
+    #[test]
+    fn word_deletes_at_line_edges_apply_at_every_cursor() {
+        // Backward from a line start joins it to the line above; at the
+        // start of the text there is nothing to take.
+        let mut b = with_carets("ab\ncd\nef", &[0, 3, 6]);
+        b.delete_word_backward();
+        assert_eq!(b.rope.to_string(), "abcdef");
+        assert_eq!(b.caret_positions(), vec![0, 2, 4]);
+
+        // Forward from a line end joins the next line; at the end of the
+        // text there is nothing to take.
+        let mut b = with_carets("ab\ncd", &[2, 5]);
+        b.delete_word_forward();
+        assert_eq!(b.rope.to_string(), "abcd");
+        assert_eq!(b.caret_positions(), vec![2, 4]);
+    }
+
+    #[test]
+    fn line_deletes_apply_at_every_cursor() {
+        let mut b = with_carets("one two\nthree four\n", &[4, 14]);
+        b.delete_to_line_start();
+        assert_eq!(b.rope.to_string(), "two\nfour\n");
+        assert_eq!(b.caret_positions(), vec![0, 4]);
+
+        let mut b = with_carets("one two\nthree four\n", &[3, 13]);
+        b.delete_to_line_end();
+        assert_eq!(b.rope.to_string(), "one\nthree\n");
+        assert_eq!(b.caret_positions(), vec![3, 9]);
+    }
+
+    #[test]
+    fn overlapping_deletes_merge_into_one() {
+        // Both carets reach back to the same line start.
+        let mut b = with_carets("abcdef\nx", &[2, 4]);
+        b.delete_to_line_start();
+        assert_eq!(b.rope.to_string(), "ef\nx");
+        assert_eq!(b.cursor_count(), 1);
+
+        // Both carets reach back into the same word.
+        let mut b = with_carets("hello world", &[8, 11]);
+        b.delete_word_backward();
+        assert_eq!(b.rope.to_string(), "hello ");
+        assert_eq!(b.cursor_count(), 1);
+        b.insert("z");
+        assert_eq!(b.rope.to_string(), "hello z");
+    }
+
+    #[test]
+    fn multi_cursor_deletes_measure_each_cursors_own_characters() {
+        // A combining accent and a joined emoji are one character each.
+        let mut b = with_carets("e\u{301}x\n\u{1f469}\u{200d}\u{1f4bb}y", &[0, 5]);
+        b.delete_forward();
+        assert_eq!(b.rope.to_string(), "x\ny");
+        assert_eq!(b.caret_positions(), vec![0, 2]);
+
+        let mut b = with_carets("caf\u{e9} na\u{ef}ve\nna\u{ef}ve caf\u{e9}", &[12, 25]);
+        b.delete_word_backward();
+        assert_eq!(b.rope.to_string(), "caf\u{e9} \nna\u{ef}ve ");
+    }
+
+    #[test]
+    fn multi_cursor_deletes_keep_crlf_whole() {
+        // A raw CRLF is one character to delete, and a line end stops
+        // before it.
+        let mut b = with_carets("ab\r\ncd\r\nef", &[2, 6]);
+        b.delete_forward();
+        assert_eq!(b.rope.to_string(), "abcdef");
+        assert_eq!(b.caret_positions(), vec![2, 4]);
+
+        let mut b = with_carets("ab\r\ncd\r\nef", &[0, 4]);
+        b.delete_to_line_end();
+        assert_eq!(b.rope.to_string(), "\r\n\r\nef");
+        assert_eq!(b.caret_positions(), vec![0, 2]);
+    }
+
+    #[test]
+    fn one_undo_restores_every_cursors_delete() {
+        let mut b = with_carets("foo bar\nbaz qux\nzip zap", &[7, 15, 23]);
+        b.delete_word_backward();
+        assert_eq!(b.rope.to_string(), "foo \nbaz \nzip ");
+        b.undo();
+        assert_eq!(b.rope.to_string(), "foo bar\nbaz qux\nzip zap");
+        assert_eq!(b.caret_positions(), vec![7, 15, 23]);
+        assert_eq!(b.cursor_count(), 3);
+        b.redo();
+        assert_eq!(b.rope.to_string(), "foo \nbaz \nzip ");
+    }
+
+    #[test]
+    fn newline_keeps_each_cursors_own_indent() {
+        let mut b = with_carets("a\n    b\n\tc", &[1, 7, 10]);
+        b.insert_newline_indented();
+        assert_eq!(b.rope.to_string(), "a\n\n    b\n    \n\tc\n\t");
+        let carets: Vec<_> = b
+            .caret_positions()
+            .into_iter()
+            .map(|at| b.position_of(at))
+            .collect();
+        assert_eq!(carets, vec![(1, 0), (3, 4), (5, 1)]);
+
+        b.undo();
+        assert_eq!(b.rope.to_string(), "a\n    b\n\tc");
+        assert_eq!(b.caret_positions(), vec![1, 7, 10]);
+    }
+
+    #[test]
+    fn newline_between_brackets_at_every_cursor() {
+        let mut b = with_carets("f {}\n    g {}", &[3, 12]);
+        b.insert_newline_indented();
+        assert_eq!(b.rope.to_string(), "f {\n    \n}\n    g {\n        \n    }");
+        let carets: Vec<_> = b
+            .caret_positions()
+            .into_iter()
+            .map(|at| b.position_of(at))
+            .collect();
+        assert_eq!(carets, vec![(1, 4), (4, 8)], "each on its own blank line");
+        b.undo();
+        assert_eq!(b.rope.to_string(), "f {}\n    g {}");
+        assert!(!b.can_undo(), "one step for every cursor");
+    }
+
+    #[test]
+    fn a_newline_at_several_cursors_is_its_own_undo_step() {
+        let mut b = with_carets("a\nb", &[1, 3]);
+        b.insert("x");
+        b.insert_newline_indented();
+        b.insert("y");
+        assert_eq!(b.rope.to_string(), "ax\ny\nbx\ny");
+        b.undo();
+        assert_eq!(b.rope.to_string(), "ax\n\nbx\n");
+        b.undo();
+        assert_eq!(b.rope.to_string(), "ax\nbx", "Return undoes on its own");
+        assert_eq!(b.cursor_count(), 2);
+    }
+
+    #[test]
+    fn soft_tab_reaches_the_next_stop_at_every_cursor() {
+        let mut b = with_carets("a\nabc\n\u{e9}", &[1, 5, 8]);
+        b.indent_style = Some(crate::text::indent::Style {
+            tabs: false,
+            width: 4,
+        });
+        b.insert_tab();
+        assert_eq!(b.rope.to_string(), "a   \nabc \n\u{e9}   ");
+        assert_eq!(b.caret_positions(), vec![4, 9, 15]);
+        b.undo();
+        assert_eq!(b.rope.to_string(), "a\nabc\n\u{e9}");
+        assert_eq!(b.cursor_count(), 3);
+
+        let mut b = with_carets("a\nabc", &[1, 5]);
+        b.insert_tab();
+        assert_eq!(b.rope.to_string(), "a\t\nabc\t");
     }
 
     // ---- brackets and replace --------------------------------------------

@@ -2,6 +2,14 @@
 
 use super::*;
 
+/// One cursor's edit: the range it replaces, the text it puts there, and
+/// how far into that text its caret lands.
+pub(super) type CursorEdit = (std::ops::Range<usize>, String, usize);
+
+fn changes_text((range, text, _): &CursorEdit) -> bool {
+    !range.is_empty() || !text.is_empty()
+}
+
 impl Buffer {
     /// How many cursors are active, including the primary.
     pub fn cursor_count(&self) -> usize {
@@ -123,36 +131,113 @@ impl Buffer {
     /// Replaces every selection with `replacement`; every cursor lands at
     /// the end of its replacement.
     pub(super) fn edit_at_all_cursors(&mut self, replacement: &str, reach: Reach) {
-        // Every range is measured here, against the text as it is, before any
-        // of them is applied. How far a caret reaches depends on the
-        // character next to *that* caret: one width for all of them deleted
-        // half of an accent under one cursor because another sat after an
-        // ASCII letter.
-        let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
-        for (start, end) in self.all_selections() {
-            let range = match reach {
-                _ if end > start => start..end,
-                Reach::Nothing => start..end,
-                Reach::Back => self.prev_boundary(start)..end,
-                Reach::Both => self.prev_boundary(start)..self.next_boundary(end),
+        let selections = self.all_selections();
+        let measured = selections
+            .iter()
+            .map(|&(start, end)| {
+                let range = match reach {
+                    _ if end > start => start..end,
+                    Reach::Nothing => start..end,
+                    Reach::Back => self.prev_boundary(start)..end,
+                    Reach::Both => self.prev_boundary(start)..self.next_boundary(end),
+                };
+                Some((range, replacement.to_owned(), replacement.len()))
+            })
+            .collect();
+        self.apply_at_cursors(&selections, measured);
+    }
+    /// One edit at every cursor, each measured by `edit` from that cursor's
+    /// own selection as `(start, end)`: Return carries the indentation of
+    /// the caret's own line, not the primary's. `None`, or an edit that
+    /// changes nothing, leaves that cursor where it is. When anything
+    /// changes it is one undo step of `kind`; returns whether it did.
+    pub(super) fn edit_each_cursor(
+        &mut self,
+        kind: EditKind,
+        edit: impl Fn(&Self, usize, usize) -> Option<CursorEdit>,
+    ) -> bool {
+        let selections = self.all_selections();
+        let measured: Vec<_> = selections
+            .iter()
+            .map(|&(start, end)| edit(self, start, end))
+            .collect();
+        if !measured.iter().flatten().any(changes_text) {
+            return false;
+        }
+        self.checkpoint_keeping_cursors(kind);
+        self.apply_at_cursors(&selections, measured);
+        true
+    }
+    /// Applies `measured`, one edit or none for each of `selections` (as
+    /// [`Buffer::all_selections`] gave them), and puts every cursor that
+    /// made an edit where that edit lands.
+    ///
+    /// Every edit is measured before any is applied, against the text as it
+    /// is. How far a caret reaches depends on the character next to *that*
+    /// caret: one width for all of them deleted half of an accent under one
+    /// cursor because another sat after an ASCII letter.
+    fn apply_at_cursors(
+        &mut self,
+        selections: &[(usize, usize)],
+        measured: Vec<Option<CursorEdit>>,
+    ) {
+        let mut edits: Vec<CursorEdit> = Vec::new();
+        // owner[i]: the edit the cursors of `selections[i]` follow.
+        let mut owner: Vec<Option<usize>> = Vec::with_capacity(measured.len());
+        for one in measured {
+            let Some((range, text, land)) = one.filter(changes_text) else {
+                owner.push(None);
+                continue;
             };
             // Reaching can run into the neighbour, and two edits over the
-            // same bytes would delete past what the first one left.
-            match ranges.last_mut() {
-                Some(last) if range.start < last.end => last.end = last.end.max(range.end),
-                _ => ranges.push(range),
+            // same bytes would delete past what the first one left. Only
+            // deletions reach, so the merged edit keeps the first's text.
+            match edits.last_mut() {
+                Some(last) if range.start < last.0.end => {
+                    last.0.start = last.0.start.min(range.start);
+                    last.0.end = last.0.end.max(range.end);
+                }
+                _ => edits.push((range, text, land)),
+            }
+            owner.push(Some(edits.len() - 1));
+        }
+        // Which edit each cursor follows, from where it is before any lands.
+        let follows = |(a, h): (usize, usize)| {
+            let at = a.min(h);
+            let i = selections.partition_point(|s| s.0 <= at).saturating_sub(1);
+            owner.get(i).copied().flatten()
+        };
+        let primary = follows((self.anchor, self.cursor));
+        let extra: Vec<_> = self.extra.iter().map(|&c| follows(c)).collect();
+
+        let applied: Vec<_> = edits
+            .iter()
+            .map(|(range, text, _)| (range.clone(), text.as_str()))
+            .collect();
+        self.apply_edits(&applied, AtInsert::After);
+
+        // Where each edit's caret lands in the text as it now is.
+        let mut shift = 0isize;
+        let landings: Vec<usize> = edits
+            .iter()
+            .map(|(range, text, land)| {
+                let at = (range.start as isize + shift) as usize + land;
+                shift += text.len() as isize - range.len() as isize;
+                at
+            })
+            .collect();
+        if let Some(e) = primary {
+            self.cursor = landings[e];
+            self.anchor = self.cursor;
+        }
+        for (cursor, follows) in self.extra.iter_mut().zip(extra) {
+            if let Some(e) = follows {
+                *cursor = (landings[e], landings[e]);
             }
         }
-        // Each cursor as a caret at its selection's end, which the edits
-        // carry to the end of its replacement.
-        let end = |(a, b): (usize, usize)| (a.max(b), a.max(b));
-        (self.anchor, self.cursor) = end((self.anchor, self.cursor));
-        for cursor in &mut self.extra {
-            *cursor = end(*cursor);
-        }
-        let edits: Vec<_> = ranges.into_iter().map(|r| (r, replacement)).collect();
-        self.apply_edits(&edits, AtInsert::After);
-        // Cursors whose ranges merged now share a place; keep one there.
+        self.clamp_positions();
+        self.goal_column = None;
+        // Cursors whose edits merged now share a place; keep one there.
         let mut seen = std::collections::HashSet::from([self.cursor]);
         self.extra.retain(|&(_, at)| seen.insert(at));
     }

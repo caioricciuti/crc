@@ -4,6 +4,14 @@ One entry per tag, written for people who use the editor.
 
 ## Unreleased
 
+- Deleting, Return and Tab work at every cursor. With several carets
+  (from Cmd-D), Delete, Option-Backspace, Option-Delete, Cmd-Backspace
+  and Cmd-Delete act at each one, where before only the first caret
+  deleted and the others vanished. Return gives each new line the
+  indentation of its own line, not the first caret's, and splits an
+  empty pair of brackets at each caret. Tab in a file indented with
+  spaces goes to the next tab stop from each caret's own column. Each
+  of these undoes in one step, with every caret back where it was.
 - Long lines scroll sideways smoothly on a trackpad. A two-finger swipe
   moves the text by the points you swiped instead of jumping a whole
   character at a time, the way vertical scrolling already did. The
