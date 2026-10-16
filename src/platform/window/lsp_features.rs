@@ -308,12 +308,16 @@ impl EditorView {
                 }
             }
             let paths: Vec<std::path::PathBuf> = on_disk.iter().map(|f| f.path.clone()).collect();
-            let done = edit_on_disk(&paths, |path, buffer| {
-                let file = on_disk.iter().find(|f| f.path == path)?;
-                let ranges = crate::lsp::edit_ranges(&buffer.rope, &file.edits)?;
-                let n = buffer.replace_ranges(&ranges);
-                (n > 0).then_some(n)
-            });
+            let done = edit_on_disk(
+                &paths,
+                |path, buffer| {
+                    let file = on_disk.iter().find(|f| f.path == path)?;
+                    let ranges = crate::lsp::edit_ranges(&buffer.rope, &file.edits)?;
+                    let n = buffer.replace_ranges(&ranges);
+                    (n > 0).then_some(n)
+                },
+                &mut state.history,
+            );
             for (path, done) in paths.into_iter().zip(done) {
                 match done {
                     Some(_) => outcome.written += 1,

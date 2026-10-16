@@ -267,6 +267,9 @@ pub struct Buffer {
     /// Size and modification time of the file as of the last read or write,
     /// so "did anyone else touch it" is one `stat` and not a full compare.
     stamp: Option<DiskStamp>,
+    /// What last passed between this buffer and its file, and a count that
+    /// moves with each: how local history tells a save from a reload.
+    disk_event: (u64, DiskEvent),
     /// The window has already told the user this tab disagrees with disk,
     /// so the next watcher batch does not say it again.
     pub conflict_noticed: bool,

@@ -119,6 +119,7 @@ impl EditorView {
             agents,
             gutter: Gutter { docs: gutter, .. },
             heat,
+            history,
             home_hits,
             recent_projects,
             home: home_summary,
@@ -140,6 +141,11 @@ impl EditorView {
         // First, before anything in the frame can go wrong: what the panic
         // hook would write is the text as of this frame.
         recovery::publish(docs.iter().chain(panes.iter().flat_map(|p| p.docs.iter())));
+        // Beside it, and as cheap: which versions local history keeps.
+        history.observe(
+            docs.iter().chain(panes.iter().flat_map(|p| p.docs.iter())),
+            Instant::now(),
+        );
 
         let viewport = *viewport;
         if viewport.width <= 0.0 || viewport.height <= 0.0 {

@@ -4,6 +4,23 @@ One entry per tag, written for people who use the editor.
 
 ## Unreleased
 
+- Local history: crc now keeps past versions of the files you edit, in
+  `~/Library/Application Support/crc/history.db`. A version is kept when
+  a file is opened (once, before its first change), at every save, before
+  a reload replaces the text, when a tab is closed without saving, when
+  quitting with changes unsaved, and after 30 seconds without typing (at
+  least every 5 minutes while you keep typing). Files a project-wide
+  replace or a symbol rename edits without opening them keep the text
+  they had. A file or folder renamed in the Explorer takes its versions
+  along; Save As starts the new file's own. Nothing is kept for untitled documents, files over 2 MB, or
+  secrets: `.env` files, keys and certificates, `.netrc`, `.pgpass`,
+  credentials files and anything in `~/.ssh`, `~/.aws` or `~/.gnupg`.
+  Versions are kept for 30 days, thinned to hourly after a day and daily
+  after a week. `local_history = false` in the settings turns it off and
+  `local_history_exclude` leaves out more files by glob. Typing never
+  waits on it, and a full disk pauses it with one message without
+  touching saving. Viewing and restoring versions comes in a later
+  change.
 - Replace in the find bar replaces only the current match when there are
   several cursors. With selections from Cmd-D, it used to put the
   replacement at every cursor. Now it replaces the match, goes back to

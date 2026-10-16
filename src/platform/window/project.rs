@@ -404,6 +404,14 @@ impl EditorView {
                     for docs in all_docs_mut(&mut state) {
                         docs.rename_path(&source_key, destination);
                     }
+                    // Local history follows the file, or every file in the
+                    // folder.
+                    let moved = crate::platform::canonical(destination);
+                    if moved.is_dir() {
+                        state.history.rename_folder(&source_key, &moved);
+                    } else {
+                        state.history.rename(&source_key, &moved);
+                    }
                     state.message = Some((
                         format!("renamed to {}", destination.display()),
                         Instant::now(),

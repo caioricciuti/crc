@@ -447,18 +447,32 @@ impl EditorView {
             return Discard::Saved;
         }
 
-        // Save first: the first button is the default.
-        let answer = ask(
-            MainThreadMarker::from(self),
-            &format!("Do you want to save the changes to \u{201c}{name}\u{201d}?"),
-            "Your changes will be lost if you don't save them.",
-            &["Save", "Cancel", "Don't Save"],
-        );
+        let answer = if self.ivars().testing {
+            // A test instance cannot answer a modal: it takes the answer
+            // from the environment, and cancels without one.
+            match std::env::var("CRC_DISCARD_ANSWER").as_deref() {
+                Ok("save") => 0,
+                Ok("dont-save") => 2,
+                _ => 1,
+            }
+        } else {
+            // Save first: the first button is the default.
+            ask(
+                MainThreadMarker::from(self),
+                &format!("Do you want to save the changes to \u{201c}{name}\u{201d}?"),
+                "Your changes will be lost if you don't save them.",
+                &["Save", "Cancel", "Don't Save"],
+            )
+        };
         match answer {
             // A save that was cancelled from its panel, or failed, is a
             // cancel: the work is still only in memory.
             0 if self.save(false) => Discard::Saved,
-            2 => Discard::Dropped,
+            2 => {
+                // The changes are gone from the editor, not from history.
+                self.history_closed_unsaved();
+                Discard::Dropped
+            }
             _ => Discard::Cancel,
         }
     }

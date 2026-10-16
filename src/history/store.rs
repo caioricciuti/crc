@@ -434,26 +434,42 @@ impl Store {
         }
         let db = &self.db;
         Ok(db.transaction(|| {
-            let Some(from) = file_id(db, old)? else {
-                return Ok(());
-            };
-            let Some(to) = file_id(db, new)? else {
-                return db
-                    .prepare("UPDATE files SET path = ?2 WHERE id = ?1")?
-                    .run(&[from.into(), new.into()]);
-            };
-            db.prepare("UPDATE snapshots SET file = ?2 WHERE file = ?1")?
-                .run(&[from.into(), to.into()])?;
-            if query_int(db, "SELECT 1 FROM undo WHERE file = ?1", &[from.into()])?.is_some() {
-                db.prepare("DELETE FROM undo WHERE file = ?1")?
-                    .run(&[to.into()])?;
-                db.prepare("UPDATE undo SET file = ?2 WHERE file = ?1")?
-                    .run(&[from.into(), to.into()])?;
-            }
-            db.prepare("DELETE FROM files WHERE id = ?1")?
-                .run(&[from.into()])?;
+            move_file(db, old, new)?;
             // `new`'s replaced journal may have held the last reference to
             // its base.
+            collect_garbage(db).map(|_| ())
+        })?)
+    }
+
+    /// Moves the timeline of every file under the folder `old` to the same
+    /// place under `new`, as when the folder is renamed, each as `rename`
+    /// would. Only what is inside the folder: `/a/b` does not take
+    /// `/a/bc` along.
+    pub fn rename_folder(&self, old: &Path, new: &Path) -> Result<()> {
+        self.writable()?;
+        let (old, new) = (key(old)?, key(new)?);
+        let (old, new) = (old.trim_end_matches('/'), new.trim_end_matches('/'));
+        if old == new {
+            return Ok(());
+        }
+        let prefix = format!("{old}/");
+        let db = &self.db;
+        Ok(db.transaction(|| {
+            let mut inside = Vec::new();
+            {
+                // A byte compare, not LIKE: no wildcards to escape, and
+                // no case folding.
+                let mut statement =
+                    db.prepare("SELECT path FROM files WHERE substr(path, 1, length(?1)) = ?1")?;
+                statement.bind(&[prefix.as_str().into()])?;
+                while statement.step()? {
+                    inside.push(statement.text(0));
+                }
+            }
+            for path in &inside {
+                let moved = format!("{new}/{}", &path[prefix.len()..]);
+                move_file(db, path, &moved)?;
+            }
             collect_garbage(db).map(|_| ())
         })?)
     }
@@ -740,6 +756,30 @@ fn query_int(db: &Db, sql: &str, params: &[Value<'_>]) -> db::Result<Option<i64>
     } else {
         None
     })
+}
+
+/// `old`'s timeline and undo journal to `new`, merged with what `new`
+/// has; inside a transaction, garbage left for the caller.
+fn move_file(db: &Db, old: &str, new: &str) -> db::Result<()> {
+    let Some(from) = file_id(db, old)? else {
+        return Ok(());
+    };
+    let Some(to) = file_id(db, new)? else {
+        return db
+            .prepare("UPDATE files SET path = ?2 WHERE id = ?1")?
+            .run(&[from.into(), new.into()]);
+    };
+    db.prepare("UPDATE snapshots SET file = ?2 WHERE file = ?1")?
+        .run(&[from.into(), to.into()])?;
+    if query_int(db, "SELECT 1 FROM undo WHERE file = ?1", &[from.into()])?.is_some() {
+        db.prepare("DELETE FROM undo WHERE file = ?1")?
+            .run(&[to.into()])?;
+        db.prepare("UPDATE undo SET file = ?2 WHERE file = ?1")?
+            .run(&[from.into(), to.into()])?;
+    }
+    db.prepare("DELETE FROM files WHERE id = ?1")?
+        .run(&[from.into()])?;
+    Ok(())
 }
 
 fn file_id(db: &Db, key: &str) -> db::Result<Option<i64>> {
@@ -1259,6 +1299,46 @@ mod tests {
             .rename(Path::new("/nothing"), Path::new("/c"))
             .unwrap();
         assert_eq!(store.list(Path::new("/c")).unwrap().len(), 3);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn rename_folder_moves_only_what_is_inside() {
+        let path = temp("rename-folder");
+        let store = Store::open(&path).unwrap();
+        let one = timeline(&store, "/a/b/one.txt", &[NOW]);
+        let deep = timeline(&store, "/a/b/sub/deep.txt", &[NOW]);
+        let sibling = timeline(&store, "/a/bc/one.txt", &[NOW]);
+        let same = timeline(&store, "/a/b", &[NOW]);
+        // Already has a timeline of its own at the destination.
+        let there = timeline(&store, "/x/one.txt", &[NOW + 1]);
+        store
+            .rename_folder(Path::new("/a/b"), Path::new("/x/"))
+            .unwrap();
+        assert!(store.list(Path::new("/a/b/one.txt")).unwrap().is_empty());
+        assert!(
+            store
+                .list(Path::new("/a/b/sub/deep.txt"))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            ids(&store.list(Path::new("/x/one.txt")).unwrap()),
+            [there[0].0, one[0].0],
+            "merged with the timeline already there"
+        );
+        assert_eq!(kept(&store, "/x/sub/deep.txt"), [deep[0].0]);
+        assert_eq!(
+            kept(&store, "/a/bc/one.txt"),
+            [sibling[0].0],
+            "/a/bc is not inside /a/b"
+        );
+        assert_eq!(
+            kept(&store, "/a/b"),
+            [same[0].0],
+            "nor is a file named like the folder"
+        );
+        assert_eq!(count(&store, "SELECT count(*) FROM files"), 4);
         cleanup(&path);
     }
 

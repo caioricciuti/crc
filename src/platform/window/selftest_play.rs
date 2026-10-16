@@ -973,6 +973,7 @@ impl EditorView {
             }
             Step::Quit => {
                 self.claude_shutdown();
+                self.history_finish();
                 std::process::exit(0)
             }
         }

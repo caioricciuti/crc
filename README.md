@@ -298,7 +298,13 @@ the size and write it back.
   marks its tab unsaved; unsaved-changes prompts on close and quit; crash
   recovery of unsaved text; UTF-8 and UTF-16 BOMs, Windows-1252 and every
   line ending preserved. Files over 512 MB open read-only and files over
-  2 GB are refused, both saying why.
+  2 GB are refused, both saying why. Local history keeps past versions of
+  the files you edit, up to 2 MB each, for 30 days
+  (`~/Library/Application Support/crc/history.db`): as opened, at each
+  save, before a reload, when closed unsaved and after 30 seconds without
+  typing. `.env` files, keys and `~/.ssh` are never kept;
+  `local_history_exclude` leaves out more, and `local_history = false`
+  turns it off.
 - **Split panes** (`Cmd-\`), up to four, each with its own tabs.
 - **Project search** (`Cmd-Shift-F`) in the background, `Cmd-P` fuzzy file
   open, and `>` in the same box to run any menu command.
@@ -329,6 +335,8 @@ the size and write it back.
   (OAuth), and shows interactive MCP Apps as nothing: their results show
   as text. `crc --mcp` has no live editor state yet, only what is on disk
   and in the index.
+- **Local history is recorded, not yet shown.** Versions are kept, but
+  no command reads them back yet; File History will.
 - **Git history is per file.** File History and Blame Heat walk one
   file's commits; there is no log of the whole repository or commit
   graph, and no merge or

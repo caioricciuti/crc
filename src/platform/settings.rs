@@ -71,6 +71,12 @@ pub struct Settings {
     /// Whether the gutter shows how recently each line was changed, from
     /// Git's blame. Off unless asked for: it runs `git blame` per file.
     pub blame_heat: bool,
+    /// Whether past versions of the files edited here are kept, in
+    /// Application Support.
+    pub local_history: bool,
+    /// Files local history leaves out besides secrets: `.gitignore` globs,
+    /// separated by commas.
+    pub local_history_exclude: String,
 }
 
 /// `word_wrap`: every document, none, or prose (Markdown and text) only.
@@ -96,6 +102,8 @@ impl Default for Settings {
             conflict_side_by_side: false,
             agent_review: true,
             blame_heat: false,
+            local_history: true,
+            local_history_exclude: String::new(),
         }
     }
 }
@@ -153,6 +161,16 @@ blame_heat = false
 # before Claude's first edit to it, so the change can be reviewed and
 # undone. Nothing is sent anywhere; the copies stay in crc's folder.
 agent_review = true
+
+# Keep past versions of the files you edit, in crc's folder in Application
+# Support: as opened, at each save, before a reload, when closed unsaved,
+# and after 30 seconds without typing. Secrets such as .env files, keys
+# and ~/.ssh are never kept. Up to 30 days.
+local_history = true
+
+# More files for local history to leave out: globs as in .gitignore,
+# separated by commas. A leading ~/ is your home folder.
+local_history_exclude = \"\"
 ";
 
 impl Settings {
@@ -236,6 +254,14 @@ impl Settings {
                 "update_check" => set_bool(value, &mut settings.update_check),
                 "agent_review" => set_bool(value, &mut settings.agent_review),
                 "blame_heat" => set_bool(value, &mut settings.blame_heat),
+                "local_history" => set_bool(value, &mut settings.local_history),
+                "local_history_exclude" => match bare.as_deref() {
+                    Some(globs) => {
+                        settings.local_history_exclude = globs.to_owned();
+                        None
+                    }
+                    None => Some("globs in quotes, separated by commas"),
+                },
                 "word_wrap" => match word {
                     "auto" => {
                         settings.word_wrap = WordWrap::Auto;
@@ -399,7 +425,7 @@ pub struct Described {
 
 /// Every key the file takes, in the page's order. A test checks this
 /// against the template, so a new key cannot ship without a sentence here.
-pub const DESCRIBED: [Described; 12] = [
+pub const DESCRIBED: [Described; 14] = [
     Described {
         key: "theme",
         group: "Appearance",
@@ -460,6 +486,16 @@ pub const DESCRIBED: [Described; 12] = [
         group: "Agents",
         what: "Keep each file as it was before the Claude Code crc starts first edits it, so its changes can be reviewed and undone.",
     },
+    Described {
+        key: "local_history",
+        group: "Local History",
+        what: "Keep past versions of the files you edit: opened, saved, reloaded, closed unsaved, and after 30 seconds without typing. Never secrets.",
+    },
+    Described {
+        key: "local_history_exclude",
+        group: "Local History",
+        what: "More files for local history to leave out: globs as in .gitignore, separated by commas.",
+    },
 ];
 
 impl Settings {
@@ -474,6 +510,8 @@ impl Settings {
             "update_check" => flag(self.update_check),
             "agent_review" => flag(self.agent_review),
             "blame_heat" => flag(self.blame_heat),
+            "local_history" => flag(self.local_history),
+            "local_history_exclude" => quote(&self.local_history_exclude),
             "format_on_save" => flag(self.format_on_save),
             "organize_imports_on_save" => flag(self.organize_imports_on_save),
             "word_wrap" => quote(match self.word_wrap {
@@ -744,6 +782,23 @@ mod tests {
     }
 
     #[test]
+    fn local_history_defaults_on_with_nothing_excluded() {
+        assert!(Settings::parse("").local_history);
+        assert!(Settings::parse(TEMPLATE).local_history);
+        assert_eq!(Settings::parse(TEMPLATE).local_history_exclude, "");
+        assert!(!Settings::parse("local_history = false\n").local_history);
+        let s = Settings::parse("local_history_exclude = \"*.log, notes/\"\n");
+        assert_eq!(s.local_history_exclude, "*.log, notes/");
+        assert_eq!(s.value_of("local_history_exclude"), "\"*.log, notes/\"");
+        assert_eq!(
+            Settings::parse_checked("local_history_exclude = *.log\n").1,
+            [
+                "config.toml line 1: local_history_exclude takes globs in quotes, separated by commas, not *.log"
+            ]
+        );
+    }
+
+    #[test]
     fn conflict_view_defaults_to_inline() {
         assert!(!Settings::parse("").conflict_side_by_side);
         assert!(Settings::parse("conflict_view = \"side-by-side\"\n").conflict_side_by_side);
@@ -803,6 +858,8 @@ mod tests {
             conflict_side_by_side: false,
             agent_review: true,
             blame_heat: false,
+            local_history: true,
+            local_history_exclude: String::new(),
         }
         .merged_into(existing);
         assert_eq!(

@@ -65,6 +65,7 @@ mod http;
 mod input;
 mod inspector;
 mod issues;
+mod local_history;
 mod lsp;
 mod lsp_features;
 mod mcp;
@@ -648,6 +649,9 @@ struct State {
     blame: Blame,
     /// Git > Blame Heat: how recently each line changed, in the gutter.
     heat: Heat,
+    /// Local history: which versions of the open files to keep, sent to
+    /// the thread that keeps them.
+    history: crate::history::recorder::Recorder,
     /// Language servers, and what is asked of them.
     lsp: Lsp,
     /// Installed extensions: their threads, commands and calls in flight.
@@ -1452,6 +1456,12 @@ define_class!(
         fn caret_blink(&self, _sender: Option<&AnyObject>) {
             self.request_redraw();
             self.pump();
+        }
+
+        /// An idle snapshot fell due with no frame to notice it.
+        #[unsafe(method(historyTick:))]
+        fn history_tick_fired(&self, _sender: Option<&AnyObject>) {
+            self.history_tick();
         }
 
         #[unsafe(method(acceptsFirstResponder))]
@@ -2887,6 +2897,7 @@ define_class!(
             self.poll_agents();
             self.poll_review();
             self.poll_reloads();
+            self.poll_history();
             self.poll_syntax();
             if self
                 .state_mut().is_some_and(|mut state| state.symbols.poll())
@@ -5601,6 +5612,7 @@ impl EditorView {
         }
         self.claude_after_frame();
         self.terminal_after_frame();
+        self.history_after_frame();
     }
 
     /// Creates the display link on first use and unpauses it.
@@ -6082,6 +6094,7 @@ define_class!(
                 }
             }
             view.claude_shutdown();
+            view.history_finish();
             NSApplicationTerminateReply::TerminateNow
         }
     }
@@ -6562,34 +6575,50 @@ const RELOAD_INLINE_BYTES: u64 = 4 * 1024 * 1024;
 /// threads at once: most of a save is waiting on the disk, and a rename
 /// across a few hundred files would otherwise wait on each in turn. `edit`
 /// answers how many changes it made, or `None` when it could not. Results
-/// come back in the order of `paths`.
-fn edit_on_disk<F>(paths: &[std::path::PathBuf], edit: F) -> Vec<Option<usize>>
+/// come back in the order of `paths`. Each file written leaves the text
+/// it had in local history.
+fn edit_on_disk<F>(
+    paths: &[std::path::PathBuf],
+    edit: F,
+    history: &mut crate::history::recorder::Recorder,
+) -> Vec<Option<usize>>
 where
     F: Fn(&Path, &mut Buffer) -> Option<usize> + Sync,
 {
     let run = |path: &std::path::PathBuf| {
         Buffer::open(path.clone()).ok().and_then(|mut buffer| {
+            let before = buffer.rope.clone();
             let n = edit(path, &mut buffer)?;
             if n > 0 {
                 buffer.save(None).ok()?;
             }
-            Some(n)
+            Some((n, (n > 0).then(|| (buffer.path.clone(), before))))
         })
     };
-    if paths.len() < 4 {
-        return paths.iter().map(run).collect();
-    }
-    let chunk = paths.len().div_ceil(8);
-    std::thread::scope(|scope| {
-        let workers: Vec<_> = paths
-            .chunks(chunk)
-            .map(|part| scope.spawn(|| part.iter().map(run).collect::<Vec<_>>()))
-            .collect();
-        workers
-            .into_iter()
-            .flat_map(|w| w.join().unwrap_or_default())
-            .collect()
-    })
+    let done: Vec<_> = if paths.len() < 4 {
+        paths.iter().map(run).collect()
+    } else {
+        let chunk = paths.len().div_ceil(8);
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = paths
+                .chunks(chunk)
+                .map(|part| scope.spawn(|| part.iter().map(run).collect::<Vec<_>>()))
+                .collect();
+            workers
+                .into_iter()
+                .flat_map(|w| w.join().unwrap_or_default())
+                .collect()
+        })
+    };
+    done.into_iter()
+        .map(|done| {
+            let (n, written) = done?;
+            if let Some((Some(path), before)) = written {
+                history.edited_on_disk(&path, &before);
+            }
+            Some(n)
+        })
+        .collect()
 }
 
 /// The open document for `path`, found by one canonical key: open
@@ -9538,6 +9567,12 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
             checking: HashSet::new(),
             checked: mpsc::channel(),
         },
+        history: crate::history::recorder::Recorder::new(
+            crate::history::store::default_path(),
+            settings.local_history,
+            &settings.local_history_exclude,
+            local_history::timing(),
+        ),
         lsp: Lsp {
             servers: HashMap::new(),
             unavailable: HashMap::new(),
@@ -9652,6 +9687,10 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         window.orderFront(None);
     } else {
         window.makeKeyAndOrderFront(None);
+    }
+    let wake = view.history_wake();
+    if let Some(mut state) = view.state_mut() {
+        state.history.set_wake(wake);
     }
     if view.ivars().state.borrow().watch.index_rx.is_some()
         || view.ivars().state.borrow().git.busy()

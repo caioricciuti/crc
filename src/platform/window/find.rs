@@ -773,7 +773,10 @@ impl EditorView {
                     None => outcome.failed.push(path.clone()),
                 }
             }
-            for (path, done) in on_disk.iter().zip(edit_on_disk(&on_disk, edit)) {
+            for (path, done) in on_disk
+                .iter()
+                .zip(edit_on_disk(&on_disk, edit, &mut state.history))
+            {
                 match done {
                     Some(0) => {}
                     Some(n) => {

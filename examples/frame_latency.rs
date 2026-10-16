@@ -15,7 +15,8 @@
 //! (`-- --wrap`, `--fold` or `--chrome` for those frames, `--scrub` for
 //! steps through a file's history, `--heat` to add Git > Blame Heat's
 //! strip to every frame, `--syntax` for typing in highlighted Rust files
-//! of 128 KiB to 4 MiB).
+//! of 128 KiB to 4 MiB, `--history` for typing with local history's
+//! recorder looking at every frame).
 
 use crc::project::tree::Tree;
 use crc::render::font::Atlas;
@@ -234,6 +235,12 @@ fn main() {
     // `--scrub`: stepping through a file's history instead of typing.
     if std::env::args().any(|arg| arg == "--scrub") {
         scrub_steps(&mut renderer, (logical_w, logical_h), (px_w, px_h));
+        return;
+    }
+    // `--history`: typing in a file local history keeps, the recorder
+    // looking at every frame.
+    if std::env::args().any(|arg| arg == "--history") {
+        history_typing(&mut renderer, (logical_w, logical_h), (px_w, px_h));
         return;
     }
     // `--syntax`: typing with highlighting in a file past the main thread's
@@ -551,6 +558,94 @@ fn syntax_typing(renderer: &mut Renderer, logical: (f32, f32), px: (usize, usize
     for (kib, full) in verdicts {
         verdict(&format!("{kib} KiB "), full);
     }
+}
+
+// ---- --history --------------------------------------------------------------
+// Typing in a file just under local history's size limit, keystrokes a
+// frame apart, with and without the recorder looking at every frame. The
+// recorder here keeps a version every 250 ms of typing instead of every 5
+// minutes, so its thread turns a 2 MiB rope into text, hashes, compresses
+// and writes it about every thirtieth keystroke, beside the frames being
+// timed: what the main thread must not feel.
+
+fn history_typing(renderer: &mut Renderer, logical: (f32, f32), px: (usize, usize)) {
+    use crc::history::recorder::{MAX_BYTES, Recorder, Timing};
+
+    let dir =
+        std::env::temp_dir().join(format!("crc-frame-latency-history-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a temporary folder");
+    let file = dir.join("big.rs");
+    let src = synth::synth(MAX_BYTES - 64 * 1024, "    // a comment line\n");
+    std::fs::write(&file, &src).expect("the file to type in");
+    println!(
+        "scope       typing in {} KiB a frame apart, local history every 250 ms of it\n",
+        src.len() / 1024
+    );
+
+    let viewport = Viewport::new(logical.0, logical.1);
+    let theme = Theme::default();
+    let rows = viewport.rows(renderer.atlas.metrics.line_height);
+    let mut glyphs = Vec::with_capacity(16_384);
+    let mut run = |recorder: Option<&mut Recorder>| -> Vec<f64> {
+        let mut buffer = Buffer::open(&file).expect("opened");
+        let middle = buffer.rope.len_lines() / 2;
+        for _ in 0..middle {
+            buffer.move_down(Motion::Move);
+        }
+        buffer.scroll_to_cursor(rows, 0);
+        let mut recorder = recorder;
+        for _ in 0..30 {
+            layout::build(&buffer, &mut renderer.atlas, viewport, &theme, &mut glyphs);
+            renderer.render_offscreen_frame(px.0, px.1, &glyphs, logical, theme.background);
+        }
+        const N: usize = 400;
+        let mut full = Vec::with_capacity(N);
+        for i in 0..N {
+            std::thread::sleep(Duration::from_secs_f64(BUDGET_MS / 1e3));
+            let started = Instant::now();
+            if i % 8 == 7 {
+                buffer.backspace();
+            } else {
+                buffer.insert("x");
+            }
+            buffer.scroll_to_cursor(rows, 0);
+            if let Some(recorder) = recorder.as_deref_mut() {
+                recorder.observe(std::iter::once(&buffer), started);
+            }
+            layout::build(&buffer, &mut renderer.atlas, viewport, &theme, &mut glyphs);
+            renderer.render_offscreen_frame(px.0, px.1, &glyphs, logical, theme.background);
+            full.push(started.elapsed().as_secs_f64() * 1e3);
+        }
+        full
+    };
+
+    let plain = run(None);
+    report("plain typing", plain.clone());
+    let db = dir.join("history.db");
+    let mut recorder = Recorder::new(
+        Some(db.clone()),
+        true,
+        "",
+        Timing {
+            idle: Duration::from_secs(30),
+            every: Duration::from_millis(250),
+        },
+    );
+    let recorded = run(Some(&mut recorder));
+    report("with local history", recorded.clone());
+    let t = Instant::now();
+    recorder.finish(std::iter::empty(), Duration::from_secs(30));
+    let kept = crc::history::store::Store::open(&db)
+        .and_then(|store| store.list(&crc::platform::canonical(&file)))
+        .map_or(0, |list| list.len());
+    println!(
+        "\n{kept} versions kept; the queue finished {:.1} ms after the last frame",
+        t.elapsed().as_secs_f64() * 1e3
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    verdict("plain typing ", plain);
+    verdict("with local history ", recorded);
 }
 
 // ---- --scrub ----------------------------------------------------------------

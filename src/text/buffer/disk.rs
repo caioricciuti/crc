@@ -106,6 +106,14 @@ impl From<&std::fs::Metadata> for DiskStamp {
         }
     }
 }
+/// What last passed between a buffer and its file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiskEvent {
+    /// Nothing since it was opened.
+    Opened,
+    Saved,
+    Reloaded,
+}
 /// A file read for a reload, not yet taken by the buffer.
 pub struct DiskRead {
     rope: Rope,
@@ -259,6 +267,15 @@ impl Buffer {
     pub fn disk_stamp(&self) -> Option<DiskStamp> {
         self.stamp
     }
+    /// The last save or reload, numbered: the number changes with each one,
+    /// so a per-frame observer sees every one without comparing text.
+    pub fn disk_event(&self) -> (u64, DiskEvent) {
+        self.disk_event
+    }
+    /// The text last read from or written to the file.
+    pub fn saved_rope(&self) -> Option<&Rope> {
+        self.saved.as_ref()
+    }
     /// Opened past [`READ_ONLY_BYTES`], so it cannot be edited.
     pub fn is_read_only(&self) -> bool {
         self.read_only
@@ -359,6 +376,7 @@ impl Buffer {
         self.goal_column = None;
         self.saved = Some(self.rope.clone());
         self.stamp = stamp;
+        self.disk_event = (self.disk_event.0 + 1, DiskEvent::Reloaded);
         self.conflict_noticed = false;
         self.dirty = false;
     }
@@ -525,6 +543,7 @@ impl Buffer {
         self.conflict_noticed = false;
         self.path = Some(crate::platform::canonical(&target));
         self.saved = Some(self.rope.clone());
+        self.disk_event = (self.disk_event.0 + 1, DiskEvent::Saved);
         self.dirty = false;
         Ok(())
     }
@@ -679,6 +698,7 @@ impl Buffer {
             dirty: false,
             saved: None,
             stamp: None,
+            disk_event: (0, DiskEvent::Opened),
             conflict_noticed: false,
             format: DiskFormat::default(),
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),

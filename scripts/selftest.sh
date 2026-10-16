@@ -57,6 +57,9 @@ export CLAUDE_CONFIG_DIR="$T/claude-config"
 mkdir -p "$T/home"
 export HOME="$T/home"
 unset XDG_CONFIG_HOME
+# Local history goes to the run's own file, whatever HOME a scenario sets:
+# no launch may write the real one in Application Support.
+export CRC_HISTORY_DB="$T/history.db"
 
 # expect <file> <field> <value>
 # A missing field or dump is a FAIL like any other, not the end of the run:
