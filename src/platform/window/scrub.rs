@@ -1735,6 +1735,8 @@ impl EditorView {
             let from = Lister {
                 db: crate::history::store::default_path(),
                 filter,
+                #[cfg(test)]
+                answers: None,
             };
             work(&path, text, &from, &worker_rx, &worker_tx, &halt)
         });
@@ -2231,6 +2233,168 @@ const UNAVAILABLE_TAIL: &str = "; local history unavailable";
 pub(super) struct Lister {
     pub(super) db: Option<std::path::PathBuf>,
     pub(super) filter: Filter,
+    /// How many reads of local history answer; each one after sleeps
+    /// [`STALL`] first, as one that hangs would.
+    #[cfg(test)]
+    pub(super) answers: Option<Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+#[cfg(test)]
+const STALL: Duration = Duration::from_secs(30);
+
+/// How long the worker waits on one read of local history before it goes
+/// on without it.
+const LOCAL_DEADLINE: Duration = Duration::from_secs(2);
+
+/// The history databases a helper is reading, one helper each at most: a
+/// read that never returns holds one thread and one connection, however
+/// often File History opens again.
+static READING: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// A database's place in [`READING`], given back when its helper is done,
+/// or never started.
+struct Reading(std::path::PathBuf);
+
+impl Reading {
+    fn claim(db: &Path) -> Option<Reading> {
+        let mut reading = READING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if reading.iter().any(|held| held == db) {
+            return None;
+        }
+        reading.push(db.to_path_buf());
+        Some(Reading(db.to_path_buf()))
+    }
+}
+
+impl Drop for Reading {
+    fn drop(&mut self) {
+        READING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|held| *held != self.0);
+    }
+}
+
+/// Local history as the worker reads it: each read on a helper thread,
+/// waited on for [`LOCAL_DEADLINE`] at most, so one that hangs costs the
+/// local versions and never the commits.
+struct Local {
+    db: Option<std::path::PathBuf>,
+    /// Read-only, and this worker's own: the history thread goes on
+    /// writing through its connection. With a helper while it reads.
+    store: Option<Store>,
+    /// A read outlived its deadline, or the history closed during one:
+    /// its helper may still have the store, and nothing more is asked.
+    stuck: bool,
+    #[cfg(test)]
+    answers: Option<Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+impl Local {
+    fn new(from: &Lister) -> Local {
+        Local {
+            db: from.db.clone(),
+            store: None,
+            stuck: false,
+            #[cfg(test)]
+            answers: from.answers.clone(),
+        }
+    }
+
+    /// Opens the store when there is one. Whether one is there and could
+    /// not be opened, or did not answer.
+    fn open(&mut self, stop: &AtomicBool) -> bool {
+        let Some(db) = self.db.clone() else {
+            return false;
+        };
+        let opened = self.run(stop, move |store| {
+            Store::open_to_read(&db).map(|opened| *store = opened)
+        });
+        !matches!(opened, Some(Ok(())))
+    }
+
+    /// Version `id`'s text, as [`Store::read`] gives it; `None` when the
+    /// store is not open or did not answer.
+    fn read(
+        &mut self,
+        id: crate::history::store::SnapshotId,
+        stop: &AtomicBool,
+    ) -> Option<crate::history::store::Result<Option<String>>> {
+        self.store.as_ref()?;
+        self.run(stop, move |store| {
+            store.as_ref().map(|store| store.read(id))
+        })
+        .flatten()
+    }
+
+    /// Runs `job` on the store on a helper thread. `None` when it is not
+    /// done within [`LOCAL_DEADLINE`] (waiting for another history's
+    /// helper on the same database included) or the history closes first:
+    /// the store stays with the helper, and from then on nothing is asked.
+    fn run<T: Send + 'static>(
+        &mut self,
+        stop: &AtomicBool,
+        job: impl FnOnce(&mut Option<Store>) -> T + Send + 'static,
+    ) -> Option<T> {
+        if self.stuck {
+            return None;
+        }
+        let db = self.db.clone()?;
+        let deadline = Instant::now() + LOCAL_DEADLINE;
+        let slice = Duration::from_millis(20);
+        let reading = loop {
+            if let Some(reading) = Reading::claim(&db) {
+                break reading;
+            }
+            if stop.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                self.stuck = true;
+                self.store = None;
+                return None;
+            }
+            std::thread::sleep(slice);
+        };
+        let mut store = self.store.take();
+        #[cfg(test)]
+        let answers = self.answers.clone();
+        let (tx, rx) = mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("crc-file-history-local".into())
+            .spawn(move || {
+                let _reading = reading;
+                #[cfg(test)]
+                if let Some(answers) = answers {
+                    let left = answers
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+                    if left.is_err() {
+                        std::thread::sleep(STALL);
+                    }
+                }
+                let out = job(&mut store);
+                let _ = tx.send((store, out));
+            });
+        if spawned.is_err() {
+            // The job, the store and the claim went with it.
+            return None;
+        }
+        loop {
+            match rx.recv_timeout(slice) {
+                Ok((store, out)) => {
+                    self.store = store;
+                    return Some(out);
+                }
+                // It panicked: the store went with it.
+                Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if stop.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                        self.stuck = true;
+                        return None;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Every version of the file at `opened` (as its tab has the path) and
@@ -2239,12 +2403,14 @@ pub(super) struct Lister {
 /// one equal to a commit beside it left out; whether the commits were cut
 /// short; and the repository's root when it is in one. Outside Git, or
 /// untracked, the local versions alone; with none of those either, why
-/// there is no history. A `store` that fails to list is taken away, so
-/// nothing else waits on it, and the commits are listed alone.
+/// there is no history. A store that fails to list, or does not answer, is
+/// taken away, so nothing else waits on it, and the commits are listed
+/// alone.
 fn list_versions(
     opened: &Path,
     path: &Path,
-    store: &mut Option<Store>,
+    local: &mut Local,
+    stop: &AtomicBool,
 ) -> Result<(Vec<Version>, bool, Option<std::path::PathBuf>), String> {
     let git = path
         .parent()
@@ -2261,34 +2427,57 @@ fn list_versions(
                 crate::project::history::file_history(&root, &relative, HISTORY_LIMIT)?;
             Ok((root, versions, capped))
         });
-    let local = match store
-        .as_ref()
-        .map(|store| local_versions(store, [opened, path]))
-    {
-        Some(Ok(local)) => local,
-        Some(Err(_)) => {
-            *store = None;
-            Vec::new()
-        }
-        None => Vec::new(),
+    let paths = [opened.to_path_buf(), path.to_path_buf()];
+    let versions = if local.store.is_some() {
+        let listed = local.run(stop, move |store| {
+            let listed = store
+                .as_ref()
+                .map(|store| local_versions(store, paths.iter().map(|p| p.as_path())));
+            match listed {
+                Some(Ok(versions)) => versions,
+                Some(Err(_)) => {
+                    *store = None;
+                    Vec::new()
+                }
+                None => Vec::new(),
+            }
+        });
+        listed.unwrap_or_default()
+    } else {
+        Vec::new()
     };
     let (root, commits, capped) = match git {
         Ok((root, commits, capped)) => (Some(root), commits, capped),
-        Err(_) if !local.is_empty() => (None, Vec::new(), false),
+        Err(_) if !versions.is_empty() => (None, Vec::new(), false),
         Err(why) => return Err(why),
     };
-    let mut all = crate::project::history::merge(commits, local);
-    if let Some(store) = store.as_ref() {
-        // The first read that fails ends the checks: each would wait on
-        // the same lock again.
-        let failed = std::cell::Cell::new(false);
-        crate::project::history::drop_duplicates(&mut all, DUPLICATE_CHECKS, |local, commit| {
-            !failed.get()
-                && same_text(store, local, commit).unwrap_or_else(|_| {
-                    failed.set(true);
-                    false
-                })
+    let mut all = crate::project::history::merge(commits, versions);
+    if local.store.is_some() && all.iter().any(Version::is_local) {
+        // Checked on a copy: one that does not answer keeps them all.
+        let checked = all.clone();
+        let checked = local.run(stop, move |store| {
+            let mut all = checked;
+            if let Some(store) = store.as_ref() {
+                // The first read that fails ends the checks: each would
+                // wait on the same lock again.
+                let failed = std::cell::Cell::new(false);
+                crate::project::history::drop_duplicates(
+                    &mut all,
+                    DUPLICATE_CHECKS,
+                    |local, commit| {
+                        !failed.get()
+                            && same_text(store, local, commit).unwrap_or_else(|_| {
+                                failed.set(true);
+                                false
+                            })
+                    },
+                );
+            }
+            all
         });
+        if let Some(checked) = checked {
+            all = checked;
+        }
     }
     Ok((all, capped, root))
 }
@@ -2352,18 +2541,15 @@ fn work(
         (Some(dir), Some(name)) => crate::platform::canonical(dir).join(name),
         _ => path.to_path_buf(),
     };
-    // Read-only, and this thread's own: the history thread goes on
-    // writing through its connection, and a lock it or another crc holds
-    // fails a read after a moment rather than holding the list up.
-    // One there that cannot be read leaves the commits to stand alone.
-    let (mut store, mut unavailable) = match from.db.as_deref().map(Store::open_to_read) {
-        Some(Ok(store)) => (store, false),
-        Some(Err(_)) => (None, true),
-        None => (None, false),
-    };
-    let open = store.is_some();
-    let listed = list_versions(opened, path, &mut store);
-    unavailable |= open && store.is_none();
+    // A lock the history thread or another crc holds fails a read after
+    // a moment, and a read that hangs is left behind after a deadline,
+    // rather than holding the list up. One there that cannot be read
+    // leaves the commits to stand alone.
+    let mut local = Local::new(from);
+    let mut unavailable = local.open(stop);
+    let open = local.store.is_some();
+    let listed = list_versions(opened, path, &mut local, stop);
+    unavailable |= open && local.store.is_none();
     let (root, mut versions) = match listed {
         Ok((all, capped, root)) => {
             let empty = all.is_empty();
@@ -2460,7 +2646,8 @@ fn work(
                 .or_insert_with(|| {
                     read_version(
                         root.as_deref(),
-                        store.as_ref(),
+                        &mut local,
+                        stop,
                         versions.get(slot),
                         &mut reader,
                     )
@@ -2505,7 +2692,8 @@ fn work(
 /// onto it still shows something.
 fn read_version(
     root: Option<&Path>,
-    store: Option<&Store>,
+    local: &mut Local,
+    stop: &AtomicBool,
     version: Option<&Version>,
     reader: &mut Option<BlobReader>,
 ) -> Result<Arc<str>, Arc<str>> {
@@ -2513,10 +2701,11 @@ fn read_version(
         return Err(Arc::from(""));
     };
     if let Source::Local { id, .. } = version.source {
-        let text = match store.map(|store| store.read(id)) {
+        let text = match local.read(id, stop) {
             Some(Ok(Some(text))) => return Ok(Arc::from(text)),
             Some(Ok(None)) => "(this local version is gone from local history)\n".to_string(),
             Some(Err(why)) => format!("(could not read this version: {why})\n"),
+            None if local.stuck => "(local history did not answer)\n".to_string(),
             None => "(local history is not open)\n".to_string(),
         };
         return Err(Arc::from(text));
@@ -2555,6 +2744,7 @@ mod tests {
     const GIT_ONLY: Lister = Lister {
         db: None,
         filter: Filter::All,
+        answers: None,
     };
 
     #[test]
@@ -3181,6 +3371,18 @@ mod tests {
     /// A worker on `path` reading local history from `db`; its list, and
     /// the channels to ask it for more.
     fn start(path: &Path, db: &Path, worktree: &str, filter: Filter) -> Started {
+        start_stalled(path, db, worktree, filter, None)
+    }
+
+    /// [`start`], with the reads of local history past the first
+    /// `answers` hanging.
+    fn start_stalled(
+        path: &Path,
+        db: &Path,
+        worktree: &str,
+        filter: Filter,
+        answers: Option<usize>,
+    ) -> Started {
         let (tx, worker_rx) = mpsc::channel();
         let (worker_tx, rx) = mpsc::channel();
         let halt = Arc::new(AtomicBool::new(false));
@@ -3188,6 +3390,7 @@ mod tests {
         let from = Lister {
             db: Some(db.to_path_buf()),
             filter,
+            answers: answers.map(|n| Arc::new(std::sync::atomic::AtomicUsize::new(n))),
         };
         let worker =
             std::thread::spawn(move || work(&path, worktree, &from, &worker_rx, &worker_tx, &halt));
@@ -3486,16 +3689,18 @@ mod tests {
     #[test]
     fn a_version_that_cannot_be_read_is_an_error_with_a_line_saying_why() {
         let mut reader = None;
+        let mut closed = Local::new(&GIT_ONLY);
+        let stop = AtomicBool::new(false);
         let local = local_v(1, Reason::Saved);
         assert_eq!(
-            read_version(None, None, Some(&local), &mut reader),
+            read_version(None, &mut closed, &stop, Some(&local), &mut reader),
             Err(Arc::from("(local history is not open)\n"))
         );
         assert_eq!(
-            read_version(None, None, Some(&commit_v("a")), &mut reader),
+            read_version(None, &mut closed, &stop, Some(&commit_v("a")), &mut reader),
             Err(Arc::from("(not in a repository)\n"))
         );
-        assert!(read_version(None, None, None, &mut reader).is_err());
+        assert!(read_version(None, &mut closed, &stop, None, &mut reader).is_err());
     }
 
     /// Outside Git a file has its local versions alone; with none, the
@@ -3531,6 +3736,108 @@ mod tests {
         assert_eq!(
             listed,
             Err("this file is not in a Git repository".to_string())
+        );
+        drop(tx);
+        worker.join().unwrap();
+    }
+
+    /// Local history that does not answer, on open or on a later read:
+    /// the commits within the deadline, and they go on being read; a local
+    /// version is unreadable; and with one read left behind on a database,
+    /// the next is given up at once, with no second helper on it.
+    #[test]
+    fn a_local_history_that_hangs_costs_only_the_local_versions() {
+        use crate::history::store::Store;
+        let tree = crate::project::TempTree::new("scrub-local-hangs", &[("plan.txt", "one\n")]);
+        let dir = tree.0.as_path();
+        git(dir, &["init", "--quiet"]);
+        git(dir, &["add", "plan.txt"]);
+        commit_at(dir, "first", 1_700_000_000);
+        let path = dir.join("plan.txt");
+        // Two databases with the same two versions.
+        let [db, other] = ["history", "other"].map(|folder| {
+            let db = tree.0.join(folder).join("history.db");
+            let store = Store::open(&db).unwrap();
+            for (text, at) in [
+                ("one\ntwo\n", 1_700_000_050_000),
+                ("one\nthree\n", 1_700_000_060_000),
+            ] {
+                store.put_snapshot(&path, text, Reason::Saved, at).unwrap();
+            }
+            db
+        });
+        let commits_alone = |listed: Result<(Vec<Version>, bool, bool), String>| {
+            let (all, _, unavailable) = listed.expect("the commits");
+            assert!(all.len() == 1 && matches!(all[0].source, Source::Commit));
+            assert!(unavailable, "local history said to be unavailable");
+        };
+        let within = |started: Instant, limit: u64| {
+            let elapsed = started.elapsed();
+            assert!(elapsed < Duration::from_millis(limit), "waited {elapsed:?}");
+        };
+
+        // On open: the commits alone, and they are read.
+        let started = Instant::now();
+        let (listed, tx, rx, _worker) = start_stalled(&path, &db, "w\n", Filter::All, Some(0));
+        within(started, 2500);
+        commits_alone(listed);
+        let started = Instant::now();
+        assert_eq!(text_of(&tx, &rx, 0), "one\n", "a commit through Git");
+        within(started, 500);
+        drop(tx);
+
+        // Its helper still out: another history on the database starts
+        // no second one, and gives up on it within the deadline.
+        let started = Instant::now();
+        let (listed, tx, _rx, _worker) = start(&path, &db, "w\n", Filter::All);
+        within(started, 2500);
+        commits_alone(listed);
+        drop(tx);
+
+        // Past the open, the list and the check for duplicates: a local
+        // version unreadable within the deadline, whether the read that
+        // hangs is the one asked for or the one the worker started on;
+        // then the commits as before, and the other local version at once.
+        let (listed, tx, rx, worker) = start_stalled(&path, &other, "w\n", Filter::All, Some(3));
+        let (all, _, unavailable) = listed.expect("the versions");
+        assert_eq!(all.len(), 3);
+        assert!(!unavailable);
+        let unreadable = |slot: usize| {
+            tx.send(Request::Want {
+                center: slot,
+                shown: slot,
+                jobs: vec![Job::Text(slot)],
+            })
+            .unwrap();
+            let mut said = Vec::new();
+            while said.len() < 2 {
+                match rx.recv_timeout(Duration::from_secs(60)).expect("an answer") {
+                    Reply::Unreadable(at) if at == slot => said.push("unreadable".to_string()),
+                    Reply::Text(at, text) if at == slot => said.push(text.trim_end().to_string()),
+                    _ => {}
+                }
+            }
+            assert_eq!(said, ["unreadable", "(local history did not answer)"]);
+        };
+        let started = Instant::now();
+        unreadable(1);
+        within(started, 2500);
+        let started = Instant::now();
+        assert_eq!(text_of(&tx, &rx, 0), "one\n", "a commit through Git");
+        unreadable(2);
+        within(started, 500);
+        let held = |db: &Path| {
+            READING
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .filter(|held| *held == db)
+                .count()
+        };
+        assert_eq!(
+            (held(&db), held(&other)),
+            (1, 1),
+            "one helper each, still out"
         );
         drop(tx);
         worker.join().unwrap();

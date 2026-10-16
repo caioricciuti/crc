@@ -1131,6 +1131,95 @@ mod tests {
         cleanup(&path);
     }
 
+    /// What the history thread does to the history File History reads, at
+    /// `path`: one file forgotten, then the other pruned to its newest
+    /// version. Each writer closes after its part, but the first with
+    /// `keep`, which is handed back.
+    fn forget_and_prune(path: &Path, keep: bool) -> Option<Store> {
+        let writer = Store::open(path).unwrap();
+        writer.forget(Path::new("/notes/plan.md")).unwrap();
+        let kept = keep.then_some(writer);
+        let pruner = Store::open(path).unwrap();
+        let tiny = Caps {
+            per_file: 1,
+            ..Caps::default()
+        };
+        pruner.prune(NOW + DAY_MS, &tiny).unwrap();
+        drop(pruner);
+        kept
+    }
+
+    /// `reader` lists and reads on a thread of its own; what it got, or a
+    /// failure after a second rather than a hung test.
+    fn read_within_a_second(reader: Store, id: SnapshotId) -> (Vec<Entry>, Option<String>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let listed = reader.list(Path::new("/notes/list.md"));
+            let read = reader.read(id);
+            let _ = tx.send((listed, read));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(1)) {
+            Ok((listed, read)) => (listed.unwrap(), read.unwrap()),
+            Err(e) => panic!("the reader did not answer: {e:?}"),
+        }
+    }
+
+    /// A reader File History keeps open while the history thread forgets
+    /// a file, prunes and closes, in this process or another: what it
+    /// reads after comes back at once.
+    #[test]
+    fn a_reader_survives_the_writer_forgetting_and_closing() {
+        if let Some(path) = std::env::var_os("CRC_HISTORY_TEST_WRITER") {
+            // The writer in another process, below.
+            forget_and_prune(Path::new(&path), false);
+            return;
+        }
+        let path = temp("reader-forget");
+        for round in 0..50 {
+            for how in ["closed", "kept open", "other process"] {
+                cleanup(&path);
+                let writer = Store::open(&path).unwrap();
+                for n in 0..4 {
+                    put(
+                        &writer,
+                        "/notes/plan.md",
+                        &noise(40_000, round * 8 + n),
+                        NOW + n as i64,
+                    );
+                }
+                let mut last = None;
+                for n in 0..4 {
+                    let text = noise(40_000, 1000 + round * 8 + n);
+                    last = Some(put(&writer, "/notes/list.md", &text, NOW + n as i64));
+                }
+                let last = last.unwrap();
+                let reader = Store::open_to_read(&path).unwrap().unwrap();
+                assert_eq!(reader.list(Path::new("/notes/list.md")).unwrap().len(), 4);
+                drop(writer);
+                let kept = if how == "other process" {
+                    let out = std::process::Command::new(std::env::current_exe().unwrap())
+                        .args([
+                            "history::store::tests::a_reader_survives_the_writer_forgetting_and_closing",
+                            "--exact",
+                            "--test-threads=1",
+                        ])
+                        .env("CRC_HISTORY_TEST_WRITER", &path)
+                        .output()
+                        .unwrap();
+                    assert!(out.status.success(), "{out:?}");
+                    None
+                } else {
+                    forget_and_prune(&path, how == "kept open")
+                };
+                let (listed, read) = read_within_a_second(reader, last);
+                assert_eq!(ids(&listed), [last.0], "round {round}, writer {how}");
+                assert!(read.is_some(), "round {round}, writer {how}");
+                drop(kept);
+            }
+        }
+        cleanup(&path);
+    }
+
     #[test]
     fn a_tampered_blob_reads_as_missing() {
         let path = temp("tamper");
