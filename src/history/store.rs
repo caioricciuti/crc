@@ -1122,8 +1122,10 @@ mod tests {
         let listed = Store::open_to_read(&path)
             .and_then(|reader| reader.unwrap().list(Path::new("/notes/plan.md")));
         assert!(listed.is_err(), "{listed:?}");
+        // Two busy waits of READ_BUSY_MS; the bound only has to sit well
+        // under the writer's five seconds, with room for a loaded CI runner.
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
+            started.elapsed() < std::time::Duration::from_secs(4),
             "waited {:?}",
             started.elapsed()
         );
