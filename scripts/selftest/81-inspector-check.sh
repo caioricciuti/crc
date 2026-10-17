@@ -8,6 +8,8 @@
 # and not checked; Pull is live anyway (it fetches itself). Check on
 # orchard's card fetches: orchard then has one to pull and says it was
 # checked, and vineyard is not checked. Pull brings the pushed file.
+# Someone else pushed to vineyard's origin too: the header's refresh
+# checks both, so both say checked, and only vineyard has one to pull.
 CK="$T/check-many"
 mkdir -p "$CK"
 for r in orchard vineyard; do
@@ -26,6 +28,11 @@ printf 'pear\n' > "$T/check-other/pear.txt"
 testgit "$T/check-other" add pear.txt
 testgit "$T/check-other" commit -qm 'plant pear'
 testgit "$T/check-other" push -q origin main
+git clone -q "$T/check-vineyard.git" "$T/check-other-vineyard"
+printf 'grape\n' > "$T/check-other-vineyard/grape.txt"
+testgit "$T/check-other-vineyard" add grape.txt
+testgit "$T/check-other-vineyard" commit -qm 'plant grape'
+testgit "$T/check-other-vineyard" push -q origin main
 cat > "$T/inspector-check.script" <<SCRIPT
 wait 500
 key 0 cmd,shift A
@@ -43,6 +50,11 @@ wait 700
 wait 700
 wait 500
 dump $T/inspector-check-pulled.out
+click @inspector.refresh
+wait 700
+wait 700
+wait 500
+dump $T/inspector-check-all.out
 quit
 SCRIPT
 mkdir -p "$T/home/inspector-check"
@@ -55,3 +67,4 @@ expect "$T/inspector-check-after.out" inspector "orchard: branch=main base=- ahe
 [ -f "$CK/orchard/pear.txt" ] || failed "inspector-check: Pull did not bring pear.txt"
 [ -f "$CK/vineyard/pear.txt" ] && failed "inspector-check: orchard's Pull reached vineyard"
 expect "$T/inspector-check-pulled.out" inspector "orchard: $check_even check=ok buttons=pull | $check_vineyard"
+expect "$T/inspector-check-all.out" inspector "orchard: $check_even check=ok buttons=pull | vineyard: branch=main base=- ahead=0 behind=0 upstream=origin/main push=0 pull=1 dirty=0 changes=+0-0 tag=- check=ok buttons=pull"

@@ -250,6 +250,8 @@ pub struct Inspector {
     /// A Check answered while a status read ran: what that read brings
     /// may be from before the fetch, so it is read again after.
     reread: bool,
+    /// The Checks the header's refresh started, while any of them runs.
+    checks_all: Vec<RepoKey>,
 }
 
 impl Inspector {
@@ -343,6 +345,42 @@ impl Inspector {
         self.checks.insert(repo, Check::Running(rx));
     }
 
+    /// The header's refresh: a Check, each on its own worker, of every
+    /// one of `repos` (on `host`) that has an upstream and is not checking
+    /// already. A repository not read yet, or read for another host, has
+    /// no upstream known and is left. Returns how many were started.
+    pub fn check_all(
+        &mut self,
+        host: Option<&str>,
+        repos: &[PathBuf],
+        ssh_auth_sock: Option<PathBuf>,
+    ) -> usize {
+        if self.read_host.as_deref() != host {
+            return 0;
+        }
+        let due: Vec<RepoKey> = repos
+            .iter()
+            .filter(|path| matches!(self.status_of(path), Some(Ok(s)) if s.upstream.is_some()))
+            .map(|path| (self.read_host.clone(), path.clone()))
+            .filter(|key| !self.checking(key))
+            .collect();
+        for key in &due {
+            self.check_remote(key.clone(), ssh_auth_sock.clone());
+        }
+        self.checks_all.retain(|key| {
+            self.checks
+                .get(key)
+                .is_some_and(|c| matches!(c, Check::Running(_)))
+        });
+        self.checks_all.extend(due.iter().cloned());
+        due.len()
+    }
+
+    /// Whether a Check the header's refresh started is running.
+    pub fn checking_all(&self) -> bool {
+        self.checks_all.iter().any(|key| self.checking(key))
+    }
+
     /// Whether `repo`'s Check is running.
     pub fn checking(&self, repo: &RepoKey) -> bool {
         matches!(self.checks.get(repo), Some(Check::Running(_)))
@@ -380,6 +418,9 @@ impl Inspector {
         if answered {
             self.invalidate();
             self.reread |= self.rx.is_some();
+            if !self.checking_all() {
+                self.checks_all.clear();
+            }
         }
         answered
     }
@@ -652,21 +693,47 @@ impl Inspector {
         );
         layout::push_sidebar_title(out, atlas, rect, "WORKSPACE", 2, theme);
         let [refresh, close] = layout::sidebar_header_buttons::<2>(rect);
-        for (button, icon, tip, action) in [
-            (refresh, icons::REFRESH, "Read Again", Action::Refresh),
+        // While the Checks it started run, refresh waits, and a bar slides
+        // under the header.
+        let checking = self.checking_all();
+        for (button, icon, tip, action, enabled) in [
+            (
+                refresh,
+                icons::REFRESH,
+                "Check Every Repo's Remote and Refresh",
+                Action::Refresh,
+                !checking,
+            ),
             (
                 close,
                 icons::CLOSE,
                 "Hide Inspector  \u{2325}\u{2318}I",
                 Action::Close,
+                true,
             ),
         ] {
             layout::Button::new(button)
                 .icon(icon)
                 .tone(layout::Tone::Ghost)
+                .enabled(enabled)
                 .tip(tip)
                 .draw(out, atlas, theme);
-            self.hits.push((button, action, None));
+            if enabled {
+                self.hits.push((button, action, None));
+            }
+        }
+        if checking {
+            layout::push_progress(
+                out,
+                atlas,
+                Viewport {
+                    x: rect.x + 1.0,
+                    y: rect.y + layout::SIDEBAR_HEADER_HEIGHT - 2.0,
+                    width: rect.width - 1.0,
+                    height: 2.0,
+                },
+                theme,
+            );
         }
         // The body scrolls under the header: drawn moved up by `scroll`,
         // then cut to the room under the header, its buttons with it.
@@ -2983,5 +3050,57 @@ mod tests {
         // Another repository's Check is its own.
         assert!(!inspector.checking(&(None, root.join("seed"))));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_header_refresh_checks_every_repo_with_an_upstream() {
+        let root = std::env::temp_dir().join(format!("crc-check-all-{}", std::process::id()));
+        let tracked = Status {
+            branch: Some("main".into()),
+            upstream: Some("origin/main".into()),
+            ..Default::default()
+        };
+        let [orchard, vineyard, meadow, unread] =
+            ["orchard", "vineyard", "meadow", "unread"].map(|n| root.join(n));
+        let mut inspector = Inspector {
+            status: vec![
+                (orchard.clone(), Ok(tracked.clone())),
+                (
+                    vineyard.clone(),
+                    Ok(Status {
+                        branch: Some("main".into()),
+                        ..Default::default()
+                    }),
+                ),
+                (meadow.clone(), Ok(tracked.clone())),
+            ],
+            ..Default::default()
+        };
+        // Meadow is checking already: its Check is not started again.
+        let (meadow_tx, meadow_rx) = mpsc::channel();
+        inspector
+            .checks
+            .insert((None, meadow.clone()), Check::Running(meadow_rx));
+        let repos = [orchard.clone(), vineyard.clone(), meadow.clone(), unread];
+        // Statuses read for this Mac are not another host's.
+        assert_eq!(inspector.check_all(Some("box"), &repos, None), 0);
+        assert!(!inspector.checking_all());
+        assert_eq!(inspector.check_all(None, &repos, None), 1);
+        assert!(inspector.checking(&(None, orchard.clone())));
+        assert!(inspector.check_of(&(None, vineyard.clone())).is_none());
+        assert!(inspector.checking_all());
+        // The Check meadow had is the one still running.
+        meadow_tx.send(Ok(String::new())).unwrap();
+        settle(&mut inspector);
+        assert!(matches!(
+            inspector.check_of(&(None, meadow)),
+            Some(Check::Done(_))
+        ));
+        // Orchard is no repository, so its fetch fails, on its own.
+        assert!(matches!(
+            inspector.check_of(&(None, orchard)),
+            Some(Check::Failed(_))
+        ));
+        assert!(!inspector.checking_all());
     }
 }

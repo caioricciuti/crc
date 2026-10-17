@@ -120,7 +120,10 @@ impl EditorView {
         }
         match action {
             Action::Close => self.toggle_inspector(),
-            Action::Refresh => self.refresh_agents(),
+            Action::Refresh => {
+                self.check_all_repos();
+                self.refresh_agents();
+            }
             Action::CommitAll => self.agent_commit_prompt(),
             Action::Pull => self.agent_remote(crate::project::git::Remote::Pull),
             Action::Push => self.agent_remote(crate::project::git::Remote::Push),
@@ -145,6 +148,28 @@ impl EditorView {
         }
         self.request_redraw();
         self.pump();
+    }
+
+    /// The header's refresh: a Check of every repository card of the
+    /// workspace shown that has an upstream, each on its own worker.
+    fn check_all_repos(&self) {
+        if let Some(mut state) = self.state_mut() {
+            let Some(task) = state
+                .agents
+                .selected_index()
+                .map(|i| state.agents.tasks[i].clone())
+            else {
+                return;
+            };
+            let Some(repos) = state.agents.read_repos_of(&task) else {
+                return;
+            };
+            let sock = state.ssh_auth_sock.clone();
+            state
+                .agents
+                .inspector
+                .check_all(task.host.as_deref(), &repos, sock);
+        }
     }
 
     /// Issue `number` of the repository `repo`, clicked in the inspector:
