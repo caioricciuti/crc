@@ -41,11 +41,18 @@ pub(super) fn refresh_review(state: &mut State) {
 
 /// [`refresh_review`] read here and now, for what has to show the change
 /// at once: the page opening, or one of its buttons. A read still running
-/// is dropped, as this one is newer.
+/// is dropped, as this one is newer. The page is read again whatever the
+/// counts say: a hunk kept changes no count.
 fn refresh_review_now(state: &mut State) {
     state.review_page.counting = None;
     state.review_page.recount = false;
-    apply_summary(state, read_summary());
+    apply_summary(state, read_summary(), true);
+}
+
+/// Whether the Review page is what the editor column draws: open, with
+/// no page over it and the terminal not covering the column.
+fn shown(state: &State) -> bool {
+    !state.agents.on && column_of(state) == Column::AgentReview
 }
 
 /// The counts a worker read, once they are in. Says whether anything
@@ -62,7 +69,7 @@ fn poll_counts(state: &mut State) -> bool {
     state.review_page.counting = None;
     let applied = summary.is_some();
     if let Some(summary) = summary {
-        apply_summary(state, summary);
+        apply_summary(state, summary, false);
     }
     if std::mem::take(&mut state.review_page.recount) {
         refresh_review(state);
@@ -70,9 +77,17 @@ fn poll_counts(state: &mut State) -> bool {
     applied
 }
 
-fn apply_summary(state: &mut State, summary: Vec<(std::path::PathBuf, String, usize)>) {
+/// Home's list and the tabs' counts take the summary; the page is read
+/// again (on a worker) when the counts changed and it is on screen, or
+/// when `force` says it has to be.
+fn apply_summary(
+    state: &mut State,
+    summary: Vec<(std::path::PathBuf, String, usize)>,
+    force: bool,
+) {
     state.review_page.running = running(state);
-    state.review_page.summary = summary;
+    let shown = shown(state);
+    let changed = state.review_page.take_summary(summary, shown);
     for tab in &mut state.terminal.tabs {
         tab.review_files = state
             .review_page
@@ -82,7 +97,7 @@ fn apply_summary(state: &mut State, summary: Vec<(std::path::PathBuf, String, us
             .find(|(dir, _, _)| *dir == tab.review)
             .map_or(0, |(_, _, n)| *n);
     }
-    if state.review_page.open {
+    if changed || (force && state.review_page.open) {
         state.review_page.reload();
     }
 }
@@ -169,23 +184,26 @@ pub(super) fn note_unhooked_writes(state: &mut State) {
 }
 
 impl EditorView {
-    /// The Review page in the editor column, read fresh.
+    /// The Review page in the editor column, read fresh on a worker; the
+    /// page shows its loading state meanwhile.
     pub(super) fn open_review(&self) {
         if let Some(mut state) = self.state_mut() {
             state.review_page.open = true;
             // Agents' sessions, not a branch reviewed before.
             state.review_page.loading = None;
+            state.review_page.again = false;
             state.review_page.sessions.clear();
-            refresh_review_now(&mut state);
-            state.review_page.diff_scroll = 0;
             if let Some(page) = &mut state.extensions {
                 page.details = false;
             }
             state.mcp.details = false;
             state.settings_page.open = false;
+            refresh_review_now(&mut state);
+            state.review_page.diff_scroll = 0;
             state.palette = None;
             state.completion = None;
         }
+        self.resume_display_link();
         self.request_redraw();
         self.pump();
     }
@@ -220,15 +238,6 @@ impl EditorView {
         };
         self.set_agents_mode(false);
         if let Some(mut state) = self.state_mut() {
-            let (tx, rx) = mpsc::channel();
-            let (worker_base, worker_title) = (base.clone(), title.clone());
-            std::thread::spawn(move || {
-                let _ = tx.send(crate::platform::review_page::load_branch(
-                    &tree,
-                    &worker_base,
-                    &worker_title,
-                ));
-            });
             let page = &mut state.review_page;
             page.open = true;
             page.sessions.clear();
@@ -236,7 +245,8 @@ impl EditorView {
             page.diff_scroll = 0;
             page.list_scroll = 0.0;
             page.confirm = None;
-            page.loading = Some(crate::platform::review_page::Loading { title, base, rx });
+            page.again = false;
+            page.load_branch(tree, base, title);
             if let Some(page) = &mut state.extensions {
                 page.details = false;
             }
@@ -250,8 +260,9 @@ impl EditorView {
         self.pump();
     }
 
-    /// Home's counts and a branch read for the Review page, once they are
-    /// in.
+    /// Home's counts and what a worker read for the Review page, once they
+    /// are in. Counts that changed while the page was off screen are read
+    /// once it is back on.
     pub(super) fn poll_review(&self) {
         let Some(mut state) = self.state_mut() else {
             return;
@@ -259,30 +270,15 @@ impl EditorView {
         if poll_counts(&mut state) {
             self.ivars().needs_redraw.set(true);
         }
-        let Some(loading) = &state.review_page.loading else {
+        if state.review_page.stale && shown(&state) {
+            state.review_page.stale = false;
+            state.review_page.reload();
+        }
+        let Some(said) = state.review_page.poll() else {
             return;
         };
-        let answer = match loading.rx.try_recv() {
-            Ok(answer) => Some(answer),
-            Err(mpsc::TryRecvError::Empty) => return,
-            Err(mpsc::TryRecvError::Disconnected) => None,
-        };
-        let title = loading.title.clone();
-        state.review_page.loading = None;
-        match answer {
-            Some(Ok(session)) => {
-                state.review_page.sessions = vec![session];
-                state.review_page.selected = (0, 0);
-                state.review_page.diff_scroll = 0;
-            }
-            Some(Err(e)) => {
-                state.review_page.open = false;
-                state.say(
-                    layout::Feedback::Failure,
-                    format!("Could not read {title}: {e}"),
-                );
-            }
-            None => {}
+        if let Err(why) = said {
+            state.say(layout::Feedback::Failure, why);
         }
         drop(state);
         self.request_redraw();
@@ -317,6 +313,8 @@ impl EditorView {
                 Err(text) => state.say(layout::Feedback::Failure, text),
             }
         }
+        // The page's read lands on the display link.
+        self.resume_display_link();
         // crc's own writes do not come back through the watcher: open
         // documents are checked now. A clean one reloads, and its old text
         // goes on its undo stack, so Cmd-Z there brings the agent's back.
@@ -374,6 +372,7 @@ impl EditorView {
             Action::Close => {
                 state.review_page.open = false;
                 state.review_page.loading = None;
+                state.review_page.again = false;
                 Ok(None)
             }
             Action::Select(s, f) => {

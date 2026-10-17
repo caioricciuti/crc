@@ -593,22 +593,30 @@ pub fn about(dir: &Path) -> (String, PathBuf) {
 
 /// What a review compares for one file: its checkpoint and its text now.
 /// A file the agent deleted reads as empty; so does one that did not
-/// exist before.
+/// exist before. Nothing over [`MAX_CHECKPOINT`] is read: a file that
+/// grew past it since, or a staged copy that size, is kept or undone
+/// whole, the way one too large to copy is.
 pub fn texts(file: &File) -> Result<(String, String), String> {
+    let too_large = "too large to review by change: keep or undo it whole";
+    let read = |path: &Path, not_text: &str| match std::fs::metadata(path) {
+        Ok(meta) if meta.len() > MAX_CHECKPOINT => Err(too_large.to_owned()),
+        Ok(_) => std::fs::read_to_string(path).map_err(|_| not_text.to_owned()),
+        Err(e) => Err(e.to_string()),
+    };
     let old = match &file.checkpoint {
-        Checkpoint::Text(kept) => std::fs::read_to_string(kept)
-            .map_err(|_| "not text: keep or undo the whole file".to_owned())?,
+        Checkpoint::Text(kept) => read(kept, "not text: keep or undo the whole file")?,
         Checkpoint::Absent | Checkpoint::Unhooked(None) => String::new(),
-        Checkpoint::Unhooked(Some(staged)) => std::fs::read_to_string(staged)
-            .map_err(|_| "not text: keep the whole file".to_owned())?,
+        Checkpoint::Unhooked(Some(staged)) => read(staged, "not text: keep the whole file")?,
         Checkpoint::TooLarge => {
             return Err("too large to review by change: keep it whole".into());
         }
     };
-    let new = match std::fs::read_to_string(&file.path) {
-        Ok(text) => text,
+    let new = match std::fs::metadata(&file.path) {
+        Ok(meta) if meta.len() > MAX_CHECKPOINT => return Err(too_large.into()),
+        Ok(_) => std::fs::read_to_string(&file.path)
+            .map_err(|_| "not text: keep or undo the whole file".to_owned())?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(_) => return Err("not text: keep or undo the whole file".into()),
+        Err(e) => return Err(e.to_string()),
     };
     Ok((old, new))
 }
@@ -797,6 +805,24 @@ mod tests {
 
         let kinds: Vec<Checkpoint> = files(&dir).into_iter().map(|f| f.checkpoint).collect();
         assert_eq!(kinds, vec![Checkpoint::TooLarge, Checkpoint::Absent]);
+    }
+
+    #[test]
+    fn a_file_grown_past_the_limit_is_not_read() {
+        let tree = TempTree::new("review-grown", &[("small.txt", "one\n")]);
+        let dir = tree.0.join("session");
+        let path = crate::platform::canonical(&tree.0.join("small.txt"));
+        hook("pre", &pre(&path), &dir).expect("hook");
+        let file = files(&dir).remove(0);
+        assert_eq!(texts(&file), Ok(("one\n".to_owned(), "one\n".to_owned())));
+        std::fs::write(&path, vec![b'x'; MAX_CHECKPOINT as usize + 1]).expect("grow");
+        assert_eq!(
+            texts(&file),
+            Err("too large to review by change: keep or undo it whole".to_owned())
+        );
+        // What was kept still puts it back whole.
+        undo_all(&dir, &file).expect("undo");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "one\n");
     }
 
     #[test]

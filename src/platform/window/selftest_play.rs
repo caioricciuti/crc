@@ -415,6 +415,9 @@ impl EditorView {
                     std::thread::sleep(slice);
                     left -= slice;
                     self.poll_agents();
+                    // The Review page's reads too, so a read asked for
+                    // while one ran lands within the same wait.
+                    self.poll_review();
                 }
                 self.check_open_files();
                 self.poll_tree_children();

@@ -90,11 +90,21 @@ impl Session {
     }
 }
 
-/// A branch being read on a worker: which, and the answer to come.
+/// What a worker is reading for the page.
+pub enum Load {
+    /// Every agent session again.
+    Sessions,
+    /// A worktree's branch against `base`, named for the status line.
+    Branch { title: String, base: String },
+}
+
+/// A read on a worker: which, and the answer to come. Nothing else reads
+/// a file for the page, so a store of thousands of files never holds the
+/// main thread.
 pub struct Loading {
-    pub title: String,
-    pub base: String,
-    pub rx: mpsc::Receiver<Result<Session, String>>,
+    pub what: Load,
+    /// The answer, with how long the worker took over it.
+    pub rx: mpsc::Receiver<(Result<Vec<Session>, String>, std::time::Duration)>,
 }
 
 #[derive(Default)]
@@ -122,26 +132,123 @@ pub struct Page {
     pub list_scroll: f32,
     pub list_rect: Option<Viewport>,
     pub list_content: f32,
-    /// A branch being read for the page.
+    /// What a worker is reading for the page.
     pub loading: Option<Loading>,
+    /// Asked to read the sessions again while a read ran: one more follows
+    /// it, so a burst of writes costs two reads at most.
+    pub again: bool,
+    /// The counts changed since the sessions were last read, while the
+    /// page was off screen: read again once it is back on.
+    pub stale: bool,
+    /// How many reads were started, and how long the last one took on
+    /// its worker, for the self-test.
+    pub loads: usize,
+    pub load_took: std::time::Duration,
 }
 
 impl Page {
-    /// Reads every session folder again, keeping the file shown when it is
-    /// still there. A branch review, or one being read, stays as it is:
-    /// it is read once, on a worker, when it is asked for.
+    /// Reads every session folder again, on a worker; [`Page::poll`] takes
+    /// what it finds, keeping the file shown when it is still there. One
+    /// read at a time: asked while one runs, it runs once more after. A
+    /// branch review, or one being read, stays as it is: it is read once,
+    /// when it is asked for.
     pub fn reload(&mut self) {
-        if self.loading.is_some() || self.sessions.first().is_some_and(Session::read_only) {
-            let files = self.sessions.first().map_or(0, |s| s.files.len());
-            if self.selected.1 >= files {
-                self.selected = (0, 0);
-            }
-            let lines = self.selected_entry().map_or(0, |e| e.diff.lines.len());
-            self.diff_scroll = self.diff_scroll.min(lines.saturating_sub(1));
-            return;
+        if self.starts_now() {
+            self.spawn(Load::Sessions, || Ok(load()));
         }
+    }
+
+    /// Whether a read of the sessions asked for now starts, rather than
+    /// waiting on the one running (which then runs once more) or being
+    /// left for a branch.
+    fn starts_now(&mut self) -> bool {
+        match &self.loading {
+            Some(Loading {
+                what: Load::Sessions,
+                ..
+            }) => {
+                self.again = true;
+                false
+            }
+            Some(Loading {
+                what: Load::Branch { .. },
+                ..
+            }) => false,
+            None => !self.sessions.first().is_some_and(Session::read_only),
+        }
+    }
+
+    /// Reads what the branch checked out in `tree` changes since it left
+    /// `base`, on a worker, as the one session the page shows.
+    pub fn load_branch(&mut self, tree: PathBuf, base: String, title: String) {
+        let (worker_base, worker_title) = (base.clone(), title.clone());
+        self.spawn(Load::Branch { title, base }, move || {
+            load_branch(&tree, &worker_base, &worker_title).map(|session| vec![session])
+        });
+    }
+
+    fn spawn<F>(&mut self, what: Load, read: F)
+    where
+        F: FnOnce() -> Result<Vec<Session>, String> + Send + 'static,
+    {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let answer = read();
+            let _ = tx.send((answer, started.elapsed()));
+        });
+        self.loads += 1;
+        self.loading = Some(Loading { what, rx });
+    }
+
+    /// What the worker read, once it is in: `Some` when the page changed,
+    /// with why a branch could not be read, which closes the page. A read
+    /// of the sessions asked for meanwhile starts now.
+    pub fn poll(&mut self) -> Option<Result<(), String>> {
+        let answer = match self.loading.as_ref()?.rx.try_recv() {
+            Ok((answer, took)) => {
+                self.load_took = took;
+                Some(answer)
+            }
+            Err(mpsc::TryRecvError::Empty) => return None,
+            Err(mpsc::TryRecvError::Disconnected) => None,
+        };
+        let what = self.loading.take().map(|l| l.what);
+        let said = match (what, answer) {
+            (Some(Load::Sessions), Some(Ok(sessions))) => {
+                self.land(sessions);
+                Ok(())
+            }
+            (Some(Load::Branch { .. }), Some(Ok(sessions))) => {
+                self.sessions = sessions;
+                self.selected = (0, 0);
+                self.diff_scroll = 0;
+                Ok(())
+            }
+            (Some(Load::Branch { title, .. }), Some(Err(e))) => {
+                self.open = false;
+                Err(format!("Could not read {title}: {e}"))
+            }
+            _ => Ok(()),
+        };
+        if self.landed() {
+            self.reload();
+        }
+        Some(said)
+    }
+
+    /// The read that was running is over: whether one more was asked for
+    /// meanwhile.
+    fn landed(&mut self) -> bool {
+        self.loading = None;
+        std::mem::take(&mut self.again)
+    }
+
+    /// The sessions read again: the file shown stays shown when it is
+    /// still there.
+    fn land(&mut self, sessions: Vec<Session>) {
         let shown = self.selected_entry().map(|e| e.file.path.clone());
-        self.sessions = load();
+        self.sessions = sessions;
         self.selected = shown
             .and_then(|path| {
                 self.sessions.iter().enumerate().find_map(|(s, session)| {
@@ -155,6 +262,31 @@ impl Page {
             .unwrap_or((0, 0));
         let lines = self.selected_entry().map_or(0, |e| e.diff.lines.len());
         self.diff_scroll = self.diff_scroll.min(lines.saturating_sub(1));
+    }
+
+    /// New counts for Home: whether the page reads its sessions again.
+    /// Only when they changed since it last read, and only while it is on
+    /// screen (`shown`); off screen it remembers to, for when it is back.
+    /// Agents write often, and most writes change no count.
+    pub fn take_summary(&mut self, summary: Vec<(PathBuf, String, usize)>, shown: bool) -> bool {
+        if self.summary != summary {
+            self.summary = summary;
+            self.stale = self.open;
+        }
+        if self.stale && shown {
+            self.stale = false;
+            return true;
+        }
+        false
+    }
+
+    /// Whether the page has nothing to show but what a worker is reading:
+    /// a branch, or the sessions when it has none yet. A read of sessions
+    /// it already shows keeps them on screen until the new ones land.
+    pub fn awaiting(&self) -> bool {
+        self.loading
+            .as_ref()
+            .is_some_and(|l| matches!(l.what, Load::Branch { .. }) || self.sessions.is_empty())
     }
 
     pub fn selected_entry(&self) -> Option<&Entry> {
@@ -208,7 +340,9 @@ impl Page {
 
     /// For the self-test: whether it has the column, what it holds, the
     /// file shown, and how many targets it drew; for a branch, its base,
-    /// and whether it is still being read.
+    /// and whether it is still being read. Then, on lines of their own,
+    /// whether a read is in flight, how many there were, and how long the
+    /// last took on its worker.
     pub fn report(&self) -> String {
         let shown = self
             .selected_entry()
@@ -230,11 +364,13 @@ impl Page {
                 Source::Checkpoints => None,
             })
             .unwrap_or_default()
-            + if self.loading.is_some() {
-                " loading"
-            } else {
-                ""
-            }
+            + if self.awaiting() { " loading" } else { "" }
+            + &format!(
+                "\nreview_loading: {}\nreview_loads: {}\nreview_load_ms: {}",
+                self.loading.is_some(),
+                self.loads,
+                self.load_took.as_millis()
+            )
     }
 }
 
@@ -460,8 +596,15 @@ pub fn draw(
         Source::Branch { base, left_out } => Some((s.title.as_str(), base.as_str(), *left_out)),
         Source::Checkpoints => None,
     });
-    let status = if let Some(loading) = &page.loading {
-        format!("Reading {} against {}\u{2026}", loading.title, loading.base)
+    let reading = page.loading.as_ref().filter(|_| page.awaiting());
+    let status = if let Some(Loading {
+        what: Load::Branch { title, base },
+        ..
+    }) = reading
+    {
+        format!("Reading {title} against {base}\u{2026}")
+    } else if reading.is_some() {
+        "Reading what agents changed\u{2026}".to_owned()
     } else if let Some((title, base, left_out)) = branch {
         let mut said = match files {
             0 => format!("Nothing on {title} differs from {base}"),
@@ -487,7 +630,7 @@ pub fn draw(
     layout::push_rect(out, atlas, [x, y], [right - x, 1.0], theme.hairline);
     y += 8.0;
     let top = y;
-    if page.loading.is_some() {
+    if reading.is_some() {
         // The list and the diff as they will stand, breathing.
         let mut ly = top + 4.0;
         for (n, width) in [0.7, 0.55, 0.62, 0.48].into_iter().enumerate() {
@@ -822,4 +965,134 @@ pub fn draw(
     }
     page.diff_rect = Some(diff_rect);
     page.hits = hits;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn counts(n: usize) -> Vec<(PathBuf, String, usize)> {
+        vec![(PathBuf::from("/s/one"), "Terminal".into(), n)]
+    }
+
+    /// A read in flight that no worker answers.
+    fn reading(
+        page: &mut Page,
+    ) -> mpsc::Sender<(Result<Vec<Session>, String>, std::time::Duration)> {
+        let (tx, rx) = mpsc::channel();
+        page.loading = Some(Loading {
+            what: Load::Sessions,
+            rx,
+        });
+        tx
+    }
+
+    #[test]
+    fn unchanged_counts_do_not_read_the_page_again() {
+        let mut page = Page {
+            open: true,
+            ..Page::default()
+        };
+        assert!(page.take_summary(counts(2), true));
+        assert!(!page.take_summary(counts(2), true));
+        assert!(!page.take_summary(counts(2), true));
+        assert!(page.take_summary(counts(3), true));
+    }
+
+    #[test]
+    fn counts_changed_off_screen_are_read_once_back_on() {
+        let mut page = Page {
+            open: true,
+            ..Page::default()
+        };
+        assert!(!page.take_summary(counts(1), false));
+        assert!(page.stale);
+        assert!(!page.take_summary(counts(2), false));
+        assert!(page.take_summary(counts(2), true));
+        assert!(!page.stale);
+        assert!(!page.take_summary(counts(2), true));
+    }
+
+    #[test]
+    fn a_closed_page_keeps_the_counts_without_reading() {
+        let mut page = Page::default();
+        assert!(!page.take_summary(counts(1), false));
+        assert!(!page.stale);
+        assert_eq!(page.summary, counts(1));
+    }
+
+    #[test]
+    fn reads_asked_for_during_one_coalesce_into_one_more() {
+        let mut page = Page {
+            open: true,
+            ..Page::default()
+        };
+        let _tx = reading(&mut page);
+        page.reload();
+        page.reload();
+        assert_eq!(page.loads, 0, "a read while one runs waits for it");
+        assert!(page.again);
+        assert!(page.landed(), "one more read follows the one that ran");
+        let _tx = reading(&mut page);
+        assert!(!page.landed(), "and only one");
+    }
+
+    #[test]
+    fn landing_takes_the_sessions() {
+        let mut page = Page {
+            open: true,
+            ..Page::default()
+        };
+        let tx = reading(&mut page);
+        assert_eq!(page.poll(), None, "nothing in yet");
+        tx.send((Ok(Vec::new()), std::time::Duration::ZERO))
+            .expect("send");
+        assert_eq!(page.poll(), Some(Ok(())));
+        assert!(page.loading.is_none());
+        assert_eq!(page.poll(), None);
+    }
+
+    #[test]
+    fn a_branch_being_read_is_not_read_as_sessions() {
+        let mut page = Page {
+            open: true,
+            ..Page::default()
+        };
+        let (_tx, rx) = mpsc::channel();
+        page.loading = Some(Loading {
+            what: Load::Branch {
+                title: "feature".into(),
+                base: "main".into(),
+            },
+            rx,
+        });
+        page.reload();
+        assert!(!page.again);
+        assert_eq!(page.loads, 0);
+        assert!(page.awaiting());
+    }
+
+    #[test]
+    fn a_branch_that_could_not_be_read_closes_the_page() {
+        let mut page = Page {
+            open: true,
+            ..Page::default()
+        };
+        let (tx, rx) = mpsc::channel();
+        page.loading = Some(Loading {
+            what: Load::Branch {
+                title: "feature".into(),
+                base: "main".into(),
+            },
+            rx,
+        });
+        tx.send((Err("no such branch".into()), std::time::Duration::ZERO))
+            .expect("send");
+        assert_eq!(
+            page.poll(),
+            Some(Err("Could not read feature: no such branch".into()))
+        );
+        assert!(!page.open);
+        assert!(page.loading.is_none());
+    }
 }
