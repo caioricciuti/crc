@@ -426,6 +426,13 @@ impl EditorView {
         if columns && let Some(handled) = self.handle_conflict_side_key(event) {
             return handled;
         }
+        // A cell's field ahead of the grid: the grid's keys run only while
+        // no field has them.
+        if self.state().is_some_and(|state| state.cell_edit.is_some())
+            && self.handle_cell_key(event)
+        {
+            return true;
+        }
         let grid = {
             let Some(state) = self.state() else {
                 return false;
@@ -1023,6 +1030,7 @@ impl EditorView {
             sidebar_edit,
             agents_edit,
             rename,
+            cell_edit,
             ..
         } = &mut *state;
         let field = match owner {
@@ -1033,6 +1041,9 @@ impl EditorView {
             Keys::Rename => rename
                 .as_mut()
                 .map(|rename| (&mut rename.field, Focus::Field)),
+            Keys::Cell => cell_edit
+                .as_mut()
+                .map(|edit| (&mut edit.field, Focus::Field)),
             Keys::GitMessage => Some((&mut git.message, Focus::Message)),
             Keys::Goto => goto.as_mut().map(|field| (field, Focus::Goto)),
             Keys::Palette => palette.as_mut().map(|(query, _)| (query, Focus::Field)),

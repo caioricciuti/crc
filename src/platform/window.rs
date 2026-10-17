@@ -702,6 +702,8 @@ struct State {
     hovered_tab: Option<usize>,
     /// F2's field: the new name, and where the rename was asked.
     rename: Option<RenameField>,
+    /// The field open on a cell of the active document's grid.
+    cell_edit: Option<crate::platform::table::CellEdit>,
     /// `format_on_save` from the settings.
     format_on_save: bool,
     /// Set while saving what a format-on-save produced, so that save does
@@ -1627,6 +1629,14 @@ define_class!(
             if let Some(mut state) = self.state_mut() {
                 state.drag = None;
             }
+            // A press anywhere but the grid commits the cell being edited,
+            // then goes on as it would have; the grid's own press sorts out
+            // whether it landed on the field.
+            if self.state().is_some_and(|state| state.cell_edit.is_some())
+                && !chrome.text.contains(x, y)
+            {
+                self.commit_cell_edit(None);
+            }
             // The peek at a Git change takes a click on it; a click anywhere
             // else closes it and goes on as it would have.
             let peek = {
@@ -1972,9 +1982,9 @@ define_class!(
                     return;
                 }
                 // A click on the grid selects a cell, not a place in the
-                // text behind it.
+                // text behind it; two open the cell.
                 Some(Hit::TableBody) => {
-                    self.table_press(x, y);
+                    self.table_press(x, y, event.clickCount());
                     return;
                 }
                 Some(Hit::ConflictStep(forward)) => {
@@ -4929,6 +4939,8 @@ define_class!(
                         None
                     } else if state.goto.is_some() || state.rename.is_some() {
                         Some(chrome.status)
+                    } else if state.cell_edit.is_some() {
+                        Some(text)
                     } else if state.palette.is_some() {
                         let rect = layout::palette_rect(state.viewport, 1);
                         Some(Viewport { height: layout::PALETTE_ROW, ..rect })
@@ -6997,6 +7009,7 @@ fn close_fields(state: &mut State) {
     state.sidebar_edit = None;
     state.agents_edit = None;
     state.rename = None;
+    state.cell_edit = None;
     state.palette = None;
     state.goto = None;
     state.git_focus = false;
@@ -7070,6 +7083,8 @@ enum Keys {
     SidebarEdit,
     AgentsEdit,
     Rename,
+    /// A cell of a CSV or TSV grid.
+    Cell,
     /// The commit message, once it has been clicked.
     GitMessage,
     Goto,
@@ -7090,6 +7105,8 @@ fn keys(state: &State) -> Keys {
         Keys::AgentsEdit
     } else if state.rename.is_some() {
         Keys::Rename
+    } else if state.cell_edit.is_some() {
+        Keys::Cell
     } else if state.git_open && state.git_focus {
         Keys::GitMessage
     } else if state.goto.is_some() {
@@ -7129,6 +7146,7 @@ fn focused_buffer(state: &State) -> &Buffer {
         Keys::SidebarEdit => state.sidebar_edit.as_ref().map(|edit| &edit.field),
         Keys::AgentsEdit => state.agents_edit.as_ref().map(|(_, field)| field),
         Keys::Rename => state.rename.as_ref().map(|rename| &rename.field),
+        Keys::Cell => state.cell_edit.as_ref().map(|edit| &edit.field),
         Keys::GitMessage => Some(&state.git.message),
         Keys::Goto => state.goto.as_ref(),
         Keys::Palette => state.palette.as_ref().map(|(query, _)| query),
@@ -9673,6 +9691,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         sidebar_edit: None,
         agents_edit: None,
         rename: None,
+        cell_edit: None,
         format_on_save: settings.format_on_save,
         saving_formatted: false,
         word_wrap: settings.word_wrap,

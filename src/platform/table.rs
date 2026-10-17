@@ -10,8 +10,10 @@
 //! Text switch.
 //!
 //! One cell can be selected, by a click or from the keys, and the selection
-//! outlives a reparse as long as its record and column still exist. Editing
-//! a cell comes later.
+//! outlives a reparse as long as its record and column still exist. The
+//! selected cell opens as a one-line field ([`CellEdit`]) on Return, a
+//! double click or a typed character; committing it is one edit of the
+//! text behind the grid, encoded for the dialect, and one undo step.
 
 use crate::render::{
     font::Atlas,
@@ -19,12 +21,13 @@ use crate::render::{
     metal::GlyphInstance,
 };
 use crate::text::{
-    buffer::Buffer,
+    buffer::{Buffer, Motion},
     columns::display_width,
     csv::{self, Cell, Dialect, Table},
     rope::Rope,
 };
 use std::collections::HashMap;
+use std::ops::Range;
 
 /// Bigger than this and the document stays text: the parse keeps a range
 /// per cell, and the grid is for looking at data, not at a dump.
@@ -36,7 +39,7 @@ const SAMPLE_ROWS: usize = 200;
 const MIN_WIDTH: usize = 3;
 const MAX_WIDTH: usize = 48;
 /// Air left and right of a cell's text, in points.
-const CELL_PAD: f32 = 8.0;
+pub const CELL_PAD: f32 = 8.0;
 
 /// The measurements the grid is laid out in, from the code font.
 #[derive(Clone, Copy, Debug)]
@@ -81,6 +84,92 @@ pub struct TableView {
     pub mode_grid: bool,
     /// The selected cell as record and column; the header is record 0.
     pub selected: Option<(usize, usize)>,
+}
+
+/// The field open on a cell: its text, and which cell takes it on commit.
+/// The field is drawn in the code font on the cell itself, so the grid
+/// keeps its shape while a value is typed.
+pub struct CellEdit {
+    pub field: Buffer,
+    /// The record, the header being 0, and the column.
+    pub record: usize,
+    pub column: usize,
+}
+
+impl CellEdit {
+    /// A field on `(record, column)` holding `value`, the caret at its end.
+    pub fn new(record: usize, column: usize, value: &str) -> Self {
+        let mut field = Buffer::from_text(value);
+        field.place_cursor(value.len(), Motion::Move);
+        Self {
+            field,
+            record,
+            column,
+        }
+    }
+
+    /// Puts the caret where a press at `x`, in points from the field's
+    /// text start, lands in the text as the field shows it in a cell
+    /// `width` points wide.
+    pub fn place_caret(&mut self, x: f32, cells: Cells, width: f32) {
+        let text = self.field.rope.to_string();
+        let window = field_window(&text, self.field.cursor(), field_columns(width, cells));
+        let start = window.start;
+        let mut at = start;
+        let mut used = 0.0;
+        for (offset, ch) in text[window].char_indices() {
+            let w = display_width(ch) as f32 * cells.advance;
+            if x < used + w / 2.0 {
+                break;
+            }
+            used += w;
+            at = start + offset + ch.len_utf8();
+        }
+        self.field.place_cursor(at, Motion::Move);
+    }
+}
+
+/// How many code cells of text fit in a cell `width` points wide.
+fn field_columns(width: f32, cells: Cells) -> usize {
+    if cells.advance <= 0.0 {
+        return 0;
+    }
+    ((width - 2.0 * CELL_PAD) / cells.advance).max(0.0) as usize
+}
+
+/// The part of a field's `text` that `columns` code cells show with the
+/// caret at `cursor` in view: from the start until the caret would run off
+/// the right, then scrolled by whole characters so the caret keeps a cell
+/// of its own. The byte range shown.
+fn field_window(text: &str, cursor: usize, columns: usize) -> Range<usize> {
+    let cursor = cursor.min(text.len());
+    let room = columns.saturating_sub(1);
+    let mut used = 0;
+    let mut start = cursor;
+    for (at, ch) in text[..cursor].char_indices().rev() {
+        let width = display_width(ch);
+        if used + width > room {
+            break;
+        }
+        used += width;
+        start = at;
+    }
+    let mut used = 0;
+    let mut end = start;
+    for (at, ch) in text[start..].char_indices() {
+        let width = display_width(ch);
+        if used + width > columns {
+            break;
+        }
+        used += width;
+        end = start + at + ch.len_utf8();
+    }
+    start..end
+}
+
+/// The width of `text` in code cells.
+fn cells_wide(text: &str) -> usize {
+    text.chars().map(display_width).sum()
 }
 
 /// One step of the selection from the keys.
@@ -219,6 +308,82 @@ impl TableView {
             self.scroll_x = (edges[column + 1] - content).min(edges[column]);
         }
         self.clamp_scroll(cells, rect);
+    }
+
+    /// A cell's value, quotes folded; empty for a cell the record does not
+    /// have.
+    pub fn cell_value(&self, record: usize, column: usize) -> String {
+        self.table
+            .cell(record, column)
+            .map_or_else(String::new, |cell| decode(&self.rope, cell))
+    }
+
+    /// The edit that puts `value` in a cell: the byte range of the parsed
+    /// text to replace and what to put there, encoded for the dialect.
+    /// `None` when the cell holds `value` already, or there is no such
+    /// record. A record with fewer cells than `column` needs gets the
+    /// missing delimiters first, at its end, so the cell exists afterwards:
+    /// this pads the record. An empty value into a cell that is not there
+    /// changes nothing visible and is left alone.
+    pub fn cell_replacement(
+        &self,
+        record: usize,
+        column: usize,
+        value: &str,
+    ) -> Option<(Range<usize>, String)> {
+        let row = self.table.rows.get(record)?;
+        let encoded = csv::encode_cell(value, &self.dialect);
+        match row.cells.get(column) {
+            Some(cell) => {
+                (decode(&self.rope, cell) != value).then(|| (cell.range.clone(), encoded))
+            }
+            None if value.is_empty() => None,
+            None => {
+                let missing = (column + 1).saturating_sub(row.cells.len());
+                let delimiter = self.dialect.delimiter as char;
+                let mut text = String::with_capacity(missing + encoded.len());
+                text.extend(std::iter::repeat_n(delimiter, missing));
+                text.push_str(&encoded);
+                Some((row.range.end..row.range.end, text))
+            }
+        }
+    }
+
+    /// Where a record's row starts on screen: the header at the top, a body
+    /// record by its place below the scroll. `None` once it is scrolled out.
+    fn row_y(&self, cells: Cells, rect: Viewport, record: usize) -> Option<f32> {
+        if record == 0 {
+            return Some(rect.y);
+        }
+        let visible = rows_visible(rect, cells.line_height);
+        let body = record - 1;
+        (self.scroll_row..self.scroll_row + visible)
+            .contains(&body)
+            .then(|| {
+                body_rect(rect, cells.line_height).y
+                    + (body - self.scroll_row) as f32 * cells.line_height
+            })
+    }
+
+    /// A cell's rectangle on screen, from rule to rule and the row's full
+    /// height, before the gutter and the right edge cut it. `None` for a
+    /// record scrolled out of view or a column the grid does not have.
+    pub fn cell_rect(
+        &self,
+        cells: Cells,
+        rect: Viewport,
+        record: usize,
+        column: usize,
+    ) -> Option<Viewport> {
+        let y = self.row_y(cells, rect, record)?;
+        let edges = self.column_edges(cells);
+        let (start, end) = (*edges.get(column)?, *edges.get(column + 1)?);
+        Some(Viewport {
+            x: rect.x + self.gutter_width(cells) + start - self.scroll_x,
+            y,
+            width: end - start,
+            height: cells.line_height,
+        })
     }
 
     /// The cell a press at a point selects: the one under it, or the first
@@ -377,13 +542,14 @@ pub fn sync(tables: &mut HashMap<u64, TableView>, buffer: &Buffer) {
     }
 }
 
-/// One line for the self-test dump.
-pub fn dump(view: Option<&TableView>) -> String {
+/// One line for the self-test dump. `editing` is whether a cell's field
+/// is open.
+pub fn dump(view: Option<&TableView>, editing: bool) -> String {
     match view {
         None => "none".to_string(),
         Some(view) if !view.mode_grid => "text".to_string(),
         Some(view) => format!(
-            "grid rows={} cols={} scroll={} sel={}",
+            "grid rows={} cols={} scroll={} sel={} editing={editing}",
             view.table.rows.len(),
             view.column_count(),
             view.scroll_row,
@@ -514,10 +680,11 @@ pub fn rows_visible(rect: Viewport, line_height: f32) -> usize {
     (body_rect(rect, line_height).height / line_height).max(1.0) as usize
 }
 
-/// The document as a grid.
+/// The document as a grid, with the field of `edit` on its cell.
 pub fn draw(
     view: &mut TableView,
     rope: &Rope,
+    edit: Option<&CellEdit>,
     atlas: &mut Atlas,
     rect: Viewport,
     theme: &Theme,
@@ -548,13 +715,9 @@ pub fn draw(
     );
     // The selected cell's row, when it is on screen: its band, under the
     // rules and the text; the cell's own outline goes on last.
-    let selected_y = view.selected.and_then(|(row, _)| match row {
-        0 => Some(rect.y),
-        _ if (view.scroll_row..view.scroll_row + visible).contains(&(row - 1)) => {
-            Some(body.y + (row - 1 - view.scroll_row) as f32 * line_height)
-        }
-        _ => None,
-    });
+    let selected_y = view
+        .selected
+        .and_then(|(row, _)| view.row_y(cells, rect, row));
     if let Some(y) = selected_y {
         layout::push_rect(
             out,
@@ -653,19 +816,78 @@ pub fn draw(
             layout::clip_horizontal(quad, left, right);
         }
     }
+
+    // The field on the cell being edited, inside its outline: the cell
+    // painted over so the old value does not show through, the text in the
+    // code font like the rest of the grid, scrolled to keep the caret in
+    // the cell, the selection band behind it and the caret. Cut at the
+    // gutter and the right edge like the cells are.
+    if let Some(edit) = edit
+        && let Some(cell) = view.cell_rect(cells, rect, edit.record, edit.column)
+    {
+        let from = out.len();
+        let inner = Viewport {
+            x: cell.x + 1.0,
+            y: cell.y + 1.0,
+            width: (cell.width - 2.0).max(0.0),
+            height: (cell.height - 2.0).max(0.0),
+        };
+        layout::push_rect(
+            out,
+            atlas,
+            [inner.x, inner.y],
+            [inner.width, inner.height],
+            theme.tab_active,
+        );
+        let x0 = cell.x + CELL_PAD;
+        let text = edit.field.rope.to_string();
+        let window = field_window(&text, edit.field.cursor(), field_columns(cell.width, cells));
+        let x_of = |at: usize| x0 + cells_wide(&text[window.start..at]) as f32 * cells.advance;
+        if let Some(selection) = edit.field.selection() {
+            let a = selection.start.clamp(window.start, window.end);
+            let b = selection.end.clamp(window.start, window.end);
+            if a < b {
+                layout::push_rect(
+                    out,
+                    atlas,
+                    [x_of(a), inner.y],
+                    [x_of(b) - x_of(a), inner.height],
+                    theme.selection,
+                );
+            }
+        }
+        let shown: String = one_line(&text[window.clone()]).collect();
+        layout::push_text(out, atlas, x0, cell.y, &shown, theme.text);
+        let caret = edit.field.cursor().clamp(window.start, window.end);
+        layout::push_rect(
+            out,
+            atlas,
+            [x_of(caret), inner.y],
+            [(cells.advance * 0.15).max(1.0), inner.height],
+            theme.cursor,
+        );
+        for quad in &mut out[from..] {
+            layout::clip_horizontal(quad, left, right);
+        }
+    }
 }
 
-/// A cell's value as drawn: quotes folded, one line, cut to the column.
-fn cell_label(rope: &Rope, cell: &Cell, width: usize) -> String {
+/// A cell's value: quotes stripped and doubled quotes folded.
+fn decode(rope: &Rope, cell: &Cell) -> String {
     let raw = rope.slice_to_string(cell.range.clone());
-    let value = Table::cell_text(
+    Table::cell_text(
         &raw,
         &Cell {
             range: 0..raw.len(),
             quoted: cell.quoted,
         },
-    );
-    crate::text::columns::fit_columns(one_line(&value), width)
+    )
+    .into_owned()
+}
+
+/// A cell's value as drawn: quotes folded, one line, cut to the column.
+fn cell_label(rope: &Rope, cell: &Cell, width: usize) -> String {
+    crate::text::columns::fit_columns(one_line(&decode(rope, cell)), width)
 }
 
 #[cfg(test)]
@@ -831,13 +1053,16 @@ mod tests {
         let view = &tables[&b.id()];
         assert_eq!(view.table.rows.len(), 5);
         assert!(!view.is_current(&b.rope));
-        assert_eq!(dump(Some(view)), "text");
+        assert_eq!(dump(Some(view), false), "text");
         tables.get_mut(&b.id()).unwrap().mode_grid = true;
         sync(&mut tables, &b);
         let view = &tables[&b.id()];
         assert_eq!(view.table.rows.len(), 6);
-        assert_eq!(dump(Some(view)), "grid rows=6 cols=4 scroll=0 sel=-");
-        assert_eq!(dump(None), "none");
+        assert_eq!(
+            dump(Some(view), false),
+            "grid rows=6 cols=4 scroll=0 sel=- editing=false"
+        );
+        assert_eq!(dump(None, false), "none");
         // Not a table file: nothing kept.
         let plain = buffer("notes.txt", "a,b\n1,2\n");
         sync(&mut tables, &plain);
@@ -1005,8 +1230,8 @@ mod tests {
         sync(&mut tables, &b);
         assert_eq!(tables[&b.id()].selected, Some((2, 1)));
         assert_eq!(
-            dump(Some(&tables[&b.id()])),
-            "grid rows=3 cols=2 scroll=0 sel=2,1"
+            dump(Some(&tables[&b.id()]), true),
+            "grid rows=3 cols=2 scroll=0 sel=2,1 editing=true"
         );
         // Text mode and back keeps it.
         tables.get_mut(&b.id()).unwrap().mode_grid = false;
@@ -1034,5 +1259,156 @@ mod tests {
             "one two three"
         );
         assert_eq!(cell_label(&rope, table.cell(1, 1).unwrap(), 5), "one t");
+    }
+
+    #[test]
+    fn a_cell_edit_is_encoded_and_spliced_at_the_cell() {
+        let text = "id,name,note,amount\n1,Ada,plain,1.00\n2,\"Smith, Jane\",x,2\n3,Bob\n";
+        let view = TableView::parse(&Rope::from_text(text));
+        let ada = view.table.cell(1, 1).unwrap().range.clone();
+        assert_eq!(&text[ada.clone()], "Ada");
+        // A plain value replaces the cell's bytes as it is.
+        assert_eq!(
+            view.cell_replacement(1, 1, "Grace"),
+            Some((ada.clone(), "Grace".to_string()))
+        );
+        // The delimiter, a quote or a line break: quoted, quotes doubled.
+        assert_eq!(
+            view.cell_replacement(1, 1, "Lovelace, Ada"),
+            Some((ada.clone(), "\"Lovelace, Ada\"".to_string()))
+        );
+        assert_eq!(
+            view.cell_replacement(1, 1, "say \"hi\""),
+            Some((ada.clone(), "\"say \"\"hi\"\"\"".to_string()))
+        );
+        assert_eq!(
+            view.cell_replacement(1, 1, "one\ntwo"),
+            Some((ada.clone(), "\"one\ntwo\"".to_string()))
+        );
+        // An empty value empties the cell.
+        assert_eq!(
+            view.cell_replacement(1, 1, ""),
+            Some((ada.clone(), String::new()))
+        );
+        // The value the cell has: nothing to do, the quoted one by its
+        // folded value.
+        assert_eq!(view.cell_replacement(1, 1, "Ada"), None);
+        assert_eq!(view.cell_replacement(2, 1, "Smith, Jane"), None);
+        assert_eq!(view.cell_value(2, 1), "Smith, Jane");
+        // A record with fewer cells is padded at its end, one delimiter
+        // per missing cell, so the cell exists.
+        let end = view.table.rows[3].range.end;
+        assert_eq!(&text[..end], &text[..text.len() - 1]);
+        assert_eq!(
+            view.cell_replacement(3, 2, "x"),
+            Some((end..end, ",x".to_string()))
+        );
+        assert_eq!(
+            view.cell_replacement(3, 3, "a,b"),
+            Some((end..end, ",,\"a,b\"".to_string()))
+        );
+        // Nothing into a cell that is not there shows nothing: left alone.
+        assert_eq!(view.cell_replacement(3, 2, ""), None);
+        assert_eq!(view.cell_value(3, 2), "");
+        // No such record.
+        assert_eq!(view.cell_replacement(4, 0, "x"), None);
+        // A tab-separated file pads with tabs.
+        let tsv = TableView::parse(&Rope::from_text("a\tb\tc\n1\n"));
+        assert_eq!(
+            tsv.cell_replacement(1, 2, "x y"),
+            Some((7..7, "\t\tx y".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_committed_cell_undoes_to_the_exact_bytes() {
+        let text = "id,name\r\n1,\"Ada\"\r\n2,Bob\r\n";
+        let mut b = buffer("undo.csv", text);
+        let view = TableView::parse(&b.rope);
+        assert_eq!(
+            view.dialect.line_ending,
+            csv::Ending::Lf,
+            "the rope is LF only"
+        );
+        let (range, value) = view.cell_replacement(1, 1, "Lovelace, Ada").unwrap();
+        // As the commit does it: the caret placed first, so the edit is
+        // its own undo step.
+        b.place_cursor(range.start, Motion::Move);
+        assert_eq!(b.replace_ranges(&[(range, value)]), 1);
+        assert_eq!(b.rope.to_string(), "id,name\n1,\"Lovelace, Ada\"\n2,Bob\n");
+        assert_eq!(
+            TableView::parse(&b.rope).cell_value(1, 1),
+            "Lovelace, Ada",
+            "the reparse reads the value back"
+        );
+        assert!(b.undo());
+        assert_eq!(b.rope.to_string(), "id,name\n1,\"Ada\"\n2,Bob\n");
+        assert_eq!(TableView::parse(&b.rope).cell_value(1, 1), "Ada");
+    }
+
+    #[test]
+    fn the_field_scrolls_to_keep_the_caret_in_the_cell() {
+        // Eight columns of "0123456789": the caret at the end leaves the
+        // first three characters out, one cell kept for the caret.
+        let text = "0123456789";
+        assert_eq!(field_window(text, 10, 8), 3..10);
+        assert_eq!(field_window(text, 0, 8), 0..8);
+        assert_eq!(field_window(text, 7, 8), 0..8);
+        assert_eq!(field_window(text, 8, 8), 1..9);
+        assert_eq!(field_window(text, 10, 20), 0..10);
+        assert_eq!(field_window(text, 10, 0), 10..10);
+        // Wide characters take two cells each.
+        assert_eq!(field_window("日本語", 9, 4), 6..9);
+        assert_eq!(field_window("日本語", 9, 5), 3..9);
+        // The caret from a press: before the character the point is in the
+        // left half of, after it otherwise; past the end, at the end.
+        let mut edit = CellEdit::new(1, 1, "abcdef");
+        assert_eq!(edit.field.cursor(), 6, "the caret starts at the end");
+        // Seven cells: the six characters and the caret's own all fit.
+        let width = 7.0 * CELLS.advance + 2.0 * CELL_PAD;
+        edit.place_caret(0.0, CELLS, width);
+        assert_eq!(edit.field.cursor(), 0);
+        edit.place_caret(2.5 * CELLS.advance, CELLS, width);
+        assert_eq!(edit.field.cursor(), 3);
+        edit.place_caret(2.4 * CELLS.advance, CELLS, width);
+        assert_eq!(edit.field.cursor(), 2);
+        edit.place_caret(100.0 * CELLS.advance, CELLS, width);
+        assert_eq!(edit.field.cursor(), 6);
+    }
+
+    #[test]
+    fn cells_have_rectangles_while_they_are_on_screen() {
+        let mut view = TableView::parse(&Rope::from_text(&rows(300)));
+        let rect = Viewport {
+            x: 100.0,
+            y: 50.0,
+            ..RECT
+        };
+        let gutter = view.gutter_width(CELLS);
+        let edges = view.column_edges(CELLS);
+        let header = view.cell_rect(CELLS, rect, 0, 1).unwrap();
+        assert_eq!(
+            (header.x, header.y, header.width, header.height),
+            (100.0 + gutter + edges[1], 50.0, edges[2] - edges[1], 19.0)
+        );
+        let body = view.cell_rect(CELLS, rect, 3, 0).unwrap();
+        assert_eq!((body.x, body.y), (100.0 + gutter, 50.0 + 19.0 * 3.0));
+        assert!(
+            view.cell_rect(CELLS, rect, 19, 0).is_none(),
+            "below the view"
+        );
+        assert!(
+            view.cell_rect(CELLS, rect, 1, 4).is_none(),
+            "no such column"
+        );
+        view.scroll_rows(10, CELLS, rect);
+        assert!(view.cell_rect(CELLS, rect, 3, 0).is_none(), "scrolled out");
+        assert_eq!(view.cell_rect(CELLS, rect, 11, 0).unwrap().y, 50.0 + 19.0);
+        view.scroll_points(40.0, CELLS, rect);
+        assert_eq!(
+            view.cell_rect(CELLS, rect, 0, 0).unwrap().x,
+            100.0 + gutter - 40.0,
+            "under the gutter, the draw cuts it"
+        );
     }
 }

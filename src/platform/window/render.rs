@@ -131,6 +131,7 @@ impl EditorView {
             conflict_scans,
             conflict_side,
             tables,
+            cell_edit,
             issue_tabs,
             scrub,
             watch,
@@ -301,6 +302,7 @@ impl EditorView {
             crate::platform::table::draw(
                 view,
                 &buffer.rope,
+                cell_edit.as_ref(),
                 &mut renderer.atlas,
                 editor_rect,
                 theme,

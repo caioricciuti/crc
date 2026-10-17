@@ -839,7 +839,7 @@ impl EditorView {
                         v.scroll
                     )),
                     state.git.conflict_count(),
-                    crate::platform::table::dump(active_table(&state)),
+                    crate::platform::table::dump(active_table(&state), state.cell_edit.is_some()),
                     state
                         .blame.shown
                         .as_ref()
