@@ -13,6 +13,7 @@ impl EditorView {
             };
             let switched = state.docs.switch(index);
             if switched {
+                uncover_column(&mut state);
                 reveal_active_tab(&mut state);
             }
             switched

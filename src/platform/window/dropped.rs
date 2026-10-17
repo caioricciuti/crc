@@ -117,6 +117,7 @@ impl EditorView {
             match Buffer::open(path) {
                 Ok(buffer) => {
                     state.docs.add(buffer);
+                    uncover_column(&mut state);
                     reveal_active_tab(&mut state);
                 }
                 Err(e) => {

@@ -377,6 +377,7 @@ impl EditorView {
                 // add, not push: the file may already be open.
                 Ok(buffer) => {
                     state.docs.add(buffer);
+                    uncover_column(&mut state);
                     format!("created {}", path.display())
                 }
                 Err(e) => format!("created but not opened: {e}"),

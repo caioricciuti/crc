@@ -5833,7 +5833,13 @@ impl EditorView {
         };
         if let Some((pane, tab)) = elsewhere {
             self.focus_pane(pane);
-            self.activate_tab(tab);
+            if !self.activate_tab(tab)
+                && let Some(mut state) = self.state_mut()
+            {
+                // Already the front tab there: nothing switched, but a
+                // page may still be over it.
+                uncover_column(&mut state);
+            }
             return true;
         }
 
@@ -5842,6 +5848,7 @@ impl EditorView {
         };
         match state.docs.open(path) {
             Ok(()) => {
+                uncover_column(&mut state);
                 reveal_active_tab(&mut state);
                 let format = state.docs.active().disk_format();
                 let note = if state.docs.active().is_read_only() {
@@ -6658,6 +6665,20 @@ fn column_of(state: &State) -> Column {
     } else {
         Column::Text
     }
+}
+
+/// Gives the editor column back to the focused pane's tabs: the pages that
+/// cover it whole (Extensions, MCP, Settings, Review) close, as Escape
+/// closes them. Every route that opens or switches to a document calls
+/// this, so the tab it just made active is on screen rather than behind a
+/// page while the status line says it opened.
+fn uncover_column(state: &mut State) {
+    if let Some(page) = &mut state.extensions {
+        page.details = false;
+    }
+    state.mcp.details = false;
+    state.settings_page.open = false;
+    state.review_page.open = false;
 }
 
 /// Whether the Source Control diff has the editor column: its tab is the
