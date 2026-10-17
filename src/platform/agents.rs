@@ -2723,9 +2723,13 @@ impl Panel {
     }
 
     /// A read or an operation is in flight: an issue read whole for its
-    /// tab too, which nothing else wakes the window for.
+    /// tab too, and an inspector Check, which nothing else wakes the
+    /// window for.
     pub fn busy(&self) -> bool {
-        self.reading_list() || self.pr_rx.is_some() || self.reading_issue()
+        self.reading_list()
+            || self.pr_rx.is_some()
+            || self.reading_issue()
+            || self.inspector.checking_any()
     }
 
     /// The list, an operation or the inspector is being read; a pull

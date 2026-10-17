@@ -137,7 +137,7 @@ testgit "$fix_path" log --format=%s | grep -x 'wip remote' >/dev/null \
     || failed "remote-git: Commit All left changes: $(testgit "$fix_path" status --porcelain)"
 # Merging main in brings its one commit: the change from it stays fix's own.
 expect "$T/rgit-updated.out" inspector "remote=myhost:$fix_path branch=fix base=main ahead=3 behind=0 upstream=- push=0 pull=0 dirty=0 changes=+2-0 tag=- buttons=push"
-expect "$T/rgit-pushed.out" inspector "remote=myhost:$fix_path branch=fix base=main ahead=3 behind=0 upstream=origin/fix push=0 pull=0 dirty=0 changes=+2-0 tag=- buttons="
+expect "$T/rgit-pushed.out" inspector "remote=myhost:$fix_path branch=fix base=main ahead=3 behind=0 upstream=origin/fix push=0 pull=0 dirty=0 changes=+2-0 tag=- check=none buttons=pull"
 [ "$(git -C "$RGO" rev-parse -q --verify refs/heads/fix)" = "$(testgit "$fix_path" rev-parse HEAD)" ] \
     || failed "remote-git: Push did not put fix on origin"
 # The changes went over ssh without a shared connection of their own, the
@@ -171,8 +171,8 @@ quit
 SCRIPT
 HOME="$RGH" CRC_TERMINAL_SHELL=/bin/sh CRC_SSH_COMMAND="$T/rgit-ssh.sh" \
     CRC_SELFTEST="$T/rgit-pull.script" "$BIN" "$T/rgitproj" 2> "$T/rgit-pull.err"
-expect "$T/rgit-behind.out" inspector "remote=myhost:$fix_path branch=fix base=main ahead=3 behind=0 upstream=origin/fix push=0 pull=1 dirty=0 changes=+2-0 tag=- buttons=pull"
-expect "$T/rgit-pulled.out" inspector "remote=myhost:$fix_path branch=fix base=main ahead=4 behind=0 upstream=origin/fix push=0 pull=0 dirty=0 changes=+3-0 tag=- buttons="
+expect "$T/rgit-behind.out" inspector "remote=myhost:$fix_path branch=fix base=main ahead=3 behind=0 upstream=origin/fix push=0 pull=1 dirty=0 changes=+2-0 tag=- check=none buttons=pull"
+expect "$T/rgit-pulled.out" inspector "remote=myhost:$fix_path branch=fix base=main ahead=4 behind=0 upstream=origin/fix push=0 pull=0 dirty=0 changes=+3-0 tag=- check=none buttons=pull"
 [ -f "$fix_path/t.txt" ] || failed "remote-git: Pull did not bring t.txt on the host"
 grep -qF -- "'pull' '--ff-only'" "$llog" 2>/dev/null || failed "remote-git: no pull over ssh had [--ff-only]"
 

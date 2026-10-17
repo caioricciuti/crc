@@ -29,15 +29,16 @@ impl EditorView {
             return;
         };
         let (action, repo) = action;
-        // An issue row, Show all, Load Issues and its hide, and a
-        // repository's fold: in the repository (for the issues a main
+        // An issue row, Show all, Load Issues and its hide, a repository's
+        // fold and its Check: in the repository (for the issues a main
         // checkout) on the host of the workspace shown.
         if let (
             Action::OpenIssue(_)
             | Action::ToggleIssues
             | Action::LoadIssues
             | Action::HideIssues
-            | Action::FoldRepo,
+            | Action::FoldRepo
+            | Action::CheckRemote,
             Some(main),
         ) = (action, &repo)
         {
@@ -58,6 +59,14 @@ impl EditorView {
                     if let Some(mut state) = self.state_mut() {
                         state.agents.hide_issues(&key);
                     }
+                }
+                // A fetch on a worker of its own, beside any operation.
+                Action::CheckRemote => {
+                    if let Some(mut state) = self.state_mut() {
+                        let sock = state.ssh_auth_sock.clone();
+                        state.agents.inspector.check_remote(key, sock);
+                    }
+                    self.resume_display_link();
                 }
                 // Opened, it is read again now; folded, it is left out.
                 Action::FoldRepo => {
@@ -131,7 +140,8 @@ impl EditorView {
             | Action::ToggleIssues
             | Action::LoadIssues
             | Action::HideIssues
-            | Action::FoldRepo => {}
+            | Action::FoldRepo
+            | Action::CheckRemote => {}
         }
         self.request_redraw();
         self.pump();

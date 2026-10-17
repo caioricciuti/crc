@@ -4,6 +4,10 @@ One entry per tag, written for people who use the editor.
 
 ## Unreleased
 
+- The Workspace inspector no longer says a repo is up to date from a
+  stale fetch. Each repo block has a Check button that fetches that repo
+  and shows what is ahead and behind, the Remote row says when it was
+  last checked, and Pull is enabled whenever the branch has an upstream.
 - Git > Recover Deleted File lists, in the palette, the files local
   history has versions of that are gone from disk, by name with their
   folder. Picking one opens its latest version at its old path as

@@ -71,6 +71,9 @@ pub enum Action {
     HideIssues,
     /// A repository's name row: its card folded to that row, or opened.
     FoldRepo,
+    /// Check: a fetch from the repository's remote, so ahead and behind
+    /// say what the remote has now.
+    CheckRemote,
 }
 
 impl Action {
@@ -94,6 +97,7 @@ impl Action {
             Action::LoadIssues => "issues_load",
             Action::HideIssues => "issues_hide",
             Action::FoldRepo => "repo_fold",
+            Action::CheckRemote => "check",
         }
     }
 }
@@ -127,6 +131,71 @@ type Fact<'a> = (&'a str, Vec<(String, [f32; 4])>);
 /// A worktree strip's height: its branch, where it stands, and its last
 /// commit.
 const STRIP: f32 = 64.0;
+
+/// A repository's Check: a fetch from its remote. The status compares
+/// HEAD with the remote's refs as last fetched, so until one is checked
+/// "up to date" only says nothing came in by the last fetch.
+pub enum Check {
+    /// The fetch, on a worker of its own: each repository's runs beside
+    /// the others', and beside the panel's one operation.
+    Running(mpsc::Receiver<Result<String, String>>),
+    /// When it answered, in Unix seconds.
+    Done(u64),
+    /// What Git said.
+    Failed(String),
+}
+
+/// How a card row's value is inked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ink {
+    Text,
+    Faint,
+    Removed,
+}
+
+impl Ink {
+    fn colour(self, theme: &Theme) -> [f32; 4] {
+        match self {
+            Ink::Text => theme.text,
+            Ink::Faint => theme.gutter_text,
+            Ink::Removed => theme.diff_removed,
+        }
+    }
+}
+
+/// The Remote row's values: where the branch stands against its upstream
+/// as last fetched, then, faintly, when that was checked (`now` in Unix
+/// seconds, for the clock).
+fn remote_values(status: &Status, check: Option<&Check>, now: u64) -> Vec<(String, Ink)> {
+    if status.upstream.is_none() {
+        return vec![("not pushed".into(), Ink::Faint)];
+    }
+    let mut parts = Vec::new();
+    if status.to_push > 0 {
+        parts.push(format!("{} to push", status.to_push));
+    }
+    if status.to_pull > 0 {
+        parts.push(format!("{} to pull", status.to_pull));
+    }
+    let counts = if parts.is_empty() {
+        "up to date".to_owned()
+    } else {
+        parts.join(", ")
+    };
+    let checked = match check {
+        None => ("not checked".to_owned(), Ink::Faint),
+        Some(Check::Running(_)) => ("checking\u{2026}".to_owned(), Ink::Faint),
+        Some(Check::Done(at)) => (
+            format!(
+                "checked {}",
+                crate::platform::clock_time(*at as i64, now as i64)
+            ),
+            Ink::Faint,
+        ),
+        Some(Check::Failed(_)) => ("check failed".to_owned(), Ink::Removed),
+    };
+    vec![(counts, Ink::Text), checked]
+}
 
 #[derive(Default)]
 pub struct Inspector {
@@ -176,6 +245,11 @@ pub struct Inspector {
     /// The repositories whose cards were folded last frame, for the
     /// self-test.
     shown_folded: Vec<PathBuf>,
+    /// Per repository, by host and folder, its Check, once asked for.
+    checks: HashMap<RepoKey, Check>,
+    /// A Check answered while a status read ran: what that read brings
+    /// may be from before the fetch, so it is read again after.
+    reread: bool,
 }
 
 impl Inspector {
@@ -245,9 +319,80 @@ impl Inspector {
         self.touched = true;
     }
 
-    /// Takes a finished read. Returns whether anything shown changed: a
-    /// read that says what the last one did is taken without a redraw.
+    /// Check: fetches `repo` (on its host, over ssh, for a host's) on a
+    /// worker, then its status is read again. Nothing can prompt: the
+    /// fetch has no terminal, and a missing credential fails. A Check of
+    /// a repository already checking is not started again.
+    pub fn check_remote(&mut self, repo: RepoKey, ssh_auth_sock: Option<PathBuf>) {
+        use crate::project::git::Remote;
+        if self.checking(&repo) {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let (host, dir) = repo.clone();
+        std::thread::spawn(move || {
+            let answer = match host {
+                Some(host) => {
+                    let runner = crate::platform::agents::runner(Some(&host));
+                    crate::project::worktree::remote_on(&runner, &dir, Remote::Fetch)
+                }
+                None => crate::project::git::remote(&dir, Remote::Fetch, ssh_auth_sock.as_deref()),
+            };
+            let _ = tx.send(answer);
+        });
+        self.checks.insert(repo, Check::Running(rx));
+    }
+
+    /// Whether `repo`'s Check is running.
+    pub fn checking(&self, repo: &RepoKey) -> bool {
+        matches!(self.checks.get(repo), Some(Check::Running(_)))
+    }
+
+    /// Whether any repository's Check is running.
+    pub fn checking_any(&self) -> bool {
+        self.checks.values().any(|c| matches!(c, Check::Running(_)))
+    }
+
+    /// `repo`'s Check, once asked for.
+    pub fn check_of(&self, repo: &RepoKey) -> Option<&Check> {
+        self.checks.get(repo)
+    }
+
+    /// Takes the Checks that answered: the statuses are read again, as
+    /// the remote's refs moved. Returns whether any did.
+    fn poll_checks(&mut self) -> bool {
+        let mut answered = false;
+        for check in self.checks.values_mut() {
+            let Check::Running(rx) = check else {
+                continue;
+            };
+            let answer = match rx.try_recv() {
+                Ok(answer) => answer,
+                Err(mpsc::TryRecvError::Empty) => continue,
+                Err(mpsc::TryRecvError::Disconnected) => Err("the fetch stopped".into()),
+            };
+            *check = match answer {
+                Ok(_) => Check::Done(crate::platform::unix_seconds()),
+                Err(e) => Check::Failed(e),
+            };
+            answered = true;
+        }
+        if answered {
+            self.invalidate();
+            self.reread |= self.rx.is_some();
+        }
+        answered
+    }
+
+    /// Takes a finished read or Check. Returns whether anything shown
+    /// changed: a read that says what the last one did is taken without a
+    /// redraw.
     pub fn poll(&mut self) -> bool {
+        let checked = self.poll_checks();
+        checked | self.poll_read()
+    }
+
+    fn poll_read(&mut self) -> bool {
         let Some(rx) = &self.rx else {
             return false;
         };
@@ -266,7 +411,8 @@ impl Inspector {
                 }
                 self.read_host = host;
                 self.status = read;
-                self.read_at = Some(Instant::now());
+                // Begun before a Check answered: read again.
+                self.read_at = (!std::mem::take(&mut self.reread)).then(Instant::now);
             }
             Err(mpsc::TryRecvError::Empty) => return false,
             Err(mpsc::TryRecvError::Disconnected) => {}
@@ -379,6 +525,21 @@ impl Inspector {
                         .map_or("-".to_owned(), |(t, n)| format!("{t}+{n}")),
                 ),
             };
+            // With an upstream: whether it was checked, which nothing else
+            // does for it.
+            let check = match self.status_of(path) {
+                Some(Ok(s)) if s.upstream.is_some() => {
+                    let key = (self.read_host.clone(), path.to_path_buf());
+                    match self.checks.get(&key) {
+                        None => " check=none",
+                        Some(Check::Running(_)) => " check=running",
+                        Some(Check::Done(_)) => " check=ok",
+                        Some(Check::Failed(_)) => " check=err",
+                    }
+                }
+                _ => "",
+            };
+            let status = format!("{status}{check}");
             let live: Vec<&str> = self
                 .hits
                 .iter()
@@ -392,6 +553,7 @@ impl Inspector {
                             | Action::LoadIssues
                             | Action::HideIssues
                             | Action::FoldRepo
+                            | Action::CheckRemote
                     ) && r.as_deref().is_none_or(|r| r == path)
                 })
                 .map(|(_, a, _)| a.name())
@@ -1625,25 +1787,20 @@ impl Inspector {
                 ));
             }
         }
+        let key = (self.read_host.clone(), repo.to_path_buf());
+        let check = self.checks.get(&key);
+        let checking = matches!(check, Some(Check::Running(_)));
         facts.push((
             "Remote",
-            vec![match &status.upstream {
-                None => ("not pushed".into(), theme.gutter_text),
-                Some(_) if status.to_push == 0 && status.to_pull == 0 => {
-                    ("up to date".into(), theme.text)
-                }
-                Some(_) => {
-                    let mut parts = Vec::new();
-                    if status.to_push > 0 {
-                        parts.push(format!("{} to push", status.to_push));
-                    }
-                    if status.to_pull > 0 {
-                        parts.push(format!("{} to pull", status.to_pull));
-                    }
-                    (parts.join(", "), theme.text)
-                }
-            }],
+            remote_values(status, check, crate::platform::unix_seconds())
+                .into_iter()
+                .map(|(value, ink)| (value, ink.colour(theme)))
+                .collect(),
         ));
+        let failed = match check {
+            Some(Check::Failed(e)) => e.lines().map(str::trim).find(|l| !l.is_empty()),
+            _ => None,
+        };
         facts.push((
             "Uncommitted",
             if status.dirty == 0 {
@@ -1671,55 +1828,89 @@ impl Inspector {
                 ],
             ));
         }
-        let y = card(out, atlas, x, y, width, &facts, theme) + 10.0;
+        let mut y = card(out, atlas, x, y, width, &facts, theme) + 10.0;
+        // A Check that failed says why, faintly, under the card.
+        if let Some(why) = failed {
+            let why = fit(atlas, why, width);
+            text(
+                out,
+                atlas,
+                x,
+                y - 6.0,
+                width,
+                &why,
+                layout::faded(theme.gutter_text, 0.7),
+            );
+            y += 20.0;
+        }
 
         // What can be done with it.
         let base = status.base.clone().unwrap_or_else(|| "main".into());
         let update = format!("Merge {base} In");
-        let buttons = [
+        let check_label = if checking {
+            "Checking\u{2026}"
+        } else {
+            "Check"
+        };
+        let mut buttons = vec![
             (
                 "Commit All\u{2026}",
                 Action::CommitAll,
                 status.dirty > 0,
                 "Stage every change and commit it",
+                None,
             ),
             (
                 update.as_str(),
                 Action::UpdateFromBase,
                 status.base.is_some() && status.behind > 0,
                 "Take the base branch's new commits: a merge, never a rebase",
+                None,
             ),
+            // Live with any upstream: `git pull --ff-only` fetches first,
+            // so the counts, as of the last fetch, do not decide it.
             (
                 "Pull",
                 Action::Pull,
-                status.upstream.is_some() && status.to_pull > 0,
+                status.upstream.is_some() && !checking,
                 "Fast-forward from the upstream",
+                None,
             ),
             (
                 "Push",
                 Action::Push,
                 status.branch.is_some() && (status.upstream.is_none() || status.to_push > 0),
                 "Push the branch, setting its upstream the first time",
+                None,
             ),
         ];
+        if status.upstream.is_some() {
+            buttons.push((
+                check_label,
+                Action::CheckRemote,
+                !checking,
+                "Fetch from the remote, then show what is ahead and behind",
+                Some(icons::REFRESH),
+            ));
+        }
         // The main checkout has nothing to take main's commits from.
-        let buttons: Vec<_> = buttons
-            .iter()
-            .filter(|b| b.1 != Action::UpdateFromBase || status.base.is_some())
-            .collect();
+        buttons.retain(|b| b.1 != Action::UpdateFromBase || status.base.is_some());
         let half = ((width - layout::UI_GAP) * 0.5).floor();
-        for (n, (label, action, enabled, tip)) in buttons.iter().enumerate() {
+        for (n, (label, action, enabled, tip, icon)) in buttons.iter().enumerate() {
             let b = Viewport {
                 x: x + (n % 2) as f32 * (half + layout::UI_GAP),
                 y: y + (n / 2) as f32 * (layout::UI_CONTROL + layout::UI_GAP),
                 width: half,
                 height: layout::UI_CONTROL,
             };
-            layout::Button::new(b)
+            let mut button = layout::Button::new(b)
                 .label(label)
                 .enabled(*enabled)
-                .tip(tip)
-                .draw(out, atlas, theme);
+                .tip(tip);
+            if let Some(icon) = icon {
+                button = button.icon(*icon);
+            }
+            button.draw(out, atlas, theme);
             if *enabled {
                 self.hits.push((b, *action, Some(repo.to_path_buf())));
             }
@@ -2505,5 +2696,292 @@ mod tests {
             "{}",
             atlas.ui_shapes() - before
         );
+    }
+
+    /// A repository at `/r` on this Mac with `status`, drawn.
+    fn drawn_status(inspector: &mut Inspector, status: Status) {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let workspace = Workspace {
+            name: "orchard".into(),
+            path: PathBuf::from("/r"),
+            branch: status.branch.clone(),
+            main: true,
+            folder: false,
+            key: String::new(),
+            repo: None,
+            base: None,
+            commit: None,
+            merged: false,
+            host: None,
+            github: None,
+        };
+        inspector.status = vec![(PathBuf::from("/r"), Ok(status))];
+        inspector.read_for = vec![PathBuf::from("/r")];
+        let mut out = Vec::new();
+        inspector.draw(
+            Some(&workspace),
+            Some(&[PathBuf::from("/r")]),
+            &[],
+            None,
+            None,
+            true,
+            Issues {
+                read: &HashMap::new(),
+                asked: false,
+                loaded: &HashSet::new(),
+                now: 0,
+            },
+            &HashSet::new(),
+            &mut atlas,
+            Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: WIDTH,
+                height: 4000.0,
+            },
+            &Theme::dark(),
+            &mut out,
+        );
+    }
+
+    fn live(inspector: &Inspector) -> Vec<Action> {
+        inspector.hits.iter().map(|(_, a, _)| *a).collect()
+    }
+
+    #[test]
+    fn the_remote_row_says_whether_and_when_the_remote_was_checked() {
+        let words = |status: &Status, check: Option<&Check>| -> Vec<(String, Ink)> {
+            remote_values(status, check, 1_790_000_000)
+        };
+        let unpushed = Status::default();
+        assert_eq!(
+            words(&unpushed, None),
+            vec![("not pushed".into(), Ink::Faint)]
+        );
+        let even = Status {
+            upstream: Some("origin/main".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            words(&even, None),
+            vec![
+                ("up to date".into(), Ink::Text),
+                ("not checked".into(), Ink::Faint)
+            ]
+        );
+        let (_tx, rx) = mpsc::channel();
+        assert_eq!(
+            words(&even, Some(&Check::Running(rx)))[1],
+            ("checking\u{2026}".into(), Ink::Faint)
+        );
+        let at = 1_790_000_000 - 120;
+        assert_eq!(
+            words(&even, Some(&Check::Done(at)))[1],
+            (
+                format!(
+                    "checked {}",
+                    crate::platform::clock_time(at as i64, 1_790_000_000)
+                ),
+                Ink::Faint
+            )
+        );
+        let both = Status {
+            upstream: Some("origin/main".into()),
+            to_push: 2,
+            to_pull: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            words(&both, Some(&Check::Failed("fatal: no".into()))),
+            vec![
+                ("2 to push, 1 to pull".into(), Ink::Text),
+                ("check failed".into(), Ink::Removed)
+            ]
+        );
+    }
+
+    #[test]
+    fn pull_and_check_are_live_with_an_upstream_and_wait_on_a_check() {
+        let mut inspector = Inspector::default();
+        drawn_status(
+            &mut inspector,
+            Status {
+                branch: Some("main".into()),
+                ..Default::default()
+            },
+        );
+        assert!(!live(&inspector).contains(&Action::CheckRemote));
+        assert!(!live(&inspector).contains(&Action::Pull));
+        assert!(!report(&inspector).contains("check="));
+        let even = Status {
+            branch: Some("main".into()),
+            upstream: Some("origin/main".into()),
+            ..Default::default()
+        };
+        drawn_status(&mut inspector, even.clone());
+        // Up to date as of the last fetch only: Pull fetches itself.
+        assert!(live(&inspector).contains(&Action::Pull));
+        assert!(live(&inspector).contains(&Action::CheckRemote));
+        assert!(
+            report(&inspector).ends_with("tag=- check=none buttons=pull"),
+            "{}",
+            report(&inspector)
+        );
+        assert!(inspector.named("inspector.check").is_some());
+        let (_tx, rx) = mpsc::channel();
+        inspector
+            .checks
+            .insert((None, PathBuf::from("/r")), Check::Running(rx));
+        drawn_status(&mut inspector, even.clone());
+        assert!(!live(&inspector).contains(&Action::Pull));
+        assert!(!live(&inspector).contains(&Action::CheckRemote));
+        assert!(report(&inspector).ends_with("check=running buttons="));
+        inspector.checks.insert(
+            (None, PathBuf::from("/r")),
+            Check::Failed("fatal: no".into()),
+        );
+        drawn_status(&mut inspector, even);
+        assert!(report(&inspector).ends_with("check=err buttons=pull"));
+    }
+
+    /// Git in `dir`, never signing, failing the test when it fails.
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=Robin Example",
+                "-c",
+                "user.email=r@example.com",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    /// A bare origin with one commit on main, and two clones of it: the
+    /// folder they are in, `mine`, and `seed`, which pushed that commit.
+    fn origin_and_clone(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("crc-check-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        git(
+            &root,
+            &["init", "-q", "--bare", "-b", "main", "orchard.git"],
+        );
+        let seed = root.join("seed");
+        git(&root, &["clone", "-q", "orchard.git", "seed"]);
+        std::fs::write(seed.join("trees.txt"), "apple\n").unwrap();
+        git(&seed, &["add", "trees.txt"]);
+        git(&seed, &["commit", "-q", "-m", "plant apple"]);
+        git(&seed, &["push", "-q", "origin", "HEAD:main"]);
+        git(&root, &["clone", "-q", "orchard.git", "mine"]);
+        (root.clone(), root.join("mine"), seed)
+    }
+
+    /// Polls until no Check runs and no status read is on its way.
+    fn settle(inspector: &mut Inspector) {
+        let started = Instant::now();
+        while inspector.checking_any() || inspector.busy() {
+            assert!(started.elapsed() < Duration::from_secs(60), "never settled");
+            inspector.poll();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The status of `dir` on this Mac, read the way the panel reads it.
+    fn read_status(inspector: &mut Inspector, dir: &Path) -> Status {
+        inspector.want(None, &[(dir.to_path_buf(), None, false)]);
+        settle(inspector);
+        inspector.status_of(dir).unwrap().clone().unwrap()
+    }
+
+    #[test]
+    fn a_check_fetches_so_the_status_has_what_the_remote_has() {
+        let (root, mine, seed) = origin_and_clone("fetch");
+        let mut inspector = Inspector::default();
+        assert_eq!(read_status(&mut inspector, &mine).to_pull, 0);
+        // Someone else pushes: until a fetch, the status cannot know.
+        std::fs::write(seed.join("trees.txt"), "apple\npear\n").unwrap();
+        git(&seed, &["commit", "-q", "-am", "plant pear"]);
+        git(&seed, &["push", "-q", "origin", "HEAD:main"]);
+        inspector.invalidate();
+        assert_eq!(read_status(&mut inspector, &mine).to_pull, 0);
+        let key: RepoKey = (None, mine.clone());
+        inspector.check_remote(key.clone(), None);
+        assert!(inspector.checking(&key));
+        settle(&mut inspector);
+        assert!(
+            matches!(inspector.check_of(&key), Some(Check::Done(_))),
+            "{:?}",
+            match inspector.check_of(&key) {
+                Some(Check::Failed(e)) => e.as_str(),
+                _ => "",
+            }
+        );
+        // Its status is wanted again (the panel asks at once): it has
+        // what came in.
+        assert!(inspector.read_at.is_none());
+        assert_eq!(read_status(&mut inspector, &mine).to_pull, 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_check_of_a_bad_remote_fails_with_gits_message() {
+        let (root, mine, _) = origin_and_clone("bad");
+        let missing = root.join("no-such-orchard.git");
+        git(
+            &mine,
+            &["remote", "set-url", "origin", &missing.to_string_lossy()],
+        );
+        let mut inspector = Inspector::default();
+        let key: RepoKey = (None, mine.clone());
+        inspector.check_remote(key.clone(), None);
+        settle(&mut inspector);
+        match inspector.check_of(&key) {
+            Some(Check::Failed(e)) => assert!(e.contains("no-such-orchard"), "{e}"),
+            _ => panic!("the check did not fail"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_second_check_while_one_runs_is_not_started() {
+        let (root, mine, _) = origin_and_clone("twice");
+        // An ssh that counts how often it is started, then fails slowly.
+        let count = root.join("started");
+        git(
+            &mine,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "ssh://orchard.invalid/orchard.git",
+            ],
+        );
+        let ssh = format!("echo x >> '{}'; sleep 1; exit 1 #", count.display());
+        git(&mine, &["config", "core.sshCommand", &ssh]);
+        // Plain ssh: Git does not start it first to ask which it is.
+        git(&mine, &["config", "ssh.variant", "ssh"]);
+        let mut inspector = Inspector::default();
+        let key: RepoKey = (None, mine.clone());
+        inspector.check_remote(key.clone(), None);
+        inspector.check_remote(key.clone(), None);
+        assert!(inspector.checking(&key));
+        settle(&mut inspector);
+        assert!(matches!(inspector.check_of(&key), Some(Check::Failed(_))));
+        let started = std::fs::read_to_string(&count).unwrap_or_default();
+        assert_eq!(started.lines().count(), 1, "{started:?}");
+        // Another repository's Check is its own.
+        assert!(!inspector.checking(&(None, root.join("seed"))));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
