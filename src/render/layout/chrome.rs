@@ -709,14 +709,18 @@ pub fn build_home(
     if y + 22.0 + ROW <= bottom {
         section(out, atlas, &mut y, "Recent");
         if recent.is_empty() {
-            push_ui_text(
-                out,
-                atlas,
-                line(y + 5.0),
-                "Folders you open will be listed here.",
-                dim,
-            );
-            y += ROW;
+            // The small variant: under a heading, an icon would outweigh
+            // the rows of the sections around it.
+            let state =
+                EmptyState::new("No recent folders", "Folders you open will be listed here.");
+            let column = Viewport {
+                x: x - UI_INSET,
+                y,
+                width: width + UI_INSET * 2.0,
+                height: state.height(atlas, width + UI_INSET * 2.0),
+            };
+            push_empty_state(out, atlas, column, state, theme);
+            y += column.height;
         }
         for path in recent {
             if y + ROW > bottom {

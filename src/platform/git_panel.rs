@@ -2108,42 +2108,13 @@ impl Panel {
         theme: &Theme,
         out: &mut Vec<GlyphInstance>,
     ) {
-        let x = g.list.x + layout::UI_INSET;
-        let width = (g.list.width - layout::UI_INSET * 2.0).max(0.0);
-        let line = |y: f32| Viewport {
-            x,
-            y,
-            width,
-            height: 22.0,
-        };
-        let icon = layout::icon_width(atlas, icons::PASS);
-        layout::push_icon_centered(
+        layout::push_empty_state(
             out,
             atlas,
-            Viewport {
-                width: icon,
-                ..line(g.list.y + 4.0)
-            },
-            icons::PASS,
-            theme.diff_added,
-        );
-        layout::push_ui_text(
-            out,
-            atlas,
-            Viewport {
-                x: x + icon + 6.0,
-                width: (width - icon - 6.0).max(0.0),
-                ..line(g.list.y + 4.0)
-            },
-            "No changes",
-            theme.text,
-        );
-        layout::push_ui_text(
-            out,
-            atlas,
-            line(g.list.y + 28.0),
-            "The working tree matches the last commit.",
-            theme.gutter_text,
+            g.list,
+            layout::EmptyState::new("No changes", "The working tree matches the last commit.")
+                .icon(icons::PASS),
+            theme,
         );
     }
 

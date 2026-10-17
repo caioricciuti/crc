@@ -246,13 +246,20 @@ impl Panel {
             return;
         }
         if self.servers.is_empty() {
-            say(out, atlas, top, "No servers yet.");
-            say(
-                out,
-                atlas,
-                top + ROW,
-                "Add them in mcp.json: the pencil above opens it.",
-            );
+            let body = Viewport {
+                y: top,
+                height: (column.height - layout::SIDEBAR_HEADER_HEIGHT).max(0.0),
+                ..column
+            };
+            let state = layout::EmptyState::new(
+                "No servers yet",
+                "Servers you add to mcp.json are listed here.",
+            )
+            .icon(icons::SERVER)
+            .button("Open mcp.json", Some(icons::EDIT));
+            if let Some(rect) = layout::push_empty_state(out, atlas, body, state, theme) {
+                self.hits.push((rect, Action::Edit));
+            }
             return;
         }
         let lines = self.lines();

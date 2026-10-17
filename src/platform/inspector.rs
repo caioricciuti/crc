@@ -830,7 +830,21 @@ impl Inspector {
         let bottom = f32::INFINITY;
         let mut y = y;
         let Some(workspace) = workspace else {
-            note(out, atlas, x, y, width, "Select a workspace", theme);
+            layout::push_empty_state(
+                out,
+                atlas,
+                Viewport {
+                    y,
+                    height: (rect.y + rect.height - y).max(0.0),
+                    ..rect
+                },
+                layout::EmptyState::new(
+                    "Select a workspace",
+                    "Its folder, Git and issues show here.",
+                )
+                .icon(icons::FOLDER_OUTLINE),
+                theme,
+            );
             return;
         };
         let name = workspace.name();
@@ -839,17 +853,18 @@ impl Inspector {
         y += 24.0;
         // No folder: no Git to show, only where its terminals start.
         if workspace.folderless() {
-            text(out, atlas, x, y, width, "No folder", theme.gutter_text);
-            y += ROW;
-            let said = wrap(
+            empty(
+                out,
                 atlas,
-                "Its terminals and Claude sessions start in your home folder.",
-                width,
+                rect,
+                y,
+                layout::EmptyState::new(
+                    "No folder",
+                    "Its terminals and Claude sessions start in your home folder.",
+                )
+                .icon(icons::FOLDER_OUTLINE),
+                theme,
             );
-            for line in said {
-                note(out, atlas, x, y, width, &line, theme);
-                y += ROW;
-            }
             return;
         }
         let shown = crate::platform::agents::shown_folder(workspace);
@@ -922,7 +937,18 @@ impl Inspector {
             } else if self.scanning {
                 skeleton(out, y, 4);
             } else {
-                note(out, atlas, x, y, width, "Nothing to show", theme);
+                empty(
+                    out,
+                    atlas,
+                    rect,
+                    y,
+                    layout::EmptyState::new(
+                        "Nothing to show",
+                        "Nothing has been read for this folder yet.",
+                    )
+                    .icon(icons::INFO),
+                    theme,
+                );
             }
             return;
         };
@@ -977,8 +1003,17 @@ impl Inspector {
                     y += 3.0 * ROW + 10.0;
                 }
                 None => {
-                    note(out, atlas, x, y, width, "Not read yet", theme);
-                    y += ROW;
+                    y += empty(
+                        out,
+                        atlas,
+                        rect,
+                        y,
+                        layout::EmptyState::new(
+                            "Not read yet",
+                            "Its status shows here once Git has been read.",
+                        ),
+                        theme,
+                    );
                 }
                 Some(Err(e)) => {
                     let why = if e == crate::project::worktree::UNREACHABLE {
@@ -1651,10 +1686,25 @@ impl Inspector {
         let Some(set) = set else {
             // No list and no read coming: said, not sketched forever.
             if !issues.reading {
-                note(out, atlas, x, y, width, "Not read yet", theme);
+                let h = empty(
+                    out,
+                    atlas,
+                    Viewport {
+                        x: x - PAD,
+                        y,
+                        width: width + 2.0 * PAD,
+                        height: 0.0,
+                    },
+                    y,
+                    layout::EmptyState::new(
+                        "Not read yet",
+                        "Its issues show here once GitHub has answered.",
+                    ),
+                    theme,
+                );
                 self.shown_issues
                     .push((repo.to_path_buf(), "unread".into()));
-                return y + ROW + 10.0;
+                return y + h + 10.0;
             }
             for n in 0..3 {
                 layout::push_skeleton_row(
@@ -2105,6 +2155,21 @@ fn note(
     theme: &Theme,
 ) {
     text(out, atlas, x, y + 3.0, width, s, theme.gutter_text);
+}
+
+/// An empty state in the flow of the body, from `y` down and as wide as
+/// the column; the height it took.
+fn empty(
+    out: &mut Vec<GlyphInstance>,
+    atlas: &mut Atlas,
+    rect: Viewport,
+    y: f32,
+    state: layout::EmptyState,
+    theme: &Theme,
+) -> f32 {
+    let height = state.height(atlas, rect.width);
+    layout::push_empty_state(out, atlas, Viewport { y, height, ..rect }, state, theme);
+    height
 }
 
 /// Whether `workspace`'s inspector names each of `repos` over its card,

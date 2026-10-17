@@ -846,6 +846,168 @@ pub fn push_spinner(out: &mut Vec<GlyphInstance>, x: f32, row: Viewport, colour:
     3.0 * size + 6.0
 }
 
+// ---- the empty state --------------------------------------------------------
+// What a surface says when it has nothing to show. Every panel used to say
+// it in its own way, most as one grey line at the top left, which reads as
+// a bug. This is the one way: an icon, a title, a line of hint and at most
+// one button, centred in the room the panel has.
+
+/// The row an empty state's icon sits in.
+pub const UI_EMPTY_ICON: f32 = 40.0;
+
+/// How much larger than a text glyph the icon of an empty state draws.
+const EMPTY_ICON_SCALE: f32 = 1.8;
+
+/// An empty state. Build it, then [`push_empty_state`] it.
+#[derive(Clone, Copy, Debug)]
+pub struct EmptyState<'a> {
+    /// The glyph over the title. `None` is the small variant, for a block
+    /// under a heading inside a list, where an icon would outweigh the
+    /// rows around it.
+    pub icon: Option<char>,
+    pub title: &'a str,
+    /// One line, wrapped to two at most where the column is narrow.
+    pub hint: &'a str,
+    /// The one action: its label and, when it has one, its icon.
+    pub button: Option<(&'a str, Option<char>)>,
+}
+
+/// Where the parts of an [`EmptyState`] land.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EmptyLayout {
+    pub icon: Option<Viewport>,
+    pub title: Viewport,
+    /// The hint's lines, each with its row.
+    pub hint: Vec<(String, Viewport)>,
+    pub button: Option<Viewport>,
+    /// The block itself: as tall as its parts, centred in the rect given.
+    pub block: Viewport,
+}
+
+impl<'a> EmptyState<'a> {
+    pub fn new(title: &'a str, hint: &'a str) -> Self {
+        Self {
+            icon: None,
+            title,
+            hint,
+            button: None,
+        }
+    }
+    pub fn icon(mut self, icon: char) -> Self {
+        self.icon = Some(icon);
+        self
+    }
+    pub fn button(mut self, label: &'a str, icon: Option<char>) -> Self {
+        self.button = Some((label, icon));
+        self
+    }
+
+    /// The height the block takes in a column `width` wide: for a panel
+    /// that lays it out in the flow of a list rather than centred in a
+    /// rect.
+    pub fn height(&self, atlas: &mut Atlas, width: f32) -> f32 {
+        self.layout(atlas, Viewport::new(width, 0.0)).block.height
+    }
+
+    /// Lays the parts out in `rect`: centred in it when it is taller than
+    /// the block, from its top when it is not.
+    pub fn layout(&self, atlas: &mut Atlas, rect: Viewport) -> EmptyLayout {
+        let x = rect.x + UI_INSET;
+        let width = (rect.width - UI_INSET * 2.0).max(0.0);
+        let lines: Vec<String> = if self.hint.is_empty() {
+            Vec::new()
+        } else {
+            wrap_words(atlas, self.hint, width)
+                .into_iter()
+                .take(2)
+                .collect()
+        };
+        let mut height = UI_CONTROL_SM;
+        if self.icon.is_some() {
+            height += UI_EMPTY_ICON + UI_GAP;
+        }
+        height += lines.len() as f32 * UI_CONTROL_SM;
+        if self.button.is_some() {
+            height += UI_INSET + UI_CONTROL;
+        }
+        let top = rect.y + ((rect.height - height) * 0.5).max(0.0).floor();
+        let mut y = top;
+        let row = |y: f32, height: f32| Viewport {
+            x,
+            y,
+            width,
+            height,
+        };
+        let icon = self.icon.map(|_| {
+            let r = row(y, UI_EMPTY_ICON);
+            y += UI_EMPTY_ICON + UI_GAP;
+            r
+        });
+        let title = row(y, UI_CONTROL_SM);
+        y += UI_CONTROL_SM;
+        let hint = lines
+            .into_iter()
+            .map(|line| {
+                let r = row(y, UI_CONTROL_SM);
+                y += UI_CONTROL_SM;
+                (line, r)
+            })
+            .collect();
+        let button = self.button.map(|(label, icon)| {
+            y += UI_INSET;
+            let mut b = Button::new(row(y, UI_CONTROL)).label(label);
+            if let Some(icon) = icon {
+                b = b.icon(icon);
+            }
+            let w = b.content_width(atlas, UI_INSET).min(width).round();
+            Viewport {
+                x: (x + (width - w) * 0.5).floor(),
+                y,
+                width: w,
+                height: UI_CONTROL,
+            }
+        });
+        EmptyLayout {
+            icon,
+            title,
+            hint,
+            button,
+            block: row(top, height),
+        }
+    }
+}
+
+/// Draws an empty state in `rect`. The button, when there is one, is
+/// drawn as a [`Button`] and its rectangle returned for the caller to
+/// act on.
+pub fn push_empty_state(
+    out: &mut Vec<GlyphInstance>,
+    atlas: &mut Atlas,
+    rect: Viewport,
+    state: EmptyState,
+    theme: &Theme,
+) -> Option<Viewport> {
+    if rect.width <= UI_INSET * 2.0 || rect.height <= 0.0 {
+        return None;
+    }
+    let laid = state.layout(atlas, rect);
+    if let (Some(glyph), Some(r)) = (state.icon, laid.icon) {
+        push_icon_scaled(out, atlas, r, glyph, theme.gutter_text, EMPTY_ICON_SCALE);
+    }
+    push_ui_text_centered(out, atlas, laid.title, state.title, theme.text);
+    for (line, r) in &laid.hint {
+        push_ui_text_centered(out, atlas, *r, line, theme.gutter_text);
+    }
+    if let (Some((label, icon)), Some(r)) = (state.button, laid.button) {
+        let mut b = Button::new(r).label(label);
+        if let Some(icon) = icon {
+            b = b.icon(icon);
+        }
+        b.draw(out, atlas, theme);
+    }
+    laid.button
+}
+
 thread_local! {
     static ANIMATING: Cell<bool> = const { Cell::new(false) };
 }
@@ -903,6 +1065,68 @@ mod tests {
         assert_eq!(feedback_of("Folder opened"), Feedback::Info);
         assert_eq!(feedback_of("Fetching…"), Feedback::Info);
         assert!(message_lasts("push failed") > message_lasts("saved"));
+    }
+
+    #[test]
+    fn an_empty_state_centres_its_block_and_stacks_the_button_last() {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let rect = Viewport {
+            x: 40.0,
+            y: 100.0,
+            width: 600.0,
+            height: 400.0,
+        };
+        let state = EmptyState::new(
+            "No servers yet",
+            "Add servers to mcp.json to list them here.",
+        )
+        .icon('\u{eb50}')
+        .button("Open mcp.json", Some('\u{ea73}'));
+        let laid = state.layout(&mut atlas, rect);
+        // Centred: as much room above the block as below it.
+        let above = laid.block.y - rect.y;
+        let below = rect.y + rect.height - (laid.block.y + laid.block.height);
+        assert!((above - below).abs() <= 1.0, "{above} above, {below} below");
+        assert_eq!(laid.block.height, state.height(&mut atlas, rect.width));
+        // Icon, title, hint, button, each under the one before.
+        let icon = laid.icon.expect("an icon row");
+        assert_eq!(icon.y, laid.block.y);
+        assert!(laid.title.y >= icon.y + icon.height);
+        let (_, hint) = laid.hint.last().expect("a hint line");
+        assert_eq!(laid.hint.len(), 1);
+        assert!(hint.y >= laid.title.y + laid.title.height);
+        let button = laid.button.expect("a button");
+        assert!(button.y >= hint.y + hint.height);
+        assert_eq!(button.y + button.height, laid.block.y + laid.block.height);
+        assert_eq!(button.height, UI_CONTROL);
+        // Sized to its label and centred on the column.
+        let centre = rect.x + rect.width * 0.5;
+        assert!((button.x + button.width * 0.5 - centre).abs() <= 1.0);
+        assert!(button.width < rect.width * 0.5);
+        // The small variant has no icon row and is shorter by it.
+        let small = EmptyState::new("No recent folders", "Folders you open will be listed here.");
+        let small_h = small.height(&mut atlas, rect.width);
+        let full_h = EmptyState::new("No recent folders", "Folders you open will be listed here.")
+            .icon('\u{ea83}')
+            .height(&mut atlas, rect.width);
+        assert_eq!(full_h - small_h, UI_EMPTY_ICON + UI_GAP);
+        assert!(small.layout(&mut atlas, rect).icon.is_none());
+        // A narrow column wraps the hint rather than clipping it.
+        let narrow = state.layout(&mut atlas, Viewport::new(200.0, 400.0));
+        assert_eq!(narrow.hint.len(), 2);
+        // In the flow of a list: a rect of its own height starts at its top.
+        let flow = Viewport {
+            height: full_h,
+            ..rect
+        };
+        assert_eq!(
+            EmptyState::new("No recent folders", "Folders you open will be listed here.")
+                .icon('\u{ea83}')
+                .layout(&mut atlas, flow)
+                .block
+                .y,
+            rect.y
+        );
     }
 
     #[test]

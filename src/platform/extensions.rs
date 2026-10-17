@@ -434,14 +434,22 @@ fn draw_page(
         return;
     }
     let Some(id) = page.selected.clone() else {
-        for line in layout::wrap_words(
+        layout::push_empty_state(
+            out,
             atlas,
-            "Extensions add commands to crc. Pick one in the list to see what it does and what it may touch. Installed ones run from the Extensions menu, from the editor's right-click menu, and from the palette.",
-            detail_w,
-        ) {
-            text(out, atlas, dx, y, detail_w, &line, dim);
-            y += 20.0;
-        }
+            Viewport {
+                x: dx,
+                y,
+                width: detail_w,
+                height: (bottom - y).max(0.0),
+            },
+            layout::EmptyState::new(
+                "Pick an extension",
+                "What it does and what it may touch shows here.",
+            )
+            .icon(crate::project::icons::extension_icon("extensions")),
+            theme,
+        );
         page.hits = hits;
         return;
     };

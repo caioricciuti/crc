@@ -7677,6 +7677,13 @@ fn frame_of(state: &mut State) -> Frame {
             Hit::TerminalHide,
             crate::platform::terminal::header_hide(header),
         );
+        // The empty screen's one button, when the workspace has no session.
+        let screen = crate::platform::terminal::split(rect).1;
+        if let Some(button) =
+            crate::platform::terminal::empty_hit(terminal, &mut renderer.atlas, screen)
+        {
+            frame.push(Hit::TerminalNew, button);
+        }
         // The screen first, so a script's offsets land on rows and columns;
         // the padding around it is the terminal too.
         frame.push(Hit::Terminal, crate::platform::terminal::split(rect).1);

@@ -798,6 +798,25 @@ pub fn header_hits(
     (tabs, new)
 }
 
+/// What the screen says when the workspace listed has no terminal left.
+fn empty_state() -> layout::EmptyState<'static> {
+    layout::EmptyState::new(
+        "No terminal in this workspace",
+        "\u{2318}T starts one here.",
+    )
+    .icon(icons::TERMINAL)
+    .button("New Terminal", Some(icons::ADD))
+}
+
+/// The New Terminal button of the empty screen, while the panel shows no
+/// session: where [`draw`] puts it, for the window to act on.
+pub fn empty_hit(panel: &Panel, atlas: &mut Atlas, screen: Viewport) -> Option<Viewport> {
+    if panel.showing() {
+        return None;
+    }
+    empty_state().layout(atlas, screen).button
+}
+
 /// Hide Panel, at the header's trailing edge.
 pub fn header_hide(header: Viewport) -> Viewport {
     let size = layout::UI_CONTROL_SM;
@@ -1024,20 +1043,7 @@ pub fn draw(
     // The workspace listed has no terminal left: the one at the front is
     // another's, and is not shown in its place.
     if !panel.showing() {
-        let said = "No terminal in this workspace. \u{2318}T starts one.";
-        let width = layout::ui_text_width(atlas, said);
-        layout::push_ui_text(
-            out,
-            atlas,
-            Viewport {
-                x: screen.x + ((screen.width - width) * 0.5).max(0.0).floor(),
-                y: screen.y + (screen.height * 0.4).floor(),
-                width: width.min(screen.width),
-                height: 20.0,
-            },
-            said,
-            theme.gutter_text,
-        );
+        layout::push_empty_state(out, atlas, screen, empty_state(), theme);
         return;
     }
     for (index, screen) in screens {
