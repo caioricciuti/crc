@@ -66,6 +66,12 @@ key 11 cmd b
 dump $T/source.out
 key 14 cmd e
 dump $T/preview.out
+key 0 cmd,shift A
+wait 700
+dump $T/preview-agents.out
+key 0 cmd,shift A
+wait 700
+dump $T/preview-editor.out
 key 124 cmd
 text X
 dump $T/live-edit.out
@@ -81,9 +87,13 @@ click 744 62 2
 dump $T/new-tab.out
 quit
 SCRIPT
-CRC_SELFTEST="$T/tabs.script" "$BIN" "$T/proj/one.md" 2> "$T/tabs.err"
+CRC_TERMINAL_SHELL=/bin/sh CRC_SELFTEST="$T/tabs.script" "$BIN" "$T/proj/one.md" 2> "$T/tabs.err"
 expect "$T/source.out" md "MdMarker,MdHeading bands=1"
 expect "$T/preview.out" message "No preview installed: get Markdown Preview from crc > Extensions"
+# The message was about the editor: a switch to Agents clears it, and
+# coming back does not bring it back.
+expect "$T/preview-agents.out" message ""
+expect "$T/preview-editor.out" message ""
 expect_line "$T/live-edit.out" 1 "# OneX"
 expect "$T/two.out" tabs "one.md | two.txt"
 expect "$T/reordered.out" tabs "two.txt | one.md"

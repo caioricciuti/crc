@@ -507,19 +507,267 @@ impl State {
     }
 }
 
+/// The extension that renders Markdown, as the registry names it.
+pub(super) const MARKDOWN_PREVIEW_ID: &str = "crc.markdown-preview";
+
+/// The one thing a status-line message asks for, as a button beside it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum MessageAction {
+    /// The Extensions page with this extension selected.
+    OpenExtension(&'static str),
+}
+
+impl MessageAction {
+    /// The button's label.
+    pub(super) fn label(&self) -> &'static str {
+        match self {
+            MessageAction::OpenExtension(_) => "Open Extensions",
+        }
+    }
+}
+
+/// Which mode a status-line message is about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Mode {
+    Editor,
+    Agents,
+    /// Both: news about the app itself, like the terminals started again
+    /// at launch.
+    Both,
+}
+
+/// What whoever set the status-line message said about it beyond its
+/// text. Paired with the text: a message set directly leaves an older
+/// `Said` behind, which then applies to nothing.
+#[derive(Clone, Debug)]
+pub(super) struct Said {
+    pub(super) text: String,
+    pub(super) kind: layout::Feedback,
+    /// The whole of what the text shortens (a file's path), for the
+    /// pointer's rest over the message.
+    pub(super) detail: Option<String>,
+    pub(super) action: Option<MessageAction>,
+    /// The mode it is about: the one it was said in, unless told
+    /// otherwise, which `State::tell` fills in.
+    pub(super) mode: Option<Mode>,
+}
+
+impl Said {
+    pub(super) fn new(kind: layout::Feedback, text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            kind,
+            detail: None,
+            action: None,
+            mode: None,
+        }
+    }
+
+    /// The whole of what the text shortens: a file's path.
+    pub(super) fn detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+
+    /// What the message asks for: a button beside it does it.
+    pub(super) fn action(mut self, action: MessageAction) -> Self {
+        self.action = Some(action);
+        self
+    }
+
+    /// About the app as a whole: a mode switch does not clear it.
+    pub(super) fn everywhere(mut self) -> Self {
+        self.mode = Some(Mode::Both);
+        self
+    }
+
+    /// This, when it is about `text`.
+    pub(super) fn about(&self, text: &str) -> Option<&Said> {
+        (self.text == text).then_some(self)
+    }
+
+    /// What `feedback_for` reads: the kind, with the text it is about.
+    pub(super) fn kind_of(said: Option<&Said>) -> Option<(&str, layout::Feedback)> {
+        said.map(|s| (s.text.as_str(), s.kind))
+    }
+}
+
+/// Whether the message `text` goes on `dismissal`: by its kind (see
+/// `layout::message_clears_on`), except that news about both modes
+/// outlasts a switch between them.
+pub(super) fn message_goes_on(
+    text: &str,
+    said: Option<&Said>,
+    dismissal: layout::Dismissal,
+) -> bool {
+    let said = said.and_then(|s| s.about(text));
+    let kind = layout::feedback_for(text, Said::kind_of(said));
+    let everywhere = said.is_some_and(|s| s.mode == Some(Mode::Both));
+    layout::message_clears_on(kind, dismissal)
+        && !(everywhere && dismissal == layout::Dismissal::ModeSwitch)
+}
+
+/// How long the message `text` stays: by its kind, or long enough to
+/// reach for its button when it has one.
+pub(super) fn message_lasts_of(text: &str, said: Option<&Said>) -> Duration {
+    let said = said.and_then(|s| s.about(text));
+    if said.is_some_and(|s| s.action.is_some()) {
+        layout::MESSAGE_ACTION_LASTS
+    } else {
+        layout::message_lasts_for(layout::feedback_for(text, Said::kind_of(said)))
+    }
+}
+
+/// How a status-line message names `path`: by its file name alone, or
+/// with its folder when another of the `open` documents has the same
+/// name; a path without a name (a root) as it is shown elsewhere.
+pub(super) fn message_name<'a>(path: &Path, open: impl Iterator<Item = &'a Path>) -> String {
+    let Some(name) = path.file_name() else {
+        return shown_path(path);
+    };
+    let name = name.to_string_lossy();
+    let twin = open.filter(|other| *other != path).any(|other| {
+        other
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy() == name)
+    });
+    match path.parent().and_then(Path::file_name) {
+        Some(folder) if twin => format!("{}/{name}", folder.to_string_lossy()),
+        _ => name.into_owned(),
+    }
+}
+
 impl State {
     /// Says `text` in the status line as `kind`: a failure shows red and
     /// stays longer whatever its wording, a success green.
     pub(super) fn say(&mut self, kind: layout::Feedback, text: impl Into<String>) {
-        let text = text.into();
-        self.message_kind = Some((text.clone(), kind));
-        self.message = Some((text, Instant::now()));
+        self.tell(Said::new(kind, text));
+    }
+
+    /// Says what `said` holds in the status line: its text now, the rest
+    /// for as long as the text shows. About the mode of the moment
+    /// unless it says otherwise.
+    pub(super) fn tell(&mut self, mut said: Said) {
+        if said.mode.is_none() {
+            said.mode = Some(if self.agents.on {
+                Mode::Agents
+            } else {
+                Mode::Editor
+            });
+        }
+        self.message = Some((said.text.clone(), Instant::now()));
+        self.said = Some(said);
+    }
+
+    /// Clears the message showing when `dismissal` makes it stale; see
+    /// [`message_goes_on`].
+    pub(super) fn dismiss(&mut self, dismissal: layout::Dismissal) {
+        let goes = self
+            .message
+            .as_ref()
+            .is_some_and(|(text, _)| message_goes_on(text, self.said.as_ref(), dismissal));
+        if goes {
+            self.message = None;
+        }
+    }
+
+    /// How a status-line message names `path`; see [`message_name`]. The
+    /// active document is what most messages are about, so it is not its
+    /// own twin however its path is spelled.
+    pub(super) fn name_for(&self, path: &Path) -> String {
+        let active = self.docs.active().id();
+        message_name(
+            path,
+            self.docs
+                .iter()
+                .filter(|b| b.id() != active)
+                .filter_map(|b| b.path.as_deref()),
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_message_names_a_file_by_its_name_and_its_folder_only_for_a_twin() {
+        let a = Path::new("/home/me/garden/src/main.rs");
+        let b = Path::new("/home/me/garden/tools/main.rs");
+        let c = Path::new("/home/me/garden/docs/notes.md");
+        // Alone, or beside documents named otherwise: the name.
+        assert_eq!(message_name(a, std::iter::empty()), "main.rs");
+        assert_eq!(message_name(a, [a, c].into_iter()), "main.rs");
+        // Another open document of the same name: the folder tells them apart.
+        assert_eq!(message_name(a, [a, b, c].into_iter()), "src/main.rs");
+        assert_eq!(message_name(b, [a, b].into_iter()), "tools/main.rs");
+        // No name to show: the path as it is shown elsewhere.
+        assert_eq!(message_name(Path::new("/"), std::iter::empty()), "/");
+    }
+
+    #[test]
+    fn news_about_the_app_outlasts_a_mode_switch() {
+        use layout::{Dismissal, Feedback};
+        let opened = Said::new(Feedback::Info, "opened notes.md");
+        let restored = Said::new(Feedback::Info, "Started again 2 terminals").everywhere();
+        let failed = Said::new(Feedback::Failure, "save failed: full").everywhere();
+        assert!(message_goes_on(
+            "opened notes.md",
+            Some(&opened),
+            Dismissal::ModeSwitch
+        ));
+        assert!(message_goes_on(
+            "opened notes.md",
+            Some(&opened),
+            Dismissal::TabClosed
+        ));
+        assert!(!message_goes_on(
+            "Started again 2 terminals",
+            Some(&restored),
+            Dismissal::ModeSwitch
+        ));
+        assert!(message_goes_on(
+            "Started again 2 terminals",
+            Some(&restored),
+            Dismissal::TabClosed
+        ));
+        assert!(!message_goes_on(
+            "save failed: full",
+            Some(&failed),
+            Dismissal::ModeSwitch
+        ));
+        // Said about another text, or nothing said: the wording decides.
+        assert!(message_goes_on(
+            "opened notes.md",
+            Some(&restored),
+            Dismissal::ModeSwitch
+        ));
+        assert!(message_goes_on(
+            "opened notes.md",
+            None,
+            Dismissal::ModeSwitch
+        ));
+        assert!(!message_goes_on("push failed", None, Dismissal::ModeSwitch));
+    }
+
+    #[test]
+    fn a_message_with_a_button_stays_longer_than_its_kind_alone() {
+        let said = Said::new(layout::Feedback::Info, "no preview")
+            .action(MessageAction::OpenExtension(MARKDOWN_PREVIEW_ID));
+        assert_eq!(
+            message_lasts_of("no preview", Some(&said)),
+            layout::MESSAGE_ACTION_LASTS
+        );
+        // Said about another text: this message is read by its wording.
+        assert_eq!(
+            message_lasts_of("saved notes.md", Some(&said)),
+            layout::message_lasts_for(layout::Feedback::Success)
+        );
+        assert_eq!(
+            message_lasts_of("saved notes.md", None),
+            layout::message_lasts_for(layout::Feedback::Success)
+        );
+    }
 
     fn gutter() -> Gutter {
         Gutter {

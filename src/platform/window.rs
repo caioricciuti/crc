@@ -82,7 +82,10 @@ mod tabs;
 mod terminal;
 use extensions::{ext_details, preview_command, preview_displaced};
 use mcp::{mcp_details, mcp_url_rows};
-use state::{Blame, Ext, Gutter, Heat, Lsp, ProjectSearch, Reloads, Watch};
+use state::{
+    Blame, Ext, Gutter, Heat, Lsp, MARKDOWN_PREVIEW_ID, MessageAction, ProjectSearch, Reloads,
+    Said, Watch, message_lasts_of,
+};
 use table::{active_table, sync_tables, table_grid};
 
 struct ProjectIndexResult {
@@ -755,6 +758,9 @@ struct State {
     /// Where the status line's right-hand readout starts, as last drawn:
     /// it is right-aligned, so where the branch is depends on its length.
     status_detail_x: Option<f32>,
+    /// Where the status line last drew the button of a message that
+    /// asks for something, for hit-testing clicks.
+    status_action: Option<Viewport>,
     /// The code font as asked for, and its size in points. The atlas holds
     /// the resolved face; this is what a rebuild at a new size starts from.
     font: String,
@@ -878,8 +884,9 @@ struct State {
     worst: Option<(std::time::Duration, FrameTiming)>,
     /// A transient note for the status line: save results, errors.
     message: Option<(String, Instant)>,
-    /// What `message` is, when whoever set it said so; see `State::say`.
-    message_kind: Option<(String, layout::Feedback)>,
+    /// What `message` is and asks for, when whoever set it said so; see
+    /// `State::say`.
+    said: Option<Said>,
     /// What config.toml could not use, said again after the file AppKit
     /// opens at launch has said "opened": that arrives after `run` is done.
     launch_note: Option<String>,
@@ -2174,6 +2181,10 @@ define_class!(
                     self.open_branch_picker(BranchIntent::Switch);
                     return;
                 }
+                Some(Hit::StatusAction) => {
+                    self.status_action();
+                    return;
+                }
                 Some(Hit::GitRepo) => {
                     self.open_repo_picker();
                     return;
@@ -2984,14 +2995,16 @@ define_class!(
                 if interval > 0.0 && interval < 1.0 {
                     state.frame_interval = Duration::from_secs_f64(interval);
                 }
-                if state.message.as_ref().is_some_and(|(text, at)| {
-                    at.elapsed()
-                        >= layout::message_lasts_for(layout::feedback_for(
-                            text,
-                            state.message_kind.as_ref(),
-                        ))
-                }) {
+                let (gone, fading) = state.message.as_ref().map_or((false, false), |(text, at)| {
+                    let lasts = message_lasts_of(text, state.said.as_ref());
+                    let elapsed = at.elapsed();
+                    (elapsed >= lasts, elapsed + layout::MESSAGE_FADE >= lasts)
+                });
+                if gone {
                     state.message = None;
+                    self.ivars().needs_redraw.set(true);
+                } else if fading {
+                    // Its last moment: thinning out, a frame per refresh.
                     self.ivars().needs_redraw.set(true);
                 }
                 // Spinners and the like move at 30 frames a second; a step's
@@ -3123,10 +3136,7 @@ define_class!(
                 self.open_preview(command);
             } else {
                 if let Some(mut state) = self.state_mut() {
-                state.message = Some((
-                    "No preview installed: get Markdown Preview from crc > Extensions".into(),
-                    Instant::now(),
-                ));
+                    say_no_preview(&mut state);
                 }
             }
             self.request_redraw();
@@ -3150,10 +3160,7 @@ define_class!(
             if !open {
                 let Some(command) = command else {
                     if let Some(mut state) = self.state_mut() {
-                        state.message = Some((
-                            "No preview installed: get Markdown Preview from crc > Extensions".into(),
-                            Instant::now(),
-                        ));
+                        say_no_preview(&mut state);
                     }
                     self.request_redraw();
                     return;
@@ -5851,19 +5858,22 @@ impl EditorView {
                 uncover_column(&mut state);
                 reveal_active_tab(&mut state);
                 let format = state.docs.active().disk_format();
+                let name = state.name_for(Path::new(path));
                 let note = if state.docs.active().is_read_only() {
                     format!(
-                        "opened {path} read-only: it is over {}",
+                        "opened {name} read-only: it is over {}",
                         crate::text::buffer::human_size(crate::text::buffer::read_only_limit())
                     )
                 } else if format.encoding == crate::text::file_format::Encoding::Windows1252 {
-                    format!("opened {path} as Windows-1252; unsupported characters cannot be saved")
+                    format!("opened {name} as Windows-1252; unsupported characters cannot be saved")
                 } else if format.line_ending_label() == "mixed endings" {
-                    format!("opened {path} with mixed line endings")
+                    format!("opened {name} with mixed line endings")
                 } else {
-                    format!("opened {path}")
+                    format!("opened {name}")
                 };
-                state.message = Some((note, Instant::now()));
+                state.tell(
+                    Said::new(layout::Feedback::Info, note).detail(shown_path(Path::new(path))),
+                );
             }
             Err(e) if e.kind() == std::io::ErrorKind::FileTooLarge => {
                 state.message = Some((format!("not opened: {e}"), Instant::now()));
@@ -7693,8 +7703,23 @@ fn frame_of(state: &mut State) -> Frame {
     if let Some(branch) = status_branch_rect(state, chrome.status) {
         frame.push(Hit::StatusBranch, branch);
     }
+    if let Some(button) = state.status_action {
+        frame.push(Hit::StatusAction, button);
+    }
     frame.push(Hit::Status, chrome.status);
     frame
+}
+
+/// Cmd-E with nothing to render Markdown: where to get it, with the
+/// Extensions page a button away.
+fn say_no_preview(state: &mut State) {
+    state.tell(
+        Said::new(
+            layout::Feedback::Info,
+            "No preview installed: get Markdown Preview from crc > Extensions",
+        )
+        .action(MessageAction::OpenExtension(MARKDOWN_PREVIEW_ID)),
+    );
 }
 
 /// The right half of the status line, where the branch, counts and the
@@ -9777,7 +9802,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         drew_once: false,
         worst: None,
         message: None,
-        message_kind: None,
+        said: None,
         launch_note: None,
         tab_hits: Vec::new(),
         tab_scroll: 0,
@@ -9846,6 +9871,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         hotspots: Vec::new(),
         hot: None,
         status_detail_x: None,
+        status_action: None,
         font: font.to_owned(),
         font_size: size_pt,
         theme_choice: settings.theme,

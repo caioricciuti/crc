@@ -648,7 +648,9 @@ impl EditorView {
                 1 => "Started again 1 terminal that ended with the last run".to_owned(),
                 n => format!("Started again {n} terminals that ended with the last run"),
             };
-            state.say(layout::Feedback::Info, said.clone());
+            // About the terminals, which both modes have: a switch to
+            // Agents, where they show, must not clear it.
+            state.tell(Said::new(layout::Feedback::Info, said.clone()).everywhere());
             state.restore_note = Some(said);
         }
     }

@@ -97,7 +97,8 @@ impl EditorView {
             drew_once,
             worst,
             message,
-            message_kind,
+            said,
+            status_action,
             marked,
             marked_caret,
             responses,
@@ -1003,19 +1004,25 @@ impl EditorView {
         );
         // A transient note (save result, open error) takes over the status
         // line briefly, then yields back to the steady-state readout.
-        let note = match message {
-            Some((text, at))
-                if at.elapsed()
-                    < layout::message_lasts_for(layout::feedback_for(
-                        text,
-                        message_kind.as_ref(),
-                    )) =>
-            {
-                Some(text.clone())
+        // Whole until its last moment, when it thins out (not with a
+        // button beside it: a control does not fade); gone once it is
+        // over.
+        let (note, note_alpha) = match message {
+            Some((text, at)) if at.elapsed() < message_lasts_of(text, said.as_ref()) => {
+                let alpha = if said
+                    .as_ref()
+                    .and_then(|s| s.about(text))
+                    .is_some_and(|s| s.action.is_some())
+                {
+                    1.0
+                } else {
+                    layout::message_alpha(at.elapsed(), message_lasts_of(text, said.as_ref()))
+                };
+                (Some(text.clone()), alpha)
             }
             _ => {
                 *message = None;
-                None
+                (None, 1.0)
             }
         };
         let diagnostics =
@@ -1122,7 +1129,7 @@ impl EditorView {
             (work.as_str(), theme.status_text)
         } else {
             let feedback = shown_note.map_or(layout::Feedback::Info, |text| {
-                layout::feedback_for(text, message_kind.as_ref())
+                layout::feedback_for(text, Said::kind_of(said.as_ref()))
             });
             let icon = match feedback {
                 layout::Feedback::Failure => Some((icons::ERROR, theme.diff_removed)),
@@ -1136,7 +1143,7 @@ impl EditorView {
                     &mut renderer.atlas,
                     Viewport { width: w, ..left },
                     glyph,
-                    tint,
+                    layout::faded(tint, note_alpha),
                 );
                 lead(&mut left, w + 6.0);
             }
@@ -1149,11 +1156,55 @@ impl EditorView {
                 },
             )
         };
-        layout::push_ui_text(glyphs, &mut renderer.atlas, left, text, colour);
+        // A message that asks for something has its button right after
+        // the text, which yields the room; a window too narrow for both
+        // keeps the text.
+        let said_now = shown_note.and_then(|text| said.as_ref().and_then(|s| s.about(text)));
+        *status_action = None;
+        let mut text_rect = left;
+        let mut button = None;
+        if let Some(action) = said_now.and_then(|s| s.action.as_ref()) {
+            let height = layout::UI_CONTROL_SM;
+            let row = Viewport {
+                x: left.x,
+                y: status_rect.y + ((status_height - height) * 0.5).round(),
+                width: 0.0,
+                height,
+            };
+            let label = action.label();
+            let w = layout::Button::new(row)
+                .label(label)
+                .content_width(&mut renderer.atlas, layout::UI_INSET)
+                .round();
+            let room = left.width - w - layout::UI_INSET;
+            if room > 0.0 {
+                let text_w = layout::ui_text_width(&mut renderer.atlas, text).ceil();
+                text_rect.width = text_w.min(room);
+                let rect = Viewport {
+                    x: left.x + text_rect.width + layout::UI_INSET,
+                    width: w,
+                    ..row
+                };
+                button = Some(layout::Button::new(rect).label(label));
+            }
+        }
+        layout::push_ui_text(
+            glyphs,
+            &mut renderer.atlas,
+            text_rect,
+            text,
+            layout::faded(colour, note_alpha),
+        );
         if let Some(note) = shown_note {
-            // A long message is cut by the window; the whole of it is a
-            // pointer's rest away.
-            layout::hotspot(left, layout::Cursor::Arrow, Some(note));
+            // A long message is cut by the window, and a path is cut to
+            // its name; the whole of it is a pointer's rest away.
+            let tip = said_now.and_then(|s| s.detail.as_deref()).unwrap_or(note);
+            layout::hotspot(text_rect, layout::Cursor::Arrow, Some(tip));
+        }
+        if let Some(button) = button {
+            button.draw(glyphs, &mut renderer.atlas, theme);
+            layout::hotspot(button.rect, layout::Cursor::Pointing, None);
+            *status_action = Some(button.rect);
         }
         // Right-aligned, so the readout ends at the window's edge however
         // long the branch name is, instead of leaving a ragged gap.

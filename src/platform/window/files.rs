@@ -640,16 +640,21 @@ impl EditorView {
             }
         }
         let ok = result.is_ok();
-        state.message = Some((
-            match result {
-                Ok(()) => match &state.docs.active_mut().path {
-                    Some(p) => format!("saved {}", p.display()),
-                    None => "saved".to_string(),
-                },
-                Err(e) => format!("save failed: {e}"),
-            },
-            Instant::now(),
-        ));
+        match result {
+            Ok(()) => {
+                let path = state.docs.active().path.clone();
+                let said = match path {
+                    Some(p) => Said::new(
+                        layout::Feedback::Success,
+                        format!("saved {}", state.name_for(&p)),
+                    )
+                    .detail(shown_path(&p)),
+                    None => Said::new(layout::Feedback::Success, "saved"),
+                };
+                state.tell(said);
+            }
+            Err(e) => state.say(layout::Feedback::Failure, format!("save failed: {e}")),
+        }
         if ok {
             note_files_written(&mut state);
         }

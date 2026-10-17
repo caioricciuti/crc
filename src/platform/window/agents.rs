@@ -23,6 +23,8 @@ impl EditorView {
                 return;
             }
             state.agents.on = on;
+            // What the other mode said is not about this one.
+            state.dismiss(layout::Dismissal::ModeSwitch);
             if on {
                 state.terminal.open = true;
                 state.terminal.focus = true;

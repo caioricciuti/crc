@@ -3088,6 +3088,8 @@ pub enum Hit {
     Status,
     /// The branch named in the status bar: it opens the branch list.
     StatusBranch,
+    /// The button beside a status-line message that asks for something.
+    StatusAction,
     /// The branch at the top of Source Control: it opens the branch list.
     GitBranch,
     /// The repository menu in Source Control's header, in a workspace of
@@ -3174,6 +3176,7 @@ impl Hit {
             Hit::Text => "text".into(),
             Hit::Status => "status".into(),
             Hit::StatusBranch => "status.branch".into(),
+            Hit::StatusAction => "status.action".into(),
             Hit::GitBranch => "git.branch".into(),
             Hit::GitRepo => "git.repo".into(),
             Hit::Git(name) => format!("git.{name}"),

@@ -33,6 +33,13 @@ def png(w, h):
 PY
 cat > "$T/pv.script" <<SCRIPT
 wait 600
+dump $T/pv-launch.out
+key 14 cmd e
+idle 300
+dump $T/pv-nopreview.out
+click @status.action
+idle 600
+dump $T/pv-action.out
 key 7 cmd,shift x
 idle 900
 click @extensions.folder
@@ -89,6 +96,14 @@ dump $T/pv-closed.out
 quit
 SCRIPT
 HOME="$T/pvhome" CRC_EXT_REGISTRY="file://$T/pvreg/" CRC_EXT_FOLDER="$T/pvfolder" CRC_SELFTEST="$T/pv.script" "$BIN" "$T/pvproj/doc.md" 2> "$T/pv.err"
+# The document opened at launch is named, not pathed, in the status line.
+expect "$T/pv-launch.out" message "opened doc.md"
+# Cmd-E with nothing installed says where to get a preview, and the
+# button beside it opens Extensions on Markdown Preview.
+expect "$T/pv-nopreview.out" message "No preview installed: get Markdown Preview from crc > Extensions"
+expect "$T/pv-action.out" message ""
+grep -q '^extensions: open selected=crc.markdown-preview ' "$T/pv-action.out" \
+    || failed "preview: the message's button did not open Markdown Preview: $(grep '^extensions:' "$T/pv-action.out")"
 expect "$T/pv-open.out" preview "open ext=crc.markdown-preview view=shown probe=64/0 scroll=0 h1=Title text=6113"
 expect "$T/pv-remote.out" preview "open ext=crc.markdown-preview view=shown probe=0 remote"
 # 1100 wide, sidebar 240: the text's 816 points become 407, a gap, 408.

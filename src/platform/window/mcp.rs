@@ -196,7 +196,8 @@ impl EditorView {
                 crate::mcp_client::config::TEMPLATE.as_bytes(),
             ) && let Some(mut state) = self.state_mut()
             {
-                state.message = Some((format!("{}: {e}", path.display()), Instant::now()));
+                let said = format!("{}: {e}", state.name_for(&path));
+                state.tell(Said::new(layout::Feedback::Failure, said).detail(shown_path(&path)));
                 return;
             }
         }

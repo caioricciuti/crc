@@ -65,8 +65,9 @@ impl EditorView {
                     };
                     match started {
                         Ok(server) => {
-                            state.message =
-                                Some((format!("{} starting", launch.name), Instant::now()));
+                            // Not said as a message: the status line shows
+                            // a server that is not ready yet with its own
+                            // spinner, until it is.
                             state.lsp.servers.insert(key, server);
                         }
                         Err(error) => {

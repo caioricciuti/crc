@@ -373,17 +373,20 @@ impl EditorView {
             let Some(mut state) = self.state_mut() else {
                 return;
             };
-            let message = match Buffer::open(path) {
+            match Buffer::open(path) {
                 // add, not push: the file may already be open.
                 Ok(buffer) => {
                     state.docs.add(buffer);
                     uncover_column(&mut state);
-                    format!("created {}", path.display())
+                    let said = format!("created {}", state.name_for(path));
+                    state.tell(Said::new(layout::Feedback::Success, said).detail(shown_path(path)));
                 }
-                Err(e) => format!("created but not opened: {e}"),
-            };
+                Err(e) => state.say(
+                    layout::Feedback::Failure,
+                    format!("created but not opened: {e}"),
+                ),
+            }
             reveal_active_tab(&mut state);
-            state.message = Some((message, Instant::now()));
         }
         self.refresh_project_after_disk_change();
         self.sync_title();

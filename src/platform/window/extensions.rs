@@ -29,6 +29,25 @@ impl EditorView {
         self.pump();
     }
 
+    /// The button beside the status-line message: what it asks for.
+    pub(super) fn status_action(&self) {
+        let action = self.state().and_then(|state| {
+            let (text, _) = state.message.as_ref()?;
+            state.said.as_ref()?.about(text)?.action.clone()
+        });
+        match action {
+            Some(MessageAction::OpenExtension(id)) => {
+                if let Some(mut state) = self.state_mut() {
+                    state.message = None;
+                }
+                self.open_extensions();
+                self.extensions_action(crate::platform::extensions::Action::Select(id.to_owned()));
+                self.request_redraw();
+            }
+            None => {}
+        }
+    }
+
     pub(super) fn refresh_registry(&self) {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {

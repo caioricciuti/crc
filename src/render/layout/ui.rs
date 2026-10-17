@@ -793,9 +793,47 @@ pub fn message_lasts_for(feedback: Feedback) -> std::time::Duration {
 
 /// What a message is: as said by whoever set it (`kind`, when it is about
 /// this very text), else as its wording reads.
-pub fn feedback_for(text: &str, kind: Option<&(String, Feedback)>) -> Feedback {
-    kind.filter(|(said, _)| said == text)
-        .map_or_else(|| feedback_of(text), |(_, kind)| *kind)
+pub fn feedback_for(text: &str, kind: Option<(&str, Feedback)>) -> Feedback {
+    kind.filter(|(said, _)| *said == text)
+        .map_or_else(|| feedback_of(text), |(_, kind)| kind)
+}
+
+/// How long a message that carries a button stays: long enough to reach
+/// for it.
+pub const MESSAGE_ACTION_LASTS: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A message's last moment: it thins out over this long before it goes.
+pub const MESSAGE_FADE: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// How opaque a message `elapsed` into the `lasts` it is given for is:
+/// whole until its last [`MESSAGE_FADE`], then down to nothing.
+pub fn message_alpha(elapsed: std::time::Duration, lasts: std::time::Duration) -> f32 {
+    let left = lasts.saturating_sub(elapsed);
+    if left >= MESSAGE_FADE {
+        1.0
+    } else {
+        (left.as_secs_f32() / MESSAGE_FADE.as_secs_f32()).clamp(0.0, 1.0)
+    }
+}
+
+/// Something that happens around a message and can make it stale.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dismissal {
+    /// Editor to Agents or back: the message was about the other mode.
+    ModeSwitch,
+    /// A document closed: what was said about it is over.
+    TabClosed,
+}
+
+/// Whether a message of `feedback` goes on `dismissal`. News and a
+/// success are about the moment and the place, so a change of either
+/// clears them; a failure stays until it has been read, whatever moves
+/// around it.
+pub fn message_clears_on(feedback: Feedback, dismissal: Dismissal) -> bool {
+    match (feedback, dismissal) {
+        (Feedback::Failure, _) => false,
+        (Feedback::Info | Feedback::Success, Dismissal::ModeSwitch | Dismissal::TabClosed) => true,
+    }
 }
 
 /// The time-based phase of anything animated, 0..1 over `period` seconds.
@@ -1065,6 +1103,39 @@ mod tests {
         assert_eq!(feedback_of("Folder opened"), Feedback::Info);
         assert_eq!(feedback_of("Fetching…"), Feedback::Info);
         assert!(message_lasts("push failed") > message_lasts("saved"));
+    }
+
+    #[test]
+    fn news_clears_when_the_scene_changes_and_a_failure_stays() {
+        use std::time::Duration;
+        for dismissal in [Dismissal::ModeSwitch, Dismissal::TabClosed] {
+            assert!(message_clears_on(Feedback::Info, dismissal));
+            assert!(message_clears_on(Feedback::Success, dismissal));
+            assert!(!message_clears_on(Feedback::Failure, dismissal));
+        }
+        // Whoever set the message outranks its wording.
+        assert_eq!(
+            feedback_for(
+                "saved notes.md",
+                Some(("saved notes.md", Feedback::Failure))
+            ),
+            Feedback::Failure
+        );
+        assert_eq!(
+            feedback_for(
+                "saved notes.md",
+                Some(("something else", Feedback::Failure))
+            ),
+            Feedback::Success
+        );
+        // Whole until the last moment, then thinning out, then gone.
+        let lasts = Duration::from_secs(4);
+        assert_eq!(message_alpha(Duration::ZERO, lasts), 1.0);
+        assert_eq!(message_alpha(lasts - MESSAGE_FADE, lasts), 1.0);
+        let half = message_alpha(lasts - MESSAGE_FADE / 2, lasts);
+        assert!((half - 0.5).abs() < 0.01, "{half}");
+        assert_eq!(message_alpha(lasts, lasts), 0.0);
+        assert_eq!(message_alpha(lasts * 2, lasts), 0.0);
     }
 
     #[test]

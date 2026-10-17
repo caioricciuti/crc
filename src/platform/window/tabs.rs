@@ -142,6 +142,8 @@ impl EditorView {
                 return;
             };
             let closed = state.docs.close(index);
+            // What was said about the document is over with it.
+            state.dismiss(layout::Dismissal::TabClosed);
             if let Some(buffer) = closed.as_ref() {
                 // A clean tab's undo, as of the moment it closed.
                 state.history.closed(buffer);
