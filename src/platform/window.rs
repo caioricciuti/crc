@@ -1295,6 +1295,9 @@ fn fill_find_cache<'a>(
 
 /// Project search results shown under the find bar at a time.
 const FIND_RESULT_ROWS: usize = 8;
+/// Rows the bar keeps while a project search runs with nothing found
+/// yet: "Searching project…" and three rows sketched under it.
+const FIND_SEARCHING_ROWS: usize = 4;
 
 struct FindBar {
     query: Buffer,
@@ -7676,7 +7679,10 @@ fn chrome_of(state: &State) -> Chrome {
         .as_ref()
         .filter(|bar| bar.terminal.is_none())
         .map_or(0, |bar| {
-            2 + if bar.project {
+            2 + if bar.project && bar.searching && bar.results.is_empty() {
+                // Room for "Searching project…" and the rows sketched under it.
+                FIND_SEARCHING_ROWS
+            } else if bar.project {
                 bar.results.len().min(FIND_RESULT_ROWS)
             } else {
                 0
@@ -8243,6 +8249,9 @@ struct PaletteSources<'a> {
     commands: &'a [Command],
     symbols: &'a symbols::Symbols,
     root: Option<&'a Path>,
+    /// The project index is being rebuilt on a worker: an empty finder
+    /// is not yet the answer.
+    indexing: bool,
     /// Set while picking a branch.
     branches: Option<&'a BranchPick>,
     /// Set while picking a code action.
@@ -8279,6 +8288,7 @@ fn palette_sources(state: &State) -> PaletteSources<'_> {
         commands: &state.commands,
         symbols: &state.symbols,
         root: state.tree.root(),
+        indexing: state.watch.index_rx.is_some(),
         branches: state.branch_list.as_ref(),
         actions: state.lsp.action_list.as_ref(),
         repos: state.repo_list.as_deref(),
@@ -8332,6 +8342,38 @@ impl PaletteMode {
         } else {
             PaletteMode::Open
         }
+    }
+}
+
+/// What the palette says around its rows.
+struct PaletteWords {
+    /// The heading over the list: "Project files", "Commands"...
+    heading: &'static str,
+    /// What an empty list says, once nothing is on its way.
+    empty: &'static str,
+    /// The list is empty only because its source is not ready: the
+    /// outline still being parsed, a `#` scan running, the project index
+    /// being rebuilt. Rows are sketched instead of "No matching...".
+    loading: bool,
+}
+
+/// The palette's heading, what it says when nothing matches, and whether
+/// an empty list is still on its way, by mode.
+fn palette_words(sources: &PaletteSources<'_>, query: &str, mode: PaletteMode) -> PaletteWords {
+    let (heading, empty) = palette_heading(query, mode, sources.branches.map(|b| &b.intent));
+    let loading = match mode {
+        PaletteMode::Open => match symbols::query(query) {
+            Some((symbols::Scope::Project, "")) => false,
+            Some((scope, _)) => sources.symbols.loading(scope),
+            None if commands::query(query).is_some() => false,
+            None => sources.indexing && sources.finder.is_empty(),
+        },
+        _ => false,
+    };
+    PaletteWords {
+        heading,
+        empty,
+        loading,
     }
 }
 
@@ -8407,6 +8449,7 @@ fn palette_rows(sources: &PaletteSources<'_>, query: &str) -> Vec<(layout::Palet
         task_repo,
         task_rename,
         commit,
+        indexing: _,
     } = sources;
     let (mcp_url, task) = (*mcp_url, *task);
     if let Some(workspace) = commit {

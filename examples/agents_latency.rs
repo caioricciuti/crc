@@ -294,6 +294,7 @@ impl Scene {
             read: &agents.issues,
             asked: self.issues,
             loaded: &agents.arrangement.issues,
+            reading: agents.reading_issues(),
             now: NOW,
         };
         agents.inspector.draw(

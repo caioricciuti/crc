@@ -147,6 +147,16 @@ impl Symbols {
         self.parsing.is_some() || self.project_rx.borrow().is_some()
     }
 
+    /// Whether `scope` has no answer yet because its worker is still at
+    /// it: the outline being parsed, or a `#` query being scanned for.
+    /// An empty list then means "not yet", not "nothing".
+    pub fn loading(&self, scope: Scope) -> bool {
+        match scope {
+            Scope::Document => self.parsing.is_some(),
+            Scope::Project => self.project_rx.borrow().is_some(),
+        }
+    }
+
     fn document_hits(&self, needle: &str) -> Vec<Hit> {
         // Still parsing: nothing yet, and the palette fills in when it lands.
         let Some(definitions) = self.outline.as_ref() else {

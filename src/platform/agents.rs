@@ -1779,6 +1779,18 @@ impl Panel {
         self.issues.get(repo)
     }
 
+    /// Whether issues are being read, or wait to be: a loaded repository
+    /// without a list is then still on its way, not left without one.
+    pub fn reading_issues(&self) -> bool {
+        self.issues_rx.is_some() || !self.issues_wanted.is_empty()
+    }
+
+    /// Whether the folders' repositories are being read: a folder without
+    /// a list is then still on its way.
+    pub fn scanning(&self) -> bool {
+        self.rx.is_some()
+    }
+
     /// Where `gh` finds the repository `repo`: this Mac's in its checkout,
     /// a host's by its GitHub name; `None` for a host's not on GitHub.
     fn issue_target(&self, repo: &RepoKey) -> Option<crate::project::worktree::GitHub> {

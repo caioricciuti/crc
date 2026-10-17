@@ -1357,6 +1357,19 @@ pub const PALETTE_HEADER: f32 = 72.0;
 pub const PALETTE_ROW: f32 = 44.0;
 pub const PALETTE_FOOTER: f32 = 32.0;
 
+/// Rows sketched while a palette list is on its way.
+pub const PALETTE_SKELETON_ROWS: usize = 3;
+
+/// How many rows the palette makes room for: its `count`, or the
+/// sketched ones while the list is `loading` and still empty.
+pub fn palette_rows_shown(count: usize, loading: bool) -> usize {
+    if loading && count == 0 {
+        PALETTE_SKELETON_ROWS
+    } else {
+        count
+    }
+}
+
 pub fn palette_rect(window: Viewport, count: usize) -> Viewport {
     let width = 570.0f32.min((window.width - 32.0).max(0.0));
     let height = (PALETTE_HEADER + count.clamp(1, 8) as f32 * PALETTE_ROW + PALETTE_FOOTER)
@@ -1777,6 +1790,9 @@ pub struct PaletteView<'a> {
     pub heading: &'a str,
     /// What an empty list says.
     pub empty: &'a str,
+    /// The list is empty only because what fills it is still being
+    /// worked out: rows are sketched in its place, not `empty`.
+    pub loading: bool,
     /// The field's hint while it is empty.
     pub placeholder: &'a str,
     /// What Return does, for the footer: "Open", "Run", "Switch".
@@ -1853,6 +1869,7 @@ pub fn build_palette(
         rows,
         heading,
         empty,
+        loading,
         placeholder,
         action,
         query,
@@ -1943,7 +1960,25 @@ pub fn build_palette(
         heading,
         theme.status_text,
     );
-    if rows.is_empty() {
+    if rows.is_empty() && loading {
+        // On its way: the shape of the rows to come, an icon and two
+        // lines each, as a file or symbol row is laid out.
+        for n in 0..PALETTE_SKELETON_ROWS {
+            push_skeleton_row(
+                out,
+                Viewport {
+                    x: viewport.x + 14.0,
+                    y: viewport.y + PALETTE_HEADER + n as f32 * PALETTE_ROW,
+                    width: viewport.width - 32.0,
+                    height: PALETTE_ROW,
+                },
+                20.0,
+                (0.38 + 0.12 * (n % 2) as f32, 0.24),
+                true,
+                theme,
+            );
+        }
+    } else if rows.is_empty() {
         push_ui_text(
             out,
             atlas,
@@ -3620,5 +3655,64 @@ mod home_tests {
         );
         assert!(hits.is_empty());
         assert!(out.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod palette_loading_tests {
+    use super::*;
+
+    fn built(rows: &[PaletteRow], loading: bool) -> Vec<GlyphInstance> {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let mut out = Vec::new();
+        let window = Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: 1200.0,
+            height: 800.0,
+        };
+        let rect = palette_rect(window, palette_rows_shown(rows.len(), loading));
+        take_animating();
+        build_palette(
+            PaletteView {
+                rows,
+                heading: "Project files",
+                empty: "No matching files",
+                loading,
+                placeholder: "",
+                action: "Open",
+                query: "",
+                selected: 0,
+                scroll: 0,
+                cursor: 0,
+                selection: None,
+            },
+            &mut atlas,
+            rect,
+            &Theme::dark(),
+            &mut out,
+        );
+        out
+    }
+
+    #[test]
+    fn an_empty_list_on_its_way_is_sketched_not_declared_empty() {
+        // Still loading: rows breathe in the list, which has room for them.
+        let while_loading = built(&[], true);
+        assert!(take_animating(), "the sketched rows breathe");
+        assert_eq!(palette_rows_shown(0, true), PALETTE_SKELETON_ROWS);
+        // Loaded and empty: the words, and nothing moves.
+        let empty = built(&[], false);
+        assert!(!take_animating(), "an empty list is still");
+        assert_eq!(palette_rows_shown(0, false), 0);
+        assert_ne!(while_loading.len(), empty.len());
+        // Rows in hand: the flag changes nothing, nothing is sketched.
+        let row = PaletteRow {
+            title: "main.rs".into(),
+            ..Default::default()
+        };
+        let _ = built(std::slice::from_ref(&row), true);
+        assert!(!take_animating());
+        assert_eq!(palette_rows_shown(1, true), 1);
     }
 }

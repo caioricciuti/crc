@@ -496,7 +496,7 @@ impl EditorView {
                     )
                     .is_some();
                 let report = format!(
-                    "git_open: {}\ngit_focus: {}\ngit_diff: {}\ngit_pending: {}\ngit_changes: {}\ngit_staged: {}\ngit_hunks_staged: {}\ngit_hunks_working: {}\ngit_message: {}\ngit_message_lines: {}\ngit_message_caret: {}\ngit_subject_len: {}\ngit_amend: {}\ngit_diff_selection: {}\nproject_menu_requested: {}\ncrumb_menu: {}\nlast_click_ms: {:.3}\nfinder_entries: {}\nsidebar_edit: {}\npalette_query: {}\npalette_first: {}\npalette_scroll: {}\npanes: {}\nfocused_pane: {}\nlsp: {}\ndiagnostics: {}\ncompletion: {}\nkey_handler_draws: {}\nwindow_title: {}\nshaping_pending: {}\ncaret_shaped: {}\nclaude: {}\nterminal: {}\n{}",
+                    "git_open: {}\ngit_focus: {}\ngit_diff: {}\ngit_pending: {}\ngit_changes: {}\ngit_staged: {}\ngit_hunks_staged: {}\ngit_hunks_working: {}\ngit_message: {}\ngit_message_lines: {}\ngit_message_caret: {}\ngit_subject_len: {}\ngit_amend: {}\ngit_diff_selection: {}\nproject_menu_requested: {}\ncrumb_menu: {}\nlast_click_ms: {:.3}\nfinder_entries: {}\nsidebar_edit: {}\npalette_query: {}\npalette_first: {}\npalette_scroll: {}\npalette_loading: {}\nfind_searching: {}\npanes: {}\nfocused_pane: {}\nlsp: {}\ndiagnostics: {}\ncompletion: {}\nkey_handler_draws: {}\nwindow_title: {}\nshaping_pending: {}\ncaret_shaped: {}\nclaude: {}\nterminal: {}\n{}",
                     state.git_open,
                     state.git_focus,
                     diffing(&state),
@@ -552,6 +552,12 @@ impl EditorView {
                         .map(|(row, _)| row.title)
                         .unwrap_or_default(),
                     state.palette_scroll,
+                    state.palette.as_ref().is_some_and(|(query, _)| {
+                        let sources = palette_sources(&state);
+                        let text = query.rope.to_string();
+                        palette_words(&sources, &text, PaletteMode::of(&sources)).loading
+                    }),
+                    state.find.as_ref().is_some_and(|bar| bar.searching),
                     pane_count(&state),
                     state.focused_pane,
                     state

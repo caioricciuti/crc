@@ -116,6 +116,9 @@ pub struct Issues<'a> {
     pub read: &'a HashMap<RepoKey, IssueSet>,
     pub asked: bool,
     pub loaded: &'a HashSet<RepoKey>,
+    /// A read is running or queued: a loaded repository without a list
+    /// is on its way, so its rows are sketched rather than said missing.
+    pub reading: bool,
     pub now: u64,
 }
 
@@ -236,6 +239,10 @@ pub struct Inspector {
     /// repositories are not known: set before each draw. Its body says so
     /// instead of waiting.
     pub unreachable: bool,
+    /// The folder workspace shown is on a host whose repositories are
+    /// being read: set before each draw. Until they are known the body
+    /// sketches them; without a read under way it says there is nothing.
+    pub scanning: bool,
     /// Per repository, by host and folder, its branch and uncommitted
     /// file count when last read: a folded card shows them, unread.
     known: HashMap<RepoKey, (Option<String>, usize)>,
@@ -467,6 +474,15 @@ impl Inspector {
         self.rx.is_some()
     }
 
+    /// Whether the read under way brings `path`'s status: until it lands
+    /// the card is sketched. A path no read covers is said to be unread,
+    /// not sketched forever.
+    fn reading_status(&self, path: &Path) -> bool {
+        self.reading
+            .as_ref()
+            .is_some_and(|(_, paths)| paths.iter().any(|p| p == path))
+    }
+
     /// The status of `path`, once read.
     pub fn status_of(&self, path: &Path) -> Option<&Result<Status, String>> {
         self.status.iter().find(|(p, _)| p == path).map(|(_, s)| s)
@@ -547,7 +563,8 @@ impl Inspector {
                 return format!("folded reads={reads}");
             }
             let status = match self.status_of(path) {
-                None => "reading".to_owned(),
+                None if self.reading_status(path) => "reading".to_owned(),
+                None => "unread".to_owned(),
                 Some(Err(e)) => format!("error={e}"),
                 Some(Ok(s)) => format!(
                     "branch={} base={} ahead={} behind={} upstream={} push={} pull={} dirty={} changes=+{}-{} tag={}",
@@ -897,12 +914,15 @@ impl Inspector {
             }
         };
         // Skeletons while the folder's repositories are first read; a host
-        // that did not answer is said.
+        // that did not answer is said, and so is a folder no read is
+        // under way for, rather than sketched forever.
         let Some(repos) = repos else {
             if self.unreachable {
                 note(out, atlas, x, y, width, "Host unreachable", theme);
-            } else {
+            } else if self.scanning {
                 skeleton(out, y, 4);
+            } else {
+                note(out, atlas, x, y, width, "Nothing to show", theme);
             }
             return;
         };
@@ -952,9 +972,13 @@ impl Inspector {
                 }
             }
             match self.status_of(repo) {
-                None => {
+                None if self.reading_status(repo) => {
                     skeleton(out, y, 3);
                     y += 3.0 * ROW + 10.0;
+                }
+                None => {
+                    note(out, atlas, x, y, width, "Not read yet", theme);
+                    y += ROW;
                 }
                 Some(Err(e)) => {
                     let why = if e == crate::project::worktree::UNREACHABLE {
@@ -1338,7 +1362,7 @@ impl Inspector {
             let room = (width - 20.0).max(0.0);
             let line2 = top + 24.0;
             match self.status_of(&tree.path) {
-                None => layout::push_skeleton_row(
+                None if self.reading_status(&tree.path) => layout::push_skeleton_row(
                     out,
                     Viewport {
                         x: x + 10.0,
@@ -1351,6 +1375,17 @@ impl Inspector {
                     false,
                     theme,
                 ),
+                None => {
+                    text(
+                        out,
+                        atlas,
+                        x + 10.0,
+                        line2,
+                        room,
+                        "not read yet",
+                        theme.gutter_text,
+                    );
+                }
                 Some(Err(_)) => {
                     text(
                         out,
@@ -1614,6 +1649,13 @@ impl Inspector {
         }
         y += ROW;
         let Some(set) = set else {
+            // No list and no read coming: said, not sketched forever.
+            if !issues.reading {
+                note(out, atlas, x, y, width, "Not read yet", theme);
+                self.shown_issues
+                    .push((repo.to_path_buf(), "unread".into()));
+                return y + ROW + 10.0;
+            }
             for n in 0..3 {
                 layout::push_skeleton_row(
                     out,
@@ -2290,6 +2332,25 @@ mod tests {
         asked: bool,
         loaded: &HashSet<RepoKey>,
     ) -> Vec<GlyphInstance> {
+        inspector.status = vec![(
+            PathBuf::from("/r"),
+            Ok(Status {
+                branch: Some("main".into()),
+                ..Default::default()
+            }),
+        )];
+        drawn_as_is(inspector, read, asked, loaded, true)
+    }
+
+    /// [`drawn_loaded`] on the statuses the inspector holds, with an
+    /// issues read under way or not.
+    fn drawn_as_is(
+        inspector: &mut Inspector,
+        read: &HashMap<RepoKey, IssueSet>,
+        asked: bool,
+        loaded: &HashSet<RepoKey>,
+        reading: bool,
+    ) -> Vec<GlyphInstance> {
         let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
         let workspace = Workspace {
             name: "garden-log".into(),
@@ -2305,13 +2366,6 @@ mod tests {
             host: None,
             github: None,
         };
-        inspector.status = vec![(
-            PathBuf::from("/r"),
-            Ok(Status {
-                branch: Some("main".into()),
-                ..Default::default()
-            }),
-        )];
         let mut out = Vec::new();
         inspector.draw(
             Some(&workspace),
@@ -2324,6 +2378,7 @@ mod tests {
                 read,
                 asked,
                 loaded,
+                reading,
                 // Twelve days after the issues were opened.
                 now: 1_790_856_000 + 12 * 86_400,
             },
@@ -2352,6 +2407,51 @@ mod tests {
 
     fn report(inspector: &Inspector) -> String {
         inspector.report(Some(&[PathBuf::from("/r")]))
+    }
+
+    #[test]
+    fn a_status_no_read_brings_is_said_not_sketched_forever() {
+        let mut inspector = Inspector::default();
+        // Nothing read and no read under way: the card says so, still.
+        layout::take_animating();
+        drawn_as_is(
+            &mut inspector,
+            &HashMap::new(),
+            false,
+            &HashSet::new(),
+            false,
+        );
+        let said = report(&inspector);
+        assert!(said.contains("unread"), "{said}");
+        assert!(!layout::take_animating(), "nothing breathes: {said}");
+        // The read under way brings it: sketched until it lands.
+        inspector.reading = Some((None, vec![PathBuf::from("/r")]));
+        drawn_as_is(
+            &mut inspector,
+            &HashMap::new(),
+            false,
+            &HashSet::new(),
+            false,
+        );
+        let said = report(&inspector);
+        assert!(said.contains("reading"), "{said}");
+        assert!(layout::take_animating(), "the sketch breathes: {said}");
+    }
+
+    #[test]
+    fn issues_without_a_read_coming_are_said_unread() {
+        let key: RepoKey = (None, PathBuf::from("/r"));
+        let loaded = HashSet::from([key]);
+        let mut inspector = Inspector::default();
+        // Loaded and being read: sketched.
+        drawn_loaded(&mut inspector, &HashMap::new(), true, &loaded);
+        assert!(report(&inspector).ends_with(" issues=loading"));
+        // Loaded, no list, and no read running or queued: said, and still.
+        layout::take_animating();
+        drawn_as_is(&mut inspector, &HashMap::new(), true, &loaded, false);
+        let said = report(&inspector);
+        assert!(said.ends_with(" issues=unread"), "{said}");
+        assert!(!layout::take_animating(), "{said}");
     }
 
     #[test]
@@ -2467,6 +2567,7 @@ mod tests {
                 read: &read,
                 asked: true,
                 loaded: &HashSet::from([(None, PathBuf::from("/main"))]),
+                reading: true,
                 now: 0,
             },
             &HashSet::new(),
@@ -2601,6 +2702,7 @@ mod tests {
                     read: &HashMap::new(),
                     asked: true,
                     loaded: &HashSet::new(),
+                    reading: true,
                     now: 0,
                 },
                 folded,
@@ -2796,6 +2898,7 @@ mod tests {
                 read: &HashMap::new(),
                 asked: false,
                 loaded: &HashSet::new(),
+                reading: true,
                 now: 0,
             },
             &HashSet::new(),

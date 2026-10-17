@@ -37,6 +37,58 @@ enum Operation {
     /// `git add` on a path whose conflict the user has resolved.
     Resolve(Change),
 }
+
+impl Operation {
+    /// What the panel's note says while it runs, named: "Committing",
+    /// not "Working". `first` when the repository has not been read yet.
+    fn verb(&self, first: bool) -> &'static str {
+        match self {
+            Operation::Refresh if first => "Reading repository",
+            Operation::Refresh => "Refreshing",
+            Operation::Select(_) => "Reading diff",
+            Operation::Stage(_, stage) | Operation::StageAll(_, stage) => {
+                if *stage {
+                    "Staging"
+                } else {
+                    "Unstaging"
+                }
+            }
+            Operation::StageHunk(_, hunk) => {
+                if hunk.staged {
+                    "Unstaging"
+                } else {
+                    "Staging"
+                }
+            }
+            Operation::StageLines(_, lines) => {
+                if lines.first().is_some_and(|(hunk, _)| hunk.staged) {
+                    "Unstaging"
+                } else {
+                    "Staging"
+                }
+            }
+            Operation::StageText(_) => "Staging",
+            Operation::Commit(_, false) => "Committing",
+            Operation::Commit(_, true) => "Amending",
+            Operation::Switch(_) => "Switching branch",
+            Operation::CreateBranch(_) => "Creating branch",
+            Operation::DeleteBranch(..) => "Deleting branch",
+            Operation::RenameBranch(..) => "Renaming branch",
+            Operation::Abort(_) => "Aborting",
+            Operation::ContinueRebase => "Continuing rebase",
+            Operation::Remote(what, _) => what.verb(),
+            Operation::Resolve(_) => "Marking resolved",
+        }
+    }
+
+    /// Whether the status line says it too: work you asked for that can
+    /// take a while. Reading the repository or a diff is the panel's own,
+    /// and happens on every save.
+    fn told(&self) -> bool {
+        !matches!(self, Operation::Refresh | Operation::Select(_))
+    }
+}
+
 /// A change from the editor to stage: the file, its text as of HEAD and in
 /// the editor, the change between them, and what the status line says
 /// once it is staged.
@@ -214,6 +266,8 @@ struct InFlight {
     keeps_place: bool,
     /// A hunk or lines were staged: the selection is gone from where it was.
     stages_from_diff: bool,
+    /// Whether the status line says what runs, beside the panel's note.
+    told: bool,
 }
 
 pub struct Panel {
@@ -550,6 +604,14 @@ impl Panel {
     pub fn busy(&self) -> bool {
         self.in_flight.is_some()
     }
+    /// The operation under way that the status line says too, as the
+    /// note has it ("Pushing…"): one you asked for, not a refresh.
+    pub fn working(&self) -> Option<&str> {
+        self.in_flight
+            .as_ref()
+            .filter(|f| f.told)
+            .map(|_| self.note.as_str())
+    }
     pub fn branch(&self) -> String {
         self.snapshot
             .as_ref()
@@ -648,7 +710,6 @@ impl Panel {
             return;
         }
         self.start(Operation::Remote(what, ssh_auth_sock));
-        self.note = format!("{}…", what.verb());
     }
     /// The last branch or remote outcome, once.
     pub fn take_announcement(&mut self) -> Option<String> {
@@ -1186,14 +1247,15 @@ impl Panel {
         let guard = self.guard.clone();
         let previous = self.selected_change().map(|c| c.path.clone());
         let (tx, rx) = mpsc::channel();
+        self.note = format!("{}…", operation.verb(self.snapshot.is_none()));
         self.in_flight = Some(InFlight {
             rx,
             submitted,
             announces,
             keeps_place,
             stages_from_diff,
+            told: operation.told(),
         });
-        self.note = "Working…".into();
         self.note_success = false;
         std::thread::spawn(move || {
             let result = (|| {
@@ -2688,6 +2750,33 @@ mod tests {
         let mut panel = Panel::idle(PathBuf::from("/tmp"), Some(snapshot));
         panel.note = String::new();
         panel
+    }
+
+    #[test]
+    fn the_note_names_the_operation_and_the_status_line_says_the_slow_ones() {
+        // Each start runs Git on /tmp on a worker, which fails there; the
+        // note is set before it is asked.
+        let mut committing = panel(vec![]);
+        committing.start(Operation::Commit("plant".into(), false));
+        assert_eq!(committing.note, "Committing…");
+        assert_eq!(committing.working(), Some("Committing…"));
+        let mut amending = panel(vec![]);
+        amending.start(Operation::Commit("plant".into(), true));
+        assert_eq!(amending.note, "Amending…");
+        let mut pushing = panel(vec![]);
+        pushing.start(Operation::Remote(git::Remote::Push, None));
+        assert_eq!(pushing.working(), Some("Pushing…"));
+        // A refresh is the panel's own: named on the panel, quiet in the
+        // status line, and "Reading repository" the first time.
+        let mut refreshing = panel(vec![]);
+        refreshing.start(Operation::Refresh);
+        assert_eq!(refreshing.note, "Refreshing…");
+        assert_eq!(refreshing.working(), None);
+        let mut first = Panel::idle(PathBuf::from("/tmp"), None);
+        first.start(Operation::Refresh);
+        assert_eq!(first.note, "Reading repository…");
+        assert_eq!(first.working(), None);
+        assert!(first.busy());
     }
 
     #[test]

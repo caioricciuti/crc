@@ -609,6 +609,7 @@ fn main() -> std::io::Result<()> {
                 rows: &rows,
                 heading: "Project files",
                 empty: "No matching files",
+                loading: false,
                 placeholder: "Find a file",
                 action: "Open",
                 query,

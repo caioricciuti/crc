@@ -848,6 +848,7 @@ impl EditorView {
                 agents.inspector.unreachable = selected
                     .as_ref()
                     .is_some_and(|w| agents.unreachable.contains(&w.id()));
+                agents.inspector.scanning = agents.scanning();
                 // A folder workspace's repositories' worktrees, a strip each.
                 let worktrees: Vec<_> = match (&selected, &repos) {
                     (Some(w), Some(repos)) if w.folder => agents
@@ -877,6 +878,7 @@ impl EditorView {
                     read: &agents.issues,
                     asked: agents.github_asked(),
                     loaded: &agents.arrangement.issues,
+                    reading: agents.reading_issues(),
                     now: crate::platform::unix_seconds(),
                 };
                 agents.inspector.draw(
@@ -1092,8 +1094,8 @@ impl EditorView {
         let shown_note = message.as_ref().map(|(text, _)| text.as_str());
         let working = if shown_note.is_some() {
             None
-        } else if git.busy() && git.note.ends_with('\u{2026}') && git.note != "Working\u{2026}" {
-            Some(git.note.clone())
+        } else if let Some(work) = git.working() {
+            Some(work.to_owned())
         } else {
             lsp_language(buffer)
                 .and_then(|language| lsp.get(&crate::lsp::servers::server_key(language)))
@@ -1182,6 +1184,7 @@ impl EditorView {
                 commands: command_list,
                 symbols: symbol_list,
                 root: tree.root(),
+                indexing: watch.index_rx.is_some(),
                 branches: branch_list.as_ref(),
                 actions: action_list.as_ref(),
                 repos: repo_list.as_deref(),
@@ -1201,8 +1204,12 @@ impl EditorView {
                 .into_iter()
                 .map(|(row, _)| row)
                 .collect();
+            let words = palette_words(&sources, &text, mode);
             *palette_count = rows.len();
-            let rect = layout::palette_rect(viewport, rows.len());
+            let rect = layout::palette_rect(
+                viewport,
+                layout::palette_rows_shown(rows.len(), words.loading),
+            );
             layout::push_rect(
                 glyphs,
                 &renderer.atlas,
@@ -1213,8 +1220,9 @@ impl EditorView {
             layout::build_palette(
                 layout::PaletteView {
                     rows: &rows,
-                    heading: palette_heading(&text, mode, intent).0,
-                    empty: palette_heading(&text, mode, intent).1,
+                    heading: words.heading,
+                    empty: words.empty,
+                    loading: words.loading,
                     placeholder: match mode {
                         PaletteMode::Branch => "Branch name",
                         PaletteMode::Action => "Filter actions",
@@ -1516,16 +1524,45 @@ fn draw_find_bar(
             );
         }
         if bar.searching {
+            // Under way: a spinner by the words, and until the first
+            // results land the shape of the rows to come. Both stop with
+            // the search, whether it found anything or not.
+            let row = Viewport {
+                x: g.results.x + 16.0,
+                y: g.results.y,
+                width: (g.results.width - 32.0).max(0.0),
+                height: layout::FIND_ROW_HEIGHT,
+            };
+            let w = layout::push_spinner(glyphs, row.x, row, theme.accent);
             layout::push_ui_text(
                 glyphs,
                 &mut renderer.atlas,
                 Viewport {
-                    x: g.results.x + 16.0,
-                    ..g.results
+                    x: row.x + w + 8.0,
+                    width: (row.width - w - 8.0).max(0.0),
+                    ..row
                 },
                 "Searching project\u{2026}",
                 theme.status_text,
             );
+            if bar.results.is_empty() {
+                for (n, widths) in [(0.28, 0.0), (0.44, 0.0), (0.36, 0.0)]
+                    .into_iter()
+                    .enumerate()
+                {
+                    layout::push_skeleton_row(
+                        glyphs,
+                        Viewport {
+                            y: row.y + layout::FIND_ROW_HEIGHT * (n as f32 + 1.0),
+                            ..row
+                        },
+                        0.0,
+                        widths,
+                        false,
+                        theme,
+                    );
+                }
+            }
         }
     }
 }
