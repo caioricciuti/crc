@@ -78,6 +78,7 @@ impl EditorView {
             word_wrap,
             branch_list,
             repo_list,
+            deleted_list,
             mcp_url_prompt,
             task_prompt,
             commit_prompt,
@@ -1146,6 +1147,7 @@ impl EditorView {
                 branches: branch_list.as_ref(),
                 actions: action_list.as_ref(),
                 repos: repo_list.as_deref(),
+                deleted: deleted_list.as_deref(),
                 mcp_url: *mcp_url_prompt,
                 task: *task_prompt,
                 task_folder: agents.new_folder(tree.root()),
@@ -1179,6 +1181,7 @@ impl EditorView {
                         PaletteMode::Branch => "Branch name",
                         PaletteMode::Action => "Filter actions",
                         PaletteMode::Repo => "Repository name",
+                        PaletteMode::Deleted => "File name",
                         PaletteMode::McpUrl => "https://host/mcp",
                         PaletteMode::TaskName => "Workspace name",
                         PaletteMode::CommitMessage => "Commit message",
@@ -1198,6 +1201,8 @@ impl EditorView {
                         "Start"
                     } else if mode == PaletteMode::CommitMessage {
                         "Commit"
+                    } else if mode == PaletteMode::Deleted {
+                        "Recover"
                     } else if mode == PaletteMode::Action || commands::query(&text).is_some() {
                         "Run"
                     } else {

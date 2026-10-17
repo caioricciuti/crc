@@ -313,7 +313,9 @@ the size and write it back.
   save, before a reload, when closed unsaved and after 30 seconds without
   typing. `.env` files, keys and `~/.ssh` are never kept;
   `local_history_exclude` leaves out more, and `local_history = false`
-  turns it off.
+  turns it off. Git > Recover Deleted File opens a deleted file's last
+  version again, and Git > Clear History for This File or Clear All
+  Local History deletes what was kept, after asking.
 - **Split panes** (`Cmd-\`), up to four, each with its own tabs.
 - **Project search** (`Cmd-Shift-F`) in the background, `Cmd-P` fuzzy file
   open, and `>` in the same box to run any menu command.

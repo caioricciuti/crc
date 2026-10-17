@@ -119,6 +119,7 @@ impl EditorView {
             state.symbols.reset(document, root);
             state.branch_list = None;
             state.repo_list = None;
+            state.deleted_list = None;
             state.lsp.action_list = None;
             state.mcp_url_prompt = false;
             state.task_prompt = false;
@@ -195,6 +196,7 @@ impl EditorView {
             Pick::NewRemoteWorkspace(host, path) => self.create_remote_workspace(host, path),
             Pick::CommitAll(message) => self.agent_commit_all(message),
             Pick::Repo(path) => self.select_repo(&path),
+            Pick::Recover(path) => self.recover_file(path),
             Pick::Symbol(path, line) => self.go_to_symbol(path, line),
             Pick::Command(at, tag) => self.run_command(at, tag),
             Pick::File(path) => {
@@ -278,6 +280,7 @@ impl EditorView {
             state.palette = None;
             state.branch_list = None;
             state.repo_list = None;
+            state.deleted_list = None;
             state.lsp.action_list = None;
             state.mcp_url_prompt = false;
             state.task_prompt = false;

@@ -283,6 +283,10 @@ pub struct Buffer {
     /// The window has already told the user this tab disagrees with disk,
     /// so the next watcher batch does not say it again.
     pub conflict_noticed: bool,
+    /// Text brought back for a file (crash recovery, Recover Deleted
+    /// File): its first save makes the folder it was in, when that is
+    /// gone too.
+    makes_folder: bool,
     format: DiskFormat,
     /// Identity of this document for as long as it is open. Anything kept
     /// beside a buffer rather than inside it, a parse tree above all, is
@@ -3748,6 +3752,35 @@ mod tests {
         b.save_overwriting(None).expect("overwrite");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "restored");
         let _ = quiet.save(None);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    /// A recovered file whose folder is gone too: saving makes the folder
+    /// again, and when it cannot, says which one.
+    #[test]
+    fn saving_recovered_text_makes_the_folder_it_was_in() {
+        let dir = scratch_dir("recovered-folder");
+        let path = dir.join("gone/deeper/notes.txt");
+        let mut b = Buffer::recovered(Some(path.clone()), "back", None);
+        assert!(b.is_dirty());
+        b.save(None).expect("save");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "back");
+        assert!(!b.is_dirty());
+
+        // A file where a folder should be.
+        std::fs::write(dir.join("blocker"), "").expect("write");
+        let blocked = dir.join("blocker/inside/notes.txt");
+        let mut b = Buffer::recovered(Some(blocked), "back", None);
+        let error = b.save(None).unwrap_err().to_string();
+        assert!(
+            error.contains(&dir.join("blocker/inside").display().to_string()),
+            "{error}"
+        );
+
+        // Only a recovered document: a new one is not given folders.
+        let mut fresh = Buffer::from_text("new");
+        assert!(fresh.save(Some(&dir.join("none/notes.txt"))).is_err());
+        assert!(!dir.join("none").exists());
         std::fs::remove_dir_all(dir).expect("cleanup");
     }
 

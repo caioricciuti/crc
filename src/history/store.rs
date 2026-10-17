@@ -1220,6 +1220,57 @@ mod tests {
         cleanup(&path);
     }
 
+    /// Clear All Local History while File History has a reader open, the
+    /// writer closed after, kept open, or in another process: the reader
+    /// answers at once, with nothing.
+    #[test]
+    fn a_reader_survives_the_writer_forgetting_everything() {
+        if let Some(path) = std::env::var_os("CRC_HISTORY_TEST_WRITER") {
+            Store::open(Path::new(&path)).unwrap().forget_all().unwrap();
+            return;
+        }
+        let path = temp("reader-forget-all");
+        for round in 0..20 {
+            for how in ["closed", "kept open", "other process"] {
+                cleanup(&path);
+                let writer = Store::open(&path).unwrap();
+                let mut last = None;
+                for n in 0..4 {
+                    let text = noise(40_000, round * 8 + n);
+                    last = Some(put(&writer, "/notes/list.md", &text, NOW + n as i64));
+                }
+                let last = last.unwrap();
+                let reader = Store::open_to_read(&path).unwrap().unwrap();
+                assert_eq!(reader.list(Path::new("/notes/list.md")).unwrap().len(), 4);
+                let kept = match how {
+                    "other process" => {
+                        drop(writer);
+                        let out = std::process::Command::new(std::env::current_exe().unwrap())
+                            .args([
+                                "history::store::tests::a_reader_survives_the_writer_forgetting_everything",
+                                "--exact",
+                                "--test-threads=1",
+                            ])
+                            .env("CRC_HISTORY_TEST_WRITER", &path)
+                            .output()
+                            .unwrap();
+                        assert!(out.status.success(), "{out:?}");
+                        None
+                    }
+                    _ => {
+                        writer.forget_all().unwrap();
+                        (how == "kept open").then_some(writer)
+                    }
+                };
+                let (listed, read) = read_within_a_second(reader, last);
+                assert_eq!(ids(&listed), [], "round {round}, writer {how}");
+                assert_eq!(read, None, "round {round}, writer {how}");
+                drop(kept);
+            }
+        }
+        cleanup(&path);
+    }
+
     #[test]
     fn a_tampered_blob_reads_as_missing() {
         let path = temp("tamper");

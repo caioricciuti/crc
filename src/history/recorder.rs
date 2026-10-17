@@ -315,6 +315,12 @@ pub enum Job {
         base: Rope,
         event: u64,
     },
+    /// Everything kept for `path`: its versions and its journal.
+    Forget {
+        path: PathBuf,
+    },
+    /// Everything kept, for every file.
+    ForgetAll,
     /// Answered once everything before it is written.
     Flush(mpsc::Sender<()>),
 }
@@ -329,6 +335,9 @@ pub enum Notice {
     Quarantined(PathBuf),
     /// It could not be opened or written, for this reason.
     Failed(String),
+    /// A clear was asked of a history from a newer crc, which is
+    /// read-only here: nothing went.
+    NotCleared,
 }
 
 impl Notice {
@@ -346,6 +355,9 @@ impl Notice {
                 )
             ),
             Notice::Failed(why) => format!("local history is not being kept: {why}"),
+            Notice::NotCleared => "local history was written by a newer crc and is \
+                                   read-only here: nothing was cleared"
+                .to_owned(),
         }
     }
 }
@@ -649,6 +661,48 @@ impl Recorder {
         }
     }
 
+    /// Clear History for This File: what is kept for `path` goes, versions
+    /// and journal. Asked for even with history off or paused; with no
+    /// history file yet there is nothing to clear, and none is made.
+    pub fn forget(&mut self, path: &Path) {
+        for track in &mut self.tracks {
+            if track.path.as_deref() == Some(path) {
+                track.policy.opened = None;
+            }
+        }
+        self.clear(Job::Forget {
+            path: path.to_owned(),
+        });
+    }
+
+    /// Clear All Local History, as [`Recorder::forget`] for every file.
+    pub fn forget_all(&mut self) {
+        for track in &mut self.tracks {
+            track.policy.opened = None;
+        }
+        self.clear(Job::ForgetAll);
+    }
+
+    /// Sends a clear, starting the history thread for it only when there
+    /// is a history file to clear.
+    fn clear(&mut self, job: Job) {
+        if self.worker.is_none() {
+            let Some(db) = self.db.clone() else {
+                return;
+            };
+            if !db.exists() {
+                return;
+            }
+            self.worker = start(db, self.wake.take());
+        }
+        let Some(worker) = &self.worker else {
+            return;
+        };
+        if worker.jobs.send(job).is_err() {
+            self.worker = None;
+        }
+    }
+
     /// A file moved inside crc: its history goes with it.
     pub fn rename(&mut self, old: &Path, new: &Path) {
         self.send(Job::Rename {
@@ -820,7 +874,7 @@ pub fn run(db: &Path, queue: &mpsc::Receiver<Job>, say: &dyn Fn(Notice), found: 
 
 /// `batch` without the idle snapshots a later idle snapshot of the same
 /// file replaces, and the journals a later journal of it replaces.
-/// Nothing is dropped across a rename.
+/// Nothing is dropped across a rename or a clear.
 fn coalesce(batch: Vec<Job>) -> Vec<Job> {
     let keep: Vec<bool> = (0..batch.len())
         .map(|i| {
@@ -835,7 +889,10 @@ fn coalesce(batch: Vec<Job>) -> Vec<Job> {
             };
             for later in &batch[i + 1..] {
                 match later {
-                    Job::Rename { .. } | Job::RenameFolder { .. } => return true,
+                    Job::Rename { .. }
+                    | Job::RenameFolder { .. }
+                    | Job::Forget { .. }
+                    | Job::ForgetAll => return true,
                     Job::Snapshot {
                         path: other,
                         reason: Reason::Idle,
@@ -922,6 +979,18 @@ impl Writer {
                     });
                 }
             }
+            Job::Forget { path } => {
+                if let Some(store) = self.clearable(say) {
+                    let result = store.forget(&path);
+                    self.check(result, say);
+                }
+            }
+            Job::ForgetAll => {
+                if let Some(store) = self.clearable(say) {
+                    let result = store.forget_all();
+                    self.check(result, say);
+                }
+            }
             Job::Flush(done) => {
                 let _ = done.send(());
             }
@@ -969,6 +1038,18 @@ impl Writer {
         if let Some(store) = self.writable() {
             let _ = store.prune(now_ms(), &Caps::default());
         }
+    }
+
+    /// A store a clear can go to: open and not from a newer crc, which is
+    /// said, as the window has already said "cleared". A full disk does
+    /// not stop it, as clearing is how room is made.
+    fn clearable(&self, say: &dyn Fn(Notice)) -> Option<&Store> {
+        let store = self.store.as_ref()?;
+        if store.read_only() {
+            say(Notice::NotCleared);
+            return None;
+        }
+        Some(store)
     }
 
     /// Says the first failure; a read-only store is not one.
@@ -1701,6 +1782,7 @@ mod tests {
                 Job::Snapshot { path, reason, .. } => (path.display().to_string(), reason.id()),
                 Job::Rename { .. } | Job::RenameFolder { .. } => ("rename".into(), 0),
                 Job::Undo { path, .. } => (format!("undo {}", path.display()), 0),
+                Job::Forget { .. } | Job::ForgetAll => ("forget".into(), 0),
                 Job::LoadUndo { .. } | Job::Flush(_) => ("other".into(), 0),
             })
             .collect();
@@ -1718,6 +1800,146 @@ mod tests {
                 ("undo /b".into(), 0),
             ]
         );
+
+        // Nor across a clear: what came before it is written, then cleared.
+        for forget in [
+            Job::Forget {
+                path: PathBuf::from("/a"),
+            },
+            Job::ForgetAll,
+        ] {
+            let batch = vec![
+                snap("/a", Reason::Idle),
+                undo("/a"),
+                forget,
+                snap("/a", Reason::Idle),
+                undo("/a"),
+            ];
+            assert_eq!(coalesce(batch).len(), 5);
+        }
+    }
+
+    /// Versions and a journal queued for a file, then a clear: none of it
+    /// is left, and what is kept after it is kept again.
+    #[test]
+    fn a_clear_drops_what_was_queued_before_it() {
+        let dir = temp("forget");
+        let db = dir.join("history.db");
+        let file = dir.join("a.txt");
+        let other = dir.join("b.txt");
+        std::fs::write(&file, "a\n").unwrap();
+        std::fs::write(&other, "b\n").unwrap();
+        let (file, other) = (
+            crate::platform::canonical(&file),
+            crate::platform::canonical(&other),
+        );
+        let mut docs = [open(&file), open(&other)];
+        let mut recorder = recorder(&db, "", Timing::default());
+        let t0 = Instant::now();
+        recorder.observe(docs.iter(), t0);
+        for doc in &mut docs {
+            doc.insert("one ");
+            doc.save(None).unwrap();
+        }
+        // Queued, not yet written: the opened text, the save, the journal.
+        recorder.observe(docs.iter(), t0 + secs(1));
+        recorder.forget(&file);
+        recorder.finish(std::iter::empty(), secs(10));
+        assert_eq!(reasons(&db, &file), []);
+        assert_eq!(Store::open(&db).unwrap().get_undo(&file).unwrap(), None);
+        assert_eq!(reasons(&db, &other), [Reason::Opened, Reason::Saved]);
+        assert!(journal(&db, &other, "one b\n").is_some());
+
+        docs[0].insert("two ");
+        docs[0].save(None).unwrap();
+        recorder.observe(docs.iter(), t0 + secs(2));
+        recorder.finish(std::iter::empty(), secs(10));
+        assert_eq!(
+            reasons(&db, &file),
+            [Reason::Saved],
+            "kept again, without the text it was opened with"
+        );
+        assert_eq!(journal(&db, &file, "one two a\n"), Some((2, 0)));
+
+        recorder.forget_all();
+        recorder.finish(std::iter::empty(), secs(10));
+        let store = Store::open(&db).unwrap();
+        for path in [&file, &other] {
+            assert!(store.list(path).unwrap().is_empty());
+            assert_eq!(store.get_undo(path).unwrap(), None);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A history from a newer crc is read-only here: a clear leaves it as
+    /// it was and says so, rather than let "cleared" stand.
+    #[test]
+    fn a_clear_of_a_read_only_history_says_nothing_was_cleared() {
+        let dir = temp("forget-read-only");
+        let db = dir.join("history.db");
+        let file = dir.join("a.txt");
+        Store::open(&db)
+            .unwrap()
+            .put_snapshot(&file, "kept\n", Reason::Saved, 0)
+            .unwrap();
+        crate::index::db::Db::open(&db)
+            .unwrap()
+            .execute("PRAGMA user_version = 99")
+            .unwrap();
+        let (jobs, queue) = mpsc::channel();
+        jobs.send(Job::Forget { path: file.clone() }).unwrap();
+        jobs.send(Job::ForgetAll).unwrap();
+        drop(jobs);
+        let said = std::sync::Mutex::new(Vec::new());
+        run(
+            &db,
+            &queue,
+            &|notice| said.lock().unwrap().push(notice),
+            &|_| {},
+        );
+        assert_eq!(
+            said.into_inner().unwrap(),
+            [Notice::NotCleared, Notice::NotCleared]
+        );
+        assert_eq!(
+            Notice::NotCleared.describe(),
+            "local history was written by a newer crc and is read-only here: nothing was cleared"
+        );
+        assert_eq!(reasons(&db, &file), [Reason::Saved]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// History off, or paused, still clears what an earlier session kept;
+    /// with no history file, a clear makes none.
+    #[test]
+    fn a_clear_works_with_history_off_and_creates_nothing() {
+        let dir = temp("forget-off");
+        let db = dir.join("history.db");
+        let file = dir.join("a.txt");
+        let mut off = Recorder::new(Some(db.clone()), false, "", Timing::default());
+        off.forget(&file);
+        off.forget_all();
+        off.finish(std::iter::empty(), secs(10));
+        assert!(off.worker.is_none());
+        assert!(!db.exists());
+
+        let mut on = recorder(&db, "", Timing::default());
+        on.edited_on_disk(&file, &Rope::from_text("before\n"));
+        on.finish(std::iter::empty(), secs(10));
+        drop(on);
+        assert_eq!(reasons(&db, &file), [Reason::EditedOnDisk]);
+        off.forget(&file);
+        off.finish(std::iter::empty(), secs(10));
+        assert_eq!(reasons(&db, &file), []);
+
+        let mut paused = recorder(&db, "", Timing::default());
+        paused.edited_on_disk(&file, &Rope::from_text("again\n"));
+        paused.finish(std::iter::empty(), secs(10));
+        paused.paused = true;
+        paused.forget_all();
+        paused.finish(std::iter::empty(), secs(10));
+        assert_eq!(reasons(&db, &file), []);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

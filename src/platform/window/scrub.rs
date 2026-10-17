@@ -1627,6 +1627,39 @@ fn restore(state: &mut State) -> Result<String, String> {
     Ok(format!("restored {label}, not saved: Undo takes it back"))
 }
 
+/// The file the active tab keeps history of: in the history's own tab,
+/// the file it is the history of. `None` for a tab with none.
+pub(super) fn history_path(state: &State) -> Option<std::path::PathBuf> {
+    let active = state.docs.active();
+    if let Some(scrub) = state
+        .scrub
+        .as_ref()
+        .filter(|s| s.sibling == Some(active.id()))
+    {
+        return buffer_by_id(&state.docs, &state.panes, scrub.live)?
+            .path
+            .clone();
+    }
+    if active.is_frozen() || active.is_preview_file() {
+        return None;
+    }
+    active.path.clone()
+}
+
+/// After a clear: the history goes when it shows `path`'s versions, or
+/// any file's with `None`, the file's tab in front if the history's was.
+pub(super) fn close_cleared(state: &mut State, path: Option<&Path>) {
+    let Some(scrub) = &state.scrub else {
+        return;
+    };
+    let live = buffer_by_id(&state.docs, &state.panes, scrub.live);
+    if path.is_some() && live.and_then(|b| b.path.as_deref()) != path {
+        return;
+    }
+    let back = scrub.sibling == Some(state.docs.active().id());
+    close(state, back);
+}
+
 /// Closes the history: its tab goes, wherever it is, and with `back` the
 /// file's own tab comes to the front as it was.
 fn close(state: &mut State, back: bool) {

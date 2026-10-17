@@ -492,6 +492,7 @@ impl State {
             && self.review_page.counting.is_none()
             && self.review_page.loading.is_none()
             && self.branch_rx.is_none()
+            && self.history_rx.is_none()
             && self.home_rx.is_none()
             && !self.mcp.busy()
             && !self.agents.busy()

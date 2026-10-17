@@ -714,6 +714,10 @@ struct State {
     branch_list: Option<BranchPick>,
     /// Set while the palette picks a repository of the workspace.
     repo_list: Option<Vec<RepoRow>>,
+    /// Set while the palette picks a deleted file to recover.
+    deleted_list: Option<Vec<local_history::DeletedRow>>,
+    /// What Recover Deleted File waits for from its worker.
+    history_rx: Option<mpsc::Receiver<local_history::Reply>>,
     /// Set while the palette takes a URL for a new MCP server.
     mcp_url_prompt: bool,
     /// The palette is taking a new task's name.
@@ -2913,6 +2917,7 @@ define_class!(
             self.poll_project_index();
             self.poll_project_search();
             self.poll_branches();
+            self.poll_history_reply();
             self.poll_home();
             self.poll_mcp();
             self.poll_agents();
@@ -3352,6 +3357,21 @@ define_class!(
         #[unsafe(method(fileHistory:))]
         fn action_file_history(&self, _sender: Option<&AnyObject>) {
             self.open_history();
+        }
+
+        #[unsafe(method(recoverDeletedFile:))]
+        fn action_recover_deleted_file(&self, _sender: Option<&AnyObject>) {
+            self.recover_deleted_file();
+        }
+
+        #[unsafe(method(clearFileHistory:))]
+        fn action_clear_file_history(&self, _sender: Option<&AnyObject>) {
+            self.clear_file_history();
+        }
+
+        #[unsafe(method(clearAllHistory:))]
+        fn action_clear_all_history(&self, _sender: Option<&AnyObject>) {
+            self.clear_all_history();
         }
 
         #[unsafe(method(toggleBlameHeat:))]
@@ -4595,6 +4615,8 @@ define_class!(
                 // The key says why when it is not.
                 let active = state.docs.active();
                 active.path.is_some() && !active.is_preview_file()
+            } else if action == sel!(clearFileHistory:) {
+                scrub::history_path(&state).is_some()
             } else if action == sel!(olderVersion:) || action == sel!(newerVersion:) {
                 scrub::has_keys(&state)
             } else if action == sel!(restoreVersion:) {
@@ -7779,6 +7801,8 @@ enum Pick {
     RenameBranchTo(String, String),
     /// A repository of the workspace, for Source Control.
     Repo(std::path::PathBuf),
+    /// A deleted file to open again from local history.
+    Recover(std::path::PathBuf),
     /// A code action, and the server that offered it.
     Action(Language, crate::lsp::CodeAction),
     /// A Streamable HTTP MCP server to add, by its URL.
@@ -8183,6 +8207,8 @@ struct PaletteSources<'a> {
     actions: Option<&'a (Language, Vec<crate::lsp::CodeAction>)>,
     /// Set while picking a repository.
     repos: Option<&'a [RepoRow]>,
+    /// Set while picking a deleted file to recover.
+    deleted: Option<&'a [local_history::DeletedRow]>,
     /// Set while taking a URL for a new MCP server.
     mcp_url: bool,
     /// Set while taking a new workspace's name.
@@ -8214,6 +8240,7 @@ fn palette_sources(state: &State) -> PaletteSources<'_> {
         branches: state.branch_list.as_ref(),
         actions: state.lsp.action_list.as_ref(),
         repos: state.repo_list.as_deref(),
+        deleted: state.deleted_list.as_deref(),
         mcp_url: state.mcp_url_prompt,
         task: state.task_prompt,
         task_folder: state.agents.new_folder(state.tree.root()),
@@ -8234,6 +8261,8 @@ enum PaletteMode {
     Branch,
     Action,
     Repo,
+    /// A deleted file to recover.
+    Deleted,
     /// A URL for a new MCP server.
     McpUrl,
     /// A new task's name.
@@ -8252,6 +8281,8 @@ impl PaletteMode {
             PaletteMode::TaskName
         } else if sources.repos.is_some() {
             PaletteMode::Repo
+        } else if sources.deleted.is_some() {
+            PaletteMode::Deleted
         } else if sources.branches.is_some() {
             PaletteMode::Branch
         } else if sources.actions.is_some() {
@@ -8281,6 +8312,12 @@ fn palette_heading(
         }
         PaletteMode::Action => return ("Code actions", "No matching actions"),
         PaletteMode::Repo => return ("Show which repository?", "No matching repositories"),
+        PaletteMode::Deleted => {
+            return (
+                "Recover which deleted file? Its latest version opens unsaved",
+                "No matching files",
+            );
+        }
         PaletteMode::McpUrl => {
             return (
                 "Add an MCP server by URL",
@@ -8321,6 +8358,7 @@ fn palette_rows(sources: &PaletteSources<'_>, query: &str) -> Vec<(layout::Palet
         branches,
         actions,
         repos,
+        deleted,
         mcp_url,
         task,
         task_folder,
@@ -8357,6 +8395,9 @@ fn palette_rows(sources: &PaletteSources<'_>, query: &str) -> Vec<(layout::Palet
     }
     if let Some(repos) = repos {
         return repo_rows(repos, query);
+    }
+    if let Some(deleted) = deleted {
+        return local_history::deleted_rows(deleted, query);
     }
     if let Some(branches) = branches {
         return branch_rows(branches, query);
@@ -9156,6 +9197,25 @@ fn install_menu(mtm: MainThreadMarker, app: &NSApplication) {
     ));
     git_menu.addItem(&item("Blame Heat", sel!(toggleBlameHeat:), "", false));
     git_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    git_menu.addItem(&item(
+        "Recover Deleted File\u{2026}",
+        sel!(recoverDeletedFile:),
+        "",
+        false,
+    ));
+    git_menu.addItem(&item(
+        "Clear History for This File\u{2026}",
+        sel!(clearFileHistory:),
+        "",
+        false,
+    ));
+    git_menu.addItem(&item(
+        "Clear All Local History\u{2026}",
+        sel!(clearAllHistory:),
+        "",
+        false,
+    ));
+    git_menu.addItem(&NSMenuItem::separatorItem(mtm));
     git_menu.addItem(&item("Next Conflict", sel!(nextConflict:), "", false));
     git_menu.addItem(&item(
         "Previous Conflict",
@@ -9533,6 +9593,8 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         ssh_auth_sock: settings.ssh_auth_sock.clone(),
         branch_list: None,
         repo_list: None,
+        deleted_list: None,
+        history_rx: None,
         mcp_url_prompt: false,
         task_prompt: false,
         commit_prompt: None,

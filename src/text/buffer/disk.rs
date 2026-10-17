@@ -426,6 +426,7 @@ impl Buffer {
         if stamp.is_some() && stamp != now {
             buffer.saved = None;
         }
+        buffer.makes_folder = path.is_some();
         buffer.path = path;
         buffer.dirty = true;
         buffer
@@ -477,6 +478,19 @@ impl Buffer {
             }
             Err(_) => target,
         };
+        // Brought back with its folder gone too: the folder first. With no
+        // folder there is no file either, so nothing below is skipped.
+        if self.makes_folder
+            && self.path.as_deref() == Some(target.as_path())
+            && let Some(folder) = target.parent().filter(|dir| !dir.exists())
+        {
+            std::fs::create_dir_all(folder).map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("could not make the folder {}: {e}", folder.display()),
+                )
+            })?;
+        }
         let existing = match std::fs::metadata(&target) {
             Ok(meta) => Some(meta),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -545,6 +559,7 @@ impl Buffer {
         self.saved = Some(self.rope.clone());
         self.disk_event = (self.disk_event.0 + 1, DiskEvent::Saved);
         self.dirty = false;
+        self.makes_folder = false;
         Ok(())
     }
     /// The format to write the text with. A file with mixed line endings
@@ -701,6 +716,7 @@ impl Buffer {
             stamp: None,
             disk_event: (0, DiskEvent::Opened),
             conflict_noticed: false,
+            makes_folder: false,
             format: DiskFormat::default(),
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }

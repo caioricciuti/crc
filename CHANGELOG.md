@@ -4,6 +4,16 @@ One entry per tag, written for people who use the editor.
 
 ## Unreleased
 
+- Git > Recover Deleted File lists, in the palette, the files local
+  history has versions of that are gone from disk, by name with their
+  folder. Picking one opens its latest version at its old path as
+  unsaved changes, and Save writes the file back. Git > Clear History
+  for This File deletes every version and the saved undo kept for the
+  file in front (in File History's tab, the file it shows), and Clear
+  All Local History does it for every file. Both ask first, work with
+  local history turned off, and close File History when it shows what
+  was cleared. Files on disk are not touched. All three are in the
+  command palette too.
 - File History can restore a version. Restore at the right of its strip,
   or Git > Restore This Version, puts the version shown, a commit's or a
   local one, into the file's own tab as one edit: Undo brings back the

@@ -46,6 +46,10 @@ fn keywords(action: Sel) -> &'static str {
         "agent claude undo keep diff changes"
     } else if action == sel!(toggleBlameHeat:) {
         "age recent gutter annotate"
+    } else if action == sel!(recoverDeletedFile:) {
+        "local history restore undelete lost removed"
+    } else if action == sel!(clearFileHistory:) || action == sel!(clearAllHistory:) {
+        "local history delete forget erase versions undo"
     } else {
         ""
     }
