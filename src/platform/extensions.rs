@@ -305,16 +305,7 @@ fn draw_page(
     if home {
         // The header is the home page's: the title, the count, and the
         // actions that are about extensions in general.
-        layout::push_title(
-            out,
-            atlas,
-            x,
-            y - 6.0,
-            20.0,
-            "Extensions",
-            theme.text,
-            260.0,
-        );
+        layout::push_page_title(out, atlas, x, y - 4.0, "Extensions", theme.text, 260.0);
         let mut bx = right;
         for (label, action) in [
             ("Close", Action::Close),
@@ -380,12 +371,11 @@ fn draw_page(
     let dx = detail_x;
     if let Some(pending) = &page.confirm {
         let m = pending.manifest();
-        layout::push_title(
+        layout::push_page_title(
             out,
             atlas,
             dx,
-            y - 6.0,
-            20.0,
+            y - 4.0,
             &format!("Install {} {}?", m.name, m.version),
             theme.text,
             detail_w,
@@ -470,7 +460,7 @@ fn draw_page(
         width: 52.0,
         height: 52.0,
     };
-    layout::push_rounded_rect(out, tile, 12.0, theme.tab_hover);
+    layout::push_rounded_rect(out, tile, layout::UI_RADIUS_LG, theme.tab_hover);
     layout::push_icon_scaled(
         out,
         atlas,
@@ -480,12 +470,11 @@ fn draw_page(
         1.9,
     );
     let nx = dx + tile.width + 14.0;
-    layout::push_title(
+    layout::push_page_title(
         out,
         atlas,
         nx,
-        y + 2.0,
-        20.0,
+        y,
         &manifest.name,
         theme.text,
         detail_w - 66.0,
@@ -861,7 +850,7 @@ pub fn draw_list(
             width: 32.0,
             height: 32.0,
         };
-        layout::push_rounded_rect(out, tile, layout::UI_RADIUS + 1.0, theme.tab_hover);
+        layout::push_rounded_rect(out, tile, layout::UI_RADIUS, theme.tab_hover);
         layout::push_icon_scaled(out, atlas, tile, *icon, theme.accent, 1.25);
         let tx = x + 32.0 + 10.0;
         let tw = (width - 42.0).max(0.0);

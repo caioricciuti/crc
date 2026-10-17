@@ -448,7 +448,7 @@ pub fn draw(
     let bottom = rect.y + rect.height;
     let mut y = rect.y + 22.0;
 
-    let title_w = layout::push_title(out, atlas, x, y - 6.0, 20.0, "Review", theme.text, 200.0);
+    let title_w = layout::push_page_title(out, atlas, x, y - 4.0, "Review", theme.text, 200.0);
     let close_w = layout::ui_text_width(atlas, "Close") + 28.0;
     if right - close_w > x + title_w + 24.0 {
         let r = button(out, atlas, theme, right - close_w, y - 4.0, "Close", false);

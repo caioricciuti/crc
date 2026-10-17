@@ -97,16 +97,7 @@ fn draw_page(
     // The header: the title, and the actions that are about servers in
     // general, from the right, the least needed dropped first when the
     // column is narrow.
-    let title_w = layout::push_title(
-        out,
-        atlas,
-        x,
-        y - 6.0,
-        20.0,
-        "MCP Servers",
-        theme.text,
-        260.0,
-    );
+    let title_w = layout::push_page_title(out, atlas, x, y - 4.0, "MCP Servers", theme.text, 260.0);
     let mut bx = right;
     for (label, action, primary) in [
         ("Close", Action::Close, false),
@@ -286,7 +277,7 @@ fn draw_home(
         let open = panel.selected == Some(si);
         layout::push_card(out, card, theme);
         if open || layout::hovered(card) {
-            layout::push_rounded_rect(out, card, layout::UI_RADIUS + 2.0, theme.row_hover);
+            layout::push_rounded_rect(out, card, layout::UI_RADIUS_LG, theme.row_hover);
         }
         let dot = Viewport {
             x: x + 18.0,
@@ -299,16 +290,7 @@ fn draw_home(
         let verb = verb_of(server);
         let verb_w = layout::ui_text_width(atlas, verb) + 28.0;
         let name_w = measure - 40.0 - verb_w - 28.0;
-        layout::push_title(
-            out,
-            atlas,
-            nx,
-            y + 10.0,
-            15.0,
-            &server.name,
-            theme.text,
-            name_w,
-        );
+        layout::push_heading(out, atlas, nx, y + 10.0, &server.name, theme.text, name_w);
         text(out, atlas, nx, y + 32.0, name_w, &where_of(server), dim);
         let (line, colour) = summary_of(server, theme);
         text(out, atlas, nx, y + 52.0, name_w, &line, colour);
@@ -372,7 +354,7 @@ fn draw_server(
         width: 52.0,
         height: 52.0,
     };
-    layout::push_rounded_rect(out, tile, 12.0, theme.tab_hover);
+    layout::push_rounded_rect(out, tile, layout::UI_RADIUS_LG, theme.tab_hover);
     layout::push_icon_scaled(out, atlas, tile, PLUG, theme.accent, 1.9);
     let dot = Viewport {
         x: tile.x + tile.width - 14.0,
@@ -382,16 +364,7 @@ fn draw_server(
     };
     layout::push_rounded_rect(out, dot, 5.0, status_colour(&server.status, theme));
     let nx = x + tile.width + 14.0;
-    layout::push_title(
-        out,
-        atlas,
-        nx,
-        y + 2.0,
-        20.0,
-        &server.name,
-        theme.text,
-        measure - 66.0,
-    );
+    layout::push_page_title(out, atlas, nx, y, &server.name, theme.text, measure - 66.0);
     text(
         out,
         atlas,
@@ -479,7 +452,7 @@ fn draw_server(
     // description under the name. A click on a row does what the sidebar's
     // does: a call document, a read, a prompt.
     let heading = |out: &mut Vec<GlyphInstance>, atlas: &mut Atlas, y: f32, title: &str| {
-        layout::push_title(out, atlas, x, y, 13.0, title, theme.text, measure);
+        layout::push_heading(out, atlas, x, y, title, theme.text, measure);
     };
     if !server.tools.is_empty() {
         heading(out, atlas, y, &format!("Tools  {}", server.tools.len()));

@@ -769,7 +769,7 @@ pub fn header_hits(
     atlas: &mut Atlas,
     header: Viewport,
 ) -> (Vec<(Viewport, Viewport)>, Viewport) {
-    let mut x = header.x + 8.0;
+    let mut x = header.x;
     let mut tabs = Vec::new();
     for (index, tab) in panel.tabs.iter().enumerate() {
         if panel
@@ -789,27 +789,29 @@ pub fn header_hits(
             ));
             continue;
         }
+        // The editor tab's metrics: its padding, its close slot and the
+        // square around the close glyph, so the two strips are one.
         let dot = if tab.attention.is_some() { 5.0 } else { 0.0 };
-        let width = layout::ui_text_width(atlas, &label(tab)) + 44.0 + dot;
-        let rect = Viewport {
-            x,
-            y: header.y + 4.0,
-            width,
-            height: HEADER - 8.0,
-        };
+        let width = layout::ui_text_width(atlas, &label(tab))
+            + layout::TAB_PADDING_X * 2.0
+            + layout::TAB_CLOSE_SLOT
+            + dot;
+        let rect = Viewport { x, width, ..header };
+        let centre = rect.x + rect.width - layout::TAB_PADDING_X - atlas.metrics.advance * 0.5;
         let close = Viewport {
-            x: rect.x + rect.width - 22.0,
-            width: 18.0,
-            ..rect
+            x: centre - layout::TAB_CLOSE_HIT * 0.5,
+            y: header.y + ((header.height - layout::TAB_CLOSE_HIT) * 0.5).floor(),
+            width: layout::TAB_CLOSE_HIT,
+            height: layout::TAB_CLOSE_HIT,
         };
         tabs.push((rect, close));
-        x += width + 4.0;
+        x += width;
     }
     let new = Viewport {
-        x,
-        y: header.y + 4.0,
-        width: HEADER - 8.0,
-        height: HEADER - 8.0,
+        x: x + layout::UI_GAP,
+        y: header.y + ((header.height - layout::UI_CONTROL_SM) * 0.5).floor(),
+        width: layout::UI_CONTROL_SM,
+        height: layout::UI_CONTROL_SM,
     };
     (tabs, new)
 }
@@ -962,19 +964,50 @@ pub fn draw(
         if rect.width <= 0.0 {
             continue;
         }
+        // The same tab as the editor's: the strip's height, the page's
+        // fill under the active one with the accent rule where it meets
+        // the screen, a lift under the pointer, a hairline between the rest.
         let active = index == panel.active;
         if active {
-            layout::push_rounded_rect(out, rect, layout::UI_RADIUS_SM, theme.tab_hover);
+            layout::push_rect(
+                out,
+                atlas,
+                [rect.x, rect.y],
+                [rect.width, rect.height],
+                theme.tab_active,
+            );
+            layout::push_rect(
+                out,
+                atlas,
+                [rect.x + layout::TAB_PADDING_X, rect.y + rect.height - 2.0],
+                [rect.width - layout::TAB_PADDING_X * 2.0, 2.0],
+                theme.accent,
+            );
         } else if layout::hovered(rect) {
-            layout::push_rounded_rect(out, rect, layout::UI_RADIUS_SM, theme.row_hover);
+            layout::push_rect(
+                out,
+                atlas,
+                [rect.x, rect.y],
+                [rect.width, rect.height],
+                theme.row_hover,
+            );
+        } else if index > 0 && index != panel.active + 1 {
+            layout::push_rect(
+                out,
+                atlas,
+                [rect.x, rect.y + 6.0],
+                [1.0, rect.height - 12.0],
+                theme.hairline,
+            );
         }
         layout::hotspot(rect, layout::Cursor::Pointing, None);
+        let mut label_x = rect.x + layout::TAB_PADDING_X;
         // A tab waiting on the person: a dot before its title.
         if tab.attention.is_some() {
             layout::push_rounded_rect(
                 out,
                 Viewport {
-                    x: rect.x + 5.0,
+                    x: label_x - 5.0,
                     y: rect.y + rect.height / 2.0 - 3.0,
                     width: 6.0,
                     height: 6.0,
@@ -982,20 +1015,25 @@ pub fn draw(
                 3.0,
                 theme.accent,
             );
+            label_x += 5.0;
         }
         let colour = if tab.claude {
             theme.accent
         } else if active {
-            theme.text
+            theme.tab_text
         } else {
-            theme.status_text
+            theme.tab_text_inactive
         };
         layout::push_ui_text(
             out,
             atlas,
             Viewport {
-                x: rect.x + if tab.attention.is_some() { 15.0 } else { 10.0 },
-                width: (rect.width - 34.0).max(0.0),
+                x: label_x,
+                width: (rect.x + rect.width
+                    - layout::TAB_PADDING_X
+                    - layout::TAB_CLOSE_SLOT
+                    - label_x)
+                    .max(0.0),
                 ..rect
             },
             &label(tab),
@@ -1004,12 +1042,7 @@ pub fn draw(
         // The close cross on the tab that is showing and the one under the
         // pointer, the way editor tabs do it.
         if active || layout::hovered(rect) {
-            let square = Viewport {
-                y: close.y + ((close.height - 18.0) * 0.5).floor(),
-                height: 18.0,
-                ..close
-            };
-            Button::new(square)
+            Button::new(close)
                 .icon(icons::CLOSE)
                 .tone(Tone::Ghost)
                 .radius(layout::UI_RADIUS_SM)

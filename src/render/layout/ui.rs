@@ -26,6 +26,15 @@ pub const UI_CONTROL_SM: f32 = 22.0;
 pub const UI_RADIUS: f32 = 6.0;
 /// The corner of a small control or a row highlight.
 pub const UI_RADIUS_SM: f32 = 4.0;
+/// The corner of a card or a tile: a surface things sit on, not a control.
+pub const UI_RADIUS_LG: f32 = 8.0;
+/// A page's title, in points: a step above a heading, two above the
+/// sidebar's section names, and no display face.
+pub const UI_TITLE: f32 = 17.0;
+/// A heading inside a page: a group of settings, a section of facts.
+pub const UI_HEADING: f32 = 14.0;
+/// How far a segment sits inside its track.
+pub const UI_SEGMENT_INSET: f32 = 2.0;
 /// A panel's content inset from its edges.
 pub const UI_INSET: f32 = 12.0;
 /// The space between neighbouring controls.
@@ -279,11 +288,13 @@ impl<'a> Button<'a> {
         let down = self.enabled && pressed(self.rect);
         let clear = [0.0, 0.0, 0.0, 0.0];
         if !self.enabled {
-            let fill = match self.tone {
-                Tone::Ghost => clear,
-                _ => theme.tab_hover,
+            // A primary that cannot act yet is still the primary: the
+            // accent, washed out, not a lesser secondary.
+            return match self.tone {
+                Tone::Ghost => (clear, faded(theme.gutter_text, 0.8)),
+                Tone::Primary => (faded(theme.accent, 0.22), faded(theme.accent, 0.7)),
+                _ => (theme.tab_hover, faded(theme.gutter_text, 0.8)),
             };
-            return (fill, faded(theme.gutter_text, 0.8));
         }
         if self.on {
             let fill = if down {
@@ -479,9 +490,106 @@ pub fn push_row_hover(out: &mut Vec<GlyphInstance>, row: Viewport, theme: &Theme
         height: (row.height - 2.0).max(0.0),
     };
     if hovered(row) {
-        push_rounded_rect(out, inset, UI_RADIUS_SM + 1.0, theme.row_hover);
+        push_rounded_rect(out, inset, UI_RADIUS_SM, theme.row_hover);
     }
     hotspot(row, Cursor::Pointing, None);
+}
+
+// ---- the segmented control ----------------------------------------------
+// A track with the choices side by side and the chosen one lit: Grid or
+// Text over a table, Editor or Agents in the toolbar, the steps and the
+// filter over a file's history. One shape for every row of related
+// choices, so a row of them never reads as a row of unrelated buttons.
+
+/// One choice of a segmented control. Its `rect` is the cell in the
+/// track; the segment is drawn [`UI_SEGMENT_INSET`] inside it.
+#[derive(Clone, Copy, Debug)]
+pub struct Segment<'a> {
+    pub rect: Viewport,
+    pub label: &'a str,
+    pub icon: Option<char>,
+    /// The chosen one, lit with the accent.
+    pub on: bool,
+    pub enabled: bool,
+    pub tip: Option<&'a str>,
+}
+
+impl<'a> Segment<'a> {
+    pub fn new(rect: Viewport, label: &'a str) -> Self {
+        Self {
+            rect,
+            label,
+            icon: None,
+            on: false,
+            enabled: true,
+            tip: None,
+        }
+    }
+    pub fn icon(mut self, icon: char) -> Self {
+        self.icon = Some(icon);
+        self
+    }
+    pub fn on(mut self, on: bool) -> Self {
+        self.on = on;
+        self
+    }
+    pub fn enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+    pub fn tip(mut self, tip: &'a str) -> Self {
+        self.tip = Some(tip);
+        self
+    }
+}
+
+/// The track under a row of segments: from the first cell to the last.
+pub fn segmented_track(segments: &[Segment<'_>]) -> Option<Viewport> {
+    let (first, last) = (segments.first()?.rect, segments.last()?.rect);
+    Some(Viewport {
+        width: (last.x + last.width - first.x).max(0.0),
+        ..first
+    })
+}
+
+/// Draws a segmented control: the track in the control's resting fill,
+/// each segment a ghost button inside its cell, the chosen one on.
+pub fn push_segmented(
+    out: &mut Vec<GlyphInstance>,
+    atlas: &mut Atlas,
+    segments: &[Segment<'_>],
+    theme: &Theme,
+) {
+    let Some(track) = segmented_track(segments) else {
+        return;
+    };
+    let radius = if track.height <= UI_CONTROL_SM {
+        UI_RADIUS_SM
+    } else {
+        UI_RADIUS
+    };
+    push_rounded_rect(out, track, radius, theme.tab_hover);
+    for segment in segments {
+        let inner = Viewport {
+            x: segment.rect.x + UI_SEGMENT_INSET,
+            y: segment.rect.y + UI_SEGMENT_INSET,
+            width: (segment.rect.width - UI_SEGMENT_INSET * 2.0).max(0.0),
+            height: (segment.rect.height - UI_SEGMENT_INSET * 2.0).max(0.0),
+        };
+        let mut button = Button::new(inner)
+            .label(segment.label)
+            .tone(Tone::Ghost)
+            .radius(UI_RADIUS_SM)
+            .on(segment.on)
+            .enabled(segment.enabled);
+        if let Some(icon) = segment.icon {
+            button = button.icon(icon);
+        }
+        if let Some(tip) = segment.tip {
+            button = button.tip(tip);
+        }
+        button.draw(out, atlas, theme);
+    }
 }
 
 /// A small rounded count beside a heading: `Changes (3)` without the
@@ -652,8 +760,10 @@ pub fn push_skeleton_row(
     two_lines: bool,
     theme: &Theme,
 ) {
+    // A whole sine, so the breath eases in and out at both ends; folding
+    // half of it with abs() put a kink at every turn.
     let t = phase(1.6);
-    let breathe = 0.55 + 0.45 * (t * std::f32::consts::TAU).sin().abs();
+    let breathe = 0.55 + 0.45 * (0.5 - 0.5 * (t * std::f32::consts::TAU).cos());
     let fill = faded(theme.control_hover, breathe);
     let mut x = row.x;
     if icon > 0.0 {
@@ -665,7 +775,7 @@ pub fn push_skeleton_row(
                 width: icon,
                 height: icon,
             },
-            UI_RADIUS_SM + 1.0,
+            UI_RADIUS_SM,
             fill,
         );
         x += icon + 10.0;
@@ -714,9 +824,41 @@ pub fn push_title(
     super::markdown::push_prose(out, atlas, x, y, size, Face::Bold, text, color, limit)
 }
 
+/// A page's title at [`UI_TITLE`]: the one size and weight every page
+/// heads with. `y` is the top of the header row the title shares with
+/// its buttons; the title is set on their centre.
+pub fn push_page_title(
+    out: &mut Vec<GlyphInstance>,
+    atlas: &mut Atlas,
+    x: f32,
+    y: f32,
+    text: &str,
+    color: [f32; 4],
+    limit: f32,
+) -> f32 {
+    // Prose above the atlas's cap is drawn scaled up from the cap's cell.
+    let (_, ch) = atlas.cell_size();
+    let drawn = ch * (UI_TITLE / atlas.max_prose_pt()).max(1.0);
+    let top = y + ((UI_CONTROL - drawn) * 0.5).floor();
+    push_title(out, atlas, x, top, UI_TITLE, text, color, limit)
+}
+
+/// A heading inside a page at [`UI_HEADING`], top-left at `(x, y)`.
+pub fn push_heading(
+    out: &mut Vec<GlyphInstance>,
+    atlas: &mut Atlas,
+    x: f32,
+    y: f32,
+    text: &str,
+    color: [f32; 4],
+    limit: f32,
+) -> f32 {
+    push_title(out, atlas, x, y, UI_HEADING, text, color, limit)
+}
+
 /// A panel of grouped facts on a page: a faint rounded card.
 pub fn push_card(out: &mut Vec<GlyphInstance>, rect: Viewport, theme: &Theme) {
-    push_rounded_rect(out, rect, UI_RADIUS + 2.0, theme.md_code_background);
+    push_rounded_rect(out, rect, UI_RADIUS_LG, theme.md_code_background);
 }
 
 /// What a status-line message is: news, a success, or a failure.
@@ -1048,6 +1190,52 @@ pub fn push_empty_state(
 
 thread_local! {
     static ANIMATING: Cell<bool> = const { Cell::new(false) };
+    /// Frames drawn so far, and when the overlay last seen was first seen.
+    static FRAME: Cell<u64> = const { Cell::new(0) };
+    static OVERLAY: Cell<Option<(u64, u64, std::time::Instant)>> = const { Cell::new(None) };
+}
+
+/// How long an overlay takes to come in.
+pub const OVERLAY_FADE: std::time::Duration = std::time::Duration::from_millis(120);
+
+/// Marks the frame being drawn as one more; the overlay fade counts them.
+pub fn next_frame() {
+    FRAME.with(|f| f.set(f.get() + 1));
+}
+
+/// How far in an overlay is, 0..1: the palette, a popover. `id` names
+/// it; its fade starts the first frame it is drawn after a frame without
+/// it, and the window keeps redrawing only until it is whole. Eased so
+/// it settles rather than stops.
+pub fn overlay_alpha(id: u64) -> f32 {
+    let now = std::time::Instant::now();
+    let frame = FRAME.with(Cell::get);
+    let since = OVERLAY.with(|o| {
+        let since = match o.get() {
+            Some((seen, last, since)) if seen == id && last + 1 >= frame => since,
+            _ => now,
+        };
+        o.set(Some((id, frame, since)));
+        since
+    });
+    let t = now.duration_since(since).as_secs_f32() / OVERLAY_FADE.as_secs_f32();
+    if t >= 1.0 {
+        return 1.0;
+    }
+    ANIMATING.with(|a| a.set(true));
+    let t = t.clamp(0.0, 1.0);
+    t * (2.0 - t)
+}
+
+/// Thins everything drawn since `from` by `alpha`: the way a fade is
+/// applied to an overlay already built.
+pub fn fade_from(out: &mut [GlyphInstance], from: usize, alpha: f32) {
+    if alpha >= 1.0 {
+        return;
+    }
+    for glyph in out.iter_mut().skip(from) {
+        glyph.color[3] *= alpha;
+    }
 }
 
 /// Something drawn in this frame is still moving: the next one is wanted.
@@ -1198,6 +1386,66 @@ mod tests {
                 .y,
             rect.y
         );
+    }
+
+    #[test]
+    fn a_segmented_control_runs_one_track_under_its_cells() {
+        let cell = |x: f32| Viewport {
+            x,
+            y: 10.0,
+            width: 50.0,
+            height: UI_CONTROL,
+        };
+        let segments = [
+            Segment::new(cell(100.0), "Older"),
+            Segment::new(cell(150.0), "Newer"),
+            Segment::new(cell(200.0), "All").on(true),
+        ];
+        let track = segmented_track(&segments).expect("a track");
+        assert_eq!((track.x, track.width), (100.0, 150.0));
+        assert_eq!((track.y, track.height), (10.0, UI_CONTROL));
+        assert!(segmented_track(&[]).is_none());
+        // Drawn: the track, then a hotspot per segment inside its cell.
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let mut out = Vec::new();
+        begin_frame();
+        push_segmented(&mut out, &mut atlas, &segments, &Theme::dark());
+        let spots = hotspots();
+        assert_eq!(spots.len(), 3);
+        assert_eq!(spots[0].rect.x, 100.0 + UI_SEGMENT_INSET);
+        assert_eq!(spots[0].rect.height, UI_CONTROL - UI_SEGMENT_INSET * 2.0);
+    }
+
+    #[test]
+    fn a_disabled_primary_keeps_the_accent_and_an_overlay_fades_in_once() {
+        let theme = Theme::dark();
+        let rect = Viewport::new(80.0, UI_CONTROL);
+        set_pointer(None);
+        let primary = Button::new(rect).tone(Tone::Primary).enabled(false);
+        let secondary = Button::new(rect).tone(Tone::Secondary).enabled(false);
+        assert_ne!(primary.colours(&theme), secondary.colours(&theme));
+        assert_eq!(primary.colours(&theme).0[..3], theme.accent[..3]);
+        // An overlay: thin on its first frame, whole after the fade, and
+        // asking for frames only until then.
+        take_animating();
+        next_frame();
+        let first = overlay_alpha(7);
+        assert!(first < 1.0, "{first}");
+        assert!(take_animating());
+        std::thread::sleep(OVERLAY_FADE + std::time::Duration::from_millis(20));
+        next_frame();
+        assert_eq!(overlay_alpha(7), 1.0);
+        assert!(!take_animating());
+        // Gone for a frame, then back: it fades in again.
+        next_frame();
+        next_frame();
+        assert!(overlay_alpha(7) < 1.0);
+        take_animating();
+        let mut out = vec![GlyphInstance::default(); 2];
+        out[0].color = [1.0, 1.0, 1.0, 1.0];
+        out[1].color = [1.0, 1.0, 1.0, 0.5];
+        fade_from(&mut out, 1, 0.5);
+        assert_eq!((out[0].color[3], out[1].color[3]), (1.0, 0.25));
     }
 
     #[test]

@@ -163,7 +163,7 @@ fn draw_page(
 
     // The header: the title, then the actions from the right, the least
     // needed dropped first when the column is narrow.
-    let title_w = layout::push_title(out, atlas, x, y - 6.0, 20.0, "Settings", theme.text, 200.0);
+    let title_w = layout::push_page_title(out, atlas, x, y - 4.0, "Settings", theme.text, 200.0);
     let mut bx = right;
     for (label, action, primary) in [
         ("Close", Action::Close, false),
@@ -228,7 +228,7 @@ fn draw_page(
         }
     }
     for group in groups {
-        layout::push_title(out, atlas, x, y, 15.0, group, theme.text, measure);
+        layout::push_heading(out, atlas, x, y, group, theme.text, measure);
         y += 28.0;
         // Each row: the key and its value, Edit at the trailing edge, then
         // what it does and, when changed, the default.
@@ -275,7 +275,7 @@ fn draw_page(
                 );
             }
             if layout::hovered(row) {
-                layout::push_rounded_rect(out, row, layout::UI_RADIUS + 2.0, theme.row_hover);
+                layout::push_rounded_rect(out, row, layout::UI_RADIUS_LG, theme.row_hover);
             }
             let edit_w = layout::ui_text_width(atlas, "Edit") + 12.0;
             let edit = link(

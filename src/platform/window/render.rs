@@ -4,6 +4,9 @@
 use super::*;
 use crate::project::icons;
 
+/// The palette, to the overlay fade.
+const PALETTE_OVERLAY: u64 = 1;
+
 impl EditorView {
     pub(super) fn resize(&self, size: NSSize) {
         let scale = self.window().map_or(2.0, |w| w.backingScaleFactor());
@@ -45,6 +48,7 @@ impl EditorView {
         let key = self.key_window();
         let mut state = self.state_mut()?;
         layout::begin_frame();
+        layout::next_frame();
         super::terminal::report_focus(&mut state, key);
         sync_conflicts(&mut state);
         sync_tables(&mut state);
@@ -1269,6 +1273,9 @@ impl EditorView {
                 viewport,
                 layout::palette_rows_shown(rows.len(), words.loading),
             );
+            // The scrim and the palette come in together over a short
+            // fade; once whole, nothing here asks for another frame.
+            let overlay_from = glyphs.len();
             layout::push_rect(
                 glyphs,
                 &renderer.atlas,
@@ -1324,6 +1331,7 @@ impl EditorView {
                 theme,
                 glyphs,
             );
+            layout::fade_from(glyphs, overlay_from, layout::overlay_alpha(PALETTE_OVERLAY));
         }
 
         let background = theme.background;
@@ -1371,7 +1379,7 @@ fn draw_find_bar(
                  focused: bool,
                  trailing: Option<&str>| {
         if focused {
-            layout::push_focus_ring(glyphs, box_rect, 6.0, 1.5, theme);
+            layout::push_focus_ring(glyphs, box_rect, layout::UI_RADIUS, 1.5, theme);
         }
         layout::push_rounded_rect(glyphs, box_rect, layout::UI_RADIUS, theme.tab_active);
         layout::hotspot(box_rect, layout::Cursor::Text, None);
@@ -1520,7 +1528,6 @@ fn draw_find_bar(
     {
         Button::new(g.options[slot])
             .label(label)
-            .tone(Tone::Ghost)
             .on(on)
             .tip(tip)
             .draw(glyphs, atlas, theme);
@@ -1548,7 +1555,7 @@ fn draw_find_bar(
                         height: layout::FIND_ROW_HEIGHT - 2.0,
                         ..row_rect
                     },
-                    5.0,
+                    layout::UI_RADIUS_SM,
                     theme.palette_selected,
                 );
             }

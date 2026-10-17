@@ -1552,17 +1552,17 @@ pub fn toolbar_mode(rect: Viewport) -> Viewport {
 
 const MODE_WIDE: f32 = 172.0;
 
-/// The switch's two halves: Editor, then Agents.
+/// The switch's two cells: Editor, then Agents. Each is half the track;
+/// the segment drawn in it sits [`UI_SEGMENT_INSET`] inside.
 pub fn toolbar_mode_segments(rect: Viewport) -> [Viewport; 2] {
     let switch = toolbar_mode(rect);
-    let half = ((switch.width - 4.0) / 2.0).max(0.0);
-    let segment = |i: f32| Viewport {
-        x: switch.x + 2.0 + i * half,
-        y: switch.y + 2.0,
+    let half = (switch.width / 2.0).floor().max(0.0);
+    let cell = |i: f32| Viewport {
+        x: switch.x + i * half,
         width: half,
-        height: (switch.height - 4.0).max(0.0),
+        ..switch
     };
-    [segment(0.0), segment(1.0)]
+    [cell(0.0), cell(1.0)]
 }
 
 pub fn toolbar_search(rect: Viewport) -> Viewport {
@@ -1602,11 +1602,10 @@ pub fn build_toolbar(
         [rect.width, rect.height],
         theme.sidebar_background,
     );
-    // Icon buttons with no fill until the pointer is over them: a row of
-    // filled pills read as a second tab bar.
+    // The icon buttons sit on the same resting fill, at the same height
+    // and corner, as the mode switch's track: one shape across the bar.
     Button::new(toolbar_sidebar(rect))
         .icon(icons::SIDEBAR_LEFT)
-        .tone(Tone::Ghost)
         .tip("Show or Hide the Sidebar  \u{2318}B")
         .draw(out, atlas, theme);
     let search = toolbar_search(rect);
@@ -1658,43 +1657,24 @@ pub fn build_toolbar(
     }
     let switch = toolbar_mode(rect);
     if switch.width > 0.0 {
-        push_rounded_rect(out, switch, UI_RADIUS, theme.tab_active);
         let wide = switch.width >= MODE_WIDE;
         let [editor, agents_rect] = toolbar_mode_segments(rect);
-        for (segment, icon, label, tip, on) in [
-            (
-                editor,
-                icons::CODE,
-                "Editor",
-                "Editor  \u{21e7}\u{2318}A",
-                !agents,
-            ),
-            (
-                agents_rect,
-                icons::AGENT,
-                "Agents",
-                "Agents  \u{21e7}\u{2318}A",
-                agents,
-            ),
-        ] {
-            let button = Button::new(segment)
-                .icon(icon)
-                .tone(Tone::Ghost)
-                .radius(UI_RADIUS_SM)
-                .on(on)
-                .tip(tip);
-            if wide {
-                button.label(label).draw(out, atlas, theme);
-            } else {
-                button.draw(out, atlas, theme);
-            }
-        }
+        let segments = [
+            Segment::new(editor, if wide { "Editor" } else { "" })
+                .icon(icons::CODE)
+                .on(!agents)
+                .tip("Editor  \u{21e7}\u{2318}A"),
+            Segment::new(agents_rect, if wide { "Agents" } else { "" })
+                .icon(icons::AGENT)
+                .on(agents)
+                .tip("Agents  \u{21e7}\u{2318}A"),
+        ];
+        push_segmented(out, atlas, &segments, theme);
     }
     let terminal = toolbar_terminal(rect);
     if terminal.width > 0.0 && !agents {
         Button::new(terminal)
             .icon(icons::TERMINAL)
-            .tone(Tone::Ghost)
             .tip("Terminal  \u{2303}`")
             .draw(out, atlas, theme);
     }
@@ -1703,7 +1683,6 @@ pub fn build_toolbar(
     {
         Button::new(terminal)
             .icon(icons::SIDEBAR_RIGHT)
-            .tone(Tone::Ghost)
             .on(shown)
             .tip("Show or Hide the Workspace Inspector  \u{2325}\u{2318}I")
             .draw(out, atlas, theme);
@@ -1927,7 +1906,7 @@ pub fn build_palette(
     // A key cap: an outline, since a filled control vanishes on the
     // palette's own fill, lit when the pointer is on it.
     let escape = palette_escape(viewport);
-    push_rounded_rect(out, escape, UI_RADIUS_SM + 1.0, theme.control_pressed);
+    push_rounded_rect(out, escape, UI_RADIUS_SM, theme.control_pressed);
     push_rounded_rect(
         out,
         Viewport {
@@ -2123,19 +2102,20 @@ pub fn build_palette(
             width: viewport.width - 36.0,
             height: PALETTE_FOOTER,
         },
-        &format!("↑ ↓  Navigate       ↵  {action}       esc  Dismiss"),
+        // Escape is the key cap at the top right; said once.
+        &format!("↑ ↓  Navigate       ↵  {action}"),
         theme.status_text,
     );
 }
 
 /// Tab metrics in points, deliberately not multiples of the font cell: a
 /// control's size is a property of the platform, not of the user's font.
-pub(super) const TAB_PADDING_X: f32 = 12.0;
-pub(super) const TAB_CLOSE_SLOT: f32 = 22.0;
+pub const TAB_PADDING_X: f32 = 12.0;
+pub const TAB_CLOSE_SLOT: f32 = 22.0;
 pub(super) const TAB_MIN_WIDTH: f32 = 120.0;
 /// Side of the square hit box around the close glyph. Bigger than the glyph
 /// on purpose: the target is what you aim at, not what you see.
-pub(super) const TAB_CLOSE_HIT: f32 = 18.0;
+pub const TAB_CLOSE_HIT: f32 = 18.0;
 pub(super) const TAB_MAX_WIDTH: f32 = 240.0;
 
 pub fn tab_width(docs: &Documents, index: usize, advance: f32) -> f32 {

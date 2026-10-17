@@ -784,48 +784,17 @@ pub fn draw_strip(
         ));
     }
     layout::strip_facts(out, atlas, strip, pill, &facts, theme);
-    let hits = strip_hits(atlas, strip);
     // The two modes read as one control: a track, and the chosen half lit.
-    if let (Some((_, first)), Some((_, last))) = (hits.first(), hits.last()) {
-        layout::push_rounded_rect(
-            out,
-            Viewport {
-                width: last.x + last.width - first.x,
-                ..*first
-            },
-            layout::UI_RADIUS,
-            theme.tab_hover,
-        );
-    }
-    for (hit, rect) in hits {
-        let Hit::TableMode(grid) = hit else {
-            continue;
-        };
-        let chosen = grid == view.mode_grid;
-        let inner = Viewport {
-            x: rect.x + 2.0,
-            y: rect.y + 2.0,
-            width: rect.width - 4.0,
-            height: rect.height - 4.0,
-        };
-        if chosen {
-            layout::push_rounded_rect(out, inner, 5.0, theme.palette_selected);
-        } else if layout::hovered(rect) {
-            layout::push_rounded_rect(out, inner, 5.0, theme.control_hover);
-        }
-        layout::hotspot(rect, layout::Cursor::Pointing, None);
-        layout::push_ui_text_centered(
-            out,
-            atlas,
-            rect,
-            MODES[usize::from(!grid)],
-            if chosen {
-                theme.text
-            } else {
-                theme.status_text
-            },
-        );
-    }
+    let segments: Vec<layout::Segment<'_>> = strip_hits(atlas, strip)
+        .into_iter()
+        .filter_map(|(hit, rect)| {
+            let Hit::TableMode(grid) = hit else {
+                return None;
+            };
+            Some(layout::Segment::new(rect, MODES[usize::from(!grid)]).on(grid == view.mode_grid))
+        })
+        .collect();
+    layout::push_segmented(out, atlas, &segments, theme);
     layout::strip_hairline(out, atlas, strip, theme);
 }
 

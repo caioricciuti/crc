@@ -194,7 +194,7 @@ impl Theme {
             find_match: [0.886, 0.643, 0.227, 0.30],
             sidebar_selected: [0.122, 0.541, 0.388, 0.12],
             palette_selected: [0.122, 0.541, 0.388, 0.12],
-            scrim: [0.000, 0.000, 0.000, 0.18],
+            scrim: [0.000, 0.000, 0.000, 0.26],
 
             syn_keyword: [0.486, 0.227, 0.929, 1.0],
             syn_function: [0.114, 0.306, 0.847, 1.0],
@@ -268,7 +268,7 @@ impl Default for Theme {
             find_match: [0.886, 0.643, 0.227, 0.16],
             sidebar_selected: [0.651, 0.867, 0.761, 0.12],
             palette_selected: [0.651, 0.867, 0.761, 0.12],
-            scrim: [0.000, 0.000, 0.000, 0.28],
+            scrim: [0.000, 0.000, 0.000, 0.40],
 
             // Syntax. Eight hue families that stay apart at the code size on
             // the graphite background: names are cool (violet, blue, mint,

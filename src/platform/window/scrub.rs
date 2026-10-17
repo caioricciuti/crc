@@ -984,15 +984,11 @@ pub(super) struct StripRects {
     pub(super) track: Viewport,
 }
 
+/// The steps, the filter and the comparison are one segmented control:
+/// their cells touch, and the track runs under all four.
 pub(super) fn strip_rects(atlas: &mut Atlas, strip: Viewport) -> StripRects {
     let older = layout::strip_button(atlas, strip, strip.x + 16.0, OLDER, 24.0);
-    let newer = layout::strip_button(
-        atlas,
-        strip,
-        older.x + older.width + layout::UI_GAP,
-        NEWER,
-        24.0,
-    );
+    let newer = layout::strip_button(atlas, strip, older.x + older.width, NEWER, 24.0);
     let widest = [Filter::All, Filter::Commits, Filter::Local]
         .into_iter()
         .max_by(|a, b| {
@@ -1003,20 +999,8 @@ pub(super) fn strip_rects(atlas: &mut Atlas, strip: Viewport) -> StripRects {
             a.total_cmp(&b)
         })
         .unwrap_or_default();
-    let filter = layout::strip_button(
-        atlas,
-        strip,
-        newer.x + newer.width + layout::UI_GAP,
-        widest.label(),
-        24.0,
-    );
-    let compare = layout::strip_button(
-        atlas,
-        strip,
-        filter.x + filter.width + layout::UI_GAP,
-        COMPARE,
-        24.0,
-    );
+    let filter = layout::strip_button(atlas, strip, newer.x + newer.width, widest.label(), 24.0);
+    let compare = layout::strip_button(atlas, strip, filter.x + filter.width, COMPARE, 24.0);
     let restore = layout::strip_button(atlas, strip, 0.0, RESTORE, 24.0);
     let restore = Viewport {
         x: strip.x + strip.width - 16.0 - restore.width,
@@ -1211,37 +1195,45 @@ pub(super) fn draw_strip(
     };
     layout::strip_facts(out, atlas, strip, pill, &facts, theme);
     let (older, newer) = steps_open(scrub);
-    Button::new(rects.older)
-        .label(OLDER)
-        .enabled(older)
-        .tip("Older Version  \u{2190}")
-        .draw(out, atlas, theme);
-    Button::new(rects.newer)
-        .label(NEWER)
-        .enabled(newer)
-        .tip("Newer Version  \u{2192}")
-        .draw(out, atlas, theme);
-    // Lit while it leaves some versions out.
-    Button::new(rects.filter)
-        .label(scrub.filter.label())
-        .enabled(filter_open(scrub))
-        .on(scrub.filter != Filter::All)
-        .tip("Show All Versions, Commits or Local Versions")
-        .draw(out, atlas, theme);
-    Button::new(rects.compare)
-        .label(COMPARE)
-        .enabled(scrub.versions.is_some())
-        .on(scrub.against_tree)
-        .tip(if scrub.against_tree {
-            "Marking Changes Against the Working Tree"
-        } else {
-            "Mark Changes Against the Working Tree, Not the Version Before"
-        })
-        .draw(out, atlas, theme);
+    // One control: the steps, the filter (lit while it leaves versions
+    // out) and the comparison (lit while the gutter marks against the
+    // working tree).
+    layout::push_segmented(
+        out,
+        atlas,
+        &[
+            layout::Segment::new(rects.older, OLDER)
+                .enabled(older)
+                .tip("Older Version  \u{2190}"),
+            layout::Segment::new(rects.newer, NEWER)
+                .enabled(newer)
+                .tip("Newer Version  \u{2192}"),
+            layout::Segment::new(rects.filter, scrub.filter.label())
+                .enabled(filter_open(scrub))
+                .on(scrub.filter != Filter::All)
+                .tip("Show All Versions, Commits or Local Versions"),
+            layout::Segment::new(rects.compare, COMPARE)
+                .enabled(scrub.versions.is_some())
+                .on(scrub.against_tree)
+                .tip(if scrub.against_tree {
+                    "Marking Changes Against the Working Tree"
+                } else {
+                    "Mark Changes Against the Working Tree, Not the Version Before"
+                }),
+        ],
+        theme,
+    );
+    // Restore throws the working tree's text away: plain until a past
+    // version is shown and read, then the strip's one primary action.
+    let restorable = scrub.restorable().is_ok();
     Button::new(rects.restore)
         .label(RESTORE)
-        .tone(Tone::Primary)
-        .enabled(scrub.restorable().is_ok())
+        .tone(if restorable {
+            Tone::Primary
+        } else {
+            Tone::Secondary
+        })
+        .enabled(restorable)
         .tip("Restore This Version")
         .draw(out, atlas, theme);
     Button::new(rects.close)
@@ -1382,16 +1374,29 @@ fn draw_timeline(
             );
         }
     }
-    // The working tree: a ring, not a tick, as it is no commit.
+    // The working tree: the thumb's own shape, hollow, at the right end.
+    // It is no commit, so no tick; and it is where the thumb rests, so it
+    // is the thumb's outline rather than a second shape on the line.
     let ground = theme.background.map(|c| c as f32);
-    let ring = |size: f32| Viewport {
-        x: m.snap(last - size * 0.5),
-        y: mid - size * 0.5,
-        width: size,
-        height: size,
+    let thumb_at = |x: f32| Viewport {
+        x: m.snap(x - THUMB.0 * 0.5),
+        y: mid - THUMB.1 * 0.5,
+        width: THUMB.0,
+        height: THUMB.1,
     };
-    layout::push_rounded_rect(out, ring(10.0), 5.0, layout::faded(ink, 0.9));
-    layout::push_rounded_rect(out, ring(6.0), 3.0, ground);
+    let home = thumb_at(last);
+    layout::push_rounded_rect(out, home, THUMB.0 * 0.5, layout::faded(ink, 0.9));
+    layout::push_rounded_rect(
+        out,
+        Viewport {
+            x: home.x + 1.5,
+            y: home.y + 1.5,
+            width: (home.width - 3.0).max(0.0),
+            height: (home.height - 3.0).max(0.0),
+        },
+        (THUMB.0 - 3.0) * 0.5,
+        ground,
+    );
     // Under the pointer: that version brighter, and what it is said when
     // the pointer rests there.
     layout::hotspot(track, layout::Cursor::Pointing, None);
@@ -1413,19 +1418,17 @@ fn draw_timeline(
         );
     }
     // The thumb, dimmer while the version it is on is read.
-    let thumb = Viewport {
-        x: m.snap(x_of(scrub.center()) - 3.0),
-        y: mid - 9.0,
-        width: 6.0,
-        height: 18.0,
-    };
+    let thumb = thumb_at(x_of(scrub.center()));
     let fill = if scrub.pending.is_some() {
         layout::faded(theme.accent, 0.55)
     } else {
         theme.accent
     };
-    layout::push_rounded_rect(out, thumb, 3.0, fill);
+    layout::push_rounded_rect(out, thumb, THUMB.0 * 0.5, fill);
 }
+
+/// The timeline thumb's width and height: a pill standing on the line.
+const THUMB: (f32, f32) = (6.0, 18.0);
 
 /// What the self-test dump says of the strip: its facts, uncut, its
 /// place, and which steps it offers.
