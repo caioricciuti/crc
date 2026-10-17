@@ -8,7 +8,8 @@
 //! only: what the branch changes since it left, uncommitted work included.
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, mpsc};
 
 use crate::platform::git_panel::{DIFF_LINE, draw_diff_lines};
 use crate::platform::mcp_page::{button, link, text};
@@ -27,6 +28,11 @@ const ROW: f32 = 44.0;
 const SESSION_ROW: f32 = 54.0;
 /// A branch review shows this many files at most.
 const BRANCH_FILES: usize = 500;
+/// A file the page lists, written to, is read again once the writes pause
+/// for this long: an agent at work writes every few hundred milliseconds,
+/// the watcher hands them on in batches, and each read is of every
+/// session.
+const QUIET: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// What a click on the page does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,6 +107,41 @@ pub enum Load {
 /// A read on a worker: which, and the answer to come. Nothing else reads
 /// a file for the page, so a store of thousands of files never holds the
 /// main thread.
+/// Writes to files the page lists, counted, and the count a worker read
+/// the sessions at: a count moved past since means a write the read did
+/// not see.
+#[derive(Default)]
+pub struct Touches {
+    count: AtomicUsize,
+    read_at: AtomicUsize,
+}
+
+impl Touches {
+    /// Reads every session, noting which writes it saw.
+    fn read(&self) -> Result<Vec<Session>, String> {
+        self.read_at
+            .store(self.count.load(Ordering::Relaxed), Ordering::Relaxed);
+        Ok(load())
+    }
+
+    /// Waits for the writes to pause for [`QUIET`].
+    fn wait_quiet(&self) {
+        let mut seen = self.count.load(Ordering::Relaxed);
+        loop {
+            std::thread::sleep(QUIET);
+            let now = self.count.load(Ordering::Relaxed);
+            if now == seen {
+                return;
+            }
+            seen = now;
+        }
+    }
+
+    fn unread(&self) -> bool {
+        self.count.load(Ordering::Relaxed) != self.read_at.load(Ordering::Relaxed)
+    }
+}
+
 pub struct Loading {
     pub what: Load,
     /// The answer, with how long the worker took over it.
@@ -140,6 +181,8 @@ pub struct Page {
     /// The counts changed since the sessions were last read, while the
     /// page was off screen: read again once it is back on.
     pub stale: bool,
+    /// Writes the watcher saw to files the page lists.
+    pub touches: Arc<Touches>,
     /// How many reads were started, and how long the last one took on
     /// its worker, for the self-test.
     pub loads: usize,
@@ -154,8 +197,40 @@ impl Page {
     /// when it is asked for.
     pub fn reload(&mut self) {
         if self.starts_now() {
-            self.spawn(Load::Sessions, || Ok(load()));
+            let touches = Arc::clone(&self.touches);
+            self.spawn(Load::Sessions, move || touches.read());
         }
+    }
+
+    /// Whether the page lists `path`.
+    pub fn lists(&self, path: &Path) -> bool {
+        self.sessions
+            .iter()
+            .any(|s| s.files.iter().any(|e| e.file.path == path))
+    }
+
+    /// A write the watcher saw: when it is to a file the page lists, the
+    /// file's changes are read again once the writes pause, so a burst
+    /// costs one read; a write during a read is caught when it lands. Says
+    /// whether the write was one the page shows.
+    pub fn touched_by(&mut self, path: &Path) -> bool {
+        if !self.lists(path) {
+            return false;
+        }
+        self.touches.count.fetch_add(1, Ordering::Relaxed);
+        self.read_after_quiet();
+        true
+    }
+
+    fn read_after_quiet(&mut self) {
+        if self.loading.is_some() || self.sessions.first().is_some_and(Session::read_only) {
+            return;
+        }
+        let touches = Arc::clone(&self.touches);
+        self.spawn(Load::Sessions, move || {
+            touches.wait_quiet();
+            touches.read()
+        });
     }
 
     /// Whether a read of the sessions asked for now starts, rather than
@@ -233,6 +308,8 @@ impl Page {
         };
         if self.landed() {
             self.reload();
+        } else if self.touches.unread() {
+            self.read_after_quiet();
         }
         Some(said)
     }
@@ -366,10 +443,11 @@ impl Page {
             .unwrap_or_default()
             + if self.awaiting() { " loading" } else { "" }
             + &format!(
-                "\nreview_loading: {}\nreview_loads: {}\nreview_load_ms: {}",
+                "\nreview_loading: {}\nreview_loads: {}\nreview_load_ms: {}\nreview_diff_lines: {}",
                 self.loading.is_some(),
                 self.loads,
-                self.load_took.as_millis()
+                self.load_took.as_millis(),
+                self.selected_entry().map_or(0, |e| e.diff.lines.len())
             )
     }
 }
@@ -1035,6 +1113,46 @@ mod tests {
         assert!(page.landed(), "one more read follows the one that ran");
         let _tx = reading(&mut page);
         assert!(!page.landed(), "and only one");
+    }
+
+    /// A page listing `path` from one session.
+    fn listing(path: &Path) -> Page {
+        let file = review::File {
+            path: path.to_path_buf(),
+            checkpoint: review::Checkpoint::Absent,
+        };
+        Page {
+            open: true,
+            sessions: vec![Session {
+                dir: PathBuf::from("/s/one"),
+                title: "Terminal".into(),
+                folder: PathBuf::from("/p"),
+                files: vec![Entry {
+                    file,
+                    diff: Diff::default(),
+                    seen: 0,
+                    whole_only: None,
+                    change: None,
+                    tag: None,
+                }],
+                source: Source::Checkpoints,
+            }],
+            ..Page::default()
+        }
+    }
+
+    #[test]
+    fn a_write_to_a_listed_file_asks_for_a_read_and_others_do_not() {
+        let listed = PathBuf::from("/p/listed.txt");
+        let mut page = listing(&listed);
+        // A read in flight, so the write is counted for it to catch.
+        let _tx = reading(&mut page);
+        assert!(!page.touched_by(Path::new("/p/other.txt")));
+        assert!(!page.touches.unread());
+        assert!(page.touched_by(&listed));
+        assert!(page.touches.unread(), "a write the read did not see");
+        assert!(!page.again, "not the again path: that read runs at once");
+        assert_eq!(page.loads, 0);
     }
 
     #[test]

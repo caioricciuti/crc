@@ -123,6 +123,16 @@ pub(super) fn note_unhooked_writes(state: &mut State) {
     if changed.is_empty() {
         return;
     }
+    // A write to a file the page lists changes no count: the page is told
+    // itself, and reads again once the writes pause, or once it is back
+    // on screen.
+    if shown(state) {
+        for path in &changed {
+            state.review_page.touched_by(path);
+        }
+    } else if state.review_page.open && changed.iter().any(|p| state.review_page.lists(p)) {
+        state.review_page.stale = true;
+    }
     let live: Vec<std::path::PathBuf> = state
         .terminal
         .tabs

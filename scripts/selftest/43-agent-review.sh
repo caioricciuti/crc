@@ -20,13 +20,19 @@ printf 'written by a shell command\n' > "$T/reviewproj/shell.txt"
 printf '{"message":"Claude is waiting for your input"}' | "$hook_bin" --hook notify
 printf 'done\n'
 # Then, with the page open, a burst of writes to a file already under
-# review, as an agent at work makes: 20 writes, one every 0.4 s.
+# review, as an agent at work makes: 20 writes, one every 0.4 s, the
+# last of 20 lines.
 sleep 3
 i=0
 while [ \$i -lt 20 ]; do
-    printf 'burst %s\n' \$i > "$T/reviewproj/new.txt"
-    sleep 0.4
     i=\$((i+1))
+    k=0
+    : > "$T/reviewproj/new.txt"
+    while [ \$k -lt \$i ]; do
+        k=\$((k+1))
+        printf 'burst %s line %s\n' \$i \$k >> "$T/reviewproj/new.txt"
+    done
+    sleep 0.4
 done
 sleep 30
 AGENT
@@ -43,8 +49,9 @@ wait 300
 dump $T/review-open.out
 SCRIPT
 # The burst lands while the page is open: the display link runs between
-# these waits, so the watcher's changes are taken as they come.
-for _ in $(seq 44); do echo 'wait 200'; done >> "$T/review.script"
+# these waits, so the watcher's changes are taken as they come; short
+# waits, so they are taken soon after each write.
+for _ in $(seq 90); do echo 'wait 100'; done >> "$T/review.script"
 cat >> "$T/review.script" <<SCRIPT
 dump $T/review-burst.out
 click @review_page.select.0.1
@@ -74,13 +81,17 @@ expect "$T/review.out" terminals "waiting: Claude is waiting for your input revi
 # Home lists the session; its row opens the page, newest session first,
 # files in path order: new.txt, then notes.txt.
 expect "$T/review-open.out" review_page "open sessions=1 files=3 hunks=1 shown=new.txt confirm=false targets=10"
-# The burst changed nothing Home counts, so the page was not read again
-# for it: once for opening, and never on the main thread. Reading every
-# session's files on each watcher event kept the window at 100% CPU.
+# The burst changed nothing Home counts; the page read its file again
+# once the writes paused, on a worker: a read for opening, one for the
+# burst. Reading every session's files on the main thread on each watcher
+# event kept the window at 100% CPU.
 expect "$T/review-burst.out" review_page "open sessions=1 files=3 hunks=1 shown=new.txt confirm=false targets=10"
+expect "$T/review-open.out" review_diff_lines "2"
+expect "$T/review-burst.out" review_diff_lines "21"
 loads=$(grep -m1 '^review_loads: ' "$T/review-burst.out" | sed 's/^review_loads: //')
 [ -n "$loads" ] && [ "$loads" -le 3 ] \
     || failed "review-burst.out: the page was read $loads times for a burst of 20 writes"
+echo "review: the page was read $loads times for opening it and a burst of 20 writes"
 # notes.txt has two changes: Keep the first, Undo the second. The file
 # keeps B and goes back to l, and with nothing left it leaves the review.
 expect "$T/review-kept.out" review_page "open sessions=1 files=3 hunks=1 shown=notes.txt confirm=false targets=10"
