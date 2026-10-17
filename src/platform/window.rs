@@ -3266,6 +3266,42 @@ define_class!(
             self.after_edit();
         }
 
+        // The Table menu: each on the grid's selected cell, see `table_edit`.
+        #[unsafe(method(tableInsertRowAbove:))]
+        fn action_table_insert_row_above(&self, _sender: Option<&AnyObject>) {
+            self.table_edit(crate::platform::table::Op::InsertRecordAbove);
+        }
+
+        #[unsafe(method(tableInsertRowBelow:))]
+        fn action_table_insert_row_below(&self, _sender: Option<&AnyObject>) {
+            self.table_edit(crate::platform::table::Op::InsertRecordBelow);
+        }
+
+        #[unsafe(method(tableDeleteRow:))]
+        fn action_table_delete_row(&self, _sender: Option<&AnyObject>) {
+            self.table_edit(crate::platform::table::Op::DeleteRecord);
+        }
+
+        #[unsafe(method(tableInsertColumnLeft:))]
+        fn action_table_insert_column_left(&self, _sender: Option<&AnyObject>) {
+            self.table_edit(crate::platform::table::Op::InsertColumnLeft);
+        }
+
+        #[unsafe(method(tableInsertColumnRight:))]
+        fn action_table_insert_column_right(&self, _sender: Option<&AnyObject>) {
+            self.table_edit(crate::platform::table::Op::InsertColumnRight);
+        }
+
+        #[unsafe(method(tableDeleteColumn:))]
+        fn action_table_delete_column(&self, _sender: Option<&AnyObject>) {
+            self.table_edit(crate::platform::table::Op::DeleteColumn);
+        }
+
+        #[unsafe(method(tableClearCell:))]
+        fn action_table_clear_cell(&self, _sender: Option<&AnyObject>) {
+            self.table_edit(crate::platform::table::Op::ClearCell);
+        }
+
         #[unsafe(method(moveLineUp:))]
         fn action_move_line_up(&self, _sender: Option<&AnyObject>) {
             if let Some(mut state) = self.state_mut() {
@@ -4765,6 +4801,16 @@ define_class!(
                 active_conflicts(&state).is_some_and(|v| v.can_resolve())
             } else if action == sel!(triggerCompletion:) {
                 !field_has_keys(&state)
+            } else if action == sel!(tableInsertRowAbove:)
+                || action == sel!(tableInsertRowBelow:)
+                || action == sel!(tableDeleteRow:)
+                || action == sel!(tableInsertColumnLeft:)
+                || action == sel!(tableInsertColumnRight:)
+                || action == sel!(tableDeleteColumn:)
+                || action == sel!(tableClearCell:)
+            {
+                // The grid, with a cell to act on.
+                table_grid(&state) && active_table(&state).is_some_and(|view| view.selected.is_some())
             } else if action == sel!(goToDefinition:)
                 || action == sel!(showHover:)
                 || action == sel!(quickFix:)
@@ -5153,6 +5199,11 @@ impl EditorView {
             } else {
                 Some(project_menu(mtm))
             }
+        } else if chrome.text.contains(x, y) && self.state().is_some_and(|state| table_grid(&state))
+        {
+            // The grid: its commands, on the cell under the pointer.
+            self.table_secondary_press(x, y);
+            Some(table_context_menu(mtm))
         } else {
             let (commands, lsp) = self.state().map(|state| {
                 let lsp = lsp_server_for(&state, state.docs.active()).is_some();
@@ -8955,6 +9006,33 @@ fn editor_context_menu(
     menu
 }
 
+/// The Table menu's commands in menu order: the title and the action the
+/// editor handles it by. Shared by the menu bar and the grid's context menu.
+fn table_commands() -> [(&'static str, Sel); 7] {
+    [
+        ("Insert Row Above", sel!(tableInsertRowAbove:)),
+        ("Insert Row Below", sel!(tableInsertRowBelow:)),
+        ("Delete Row", sel!(tableDeleteRow:)),
+        ("Insert Column Left", sel!(tableInsertColumnLeft:)),
+        ("Insert Column Right", sel!(tableInsertColumnRight:)),
+        ("Delete Column", sel!(tableDeleteColumn:)),
+        ("Clear Cell", sel!(tableClearCell:)),
+    ]
+}
+
+/// Right-click menu on the grid: the Table menu's commands, on the cell
+/// under the pointer, which the press selected.
+fn table_context_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
+    let menu = context_menu_new(mtm);
+    for (title, action) in table_commands() {
+        menu.addItem(&menu_item(mtm, title, action));
+        if title == "Delete Row" || title == "Delete Column" {
+            menu.addItem(&NSMenuItem::separatorItem(mtm));
+        }
+    }
+    menu
+}
+
 /// One item per enabled extension, named for it, holding its commands; each
 /// command's tag is its index in `commands`, which `runExtensionCommand:`
 /// runs. The menu bar's Extensions menu and the editor's context menu both
@@ -9126,6 +9204,18 @@ fn install_menu(mtm: MainThreadMarker, app: &NSApplication) {
     ));
     edit_item.setSubmenu(Some(&edit_menu));
     menubar.addItem(&edit_item);
+
+    // The grid's commands, on its selected cell. Greyed out everywhere
+    // else, and in the palette as "Table" commands.
+    let (table_item, table_menu) = submenu("Table");
+    for (title, action) in table_commands() {
+        table_menu.addItem(&item(title, action, "", false));
+        if title == "Delete Row" || title == "Delete Column" {
+            table_menu.addItem(&NSMenuItem::separatorItem(mtm));
+        }
+    }
+    table_item.setSubmenu(Some(&table_menu));
+    menubar.addItem(&table_item);
 
     let (view_item, view_menu) = submenu("View");
     view_menu.addItem(&item("Toggle Sidebar", sel!(toggleSidebar:), "b", false));

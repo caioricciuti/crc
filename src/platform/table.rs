@@ -193,6 +193,38 @@ pub enum Move {
     PageDown,
 }
 
+/// One range of the parsed text and what replaces it.
+pub type Edit = (Range<usize>, String);
+
+/// The Table menu's commands, each on the selected cell's record or column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Op {
+    InsertRecordAbove,
+    InsertRecordBelow,
+    DeleteRecord,
+    InsertColumnLeft,
+    InsertColumnRight,
+    DeleteColumn,
+    ClearCell,
+}
+
+impl Op {
+    /// The cell selected once `self` has been applied at `(record,
+    /// column)`: the first cell of a new record, the new cell of a new
+    /// column, the cell now where a deleted one was. Clamped by the caller
+    /// once the text is reparsed.
+    pub fn selection_after(self, record: usize, column: usize) -> (usize, usize) {
+        match self {
+            Op::InsertRecordAbove => (record, 0),
+            Op::InsertRecordBelow => (record + 1, 0),
+            Op::InsertColumnRight => (record, column + 1),
+            Op::DeleteRecord | Op::InsertColumnLeft | Op::DeleteColumn | Op::ClearCell => {
+                (record, column)
+            }
+        }
+    }
+}
+
 impl TableView {
     fn parse(rope: &Rope) -> Self {
         let text = rope.to_string();
@@ -347,6 +379,142 @@ impl TableView {
                 Some((row.range.end..row.range.end, text))
             }
         }
+    }
+
+    /// The edits of `op` on the selected cell: the ranges of the parsed
+    /// text and their replacements, in order and without overlap, for one
+    /// `replace_ranges` call and one undo step. `None` when there is no
+    /// such cell or nothing would change.
+    pub fn edit(&self, op: Op, record: usize, column: usize) -> Option<Vec<Edit>> {
+        match op {
+            Op::InsertRecordAbove => self.record_insertion(record, false),
+            Op::InsertRecordBelow => self.record_insertion(record, true),
+            Op::DeleteRecord => self.record_deletion(record),
+            Op::InsertColumnLeft => self.column_insertion(column, false),
+            Op::InsertColumnRight => self.column_insertion(column, true),
+            Op::DeleteColumn => self.column_deletion(column),
+            Op::ClearCell => self
+                .cell_replacement(record, column, "")
+                .map(|edit| vec![edit]),
+        }
+    }
+
+    /// `edits`, when there are several, as the one edit that spans them:
+    /// the text from the first range's start to the last range's end with
+    /// every replacement in place. The buffer rebuilds its rope once per
+    /// range, and a column edit of a big file is a range per record, which
+    /// is seconds; one range is milliseconds. The same text results.
+    pub fn coalesce(&self, edits: Vec<Edit>) -> Vec<Edit> {
+        let (Some((first, _)), Some((last, _))) = (edits.first(), edits.last()) else {
+            return edits;
+        };
+        if edits.len() < 2 {
+            return edits;
+        }
+        let span = first.start..last.end;
+        let mut text = String::with_capacity(span.len() + edits.len());
+        let mut at = span.start;
+        for (range, replacement) in &edits {
+            text.extend(self.rope.chunks_in(at..range.start));
+            text.push_str(replacement);
+            at = range.end;
+        }
+        vec![(span, text)]
+    }
+
+    /// A record of empty cells, as many as the grid has columns.
+    fn empty_record(&self) -> String {
+        std::iter::repeat_n(
+            self.dialect.delimiter as char,
+            self.column_count().saturating_sub(1),
+        )
+        .collect()
+    }
+
+    /// An empty record before `record`, or after it. The new record takes
+    /// the file's line ending; after the last record of a file without a
+    /// trailing one, the ending goes before it and the file stays without.
+    pub fn record_insertion(&self, record: usize, after: bool) -> Option<Vec<Edit>> {
+        let rows = &self.table.rows;
+        let row = rows.get(record)?;
+        let ending = self.dialect.line_ending_text();
+        let blank = self.empty_record();
+        let (at, text) = if !after {
+            (row.range.start, format!("{blank}{ending}"))
+        } else if let Some(next) = rows.get(record + 1) {
+            (next.range.start, format!("{blank}{ending}"))
+        } else if row.range.end < self.rope.len_bytes() {
+            (self.rope.len_bytes(), format!("{blank}{ending}"))
+        } else {
+            (row.range.end, format!("{ending}{blank}"))
+        };
+        Some(vec![(at..at, text)])
+    }
+
+    /// `record` and one line ending: the one after it, or before it for the
+    /// last record. Deleting the only record leaves the file empty.
+    pub fn record_deletion(&self, record: usize) -> Option<Vec<Edit>> {
+        let rows = &self.table.rows;
+        let row = rows.get(record)?;
+        let range = if let Some(next) = rows.get(record + 1) {
+            row.range.start..next.range.start
+        } else if record > 0 {
+            rows[record - 1].range.end..row.range.end
+        } else {
+            row.range.start..self.rope.len_bytes()
+        };
+        Some(vec![(range, String::new())])
+    }
+
+    /// An empty cell left of `column`, or right of it, in every record, the
+    /// header included: one delimiter where the cell goes. A record that
+    /// ends before the column is padded up to it, so the column exists in
+    /// every record afterwards.
+    pub fn column_insertion(&self, column: usize, after: bool) -> Option<Vec<Edit>> {
+        if column >= self.column_count() {
+            return None;
+        }
+        let at = if after { column + 1 } else { column };
+        let delimiter = self.dialect.delimiter as char;
+        let edits = self
+            .table
+            .rows
+            .iter()
+            .map(|row| match row.cells.get(at) {
+                Some(cell) => (cell.range.start..cell.range.start, delimiter.to_string()),
+                None => {
+                    let missing = at + 1 - row.cells.len();
+                    let padding = std::iter::repeat_n(delimiter, missing).collect();
+                    (row.range.end..row.range.end, padding)
+                }
+            })
+            .collect();
+        Some(edits)
+    }
+
+    /// `column` out of every record that has it: the cell and the delimiter
+    /// after it, or before it for a record's last cell. A record too short
+    /// to have the column is left alone; the only cell of a one-column
+    /// record is emptied, which leaves an empty line.
+    pub fn column_deletion(&self, column: usize) -> Option<Vec<Edit>> {
+        if column >= self.column_count() {
+            return None;
+        }
+        let edits: Vec<Edit> = self
+            .table
+            .rows
+            .iter()
+            .filter_map(|row| {
+                let cell = row.cells.get(column)?;
+                let range = match row.cells.get(column + 1) {
+                    Some(next) => cell.range.start..next.range.start,
+                    None if column > 0 => row.cells[column - 1].range.end..cell.range.end,
+                    None => cell.range.clone(),
+                };
+                Some((range, String::new()))
+            })
+            .collect();
+        (!edits.is_empty()).then_some(edits)
     }
 
     /// Where a record's row starts on screen: the header at the top, a body
@@ -1410,5 +1578,323 @@ mod tests {
             100.0 + gutter - 40.0,
             "under the gutter, the draw cuts it"
         );
+    }
+
+    /// `edits` applied to `text`, as the buffer applies them.
+    fn splice(text: &str, edits: &[Edit]) -> String {
+        let mut out = text.to_string();
+        for (range, replacement) in edits.iter().rev() {
+            out.replace_range(range.clone(), replacement);
+        }
+        out
+    }
+
+    /// `op` at `(record, column)` of a table of `text` gives `expected`:
+    /// by the ranges alone, and through a buffer as the window does it,
+    /// where one undo brings the text back. The buffer holds LF only, so
+    /// a CRLF text is checked by the ranges alone.
+    fn check(text: &str, op: Op, (record, column): (usize, usize), expected: &str) {
+        let view = TableView::parse(&Rope::from_text(text));
+        let edits = view
+            .edit(op, record, column)
+            .unwrap_or_else(|| panic!("{op:?} at {record},{column} on {text:?}: no edit"));
+        assert_eq!(
+            splice(text, &edits),
+            expected,
+            "{op:?} at {record},{column}"
+        );
+        if text.contains('\r') {
+            return;
+        }
+        let mut b = buffer("op.csv", text);
+        b.place_cursor(edits[0].0.start, Motion::Move);
+        assert_eq!(b.replace_ranges(&edits), edits.len());
+        assert_eq!(b.rope.to_string(), expected, "{op:?} in the buffer");
+        assert!(b.undo());
+        assert_eq!(b.rope.to_string(), text, "{op:?} undone");
+    }
+
+    const GRID: &str = "a,b,c\n1,2,3\n4,5,6\n";
+
+    #[test]
+    fn records_are_inserted_above_and_below_with_the_line_ending() {
+        check(
+            GRID,
+            Op::InsertRecordAbove,
+            (1, 1),
+            "a,b,c\n,,\n1,2,3\n4,5,6\n",
+        );
+        check(
+            GRID,
+            Op::InsertRecordBelow,
+            (1, 1),
+            "a,b,c\n1,2,3\n,,\n4,5,6\n",
+        );
+        check(
+            GRID,
+            Op::InsertRecordBelow,
+            (2, 0),
+            "a,b,c\n1,2,3\n4,5,6\n,,\n",
+        );
+        check(
+            GRID,
+            Op::InsertRecordAbove,
+            (0, 2),
+            ",,\na,b,c\n1,2,3\n4,5,6\n",
+        );
+        // Without a trailing line ending the new last record goes without
+        // one too, and the ending goes between.
+        let open = "a,b,c\n1,2,3\n4,5,6";
+        check(
+            open,
+            Op::InsertRecordBelow,
+            (2, 2),
+            "a,b,c\n1,2,3\n4,5,6\n,,",
+        );
+        check(
+            open,
+            Op::InsertRecordAbove,
+            (2, 2),
+            "a,b,c\n1,2,3\n,,\n4,5,6",
+        );
+        // The new record takes the first cell; a record that is not there
+        // takes nothing.
+        assert_eq!(Op::InsertRecordAbove.selection_after(1, 2), (1, 0));
+        assert_eq!(Op::InsertRecordBelow.selection_after(1, 2), (2, 0));
+        let view = TableView::parse(&Rope::from_text(GRID));
+        assert_eq!(view.edit(Op::InsertRecordBelow, 3, 0), None);
+        assert_eq!(view.edit(Op::InsertRecordAbove, 3, 0), None);
+    }
+
+    #[test]
+    fn a_record_is_deleted_with_one_line_ending() {
+        check(GRID, Op::DeleteRecord, (1, 1), "a,b,c\n4,5,6\n");
+        check(GRID, Op::DeleteRecord, (0, 0), "1,2,3\n4,5,6\n");
+        // The last record takes the ending before it, so the file keeps its
+        // trailing one, or stays without.
+        check(GRID, Op::DeleteRecord, (2, 2), "a,b,c\n1,2,3\n");
+        check(
+            "a,b,c\n1,2,3\n4,5,6",
+            Op::DeleteRecord,
+            (2, 0),
+            "a,b,c\n1,2,3",
+        );
+        // The only record: an empty file.
+        check("a,b,c\n", Op::DeleteRecord, (0, 0), "");
+        check("a,b,c", Op::DeleteRecord, (0, 1), "");
+        // A quoted cell with a line break inside goes with its record.
+        check(
+            "a,b\n1,\"x\ny\"\n2,z\n",
+            Op::DeleteRecord,
+            (1, 0),
+            "a,b\n2,z\n",
+        );
+        assert_eq!(Op::DeleteRecord.selection_after(1, 2), (1, 2));
+        let view = TableView::parse(&Rope::from_text(GRID));
+        assert_eq!(view.edit(Op::DeleteRecord, 3, 0), None);
+    }
+
+    #[test]
+    fn a_column_is_inserted_in_every_record_and_short_ones_are_padded() {
+        check(
+            GRID,
+            Op::InsertColumnLeft,
+            (1, 1),
+            "a,,b,c\n1,,2,3\n4,,5,6\n",
+        );
+        check(
+            GRID,
+            Op::InsertColumnLeft,
+            (2, 0),
+            ",a,b,c\n,1,2,3\n,4,5,6\n",
+        );
+        check(
+            GRID,
+            Op::InsertColumnRight,
+            (0, 2),
+            "a,b,c,\n1,2,3,\n4,5,6,\n",
+        );
+        check(
+            GRID,
+            Op::InsertColumnRight,
+            (1, 0),
+            "a,,b,c\n1,,2,3\n4,,5,6\n",
+        );
+        // Ragged: a record that has the column gets exactly one delimiter
+        // where the cell goes; one that ends before it is padded up to the
+        // new cell. An empty line is a record of one empty cell.
+        let ragged = "a,b,c\n1\n4,5\n\n7,8,9\n";
+        check(
+            ragged,
+            Op::InsertColumnLeft,
+            (0, 1),
+            "a,,b,c\n1,\n4,,5\n,\n7,,8,9\n",
+        );
+        check(
+            ragged,
+            Op::InsertColumnRight,
+            (0, 2),
+            "a,b,c,\n1,,,\n4,5,,\n,,,\n7,8,9,\n",
+        );
+        let view = TableView::parse(&Rope::from_text(ragged));
+        let edits = view.edit(Op::InsertColumnLeft, 0, 1).unwrap();
+        assert_eq!(edits.len(), 5, "one edit per record");
+        assert!(
+            edits.windows(2).all(|w| w[0].0.end <= w[1].0.start),
+            "in order"
+        );
+        // A quoted cell takes the delimiter before its quote.
+        check(
+            "a,b\n\"x,y\",z\n",
+            Op::InsertColumnLeft,
+            (1, 0),
+            ",a,b\n,\"x,y\",z\n",
+        );
+        assert_eq!(Op::InsertColumnLeft.selection_after(1, 1), (1, 1));
+        assert_eq!(Op::InsertColumnRight.selection_after(1, 1), (1, 2));
+        assert_eq!(view.edit(Op::InsertColumnLeft, 0, 3), None);
+    }
+
+    #[test]
+    fn a_column_is_deleted_from_the_records_that_have_it() {
+        check(GRID, Op::DeleteColumn, (1, 1), "a,c\n1,3\n4,6\n");
+        check(GRID, Op::DeleteColumn, (0, 0), "b,c\n2,3\n5,6\n");
+        // The last column takes the delimiter before it.
+        check(GRID, Op::DeleteColumn, (2, 2), "a,b\n1,2\n4,5\n");
+        // Ragged: a record too short for the column is left alone, one
+        // whose last cell it is loses the delimiter before.
+        let ragged = "a,b,c\n1\n4,5\n7,8,9\n";
+        check(ragged, Op::DeleteColumn, (0, 2), "a,b\n1\n4,5\n7,8\n");
+        check(ragged, Op::DeleteColumn, (0, 1), "a,c\n1\n4\n7,9\n");
+        check(ragged, Op::DeleteColumn, (0, 0), "b,c\n\n5\n8,9\n");
+        // A quoted cell goes whole.
+        check(
+            "a,b\n\"x,y\",\"z\"\n",
+            Op::DeleteColumn,
+            (1, 0),
+            "b\n\"z\"\n",
+        );
+        // The only column: every record becomes an empty line.
+        check("a\n1\n2\n", Op::DeleteColumn, (1, 0), "\n\n\n");
+        assert_eq!(Op::DeleteColumn.selection_after(1, 2), (1, 2));
+        let view = TableView::parse(&Rope::from_text(GRID));
+        assert_eq!(view.edit(Op::DeleteColumn, 0, 3), None);
+    }
+
+    #[test]
+    fn a_cell_is_cleared_through_its_replacement() {
+        check(GRID, Op::ClearCell, (1, 1), "a,b,c\n1,,3\n4,5,6\n");
+        check("a,b\n\"x,y\",z\n", Op::ClearCell, (1, 0), "a,b\n,z\n");
+        // Empty already, or not there: nothing to do.
+        let view = TableView::parse(&Rope::from_text("a,b,c\n1,,3\n4\n"));
+        assert_eq!(view.edit(Op::ClearCell, 1, 1), None);
+        assert_eq!(view.edit(Op::ClearCell, 2, 2), None);
+        assert_eq!(Op::ClearCell.selection_after(1, 2), (1, 2));
+    }
+
+    #[test]
+    fn records_and_columns_follow_the_dialect() {
+        // CRLF: the new record's ending is the file's, and a deleted
+        // record takes both bytes.
+        let crlf = "a,b,c\r\n1,2,3\r\n4,5,6\r\n";
+        let view = TableView::parse(&Rope::from_text(crlf));
+        assert_eq!(view.dialect.line_ending, csv::Ending::CrLf);
+        check(
+            crlf,
+            Op::InsertRecordBelow,
+            (1, 0),
+            "a,b,c\r\n1,2,3\r\n,,\r\n4,5,6\r\n",
+        );
+        check(
+            crlf,
+            Op::InsertRecordBelow,
+            (2, 0),
+            "a,b,c\r\n1,2,3\r\n4,5,6\r\n,,\r\n",
+        );
+        check(crlf, Op::DeleteRecord, (1, 0), "a,b,c\r\n4,5,6\r\n");
+        check(crlf, Op::DeleteRecord, (2, 0), "a,b,c\r\n1,2,3\r\n");
+        check(
+            crlf,
+            Op::InsertColumnRight,
+            (0, 2),
+            "a,b,c,\r\n1,2,3,\r\n4,5,6,\r\n",
+        );
+        check(crlf, Op::DeleteColumn, (0, 1), "a,c\r\n1,3\r\n4,6\r\n");
+        // A buffer on a CRLF file holds LF and parses as LF: the edit is
+        // in LF too, and the file's endings come back on save.
+        let mut b = buffer("crlf.csv", crlf);
+        let view = TableView::parse(&b.rope);
+        assert_eq!(view.dialect.line_ending, csv::Ending::Lf);
+        let edits = view.edit(Op::InsertRecordBelow, 1, 0).unwrap();
+        b.place_cursor(edits[0].0.start, Motion::Move);
+        assert_eq!(b.replace_ranges(&edits), 1);
+        assert_eq!(b.rope.to_string(), "a,b,c\n1,2,3\n,,\n4,5,6\n");
+        assert!(b.undo());
+        assert_eq!(b.rope.to_string(), "a,b,c\n1,2,3\n4,5,6\n");
+        // TSV: tabs between the empty cells, and as the new delimiter.
+        let tsv = "a\tb\tc\n1\t2\t3\n4\t5\t6\n";
+        check(
+            tsv,
+            Op::InsertRecordBelow,
+            (2, 0),
+            "a\tb\tc\n1\t2\t3\n4\t5\t6\n\t\t\n",
+        );
+        check(
+            tsv,
+            Op::InsertColumnLeft,
+            (0, 1),
+            "a\t\tb\tc\n1\t\t2\t3\n4\t\t5\t6\n",
+        );
+        check(tsv, Op::DeleteColumn, (0, 2), "a\tb\n1\t2\n4\t5\n");
+        check(tsv, Op::DeleteRecord, (1, 0), "a\tb\tc\n4\t5\t6\n");
+    }
+
+    #[test]
+    fn many_edits_coalesce_into_one_that_spans_them() {
+        let view = TableView::parse(&Rope::from_text(GRID));
+        let edits = view.edit(Op::InsertColumnLeft, 0, 1).unwrap();
+        assert_eq!(edits.len(), 3);
+        let coalesced = view.coalesce(edits.clone());
+        // From the header's cell to the last record's, one delimiter each.
+        assert_eq!(coalesced, vec![(2..14, ",b,c\n1,,2,3\n4,,".to_string())]);
+        assert_eq!(splice(GRID, &coalesced), splice(GRID, &edits));
+        // Deletions, and a quoted cell with a line break inside, come out
+        // the same both ways.
+        let text = "a,b,c\n1,\"x\ny\",3\n4,5,6";
+        let view = TableView::parse(&Rope::from_text(text));
+        for op in [Op::DeleteColumn, Op::InsertColumnRight] {
+            let edits = view.edit(op, 0, 1).unwrap();
+            let coalesced = view.coalesce(edits.clone());
+            assert_eq!(coalesced.len(), 1);
+            assert_eq!(splice(text, &coalesced), splice(text, &edits), "{op:?}");
+        }
+        // One edit, or none, is left as it is.
+        let one = view.edit(Op::DeleteRecord, 1, 0).unwrap();
+        assert_eq!(view.coalesce(one.clone()), one);
+        assert_eq!(view.coalesce(Vec::new()), Vec::new());
+    }
+
+    #[test]
+    fn column_edits_on_a_big_table_are_one_call() {
+        let text = rows(100_000);
+        let mut b = buffer("big.csv", &text);
+        let view = TableView::parse(&b.rope);
+        let started = std::time::Instant::now();
+        let edits = view.edit(Op::InsertColumnLeft, 0, 1).unwrap();
+        assert_eq!(edits.len(), 100_000);
+        let edits = view.coalesce(edits);
+        assert_eq!(edits.len(), 1);
+        eprintln!("building the edit: {:?}", started.elapsed());
+        let started = std::time::Instant::now();
+        b.place_cursor(edits[0].0.start, Motion::Move);
+        assert_eq!(b.replace_ranges(&edits), 1);
+        eprintln!("insert column in 100k records: {:?}", started.elapsed());
+        let started = std::time::Instant::now();
+        let reparsed = TableView::parse(&b.rope);
+        eprintln!("reparse: {:?}", started.elapsed());
+        assert_eq!(reparsed.column_count(), 5);
+        assert_eq!(reparsed.table.rows.len(), 100_000);
+        assert!(b.undo());
+        assert_eq!(b.rope.to_string(), text);
     }
 }

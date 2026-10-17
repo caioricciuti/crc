@@ -3,7 +3,7 @@
 //! `crate::platform::table`.
 
 use super::*;
-use crate::platform::table::{CellEdit, Cells, Move, TableView};
+use crate::platform::table::{CellEdit, Cells, Move, Op, TableView};
 
 /// Brings the active document's table up to date with its text. Cheap
 /// when nothing changed.
@@ -228,6 +228,114 @@ impl EditorView {
         }
     }
 
+    /// One of the Table menu's commands on the selected cell's record or
+    /// column, as one edit of the text behind the grid and one undo step.
+    /// An open field is committed first, the ranges come from a parse of
+    /// the text as it is now, and the selection lands on the new record's
+    /// first cell, the new column's cell, or the cell now where a deleted
+    /// one was. The caret follows, for the text behind the grid.
+    pub(super) fn table_edit(&self, op: Op) {
+        self.commit_cell_edit(None);
+        let text = self.chrome().text;
+        let edited = {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            if !table_grid(&state) {
+                return;
+            }
+            sync_tables(&mut state);
+            let id = state.docs.active().id();
+            let target = {
+                let State {
+                    docs,
+                    tables,
+                    message,
+                    ..
+                } = &mut *state;
+                let buffer = docs.active_mut();
+                let Some(view) = tables.get(&id) else {
+                    return;
+                };
+                let Some((record, column)) = view.selected else {
+                    return;
+                };
+                if !view.is_current(&buffer.rope) {
+                    return;
+                }
+                let Some(edits) = view.edit(op, record, column) else {
+                    return;
+                };
+                // A column edit is a range per record: one range instead.
+                let edits = view.coalesce(edits);
+                // Its own undo step, never merged into typing just before.
+                buffer.place_cursor(edits[0].0.start, Motion::Move);
+                if buffer.replace_ranges(&edits) == 0 {
+                    *message = Some(("this document is read-only".to_string(), Instant::now()));
+                    None
+                } else {
+                    Some(op.selection_after(record, column))
+                }
+            };
+            if let Some(target) = target {
+                // The parse of the new text, then the selection on its cell.
+                sync_tables(&mut state);
+                let State {
+                    docs,
+                    tables,
+                    renderer,
+                    ..
+                } = &mut *state;
+                let cells = Cells::of(&renderer.atlas);
+                if let Some(view) = tables.get_mut(&id) {
+                    view.select(Some(target), cells, text);
+                    if let Some(cell) = view
+                        .selected
+                        .and_then(|(record, column)| view.table.cell(record, column))
+                    {
+                        docs.active_mut()
+                            .place_cursor(cell.range.start, Motion::Move);
+                    }
+                }
+            }
+            target.is_some()
+        };
+        if edited {
+            self.after_edit();
+        } else {
+            self.request_redraw();
+            self.pump();
+        }
+    }
+
+    /// A secondary press on the grid, before its menu shows: the cell under
+    /// it is selected, so the menu's commands act on what was pressed. An
+    /// open field is committed first.
+    pub(super) fn table_secondary_press(&self, x: f32, y: f32) {
+        self.commit_cell_edit(None);
+        let text = self.chrome().text;
+        {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            let State {
+                docs,
+                tables,
+                renderer,
+                ..
+            } = &mut *state;
+            let cells = Cells::of(&renderer.atlas);
+            let Some(view) = tables.get_mut(&docs.active().id()) else {
+                return;
+            };
+            if let Some(cell) = view.cell_for_press(cells, text, x, y) {
+                view.select(Some(cell), cells, text);
+            }
+        }
+        self.request_redraw();
+        self.pump();
+    }
+
     /// Keys while a cell's field is open. Return commits and stays on the
     /// cell, Tab and Shift-Tab commit and move, Escape drops the field with
     /// the cell as it was; the editing keys edit the field and the rest is
@@ -342,6 +450,14 @@ impl EditorView {
                     if let Some(delta) = scroll(page as isize) {
                         view.scroll_rows(delta, cells, text);
                     }
+                }
+                // Delete and Backspace empty the selected cell.
+                (key::DELETE | key::FORWARD_DELETE, None)
+                    if view.selected.is_some() && !command && !control =>
+                {
+                    drop(state);
+                    self.table_edit(Op::ClearCell);
+                    return Some(true);
                 }
                 // Menus still work.
                 (_, None) if command || control => return None,
