@@ -2,7 +2,7 @@
 
 One entry per tag, written for people who use the editor.
 
-## Unreleased
+## v0.2.0-alpha.25, 2026-10-17
 
 - The Workspace inspector no longer says a repo is up to date from a
   stale fetch. Each repo block has a Check button that fetches that repo
