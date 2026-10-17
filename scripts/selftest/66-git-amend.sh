@@ -33,6 +33,8 @@ SCRIPT
 HOME="$T/amendhome" CRC_SELFTEST="$T/amend-pushed.script" "$BIN" "$T/amendproj" 2> "$T/amend-pushed.err"
 expect "$T/amend-pushed.out" git_open true
 expect "$T/amend-pushed.out" git_amend blocked
+# On its upstream with nothing to move: the arrows stay bare.
+expect "$T/amend-pushed.out" git_sync "↓ ↑ not checked"
 expect "$T/amend-pushed-click.out" git_amend blocked
 expect "$T/amend-pushed-click.out" git_message ''
 
@@ -67,6 +69,8 @@ SCRIPT
 HOME="$T/amendhome" CRC_SELFTEST="$T/amend-local.script" "$BIN" "$T/amendproj" 2> "$T/amend-local.err"
 expect "$T/amend-off.out" git_amend off
 expect "$T/amend-off.out" git_staged 1
+# One commit ahead: Push carries the count.
+expect "$T/amend-off.out" git_sync "↓ ↑1 not checked"
 expect "$T/amend-on.out" git_amend on
 expect "$T/amend-on.out" git_message 'plant the beans'
 expect "$T/amend-edited.out" git_focus true

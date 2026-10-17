@@ -110,6 +110,8 @@ struct Reply {
     error: Option<String>,
     /// What a branch or remote command did, for the status line.
     done: Option<String>,
+    /// When the repository last fetched (see [`last_fetch`]).
+    fetched_at: Option<u64>,
 }
 
 /// The commit message's text inset inside its box, for drawing and clicks.
@@ -328,6 +330,13 @@ pub struct Panel {
     /// Counts the worker's answers, so a view derived from the snapshot
     /// knows when to look again.
     generation: u64,
+    /// When the repository last fetched from its remote, read with the
+    /// snapshot: the branch row's "checked 14:02".
+    fetched_at: Option<u64>,
+    /// The branch menu's width as last drawn: its content's when the
+    /// remote's word fits beside it, else the whole row (`None`). A click
+    /// lands on what is on screen.
+    branch_width: std::cell::Cell<Option<f32>>,
 }
 
 /// How a commit the workspace's leak guard refused is said.
@@ -412,6 +421,9 @@ pub struct Sidebar {
     /// Opens the Git menu: fetch, pull, push and the branch commands.
     pub more: Viewport,
     pub branch: Viewport,
+    /// The remote's word ("checked 14:02") between the branch menu and
+    /// Pull; no width until [`Sidebar::fit_branch`] makes room for it.
+    pub sync: Viewport,
     pub pull: Viewport,
     pub push: Viewport,
     pub message: Viewport,
@@ -458,6 +470,11 @@ impl Sidebar {
             width: (pull.x - layout::UI_GAP - x).max(0.0),
             height: control,
         };
+        let sync = Viewport {
+            x: branch.x + branch.width,
+            width: 0.0,
+            ..branch
+        };
         let message = Viewport {
             x,
             y: branch.y + control + 8.0,
@@ -495,6 +512,7 @@ impl Sidebar {
             refresh,
             more,
             branch,
+            sync,
             pull,
             push,
             message,
@@ -510,8 +528,25 @@ impl Sidebar {
         }
     }
 
-    /// The staging control at the trailing edge of a file row, shown while
-    /// the pointer is on the row.
+    /// The layout with the branch menu `width` wide (its content's) and
+    /// the remote's word in the room left before Pull. Wider than the
+    /// row, the menu keeps the row.
+    pub fn fit_branch(mut self, width: f32) -> Self {
+        if width >= self.branch.width {
+            return self;
+        }
+        let after = self.branch.x + width + layout::UI_GAP;
+        self.sync = Viewport {
+            x: after,
+            width: (self.branch.x + self.branch.width - after).max(0.0),
+            ..self.branch
+        };
+        self.branch.width = width;
+        self
+    }
+
+    /// The staging box at the trailing edge of a file row: empty for a
+    /// change in the working tree, ticked once it is staged.
     pub fn toggle(&self, row: Viewport) -> Viewport {
         let size = layout::UI_CONTROL_SM;
         Viewport {
@@ -556,7 +591,11 @@ impl Panel {
     /// Where the panel draws in `column`, with the message field as tall
     /// as what is written in it.
     pub fn sidebar(&self, column: Viewport) -> Sidebar {
-        Sidebar::new(column, message_rows(&self.message.rope.to_string()))
+        let g = Sidebar::new(column, message_rows(&self.message.rope.to_string()));
+        match self.branch_width.get() {
+            Some(width) => g.fit_branch(width),
+            None => g,
+        }
     }
 
     pub fn new(directory: PathBuf) -> Self {
@@ -594,6 +633,8 @@ impl Panel {
             select_queued: None,
             queued: None,
             generation: 0,
+            fetched_at: None,
+            branch_width: Default::default(),
         }
     }
     /// How many times the worker has answered.
@@ -856,6 +897,34 @@ impl Panel {
             }
         }
         Some(counts)
+    }
+
+    /// The Pull and Push arrows as drawn (see [`arrows`]).
+    pub fn arrows(&self) -> [Arrow; 2] {
+        arrows(self.ahead_behind(), self.busy())
+    }
+
+    /// The branch row's word on the remote (see [`sync_text`]).
+    pub fn sync_text(&self, now: u64) -> Option<String> {
+        sync_text(self.ahead_behind().is_some(), self.fetched_at, now)
+    }
+
+    /// The branch row's remote state on one line, for the self-test's
+    /// dump: `↓2 ↑1 checked 14:02`; an arrow reads `off` when it has no
+    /// upstream to act on (a refresh under way is `git_pending`), and
+    /// `-` stands for no word.
+    pub fn sync_summary(&self) -> String {
+        let [pull, push] = arrows(self.ahead_behind(), false);
+        let arrow = |glyph: char, a: &Arrow| {
+            format!("{glyph}{}{}", a.label, if a.enabled { "" } else { "off" })
+        };
+        format!(
+            "{} {} {}",
+            arrow('\u{2193}', &pull),
+            arrow('\u{2191}', &push),
+            self.sync_text(crate::platform::unix_seconds())
+                .unwrap_or_else(|| "-".into())
+        )
     }
 
     /// Why Commit cannot run, for its tooltip; `None` when it can.
@@ -1426,6 +1495,7 @@ impl Panel {
                 };
                 let mut snapshot = git::snapshot(&root)?;
                 git::read_head(&mut snapshot);
+                let fetched_at = last_fetch(&snapshot.root);
                 let selected = selected_path
                     .and_then(|p| snapshot.changes.iter().position(|c| c.path == p))
                     .unwrap_or(0);
@@ -1443,6 +1513,7 @@ impl Panel {
                     amended,
                     error,
                     done,
+                    fetched_at,
                 })
             })();
             let _ = tx.send(result);
@@ -1480,6 +1551,7 @@ impl Panel {
                 }
                 let before = self.selected_change().map(|c| c.path.clone());
                 self.snapshot = Some(reply.snapshot);
+                self.fetched_at = reply.fetched_at;
                 self.selected = reply.selected;
                 self.diff = git::Diff::parse(&reply.diff);
                 // The same file read again keeps the reader's place.
@@ -1894,46 +1966,63 @@ impl Panel {
             Some(what) => format!("{branch} \u{b7} {}", what.label()),
             None => branch,
         };
-        Button::new(g.branch)
+        let branch_button = Button::new(g.branch)
             .label(&branch_label)
             .icon(crate::render::layout::ACTIVITY_ICONS[1].0)
             .menu()
-            .tip(tip_branch)
-            .draw(out, atlas, theme);
-        let sync = self.ahead_behind();
-        let (ahead, behind) = sync.unwrap_or((0, 0));
-        let count = |n: usize| if n > 0 { n.to_string() } else { String::new() };
-        let behind_label = count(behind);
-        let ahead_label = count(ahead);
-        let pull_tip = match sync {
-            None => "Pull (no upstream)".to_owned(),
-            Some((_, 0)) => "Pull: up to date with upstream".to_owned(),
-            Some((_, n)) => format!(
-                "Pull {n} commit{} from upstream",
-                if n == 1 { "" } else { "s" }
-            ),
-        };
-        let push_tip = match sync {
-            None => "Push and set upstream".to_owned(),
-            Some((0, _)) => "Push: nothing to push".to_owned(),
-            Some((n, _)) => format!(
-                "Push {n} commit{} to upstream",
-                if n == 1 { "" } else { "s" }
-            ),
+            .tip(tip_branch);
+        // The remote's word sits at the right of the branch row when the
+        // menu, at its content's width, leaves it room. A narrow column
+        // keeps the menu whole and says it in Pull's tooltip instead.
+        let sync_text = self.sync_text(crate::platform::unix_seconds());
+        let whole = Sidebar::new(column, message_rows(&self.message.rope.to_string()));
+        let fit = sync_text.as_ref().and_then(|text| {
+            let wanted = (branch_button.content_width(atlas, 8.0)
+                + layout::icon_width(atlas, icons::CHEVRON_DOWN)
+                + 2.0)
+                .ceil();
+            let room = whole.branch.width - wanted - layout::UI_GAP;
+            (layout::ui_text_width(atlas, text) <= room).then_some(wanted)
+        });
+        self.branch_width.set(fit);
+        let g = self.sidebar(column);
+        Button {
+            rect: g.branch,
+            ..branch_button
+        }
+        .draw(out, atlas, theme);
+        if let (Some(text), Some(_)) = (&sync_text, fit) {
+            let w = layout::ui_text_width(atlas, text);
+            layout::push_ui_text(
+                out,
+                atlas,
+                Viewport {
+                    x: g.sync.x + g.sync.width - w,
+                    width: w + 1.0,
+                    ..g.sync
+                },
+                text,
+                theme.gutter_text,
+            );
+        }
+        let [pull, push] = self.arrows();
+        let pull_tip = match (&sync_text, fit) {
+            (Some(text), None) => format!("{} ({text})", pull.tip),
+            _ => pull.tip.clone(),
         };
         Button::new(g.pull)
             .icon(icons::ARROW_DOWN)
-            .label(&behind_label)
-            .on(behind > 0)
-            .enabled(!busy)
+            .label(&pull.label)
+            .on(pull.on)
+            .enabled(pull.enabled)
             .tip(&pull_tip)
             .draw(out, atlas, theme);
         Button::new(g.push)
             .icon(icons::ARROW_UP)
-            .label(&ahead_label)
-            .on(ahead > 0)
-            .enabled(!busy)
-            .tip(&push_tip)
+            .label(&push.label)
+            .on(push.on)
+            .enabled(push.enabled)
+            .tip(&push.tip)
             .draw(out, atlas, theme);
 
         // The message: a field, ringed while it has the keyboard, a line
@@ -2279,10 +2368,12 @@ impl Panel {
             },
         );
         let name_x = icon_x + icon_w.max(18.0) + 6.0;
-        let trailing = if over && !conflicted {
+        let trailing = if conflicted {
+            g.letter(rect).x - 4.0
+        } else if over {
             g.open(rect).x - 4.0
         } else {
-            g.letter(rect).x - 4.0
+            g.toggle(rect).x - 4.0
         };
         let name_rect = Viewport {
             x: name_x,
@@ -2329,27 +2420,36 @@ impl Panel {
             colour,
         );
         // A conflicted file is staged by Mark Resolved above its text, once
-        // no markers are left in it; a plus here would stage the markers.
-        if conflicted || !over {
+        // no markers are left in it; a box here would stage the markers.
+        if conflicted {
             return;
         }
-        // Stage/unstage sits on the row it acts on, with Open File beside
-        // it, both shown while the pointer is on the row.
-        Button::new(g.open(rect))
-            .icon(icons::GO_TO_FILE)
-            .tone(Tone::Ghost)
-            .tip("Open File")
-            .draw(out, atlas, theme);
-        Button::new(g.toggle(rect))
-            .icon(if staged { icons::REMOVE } else { icons::ADD })
-            .tone(Tone::Ghost)
+        // The staging box, a checkbox on the row it acts on: empty in the
+        // control's resting fill for a change in the working tree, ticked
+        // in the accent once it is staged, so the row says which at rest.
+        // Open File joins it while the pointer is on the row, when the
+        // empty box also shows the plus it will act as.
+        if over {
+            Button::new(g.open(rect))
+                .icon(icons::GO_TO_FILE)
+                .tone(Tone::Ghost)
+                .tip("Open File")
+                .draw(out, atlas, theme);
+        }
+        let mut toggle = Button::new(g.toggle(rect))
+            .on(staged)
             .enabled(!self.busy())
             .tip(if staged {
                 "Unstage Changes"
             } else {
                 "Stage Changes"
-            })
-            .draw(out, atlas, theme);
+            });
+        if staged {
+            toggle = toggle.icon(icons::CHECK);
+        } else if over {
+            toggle = toggle.icon(icons::ADD);
+        }
+        toggle.draw(out, atlas, theme);
     }
 }
 
@@ -2641,6 +2741,107 @@ pub fn draw_diff_lines(
 /// `detached HEAD` for `HEAD (no branch)`.
 /// A repository's branch, how far it is from its upstream, and any
 /// operation in progress: `main ↑2 ↓1 · merging`.
+/// Pull or Push in the branch row: an arrow, lit with its count when
+/// there is something to pull or push.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Arrow {
+    /// The count; empty when the arrow stays bare.
+    pub label: String,
+    pub enabled: bool,
+    /// Lit: there is something to pull or push.
+    pub on: bool,
+    pub tip: String,
+}
+
+/// The Pull and Push arrows for a branch `sync` commits (to push, to
+/// pull) from its upstream, or `None` without one: then there is nothing
+/// to pull from, and Push publishes the branch on origin.
+pub fn arrows(sync: Option<(usize, usize)>, busy: bool) -> [Arrow; 2] {
+    let count = |n: usize| match n {
+        0 => String::new(),
+        1..=99 => n.to_string(),
+        _ => "99+".to_owned(),
+    };
+    let commits = |n: usize| format!("{n} commit{}", if n == 1 { "" } else { "s" });
+    let pull = match sync {
+        None => Arrow {
+            label: String::new(),
+            enabled: false,
+            on: false,
+            tip: "No upstream".into(),
+        },
+        Some((_, to_pull)) => Arrow {
+            label: count(to_pull),
+            enabled: !busy,
+            on: to_pull > 0,
+            tip: match to_pull {
+                0 => "Pull: up to date with upstream".to_owned(),
+                n => format!("Pull {} from upstream", commits(n)),
+            },
+        },
+    };
+    let push = match sync {
+        None => Arrow {
+            label: String::new(),
+            enabled: !busy,
+            on: false,
+            tip: "Push and set upstream".into(),
+        },
+        Some((to_push, _)) => Arrow {
+            label: count(to_push),
+            enabled: !busy,
+            on: to_push > 0,
+            tip: match to_push {
+                0 => "Push: nothing to push".to_owned(),
+                n => format!("Push {} to upstream", commits(n)),
+            },
+        },
+    };
+    [pull, push]
+}
+
+/// The branch row's quiet word on the remote, in the words of the
+/// inspector's Remote row so the two agree: "checked 14:02" after a
+/// fetch, "not checked" before one. Nothing without an upstream, where
+/// there is no remote branch to check against.
+pub fn sync_text(upstream: bool, fetched_at: Option<u64>, now: u64) -> Option<String> {
+    if !upstream {
+        return None;
+    }
+    Some(match fetched_at {
+        None => "not checked".to_owned(),
+        Some(at) => format!(
+            "checked {}",
+            crate::platform::clock_time(at as i64, now as i64)
+        ),
+    })
+}
+
+/// When the repository last fetched, as the time on its FETCH_HEAD in
+/// Unix seconds: the one record every fetch and pull leaves, whoever ran
+/// it (the panel, the inspector's Check, a terminal). `None` before a
+/// first fetch. A linked worktree's `.git` is a file naming its Git
+/// directory, whose `commondir` names the one FETCH_HEAD is in.
+fn last_fetch(root: &std::path::Path) -> Option<u64> {
+    let dot_git = root.join(".git");
+    let mut git_dir = if dot_git.is_dir() {
+        dot_git
+    } else {
+        let text = std::fs::read_to_string(&dot_git).ok()?;
+        root.join(text.strip_prefix("gitdir:")?.trim())
+    };
+    if let Ok(common) = std::fs::read_to_string(git_dir.join("commondir")) {
+        git_dir = git_dir.join(common.trim());
+    }
+    std::fs::metadata(git_dir.join("FETCH_HEAD"))
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
 pub fn snapshot_status(snapshot: &Snapshot) -> String {
     let header = &snapshot.branch;
     let mut out = branch_name(header);
@@ -3016,6 +3217,115 @@ mod tests {
         assert_eq!(p.branch_status(), "main ↑5 ↓2");
         p.snapshot.as_mut().unwrap().branch = "dev...origin/dev [behind 1]".into();
         assert_eq!(p.branch_status(), "dev ↓1");
+    }
+
+    #[test]
+    fn the_arrows_carry_their_counts_and_go_bare_or_off() {
+        let [pull, push] = arrows(Some((1, 2)), false);
+        assert_eq!(
+            (pull.label.as_str(), pull.on, pull.enabled),
+            ("2", true, true)
+        );
+        assert_eq!(pull.tip, "Pull 2 commits from upstream");
+        assert_eq!(
+            (push.label.as_str(), push.on, push.enabled),
+            ("1", true, true)
+        );
+        assert_eq!(push.tip, "Push 1 commit to upstream");
+        // Up to date: bare arrows, still live.
+        let [pull, push] = arrows(Some((0, 0)), false);
+        assert!(pull.label.is_empty() && push.label.is_empty());
+        assert!(!pull.on && !push.on && pull.enabled && push.enabled);
+        assert_eq!(pull.tip, "Pull: up to date with upstream");
+        assert_eq!(push.tip, "Push: nothing to push");
+        // No upstream: nothing to pull from; Push publishes the branch.
+        let [pull, push] = arrows(None, false);
+        assert!(!pull.enabled && pull.label.is_empty());
+        assert_eq!(pull.tip, "No upstream");
+        assert!(push.enabled);
+        assert_eq!(push.tip, "Push and set upstream");
+        // Busy: both wait, the counts stay.
+        let [pull, push] = arrows(Some((3, 0)), true);
+        assert!(!pull.enabled && !push.enabled);
+        assert_eq!(push.label, "3");
+        assert_eq!(arrows(Some((120, 0)), false)[1].label, "99+");
+        // From the panel: the status header's counts.
+        let mut p = panel(Vec::new());
+        assert_eq!(p.arrows()[0].tip, "No upstream");
+        p.snapshot.as_mut().unwrap().branch = "main...origin/main [ahead 5, behind 2]".into();
+        let [pull, push] = p.arrows();
+        assert_eq!((pull.label.as_str(), push.label.as_str()), ("2", "5"));
+    }
+
+    #[test]
+    fn the_branch_row_says_when_the_remote_was_checked_in_the_inspectors_words() {
+        let now = 1_790_000_000;
+        assert_eq!(sync_text(false, None, now), None);
+        assert_eq!(sync_text(false, Some(now - 60), now), None);
+        assert_eq!(sync_text(true, None, now).as_deref(), Some("not checked"));
+        let at = now - 120;
+        assert_eq!(
+            sync_text(true, Some(at), now),
+            Some(format!(
+                "checked {}",
+                crate::platform::clock_time(at as i64, now as i64)
+            ))
+        );
+        let mut p = panel(Vec::new());
+        assert_eq!(p.sync_text(now), None);
+        assert_eq!(p.sync_summary(), "↓off ↑ -");
+        p.snapshot.as_mut().unwrap().branch = "main...origin/main [ahead 1]".into();
+        assert_eq!(p.sync_text(now).as_deref(), Some("not checked"));
+        assert_eq!(p.sync_summary(), "↓ ↑1 not checked");
+    }
+
+    #[test]
+    fn the_branch_menu_gives_the_remotes_word_its_room_only_when_fitted() {
+        let g = Sidebar::new(column(), 1);
+        assert_eq!(g.sync.width, 0.0);
+        let fitted = g.fit_branch(80.0);
+        assert_eq!(fitted.branch.width, 80.0);
+        assert_eq!(fitted.sync.x, g.branch.x + 80.0 + layout::UI_GAP);
+        assert_eq!(
+            fitted.sync.x + fitted.sync.width,
+            g.branch.x + g.branch.width
+        );
+        assert!(fitted.sync.x + fitted.sync.width <= fitted.pull.x);
+        assert_eq!(fitted.sync.y, g.branch.y);
+        // Wider than the row: the menu keeps the row.
+        let whole = g.fit_branch(1000.0);
+        assert_eq!(whole.branch.width, g.branch.width);
+        assert_eq!(whole.sync.width, 0.0);
+        // The panel lays out as it last drew.
+        let p = panel(Vec::new());
+        assert_eq!(p.sidebar(column()).branch.width, g.branch.width);
+        p.branch_width.set(Some(80.0));
+        assert_eq!(p.sidebar(column()).branch.width, 80.0);
+    }
+
+    #[test]
+    fn the_last_fetch_is_read_from_fetch_head_wherever_the_git_directory_is() {
+        let dir = std::env::temp_dir().join(format!("crc-last-fetch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("repo/.git")).unwrap();
+        assert_eq!(last_fetch(&dir.join("repo")), None);
+        std::fs::write(dir.join("repo/.git/FETCH_HEAD"), "").unwrap();
+        let at = last_fetch(&dir.join("repo")).expect("a fetch time");
+        assert!(at > 1_600_000_000);
+        // A linked worktree: its .git names a directory whose commondir
+        // holds FETCH_HEAD.
+        std::fs::create_dir_all(dir.join("repo/.git/worktrees/w")).unwrap();
+        std::fs::write(dir.join("repo/.git/worktrees/w/commondir"), "../..\n").unwrap();
+        std::fs::create_dir_all(dir.join("w")).unwrap();
+        std::fs::write(
+            dir.join("w/.git"),
+            format!("gitdir: {}\n", dir.join("repo/.git/worktrees/w").display()),
+        )
+        .unwrap();
+        assert_eq!(last_fetch(&dir.join("w")), Some(at));
+        std::fs::create_dir_all(dir.join("none")).unwrap();
+        assert_eq!(last_fetch(&dir.join("none")), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn column() -> Viewport {

@@ -510,7 +510,7 @@ impl EditorView {
                     )
                     .is_some();
                 let report = format!(
-                    "git_open: {}\ngit_focus: {}\ngit_diff: {}\ngit_pending: {}\ngit_changes: {}\ngit_staged: {}\ngit_hunks_staged: {}\ngit_hunks_working: {}\ngit_message: {}\ngit_message_lines: {}\ngit_message_caret: {}\ngit_subject_len: {}\ngit_amend: {}\ngit_diff_selection: {}\nproject_menu_requested: {}\ncrumb_menu: {}\nlast_click_ms: {:.3}\nfinder_entries: {}\nsidebar_edit: {}\npalette_query: {}\npalette_first: {}\npalette_scroll: {}\npalette_loading: {}\nfind_searching: {}\npanes: {}\nfocused_pane: {}\nlsp: {}\ndiagnostics: {}\ncompletion: {}\nkey_handler_draws: {}\nwindow_title: {}\nshaping_pending: {}\ncaret_shaped: {}\nclaude: {}\nterminal: {}\n{}",
+                    "git_open: {}\ngit_focus: {}\ngit_diff: {}\ngit_pending: {}\ngit_changes: {}\ngit_staged: {}\ngit_hunks_staged: {}\ngit_hunks_working: {}\ngit_message: {}\ngit_message_lines: {}\ngit_message_caret: {}\ngit_subject_len: {}\ngit_amend: {}\ngit_sync: {}\ngit_diff_selection: {}\nproject_menu_requested: {}\ncrumb_menu: {}\nlast_click_ms: {:.3}\nfinder_entries: {}\nsidebar_edit: {}\npalette_query: {}\npalette_first: {}\npalette_scroll: {}\npalette_loading: {}\nfind_searching: {}\npanes: {}\nfocused_pane: {}\nlsp: {}\ndiagnostics: {}\ncompletion: {}\nkey_handler_draws: {}\nwindow_title: {}\nshaping_pending: {}\ncaret_shaped: {}\nclaude: {}\nterminal: {}\n{}",
                     state.git_open,
                     state.git_focus,
                     diffing(&state),
@@ -532,6 +532,7 @@ impl EditorView {
                     },
                     crate::platform::git_panel::subject_len(&state.git.message.rope.to_string()),
                     state.git.amend_state(),
+                    state.git.sync_summary(),
                     {
                         let lines = state.git.diff_selection();
                         format!(

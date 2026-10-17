@@ -5,6 +5,9 @@
 # A throwaway repository with a bare one as origin. The caret's line is
 # blamed in the status line; Git > Switch Branch creates a branch from the
 # palette; Pull with no upstream says so; Push sets the upstream on origin.
+# Source Control's branch row follows: Pull off with no upstream, the
+# arrows bare once there is one and nothing to move, and after a Fetch
+# the row says when the remote was checked.
 mkdir -p "$T/branchproj"
 git init -q -b main "$T/branchproj"
 git init -q --bare "$T/branchorigin.git"
@@ -42,6 +45,20 @@ key 36
 wait 1500
 wait 300
 dump $T/branch-push.out
+key 35 cmd p
+wait 200
+text >fetch
+key 36
+wait 1000
+wait 300
+key 5 cmd,opt g
+wait 300
+down @sidebar.divider
+drag 440 400
+up 440 400
+wait 400
+frame $T/branch-synced.bmp
+dump $T/branch-synced.out
 quit
 SCRIPT
 CRC_SELFTEST="$T/branch.script" "$BIN" "$T/branchproj/notes.txt" 2> "$T/branch.err"
@@ -52,11 +69,16 @@ expect "$T/branch-picker.out" palette_first "Create branch “feature”"
 expect "$T/branch-created.out" branch "feature"
 expect "$T/branch-created.out" message "created and switched to feature"
 expect "$T/branch-pull.out" message "this branch has no upstream to pull from"
+expect "$T/branch-pull.out" git_sync "↓off ↑ -"
 expect "$T/branch-push.out" branch "feature"
+expect "$T/branch-push.out" git_sync "↓ ↑ not checked"
 grep -q '^message: pushed' "$T/branch-push.out" \
     || failed "branch-push.out: $(grep '^message:' "$T/branch-push.out")"
 git -C "$T/branchorigin.git" rev-parse --verify -q refs/heads/feature > /dev/null \
     || failed "branch push: origin has no feature branch"
+grep -Eq '^git_sync: ↓ ↑ checked [0-9]{2}:[0-9]{2}$' "$T/branch-synced.out" \
+    || failed "branch-synced.out: no check time after Fetch: $(grep '^git_sync:' "$T/branch-synced.out")"
+expect "$T/branch-synced.out" git_open "true"
 
 # ---- renaming and deleting branches -------------------------------------------
 # The branch in the status bar opens the list, as does the one at the top
