@@ -341,6 +341,37 @@ impl EditorView {
         self.pump();
     }
 
+    /// Escape over a page that has the editor column: leaves the page's
+    /// confirmation, then the page. Returns whether a page took the key,
+    /// which then reaches nothing else.
+    fn escape_page(&self, event: &NSEvent) -> bool {
+        let command = event
+            .modifierFlags()
+            .contains(NSEventModifierFlags::Command);
+        let Some(mut state) = self.state_mut() else {
+            return false;
+        };
+        if !escape_closes_page(
+            event.keyCode(),
+            command,
+            page_covers(&state),
+            state.palette.is_some(),
+        ) {
+            return false;
+        }
+        let confirming = {
+            let page = state.extensions.as_mut();
+            page.is_some_and(|p| p.confirm.take().is_some())
+                || state.review_page.confirm.take().is_some()
+        };
+        if !confirming {
+            uncover_column(&mut state);
+        }
+        drop(state);
+        self.request_redraw();
+        true
+    }
+
     /// Applies a key event. Returns whether anything changed.
     pub(super) fn handle_key(&self, event: &NSEvent) -> bool {
         // Ctrl-` by its key, not its character: on layouts where that key
@@ -382,7 +413,18 @@ impl EditorView {
             self.jump_to_tab(number);
             return true;
         }
+        // Escape closes what is open on screen before any shell hears it.
+        // A field with the keyboard (palette, find, go to line) is ahead
+        // of the terminal already; a page covering the editor column
+        // (Extensions, MCP, Settings, Review) is closed here, ahead of the
+        // shell. The key that closed something is spent and never reaches
+        // the terminal, so bash does not ring its bell on ESC ESC after a
+        // page was merely closed. Only with nothing to close does Escape
+        // go to the shell, where vim and friends need it.
         if self.terminal_has_keys() {
+            if self.escape_page(event) {
+                return true;
+            }
             return self.terminal_key(event);
         }
         if self
@@ -597,39 +639,14 @@ impl EditorView {
         // leaves its confirmation, then the page; nothing types into the
         // document underneath. The palette, opened over it, keeps its own
         // keys.
-        if self.state().is_some_and(|state| {
-            ext_details(&state)
-                || mcp_details(&state)
-                || state.settings_page.open
-                || state.review_page.open
-        }) && self.state().is_some_and(|state| state.palette.is_none())
+        if self
+            .state()
+            .is_some_and(|state| page_covers(&state) && state.palette.is_none())
             && !event
                 .modifierFlags()
                 .contains(NSEventModifierFlags::Command)
         {
-            const ESCAPE: u16 = 53;
-            if event.keyCode() == ESCAPE {
-                let confirming = {
-                    let Some(mut state) = self.state_mut() else {
-                        return false;
-                    };
-                    let page = state.extensions.as_mut();
-                    page.is_some_and(|p| p.confirm.take().is_some())
-                        || state.review_page.confirm.take().is_some()
-                };
-                if !confirming {
-                    let Some(mut state) = self.state_mut() else {
-                        return false;
-                    };
-                    if let Some(page) = &mut state.extensions {
-                        page.details = false;
-                    }
-                    state.mcp.details = false;
-                    state.settings_page.open = false;
-                    state.review_page.open = false;
-                }
-                self.request_redraw();
-            }
+            self.escape_page(event);
             return true;
         }
         const ESCAPE_KEY: u16 = 53;
@@ -1218,4 +1235,38 @@ impl EditorView {
 fn task_digit(code: u16) -> Option<usize> {
     const KEYS: [u16; 9] = [18, 19, 20, 21, 23, 22, 26, 28, 25];
     KEYS.iter().position(|k| *k == code).map(|i| i + 1)
+}
+
+/// Whether a page that takes the editor column whole (Extensions details,
+/// MCP, Settings, Review) is open.
+fn page_covers(state: &State) -> bool {
+    ext_details(state) || mcp_details(state) || state.settings_page.open || state.review_page.open
+}
+
+/// Whether a key is Escape over a page that has the editor column, with
+/// no palette over the page: the key then closes the page's confirmation
+/// or the page, and is spent there. Command keys are the menu's.
+fn escape_closes_page(code: u16, command: bool, page_open: bool, palette_open: bool) -> bool {
+    const ESCAPE: u16 = 53;
+    code == ESCAPE && !command && page_open && !palette_open
+}
+
+#[cfg(test)]
+mod tests {
+    use super::escape_closes_page;
+
+    #[test]
+    fn escape_over_a_page_closes_it_and_nothing_else() {
+        const ESCAPE: u16 = 53;
+        // A page open, nothing over it: Escape is the page's.
+        assert!(escape_closes_page(ESCAPE, false, true, false));
+        // No page: Escape goes on, to the shell when the terminal has
+        // the keyboard.
+        assert!(!escape_closes_page(ESCAPE, false, false, false));
+        // The palette over the page keeps its own Escape.
+        assert!(!escape_closes_page(ESCAPE, false, true, true));
+        // Command keys are the menu's, and other keys are not Escape.
+        assert!(!escape_closes_page(ESCAPE, true, true, false));
+        assert!(!escape_closes_page(36, false, true, false));
+    }
 }
