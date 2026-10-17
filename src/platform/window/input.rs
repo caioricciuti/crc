@@ -102,6 +102,38 @@ impl EditorView {
             self.pump();
             return;
         }
+        // So does the grid, and sideways it moves by points.
+        if !over_sidebar && chrome.text.contains(x, y) && table_grid(&state) {
+            let per_row = if precise {
+                m.line_height as f64
+            } else {
+                1.0 / WHEEL_LINES_PER_NOTCH
+            };
+            state.scroll_carry.1 -= dy / per_row;
+            let rows = state.scroll_carry.1.trunc();
+            state.scroll_carry.1 -= rows;
+            state.scroll_carry.0 = 0.0;
+            let points = if precise {
+                -dx
+            } else {
+                -dx * WHEEL_LINES_PER_NOTCH * m.advance as f64
+            };
+            let State {
+                docs,
+                tables,
+                renderer,
+                ..
+            } = &mut *state;
+            if let Some(view) = tables.get_mut(&docs.active().id()) {
+                let cells = crate::platform::table::Cells::of(&renderer.atlas);
+                view.scroll_rows(rows as isize, cells, chrome.text);
+                view.scroll_points(points as f32, cells, chrome.text);
+            }
+            drop(state);
+            self.request_redraw();
+            self.pump();
+            return;
+        }
         if precise && !over_sidebar {
             state.scroll_carry.1 = 0.0;
             state
@@ -392,6 +424,15 @@ impl EditorView {
             side_by_side(&state) && !field_has_keys(&state)
         };
         if columns && let Some(handled) = self.handle_conflict_side_key(event) {
+            return handled;
+        }
+        let grid = {
+            let Some(state) = self.state() else {
+                return false;
+            };
+            table_grid(&state) && !field_has_keys(&state)
+        };
+        if grid && let Some(handled) = self.handle_table_key(event) {
             return handled;
         }
         // Escape with no overlay open drops back to a single cursor, which

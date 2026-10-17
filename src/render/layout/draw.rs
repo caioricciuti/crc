@@ -8,7 +8,7 @@ pub fn clip_vertical(quad: &mut GlyphInstance, top: f32, bottom: f32) {
     clip_axis(quad, 1, top, bottom);
 }
 
-pub(super) fn clip_horizontal(quad: &mut GlyphInstance, left: f32, right: f32) {
+pub fn clip_horizontal(quad: &mut GlyphInstance, left: f32, right: f32) {
     clip_axis(quad, 0, left, right);
 }
 

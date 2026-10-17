@@ -47,6 +47,7 @@ impl EditorView {
         layout::begin_frame();
         super::terminal::report_focus(&mut state, key);
         sync_conflicts(&mut state);
+        sync_tables(&mut state);
         super::agents::forget_emptied(&mut state);
         let column = column_of(&state);
         let chrome = chrome_of(&state);
@@ -129,8 +130,10 @@ impl EditorView {
             completion_chips,
             conflict_scans,
             conflict_side,
+            tables,
             issue_tabs,
             scrub,
+            watch,
             ..
         } = &mut *state;
         *unshaped_on_screen = false;
@@ -284,6 +287,18 @@ impl EditorView {
                 theme.tab_active,
             );
             crate::platform::conflicts::draw_side(
+                view,
+                &buffer.rope,
+                &mut renderer.atlas,
+                editor_rect,
+                theme,
+                glyphs,
+            );
+        } else if column == Column::Table
+            && let Some(view) = tables.get_mut(&buffer.id())
+        {
+            glyphs.clear();
+            crate::platform::table::draw(
                 view,
                 &buffer.rope,
                 &mut renderer.atlas,
@@ -702,6 +717,29 @@ impl EditorView {
                     *conflict_side,
                     &file,
                     buffer.is_dirty(),
+                    &mut renderer.atlas,
+                    strip,
+                    theme,
+                    glyphs,
+                );
+            }
+            // A table's strip, when no conflict, review or history has it.
+            if let Some(strip) = response_rect
+                && !responses.contains_key(&buffer.id())
+                && claude
+                    .as_ref()
+                    .and_then(|c| c.reviews.get(&buffer.id()))
+                    .is_none()
+                && conflict_scans
+                    .get(&buffer.id())
+                    .and_then(|s| s.view.as_ref())
+                    .is_none()
+                && scrub.as_ref().is_none_or(|s| !s.strip_over(buffer.id()))
+                && let Some(view) = tables.get(&buffer.id())
+            {
+                crate::platform::table::draw_strip(
+                    view,
+                    &buffer.display_name(),
                     &mut renderer.atlas,
                     strip,
                     theme,

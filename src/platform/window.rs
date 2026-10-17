@@ -77,11 +77,13 @@ mod scrub;
 mod selftest_play;
 mod sidebar;
 mod state;
+mod table;
 mod tabs;
 mod terminal;
 use extensions::{ext_details, preview_command, preview_displaced};
 use mcp::{mcp_details, mcp_url_rows};
 use state::{Blame, Ext, Gutter, Heat, Lsp, ProjectSearch, Reloads, Watch};
+use table::{active_table, sync_tables, table_grid};
 
 struct ProjectIndexResult {
     root: std::path::PathBuf,
@@ -733,6 +735,8 @@ struct State {
     extensions: Option<crate::platform::extensions::Page>,
     /// Merge conflicts found in open documents, keyed by buffer id.
     conflict_scans: HashMap<u64, crate::platform::conflicts::Scan>,
+    /// CSV and TSV documents parsed as tables, keyed by buffer id.
+    tables: HashMap<u64, crate::platform::table::TableView>,
     /// Conflicts are shown as columns rather than in the text.
     conflict_side: bool,
     /// The Claude Code started here runs the review hooks.
@@ -1960,6 +1964,15 @@ define_class!(
                     self.set_conflict_side(side);
                     return;
                 }
+                Some(Hit::TableMode(grid)) => {
+                    self.set_table_mode(grid);
+                    return;
+                }
+                // The grid takes no selection yet: a click on it is not a
+                // click in the text behind it.
+                Some(Hit::TableBody) => {
+                    return;
+                }
                 Some(Hit::ConflictStep(forward)) => {
                     self.step_conflict(forward, false);
                     return;
@@ -2620,6 +2633,7 @@ define_class!(
                         | Hit::ConflictStep(_)
                         | Hit::ConflictResolve
                         | Hit::ConflictTake(..)
+                        | Hit::TableMode(_)
                         | Hit::ToolbarTerminal
                         | Hit::ToolbarInspector
                         | Hit::TerminalTab(_)
@@ -6519,6 +6533,7 @@ fn forget_document(state: &mut State, id: u64) {
     state.heat.pending.remove(&id);
     state.lsp.dirty.remove(&id);
     state.conflict_scans.remove(&id);
+    state.tables.remove(&id);
     state.issue_tabs.remove(&id);
     // Either side of the file history gone: stepping stops. A version
     // left open stays a read-only tab.
@@ -6542,6 +6557,8 @@ enum Column {
     GitDiff,
     /// A document's merge conflicts as columns.
     ConflictColumns,
+    /// A CSV or TSV document as a grid.
+    Table,
     /// Claude's proposed change, in its tab.
     Review,
     /// Nothing open.
@@ -6567,6 +6584,8 @@ fn column_of(state: &State) -> Column {
         Column::ConflictColumns
     } else if active_review(state).is_some() {
         Column::Review
+    } else if table_grid(state) {
+        Column::Table
     } else if state.docs.is_home() {
         Column::Home
     } else {
@@ -7252,6 +7271,7 @@ fn draw_other_pane(
 /// on its own.
 fn frame_of(state: &mut State) -> Frame {
     sync_conflicts(state);
+    sync_tables(state);
     let chrome = chrome_of(state);
     let terminal_find = terminal::find_rect(state, &chrome);
     let column = column_of(state);
@@ -7301,6 +7321,24 @@ fn frame_of(state: &mut State) -> Frame {
             }
             _ => Vec::new(),
         }
+    };
+    // The table's strip, under the same rules as the conflicts', which
+    // wins when a table document has conflicts; and the grid as one
+    // region, so a click on it is not a click in the text.
+    let table_hits = {
+        let shown = matches!(column, Column::Table | Column::Text) && active_table(state).is_some();
+        let scrubbing = scrub::strip_scrub(state).is_some();
+        let State { renderer, .. } = &mut *state;
+        let mut hits = match chrome.response {
+            Some(strip) if shown && !scrubbing => {
+                crate::platform::table::strip_hits(&mut renderer.atlas, strip)
+            }
+            _ => Vec::new(),
+        };
+        if column == Column::Table {
+            hits.push((Hit::TableBody, chrome.text));
+        }
+        hits
     };
     let scrub_hits = match (chrome.response, scrub::strip_scrub(state).is_some()) {
         (Some(strip), true) => {
@@ -7524,6 +7562,9 @@ fn frame_of(state: &mut State) -> Frame {
         for (hit, rect) in conflict_hits {
             frame.push(hit, rect);
         }
+        for (hit, rect) in table_hits {
+            frame.push(hit, rect);
+        }
     }
     // Before the terminal: the terminal's bar is over its screen.
     if let Some(find) = chrome.find.or(terminal_find) {
@@ -7644,6 +7685,7 @@ fn chrome_of(state: &State) -> Chrome {
     let response = state.responses.contains_key(&state.docs.active().id())
         || active_review(state).is_some()
         || active_conflicts(state).is_some()
+        || active_table(state).is_some()
         || issues::active_issue(state).is_some()
         || scrub::strip_scrub(state).is_some();
     let mut chrome = Chrome::with_panes(
@@ -9615,6 +9657,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         organize_on_save: settings.organize_imports_on_save,
         extensions: None,
         conflict_scans: HashMap::new(),
+        tables: HashMap::new(),
         conflict_side: settings.conflict_side_by_side,
         agent_review: settings.agent_review,
         conflict_cursor_key: None,

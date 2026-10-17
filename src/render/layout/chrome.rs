@@ -3038,6 +3038,10 @@ pub enum Hit {
     /// Resolves conflict `n` of the active document one way, from its
     /// marker line or its header in the columns.
     ConflictTake(usize, crate::project::conflict::Take),
+    /// Above a CSV or TSV document: the Grid (`true`) or Text half of the
+    /// mode switch, and the grid itself.
+    TableMode(bool),
+    TableBody,
     /// A part of the breadcrumb path, left to right.
     Breadcrumb(usize),
     Find,
@@ -3119,6 +3123,13 @@ impl Hit {
             .into(),
             Hit::ConflictResolve => "conflict.resolve".into(),
             Hit::ConflictTake(i, take) => format!("conflict.{}.{i}", take.name()),
+            Hit::TableMode(grid) => if *grid {
+                "table.mode.grid"
+            } else {
+                "table.mode.text"
+            }
+            .into(),
+            Hit::TableBody => "table.body".into(),
             Hit::Breadcrumb(i) => format!("breadcrumb.{i}"),
             Hit::Find => "find".into(),
             Hit::Text => "text".into(),
