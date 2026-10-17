@@ -1971,9 +1971,10 @@ define_class!(
                     self.set_table_mode(grid);
                     return;
                 }
-                // The grid takes no selection yet: a click on it is not a
-                // click in the text behind it.
+                // A click on the grid selects a cell, not a place in the
+                // text behind it.
                 Some(Hit::TableBody) => {
+                    self.table_press(x, y);
                     return;
                 }
                 Some(Hit::ConflictStep(forward)) => {

@@ -9,7 +9,9 @@
 //! The strip above the text names the file's shape and holds the Grid and
 //! Text switch.
 //!
-//! Read only for now: selection and editing come later.
+//! One cell can be selected, by a click or from the keys, and the selection
+//! outlives a reparse as long as its record and column still exist. Editing
+//! a cell comes later.
 
 use crate::render::{
     font::Atlas,
@@ -77,6 +79,29 @@ pub struct TableView {
     pub scroll_x: f32,
     /// The grid rather than the text.
     pub mode_grid: bool,
+    /// The selected cell as record and column; the header is record 0.
+    pub selected: Option<(usize, usize)>,
+}
+
+/// One step of the selection from the keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Move {
+    Up,
+    Down,
+    Left,
+    Right,
+    /// Tab: right, and on to the next record from the last column.
+    Next,
+    /// Shift-Tab: left, and back to the previous record from the first.
+    Previous,
+    /// Home and End: the record's first and last column.
+    RowStart,
+    RowEnd,
+    /// Cmd-Home and Cmd-End: the first and the last record.
+    First,
+    Last,
+    PageUp,
+    PageDown,
 }
 
 impl TableView {
@@ -99,7 +124,116 @@ impl TableView {
             scroll_row: 0,
             scroll_x: 0.0,
             mode_grid: true,
+            selected: None,
         }
+    }
+
+    /// The last record and the last column, when there are any.
+    fn last_cell(&self) -> Option<(usize, usize)> {
+        Some((
+            self.table.rows.len().checked_sub(1)?,
+            self.column_count().checked_sub(1)?,
+        ))
+    }
+
+    /// Keeps the selection on a cell that exists: after a reparse that
+    /// removed records or columns, the selection moves in to the last.
+    fn clamp_selection(&mut self) {
+        self.selected = match (self.selected, self.last_cell()) {
+            (Some((row, column)), Some((last_row, last_column))) => {
+                Some((row.min(last_row), column.min(last_column)))
+            }
+            _ => None,
+        };
+    }
+
+    /// Selects `cell`, or nothing, and brings it on screen.
+    pub fn select(&mut self, cell: Option<(usize, usize)>, cells: Cells, rect: Viewport) {
+        self.selected = cell;
+        self.clamp_selection();
+        self.scroll_to_selection(cells, rect);
+    }
+
+    /// Moves the selection one `step`, clamped at the grid's edges, and
+    /// brings it on screen. Nothing happens without a selection: the keys
+    /// scroll then. `page` is how many records a page key moves by.
+    pub fn move_selection(
+        &mut self,
+        step: Move,
+        page: usize,
+        cells: Cells,
+        rect: Viewport,
+    ) -> bool {
+        let (Some((row, column)), Some((last_row, last_column))) =
+            (self.selected, self.last_cell())
+        else {
+            return false;
+        };
+        let target = match step {
+            Move::Up => (row.saturating_sub(1), column),
+            Move::Down => (row + 1, column),
+            Move::Left => (row, column.saturating_sub(1)),
+            Move::Right => (row, column + 1),
+            Move::Next if column < last_column => (row, column + 1),
+            Move::Next if row < last_row => (row + 1, 0),
+            Move::Next => (row, column),
+            Move::Previous if column > 0 => (row, column - 1),
+            Move::Previous if row > 0 => (row - 1, last_column),
+            Move::Previous => (row, column),
+            Move::RowStart => (row, 0),
+            Move::RowEnd => (row, last_column),
+            Move::First => (0, column),
+            Move::Last => (last_row, column),
+            Move::PageUp => (row.saturating_sub(page), column),
+            Move::PageDown => (row + page, column),
+        };
+        // The header is always on screen, so going to it would leave the
+        // body where it was; the first record means the top of the file.
+        if step == Move::First {
+            self.scroll_row = 0;
+        }
+        self.select(Some(target), cells, rect);
+        true
+    }
+
+    /// Scrolls so the selected cell is whole on screen: by records down,
+    /// by points sideways. A cell wider than the view shows its start.
+    pub fn scroll_to_selection(&mut self, cells: Cells, rect: Viewport) {
+        let Some((row, column)) = self.selected else {
+            return;
+        };
+        if row > 0 {
+            let visible = rows_visible(rect, cells.line_height);
+            let body = row - 1;
+            if body < self.scroll_row {
+                self.scroll_row = body;
+            } else if body >= self.scroll_row + visible {
+                self.scroll_row = body + 1 - visible;
+            }
+        }
+        let edges = self.column_edges(cells);
+        let content = (rect.width - self.gutter_width(cells)).max(0.0);
+        if edges[column] < self.scroll_x {
+            self.scroll_x = edges[column];
+        } else if edges[column + 1] > self.scroll_x + content {
+            self.scroll_x = (edges[column + 1] - content).min(edges[column]);
+        }
+        self.clamp_scroll(cells, rect);
+    }
+
+    /// The cell a press at a point selects: the one under it, or the first
+    /// of the record whose number is under it in the gutter.
+    pub fn cell_for_press(
+        &self,
+        cells: Cells,
+        rect: Viewport,
+        x: f32,
+        y: f32,
+    ) -> Option<(usize, usize)> {
+        if rect.contains(x, y) && x < rect.x + self.gutter_width(cells) {
+            return Some((self.row_at(cells, rect, y)?, 0));
+        }
+        self.cell_at(cells, rect, x, y)
     }
 
     /// Whether the parse is of the text as it is now.
@@ -163,6 +297,19 @@ impl TableView {
         self.clamp_scroll(cells, rect);
     }
 
+    /// The record under a height in `rect`: the header is record 0.
+    fn row_at(&self, cells: Cells, rect: Viewport, y: f32) -> Option<usize> {
+        if y < rect.y || y >= rect.y + rect.height {
+            return None;
+        }
+        let row = if y < rect.y + cells.line_height {
+            0
+        } else {
+            1 + self.scroll_row + ((y - rect.y - cells.line_height) / cells.line_height) as usize
+        };
+        (row < self.table.rows.len()).then_some(row)
+    }
+
     /// The record and column under a point in `rect`: the header is record
     /// 0. Nothing over the gutter or past the last column.
     pub fn cell_at(&self, cells: Cells, rect: Viewport, x: f32, y: f32) -> Option<(usize, usize)> {
@@ -173,12 +320,7 @@ impl TableView {
         let gx = x - rect.x - gutter + self.scroll_x;
         let edges = self.column_edges(cells);
         let column = edges.windows(2).position(|w| gx >= w[0] && gx < w[1])?;
-        let row = if y < rect.y + cells.line_height {
-            0
-        } else {
-            1 + self.scroll_row + ((y - rect.y - cells.line_height) / cells.line_height) as usize
-        };
-        (row < self.table.rows.len()).then_some((row, column))
+        Some((self.row_at(cells, rect, y)?, column))
     }
 }
 
@@ -229,6 +371,7 @@ pub fn sync(tables: &mut HashMap<u64, TableView>, buffer: &Buffer) {
             view.table = fresh.table;
             view.widths = fresh.widths;
             view.short_rows = fresh.short_rows;
+            view.clamp_selection();
         }
         Some(_) => {}
     }
@@ -240,10 +383,12 @@ pub fn dump(view: Option<&TableView>) -> String {
         None => "none".to_string(),
         Some(view) if !view.mode_grid => "text".to_string(),
         Some(view) => format!(
-            "grid rows={} cols={} scroll={}",
+            "grid rows={} cols={} scroll={} sel={}",
             view.table.rows.len(),
             view.column_count(),
-            view.scroll_row
+            view.scroll_row,
+            view.selected
+                .map_or("-".to_string(), |(row, column)| format!("{row},{column}"))
         ),
     }
 }
@@ -401,6 +546,24 @@ pub fn draw(
         [rect.width, line_height],
         theme.tab_bar,
     );
+    // The selected cell's row, when it is on screen: its band, under the
+    // rules and the text; the cell's own outline goes on last.
+    let selected_y = view.selected.and_then(|(row, _)| match row {
+        0 => Some(rect.y),
+        _ if (view.scroll_row..view.scroll_row + visible).contains(&(row - 1)) => {
+            Some(body.y + (row - 1 - view.scroll_row) as f32 * line_height)
+        }
+        _ => None,
+    });
+    if let Some(y) = selected_y {
+        layout::push_rect(
+            out,
+            atlas,
+            [rect.x, y],
+            [rect.width, line_height],
+            theme.row_hover,
+        );
+    }
     layout::push_rect(
         out,
         atlas,
@@ -467,6 +630,28 @@ pub fn draw(
     draw_row(0, rect.y, theme.status_text, out);
     for (index, y) in shown {
         draw_row(index, y, theme.text, out);
+    }
+
+    // The selected cell: a one point outline on the rules around it (the
+    // header has none above, and the gutter's is left alone), cut where
+    // the cell runs under the gutter or off the right.
+    if let (Some(y), Some((row, column))) = (selected_y, view.selected) {
+        let x = left + edges[column] - scroll_x;
+        let width = edges[column + 1] - edges[column] + 1.0;
+        let top = if row == 0 { y } else { y - 1.0 };
+        let height = y + line_height - top;
+        let from = out.len();
+        for (pos, size) in [
+            ([x, top], [width, 1.0]),
+            ([x, y + line_height - 1.0], [width, 1.0]),
+            ([x, top], [1.0, height]),
+            ([x + width - 1.0, top], [1.0, height]),
+        ] {
+            layout::push_rect(out, atlas, pos, size, theme.accent);
+        }
+        for quad in &mut out[from..] {
+            layout::clip_horizontal(quad, left, right);
+        }
     }
 }
 
@@ -651,7 +836,7 @@ mod tests {
         sync(&mut tables, &b);
         let view = &tables[&b.id()];
         assert_eq!(view.table.rows.len(), 6);
-        assert_eq!(dump(Some(view)), "grid rows=6 cols=4 scroll=0");
+        assert_eq!(dump(Some(view)), "grid rows=6 cols=4 scroll=0 sel=-");
         assert_eq!(dump(None), "none");
         // Not a table file: nothing kept.
         let plain = buffer("notes.txt", "a,b\n1,2\n");
@@ -660,6 +845,179 @@ mod tests {
         let tsv = buffer("t.tsv", "a\tb\n1\t2\n");
         sync(&mut tables, &tsv);
         assert_eq!(tables[&tsv.id()].dialect.delimiter, b'\t');
+    }
+
+    /// 19 rows (the header and 18 of the body) by 200 points: 160 of them
+    /// right of the gutter, less than the grid's width.
+    const RECT: Viewport = Viewport {
+        x: 0.0,
+        y: 0.0,
+        width: 200.0,
+        height: 19.0 * 19.0,
+    };
+
+    #[test]
+    fn the_selection_steps_and_stops_at_the_edges() {
+        let mut view = TableView::parse(&Rope::from_text(&rows(300)));
+        // Without a selection the keys do nothing here.
+        assert!(!view.move_selection(Move::Down, 17, CELLS, RECT));
+        assert_eq!(view.selected, None);
+        view.select(Some((1, 1)), CELLS, RECT);
+        assert!(view.move_selection(Move::Up, 17, CELLS, RECT));
+        assert_eq!(view.selected, Some((0, 1)), "up to the header");
+        view.move_selection(Move::Up, 17, CELLS, RECT);
+        assert_eq!(view.selected, Some((0, 1)), "the header is the top");
+        view.move_selection(Move::Left, 17, CELLS, RECT);
+        view.move_selection(Move::Left, 17, CELLS, RECT);
+        assert_eq!(view.selected, Some((0, 0)));
+        view.move_selection(Move::RowEnd, 17, CELLS, RECT);
+        assert_eq!(view.selected, Some((0, 3)));
+        view.move_selection(Move::Right, 17, CELLS, RECT);
+        assert_eq!(view.selected, Some((0, 3)), "the last column is the edge");
+        view.move_selection(Move::Last, 17, CELLS, RECT);
+        assert_eq!(view.selected, Some((299, 3)));
+        view.move_selection(Move::Down, 17, CELLS, RECT);
+        view.move_selection(Move::PageDown, 17, CELLS, RECT);
+        assert_eq!(view.selected, Some((299, 3)), "the last record is the edge");
+        view.move_selection(Move::PageUp, 17, CELLS, RECT);
+        assert_eq!(view.selected, Some((282, 3)));
+        view.move_selection(Move::RowStart, 17, CELLS, RECT);
+        assert_eq!(view.selected, Some((282, 0)));
+        view.move_selection(Move::First, 17, CELLS, RECT);
+        assert_eq!(view.selected, Some((0, 0)));
+        view.move_selection(Move::PageUp, 17, CELLS, RECT);
+        assert_eq!(view.selected, Some((0, 0)));
+        // A selection past the grid is pulled in.
+        view.select(Some((500, 9)), CELLS, RECT);
+        assert_eq!(view.selected, Some((299, 3)));
+        view.select(None, CELLS, RECT);
+        assert_eq!(view.selected, None);
+    }
+
+    #[test]
+    fn tab_wraps_to_the_next_record_and_stops_at_the_last_cell() {
+        let mut view = TableView::parse(&Rope::from_text(&rows(4)));
+        view.select(Some((1, 2)), CELLS, RECT);
+        view.move_selection(Move::Next, 1, CELLS, RECT);
+        assert_eq!(view.selected, Some((1, 3)));
+        view.move_selection(Move::Next, 1, CELLS, RECT);
+        assert_eq!(view.selected, Some((2, 0)), "on to the next record");
+        view.move_selection(Move::Previous, 1, CELLS, RECT);
+        assert_eq!(view.selected, Some((1, 3)), "and back");
+        view.select(Some((3, 3)), CELLS, RECT);
+        view.move_selection(Move::Next, 1, CELLS, RECT);
+        assert_eq!(view.selected, Some((3, 3)), "the last cell stays");
+        view.select(Some((0, 0)), CELLS, RECT);
+        view.move_selection(Move::Previous, 1, CELLS, RECT);
+        assert_eq!(view.selected, Some((0, 0)), "so does the first");
+    }
+
+    #[test]
+    fn the_selection_scrolls_into_view() {
+        let mut view = TableView::parse(&Rope::from_text(&rows(300)));
+        let edges = view.column_edges(CELLS);
+        // Below the 18 body rows on screen: the record becomes the last
+        // one shown. Right of the 160 points: the column's end comes to
+        // the right edge.
+        view.select(Some((30, 3)), CELLS, RECT);
+        assert_eq!(view.scroll_row, 30 - 18);
+        assert_eq!(view.scroll_x, edges[4] - 160.0);
+        // Up and left again: the record becomes the first shown and the
+        // column starts at the left edge.
+        view.select(Some((5, 1)), CELLS, RECT);
+        assert_eq!(view.scroll_row, 4);
+        assert_eq!(view.scroll_x, edges[1]);
+        // The header is always on screen: no vertical scroll for it.
+        view.select(Some((0, 0)), CELLS, RECT);
+        assert_eq!(view.scroll_row, 4);
+        assert_eq!(view.scroll_x, 0.0);
+        // A column wider than the view shows its start.
+        let wide = Viewport {
+            width: view.gutter_width(CELLS) + 20.0,
+            ..RECT
+        };
+        view.select(Some((0, 2)), CELLS, wide);
+        assert_eq!(view.scroll_x, edges[2]);
+        // A step from the keys scrolls too.
+        view.select(Some((1, 0)), CELLS, RECT);
+        assert_eq!(view.scroll_row, 0);
+        view.select(Some((18, 0)), CELLS, RECT);
+        assert_eq!(view.scroll_row, 0, "the last row that fits");
+        view.move_selection(Move::Down, 17, CELLS, RECT);
+        assert_eq!(view.selected, Some((19, 0)));
+        assert_eq!(view.scroll_row, 1);
+        view.move_selection(Move::PageDown, 17, CELLS, RECT);
+        assert_eq!(view.selected, Some((36, 0)));
+        assert_eq!(view.scroll_row, 18);
+        // The first record is the header, which is always on screen: the
+        // body goes back to the top all the same.
+        view.move_selection(Move::First, 17, CELLS, RECT);
+        assert_eq!(view.selected, Some((0, 0)));
+        assert_eq!(view.scroll_row, 0);
+    }
+
+    #[test]
+    fn a_press_in_the_gutter_selects_the_record() {
+        let view = TableView::parse(&Rope::from_text(&rows(300)));
+        let rect = Viewport {
+            x: 100.0,
+            y: 50.0,
+            ..RECT
+        };
+        let gutter = view.gutter_width(CELLS);
+        assert_eq!(view.cell_for_press(CELLS, rect, 102.0, 55.0), Some((0, 0)));
+        assert_eq!(
+            view.cell_for_press(CELLS, rect, 102.0, 50.0 + 19.0 * 3.0 + 1.0),
+            Some((3, 0))
+        );
+        assert_eq!(
+            view.cell_for_press(CELLS, rect, 100.0 + gutter + 41.0, 55.0),
+            Some((0, 1))
+        );
+        assert_eq!(view.cell_for_press(CELLS, rect, 102.0, 40.0), None);
+        assert_eq!(
+            view.cell_for_press(CELLS, rect, 102.0, 50.0 + 19.0 * 19.0),
+            None
+        );
+        // Below the last record, in a short file.
+        let small = TableView::parse(&Rope::from_text("a,b\n1,2\n"));
+        assert_eq!(
+            small.cell_for_press(CELLS, rect, 102.0, 50.0 + 19.0 * 5.0),
+            None
+        );
+    }
+
+    #[test]
+    fn the_selection_survives_a_reparse_and_is_clamped_to_what_is_left() {
+        let mut b = buffer("sel.csv", &rows(6));
+        let mut tables = HashMap::new();
+        sync(&mut tables, &b);
+        tables
+            .get_mut(&b.id())
+            .unwrap()
+            .select(Some((5, 3)), CELLS, RECT);
+        // Text changed, the cell still there: the selection stays.
+        b.insert("9,Z,z,0\n");
+        sync(&mut tables, &b);
+        assert_eq!(tables[&b.id()].selected, Some((5, 3)));
+        // Rows and a column gone: the selection moves in.
+        b.rope = Rope::from_text("a,b\n1,2\n3,4\n");
+        sync(&mut tables, &b);
+        assert_eq!(tables[&b.id()].selected, Some((2, 1)));
+        assert_eq!(
+            dump(Some(&tables[&b.id()])),
+            "grid rows=3 cols=2 scroll=0 sel=2,1"
+        );
+        // Text mode and back keeps it.
+        tables.get_mut(&b.id()).unwrap().mode_grid = false;
+        sync(&mut tables, &b);
+        tables.get_mut(&b.id()).unwrap().mode_grid = true;
+        sync(&mut tables, &b);
+        assert_eq!(tables[&b.id()].selected, Some((2, 1)));
+        // Nothing left: nothing selected.
+        b.rope = Rope::from_text("");
+        sync(&mut tables, &b);
+        assert_eq!(tables[&b.id()].selected, None);
     }
 
     #[test]

@@ -1038,6 +1038,9 @@ impl EditorView {
             unshaped: *unshaped_on_screen,
             branch: git.branch_status(),
             claude: claude.as_ref().is_some_and(|c| c.is_connected()),
+            table_cell: (column == Column::Table)
+                .then(|| tables.get(&buffer.id()).and_then(|view| view.selected))
+                .flatten(),
             lsp: lsp_language(buffer)
                 .and_then(|language| lsp.get(&crate::lsp::servers::server_key(language)))
                 .and_then(|server| match &server.phase {
@@ -1635,6 +1638,9 @@ struct StatusParts<'a> {
     /// The document's language server once it answers: its name, or that
     /// it stopped. Nothing while it starts; the spinner says that.
     lsp: Option<String>,
+    /// The grid's selected cell, as record and column from 0, while a CSV
+    /// or TSV document shows as a grid: it stands in for the caret.
+    table_cell: Option<(usize, usize)>,
 }
 
 /// The status line's left and right text. The left is a note, else the
@@ -1689,13 +1695,17 @@ fn status_texts(parts: &StatusParts<'_>) -> (String, String) {
             .unwrap_or_default();
         format!("{name}   {saved}{unshaped}{blamed}")
     });
+    // In the grid the selected cell is the position, numbered as the
+    // gutter numbers the records; the same width as the caret's.
+    let place = match parts.table_cell {
+        Some((row, column)) => format!("Row {}, Col {}", row + 1, column + 1),
+        None => format!("Ln {}, Col {}", line + 1, column + 1),
+    };
     let position = if buffer.is_view_only() {
         String::new()
     } else {
         format!(
-            "Ln {}, Col {}     {}     {}",
-            line + 1,
-            column + 1,
+            "{place}     {}     {}",
             buffer.disk_format().label(),
             buffer.disk_format().line_ending_label()
         )
@@ -1733,7 +1743,20 @@ mod status_tests {
             branch: String::new(),
             claude: false,
             lsp: None,
+            table_cell: None,
         }
+    }
+
+    #[test]
+    fn the_grids_cell_stands_in_for_the_caret() {
+        let buffer = Buffer::new();
+        let grid = StatusParts {
+            table_cell: Some((2, 1)),
+            ..parts(&buffer)
+        };
+        let (_, right) = status_texts(&grid);
+        assert!(right.starts_with("Row 3, Col 2     "), "{right}");
+        assert!(!right.contains("Ln "), "{right}");
     }
 
     #[test]
