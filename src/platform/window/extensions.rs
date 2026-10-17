@@ -44,6 +44,8 @@ impl EditorView {
                 self.extensions_action(crate::platform::extensions::Action::Select(id.to_owned()));
                 self.request_redraw();
             }
+            // The message stays for a cancelled quit: it is still true.
+            Some(MessageAction::Restart) => self.restart(false),
             None => {}
         }
     }

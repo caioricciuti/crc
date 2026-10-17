@@ -91,6 +91,7 @@ impl EditorView {
             settings_page,
             review_page,
             update_ready,
+            replaced,
             blame: Blame { shown: blame, .. },
             renderer,
             glyphs,
@@ -128,6 +129,7 @@ impl EditorView {
             heat,
             history,
             home_hits,
+            home_view,
             recent_projects,
             home: home_summary,
             status_detail_x,
@@ -338,7 +340,7 @@ impl EditorView {
                 [editor_rect.width, editor_rect.height],
                 theme.tab_active,
             );
-            layout::build_home(
+            layout::build_home_view(
                 glyphs,
                 &mut renderer.atlas,
                 editor_rect,
@@ -357,6 +359,8 @@ impl EditorView {
                     .map(|(dir, title, n)| (title.clone(), *n, review_page.running.contains(dir)))
                     .collect::<Vec<_>>(),
                 update_ready.as_ref().map(|r| r.version.as_str()),
+                *replaced,
+                home_view,
                 home_hits,
             );
         } else {

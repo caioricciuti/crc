@@ -135,6 +135,36 @@ pub fn hotspot(rect: Viewport, cursor: Cursor, tip: Option<&str>) {
     });
 }
 
+/// How many hotspots the frame has so far: the mark for
+/// [`clip_hotspots`].
+pub fn hotspots_len() -> usize {
+    HOTSPOTS.with(|h| h.borrow().len())
+}
+
+/// Cuts the hotspots added since `from` to `rect`, for a surface that
+/// scrolls: a row drawn past the pane's edge is clipped away, so it must
+/// not keep the pointer either. Those left wholly outside go.
+pub fn clip_hotspots(from: usize, rect: Viewport) {
+    let (top, bottom) = (rect.y, rect.y + rect.height);
+    HOTSPOTS.with(|h| {
+        let mut h = h.borrow_mut();
+        let from = from.min(h.len());
+        let kept: Vec<Hotspot> = h
+            .drain(from..)
+            .filter_map(|mut spot| {
+                let y0 = spot.rect.y.max(top);
+                let y1 = (spot.rect.y + spot.rect.height).min(bottom);
+                (y1 > y0).then(|| {
+                    spot.rect.y = y0;
+                    spot.rect.height = y1 - y0;
+                    spot
+                })
+            })
+            .collect();
+        h.extend(kept);
+    });
+}
+
 /// The hotspots of the frame just drawn, in drawing order.
 pub fn hotspots() -> Vec<Hotspot> {
     HOTSPOTS.with(|h| h.borrow().clone())
@@ -1186,6 +1216,51 @@ pub fn push_empty_state(
         b.draw(out, atlas, theme);
     }
     laid.button
+}
+
+// A key cap: how a keyboard shortcut is drawn wherever one is shown as
+// a thing to press rather than a word in a sentence. The palette's "esc"
+// and Home's Keys table share it.
+
+/// The key's name draws at this share of the UI size inside its cap.
+pub const KEY_CAP_TEXT: f32 = 0.85;
+
+/// The width a cap for `text` wants: the name with air either side,
+/// never narrower than a control is tall.
+pub fn key_cap_width(atlas: &mut Atlas, text: &str) -> f32 {
+    (ui_text_width(atlas, text) * KEY_CAP_TEXT + UI_INSET)
+        .max(UI_CONTROL)
+        .round()
+}
+
+/// A key cap in `rect`: a ring on the control ramp's pressed shade, the
+/// surface it sits on (`ground`) inside it, and the key's name. An outline
+/// rather than a fill, since a filled control vanishes on the fills the
+/// palette and the pages use.
+pub fn push_key_cap(
+    out: &mut Vec<GlyphInstance>,
+    atlas: &mut Atlas,
+    rect: Viewport,
+    text: &str,
+    ground: [f32; 4],
+    theme: &Theme,
+) {
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
+    }
+    push_rounded_rect(out, rect, UI_RADIUS_SM, theme.control_pressed);
+    push_rounded_rect(
+        out,
+        Viewport {
+            x: rect.x + 1.0,
+            y: rect.y + 1.0,
+            width: rect.width - 2.0,
+            height: rect.height - 2.0,
+        },
+        UI_RADIUS_SM,
+        ground,
+    );
+    push_ui_text_scaled(out, atlas, rect, text, theme.status_text, KEY_CAP_TEXT);
 }
 
 thread_local! {

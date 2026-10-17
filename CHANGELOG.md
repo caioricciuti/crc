@@ -50,6 +50,13 @@ One entry per tag, written for people who use the editor.
   line follows only the ones you asked for. The Workspace inspector
   sketches rows only while a read is in flight, and otherwise says
   Nothing to show or Not read yet.
+- Help > Restart crc quits the way Cmd-Q does (unsaved documents ask
+  first, and Cancel keeps crc running) and opens the app again. When
+  crc.app is replaced under a running crc, the status line now says "crc
+  was updated on disk" with a Restart button beside it, and Home's Start
+  list offers Restart crc, in place of a note telling you to quit and
+  reopen by hand. crc looks for that when it comes to the front and every
+  half minute while it draws.
 
 ## v0.2.0-alpha.25, 2026-10-17
 

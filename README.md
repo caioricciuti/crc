@@ -409,6 +409,11 @@ the size and write it back.
   Cmd-Q does (unsaved documents ask first), puts the new app where the old
   one was and opens it. If that cannot be done (an app in a folder you
   cannot write to), crc keeps running and the status line says why.
+  Help > Restart crc quits the same way and opens the app as it is on
+  disk; when crc.app was replaced under a running crc (an install from
+  one of its own terminals), the status line says so with a Restart
+  button and Home offers Restart crc, since macOS withholds the app's
+  permissions from the old process until it is reopened.
 - **macOS only, and deliberately so.**
 
 ## Keys

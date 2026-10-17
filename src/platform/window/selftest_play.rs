@@ -425,6 +425,8 @@ impl EditorView {
                 self.poll_project_search();
                 self.poll_http();
                 self.poll_update();
+                // The app on disk: what coming to the front looks for.
+                self.say_if_replaced(false);
                 self.poll_ignored();
                 self.poll_completion();
                 self.poll_claude();
@@ -727,7 +729,7 @@ impl EditorView {
                 let spans = state.spans.len();
                 let report = format!(
                     // First: the report ends with the document's text.
-                    "message: {}\npreview: {}\nmd: {md}\nspans: {spans}\nactivity: {}\npointer_targets: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nrepo: {}\ngit_note: {}\nhome: {}\nmcp: {}\nmcp_page: {}\nsettings_page: {}\nreview_page: {}\nterminals: {}\nagents: {}\ninspector: {}\nteams: {}\nagents_tree: {}\nagents_activity: {}\nagents_prs: {}\nconflicts: {}\ngit_conflicts: {}\ntable: {}\nblame: {}\nfind_results: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\npeek: {}\ngutter: {}\nissue_tab: {}\nscrub: {}\nscrub_strip: {}\nscrub_fade: {}\nscrub_filter: {}\nscrub_compare: {}\nblame_heat: {}\n{report}",
+                    "message: {}\npreview: {}\nmd: {md}\nspans: {spans}\nactivity: {}\npointer_targets: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nrepo: {}\ngit_note: {}\nhome: {}\nhome_scroll: {}\nmcp: {}\nmcp_page: {}\nsettings_page: {}\nreview_page: {}\nterminals: {}\nagents: {}\ninspector: {}\nteams: {}\nagents_tree: {}\nagents_activity: {}\nagents_prs: {}\nconflicts: {}\ngit_conflicts: {}\ntable: {}\nblame: {}\nfind_results: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\npeek: {}\ngutter: {}\nissue_tab: {}\nscrub: {}\nscrub_strip: {}\nscrub_fade: {}\nscrub_filter: {}\nscrub_compare: {}\nblame_heat: {}\nreplaced: {}\n{report}",
                     state.message.as_ref().map_or("", |(text, _)| text.as_str()),
                     state.html_preview.as_ref().map_or("closed".to_string(), |p| format!(
                         "open ext={} view={} probe={}",
@@ -812,6 +814,7 @@ impl EditorView {
                         h.calls.len(),
                         state.home_hits.len(),
                     )),
+                    state.home_view.report(),
                     state.mcp.report(),
                     state.mcp.page_report(),
                     state.settings_page.report(),
@@ -840,11 +843,12 @@ impl EditorView {
                     ),
                     state.agents.report_teams(&state.terminal.tabs),
                     // With the folder each folder workspace's row shows,
-                    // on a line of its own.
+                    // on a line of its own, and the list's first line shown.
                     format_args!(
-                        "{}\nagents_folders: {}",
+                        "{}\nagents_folders: {}\nagents_scroll: {}",
                         state.agents.report_tree(),
-                        state.agents.report_folders()
+                        state.agents.report_folders(),
+                        state.agents.scroll
                     ),
                     state.agents.report_activity(),
                     state.agents.report_pull_requests(),
@@ -996,6 +1000,7 @@ impl EditorView {
                             )
                         })
                     },
+                    state.replaced,
                 );
                 if let Err(e) = std::fs::write(path, report) {
                     eprintln!("crc: selftest could not write {path}: {e}");
@@ -1145,6 +1150,11 @@ fn region_named(state: &mut State, name: &str) -> Option<Viewport> {
             state.git.diff_line_rect(text, line)
         }
         _ if name.starts_with("inspector.") => state.agents.inspector.named(name),
+        // The Open Folder button of the Explorer with no folder.
+        _ if name == "sidebar.open" => {
+            let sidebar = chrome_of(state).sidebar?;
+            layout::sidebar_empty_button(&mut state.renderer.atlas, sidebar)
+        }
         _ if name == "home.review" => state
             .home_hits
             .iter()
@@ -1154,6 +1164,11 @@ fn region_named(state: &mut State, name: &str) -> Option<Viewport> {
             .home_hits
             .iter()
             .find(|h| h.action == layout::HomeAction::RestartToUpdate)
+            .map(|h| h.rect),
+        _ if name == "home.restart" => state
+            .home_hits
+            .iter()
+            .find(|h| h.action == layout::HomeAction::Restart)
             .map(|h| h.rect),
         _ => frame_of(state).named(name),
     }

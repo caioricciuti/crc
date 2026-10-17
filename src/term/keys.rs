@@ -135,6 +135,21 @@ fn control(bare: &str) -> Option<Vec<u8>> {
     Some(vec![byte])
 }
 
+/// The wheel on the alternate screen, xterm's alternate scroll: a program
+/// that took the screen whole but did not ask for the mouse (`less`, a
+/// pager in `git log`) hears each line of the wheel as an arrow key, Up
+/// for `lines` negative, in the cursor mode it set. Nothing for no whole
+/// line, so a trackpad adds up outside.
+pub fn alternate_scroll(lines: isize, app_cursor: bool) -> Vec<u8> {
+    let arrow: &[u8] = match (lines < 0, app_cursor) {
+        (true, true) => b"\x1bOA",
+        (true, false) => b"\x1b[A",
+        (false, true) => b"\x1bOB",
+        (false, false) => b"\x1b[B",
+    };
+    arrow.repeat(lines.unsigned_abs())
+}
+
 /// Text to paste. Inside bracketed paste the program is told where it
 /// starts and ends, and the end marker cannot be smuggled inside it.
 pub fn paste(text: &str, bracketed: bool) -> Vec<u8> {
@@ -276,5 +291,17 @@ mod tests {
     fn pastes_are_bracketed_and_cannot_close_early() {
         assert_eq!(paste("a\nb", false), b"a\rb".to_vec());
         assert_eq!(paste("x\x1b[201~y", true), b"\x1b[200~xy\x1b[201~".to_vec());
+    }
+
+    #[test]
+    fn alternate_scroll_is_an_arrow_per_line_in_the_cursor_mode() {
+        // A wheel notch is three lines up: three Up arrows, xterm style.
+        assert_eq!(alternate_scroll(-3, false), b"\x1b[A\x1b[A\x1b[A".to_vec());
+        assert_eq!(alternate_scroll(3, false), b"\x1b[B\x1b[B\x1b[B".to_vec());
+        // Application cursor mode (DECCKM) takes the SS3 form.
+        assert_eq!(alternate_scroll(-1, true), b"\x1bOA".to_vec());
+        assert_eq!(alternate_scroll(2, true), b"\x1bOB\x1bOB".to_vec());
+        // A trackpad short of a whole line sends nothing yet.
+        assert!(alternate_scroll(0, false).is_empty());
     }
 }

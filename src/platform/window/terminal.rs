@@ -1682,7 +1682,9 @@ impl EditorView {
 
     /// The wheel over the terminal, `lines` of it, negative up: reported
     /// as wheel buttons, one per line, to a program that asked for the
-    /// mouse, and otherwise a scroll through the history.
+    /// mouse; as arrow keys, one per line, to one on the alternate screen
+    /// that did not (xterm's alternate scroll, so a pager still moves);
+    /// and otherwise a scroll through the history.
     pub(super) fn terminal_wheel(&self, x: f32, y: f32, lines: isize, flags: NSEventModifierFlags) {
         let target = (lines != 0 && !mouse_kept(flags))
             .then(|| self.mouse_pane(x, y))
@@ -1701,6 +1703,29 @@ impl EditorView {
                 self.mouse_report(tab, mouse_event(Action::Press, Some(button), cell, flags));
             }
             return;
+        }
+        // The alternate screen has no history to scroll: the pane's program
+        // gets the wheel as cursor keys, in the mode it set.
+        let alternate = (lines != 0 && !mouse_kept(flags))
+            .then(|| self.mouse_screen(x, y))
+            .flatten()
+            .map(|(tab, _)| tab);
+        if let Some(tab) = alternate {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            let Some(tab) = state.terminal.tabs.get_mut(tab) else {
+                return;
+            };
+            let app_cursor = {
+                let term = tab.session.term.lock().unwrap_or_else(|e| e.into_inner());
+                term.is_alternate().then_some(term.modes.app_cursor)
+            };
+            if let Some(app_cursor) = app_cursor {
+                tab.session
+                    .write(&crate::term::keys::alternate_scroll(lines, app_cursor));
+                return;
+            }
         }
         let Some(mut state) = self.state_mut() else {
             return;

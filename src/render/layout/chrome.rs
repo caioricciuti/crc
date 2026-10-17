@@ -471,6 +471,8 @@ pub enum HomeAction {
     OpenReview,
     /// Install the downloaded update: Help > Restart to Update.
     RestartToUpdate,
+    /// Open the app on disk again: Help > Restart crc.
+    Restart,
 }
 
 /// A clickable row on the home screen.
@@ -480,12 +482,119 @@ pub struct HomeHit {
     pub action: HomeAction,
 }
 
+/// The height of a Home row, and what one wheel line scrolls.
+pub const HOME_ROW: f32 = 30.0;
+
+/// How many recent folders Home lists: as many as the session keeps.
+/// The column scrolls, so the pane does not bound the list.
+pub const HOME_RECENT: usize = 8;
+
+/// How far Home is scrolled, kept per window like the other pages'.
+/// Home lays out everything it has and cuts to the pane; what is below
+/// the pane is reached with the wheel, Page Up and Down, Home and End.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HomeView {
+    /// How far the column is scrolled, in points.
+    pub scroll: f32,
+    /// Where it was drawn, for the wheel and the page keys.
+    pub rect: Option<Viewport>,
+    /// How tall the content was last frame, which bounds the scroll.
+    pub content: f32,
+}
+
+impl HomeView {
+    /// The most the column can scroll: what does not fit the pane.
+    pub fn max_scroll(&self) -> f32 {
+        let visible = self.rect.map_or(0.0, |r| r.height);
+        (self.content - visible).max(0.0)
+    }
+
+    pub fn scroll_by(&mut self, points: f32) {
+        self.scroll = (self.scroll + points).clamp(0.0, self.max_scroll());
+    }
+
+    /// Page Down (`pages` 1.0) or Page Up (-1.0): a pane's height less a
+    /// row, so the last row seen is the first row then.
+    pub fn page_by(&mut self, pages: f32) {
+        let visible = self.rect.map_or(0.0, |r| r.height);
+        self.scroll_by(pages * (visible - HOME_ROW).max(HOME_ROW));
+    }
+
+    pub fn to_top(&mut self) {
+        self.scroll = 0.0;
+    }
+
+    pub fn to_end(&mut self) {
+        self.scroll = self.max_scroll();
+    }
+
+    /// Whether the point is on the column as last drawn.
+    pub fn over(&self, x: f32, y: f32) -> bool {
+        self.rect.is_some_and(|r| r.contains(x, y))
+    }
+
+    /// For the self-test: how far it is scrolled, of how far it can be.
+    pub fn report(&self) -> String {
+        format!("{:.0} of {:.0}", self.scroll, self.max_scroll())
+    }
+}
+
+/// The widest Home's column gets. Wider, and a row's detail drifts away
+/// from its label and the shortcut on the right from both.
+pub const HOME_MEASURE: f32 = 680.0;
+
+/// Home's column in `rect`: its left edge and its width. Centred once the
+/// pane is wider than the column; on a narrow pane it keeps a margin.
+pub fn home_column(rect: Viewport) -> (f32, f32) {
+    let width = (rect.width - 112.0)
+        .clamp(240.0, HOME_MEASURE)
+        .min((rect.width - 56.0).max(0.0));
+    let x = rect.x + ((rect.width - width) / 2.0).max(28.0);
+    (x, width)
+}
+
+/// A folder's path cut to fit: the home folder as `~`, then, when the
+/// whole does not fit, the middle elided and the last two components
+/// kept, since where a folder sits says more than where its disk starts.
+/// `fits` says whether a candidate fits the room.
+pub fn elide_path(path: &str, mut fits: impl FnMut(&str) -> bool) -> String {
+    let path = shorten_home(path);
+    if fits(&path) {
+        return path;
+    }
+    let parts: Vec<&str> = path.split('/').collect();
+    let n = parts.len();
+    let tail = |keep: usize| parts[n - keep.min(n)..].join("/");
+    let mut candidates = Vec::new();
+    // The head is the root's first folder or `~`, kept when something
+    // lies between it and the last two parts.
+    let head = if parts[0].is_empty() { 2 } else { 1 };
+    if n > head + 2 {
+        candidates.push(format!("{}/\u{2026}/{}", parts[..head].join("/"), tail(2)));
+    }
+    if n > 2 {
+        candidates.push(format!("\u{2026}/{}", tail(2)));
+    }
+    if n > 1 {
+        candidates.push(format!("\u{2026}/{}", tail(1)));
+    }
+    candidates
+        .into_iter()
+        .find(|c| fits(c))
+        .unwrap_or_else(|| tail(1))
+}
+
 /// The home screen: what the editor column shows with nothing open.
 ///
 /// Drawn natively rather than as a Markdown document, so it can have rows
 /// you click, the project's recent folders, and the UI font instead of a
 /// monospace table. Appends to `out`; the caller clears and paints the
-/// background first, as for every other panel. `hits` receives the rows.
+/// background first, as for every other panel. `update` is a downloaded
+/// release's version; `replaced` says the app on disk was replaced under
+/// this one, which a restart puts right. `hits` receives the rows.
+///
+/// Unscrolled: for a pane that keeps no [`HomeView`], such as the other
+/// half of a split. The focused pane draws with [`build_home_view`].
 #[allow(clippy::too_many_arguments)]
 pub fn build_home(
     out: &mut Vec<GlyphInstance>,
@@ -498,19 +607,55 @@ pub fn build_home(
     terminals: &[(String, String)],
     review: &[(String, usize, bool)],
     update: Option<&str>,
+    replaced: bool,
     hits: &mut Vec<HomeHit>,
 ) {
-    const ROW: f32 = 30.0;
+    let mut view = HomeView::default();
+    build_home_view(
+        out, atlas, rect, theme, project, recent, summary, terminals, review, update, replaced,
+        &mut view, hits,
+    );
+}
+
+/// [`build_home`] scrolled by `view`, which learns where the column was
+/// drawn and how tall its content is. Everything is laid out; what lies
+/// outside `rect` is cut away, from the glyphs, the hits and the hotspots.
+#[allow(clippy::too_many_arguments)]
+pub fn build_home_view(
+    out: &mut Vec<GlyphInstance>,
+    atlas: &mut Atlas,
+    rect: Viewport,
+    theme: &Theme,
+    project: Option<&std::path::Path>,
+    recent: &[std::path::PathBuf],
+    summary: Option<&crate::project::workspace::Summary>,
+    terminals: &[(String, String)],
+    review: &[(String, usize, bool)],
+    update: Option<&str>,
+    replaced: bool,
+    view: &mut HomeView,
+    hits: &mut Vec<HomeHit>,
+) {
+    const ROW: f32 = HOME_ROW;
     const GAP: f32 = 18.0;
     hits.clear();
+    view.rect = None;
     if rect.width < 200.0 || rect.height < 120.0 {
+        view.content = 0.0;
+        view.scroll = 0.0;
         return;
     }
-    let width = (rect.width - 112.0).clamp(240.0, 560.0);
-    let x = rect.x + ((rect.width - width) / 2.0).clamp(28.0, 72.0);
+    view.rect = Some(rect);
+    // Last frame's content bounds this frame's scroll, as on the pages.
+    view.scroll_by(0.0);
+    let start = out.len();
+    let spots = super::ui::hotspots_len();
+    let (x, width) = home_column(rect);
     let right = x + width;
-    let mut y = rect.y + (rect.height * 0.06).clamp(24.0, 48.0);
-    let bottom = rect.y + rect.height - 16.0;
+    let top_pad = (rect.height * 0.06).clamp(24.0, 48.0);
+    let mut y = rect.y + top_pad - view.scroll;
+    // Nothing is left out for want of height: the column scrolls.
+    let bottom = f32::INFINITY;
     let dim = theme.status_text;
 
     // Wordmark and the one-line situation report.
@@ -622,7 +767,8 @@ pub fn build_home(
         y += GAP;
     }
 
-    // Start: the three things to do from here, each with its shortcut.
+    // Start: the three things to do from here, each with its shortcut,
+    // and the restart an install over the running app asks for.
     section(out, atlas, &mut y, "Start");
     let actions = [
         (
@@ -644,7 +790,8 @@ pub fn build_home(
             HomeAction::FindFile,
         ),
     ];
-    for (glyph, label, keys, action) in actions {
+    let restart = replaced.then_some((icons::REFRESH, "Restart crc", "", HomeAction::Restart));
+    for (glyph, label, keys, action) in actions.into_iter().chain(restart) {
         if y + ROW > bottom {
             return;
         }
@@ -700,11 +847,12 @@ pub fn build_home(
         y = home_workspace(out, atlas, theme, (x, width), y, bottom, summary, hits);
     }
 
-    // Recent: folders opened before, name first, path dimmed after it.
+    // Recent: folders opened before, the name as the label and where it
+    // is, cut to fit, dimmed after it. The whole path is the tooltip.
     let recent: Vec<&std::path::PathBuf> = recent
         .iter()
         .filter(|p| Some(p.as_path()) != project)
-        .take(6)
+        .take(HOME_RECENT)
         .collect();
     if y + 22.0 + ROW <= bottom {
         section(out, atlas, &mut y, "Recent");
@@ -730,56 +878,29 @@ pub fn build_home(
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| path.display().to_string());
+            let full = path.display().to_string();
+            let room = home_detail_width(atlas, width, &name);
             let parent = path
                 .parent()
-                .map(|p| shorten_home(&p.display().to_string()))
+                .map(|p| {
+                    elide_path(&p.display().to_string(), |s| {
+                        ui_text_width(atlas, s) <= room
+                    })
+                })
                 .unwrap_or_default();
-            let row = Viewport {
-                x: x - 8.0,
+            let rect = home_row_tipped(
+                out,
+                atlas,
+                theme,
+                (x, width),
                 y,
-                width: width + 16.0,
-                height: ROW,
-            };
-            push_home_hover(out, row, theme);
-            push_icon_centered(
-                out,
-                atlas,
-                Viewport {
-                    x,
-                    y,
-                    width: 24.0,
-                    height: ROW,
-                },
                 icons::FOLDER,
-                dim,
-            );
-            let name_w = (ui_text_width(atlas, &name) + 4.0).min(width * 0.5);
-            push_ui_text(
-                out,
-                atlas,
-                Viewport {
-                    x: x + 32.0,
-                    y: y + 5.0,
-                    width: name_w,
-                    height: 20.0,
-                },
                 &name,
-                theme.text,
-            );
-            push_ui_text(
-                out,
-                atlas,
-                Viewport {
-                    x: x + 32.0 + name_w + 10.0,
-                    y: y + 5.0,
-                    width: (width - 32.0 - name_w - 10.0).max(0.0),
-                    height: 20.0,
-                },
                 &parent,
-                dim,
+                Some(&full),
             );
             hits.push(HomeHit {
-                rect: row,
+                rect,
                 action: HomeAction::OpenProject(path.clone()),
             });
             y += ROW;
@@ -787,7 +908,8 @@ pub fn build_home(
         y += GAP;
     }
 
-    // Keys: the rest of the shortcuts, two columns.
+    // Keys: the rest of the shortcuts, two columns, each key in a cap of
+    // one width so they read as keys and the actions line up.
     let keys = [
         ("\u{2318}B", "Show or hide the sidebar"),
         ("\u{2318}\u{2325}G", "Source Control"),
@@ -796,32 +918,32 @@ pub fn build_home(
         ("\u{2318}O", "Open a file"),
         ("\u{2318}=", "Zoom in"),
     ];
-    let rows_needed = keys.len().div_ceil(2) as f32 * 24.0;
+    const KEY_ROW: f32 = 28.0;
+    let rows_needed = keys.len().div_ceil(2) as f32 * KEY_ROW;
     if y + 22.0 + rows_needed + 30.0 <= bottom {
         section(out, atlas, &mut y, "Keys");
         let column = width / 2.0;
+        let cap_w = keys
+            .iter()
+            .map(|(combo, _)| key_cap_width(atlas, combo))
+            .fold(0.0, f32::max);
         for (i, (combo, what)) in keys.iter().enumerate() {
             let cx = x + (i % 2) as f32 * column;
-            let cy = y + (i / 2) as f32 * 24.0 + 2.0;
+            let cy = y + (i / 2) as f32 * KEY_ROW;
+            let cap = Viewport {
+                x: cx,
+                y: cy + ((KEY_ROW - UI_CONTROL_SM) * 0.5).floor(),
+                width: cap_w,
+                height: UI_CONTROL_SM,
+            };
+            push_key_cap(out, atlas, cap, combo, theme.tab_active, theme);
             push_ui_text(
                 out,
                 atlas,
                 Viewport {
-                    x: cx,
-                    y: cy,
-                    width: 64.0,
-                    height: 20.0,
-                },
-                combo,
-                dim,
-            );
-            push_ui_text(
-                out,
-                atlas,
-                Viewport {
-                    x: cx + 68.0,
-                    y: cy,
-                    width: column - 76.0,
+                    x: cx + cap_w + UI_INSET,
+                    y: cy + 4.0,
+                    width: (column - cap_w - UI_INSET * 2.0).max(0.0),
                     height: 20.0,
                 },
                 what,
@@ -839,7 +961,24 @@ pub fn build_home(
             "Or start typing: this becomes an untitled document.",
             dim,
         );
+        y += 20.0;
     }
+    view.content = y + 16.0 - (rect.y - view.scroll);
+
+    // Cut to the pane: a row scrolled out of it is neither seen, clicked
+    // nor pointed at.
+    let (top, bottom) = (rect.y, rect.y + rect.height);
+    for quad in &mut out[start..] {
+        clip_vertical(quad, top, bottom);
+    }
+    hits.retain_mut(|hit| {
+        let y0 = hit.rect.y.max(top);
+        let y1 = (hit.rect.y + hit.rect.height).min(bottom);
+        hit.rect.y = y0;
+        hit.rect.height = y1 - y0;
+        y1 > y0
+    });
+    super::ui::clip_hotspots(spots, rect);
 }
 
 /// One clickable Home row: an icon, a label, and a dimmed detail after it.
@@ -850,6 +989,17 @@ fn push_home_hover(out: &mut Vec<GlyphInstance>, row: Viewport, theme: &Theme) {
         push_rounded_rect(out, row, UI_RADIUS, theme.row_hover);
     }
     hotspot(row, Cursor::Pointing, None);
+}
+
+/// The width a Home row's label takes: its text, capped so the detail
+/// after it keeps some room.
+fn home_label_width(atlas: &mut Atlas, width: f32, label: &str) -> f32 {
+    (ui_text_width(atlas, label) + 4.0).min(width * 0.6)
+}
+
+/// The room a Home row's detail has after its label.
+fn home_detail_width(atlas: &mut Atlas, width: f32, label: &str) -> f32 {
+    (width - 32.0 - home_label_width(atlas, width, label) - 10.0).max(0.0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -863,6 +1013,22 @@ fn home_row(
     label: &str,
     detail: &str,
 ) -> Viewport {
+    home_row_tipped(out, atlas, theme, (x, width), y, glyph, label, detail, None)
+}
+
+/// [`home_row`] with a tooltip: the whole of what the detail cut short.
+#[allow(clippy::too_many_arguments)]
+fn home_row_tipped(
+    out: &mut Vec<GlyphInstance>,
+    atlas: &mut Atlas,
+    theme: &Theme,
+    (x, width): (f32, f32),
+    y: f32,
+    glyph: char,
+    label: &str,
+    detail: &str,
+    tip: Option<&str>,
+) -> Viewport {
     const ROW: f32 = 30.0;
     let whole = Viewport {
         x: x - 8.0,
@@ -874,7 +1040,7 @@ fn home_row(
     if over {
         push_rounded_rect(out, whole, UI_RADIUS, theme.row_hover);
     }
-    hotspot(whole, Cursor::Pointing, None);
+    hotspot(whole, Cursor::Pointing, tip);
     push_icon_centered(
         out,
         atlas,
@@ -891,7 +1057,8 @@ fn home_row(
             theme.status_text
         },
     );
-    let label_w = (ui_text_width(atlas, label) + 4.0).min(width * 0.6);
+    let label_w = home_label_width(atlas, width, label);
+    let detail_w = home_detail_width(atlas, width, label);
     push_ui_text(
         out,
         atlas,
@@ -910,7 +1077,7 @@ fn home_row(
         Viewport {
             x: x + 32.0 + label_w + 10.0,
             y: y + 5.0,
-            width: (width - 32.0 - label_w - 10.0).max(0.0),
+            width: detail_w,
             height: 20.0,
         },
         detail,
@@ -1042,7 +1209,8 @@ fn home_workspace(
                 1 => format!("{}  ·  1 change", repo.status),
                 n => format!("{}  ·  {n} changes", repo.status),
             };
-            let rect = home_row(
+            let full = repo.path.display().to_string();
+            let rect = home_row_tipped(
                 out,
                 atlas,
                 theme,
@@ -1051,6 +1219,7 @@ fn home_workspace(
                 icons::FOLDER,
                 &repo.label,
                 &detail,
+                Some(&full),
             );
             hits.push(HomeHit {
                 rect,
@@ -1127,11 +1296,17 @@ fn home_workspace(
             let label = note
                 .file_name()
                 .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+            let full = note.display().to_string();
+            let room = home_detail_width(atlas, width, &label);
             let detail = note
                 .parent()
-                .map(|p| shorten_home(&p.display().to_string()))
+                .map(|p| {
+                    elide_path(&p.display().to_string(), |s| {
+                        ui_text_width(atlas, s) <= room
+                    })
+                })
                 .unwrap_or_default();
-            let rect = home_row(
+            let rect = home_row_tipped(
                 out,
                 atlas,
                 theme,
@@ -1140,6 +1315,7 @@ fn home_workspace(
                 icons::FILE,
                 &label,
                 &detail,
+                Some(&full),
             );
             hits.push(HomeHit {
                 rect,
@@ -1903,26 +2079,20 @@ pub fn build_palette(
         },
         theme,
     );
-    // A key cap: an outline, since a filled control vanishes on the
-    // palette's own fill, lit when the pointer is on it.
+    // The key cap that closes the palette, lit when the pointer is on it.
     let escape = palette_escape(viewport);
-    push_rounded_rect(out, escape, UI_RADIUS_SM, theme.control_pressed);
-    push_rounded_rect(
+    push_key_cap(
         out,
-        Viewport {
-            x: escape.x + 1.0,
-            y: escape.y + 1.0,
-            width: escape.width - 2.0,
-            height: escape.height - 2.0,
-        },
-        UI_RADIUS_SM,
+        atlas,
+        escape,
+        "esc",
         if super::ui::hovered(escape) {
             theme.control_hover
         } else {
             theme.palette_background
         },
+        theme,
     );
-    push_ui_text_scaled(out, atlas, escape, "esc", theme.status_text, 0.85);
     hotspot(escape, Cursor::Pointing, Some("Close"));
     push_rect(
         out,
@@ -2680,6 +2850,29 @@ pub struct SidebarEdit<'a> {
     pub selection: Option<std::ops::Range<usize>>,
 }
 
+/// What the Explorer says with no folder open.
+pub fn sidebar_empty_state() -> EmptyState<'static> {
+    EmptyState::new("No folder open", "Open one to browse its files")
+        .icon(icons::FOLDER)
+        .button("Open Folder", None)
+}
+
+/// The room under the Explorer's title, where its empty state is centred.
+fn sidebar_empty_body(viewport: Viewport) -> Viewport {
+    Viewport {
+        y: viewport.y + SIDEBAR_HEADER_HEIGHT,
+        height: (viewport.height - SIDEBAR_HEADER_HEIGHT).max(0.0),
+        ..viewport
+    }
+}
+
+/// Where the empty Explorer's Open Folder button lands, for a click on it.
+pub fn sidebar_empty_button(atlas: &mut Atlas, viewport: Viewport) -> Option<Viewport> {
+    sidebar_empty_state()
+        .layout(atlas, sidebar_empty_body(viewport))
+        .button
+}
+
 /// [`build_sidebar`] with an inline name field at `edit`.
 pub fn build_sidebar_with_edit(
     tree: &Tree,
@@ -2720,39 +2913,17 @@ pub fn build_sidebar_with_edit(
         return 0;
     }
 
-    // An empty panel with no explanation reads as a bug. Say what to do.
+    // No folder: the one empty state, with the one thing to do. Home,
+    // beside it, lists the rest.
     if tree.root().is_none() {
         push_sidebar_title(out, atlas, viewport, "EXPLORER", 0, theme);
-        let x = viewport.x + UI_INSET;
-        let width = (viewport.width - UI_INSET * 2.0).max(0.0);
-        let mut y = viewport.y + SIDEBAR_HEADER_HEIGHT + 8.0;
-        push_ui_text(
+        push_empty_state(
             out,
             atlas,
-            Viewport {
-                x,
-                y,
-                width,
-                height: 22.0,
-            },
-            "No folder open",
-            theme.text,
+            sidebar_empty_body(viewport),
+            sidebar_empty_state(),
+            theme,
         );
-        y += 26.0;
-        for (keys, what) in [
-            ("\u{21e7}\u{2318}O", "Open a folder"),
-            ("\u{2318}O", "Open a file"),
-        ] {
-            let line = Viewport {
-                x,
-                y,
-                width,
-                height: 22.0,
-            };
-            push_ui_text(out, atlas, line, what, theme.status_text);
-            push_ui_text_right(out, atlas, line, keys, theme.gutter_text);
-            y += 24.0;
-        }
         return 0;
     }
 
@@ -3520,6 +3691,7 @@ mod home_tests {
             &[],
             &[],
             None,
+            false,
             &mut hits,
         );
         let actions: Vec<&HomeAction> = hits.iter().map(|h| &h.action).collect();
@@ -3595,6 +3767,7 @@ mod home_tests {
             &[("claude".into(), "waiting: Approve?".into())],
             &[],
             None,
+            false,
             &mut hits,
         );
         let actions: Vec<HomeAction> = hits.iter().map(|h| h.action.clone()).collect();
@@ -3614,6 +3787,232 @@ mod home_tests {
         for pair in hits.windows(2) {
             assert!(pair[0].rect.y + pair[0].rect.height <= pair[1].rect.y + 0.01);
         }
+    }
+
+    #[test]
+    fn the_column_is_centred_in_a_wide_pane_and_keeps_a_margin_in_a_narrow_one() {
+        let pane = |width: f32| Viewport {
+            x: 240.0,
+            y: 0.0,
+            width,
+            height: 800.0,
+        };
+        // Wide: the column stops at its measure and sits in the middle.
+        let (x, width) = home_column(pane(1200.0));
+        assert_eq!(width, HOME_MEASURE);
+        let left = x - 240.0;
+        let right = 240.0 + 1200.0 - (x + width);
+        assert!((left - right).abs() < 0.01, "left {left}, right {right}");
+        // Narrow (a 900 pt window beside the sidebar): the column shrinks
+        // and keeps the same margin on both sides.
+        let (x, width) = home_column(pane(660.0));
+        assert!((240.0..HOME_MEASURE).contains(&width));
+        assert!((x - 240.0 - (240.0 + 660.0 - x - width)).abs() < 0.01);
+        assert!(x - 240.0 >= 28.0);
+        // Narrower than the column's floor: it still fits the pane.
+        let (x, width) = home_column(pane(260.0));
+        assert!(x + width <= 240.0 + 260.0);
+        assert!(x - 240.0 >= 28.0);
+    }
+
+    #[test]
+    fn a_recent_path_is_cut_from_the_left_and_keeps_its_last_two_parts() {
+        let within = |n: usize| move |s: &str| s.chars().count() <= n;
+        let deep = "/private/var/folders/g1/abc/T/tmp.x";
+        assert_eq!(elide_path(deep, within(40)), deep, "fits: shown whole");
+        assert_eq!(
+            elide_path(deep, within(24)),
+            "/private/\u{2026}/T/tmp.x",
+            "the disk's first folder, the middle gone, the last two kept"
+        );
+        assert_eq!(elide_path(deep, within(12)), "\u{2026}/T/tmp.x");
+        assert_eq!(elide_path(deep, within(8)), "\u{2026}/tmp.x");
+        assert_eq!(
+            elide_path(deep, within(3)),
+            "tmp.x",
+            "nothing fits: the name"
+        );
+        assert_eq!(
+            elide_path("~/Desktop/notes/garden", within(16)),
+            "~/\u{2026}/notes/garden"
+        );
+        assert_eq!(
+            elide_path("~/a/notes/garden", within(15)),
+            "\u{2026}/notes/garden",
+            "the head goes when keeping it does not fit"
+        );
+    }
+
+    #[test]
+    fn a_recent_row_tells_the_whole_path_and_hits_in_the_column() {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let mut out = Vec::new();
+        let mut hits = Vec::new();
+        let rect = Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: 660.0,
+            height: 800.0,
+        };
+        let deep = std::path::PathBuf::from(
+            "/private/var/folders/a-long-folder-name/another-long-folder-name/and-one-more/garden",
+        );
+        super::super::ui::begin_frame();
+        build_home(
+            &mut out,
+            &mut atlas,
+            rect,
+            &Theme::default(),
+            None,
+            std::slice::from_ref(&deep),
+            None,
+            &[],
+            &[],
+            None,
+            false,
+            &mut hits,
+        );
+        let row = hits
+            .iter()
+            .find(|h| h.action == HomeAction::OpenProject(deep.clone()))
+            .expect("the recent folder is a row");
+        let (x, width) = home_column(rect);
+        assert!(row.rect.x + row.rect.width <= x + width + 8.0 + 0.01);
+        let spots = super::super::ui::hotspots();
+        let tip = spots
+            .iter()
+            .find(|s| s.rect == row.rect)
+            .and_then(|s| s.tip.as_deref());
+        assert_eq!(
+            tip,
+            Some(deep.to_str().unwrap()),
+            "the tooltip is the whole path"
+        );
+    }
+
+    #[test]
+    fn home_offers_a_restart_once_the_app_on_disk_was_replaced() {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let mut out = Vec::new();
+        let mut hits = Vec::new();
+        let rect = Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: 800.0,
+            height: 616.0,
+        };
+        for replaced in [false, true] {
+            build_home(
+                &mut out,
+                &mut atlas,
+                rect,
+                &Theme::default(),
+                None,
+                &[],
+                None,
+                &[],
+                &[],
+                None,
+                replaced,
+                &mut hits,
+            );
+            assert_eq!(
+                hits.iter().any(|h| h.action == HomeAction::Restart),
+                replaced
+            );
+        }
+        // Last in Start, under the three ways to begin.
+        let start: Vec<&HomeAction> = hits.iter().take(4).map(|h| &h.action).collect();
+        assert_eq!(
+            start,
+            [
+                &HomeAction::OpenFolder,
+                &HomeAction::NewFile,
+                &HomeAction::FindFile,
+                &HomeAction::Restart
+            ]
+        );
+    }
+
+    #[test]
+    fn a_tall_home_scrolls_to_its_last_row_and_no_further() {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let mut hits = Vec::new();
+        // An 1100 by 600 window: the pane beside the sidebar and under the
+        // toolbar and tabs.
+        let rect = Viewport {
+            x: 240.0,
+            y: 116.0,
+            width: 860.0,
+            height: 440.0,
+        };
+        let recent: Vec<std::path::PathBuf> = (1..=HOME_RECENT)
+            .map(|n| std::path::PathBuf::from(format!("/tmp/garden-{n}")))
+            .collect();
+        let mut view = HomeView::default();
+        let mut draw = |view: &mut HomeView, hits: &mut Vec<HomeHit>| {
+            let mut out = Vec::new();
+            super::super::ui::begin_frame();
+            build_home_view(
+                &mut out,
+                &mut atlas,
+                rect,
+                &Theme::default(),
+                None,
+                &recent,
+                None,
+                &[],
+                &[],
+                None,
+                false,
+                view,
+                hits,
+            );
+            out
+        };
+        let out = draw(&mut view, &mut hits);
+        assert!(
+            view.content > rect.height,
+            "eight folders overflow the pane"
+        );
+        assert_eq!(view.scroll, 0.0);
+        let bottom = rect.y + rect.height;
+        assert!(
+            out.iter()
+                .all(|q| q.pos[1] >= rect.y && q.pos[1] + q.size[1] <= bottom + 0.01),
+            "every glyph is cut to the pane"
+        );
+        let last = HomeAction::OpenProject(recent[HOME_RECENT - 1].clone());
+        assert!(
+            !hits.iter().any(|h| h.action == last),
+            "the last recent row is below the pane and not a hit"
+        );
+        for spot in super::super::ui::hotspots() {
+            assert!(spot.rect.y >= rect.y && spot.rect.y + spot.rect.height <= bottom + 0.01);
+        }
+
+        // Scrolling further than there is content stops at the end, where
+        // the last row is on screen and the first has gone.
+        view.scroll_by(10_000.0);
+        let max = view.max_scroll();
+        assert!(max > 0.0 && view.scroll == max);
+        let _ = draw(&mut view, &mut hits);
+        assert_eq!(view.scroll, max, "the content height is stable");
+        let row = hits
+            .iter()
+            .find(|h| h.action == last)
+            .expect("the last recent row is reachable");
+        assert!(row.rect.y >= rect.y && row.rect.y + row.rect.height <= bottom + 0.01);
+        assert!(!hits.iter().any(|h| h.action == HomeAction::OpenFolder));
+
+        // A page back, then Home and End.
+        view.page_by(-1.0);
+        assert_eq!(view.scroll, (max - (rect.height - HOME_ROW)).max(0.0));
+        view.to_top();
+        assert_eq!(view.scroll, 0.0);
+        view.to_end();
+        assert_eq!(view.scroll, max);
+        assert_eq!(view.report(), format!("{max:.0} of {max:.0}"));
     }
 
     #[test]
@@ -3638,6 +4037,7 @@ mod home_tests {
             &[],
             &[],
             None,
+            false,
             &mut hits,
         );
         assert!(hits.is_empty());

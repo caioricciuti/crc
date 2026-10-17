@@ -4419,6 +4419,42 @@ mod tests {
     }
 
     /// A folder workspace on `/r` (holding the repository `/r`) and one on
+    #[test]
+    fn the_list_scrolls_by_lines_and_stops_at_its_ends() {
+        // Thirty folder workspaces in a column with room for a few: the
+        // wheel moves the first line shown, never past the last row's
+        // bottom and never above the top.
+        let mut panel = Panel {
+            folders: (0..30)
+                .map(|i| folder(&format!("ws{i:02}"), &format!("/w/ws{i:02}")))
+                .collect(),
+            ..Panel::default()
+        };
+        panel.rebuild();
+        let column = Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: 240.0,
+            height: layout::SIDEBAR_HEADER_HEIGHT + 200.0,
+        };
+        assert_eq!(panel.scroll, 0);
+        panel.scroll_by(3, column, &[]);
+        assert_eq!(panel.scroll, 3);
+        panel.scroll_by(-1, column, &[]);
+        assert_eq!(panel.scroll, 2);
+        panel.scroll_by(1000, column, &[]);
+        let max = panel.scroll;
+        assert!(max > 3 && max < 30, "max scroll {max}");
+        // At the end the rows left fill the room: one more line up would
+        // leave a gap under the list.
+        let lines = panel.lines(&[]);
+        let shown: f32 = lines[max..].iter().map(|l| panel.height(l)).sum();
+        let one_more: f32 = lines[max - 1..].iter().map(|l| panel.height(l)).sum();
+        assert!(shown <= 200.0 && one_more > 200.0, "{shown} {one_more}");
+        panel.scroll_by(-1000, column, &[]);
+        assert_eq!(panel.scroll, 0);
+    }
+
     /// `/n`, with `/r`'s worktrees `/w/a` and `/w/b` and a worktree of a
     /// repository no workspace holds.
     fn nested() -> Panel {

@@ -415,6 +415,27 @@ impl EditorView {
 
     /// Handles a click in the sidebar: select, and toggle or open.
     pub(super) fn sidebar_click(&self, y: f32, rect: Viewport) {
+        // No folder: the panel is its empty state, whose one button opens one.
+        let on_open = {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            state.tree.root().is_none()
+                && layout::sidebar_empty_button(&mut state.renderer.atlas, rect).is_some_and(
+                    |button| {
+                        y >= button.y
+                            && y < button.y + button.height
+                            && layout::pointer().is_none_or(|(px, _)| {
+                                px >= button.x && px < button.x + button.width
+                            })
+                    },
+                )
+        };
+        if on_open {
+            self.open_folder();
+            self.request_redraw();
+            return;
+        }
         let index = {
             let Some(state) = self.state() else {
                 return;

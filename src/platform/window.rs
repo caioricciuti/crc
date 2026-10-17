@@ -61,6 +61,7 @@ mod extensions;
 mod files;
 mod find;
 mod git_menu;
+mod home;
 mod http;
 mod input;
 mod inspector;
@@ -786,10 +787,14 @@ struct State {
     )>,
     /// A checked release, waiting for Restart to Update.
     update_ready: Option<crate::platform::update::Ready>,
-    /// Restart to Update asked to quit: the quit installs it.
-    update_on_quit: bool,
-    /// Said once that crc was reinstalled under this running copy.
-    replaced_said: bool,
+    /// A restart asked to quit: what the quit does before the app opens
+    /// again.
+    restart_on_quit: Option<crate::platform::update::Restart>,
+    /// The app on disk was replaced under this running copy, and it was
+    /// said once.
+    replaced: bool,
+    /// When the app on disk was last looked at for that.
+    replaced_checked: Instant,
     /// What launching found to say (terminals started again), shown when
     /// the folder has opened instead of "Folder opened".
     restore_note: Option<String>,
@@ -897,6 +902,8 @@ struct State {
     tab_scroll_carry: f64,
     /// The home screen's rows, as of the last frame that drew it.
     home_hits: Vec<layout::HomeHit>,
+    /// How far the home screen is scrolled, and where it was drawn.
+    home_view: layout::HomeView,
     /// Project folders opened before, most recent first.
     recent_projects: Vec<std::path::PathBuf>,
     /// Which tab a context menu was opened on. The menu action fires later,
@@ -2320,9 +2327,8 @@ define_class!(
                             self.run_mcp_call();
                         }
                         layout::HomeAction::OpenReview => self.open_review(),
-                        layout::HomeAction::RestartToUpdate => {
-                            self.restart_to_update();
-                        }
+                        layout::HomeAction::RestartToUpdate => self.restart(true),
+                        layout::HomeAction::Restart => self.restart(false),
                     }
                     self.request_redraw();
                     self.pump();
@@ -4009,7 +4015,12 @@ define_class!(
 
         #[unsafe(method(restartToUpdate:))]
         fn action_restart_to_update(&self, _sender: Option<&AnyObject>) {
-            self.restart_to_update();
+            self.restart(true);
+        }
+
+        #[unsafe(method(restartApp:))]
+        fn action_restart_app(&self, _sender: Option<&AnyObject>) {
+            self.restart(false);
         }
 
         #[unsafe(method(checkForUpdates:))]
@@ -5294,6 +5305,7 @@ impl EditorView {
     /// the new release's page.
     fn poll_update(&self) {
         self.poll_update_install();
+        self.check_replaced();
         let (manual, outcome) = {
             let Some(mut state) = self.state_mut() else {
                 return;
@@ -5354,36 +5366,66 @@ impl EditorView {
         }
     }
 
-    /// Says that crc was installed again under this running copy, and how
-    /// to get its permissions back: once on focus, `again` for each new
-    /// terminal. Returns whether it was.
+    /// Says that crc was installed again under this running copy, with
+    /// the restart that gets its permissions back a button away: once on
+    /// focus and every half minute, `again` for each new terminal. Home
+    /// offers the same from then on. Returns whether it was.
     pub(super) fn say_if_replaced(&self, again: bool) -> bool {
+        if let Some(mut state) = self.state_mut() {
+            state.replaced_checked = Instant::now();
+        }
         if !crate::platform::update::replaced() {
             return false;
         }
         if let Some(mut state) = self.state_mut()
-            && (again || !state.replaced_said)
+            && (again || !state.replaced)
         {
-            state.replaced_said = true;
-            state.say(
-                layout::Feedback::Failure,
-                "crc was reinstalled while open: until Help > Restart to Update, macOS withholds its \
-                 permissions from its terminals, so git commit signing, SSH keys and the microphone fail",
+            state.replaced = true;
+            state.tell(
+                Said::new(layout::Feedback::Failure, "crc was updated on disk")
+                    .detail(
+                        "crc was reinstalled while open: until it is restarted, macOS withholds \
+                         its permissions from its terminals, so git commit signing, SSH keys \
+                         and the microphone fail",
+                    )
+                    .action(MessageAction::Restart)
+                    .everywhere()
+                    .stays(),
             );
         }
         self.request_redraw();
         true
     }
 
-    /// Quits to install the downloaded update. The ordinary quit: unsaved
-    /// documents ask first, and a cancel there cancels the update too.
-    fn restart_to_update(&self) {
-        let ready = self.state_mut().is_some_and(|mut state| {
-            state.update_on_quit =
-                state.update_ready.is_some() || crate::platform::update::replaced();
-            state.update_on_quit
+    /// Looks at the app on disk once every half minute of frames: an
+    /// install from one of this window's own terminals brings nothing to
+    /// the front.
+    fn check_replaced(&self) {
+        let due = self
+            .state()
+            .is_some_and(|state| state.replaced_checked.elapsed() >= REPLACED_CHECK_EVERY);
+        if due {
+            self.say_if_replaced(false);
+        }
+    }
+
+    /// Quits to open crc again: Restart to Update (`to_update`) installs
+    /// the downloaded release first, Restart crc only reopens what is on
+    /// disk. The ordinary quit: unsaved documents ask first, and a cancel
+    /// there cancels the restart too.
+    fn restart(&self, to_update: bool) {
+        let planned = self.state_mut().is_some_and(|mut state| {
+            state.restart_on_quit = if to_update {
+                crate::platform::update::Restart::to_update(
+                    state.update_ready.as_ref(),
+                    crate::platform::update::replaced(),
+                )
+            } else {
+                Some(crate::platform::update::Restart::Relaunch)
+            };
+            state.restart_on_quit.is_some()
         });
-        if ready {
+        if planned {
             NSApplication::sharedApplication(MainThreadMarker::from(self)).terminate(None);
         }
     }
@@ -6155,53 +6197,25 @@ define_class!(
             let view = &self.ivars().view;
             if !view.confirm_discard_all() {
                 if let Some(mut state) = view.state_mut() {
-                    state.update_on_quit = false;
+                    state.restart_on_quit = None;
                 }
                 return NSApplicationTerminateReply::TerminateCancel;
             }
-            // Restart to Update: the new app goes where this one is now,
-            // before anything is saved or shut down, so a failure keeps
-            // this one running with nothing lost.
-            let (restart, update) = view.state_mut().map_or((false, None), |mut state| {
-                let restart = std::mem::take(&mut state.update_on_quit);
-                (
-                    restart,
-                    restart.then(|| state.update_ready.clone()).flatten(),
-                )
-            });
-            // Reinstalled under us, nothing downloaded: only reopen.
-            if restart
-                && update.is_none()
-                && let Some(app) = crate::platform::update::running_app()
-                && let Err(e) = crate::platform::update::relaunch_after_exit(&app)
+            // A restart: the new app (Restart to Update) goes where this
+            // one is now, before anything is saved or shut down, so a
+            // failure keeps this one running with nothing lost; then this
+            // one is opened again once it has gone.
+            let restart = view
+                .state_mut()
+                .and_then(|mut state| state.restart_on_quit.take());
+            if let Some(restart) = restart
+                && let Err(e) = restart.perform(crate::platform::update::running_app().as_deref())
             {
                 if let Some(mut state) = view.state_mut() {
-                    state.say(
-                        layout::Feedback::Failure,
-                        format!("could not reopen crc: {e}"),
-                    );
+                    state.say(layout::Feedback::Failure, e);
                 }
                 view.request_redraw();
                 return NSApplicationTerminateReply::TerminateCancel;
-            }
-            if let Some(ready) = update {
-                let installed = crate::platform::update::running_app()
-                    .ok_or_else(|| "crc is not running from an app".to_owned())
-                    .and_then(|app| {
-                        crate::platform::update::apply(&ready, &app)?;
-                        crate::platform::update::relaunch_after_exit(&app)
-                            .map_err(|e| format!("could not reopen crc: {e}"))
-                    });
-                if let Err(e) = installed {
-                    if let Some(mut state) = view.state_mut() {
-                        state.say(
-                            layout::Feedback::Failure,
-                            format!("could not install crc {}: {e}", ready.version),
-                        );
-                    }
-                    view.request_redraw();
-                    return NSApplicationTerminateReply::TerminateCancel;
-                }
             }
             // Written only once quitting is certain: recording a session for
             // a quit the user then cancelled would overwrite the real one.
@@ -6343,6 +6357,10 @@ fn wraps_by_default(buffer: &Buffer) -> bool {
 const LSP_MAX_RESTARTS: u32 = 3;
 /// A server that stopped sooner than this after starting is not restarted.
 const LSP_RESTART_AFTER: Duration = Duration::from_secs(30);
+
+/// How often a running window looks at whether the app on disk was
+/// replaced under it, beyond each time it comes to the front.
+const REPLACED_CHECK_EVERY: Duration = Duration::from_secs(30);
 
 /// Documents past this are not given to a language server: every pause in
 /// typing would send the whole text again (full sync), and servers choke on
@@ -7313,6 +7331,7 @@ fn draw_other_pane(
             &[],
             &[],
             None,
+            false,
             &mut hits,
         );
         return;
@@ -9596,6 +9615,7 @@ fn install_menu(mtm: MainThreadMarker, app: &NSApplication) {
         "",
         false,
     ));
+    help_menu.addItem(&item("Restart crc", sel!(restartApp:), "", false));
     help_menu.addItem(&item("Report a Problem…", sel!(reportProblem:), "", false));
     help_menu.addItem(&item("Show Crash Logs", sel!(showCrashLogs:), "", false));
     help_item.setSubmenu(Some(&help_menu));
@@ -9815,6 +9835,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         discard_confirmed: false,
         quit_session: None,
         home_hits: Vec::new(),
+        home_view: layout::HomeView::default(),
         recent_projects,
         syntax: SyntaxStore::new(),
         spans: Vec::new(),
@@ -9884,10 +9905,11 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         update: None,
         update_install: None,
         update_ready: None,
-        replaced_said: false,
+        restart_on_quit: None,
+        replaced: false,
+        replaced_checked: Instant::now(),
         restore_note: None,
         held_lock: None,
-        update_on_quit: false,
         reloads: Reloads {
             channel: mpsc::channel(),
             pending: HashSet::new(),

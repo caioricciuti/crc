@@ -134,6 +134,20 @@ impl EditorView {
             self.pump();
             return;
         }
+        // Home scrolls its column: by points from a trackpad, a row per
+        // line from a wheel.
+        if !over_sidebar && chrome.text.contains(x, y) && state.docs.is_home() {
+            let points = if precise {
+                -dy as f32
+            } else {
+                (-dy * WHEEL_LINES_PER_NOTCH) as f32 * layout::HOME_ROW
+            };
+            state.home_view.scroll_by(points);
+            drop(state);
+            self.request_redraw();
+            self.pump();
+            return;
+        }
         if precise && !over_sidebar {
             state.scroll_carry.1 = 0.0;
             state
@@ -171,6 +185,14 @@ impl EditorView {
         }
 
         match chrome.sidebar {
+            // In Agents mode the sidebar is the workspace list, a row per
+            // line, clamped so its end stays at the bottom.
+            Some(rect) if rect.contains(x, y) && state.agents.on => {
+                let State {
+                    agents, terminal, ..
+                } = &mut *state;
+                agents.scroll_by(lines, rect, &terminal.tabs);
+            }
             Some(rect) if rect.contains(x, y) && state.mcp.open => {
                 state.mcp.scroll_by(lines, rect);
             }
@@ -204,17 +226,12 @@ impl EditorView {
     pub(super) fn wheel_lines_by(&self, dy: f64, precise: bool, target: WheelTarget) -> isize {
         let (owner, rest) = self.ivars().wheel_rest.get();
         let rest = if owner == Some(target) { rest } else { 0.0 };
-        let total = if precise {
-            let line = self
-                .state()
-                .map_or(16.0, |s| s.renderer.atlas.metrics.line_height as f64);
-            rest - dy / line.max(1.0)
-        } else {
-            rest - dy * 3.0
-        };
-        let lines = total.trunc();
-        self.ivars().wheel_rest.set((Some(target), total - lines));
-        lines as isize
+        let line = self
+            .state()
+            .map_or(16.0, |s| s.renderer.atlas.metrics.line_height as f64);
+        let (lines, rest) = wheel_carry(rest, dy, precise, line);
+        self.ivars().wheel_rest.set((Some(target), rest));
+        lines
     }
 
     /// Records that a human pressed a key or clicked at `at`.
@@ -483,6 +500,10 @@ impl EditorView {
         };
         if grid && let Some(handled) = self.handle_table_key(event) {
             return handled;
+        }
+        // Home's page keys scroll its column while the Home tab has them.
+        if self.handle_home_key(event) {
+            return true;
         }
         // Escape with no overlay open drops back to a single cursor, which
         // is the only way out of a multi-cursor edit.
@@ -1251,9 +1272,22 @@ fn escape_closes_page(code: u16, command: bool, page_open: bool, palette_open: b
     code == ESCAPE && !command && page_open && !palette_open
 }
 
+/// The whole lines a wheel delta `dy` makes with `rest` carried from the
+/// last event, forward positive, and the rest to carry on: a trackpad's
+/// points over a `line`'s height, a mouse wheel's notch three lines.
+fn wheel_carry(rest: f64, dy: f64, precise: bool, line: f64) -> (isize, f64) {
+    let total = if precise {
+        rest - dy / line.max(1.0)
+    } else {
+        rest - dy * WHEEL_LINES_PER_NOTCH
+    };
+    let lines = total.trunc();
+    (lines as isize, total - lines)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::escape_closes_page;
+    use super::{escape_closes_page, wheel_carry};
 
     #[test]
     fn escape_over_a_page_closes_it_and_nothing_else() {
@@ -1268,5 +1302,22 @@ mod tests {
         // Command keys are the menu's, and other keys are not Escape.
         assert!(!escape_closes_page(ESCAPE, true, true, false));
         assert!(!escape_closes_page(36, false, true, false));
+    }
+
+    #[test]
+    fn a_trackpad_adds_up_to_whole_lines_and_a_notch_is_three() {
+        // Two slow swipes of half a line each: nothing, then one line up
+        // (the delta is negative for up, the lines positive going down).
+        let (lines, rest) = wheel_carry(0.0, 8.0, true, 16.0);
+        assert_eq!((lines, rest), (0, -0.5));
+        let (lines, rest) = wheel_carry(rest, 8.0, true, 16.0);
+        assert_eq!((lines, rest), (-1, 0.0));
+        // A flick's tail is kept, not rounded away.
+        let (lines, rest) = wheel_carry(0.0, -40.0, true, 16.0);
+        assert_eq!(lines, 2);
+        assert!((rest - 0.5).abs() < 1e-9);
+        // A wheel notch is three lines, either way.
+        assert_eq!(wheel_carry(0.0, -1.0, false, 16.0), (3, 0.0));
+        assert_eq!(wheel_carry(0.0, 1.0, false, 16.0), (-3, 0.0));
     }
 }

@@ -13,6 +13,10 @@
 //! the way Cmd-Q does, puts the new app where this one is, and opens it.
 //! Nothing is installed without that click, and nothing but macOS's own
 //! tools does the work.
+//!
+//! Restart crc (Help menu, the status line's button and Home's row once
+//! the app on disk was replaced under this one) quits the same way and
+//! opens the app as it is on disk, installing nothing.
 
 use std::cmp::Ordering;
 use std::path::PathBuf;
@@ -397,6 +401,48 @@ pub fn apply(ready: &Ready, app: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
+/// What a restart does once the app may quit: Restart to Update puts the
+/// checked release in place first; Restart crc only opens the app again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Restart {
+    /// Put this release where the app is, then open it.
+    Install(Ready),
+    /// Open the app as it is on disk.
+    Relaunch,
+}
+
+impl Restart {
+    /// What Restart to Update does: install `ready`; with nothing
+    /// downloaded, open the app again when it was `replaced` on disk,
+    /// which is what the install over it left to do; otherwise nothing.
+    pub fn to_update(ready: Option<&Ready>, replaced: bool) -> Option<Self> {
+        match ready {
+            Some(ready) => Some(Restart::Install(ready.clone())),
+            None if replaced => Some(Restart::Relaunch),
+            None => None,
+        }
+    }
+
+    /// Carries it out, this process about to exit: the release put in
+    /// `app`'s place when there is one, then `app` opened once this
+    /// process has gone. `app` is [`running_app`]; the message says what
+    /// could not be done.
+    pub fn perform(&self, app: Option<&std::path::Path>) -> Result<(), String> {
+        let done = app
+            .ok_or_else(|| "could not reopen crc: it is not running from an app".to_owned())
+            .and_then(|app| {
+                if let Restart::Install(ready) = self {
+                    apply(ready, app)?;
+                }
+                relaunch_after_exit(app).map_err(|e| format!("could not reopen crc: {e}"))
+            });
+        done.map_err(|e| match self {
+            Restart::Install(ready) => format!("could not install crc {}: {e}", ready.version),
+            Restart::Relaunch => e,
+        })
+    }
+}
+
 /// Inode, size, and modification time in seconds and nanoseconds.
 pub type Identity = (u64, u64, i64, i64);
 
@@ -415,11 +461,18 @@ static LAUNCHED: std::sync::OnceLock<Option<(PathBuf, Identity)>> = std::sync::O
 /// Remembers what this process was started from. Called once at launch.
 pub fn note_launch() {
     LAUNCHED.get_or_init(|| {
-        let exe = std::env::current_exe().ok()?;
-        let app = exe.parent()?.parent()?.parent()?;
-        if app.extension()? != "app" {
-            return None;
-        }
+        // A self-test watches the executable of the bundle it names (see
+        // `running_app`), so a scenario can write over it.
+        let exe = if std::env::var_os("CRC_SELFTEST").is_some() {
+            PathBuf::from(std::env::var_os("CRC_UPDATE_APP")?).join("Contents/MacOS/crc")
+        } else {
+            let exe = std::env::current_exe().ok()?;
+            let app = exe.parent()?.parent()?.parent()?;
+            if app.extension()? != "app" {
+                return None;
+            }
+            exe
+        };
         let id = identity(&exe)?;
         Some((exe, id))
     });
@@ -440,7 +493,7 @@ pub fn replaced() -> bool {
 /// Opens `app` once this process has exited.
 pub fn relaunch_after_exit(app: &std::path::Path) -> std::io::Result<()> {
     // A test instance must not open a real crc on someone's screen.
-    if std::env::var_os("CRC_SELFTEST").is_some() {
+    if cfg!(test) || std::env::var_os("CRC_SELFTEST").is_some() {
         return Ok(());
     }
     std::process::Command::new("/bin/sh")
@@ -473,6 +526,59 @@ mod tests {
         std::fs::rename(&new, &exe).unwrap();
         assert_ne!(identity(&exe), Some(before));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restart_to_update_installs_what_is_ready_or_reopens_a_replaced_app() {
+        let ready = Ready {
+            version: "9.0.0".into(),
+            app: PathBuf::from("/tmp/staged/crc.app"),
+        };
+        assert_eq!(
+            Restart::to_update(Some(&ready), false),
+            Some(Restart::Install(ready.clone()))
+        );
+        // Downloaded and replaced on disk: the download is the newer one.
+        assert_eq!(
+            Restart::to_update(Some(&ready), true),
+            Some(Restart::Install(ready))
+        );
+        assert_eq!(Restart::to_update(None, true), Some(Restart::Relaunch));
+        assert_eq!(Restart::to_update(None, false), None);
+    }
+
+    #[test]
+    fn a_restart_installs_only_when_asked_to_update() {
+        let dir = std::env::temp_dir().join(format!("crc-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let installed = dir.join("Applications/crc.app");
+        let staged = dir.join("update/crc.app");
+        std::fs::create_dir_all(&installed).unwrap();
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::write(installed.join("v"), "old").unwrap();
+        std::fs::write(staged.join("v"), "new").unwrap();
+        let ready = Ready {
+            version: "9.0.0".into(),
+            app: staged.clone(),
+        };
+        // Not from an app: nothing to reopen, and the quit is refused.
+        assert_eq!(
+            Restart::Relaunch.perform(None),
+            Err("could not reopen crc: it is not running from an app".into())
+        );
+        assert!(
+            Restart::Install(ready.clone())
+                .perform(None)
+                .unwrap_err()
+                .starts_with("could not install crc 9.0.0: ")
+        );
+        // Relaunch leaves the app as it is.
+        Restart::Relaunch.perform(Some(&installed)).unwrap();
+        assert_eq!(std::fs::read_to_string(installed.join("v")).unwrap(), "old");
+        // Install puts the release in its place first.
+        Restart::Install(ready).perform(Some(&installed)).unwrap();
+        assert_eq!(std::fs::read_to_string(installed.join("v")).unwrap(), "new");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

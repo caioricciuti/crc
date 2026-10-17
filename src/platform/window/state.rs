@@ -515,6 +515,8 @@ pub(super) const MARKDOWN_PREVIEW_ID: &str = "crc.markdown-preview";
 pub(super) enum MessageAction {
     /// The Extensions page with this extension selected.
     OpenExtension(&'static str),
+    /// Quit the way Cmd-Q does and open the app on disk again.
+    Restart,
 }
 
 impl MessageAction {
@@ -522,6 +524,7 @@ impl MessageAction {
     pub(super) fn label(&self) -> &'static str {
         match self {
             MessageAction::OpenExtension(_) => "Open Extensions",
+            MessageAction::Restart => "Restart",
         }
     }
 }
@@ -550,6 +553,9 @@ pub(super) struct Said {
     /// The mode it is about: the one it was said in, unless told
     /// otherwise, which `State::tell` fills in.
     pub(super) mode: Option<Mode>,
+    /// Until acted on or said over, not for a while: news that stays
+    /// true, like the app on disk having been replaced.
+    pub(super) stays: bool,
 }
 
 impl Said {
@@ -560,6 +566,7 @@ impl Said {
             detail: None,
             action: None,
             mode: None,
+            stays: false,
         }
     }
 
@@ -578,6 +585,12 @@ impl Said {
     /// About the app as a whole: a mode switch does not clear it.
     pub(super) fn everywhere(mut self) -> Self {
         self.mode = Some(Mode::Both);
+        self
+    }
+
+    /// For as long as nothing is said over it: what it says stays true.
+    pub(super) fn stays(mut self) -> Self {
+        self.stays = true;
         self
     }
 
@@ -607,11 +620,13 @@ pub(super) fn message_goes_on(
         && !(everywhere && dismissal == layout::Dismissal::ModeSwitch)
 }
 
-/// How long the message `text` stays: by its kind, or long enough to
-/// reach for its button when it has one.
+/// How long the message `text` stays: by its kind, long enough to reach
+/// for its button when it has one, or for good when it was said to stay.
 pub(super) fn message_lasts_of(text: &str, said: Option<&Said>) -> Duration {
     let said = said.and_then(|s| s.about(text));
-    if said.is_some_and(|s| s.action.is_some()) {
+    if said.is_some_and(|s| s.stays) {
+        Duration::MAX
+    } else if said.is_some_and(|s| s.action.is_some()) {
         layout::MESSAGE_ACTION_LASTS
     } else {
         layout::message_lasts_for(layout::feedback_for(text, Said::kind_of(said)))
@@ -765,6 +780,22 @@ mod tests {
         );
         assert_eq!(
             message_lasts_of("saved notes.md", None),
+            layout::message_lasts_for(layout::Feedback::Success)
+        );
+    }
+
+    #[test]
+    fn a_message_said_to_stay_does_not_go_on_its_own() {
+        let said = Said::new(layout::Feedback::Failure, "crc was updated on disk")
+            .action(MessageAction::Restart)
+            .stays();
+        assert_eq!(
+            message_lasts_of("crc was updated on disk", Some(&said)),
+            Duration::MAX
+        );
+        // Another text in front of it is read by its own wording.
+        assert_eq!(
+            message_lasts_of("saved notes.md", Some(&said)),
             layout::message_lasts_for(layout::Feedback::Success)
         );
     }
