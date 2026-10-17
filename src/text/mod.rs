@@ -2,6 +2,7 @@
 
 pub mod buffer;
 pub mod columns;
+pub mod csv;
 pub mod documents;
 pub mod file_format;
 mod grapheme;
