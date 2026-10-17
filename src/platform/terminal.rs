@@ -79,6 +79,8 @@ pub struct Tab {
     /// Whether its program was last told it has the keyboard, for focus
     /// reports (mode 1004) on a change only.
     pub told_focus: bool,
+    /// When something was last typed into it; see [`Tab::heeds_bell`].
+    pub last_typed: Option<Instant>,
     /// When its process was last read for where it is and whether it runs
     /// ssh; see [`Tab::probe`].
     pub last_probe: Option<Instant>,
@@ -249,7 +251,21 @@ impl Tab {
     pub fn base_name(&self) -> String {
         title_of(self)
     }
+
+    /// Whether a bell rung at `now` asks for attention. One right after a
+    /// keystroke is the program answering the key (a shell given a key it
+    /// has nothing bound to, a completion with nothing to offer, a
+    /// backspace at an empty line), not a call for you: it marks nothing.
+    pub fn heeds_bell(&self, now: Instant) -> bool {
+        !self
+            .last_typed
+            .is_some_and(|at| now.saturating_duration_since(at) < BELL_ECHO)
+    }
 }
+
+/// How long after a keystroke a bell is taken as the program's answer to
+/// it rather than a call for attention.
+pub const BELL_ECHO: Duration = Duration::from_millis(300);
 
 pub struct Panel {
     /// The folder workspaces a terminal left by `cd` since the window last
@@ -1406,10 +1422,26 @@ mod tests {
             program_pid: None,
             remote: None,
             told_focus: false,
+            last_typed: None,
             last_probe: None,
             probe_owed: false,
             seen: None,
         }
+    }
+
+    #[test]
+    fn a_bell_right_after_a_keystroke_is_the_programs_answer() {
+        let now = Instant::now();
+        let mut tab = tab();
+        // Nothing typed: a ring is a call, as a script's at its start.
+        assert!(tab.heeds_bell(now));
+        // Typed into just now: the ring answers the key.
+        tab.last_typed = Some(now);
+        assert!(!tab.heeds_bell(now));
+        assert!(!tab.heeds_bell(now + BELL_ECHO / 2));
+        // Long enough after, it is the program's own.
+        assert!(tab.heeds_bell(now + BELL_ECHO));
+        assert!(tab.heeds_bell(now + Duration::from_secs(30)));
     }
 
     /// Output in `tab` as the window takes it: the screen has it, then

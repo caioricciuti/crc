@@ -1865,6 +1865,19 @@ impl Panel {
             && self.repo_folded(&(workspace.host.clone(), repo.to_path_buf()))
     }
 
+    /// What the last status read of a folder workspace's repository said,
+    /// for its row: only for a folder that is itself the one repository,
+    /// whose inspector card has no name row.
+    fn repo_known(&self, workspace: &Workspace) -> Option<&crate::platform::inspector::Known> {
+        let repos = self.repos_of(workspace)?;
+        if crate::platform::inspector::names_repos(workspace, &repos) {
+            return None;
+        }
+        let repo = repos.first()?;
+        self.inspector
+            .known_of(&(workspace.host.clone(), repo.clone()))
+    }
+
     /// The repositories of `workspace` whose status the inspector reads:
     /// those of [`Panel::repos_of`] whose card is not folded.
     pub fn read_repos_of(&self, workspace: &Workspace) -> Option<Vec<PathBuf>> {
@@ -3552,6 +3565,44 @@ pub fn shown_folder(workspace: &Workspace) -> String {
     }
 }
 
+/// A folder workspace's folder as its row and the inspector name it: the
+/// folder's name, with its parent's before it when another folder
+/// workspace of `peers` on the same host is on a folder of that name
+/// elsewhere; `host:name` for one on a host; `-` for one without a
+/// folder. The whole path ([`shown_folder`]) is the tooltip.
+pub fn folder_name(workspace: &Workspace, peers: &[Workspace]) -> String {
+    if workspace.folderless() {
+        return "-".into();
+    }
+    let name = |path: &Path| {
+        path.file_name().map_or_else(
+            || path.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        )
+    };
+    let own = name(&workspace.path);
+    let twin = peers.iter().any(|p| {
+        p.folder
+            && !p.folderless()
+            && p.host == workspace.host
+            && p.path != workspace.path
+            && name(&p.path) == own
+    });
+    let label = match workspace
+        .path
+        .parent()
+        .filter(|_| twin)
+        .and_then(Path::file_name)
+    {
+        Some(parent) => format!("{}/{own}", parent.to_string_lossy()),
+        None => own,
+    };
+    match &workspace.host {
+        Some(host) => format!("{host}:{label}"),
+        None => label,
+    }
+}
+
 /// A pull request's badge colour: its checks while open, else its state.
 fn pr_colour(pr: &crate::project::worktree::PullRequest, theme: &Theme) -> [f32; 4] {
     use crate::project::worktree::Checks;
@@ -4051,22 +4102,60 @@ impl Panel {
             &said,
             colour,
         );
-        // The folder, dimmer, cut from its start: its end is the folder
-        // itself, the part that tells two apart.
+        // The folder by name, dimmer, with what its Git last said: the
+        // branch, uncommitted files, commits to push or pull. The last
+        // facts go whole before anything is cut; the whole path is the
+        // tooltip.
         if task.folder && !task.folderless() && child.is_none() {
             let room = (right - name_x).max(0.0);
-            let shown = crate::platform::inspector::fit_start(atlas, &shown_folder(&task), room);
+            let mut parts = vec![folder_name(&task, &self.tasks)];
+            if let Some(known) = self.repo_known(&task) {
+                parts.push(
+                    known
+                        .branch
+                        .clone()
+                        .unwrap_or_else(|| "detached HEAD".to_owned()),
+                );
+                if known.dirty > 0 {
+                    parts.push(format!(
+                        "{} change{}",
+                        known.dirty,
+                        if known.dirty == 1 { "" } else { "s" }
+                    ));
+                }
+                if known.to_push > 0 {
+                    parts.push(format!("{} to push", known.to_push));
+                }
+                if known.to_pull > 0 {
+                    parts.push(format!("{} to pull", known.to_pull));
+                }
+            }
+            while parts.len() > 1
+                && layout::ui_text_width(atlas, &parts.join(" \u{b7} ")) > room + 0.5
+            {
+                parts.pop();
+            }
+            let shown = crate::platform::inspector::fit(atlas, &parts.join(" \u{b7} "), room);
+            let line3 = Viewport {
+                x: name_x,
+                y: line2.y + 16.0,
+                width: room,
+                height: 20.0,
+            };
             layout::push_ui_text(
                 out,
                 atlas,
-                Viewport {
-                    x: name_x,
-                    y: line2.y + 16.0,
-                    width: room,
-                    height: 20.0,
-                },
+                line3,
                 &shown,
                 layout::faded(theme.gutter_text, 0.8),
+            );
+            layout::hotspot(
+                Viewport {
+                    width: layout::ui_text_width(atlas, &shown).min(room),
+                    ..line3
+                },
+                layout::Cursor::Arrow,
+                Some(&shown_folder(&task)),
             );
         }
         self.hits.push((card, Action::Select(index)));
@@ -5054,6 +5143,33 @@ mod tests {
         panel.selected = Some(scratch);
         assert_eq!(panel.blank_folder(open), some("/e"));
         assert_eq!(panel.blank_folder(None), None);
+    }
+
+    #[test]
+    fn a_folder_row_names_its_folder_and_tells_twins_apart() {
+        let garden = folder("garden", "/x/garden");
+        let twin = folder("garden 2", "/y/garden");
+        let again = folder("again", "/x/garden");
+        let notes = folder("notes", "/x/notes");
+        let peers = vec![garden.clone(), twin.clone(), again.clone(), notes.clone()];
+        // Two folders of one name, elsewhere: their parents tell them apart.
+        assert_eq!(folder_name(&garden, &peers), "x/garden");
+        assert_eq!(folder_name(&twin, &peers), "y/garden");
+        // Two workspaces on the one folder share its name as they share it.
+        assert_eq!(folder_name(&again, &peers), "x/garden");
+        assert_eq!(folder_name(&notes, &peers), "notes");
+        assert_eq!(
+            folder_name(&garden, &[garden.clone(), again.clone()]),
+            "garden"
+        );
+        // A host's: its name on that host; a worktree is no twin.
+        let mut remote = folder("app", "~/srv/app");
+        remote.host = Some("myhost".into());
+        let mut wt = tree("/z/garden", false);
+        wt.repo = Some(PathBuf::from("/z/garden"));
+        assert_eq!(folder_name(&remote, &peers), "myhost:app");
+        assert_eq!(folder_name(&garden, &[garden.clone(), wt]), "garden");
+        assert_eq!(folder_name(&folder("scratch", ""), &peers), "-");
     }
 
     #[test]

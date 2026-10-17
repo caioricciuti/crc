@@ -576,6 +576,7 @@ impl EditorView {
                     program_pid: None,
                     remote: None,
                     told_focus: false,
+                    last_typed: None,
                     last_probe: None,
                     probe_owed: false,
                     seen: None,
@@ -730,6 +731,7 @@ impl EditorView {
                     program_pid: None,
                     remote: None,
                     told_focus: false,
+                    last_typed: None,
                     last_probe: None,
                     probe_owed: false,
                     seen: None,
@@ -1127,6 +1129,7 @@ impl EditorView {
                 answered = true;
             }
             tab.session.write(bytes);
+            tab.last_typed = Some(Instant::now());
         }
         if answered {
             super::agents::sync_dock_badge(&state, MainThreadMarker::from(self));
@@ -1233,7 +1236,8 @@ impl EditorView {
                     }
                 }
             }
-            if let Some(text) = notice {
+            // A bell right after a keystroke answers the key, not you.
+            if let Some(text) = notice.filter(|text| !text.is_empty() || tab.heeds_bell(now)) {
                 asked |= tab.attention.is_none();
                 tab.attention = Some(text);
                 if !(watching && index == active) {

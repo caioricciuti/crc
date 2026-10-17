@@ -3,6 +3,9 @@
 
 use super::*;
 
+/// How long a `wait` step sleeps between looks at the Agents reads.
+const WAIT_SLICE: Duration = Duration::from_millis(50);
+
 impl EditorView {
     /// Performs one self-test step as a real event through the window.
     pub(super) fn play(&self, step: &Step) {
@@ -401,7 +404,18 @@ impl EditorView {
                 }
             }
             Step::Wait(ms) => {
-                std::thread::sleep(Duration::from_millis(*ms));
+                // Slept in slices, the Agents reads looked at between them:
+                // the display link that takes them does not fire while
+                // this thread sleeps, and a folder's status is read only
+                // once its list read has landed, so one look at the end
+                // would leave the inspector sketched for the dump after.
+                let mut left = Duration::from_millis(*ms);
+                while !left.is_zero() {
+                    let slice = left.min(WAIT_SLICE);
+                    std::thread::sleep(slice);
+                    left -= slice;
+                    self.poll_agents();
+                }
                 self.check_open_files();
                 self.poll_tree_children();
                 self.poll_project_index();

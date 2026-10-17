@@ -33,8 +33,8 @@ printf 'new\n' > "$F/new.txt"
 cat > "$T/inspector.script" <<SCRIPT
 wait 500
 key 0 cmd,shift A
-wait 700
-wait 600
+wait 1200
+dump $T/inspector-first.out
 key 19 ctrl 2
 wait 700
 wait 500
@@ -81,6 +81,9 @@ expect_prefix() {
         ;;
     esac
 }
+# One wait after Agents mode comes on, and the folder's status is read,
+# not still sketched: the list read lands and starts it within the wait.
+expect_prefix "$T/inspector-first.out" inspector "branch=main "
 expect_prefix "$T/inspector-feat.out" inspector "branch=feat base=main ahead=1 behind=1 upstream=- push=0 pull=0 dirty=1 changes=+1-0 tag=- buttons=commit,update,push"
 expect_prefix "$T/inspector-committed.out" inspector "branch=feat base=main ahead=2 behind=1 upstream=- push=0 pull=0 dirty=0 changes=+2-0 tag=- buttons=update,push"
 subjects=$(testgit "$F" log --format=%s)

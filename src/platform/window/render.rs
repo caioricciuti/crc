@@ -884,6 +884,9 @@ impl EditorView {
                     reading: agents.reading_issues(),
                     now: crate::platform::unix_seconds(),
                 };
+                agents.inspector.folder_label = selected.as_ref().map_or_else(String::new, |w| {
+                    crate::platform::agents::folder_name(w, &agents.tasks)
+                });
                 agents.inspector.draw(
                     selected.as_ref(),
                     repos.as_deref(),

@@ -200,6 +200,18 @@ fn remote_values(status: &Status, check: Option<&Check>, now: u64) -> Vec<(Strin
     vec![(counts, Ink::Text), checked]
 }
 
+/// What a repository's last status read said that is shown when its card
+/// is not: folded to its name row, or on its workspace's row in the list.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Known {
+    pub branch: Option<String>,
+    /// Files with uncommitted changes.
+    pub dirty: usize,
+    /// Commits its upstream lacks, and has that it lacks; 0 without one.
+    pub to_push: usize,
+    pub to_pull: usize,
+}
+
 #[derive(Default)]
 pub struct Inspector {
     /// Closed by its button or View > Workspace Inspector; open otherwise.
@@ -243,9 +255,12 @@ pub struct Inspector {
     /// being read: set before each draw. Until they are known the body
     /// sketches them; without a read under way it says there is nothing.
     pub scanning: bool,
-    /// Per repository, by host and folder, its branch and uncommitted
-    /// file count when last read: a folded card shows them, unread.
-    known: HashMap<RepoKey, (Option<String>, usize)>,
+    /// Per repository, by host and folder, what its last read said that
+    /// a folded card and its workspace's row show, unread.
+    known: HashMap<RepoKey, Known>,
+    /// The folder workspace shown, by its folder's name (see
+    /// [`crate::platform::agents::folder_name`]): set before each draw.
+    pub folder_label: String,
     /// Per repository, by host and folder, how many times its status was
     /// asked for this run, for the self-test.
     reads: HashMap<RepoKey, usize>,
@@ -453,8 +468,15 @@ impl Inspector {
                 self.read_for = read.iter().map(|(p, _)| p.clone()).collect();
                 for (path, status) in &read {
                     if let Ok(s) = status {
-                        self.known
-                            .insert((host.clone(), path.clone()), (s.branch.clone(), s.dirty));
+                        self.known.insert(
+                            (host.clone(), path.clone()),
+                            Known {
+                                branch: s.branch.clone(),
+                                dirty: s.dirty,
+                                to_push: s.to_push,
+                                to_pull: s.to_pull,
+                            },
+                        );
                     }
                 }
                 self.read_host = host;
@@ -481,6 +503,12 @@ impl Inspector {
         self.reading
             .as_ref()
             .is_some_and(|(_, paths)| paths.iter().any(|p| p == path))
+    }
+
+    /// What `repo`'s last read said, however long ago, for its workspace's
+    /// row in the list; nothing until it was read once.
+    pub fn known_of(&self, repo: &RepoKey) -> Option<&Known> {
+        self.known.get(repo)
     }
 
     /// The status of `path`, once read.
@@ -867,8 +895,19 @@ impl Inspector {
             );
             return;
         }
-        let shown = crate::platform::agents::shown_folder(workspace);
-        let shown = fit_start(atlas, &shown, width);
+        // Its folder by name; the whole path is the tooltip.
+        let shown = fit(atlas, &self.folder_label, width);
+        let path = crate::platform::agents::shown_folder(workspace);
+        layout::hotspot(
+            Viewport {
+                x,
+                y,
+                width: layout::ui_text_width(atlas, &shown).min(width),
+                height: ROW,
+            },
+            layout::Cursor::Arrow,
+            Some(&path),
+        );
         text(out, atlas, x, y, width, &shown, theme.gutter_text);
         y += ROW;
         // The terminal showing is in ssh: where it is, not this Mac's Git.
@@ -1560,7 +1599,7 @@ impl Inspector {
         // Folded: the branch at the right, and a dot for uncommitted work,
         // from the last read; nothing read yet says nothing.
         let known = if folded { self.known.get(key) } else { None };
-        if let Some((branch, dirty)) = known {
+        if let Some(Known { branch, dirty, .. }) = known {
             let mut right = x + width;
             if *dirty > 0 {
                 right -= 8.0;
@@ -2213,32 +2252,6 @@ pub(crate) fn fit(atlas: &mut Atlas, s: &str, width: f32) -> String {
     .unwrap_or_default()
 }
 
-/// `s`, cut from its start with an ellipsis to fit `width`: for a path,
-/// whose end says the most.
-pub(crate) fn fit_start(atlas: &mut Atlas, s: &str, width: f32) -> String {
-    let width = width + 0.5;
-    if layout::ui_text_width(atlas, s) <= width {
-        return s.to_owned();
-    }
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() < 2 {
-        return String::new();
-    }
-    let ellipsis = layout::ui_text_width(atlas, "\u{2026}");
-    // What is measured of a cut is its first 120 characters, the ellipsis
-    // and 119 of the rest.
-    let guess: Vec<f32> = match caret_xs(atlas, &chars) {
-        Some(x) => (1..chars.len())
-            .map(|n| ellipsis + x[(n + 119).min(chars.len())].0 - x[n].1)
-            .collect(),
-        None => vec![f32::NEG_INFINITY; chars.len() - 1],
-    };
-    first_fitting(atlas, width, &guess, |i| {
-        "\u{2026}".to_owned() + &chars[i + 1..].iter().collect::<String>()
-    })
-    .unwrap_or_default()
-}
-
 /// The caret x before each of `chars` and after the last, from the string
 /// shaped once, if it can be. Inside a grapheme (an emoji sequence, a
 /// base and its marks) a cut shapes as something else, often narrower, so
@@ -2803,9 +2816,10 @@ mod tests {
         assert!(inspector.named("inspector.issues_load.1").is_none());
         let load = inspector.named("inspector.issues_load").unwrap();
         assert!(load.y < open_load.y);
+        let known = inspector.known_of(&(None, repos[0].clone())).unwrap();
         assert_eq!(
-            inspector.known.get(&(None, repos[0].clone())),
-            Some(&(Some("seedlings".to_owned()), 2))
+            (known.branch.as_deref(), known.dirty),
+            (Some("seedlings"), 2)
         );
     }
 
@@ -2820,22 +2834,6 @@ mod tests {
         while n > 0 {
             n -= 1;
             let cut: String = chars[..n].iter().collect::<String>() + "\u{2026}";
-            if layout::ui_text_width(atlas, &cut) <= width {
-                return cut;
-            }
-        }
-        String::new()
-    }
-
-    /// `fit_start` as it was: the oracle.
-    fn fit_start_by_measuring(atlas: &mut Atlas, s: &str, width: f32) -> String {
-        let width = width + 0.5;
-        if layout::ui_text_width(atlas, s) <= width {
-            return s.to_owned();
-        }
-        let chars: Vec<char> = s.chars().collect();
-        for n in 1..chars.len() {
-            let cut: String = "\u{2026}".to_owned() + &chars[n..].iter().collect::<String>();
             if layout::ui_text_width(atlas, &cut) <= width {
                 return cut;
             }
@@ -2898,11 +2896,6 @@ mod tests {
                     fit_by_measuring(&mut atlas, s, width),
                     "fit {s:?} into {width}"
                 );
-                assert_eq!(
-                    fit_start(&mut atlas, s, width),
-                    fit_start_by_measuring(&mut atlas, s, width),
-                    "fit_start {s:?} into {width}"
-                );
             }
         }
     }
@@ -2917,14 +2910,6 @@ mod tests {
             cut.ends_with('\u{2026}') && cut.len() < title.len(),
             "{cut}"
         );
-        assert!(
-            atlas.ui_shapes() - before <= 4,
-            "{}",
-            atlas.ui_shapes() - before
-        );
-        let before = atlas.ui_shapes();
-        let cut = fit_start(&mut atlas, SAMPLES[1], 120.0);
-        assert!(cut.starts_with('\u{2026}'), "{cut}");
         assert!(
             atlas.ui_shapes() - before <= 4,
             "{}",
