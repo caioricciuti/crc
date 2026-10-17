@@ -2,6 +2,55 @@
 
 One entry per tag, written for people who use the editor.
 
+## Unreleased
+
+- CSV and TSV files open as a grid. The first row is the header and
+  stays in view while the rest scrolls, a gutter numbers the rows, and
+  each column is as wide as its first 200 values, between 3 and 48
+  characters, so one long note does not push the others off screen. A
+  Table strip above the grid says how many rows and columns the file
+  has, which delimiter it uses (comma, semicolon, tab or pipe, detected
+  from the file) and how many rows have fewer cells than the widest, and
+  holds a Grid and Text switch; Escape goes to the text, and the grid
+  follows every change made there. Files over 32 MB open as text.
+- Click a cell to select it (click a row number to select its first
+  cell). Arrows move the selection; Tab and Shift-Tab move too and wrap
+  to the next or previous row; Home and End go to the row's first and
+  last cell, Cmd-Home and Cmd-End to the first and last row, PageUp and
+  PageDown by a screen. The grid scrolls to keep the cell in view, the
+  status line reads Row and Col in place of the caret, and Escape clears
+  the selection. The selection survives a switch to Text and back.
+- Return, a double click or typing on the selected cell opens it for
+  editing, in place. Return commits, Tab and Shift-Tab commit and move
+  on, Escape cancels, and a click anywhere else commits. The value is
+  written back into the file's text with the file's own rules: quoted
+  only when it holds the delimiter, a quote, a line break or a leading
+  or trailing space, with quotes inside doubled. A row shorter than the
+  column being edited is padded with delimiters first, so the cell
+  exists afterwards. An unchanged value changes nothing.
+- The Table menu, also on right click over the grid, inserts a row above
+  or below the selected cell, deletes its row, inserts a column left or
+  right of it, deletes its column, or clears the cell; Delete and
+  Backspace clear it too. A new row takes the file's line ending, a new
+  column is one more empty cell in every row (short rows are padded up
+  to it), and a deleted column goes out of every row that has it. Right
+  click selects the cell under the pointer first, so the command acts on
+  what you pressed.
+- Every change in the grid, a cell edit or a row or column change, is
+  one edit of the file's text and one undo step. Nothing is converted:
+  the file's delimiter, quoting, line endings (LF, CRLF or CR) and byte
+  order mark are kept, ragged rows stay ragged, and local history, the
+  unsaved mark and Save work as for any other file. A file opened and
+  saved without a change is byte for byte the same.
+- Waiting now looks like waiting. Project search shows a spinner and
+  sketched rows until the first results land. The palette sketches rows
+  while the file index rebuilds, the outline parses or a project symbol
+  scan runs, instead of saying no match. The Git panel names the
+  operation under way (Fetching, Committing, Staging) and the status
+  line follows only the ones you asked for. The Workspace inspector
+  sketches rows only while a read is in flight, and otherwise says
+  Nothing to show or Not read yet.
+
 ## v0.2.0-alpha.25, 2026-10-17
 
 - The Workspace inspector no longer says a repo is up to date from a

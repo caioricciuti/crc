@@ -329,6 +329,14 @@ the size and write it back.
   dragged to size) or in the whole tab (`Cmd-Shift-E`) from the Markdown
   Preview extension; images, PDFs, audio, video and office files open as
   Quick Look previews.
+- **CSV and TSV open as a grid**: a header that stays put, row numbers,
+  columns sized from the first rows, and a Table strip that says the
+  file's shape and switches between Grid and Text (Escape goes to text).
+  Click or arrow to a cell, press Return or just type to edit it, Return
+  or Tab to commit; the Table menu and the right-click menu insert and
+  delete rows and columns and clear a cell. Each change is one undo step
+  in the file's own text, with its delimiter (comma, semicolon, tab or
+  pipe), quoting and line endings kept, so Save writes what you see.
 - **A native, themed UI**: system-font chrome, light and dark following the
   system or your setting, a home screen with recent projects, overlay
   scrollbars, font zoom, and the right pointer for every control.
@@ -376,6 +384,8 @@ the size and write it back.
   the server itself (load, disk) is read. An ssh session typed in a
   local terminal is shown from its command line and `~/.ssh/config`
   alone.
+- **Only CSV and TSV are a grid.** xlsx, docx and pptx still open as
+  read-only Quick Look previews.
 - **No minimap.** Folding is by indentation, not by syntax.
 - **Markdown styling has edges.** Italic is not drawn on lines with
   non-ASCII text, and bold there is the regular face drawn twice; a line

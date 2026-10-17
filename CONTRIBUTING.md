@@ -107,6 +107,19 @@ Use it. Unit tests can tell you a glyph has ink in it; they cannot tell you
 the baseline is three pixels off or the atlas is upside down. Both of those
 happened during milestone 0 and only a dumped image caught them.
 
+For a change to the chrome, `scripts/ui-tour.sh` walks a test instance
+through every surface (home screen, editor, palette, search, Git,
+history, split, terminal, settings, extensions, preview, CSV, Agents and
+inspector) in both themes and keeps a PNG of each, drawn by the renderer
+itself rather than captured from the screen, so it needs no permission
+and the window need not be in front. Look at the frames before sending
+the change:
+
+```sh
+scripts/ui-tour.sh                # every frame, into a new folder under /tmp
+scripts/ui-tour.sh --out DIR git  # only the frames whose names contain "git"
+```
+
 ## Style
 
 - Comments explain *why*, not *what*. If a comment restates the code, delete it.
