@@ -313,7 +313,9 @@ the size and write it back.
   save, before a reload, when closed unsaved and after 30 seconds without
   typing. `.env` files, keys and `~/.ssh` are never kept;
   `local_history_exclude` leaves out more, and `local_history = false`
-  turns it off. Git > Recover Deleted File opens a deleted file's last
+  turns it off. Undo and redo survive a restart: reopen a file that has
+  not changed on disk since crc last saw it and they come back. Git >
+  Recover Deleted File opens a deleted file's last
   version again, and Git > Clear History for This File or Clear All
   Local History deletes what was kept, after asking.
 - **Split panes** (`Cmd-\`), up to four, each with its own tabs.
@@ -346,9 +348,6 @@ the size and write it back.
   (OAuth), and shows interactive MCP Apps as nothing: their results show
   as text. `crc --mcp` has no live editor state yet, only what is on disk
   and in the index.
-- **A deleted file cannot be recovered from local history yet.** File
-  History shows, compares and restores the versions kept of an open
-  file; recovering one that is gone comes in a later change.
 - **Git history is per file.** File History and Blame Heat walk one
   file's commits; there is no log of the whole repository or commit
   graph, and no merge or

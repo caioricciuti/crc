@@ -8,6 +8,8 @@ One entry per tag, written for people who use the editor.
   stale fetch. Each repo block has a Check button that fetches that repo
   and shows what is ahead and behind, the Remote row says when it was
   last checked, and Pull is enabled whenever the branch has an upstream.
+  The refresh button in the inspector's header checks every repo with an
+  upstream at once, each block updating as its own fetch answers.
 - Git > Recover Deleted File lists, in the palette, the files local
   history has versions of that are gone from disk, by name with their
   folder. Picking one opens its latest version at its old path as
@@ -18,6 +20,14 @@ One entry per tag, written for people who use the editor.
   local history turned off, and close File History when it shows what
   was cleared. Files on disk are not touched. All three are in the
   command palette too.
+- Undo and redo survive a restart. When you open a file that has not
+  changed on disk since crc last saw it, its undo and redo come back,
+  up to 1000 steps. They are kept for saved files only, so a file left
+  with unsaved changes at quit keeps the undo from its last save. Opening
+  never waits for them, and `.env` files, keys and other files local
+  history leaves out keep none.
+- Opening File History while a completion list was showing left its keys
+  dead: Left moved the caret instead of stepping versions. Fixed.
 - File History can restore a version. Restore at the right of its strip,
   or Git > Restore This Version, puts the version shown, a commit's or a
   local one, into the file's own tab as one edit: Undo brings back the
