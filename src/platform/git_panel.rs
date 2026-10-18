@@ -1,6 +1,7 @@
 //! Native local source-control panel; Git processes run on workers.
 use crate::project::git::{self, Change, Snapshot};
 use crate::project::icons;
+use crate::project::review;
 use crate::render::{
     font::Atlas,
     layout::{self, Button, Theme, Tone, Viewport},
@@ -112,6 +113,79 @@ struct Reply {
     done: Option<String>,
     /// When the repository last fetched (see [`last_fetch`]).
     fetched_at: Option<u64>,
+    /// The agents' files inside the repository (see [`agent_rows`]).
+    agents: Vec<AgentFile>,
+}
+
+/// A file an agent in a crc terminal changed, from the session store: one
+/// row under "Changed by agents".
+#[derive(Clone, Debug)]
+pub struct AgentFile {
+    /// The session folder that holds its checkpoint.
+    pub session: PathBuf,
+    pub file: review::File,
+    /// Its path relative to the repository, as `Snapshot::changes` has it.
+    pub relative: PathBuf,
+    /// The terminal tab's title, live or as the session recorded it.
+    pub label: String,
+    /// When the agent last wrote it, as the store saw it.
+    pub wrote_at: Option<std::time::SystemTime>,
+}
+
+impl AgentFile {
+    /// The file's name, for the row and the status line.
+    pub fn name(&self) -> String {
+        self.file
+            .path
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+    }
+}
+
+/// The agents' files inside the repository at `root`, in path order: every
+/// session's files whose path is under it. `labels` names the sessions of
+/// live terminals; a closed session goes by what it recorded of its tab.
+/// Store paths are resolved, so `root` (Git's own, which need not be) is
+/// resolved to match them.
+pub fn agent_rows(
+    root: &std::path::Path,
+    sessions: &[PathBuf],
+    labels: &[(PathBuf, String)],
+) -> Vec<AgentFile> {
+    let root = crate::platform::canonical(root);
+    let mut out: Vec<AgentFile> = sessions
+        .iter()
+        .flat_map(|session| {
+            let label = labels
+                .iter()
+                .find(|(dir, _)| dir == session)
+                .map_or_else(|| review::about(session).0, |(_, label)| label.clone());
+            review::files(session)
+                .into_iter()
+                .filter_map(|file| {
+                    let relative = file.path.strip_prefix(&root).ok()?.to_path_buf();
+                    Some(AgentFile {
+                        session: session.clone(),
+                        wrote_at: review::wrote_at(session, &file),
+                        relative,
+                        label: label.clone(),
+                        file,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    out.sort_by(|a, b| a.file.path.cmp(&b.file.path));
+    out
+}
+
+/// How long ago the agent wrote a file, as its row says: "2 min ago".
+pub fn agent_age(since: std::time::Duration) -> String {
+    if since.as_secs() < 60 {
+        "just now".into()
+    } else {
+        format!("{} ago", crate::platform::agents::span(since))
+    }
 }
 
 /// The commit message's text inset inside its box, for drawing and clicks.
@@ -302,8 +376,14 @@ pub struct Panel {
     pub note: String,
     /// The note says something went right (a commit), not wrong.
     note_success: bool,
-    /// Sections folded shut, by [`Group::index`].
-    pub collapsed: [bool; 3],
+    /// Sections folded shut, by [`Group::index`]; the agents' group in
+    /// the slot after them ([`AGENTS_FOLD`]).
+    pub collapsed: [bool; 4],
+    /// The agents' files inside the repository, read with the snapshot.
+    pub agents: Vec<AgentFile>,
+    /// The sessions of live terminals and their tabs' titles, for naming
+    /// the agents' rows; the window keeps it current.
+    agent_labels: Vec<(PathBuf, String)>,
     /// Whether the editor column is showing the selected change instead of
     /// the active document.
     pub showing_diff: bool,
@@ -346,6 +426,8 @@ const REFUSED: &str = "Not committed: ";
 pub const ROW: f32 = 26.0;
 /// Height of a `Staged Changes` / `Changes` section heading.
 pub const SECTION: f32 = 26.0;
+/// The slot of the "Changed by agents" group in [`Panel::collapsed`].
+const AGENTS_FOLD: usize = 3;
 
 /// The headings of the change list, in order.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -386,15 +468,29 @@ impl Group {
 /// is a change together with the group it is listed under.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Entry {
-    Section { group: Group, count: usize },
-    File { change: usize, group: Group },
+    Section {
+        group: Group,
+        count: usize,
+    },
+    File {
+        change: usize,
+        group: Group,
+    },
+    /// The "Changed by agents" heading, last, with its count.
+    Agents {
+        count: usize,
+    },
+    /// One agent's file, by its index in [`Panel::agents`].
+    Agent {
+        index: usize,
+    },
 }
 
 impl Entry {
     pub fn height(self) -> f32 {
         match self {
-            Entry::Section { .. } => SECTION,
-            Entry::File { .. } => ROW,
+            Entry::Section { .. } | Entry::Agents { .. } => SECTION,
+            Entry::File { .. } | Entry::Agent { .. } => ROW,
         }
     }
 }
@@ -623,7 +719,9 @@ impl Panel {
             message_scroll: Default::default(),
             note: "Reading repository…".into(),
             note_success: false,
-            collapsed: [false; 3],
+            collapsed: [false; 4],
+            agents: Vec::new(),
+            agent_labels: Vec::new(),
             showing_diff: false,
             diff: git::Diff::default(),
             in_flight: None,
@@ -797,6 +895,15 @@ impl Panel {
                     .map(|change| Entry::File { change, group }),
             );
         }
+        // Last, and only when there is one: scripts count the rows above.
+        if !self.agents.is_empty() {
+            entries.push(Entry::Agents {
+                count: self.agents.len(),
+            });
+            if !self.collapsed[AGENTS_FOLD] {
+                entries.extend((0..self.agents.len()).map(|index| Entry::Agent { index }));
+            }
+        }
         entries
     }
 
@@ -852,6 +959,29 @@ impl Panel {
         let i = group.index();
         self.collapsed[i] = !self.collapsed[i];
         self.list_scroll = self.list_scroll.min(self.entries().len().saturating_sub(1));
+    }
+
+    /// Folds the agents' group shut, or opens it.
+    pub fn toggle_agents(&mut self) {
+        self.collapsed[AGENTS_FOLD] = !self.collapsed[AGENTS_FOLD];
+        self.list_scroll = self.list_scroll.min(self.entries().len().saturating_sub(1));
+    }
+
+    /// Which tab each live session belongs to, for the agents' rows; the
+    /// next read of the repository uses it.
+    pub fn set_agent_labels(&mut self, labels: Vec<(PathBuf, String)>) {
+        self.agent_labels = labels;
+    }
+
+    /// The change Git lists an agent's file as, when it does: a file kept
+    /// or put back by hand is as HEAD has it, and has none.
+    pub fn agent_change(&self, index: usize) -> Option<usize> {
+        let agent = self.agents.get(index)?;
+        self.snapshot
+            .as_ref()?
+            .changes
+            .iter()
+            .position(|c| c.path == agent.relative)
     }
 
     /// Stages every change under Changes, or unstages every one under
@@ -1314,6 +1444,7 @@ impl Panel {
         let keeps_place = stages_from_diff || matches!(operation, Operation::Refresh);
         let directory = self.directory.clone();
         let guard = self.guard.clone();
+        let labels = self.agent_labels.clone();
         let previous = self.selected_change().map(|c| c.path.clone());
         let (tx, rx) = mpsc::channel();
         self.note = format!("{}…", operation.verb(self.snapshot.is_none()));
@@ -1496,6 +1627,9 @@ impl Panel {
                 let mut snapshot = git::snapshot(&root)?;
                 git::read_head(&mut snapshot);
                 let fetched_at = last_fetch(&snapshot.root);
+                let agents = review::root().map_or_else(Vec::new, |store| {
+                    agent_rows(&snapshot.root, &review::sessions(&store), &labels)
+                });
                 let selected = selected_path
                     .and_then(|p| snapshot.changes.iter().position(|c| c.path == p))
                     .unwrap_or(0);
@@ -1514,6 +1648,7 @@ impl Panel {
                     error,
                     done,
                     fetched_at,
+                    agents,
                 })
             })();
             let _ = tx.send(result);
@@ -1551,6 +1686,7 @@ impl Panel {
                 }
                 let before = self.selected_change().map(|c| c.path.clone());
                 self.snapshot = Some(reply.snapshot);
+                self.agents = reply.agents;
                 self.fetched_at = reply.fetched_at;
                 self.selected = reply.selected;
                 self.diff = git::Diff::parse(&reply.diff);
@@ -2134,6 +2270,22 @@ impl Panel {
                 Entry::File { change, group } => {
                     self.draw_file_row(atlas, g, rect, change, group, theme, out);
                 }
+                Entry::Agents { count } => {
+                    layout::push_row_hover(out, rect, theme);
+                    layout::push_section_heading(
+                        out,
+                        atlas,
+                        rect,
+                        "Changed by agents",
+                        Some(count),
+                        !self.collapsed[AGENTS_FOLD],
+                        theme.status_text,
+                        theme,
+                    );
+                }
+                Entry::Agent { index } => {
+                    self.draw_agent_row(atlas, g, rect, index, theme, out);
+                }
             }
         }
         self.draw_note(atlas, g, theme, out);
@@ -2450,6 +2602,135 @@ impl Panel {
             toggle = toggle.icon(icons::ADD);
         }
         toggle.draw(out, atlas, theme);
+    }
+
+    /// A row under "Changed by agents": the file as a Changes row shows
+    /// it, then which terminal's agent wrote it and how long ago, at the
+    /// trailing edge in the muted colour. No staging box: the row is about
+    /// the agent's change, which its menu keeps or undoes.
+    fn draw_agent_row(
+        &self,
+        atlas: &mut Atlas,
+        g: Sidebar,
+        rect: Viewport,
+        index: usize,
+        theme: &Theme,
+        out: &mut Vec<GlyphInstance>,
+    ) {
+        let Some(agent) = self.agents.get(index) else {
+            return;
+        };
+        let selected = self.showing_diff && self.agent_change(index) == Some(self.selected);
+        if selected {
+            layout::push_rounded_rect(
+                out,
+                Viewport {
+                    x: rect.x + 6.0,
+                    y: rect.y + 1.0,
+                    width: (rect.width - 12.0).max(0.0),
+                    height: rect.height - 2.0,
+                },
+                layout::UI_RADIUS_SM + 1.0,
+                theme.palette_selected,
+            );
+            layout::hotspot(rect, layout::Cursor::Pointing, None);
+        } else {
+            layout::push_row_hover(out, rect, theme);
+        }
+        let over = layout::hovered(rect);
+        let name = agent.name();
+        let parent = agent
+            .relative
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let icon = icons::for_file(&agent.relative).glyph;
+        let icon_x = rect.x + 24.0;
+        let icon_w = layout::icon_width(atlas, icon);
+        layout::push_icon_centered(
+            out,
+            atlas,
+            Viewport {
+                x: icon_x,
+                width: icon_w,
+                ..rect
+            },
+            icon,
+            if selected {
+                theme.accent
+            } else {
+                theme.status_text
+            },
+        );
+        let name_x = icon_x + icon_w.max(18.0) + 6.0;
+        // Open File joins the row while the pointer is on it, as on every
+        // row; the text ends where the button starts.
+        let right = if over {
+            let open = g.open(rect);
+            Button::new(open)
+                .icon(icons::GO_TO_FILE)
+                .tone(Tone::Ghost)
+                .tip("Open File")
+                .draw(out, atlas, theme);
+            open.x - 4.0
+        } else {
+            let toggle = g.toggle(rect);
+            toggle.x + toggle.width
+        };
+        let age = agent
+            .wrote_at
+            .and_then(|at| std::time::SystemTime::now().duration_since(at).ok())
+            .map(agent_age);
+        let name_width = layout::ui_text_width(atlas, &name);
+        let room = (right - name_x).max(0.0);
+        // The name first; the note gives way in a narrow column, the time
+        // before the terminal's name, so a row never loses both at once.
+        let name_rect = Viewport {
+            x: name_x,
+            y: rect.y,
+            width: name_width.min(room),
+            height: rect.height,
+        };
+        layout::push_ui_text(out, atlas, name_rect, &name, theme.text);
+        let mut after_name = name_x + name_rect.width + 8.0;
+        let notes = [
+            age.as_ref()
+                .map(|age| format!("{} \u{b7} {age}", agent.label)),
+            Some(agent.label.clone()),
+            age,
+        ];
+        let fits = notes.into_iter().flatten().find_map(|note| {
+            let width = layout::ui_text_width(atlas, &note);
+            (name_width + 8.0 + width <= room).then_some((note, width))
+        });
+        if let Some((note, width)) = fits {
+            layout::push_ui_text_right(
+                out,
+                atlas,
+                Viewport {
+                    x: after_name,
+                    width: (right - after_name).max(0.0),
+                    ..name_rect
+                },
+                &note,
+                theme.gutter_text,
+            );
+            after_name = right - width;
+        }
+        let folder_width = layout::ui_text_width(atlas, &parent);
+        if !parent.is_empty() && name_x + name_rect.width + 8.0 + folder_width + 8.0 <= after_name {
+            layout::push_ui_text(
+                out,
+                atlas,
+                Viewport {
+                    x: name_x + name_rect.width + 8.0,
+                    width: folder_width,
+                    ..name_rect
+                },
+                &parent,
+                theme.gutter_text,
+            );
+        }
     }
 }
 
@@ -3381,7 +3662,7 @@ mod tests {
             .iter()
             .map(|e| match e {
                 Entry::File { change, .. } => *change,
-                Entry::Section { .. } => unreachable!("one section per side"),
+                _ => unreachable!("one section per side"),
             })
             .collect();
         assert_eq!(unstaged, vec![1, 2, 3], "both.rs is listed on both sides");
@@ -3549,5 +3830,119 @@ mod tests {
                 "a row was reported past the bottom of the list"
             );
         }
+    }
+
+    /// A session holds whatever its agent wrote anywhere; the panel lists
+    /// what is inside this repository, named for the tab, by its path in
+    /// the repository. The root comes from Git unresolved (a temp folder
+    /// here, a symbolic link), the store's paths resolved.
+    #[test]
+    fn agent_rows_leave_out_paths_outside_the_repository() {
+        let tree = crate::project::TempTree::new(
+            "git-agent-rows",
+            &[
+                ("repo/src/a.rs", "fn a() {}\n"),
+                ("elsewhere/b.rs", "fn b() {}\n"),
+                ("sessions/one/", ""),
+                ("sessions/two/", ""),
+            ],
+        );
+        let one = tree.0.join("sessions/one");
+        let two = tree.0.join("sessions/two");
+        for (dir, path) in [
+            (&one, tree.0.join("repo/src/a.rs")),
+            (&one, tree.0.join("elsewhere/b.rs")),
+            (&two, tree.0.join("repo/new.rs")),
+        ] {
+            review::checkpoint(
+                dir,
+                &crate::platform::canonical(path.parent().unwrap()).join(path.file_name().unwrap()),
+            )
+            .expect("checkpoint");
+        }
+        let labels = vec![(one.clone(), "\u{273b} Claude".to_owned())];
+        let rows = agent_rows(&tree.0.join("repo"), &[one.clone(), two.clone()], &labels);
+        let listed: Vec<(String, String)> = rows
+            .iter()
+            .map(|r| (r.relative.to_string_lossy().into_owned(), r.label.clone()))
+            .collect();
+        // Path order; the live tab names its rows, a session with no tab
+        // goes by its record, "Terminal" when it never wrote one.
+        assert_eq!(
+            listed,
+            vec![
+                ("new.rs".to_owned(), "Terminal".to_owned()),
+                ("src/a.rs".to_owned(), "\u{273b} Claude".to_owned()),
+            ]
+        );
+        assert_eq!(rows[1].session, one);
+        assert_eq!(rows[1].name(), "a.rs");
+        assert!(
+            rows[1].wrote_at.is_some(),
+            "the claim's time stands in for the write's"
+        );
+        assert!(agent_rows(&tree.0.join("elsewhere"), &[one], &labels).len() == 1);
+    }
+
+    #[test]
+    fn the_agent_row_says_how_long_ago() {
+        let secs = std::time::Duration::from_secs;
+        assert_eq!(agent_age(secs(0)), "just now");
+        assert_eq!(agent_age(secs(59)), "just now");
+        assert_eq!(agent_age(secs(120)), "2 min ago");
+        assert_eq!(agent_age(secs(3 * 3600)), "3 h ago");
+        assert_eq!(agent_age(secs(2 * 86400)), "2 d ago");
+    }
+
+    /// The group is last, so the rows scripts click above it do not move,
+    /// and there is no heading when no agent changed anything.
+    #[test]
+    fn the_agents_group_is_last_and_hidden_when_empty() {
+        let mut panel = panel(vec![
+            change("dirty.rs", b' ', b'M'),
+            change("new.rs", b'?', b'?'),
+        ]);
+        assert!(
+            !panel
+                .entries()
+                .iter()
+                .any(|e| matches!(e, Entry::Agents { .. } | Entry::Agent { .. })),
+            "nothing changed by an agent, no group"
+        );
+        let agent = |name: &str| AgentFile {
+            session: PathBuf::from("/tmp/sessions/one"),
+            file: review::File {
+                path: PathBuf::from("/tmp").join(name),
+                checkpoint: review::Checkpoint::Absent,
+            },
+            relative: PathBuf::from(name),
+            label: "Claude".into(),
+            wrote_at: None,
+        };
+        panel.agents = vec![agent("new.rs"), agent("kept.rs")];
+        let entries = panel.entries();
+        assert_eq!(
+            &entries[entries.len() - 3..],
+            &[
+                Entry::Agents { count: 2 },
+                Entry::Agent { index: 0 },
+                Entry::Agent { index: 1 },
+            ]
+        );
+        assert_eq!(
+            entries[0],
+            Entry::Section {
+                group: Group::Changes,
+                count: 2
+            }
+        );
+        // A file Git lists is opened as that change; one it does not (kept
+        // and committed, or put back by hand) has no diff to show.
+        assert_eq!(panel.agent_change(0), Some(1));
+        assert_eq!(panel.agent_change(1), None);
+        panel.toggle_agents();
+        let folded = panel.entries();
+        assert_eq!(folded.last(), Some(&Entry::Agents { count: 2 }));
+        assert!(!folded.iter().any(|e| matches!(e, Entry::Agent { .. })));
     }
 }

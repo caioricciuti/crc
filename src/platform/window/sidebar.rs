@@ -165,6 +165,8 @@ impl EditorView {
             if scm {
                 state.palette = None;
                 state.goto = None;
+                let labels = super::review::agent_labels(&state);
+                state.git.set_agent_labels(labels);
                 state.git.refresh();
             }
         }
@@ -263,6 +265,38 @@ impl EditorView {
                         state.git.toggle_group(group);
                     }
                 }
+                // An agent's file opens as the change Git lists it under,
+                // the working tree's unless only the index has it.
+                Entry::Agent { index } => {
+                    state.git_focus = false;
+                    let agent_path = state.git.agents.get(index).map(|a| a.file.path.clone());
+                    if g.open(rect).contains(x, y) {
+                        open_file = agent_path;
+                    } else if let Some(change) = state.git.agent_change(index) {
+                        let staged = state
+                            .git
+                            .snapshot
+                            .as_ref()
+                            .and_then(|s| s.changes.get(change))
+                            .is_some_and(|c| !c.unstaged());
+                        state.git.select(change);
+                        open_diff_tab(&mut state, change, staged);
+                    } else {
+                        // Kept, committed, or put back by hand: Git has
+                        // nothing to show, so the file itself opens.
+                        let name = state
+                            .git
+                            .agents
+                            .get(index)
+                            .map_or_else(String::new, |a| a.name());
+                        state.say(
+                            layout::Feedback::Info,
+                            format!("{name}: no difference from HEAD"),
+                        );
+                        open_file = agent_path;
+                    }
+                }
+                Entry::Agents { .. } => state.git.toggle_agents(),
             }
         } else {
             handled = false;

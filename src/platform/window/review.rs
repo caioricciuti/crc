@@ -17,6 +17,37 @@ fn running(state: &State) -> Vec<std::path::PathBuf> {
         .collect()
 }
 
+/// Which tab each live session belongs to, for the Git panel's "Changed
+/// by agents" rows: the title without the review count, as the session's
+/// own record has it.
+pub(super) fn agent_labels(state: &State) -> Vec<(std::path::PathBuf, String)> {
+    state
+        .terminal
+        .tabs
+        .iter()
+        .filter(|t| t.tracks_review())
+        .map(|t| (t.review.clone(), t.base_name()))
+        .collect()
+}
+
+/// Whether `path` is open in crc with unsaved edits: Undo leaves such a
+/// file alone, since choosing between two versions is the person's call.
+fn dirty_in_crc(state: &State, path: &std::path::Path) -> bool {
+    all_docs(state)
+        .flat_map(|d| d.iter())
+        .any(|b| b.path.as_deref() == Some(path) && b.is_dirty())
+}
+
+/// How Undo refuses a file that is [`dirty_in_crc`].
+fn unsaved_refusal(file: &review::File) -> String {
+    format!(
+        "{} has unsaved edits in crc: save or revert them first",
+        file.path
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+    )
+}
+
 /// Every session with something to review, as Home lists it.
 fn read_summary() -> Vec<(std::path::PathBuf, String, usize)> {
     review::root().map_or_else(Vec::new, |r| review::summary(&r))
@@ -28,6 +59,9 @@ fn read_summary() -> Vec<(std::path::PathBuf, String, usize)> {
 /// thousands of files; a write while one is read asks for one more read
 /// after it. [`poll_counts`] applies what it finds.
 pub(super) fn refresh_review(state: &mut State) {
+    // The Git panel lists the agents' files with the repository's changes.
+    state.git.set_agent_labels(agent_labels(state));
+    state.git.refresh();
     if state.review_page.counting.is_some() {
         state.review_page.recount = true;
         return;
@@ -297,6 +331,49 @@ impl EditorView {
         self.request_redraw();
     }
 
+    /// Keep or Undo from an agent's row in Source Control: the whole file,
+    /// as the Review page's buttons do it. Undo is refused for a file with
+    /// unsaved edits in crc, and by the store for one not as the agent
+    /// left it; the status line says which.
+    pub(super) fn agent_row_action(&self, undo: bool) {
+        let said = (|| -> Result<Option<String>, String> {
+            let Some(state) = self.state() else {
+                return Ok(None);
+            };
+            let index = state.context_agent;
+            let Some(agent) = index.and_then(|i| state.git.agents.get(i).cloned()) else {
+                return Ok(None);
+            };
+            let name = agent.name();
+            if undo {
+                if dirty_in_crc(&state, &agent.file.path) {
+                    return Err(unsaved_refusal(&agent.file));
+                }
+                review::undo_all(&agent.session, &agent.file)?;
+                Ok(Some(format!("Put {name} back as it was")))
+            } else {
+                review::keep_all(&agent.session, &agent.file)?;
+                Ok(Some(format!("Kept every change in {name}")))
+            }
+        })();
+        if let Some(mut state) = self.state_mut() {
+            refresh_review_now(&mut state);
+            match said {
+                Ok(Some(text)) => state.say(layout::Feedback::Success, text),
+                Ok(None) => {}
+                Err(text) => state.say(layout::Feedback::Failure, text),
+            }
+        }
+        self.resume_display_link();
+        // As after the page's Undo: a clean open document reloads, with
+        // the agent's text on its undo stack.
+        if undo {
+            self.check_open_files();
+        }
+        self.request_redraw();
+        self.pump();
+    }
+
     /// What a click on the Review page does.
     pub(super) fn review_action(&self, action: Action) {
         // The file shown, in the editor: the page gives the column back.
@@ -370,17 +447,8 @@ impl EditorView {
                 .file_name()
                 .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
         };
-        let dirty = |path: &std::path::Path| {
-            all_docs(&state)
-                .flat_map(|d| d.iter())
-                .any(|b| b.path.as_deref() == Some(path) && b.is_dirty())
-        };
-        let refuse = |file: &review::File| {
-            format!(
-                "{} has unsaved edits in crc: save or revert them first",
-                name(file)
-            )
-        };
+        let dirty = |path: &std::path::Path| dirty_in_crc(&state, path);
+        let refuse = unsaved_refusal;
         match action {
             Action::Close => {
                 state.review_page.open = false;

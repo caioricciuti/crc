@@ -326,6 +326,18 @@ pub fn has(dir: &Path, path: &Path) -> bool {
         .exists()
 }
 
+/// When the agent last wrote `file`, as the store saw it: the post hook's
+/// record, or the claim for a file with none (changed without the hook).
+/// `None` for a file the session does not have.
+pub fn wrote_at(dir: &Path, file: &File) -> Option<std::time::SystemTime> {
+    let files = dir.join("files");
+    let key = key(&file.path);
+    [format!("{key}.after"), format!("{key}.path")]
+        .iter()
+        .filter_map(|name| std::fs::metadata(files.join(name)).ok()?.modified().ok())
+        .max()
+}
+
 /// The file's size and a hash of its bytes, as the post hook records them
 /// and Undo checks them; `absent` for a file that is not there.
 fn file_fingerprint(path: &Path) -> std::io::Result<String> {

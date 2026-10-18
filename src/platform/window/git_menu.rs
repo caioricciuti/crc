@@ -257,8 +257,16 @@ impl EditorView {
             Some(Entry::File { change, group }) => {
                 if let Some(mut state) = self.state_mut() {
                     state.context_change = Some((change, group));
+                    state.context_agent = None;
                 }
                 git_change_menu(mtm, group == Group::Staged, group == Group::Conflicts)
+            }
+            Some(Entry::Agent { index }) => {
+                if let Some(mut state) = self.state_mut() {
+                    state.context_change = None;
+                    state.context_agent = Some(index);
+                }
+                git_agent_menu(mtm)
             }
             Some(Entry::Section { group, .. }) if group != Group::Conflicts => {
                 git_section_menu(mtm, group == Group::Staged)
@@ -287,14 +295,17 @@ impl EditorView {
         self.request_redraw();
     }
 
-    /// The change a Source Control context menu was opened on: its path in
-    /// the repository and on disk.
+    /// The change a Source Control context menu was opened on, or the
+    /// agent's file: its path in the repository and on disk.
     pub(super) fn context_change_paths(&self) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
         let state = self.state()?;
-        let (index, _) = state.context_change?;
-        let snapshot = state.git.snapshot.as_ref()?;
-        let change = snapshot.changes.get(index)?;
-        Some((change.path.clone(), snapshot.root.join(&change.path)))
+        if let Some((index, _)) = state.context_change {
+            let snapshot = state.git.snapshot.as_ref()?;
+            let change = snapshot.changes.get(index)?;
+            return Some((change.path.clone(), snapshot.root.join(&change.path)));
+        }
+        let agent = state.git.agents.get(state.context_agent?)?;
+        Some((agent.relative.clone(), agent.file.path.clone()))
     }
 
     pub(super) fn git_remote(&self, what: crate::project::git::Remote) {

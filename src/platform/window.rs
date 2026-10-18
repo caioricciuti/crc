@@ -913,6 +913,9 @@ struct State {
     /// The Source Control row a context menu was opened on: a change and
     /// the section it is listed under.
     context_change: Option<(usize, crate::platform::git_panel::Group)>,
+    /// The "Changed by agents" row a context menu was opened on, by its
+    /// index in the panel's list of them.
+    context_agent: Option<usize>,
     /// The extension and the MCP row a context menu was opened on.
     context_ext: Option<String>,
     context_mcp: Option<crate::platform::mcp_panel::Action>,
@@ -3789,6 +3792,16 @@ define_class!(
             self.resume_display_link();
         }
 
+        #[unsafe(method(gitKeepContextAgent:))]
+        fn action_git_keep_agent(&self, _sender: Option<&AnyObject>) {
+            self.agent_row_action(false);
+        }
+
+        #[unsafe(method(gitUndoContextAgent:))]
+        fn action_git_undo_agent(&self, _sender: Option<&AnyObject>) {
+            self.agent_row_action(true);
+        }
+
         #[unsafe(method(gitStageAll:))]
         fn action_git_stage_all(&self, _sender: Option<&AnyObject>) {
             if let Some(mut state) = self.state_mut() {
@@ -4796,6 +4809,8 @@ define_class!(
                 state.context_change.is_some_and(|(_, g)| g == crate::platform::git_panel::Group::Changes) && !state.git.busy()
             } else if action == sel!(gitUnstageContextChange:) {
                 state.context_change.is_some_and(|(_, g)| g == crate::platform::git_panel::Group::Staged) && !state.git.busy()
+            } else if action == sel!(gitKeepContextAgent:) || action == sel!(gitUndoContextAgent:) {
+                state.context_agent.is_some_and(|i| i < state.git.agents.len())
             } else if action == sel!(closeOtherTabs:) {
                 state.docs.len() > 1
             } else if action == sel!(closeTabsToRight:) {
@@ -8783,6 +8798,26 @@ fn git_change_menu(mtm: MainThreadMarker, staged: bool, conflicted: bool) -> Ret
     menu
 }
 
+/// A file under "Changed by agents" in Source Control: open it, keep the
+/// agent's change, or put the file back as it was before the agent.
+fn git_agent_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
+    let menu = context_menu_new(mtm);
+    let add = |title: &str, action: Sel| menu.addItem(&menu_item(mtm, title, action));
+    let line = || menu.addItem(&NSMenuItem::separatorItem(mtm));
+    add("Open File", sel!(gitOpenContextChange:));
+    line();
+    add("Keep", sel!(gitKeepContextAgent:));
+    add("Undo agent change", sel!(gitUndoContextAgent:));
+    line();
+    add("Copy Path", sel!(gitCopyContextChangePath:));
+    add(
+        "Copy Relative Path",
+        sel!(gitCopyContextChangeRelativePath:),
+    );
+    add("Reveal in Finder", sel!(gitRevealContextChange:));
+    menu
+}
+
 /// A section heading in Source Control.
 fn git_section_menu(mtm: MainThreadMarker, staged: bool) -> Retained<NSMenu> {
     let menu = context_menu_new(mtm);
@@ -9829,6 +9864,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         tab_scroll_carry: 0.0,
         context_tab: None,
         context_change: None,
+        context_agent: None,
         context_ext: None,
         context_mcp: None,
         ephemeral_session: launched_with_file,
