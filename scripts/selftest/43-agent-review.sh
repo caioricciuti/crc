@@ -51,7 +51,7 @@ SCRIPT
 # The burst lands while the page is open: the display link runs between
 # these waits, so the watcher's changes are taken as they come; short
 # waits, so they are taken soon after each write.
-for _ in $(seq 90); do echo 'wait 100'; done >> "$T/review.script"
+for _ in $(seq 130); do echo 'wait 100'; done >> "$T/review.script"
 cat >> "$T/review.script" <<SCRIPT
 dump $T/review-burst.out
 click @review_page.select.0.1
@@ -73,11 +73,23 @@ dump $T/review-shell.out
 click @review_page.keep_file
 wait 300
 dump $T/review-empty.out
+click @home.review
+wait 300
+key 0 cmd,shift A
+wait 400
+key 0 cmd,shift A
+wait 400
+dump $T/review-mode.out
 quit
 SCRIPT
 CRC_TERMINAL_SHELL=/bin/sh CRC_CLAUDE_COMMAND="$T/review-agent.sh" \
     CRC_SELFTEST="$T/review.script" "$BIN" "$T/reviewproj" 2> "$T/review.err"
 expect "$T/review.out" terminals "waiting: Claude is waiting for your input review=3"
+# A page left open is left behind by the switch to Agents mode: coming
+# back to the editor shows the tabs, not the page over them again.
+if ! grep -q '^review_page: closed' "$T/review-mode.out"; then
+    failed "review-mode.out: $(grep -m1 '^review_page' "$T/review-mode.out"), expected the page closed after a switch to Agents mode and back"
+fi
 # Home lists the session; its row opens the page, newest session first,
 # files in path order: new.txt, then notes.txt.
 expect "$T/review-open.out" review_page "open sessions=1 files=3 hunks=1 shown=new.txt confirm=false targets=10"

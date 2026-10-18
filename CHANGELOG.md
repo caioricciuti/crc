@@ -90,6 +90,10 @@ One entry per tag, written for people who use the editor.
   editor tabs with the same close glyph. The palette's scrim is darker
   and says the Escape hint once, the palette fades in over 120 ms, and
   sketched rows breathe smoothly instead of stepping.
+- The Review page no longer comes back on its own. Agents mode hid the
+  page but kept it open, so every switch back to the editor found it over
+  the tabs again. A switch to Agents mode now leaves any page behind,
+  like Escape does, and the editor comes back as you left it.
 - A file opened behind a page comes to the front. With a split and
   Settings, Extensions, MCP or Review covering the focused pane, a file
   opened from the palette, the sidebar, a dialog, a drop or Go to

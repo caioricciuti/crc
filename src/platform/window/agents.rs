@@ -31,6 +31,11 @@ impl EditorView {
                 state.sidebar_keys = false;
                 state.palette = None;
                 state.completion = None;
+                // A page over the editor column is left behind like any
+                // other: Agents mode hid the Review page but kept it open,
+                // so coming back to the editor found it over the tabs
+                // again, every time.
+                uncover_column(&mut state);
                 state.agents.refresh();
                 if state.agents.selected_index().is_none() {
                     let tasks = &state.agents.tasks;
