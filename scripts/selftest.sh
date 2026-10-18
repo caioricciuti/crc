@@ -22,7 +22,24 @@
 #
 # The scenarios are scripts/selftest/NN-*.sh, run in order in this shell.
 set -euo pipefail
+# A Mac that sleeps mid-run fails scenarios for no fault of their own (see
+# slept_note below), so the whole run holds the machine awake. Once: the
+# re-exec marks itself so the inner run goes straight on.
+if [ -z "${CRC_SELFTEST_CAFFEINATED:-}" ] && command -v caffeinate >/dev/null 2>&1; then
+    CRC_SELFTEST_CAFFEINATED=1 exec caffeinate -i "$BASH" "$0" "$@"
+fi
 cd "$(dirname "$0")/.."
+
+# now: seconds since the epoch, with a fraction. macOS's date has no %N and
+# this bash is 3.2, without EPOCHREALTIME, so python3 tells the time.
+now() {
+    python3 -c 'import time;print(time.time())'
+}
+# elapsed <start>: seconds since <start>, to a tenth.
+elapsed() {
+    python3 -c "import time;print(f'{time.time()-$1:.1f}')"
+}
+run_start=$(now)
 
 debug=0
 only=""
@@ -32,6 +49,7 @@ for arg in "$@"; do
         *) only="$only $arg" ;;
     esac
 done
+build_start=$(now)
 if [ "$debug" = 1 ]; then
     cargo build --locked
     BIN=target/debug/crc
@@ -39,6 +57,7 @@ else
     cargo build --release --locked
     BIN=target/release/crc
 fi
+build_secs=$(elapsed "$build_start")
 T=$(mktemp -d)
 # A Mac that sleeps mid-run (a closed lid) goes on only in short dark
 # wakes with the display off: no frames are drawn and every wait runs
@@ -59,6 +78,10 @@ trap 'result=$?; pkill -f -- "--hold $T/home/" 2>/dev/null || true; if [ "$resul
 # Everything said from here is also kept with the artifacts, so a failure
 # seen once can still be named after the terminal has scrolled past it.
 exec > >(tee "$T/selftest.log") 2>&1
+# The build ran before the log existed; its time is said now so the log has
+# every timing line, one per step, and a summary at the end.
+echo "timing: build $build_secs"
+timings=""
 fail=0
 # Every launch serves Claude Code for its project. Keep the lock files out of
 # the real ~/.claude/ide, where a running claude would offer these windows.
@@ -142,8 +165,13 @@ for scenario in scripts/selftest/[0-9][0-9]-*.sh; do
         done
         [ "$wanted" = 1 ] || continue
     fi
+    scenario_start=$(now)
     # shellcheck source=/dev/null
     . "$scenario"
+    scenario_secs=$(elapsed "$scenario_start")
+    echo "timing: ${name#[0-9][0-9]-} $scenario_secs"
+    timings="$timings${name#[0-9][0-9]-} $scenario_secs
+"
     # Every launch takes back the sessions helpers hold, whatever folder it
     # opens: a scenario's terminals, and their records, end with it.
     pkill -f -- "--hold $T/home/" 2>/dev/null || true
@@ -162,6 +190,15 @@ if ls "$T"/*.err >/dev/null 2>&1 && cat "$T"/*.err | grep -v '^slow frame' | gre
     cat "$T"/*.err | grep -v '^slow frame'
     fail=1
 fi
+
+# Where the time went: the whole run, the build, the scenarios together,
+# and the five that took longest, so a slow suite names its slow parts.
+echo "timing: total $(elapsed "$run_start")"
+echo "timing: build $build_secs"
+echo "timing: scenarios $(printf '%s' "$timings" | awk '{ s += $2 } END { printf "%.1f", s }')"
+printf '%s' "$timings" | sort -k2 -g -r | head -5 | while read -r slow_name slow_secs; do
+    echo "timing: slowest $slow_name $slow_secs"
+done
 
 if [ "$fail" = 0 ]; then
     if [ -n "$only" ]; then
