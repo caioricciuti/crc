@@ -72,6 +72,7 @@ mod lsp_features;
 mod mcp;
 mod palette;
 mod project;
+mod query;
 mod render;
 mod review;
 mod scrub;
@@ -708,6 +709,12 @@ struct State {
     rename: Option<RenameField>,
     /// The field open on a cell of the active document's grid.
     cell_edit: Option<crate::platform::table::CellEdit>,
+    /// The SQL field open in the active table document's strip.
+    query: Option<crate::platform::table::QueryField>,
+    /// A DuckDB query out on the worker.
+    query_job: Option<query::QueryJob>,
+    /// Result tabs, by buffer id: the query each one shows the outcome of.
+    queries: HashMap<u64, crate::platform::table::QueryView>,
     /// `format_on_save` from the settings.
     format_on_save: bool,
     /// Set while saving what a format-on-save produced, so that save does
@@ -1654,6 +1661,18 @@ define_class!(
             {
                 self.commit_cell_edit(None);
             }
+            // A press anywhere but the table's strip closes the Query field,
+            // its text kept; the strip's own controls are sorted out below.
+            if self.state().is_some_and(|state| state.query.is_some())
+                && !chrome.response.is_some_and(|strip| strip.contains(x, y))
+            {
+                if let Some(mut state) = self.state_mut() {
+                    query::close_query_field(&mut state);
+                }
+                if let Some(window) = self.window() {
+                    window.invalidateCursorRectsForView(self);
+                }
+            }
             // The peek at a Git change takes a click on it; a click anywhere
             // else closes it and goes on as it would have.
             let peek = {
@@ -1970,6 +1989,22 @@ define_class!(
                 }
                 Some(Hit::TableMode(grid)) => {
                     self.set_table_mode(grid);
+                    return;
+                }
+                Some(Hit::TableQuery) => {
+                    self.toggle_query_field();
+                    return;
+                }
+                Some(Hit::TableQueryField) => {
+                    self.query_field_press(x);
+                    return;
+                }
+                Some(Hit::TableRun) => {
+                    self.run_query();
+                    return;
+                }
+                Some(Hit::TableBack) => {
+                    self.query_back();
                     return;
                 }
                 // A click on the grid selects a cell, not a place in the
@@ -2640,6 +2675,9 @@ define_class!(
                         | Hit::ConflictResolve
                         | Hit::ConflictTake(..)
                         | Hit::TableMode(_)
+                        | Hit::TableQuery
+                        | Hit::TableRun
+                        | Hit::TableBack
                         | Hit::ToolbarTerminal
                         | Hit::ToolbarInspector
                         | Hit::TerminalTab(_)
@@ -2932,6 +2970,7 @@ define_class!(
                 self.request_redraw();
             }
             self.poll_http();
+            self.poll_query();
             self.poll_update();
             self.poll_ignored();
             self.refresh_after_watch();
@@ -3269,6 +3308,12 @@ define_class!(
         #[unsafe(method(tableClearCell:))]
         fn action_table_clear_cell(&self, _sender: Option<&AnyObject>) {
             self.table_edit(crate::platform::table::Op::ClearCell);
+        }
+
+        /// The SQL field in the table's strip, open or closed.
+        #[unsafe(method(tableQuery:))]
+        fn action_table_query(&self, _sender: Option<&AnyObject>) {
+            self.toggle_query_field();
         }
 
         #[unsafe(method(moveLineUp:))]
@@ -4775,6 +4820,8 @@ define_class!(
                 active_conflicts(&state).is_some_and(|v| v.can_resolve())
             } else if action == sel!(triggerCompletion:) {
                 !field_has_keys(&state)
+            } else if action == sel!(tableQuery:) {
+                query::can_query(&state)
             } else if action == sel!(tableInsertRowAbove:)
                 || action == sel!(tableInsertRowBelow:)
                 || action == sel!(tableDeleteRow:)
@@ -4961,6 +5008,8 @@ define_class!(
                         Some(chrome.status)
                     } else if state.cell_edit.is_some() {
                         Some(text)
+                    } else if state.query.is_some() {
+                        chrome.response
                     } else if state.palette.is_some() {
                         let rect = layout::palette_rect(state.viewport, 1);
                         Some(Viewport { height: layout::PALETTE_ROW, ..rect })
@@ -5905,6 +5954,7 @@ impl EditorView {
             syntax,
             spans,
             responses,
+            queries,
             panes,
             ..
         } = &mut *state;
@@ -5916,6 +5966,7 @@ impl EditorView {
         };
         syntax.retain(open);
         responses.retain(|id, _| open(*id));
+        queries.retain(|id, _| open(*id));
         if !syntax.has(docs.active().id()) {
             spans.clear();
         }
@@ -7053,6 +7104,7 @@ fn close_fields(state: &mut State) {
     state.agents_edit = None;
     state.rename = None;
     state.cell_edit = None;
+    query::close_query_field(state);
     state.palette = None;
     state.goto = None;
     state.git_focus = false;
@@ -7128,6 +7180,8 @@ enum Keys {
     Rename,
     /// A cell of a CSV or TSV grid.
     Cell,
+    /// The SQL field in a table's strip.
+    Query,
     /// The commit message, once it has been clicked.
     GitMessage,
     Goto,
@@ -7150,6 +7204,8 @@ fn keys(state: &State) -> Keys {
         Keys::Rename
     } else if state.cell_edit.is_some() {
         Keys::Cell
+    } else if state.query.is_some() {
+        Keys::Query
     } else if state.git_open && state.git_focus {
         Keys::GitMessage
     } else if state.goto.is_some() {
@@ -7190,6 +7246,7 @@ fn focused_buffer(state: &State) -> &Buffer {
         Keys::AgentsEdit => state.agents_edit.as_ref().map(|(_, field)| field),
         Keys::Rename => state.rename.as_ref().map(|rename| &rename.field),
         Keys::Cell => state.cell_edit.as_ref().map(|edit| &edit.field),
+        Keys::Query => state.query.as_ref().map(|field| &field.field),
         Keys::GitMessage => Some(&state.git.message),
         Keys::Goto => state.goto.as_ref(),
         Keys::Palette => state.palette.as_ref().map(|(query, _)| query),
@@ -7393,10 +7450,20 @@ fn frame_of(state: &mut State) -> Frame {
     let table_hits = {
         let shown = matches!(column, Column::Table | Column::Text) && active_table(state).is_some();
         let scrubbing = scrub::strip_scrub(state).is_some();
-        let State { renderer, .. } = &mut *state;
+        let State {
+            renderer,
+            docs,
+            tables,
+            query,
+            query_job,
+            queries,
+            ..
+        } = &mut *state;
         let mut hits = match chrome.response {
             Some(strip) if shown && !scrubbing => {
-                crate::platform::table::strip_hits(&mut renderer.atlas, strip)
+                let query =
+                    query::query_strip(docs.active().id(), tables, query, query_job, queries);
+                crate::platform::table::strip_hits(&mut renderer.atlas, strip, &query)
             }
             _ => Vec::new(),
         };
@@ -9245,6 +9312,9 @@ fn install_menu(mtm: MainThreadMarker, app: &NSApplication) {
             table_menu.addItem(&NSMenuItem::separatorItem(mtm));
         }
     }
+    // SQL over the file. Not Shift-Cmd-Q: the Apple menu's Log Out has it.
+    table_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    table_menu.addItem(&item("Query\u{2026}", sel!(tableQuery:), "u", true));
     table_item.setSubmenu(Some(&table_menu));
     menubar.addItem(&table_item);
 
@@ -9815,6 +9885,9 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         agents_edit: None,
         rename: None,
         cell_edit: None,
+        query: None,
+        query_job: None,
+        queries: HashMap::new(),
         format_on_save: settings.format_on_save,
         saving_formatted: false,
         word_wrap: settings.word_wrap,

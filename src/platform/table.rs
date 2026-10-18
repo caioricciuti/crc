@@ -14,6 +14,11 @@
 //! selected cell opens as a one-line field ([`CellEdit`]) on Return, a
 //! double click or a typed character; committing it is one edit of the
 //! text behind the grid, encoded for the dialect, and one undo step.
+//!
+//! The strip's Query segment opens a one-line SQL field over the file
+//! ([`QueryField`]); the statement runs through DuckDB
+//! (`crate::project::duckdb`) and its CSV lands in a read-only result tab
+//! ([`QueryView`]) that this same grid draws.
 
 use crate::render::{
     font::Atlas,
@@ -28,6 +33,8 @@ use crate::text::{
 };
 use std::collections::HashMap;
 use std::ops::Range;
+use std::path::PathBuf;
+use std::time::Duration;
 
 /// Bigger than this and the document stays text: the parse keeps a range
 /// per cell, and the grid is for looking at data, not at a dump.
@@ -84,6 +91,12 @@ pub struct TableView {
     pub mode_grid: bool,
     /// The selected cell as record and column; the header is record 0.
     pub selected: Option<(usize, usize)>,
+    /// The Query field's text, kept while the field is closed and across
+    /// runs, so the statement is there the next time the field opens.
+    pub sql: String,
+    /// What the last query over this document failed with, shown in the
+    /// strip until the next run.
+    pub query_error: Option<String>,
 }
 
 /// The field open on a cell: its text, and which cell takes it on commit.
@@ -126,6 +139,127 @@ impl CellEdit {
             at = start + offset + ch.len_utf8();
         }
         self.field.place_cursor(at, Motion::Move);
+    }
+}
+
+/// The Query field open in the strip: its text, and the document it is
+/// over. Only that document's strip shows it, and it has the keyboard
+/// while open.
+pub struct QueryField {
+    pub field: Buffer,
+    pub buffer: u64,
+}
+
+impl QueryField {
+    /// A field over `buffer` holding `sql`, the caret at its end.
+    pub fn new(buffer: u64, sql: &str) -> Self {
+        let mut field = Buffer::from_text(sql);
+        field.place_cursor(sql.len(), Motion::Move);
+        Self { field, buffer }
+    }
+}
+
+/// What a result tab shows: the query that made it and what it produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryView {
+    /// The file the statement ran over.
+    pub source: PathBuf,
+    pub sql: String,
+    /// Rows under the header, as far as they were kept.
+    pub rows: usize,
+    pub elapsed: Duration,
+    /// Whether DuckDB had more than the row cap.
+    pub truncated: bool,
+}
+
+/// The query side of one document's strip: the field when it is open
+/// here, a run in flight, the last failure, or the result this tab is.
+#[derive(Default, Clone, Copy)]
+pub struct QueryStrip<'a> {
+    pub field: Option<&'a Buffer>,
+    pub running: bool,
+    pub error: Option<&'a str>,
+    pub result: Option<&'a QueryView>,
+}
+
+/// What the empty Query field says.
+pub const QUERY_PLACEHOLDER: &str = "SQL over this file, the table is called here";
+
+/// The strip's facts while a query runs.
+pub const QUERY_RUNNING: &str = "Running...";
+
+/// The Query field's text inset inside its box.
+pub const QUERY_FIELD_PAD: f32 = 10.0;
+
+/// The title of the result tab for `file`, which a second run reuses.
+pub fn result_title(file: &str) -> String {
+    format!("Result: {file}")
+}
+
+/// `n` with thousands separators: "1,234".
+fn thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// "1,234 rows", or "first 10,000 rows" when DuckDB had more.
+pub fn rows_text(rows: usize, truncated: bool) -> String {
+    let rows = thousands(rows);
+    if truncated {
+        format!("first {rows} rows")
+    } else {
+        format!("{rows} rows")
+    }
+}
+
+/// The result tab's facts: "Result · 1,234 rows · 0.3 s".
+pub fn result_facts(view: &QueryView) -> String {
+    format!(
+        "Result \u{b7} {} \u{b7} {:.1} s",
+        rows_text(view.rows, view.truncated),
+        view.elapsed.as_secs_f64()
+    )
+}
+
+/// A failed query's facts: the first two lines of what DuckDB said, on
+/// the one line the strip has.
+pub fn error_facts(error: &str) -> String {
+    error
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(2)
+        .collect::<Vec<_>>()
+        .join("  ")
+}
+
+/// One line for the self-test dump: `idle`, `running`, `error <text>`
+/// with the error's lines joined by ` | `, or `result rows=N
+/// truncated=bool`.
+pub fn dump_query(query: &QueryStrip<'_>) -> String {
+    if let Some(view) = query.result {
+        format!("result rows={} truncated={}", view.rows, view.truncated)
+    } else if query.running {
+        "running".to_string()
+    } else if let Some(error) = query.error {
+        format!(
+            "error {}",
+            error
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        )
+    } else {
+        "idle".to_string()
     }
 }
 
@@ -246,6 +380,8 @@ impl TableView {
             scroll_x: 0.0,
             mode_grid: true,
             selected: None,
+            sql: String::new(),
+            query_error: None,
         }
     }
 
@@ -731,18 +867,53 @@ pub fn dump(view: Option<&TableView>, editing: bool) -> String {
 
 const MODES: [&str; 2] = ["Grid", "Text"];
 
-/// The mode segments, where they are.
-pub fn strip_hits(atlas: &mut Atlas, strip: Viewport) -> Vec<(Hit, Viewport)> {
+/// Every control in the strip, where it is: the mode segments, then the
+/// Query segment with the field and Run while it is open, or Back to file
+/// on a result tab.
+pub fn strip_hits(
+    atlas: &mut Atlas,
+    strip: Viewport,
+    query: &QueryStrip<'_>,
+) -> Vec<(Hit, Viewport)> {
     let mut x = strip.x + 16.0;
-    MODES
-        .iter()
-        .enumerate()
-        .map(|(index, label)| {
-            let rect = layout::strip_button(atlas, strip, x, label, 24.0);
-            x += rect.width;
-            (Hit::TableMode(index == 0), rect)
-        })
-        .collect()
+    let mut hits = Vec::new();
+    for (index, label) in MODES.iter().enumerate() {
+        let rect = layout::strip_button(atlas, strip, x, label, 24.0);
+        hits.push((Hit::TableMode(index == 0), rect));
+        x += rect.width;
+    }
+    let right = strip.x + strip.width - 16.0;
+    if query.result.is_some() {
+        x += layout::UI_GAP * 2.0;
+        let back = layout::strip_button(atlas, strip, x, "Back to file", 28.0);
+        if back.x + back.width <= right {
+            hits.push((Hit::TableBack, back));
+        }
+        return hits;
+    }
+    let segment = layout::strip_button(atlas, strip, x, "Query", 24.0);
+    hits.push((Hit::TableQuery, segment));
+    x += segment.width + layout::UI_GAP * 2.0;
+    if query.field.is_some() {
+        // The field takes what is left between the segments and Run; in a
+        // strip too narrow for both, neither is there to click.
+        let run = layout::strip_button(atlas, strip, 0.0, "Run", 28.0);
+        let run_x = right - run.width;
+        let width = run_x - layout::UI_GAP - x;
+        if width >= 80.0 {
+            hits.push((
+                Hit::TableQueryField,
+                Viewport {
+                    x,
+                    y: run.y,
+                    width,
+                    height: run.height,
+                },
+            ));
+            hits.push((Hit::TableRun, Viewport { x: run_x, ..run }));
+        }
+    }
+    hits
 }
 
 fn delimiter_name(delimiter: u8) -> &'static str {
@@ -754,16 +925,121 @@ fn delimiter_name(delimiter: u8) -> &'static str {
     }
 }
 
-/// The file's shape and the switch.
+/// The file's shape, or what the query is up to, and the controls.
 pub fn draw_strip(
     view: &TableView,
     file: &str,
+    query: &QueryStrip<'_>,
     atlas: &mut Atlas,
     strip: Viewport,
     theme: &Theme,
     out: &mut Vec<GlyphInstance>,
 ) {
     let pill = layout::strip_pill(out, atlas, strip, "Table", theme.accent);
+    // The facts row is the query's while it has something to say: a run in
+    // flight, what the last one failed with, or what a result tab holds.
+    if let Some(result) = query.result {
+        let source = result
+            .source
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let facts = format!("{} from {source}", result_facts(result));
+        layout::strip_facts(out, atlas, strip, pill, &facts, theme);
+    } else if query.running {
+        let row = Viewport {
+            x: pill.x + pill.width + 12.0,
+            y: pill.y,
+            width: layout::ui_text_width(atlas, QUERY_RUNNING),
+            height: pill.height,
+        };
+        layout::push_ui_text(out, atlas, row, QUERY_RUNNING, theme.status_text);
+        layout::push_spinner(out, row.x + row.width + 8.0, row, theme.status_text);
+    } else if let Some(error) = query.error {
+        let row = Viewport {
+            x: pill.x + pill.width + 12.0,
+            y: pill.y,
+            width: (strip.x + strip.width - pill.x - pill.width - 28.0).max(0.0),
+            height: pill.height,
+        };
+        layout::push_ui_text(out, atlas, row, &error_facts(error), theme.diff_removed);
+    } else {
+        layout::strip_facts(out, atlas, strip, pill, &shape_facts(view, file), theme);
+    }
+    let hits = strip_hits(atlas, strip, query);
+    // The modes and Query read as one control: a track, the chosen mode
+    // lit, and Query lit while its field is open.
+    let segments: Vec<layout::Segment<'_>> = hits
+        .iter()
+        .filter_map(|(hit, rect)| match hit {
+            Hit::TableMode(grid) => Some(
+                layout::Segment::new(*rect, MODES[usize::from(!grid)]).on(*grid == view.mode_grid),
+            ),
+            Hit::TableQuery => Some(
+                layout::Segment::new(*rect, "Query")
+                    .on(query.field.is_some())
+                    .tip("SQL over this file with DuckDB"),
+            ),
+            _ => None,
+        })
+        .collect();
+    layout::push_segmented(out, atlas, &segments, theme);
+    for (hit, rect) in &hits {
+        match hit {
+            Hit::TableQueryField => {
+                let Some(field) = query.field else {
+                    continue;
+                };
+                // The segmented track's fill: the strip is the editor's
+                // background, which the find field's fill vanishes into.
+                layout::push_rounded_rect(out, *rect, layout::UI_RADIUS, theme.tab_hover);
+                layout::hotspot(*rect, layout::Cursor::Text, None);
+                let text = field.rope.to_string();
+                layout::push_ui_field(
+                    out,
+                    atlas,
+                    Viewport {
+                        x: rect.x + QUERY_FIELD_PAD,
+                        width: (rect.width - QUERY_FIELD_PAD * 2.0).max(0.0),
+                        ..*rect
+                    },
+                    (5.0, rect.height - 10.0),
+                    &layout::UiField {
+                        text: &text,
+                        cursor: field.cursor(),
+                        selection: field.selection(),
+                        placeholder: QUERY_PLACEHOLDER,
+                        focused: true,
+                    },
+                    theme,
+                );
+            }
+            Hit::TableRun => {
+                layout::Button::new(*rect)
+                    .label("Run")
+                    .tone(layout::Tone::Primary)
+                    .enabled(!query.running)
+                    .tip(if query.running {
+                        "A query is still running"
+                    } else {
+                        "Run the statement (Return)"
+                    })
+                    .draw(out, atlas, theme);
+            }
+            Hit::TableBack => {
+                layout::Button::new(*rect)
+                    .label("Back to file")
+                    .tip("The file this is the result of")
+                    .draw(out, atlas, theme);
+            }
+            _ => {}
+        }
+    }
+    layout::strip_hairline(out, atlas, strip, theme);
+}
+
+/// "4 rows and 3 columns in people.csv, comma-separated".
+fn shape_facts(view: &TableView, file: &str) -> String {
     let rows = view.table.rows.len();
     let columns = view.column_count();
     let mut facts = format!(
@@ -783,19 +1059,7 @@ pub fn draw_strip(
             }
         ));
     }
-    layout::strip_facts(out, atlas, strip, pill, &facts, theme);
-    // The two modes read as one control: a track, and the chosen half lit.
-    let segments: Vec<layout::Segment<'_>> = strip_hits(atlas, strip)
-        .into_iter()
-        .filter_map(|(hit, rect)| {
-            let Hit::TableMode(grid) = hit else {
-                return None;
-            };
-            Some(layout::Segment::new(rect, MODES[usize::from(!grid)]).on(grid == view.mode_grid))
-        })
-        .collect();
-    layout::push_segmented(out, atlas, &segments, theme);
-    layout::strip_hairline(out, atlas, strip, theme);
+    facts
 }
 
 // ---- the grid -------------------------------------------------------------
@@ -1841,6 +2105,81 @@ mod tests {
         let one = view.edit(Op::DeleteRecord, 1, 0).unwrap();
         assert_eq!(view.coalesce(one.clone()), one);
         assert_eq!(view.coalesce(Vec::new()), Vec::new());
+    }
+
+    fn result(rows: usize, truncated: bool, millis: u64) -> QueryView {
+        QueryView {
+            source: PathBuf::from("/data/people.csv"),
+            sql: "SELECT * FROM here".into(),
+            rows,
+            elapsed: Duration::from_millis(millis),
+            truncated,
+        }
+    }
+
+    #[test]
+    fn query_strip_text_for_each_state() {
+        assert_eq!(
+            result_facts(&result(1234, false, 300)),
+            "Result \u{b7} 1,234 rows \u{b7} 0.3 s"
+        );
+        assert_eq!(
+            result_facts(&result(10_000, true, 2100)),
+            "Result \u{b7} first 10,000 rows \u{b7} 2.1 s"
+        );
+        assert_eq!(
+            result_facts(&result(1, false, 40)),
+            "Result \u{b7} 1 rows \u{b7} 0.0 s"
+        );
+        assert_eq!(QUERY_RUNNING, "Running...");
+        assert_eq!(
+            error_facts(
+                "Catalog Error: Table with name nope does not exist!\nLINE 1: SELECT * FROM nope\n       ^\n"
+            ),
+            "Catalog Error: Table with name nope does not exist!  LINE 1: SELECT * FROM nope"
+        );
+        assert_eq!(result_title("people.csv"), "Result: people.csv");
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(1_000_000), "1,000,000");
+    }
+
+    #[test]
+    fn query_dump_names_the_state() {
+        let idle = QueryStrip::default();
+        assert_eq!(dump_query(&idle), "idle");
+        let running = QueryStrip {
+            running: true,
+            ..idle
+        };
+        assert_eq!(dump_query(&running), "running");
+        let failed = QueryStrip {
+            error: Some("Catalog Error: no\nLINE 1: x"),
+            ..idle
+        };
+        assert_eq!(dump_query(&failed), "error Catalog Error: no | LINE 1: x");
+        let view = result(3, false, 10);
+        let shown = QueryStrip {
+            result: Some(&view),
+            // A result tab's own error or run never shows: the result wins.
+            running: true,
+            ..idle
+        };
+        assert_eq!(dump_query(&shown), "result rows=3 truncated=false");
+    }
+
+    #[test]
+    fn a_frozen_result_refuses_cell_edits() {
+        let mut b = Buffer::generated("Result: people.csv", "csv", "a,b\n1,x\n2,y\n");
+        b.set_frozen(true);
+        assert!(is_table_file(&b), "a generated csv shows as a grid");
+        let view = TableView::parse(&b.rope);
+        let (range, encoded) = view.cell_replacement(1, 1, "z").expect("a cell to replace");
+        assert_eq!(b.replace_ranges(&[(range, encoded)]), 0);
+        assert_eq!(b.rope.to_string(), "a,b\n1,x\n2,y\n");
+        let edits = view.coalesce(view.edit(Op::DeleteRecord, 1, 0).expect("edits"));
+        assert_eq!(b.replace_ranges(&edits), 0);
+        assert_eq!(b.rope.to_string(), "a,b\n1,x\n2,y\n");
     }
 
     #[test]

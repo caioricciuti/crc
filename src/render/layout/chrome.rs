@@ -3197,6 +3197,14 @@ pub enum Hit {
     /// mode switch, and the grid itself.
     TableMode(bool),
     TableBody,
+    /// The Query segment beside the modes: opens or closes the SQL field.
+    TableQuery,
+    /// The SQL field itself, while it is open.
+    TableQueryField,
+    /// Runs the field's statement through DuckDB.
+    TableRun,
+    /// On a result tab: back to the file the query ran over.
+    TableBack,
     /// A part of the breadcrumb path, left to right.
     Breadcrumb(usize),
     Find,
@@ -3287,6 +3295,10 @@ impl Hit {
             }
             .into(),
             Hit::TableBody => "table.body".into(),
+            Hit::TableQuery => "table.query".into(),
+            Hit::TableQueryField => "table.query.field".into(),
+            Hit::TableRun => "table.run".into(),
+            Hit::TableBack => "table.back".into(),
             Hit::Breadcrumb(i) => format!("breadcrumb.{i}"),
             Hit::Find => "find".into(),
             Hit::Text => "text".into(),

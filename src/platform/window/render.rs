@@ -138,6 +138,9 @@ impl EditorView {
             conflict_side,
             tables,
             cell_edit,
+            query: query_field,
+            query_job,
+            queries,
             issue_tabs,
             scrub,
             watch,
@@ -730,9 +733,12 @@ impl EditorView {
                 && scrub.as_ref().is_none_or(|s| !s.strip_over(buffer.id()))
                 && let Some(view) = tables.get(&buffer.id())
             {
+                let query =
+                    super::query::query_strip(buffer.id(), tables, query_field, query_job, queries);
                 crate::platform::table::draw_strip(
                     view,
                     &buffer.display_name(),
+                    &query,
                     &mut renderer.atlas,
                     strip,
                     theme,

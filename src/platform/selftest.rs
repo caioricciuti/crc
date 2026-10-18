@@ -237,6 +237,7 @@ fn key_for(ch: char) -> Option<(u16, bool)> {
         '(' => (25, true),
         ')' => (29, true),
         '@' => (19, true),
+        '*' => (28, true),
         '#' => (20, true),
         '$' => (21, true),
         '_' => (27, true),

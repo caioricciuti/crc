@@ -10,7 +10,8 @@
 //! `CRC_DUCKDB_FAKE=<script>` makes [`duckdb`] return that script instead
 //! of looking for the real tool, which is how the tests and the GUI
 //! self-test drive the whole path without DuckDB installed
-//! (`scripts/fake-duckdb.py`).
+//! (`scripts/fake-duckdb.py`); set but empty, it finds no tool at all, for
+//! testing what the editor says then on a machine that has DuckDB.
 
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read};
@@ -34,7 +35,7 @@ pub const TIMEOUT: Duration = Duration::from_secs(30);
 /// the fake named by `CRC_DUCKDB_FAKE`.
 pub fn duckdb() -> Option<PathBuf> {
     if let Some(fake) = std::env::var_os("CRC_DUCKDB_FAKE") {
-        return Some(PathBuf::from(fake));
+        return (!fake.is_empty()).then(|| PathBuf::from(fake));
     }
     crate::lsp::servers::search_dirs()
         .into_iter()

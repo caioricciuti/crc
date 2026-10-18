@@ -1,6 +1,6 @@
 //! CSV and TSV documents in the editor: the grid's keys and presses, the
 //! field that edits a cell, and the Grid or Text switch. The view itself is
-//! `crate::platform::table`.
+//! `crate::platform::table`; the Query field in the strip is `super::query`.
 
 use super::*;
 use crate::platform::table::{CellEdit, Cells, Move, Op, TableView};
@@ -22,6 +22,14 @@ pub(super) fn sync_tables(state: &mut State) {
         });
         if !alive {
             state.cell_edit = None;
+        }
+    }
+    // The Query field lives as long as its document's strip shows; its
+    // text stays with the table for the next time it opens.
+    if let Some(field) = &state.query {
+        let alive = state.docs.active().id() == field.buffer && query::can_query(state);
+        if !alive {
+            query::close_query_field(state);
         }
     }
 }

@@ -491,6 +491,10 @@ impl EditorView {
         {
             return true;
         }
+        // The Query field likewise, and ahead of Cmd-Return's Send Request.
+        if self.state().is_some_and(|state| state.query.is_some()) && self.handle_query_key(event) {
+            return true;
+        }
         let grid = {
             let Some(state) = self.state() else {
                 return false;
@@ -1068,6 +1072,7 @@ impl EditorView {
             agents_edit,
             rename,
             cell_edit,
+            query,
             ..
         } = &mut *state;
         let field = match owner {
@@ -1081,6 +1086,7 @@ impl EditorView {
             Keys::Cell => cell_edit
                 .as_mut()
                 .map(|edit| (&mut edit.field, Focus::Field)),
+            Keys::Query => query.as_mut().map(|field| (&mut field.field, Focus::Field)),
             Keys::GitMessage => Some((&mut git.message, Focus::Message)),
             Keys::Goto => goto.as_mut().map(|field| (field, Focus::Goto)),
             Keys::Palette => palette.as_mut().map(|(query, _)| (query, Focus::Field)),
