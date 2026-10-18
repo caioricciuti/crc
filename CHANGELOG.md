@@ -2,7 +2,7 @@
 
 One entry per tag, written for people who use the editor.
 
-## Unreleased
+## v0.2.0-alpha.26, 2026-10-18
 
 - CSV and TSV files open as a grid. The first row is the header and
   stays in view while the rest scrolls, a gutter numbers the rows, and
