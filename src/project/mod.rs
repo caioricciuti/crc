@@ -1,6 +1,7 @@
 //! Project-level state: the file tree and the fuzzy file finder.
 
 pub mod conflict;
+pub mod duckdb;
 pub mod finder;
 pub mod git;
 pub mod history;
