@@ -22,6 +22,24 @@ use std::sync::{Arc, Mutex};
 
 use super::Term;
 
+/// Keep a busy session from holding up the UI's status and screen reads
+/// for a whole 64 KiB burst (or a 2 MiB held-session replay). Parser state
+/// survives a slice ending inside UTF-8 or a control sequence.
+const OUTPUT_SLICE: usize = 4096;
+
+fn advance_output(term: &Mutex<Term>, bytes: &[u8], mut reply: impl FnMut(Vec<u8>)) {
+    for slice in bytes.chunks(OUTPUT_SLICE) {
+        let replies = {
+            let mut term = term.lock().unwrap_or_else(|e| e.into_inner());
+            term.advance(slice);
+            term.take_replies()
+        };
+        // The UI can acquire the terminal between slices; writes back to
+        // the program must not extend the time spent holding its lock.
+        reply(replies);
+    }
+}
+
 unsafe extern "C" {
     fn posix_openpt(flags: i32) -> i32;
     fn grantpt(fd: i32) -> i32;
@@ -251,14 +269,11 @@ impl Session {
                     Ok(0) | Err(_) => break,
                     Ok(n) => n,
                 };
-                let reply = {
-                    let mut term = shared.lock().unwrap_or_else(|e| e.into_inner());
-                    term.advance(&buffer[..n]);
-                    term.take_replies()
-                };
-                if !reply.is_empty() {
-                    let _ = replies.write_all(&reply);
-                }
+                advance_output(&shared, &buffer[..n], |reply| {
+                    if !reply.is_empty() {
+                        let _ = replies.write_all(&reply);
+                    }
+                });
                 if seen.queue_wake() {
                     wake();
                 }
@@ -314,14 +329,11 @@ impl Session {
             loop {
                 match hold::receive(&mut reader) {
                     Ok(Frame::Output(bytes)) => {
-                        let reply = {
-                            let mut term = shared.lock().unwrap_or_else(|e| e.into_inner());
-                            term.advance(&bytes);
-                            term.take_replies()
-                        };
-                        if !reply.is_empty() {
-                            let _ = replies.send(reply);
-                        }
+                        advance_output(&shared, &bytes, |reply| {
+                            if !reply.is_empty() {
+                                let _ = replies.send(reply);
+                            }
+                        });
                         if seen.queue_wake() {
                             wake();
                         }
@@ -374,11 +386,7 @@ impl Session {
     /// woken the window (none was queued yet).
     #[doc(hidden)]
     pub fn feed(&self, bytes: &[u8]) -> bool {
-        {
-            let mut term = self.term.lock().unwrap_or_else(|e| e.into_inner());
-            term.advance(bytes);
-            term.take_replies();
-        }
+        advance_output(&self.term, bytes, |_| {});
         self.status.queue_wake()
     }
 
@@ -477,6 +485,42 @@ impl Drop for Session {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn output_slices_release_the_terminal_and_preserve_parser_state() {
+        let mut output = vec![b'x'; OUTPUT_SLICE - 1];
+        // A multibyte character, CSI and OSC each cross a slice boundary.
+        output.extend_from_slice("\u{1f980}".as_bytes());
+        output.resize(OUTPUT_SLICE * 2 - 1, b'y');
+        output.extend_from_slice(b"\x1b[31mred\x1b[0m\r\n");
+        output.resize(OUTPUT_SLICE * 3 - 3, b'z');
+        output.extend_from_slice(b"\x1b]2;Personal sample\x1b\\\x1b[6n\x1b]9;Done\x07");
+        output.extend_from_slice(b"\x1b]52;c;Y3Jj\x07\x1b[5n");
+
+        let mut expected = Term::new(120, 40);
+        expected.advance(&output);
+        let terminal = Mutex::new(Term::new(120, 40));
+        let mut replies = Vec::new();
+        let mut read_before_title = false;
+        advance_output(&terminal, &output, |reply| {
+            let view = terminal.try_lock().expect("UI can read between slices");
+            read_before_title |= view.title.is_empty();
+            replies.extend(reply);
+        });
+        assert!(read_before_title, "UI can read before the burst finishes");
+        let mut actual = terminal.lock().unwrap();
+        assert_eq!(actual.screen_text(), expected.screen_text());
+        assert_eq!(actual.cursor(), expected.cursor());
+        assert_eq!(actual.title, expected.title);
+        assert_eq!(actual.scrollback_len(), expected.scrollback_len());
+        for row in 0..actual.rows() {
+            assert_eq!(actual.visible_row(row, 0), expected.visible_row(row, 0));
+        }
+        assert_eq!(replies, expected.take_replies());
+        assert!(!replies.is_empty());
+        assert_eq!(actual.take_notices(), expected.take_notices());
+        assert_eq!(actual.take_clipboard(), expected.take_clipboard());
+    }
 
     fn wait_for(session: &Session, what: impl Fn(&Term) -> bool) -> bool {
         let deadline = Instant::now() + Duration::from_secs(5);
