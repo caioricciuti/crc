@@ -3205,6 +3205,7 @@ pub enum Hit {
     TableRun,
     /// On a result tab: back to the file the query ran over.
     TableBack,
+    TableExport,
     /// A part of the breadcrumb path, left to right.
     Breadcrumb(usize),
     Find,
@@ -3299,6 +3300,7 @@ impl Hit {
             Hit::TableQueryField => "table.query.field".into(),
             Hit::TableRun => "table.run".into(),
             Hit::TableBack => "table.back".into(),
+            Hit::TableExport => "table.export".into(),
             Hit::Breadcrumb(i) => format!("breadcrumb.{i}"),
             Hit::Find => "find".into(),
             Hit::Text => "text".into(),

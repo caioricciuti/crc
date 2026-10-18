@@ -160,6 +160,21 @@ struct Captured {
 
 /// Runs `query` to completion on this thread, within the caps.
 pub fn run(query: &Query, exe: &Path) -> Result<Outcome, String> {
+    // Discover on this worker, never on the UI thread. sqlite_master is
+    // read through the same tool and bounded output path as every query.
+    if query.reader == Reader::Sqlite && query.table.is_none() {
+        let mut discovery = query.clone();
+        discovery.table = Some("sqlite_master".into());
+        discovery.sql = "SELECT name FROM here WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name LIMIT 1".into();
+        let names = run(&discovery, exe)?;
+        let table = crate::text::csv::parse(&names.csv, &crate::text::csv::Dialect::default());
+        let cell = table
+            .cell(1, 0)
+            .ok_or("the SQLite database has no tables")?;
+        let mut query = query.clone();
+        query.table = Some(crate::text::csv::Table::cell_text(&names.csv, cell).into_owned());
+        return run(&query, exe);
+    }
     let argv = argv(query, exe)?;
     let started = Instant::now();
     let mut child = Command::new(&argv[0])
@@ -343,6 +358,13 @@ mod tests {
         assert_eq!(outcome.csv, "a,b\n1,x\n2,y\n3,z\n");
         assert_eq!(outcome.rows, 3);
         assert!(!outcome.truncated);
+    }
+
+    #[test]
+    fn sqlite_discovers_a_table_before_running_the_statement() {
+        let outcome = run(&query("/data/a.sqlite", "SELECT * FROM here"), &fake()).expect("query");
+        assert_eq!(outcome.csv, "a,b\n1,x\n2,y\n3,z\n");
+        assert_eq!(outcome.rows, 3);
     }
 
     #[test]

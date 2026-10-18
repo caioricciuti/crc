@@ -486,6 +486,7 @@ impl State {
             && !(self.terminal.selecting && self.terminal.drag_point.is_some())
             && self.project_search.rx.is_none()
             && self.http.is_none()
+            && self.query_job.is_none()
             && self.update.is_none()
             && self.update_install.is_none()
             && self.review_scan.is_none()

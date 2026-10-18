@@ -162,6 +162,7 @@ impl QueryField {
 /// What a result tab shows: the query that made it and what it produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryView {
+    pub preview: bool,
     /// The file the statement ran over.
     pub source: PathBuf,
     pub sql: String,
@@ -883,11 +884,21 @@ pub fn strip_hits(
         x += rect.width;
     }
     let right = strip.x + strip.width - 16.0;
-    if query.result.is_some() {
+    if query.result.is_some_and(|view| !view.preview) {
         x += layout::UI_GAP * 2.0;
         let back = layout::strip_button(atlas, strip, x, "Back to file", 28.0);
         if back.x + back.width <= right {
             hits.push((Hit::TableBack, back));
+        }
+        let export = layout::strip_button(
+            atlas,
+            strip,
+            back.x + back.width + layout::UI_GAP,
+            "Export CSV",
+            28.0,
+        );
+        if export.x + export.width <= right {
+            hits.push((Hit::TableExport, export));
         }
         return hits;
     }
@@ -944,7 +955,11 @@ pub fn draw_strip(
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let facts = format!("{} from {source}", result_facts(result));
+        let facts = if result.preview {
+            format!("read-only view of {source} via DuckDB")
+        } else {
+            format!("{} from {source}", result_facts(result))
+        };
         layout::strip_facts(out, atlas, strip, pill, &facts, theme);
     } else if query.running {
         let row = Viewport {
@@ -1024,6 +1039,12 @@ pub fn draw_strip(
                     } else {
                         "Run the statement (Return)"
                     })
+                    .draw(out, atlas, theme);
+            }
+            Hit::TableExport => {
+                layout::Button::new(*rect)
+                    .label("Export CSV")
+                    .tip("Save a copy of this result as CSV")
                     .draw(out, atlas, theme);
             }
             Hit::TableBack => {
@@ -2109,6 +2130,7 @@ mod tests {
 
     fn result(rows: usize, truncated: bool, millis: u64) -> QueryView {
         QueryView {
+            preview: false,
             source: PathBuf::from("/data/people.csv"),
             sql: "SELECT * FROM here".into(),
             rows,

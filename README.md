@@ -389,8 +389,13 @@ the size and write it back.
   the server itself (load, disk) is read. An ssh session typed in a
   local terminal is shown from its command line and `~/.ssh/config`
   alone.
-- **Only CSV and TSV are a grid.** xlsx, docx and pptx still open as
-  read-only Quick Look previews.
+- **Office files use Quick Look.** xlsx, docx and pptx still open as
+  read-only Quick Look previews. With DuckDB installed, Parquet, JSONL,
+  NDJSON and SQLite files open as read-only grids (the first SQLite table).
+  The Table strip's Query field runs SQL over the saved source as `here`;
+  results are read-only grids with Back to file and Export CSV. DuckDB
+  runs as an installed command, with a 30-second timeout and bounded
+  output; crc does not bundle or install it.
 - **No minimap.** Folding is by indentation, not by syntax.
 - **Markdown styling has edges.** Italic is not drawn on lines with
   non-ASCII text, and bold there is the regular face drawn twice; a line

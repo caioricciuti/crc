@@ -11,6 +11,7 @@ use std::path::PathBuf;
 /// A query out on the worker: the document it ran over, enough to title
 /// and describe the result tab, and where the outcome arrives.
 pub(super) struct QueryJob {
+    pub(super) preview: bool,
     pub(super) buffer: u64,
     pub(super) source: PathBuf,
     pub(super) sql: String,
@@ -45,7 +46,13 @@ pub(super) fn query_strip<'a>(
             .map(|field| &field.field),
         running: job.as_ref().is_some_and(|job| job.buffer == id),
         error: tables.get(&id).and_then(|view| view.query_error.as_deref()),
-        result: queries.get(&id),
+        result: queries.get(&id).filter(|view| {
+            !view.preview
+                || (!job.as_ref().is_some_and(|job| job.buffer == id)
+                    && tables
+                        .get(&id)
+                        .is_none_or(|table| table.query_error.is_none()))
+        }),
     }
 }
 
@@ -63,10 +70,74 @@ pub(super) fn active_query_strip(state: &State) -> QueryStrip<'_> {
 /// Whether the active document can have the Query field: a table, and not
 /// itself the result of a query.
 pub(super) fn can_query(state: &State) -> bool {
-    active_table(state).is_some() && !state.queries.contains_key(&state.docs.active().id())
+    active_table(state).is_some()
+        && state
+            .queries
+            .get(&state.docs.active().id())
+            .is_none_or(|view| view.preview)
 }
 
 impl EditorView {
+    /// Starts a bounded read-only view for installed-tool data formats.
+    /// Called on the common display path, including launch and session restore.
+    pub(super) fn sync_data_preview(&self) {
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
+        let buffer = state.docs.active();
+        let Some(path) = buffer.path.clone() else {
+            return;
+        };
+        let ext = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !matches!(
+            ext.as_str(),
+            "parquet" | "jsonl" | "ndjson" | "sqlite" | "db"
+        ) || buffer.is_dirty()
+            || state.data_preview_attempts.contains(&buffer.id())
+            || state.query_job.is_some()
+        {
+            return;
+        }
+        let id = buffer.id();
+        // Also records a failed attempt so drawing cannot repeatedly spawn it.
+        state.data_preview_attempts.insert(id);
+        let Some(exe) = duckdb::duckdb() else {
+            state.say(layout::Feedback::Info, duckdb::missing());
+            return;
+        };
+        state.docs.active_mut().set_frozen(true);
+        let Some(reader) = duckdb::Reader::for_path(&path) else {
+            return;
+        };
+        let sql = "SELECT * FROM here LIMIT 10000".to_owned();
+        let rx = duckdb::spawn(
+            duckdb::Query {
+                source: path.clone(),
+                reader,
+                table: None,
+                sql: sql.clone(),
+            },
+            &exe,
+        );
+        state.query_job = Some(QueryJob {
+            preview: true,
+            buffer: id,
+            source: path,
+            sql,
+            rx,
+        });
+        state.say(
+            layout::Feedback::Info,
+            "Reading a read-only view through DuckDB...",
+        );
+        drop(state);
+        self.resume_display_link();
+    }
+
     /// Opens the Query field over the active table with the statement it
     /// last held, or closes it: the Query segment and its menu command.
     pub(super) fn toggle_query_field(&self) {
@@ -177,7 +248,13 @@ impl EditorView {
             if buffer.id() != id {
                 return;
             }
-            let Some(path) = buffer.path.clone() else {
+            let Some(path) = buffer.path.clone().or_else(|| {
+                state
+                    .queries
+                    .get(&id)
+                    .filter(|view| view.preview)
+                    .map(|view| view.source.clone())
+            }) else {
                 state.say(
                     layout::Feedback::Failure,
                     "Save the file first: DuckDB reads it from disk",
@@ -213,6 +290,7 @@ impl EditorView {
             };
             let rx = duckdb::spawn(query, &exe);
             state.query_job = Some(QueryJob {
+                preview: false,
                 buffer: id,
                 source: path,
                 sql,
@@ -258,7 +336,42 @@ impl EditorView {
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
                 let title = crate::platform::table::result_title(&file);
-                match state.docs.index_of_label(&title) {
+                if job.preview {
+                    let Some(buffer) = all_docs_mut(&mut state)
+                        .into_iter()
+                        .flat_map(|docs| docs.iter_mut())
+                        .find(|buffer| buffer.id() == job.buffer)
+                    else {
+                        return;
+                    };
+                    *buffer = Buffer::generated(&file, "csv", &outcome.csv);
+                    buffer.set_frozen(true);
+                    let id = buffer.id();
+                    state.queries.insert(
+                        id,
+                        QueryView {
+                            preview: true,
+                            source: job.source,
+                            sql: job.sql,
+                            rows: outcome.rows,
+                            elapsed: outcome.elapsed,
+                            truncated: outcome.truncated,
+                        },
+                    );
+                    drop(state);
+                    self.sync_title();
+                    self.reparse();
+                    self.request_redraw();
+                    self.pump();
+                    return;
+                }
+                let existing = state.docs.iter().position(|buffer| {
+                    state
+                        .queries
+                        .get(&buffer.id())
+                        .is_some_and(|view| !view.preview && view.source == job.source)
+                });
+                match existing {
                     Some(index) => {
                         state.docs.switch(index);
                         state.docs.active_mut().regenerate(&outcome.csv);
@@ -272,6 +385,7 @@ impl EditorView {
                 buffer.set_frozen(true);
                 let id = buffer.id();
                 let view = QueryView {
+                    preview: job.preview,
                     source: job.source,
                     sql: job.sql,
                     rows: outcome.rows,
@@ -289,6 +403,15 @@ impl EditorView {
                 state.say(layout::Feedback::Success, note);
             }
             Err(error) => {
+                if job.preview
+                    && let Some(buffer) = all_docs_mut(&mut state)
+                        .into_iter()
+                        .flat_map(|docs| docs.iter_mut())
+                        .find(|buffer| buffer.id() == job.buffer)
+                {
+                    buffer.set_frozen(false);
+                }
+                state.say(layout::Feedback::Failure, error.clone());
                 if let Some(view) = state.tables.get_mut(&job.buffer) {
                     view.query_error = Some(error);
                 }
@@ -303,31 +426,92 @@ impl EditorView {
     /// Back to the file a result tab came from, its Query field open with
     /// the statement.
     pub(super) fn query_back(&self) {
-        let index = {
-            let Some(mut state) = self.state_mut() else {
+        let source = {
+            let Some(state) = self.state() else {
                 return;
             };
-            let id = state.docs.active().id();
-            let Some(view) = state.queries.get(&id) else {
+            let Some(view) = state.queries.get(&state.docs.active().id()) else {
                 return;
             };
-            let source = view.source.clone();
-            match state.docs.index_of(&source) {
-                Some(index) => index,
-                None => {
-                    let name = source
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    state.say(layout::Feedback::Info, format!("{name} is not open"));
-                    drop(state);
-                    self.request_redraw();
-                    return;
+            view.source.clone()
+        };
+        let index = self.state().and_then(|state| {
+            state.docs.index_of(&source).or_else(|| {
+                state.docs.iter().position(|buffer| {
+                    state
+                        .queries
+                        .get(&buffer.id())
+                        .is_some_and(|view| view.preview && view.source == source)
+                })
+            })
+        });
+        if let Some(index) = index {
+            self.activate_tab(index);
+        } else if !self.load_path(&source.to_string_lossy()) {
+            return;
+        }
+        self.open_query_field();
+    }
+
+    /// Exports a copy, leaving the generated result frozen and untitled.
+    pub(super) fn query_export(&self) {
+        let (text, suggested, source) = {
+            let Some(state) = self.state() else {
+                return;
+            };
+            let Some(view) = state.queries.get(&state.docs.active().id()) else {
+                return;
+            };
+            let stem = view
+                .source
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy();
+            (
+                state.docs.active().rope.to_string(),
+                format!("{stem}-result.csv"),
+                view.source.clone(),
+            )
+        };
+        let destination = if self.ivars().testing {
+            std::env::var_os("CRC_QUERY_EXPORT").map(PathBuf::from)
+        } else {
+            let Some(panel) = save_panel(MainThreadMarker::from(self)) else {
+                return;
+            };
+            panel.setNameFieldStringValue(&NSString::from_str(&suggested));
+            if panel.runModal() != MODAL_RESPONSE_OK {
+                return;
+            }
+            panel
+                .URL()
+                .and_then(|url| url.path())
+                .map(|path| PathBuf::from(path.to_string()))
+        };
+        let Some(destination) = destination else {
+            return;
+        };
+        // A result must never replace the file it was queried from.
+        if same_file(&destination, &source) || destination == source {
+            if let Some(mut state) = self.state_mut() {
+                state.say(
+                    layout::Feedback::Failure,
+                    "Choose a different file from the query source",
+                );
+            }
+        } else {
+            let mut copy = Buffer::generated("Export", "csv", &text);
+            let result = copy.save(Some(&destination));
+            if let Some(mut state) = self.state_mut() {
+                match result {
+                    Ok(()) => state.say(layout::Feedback::Success, "exported CSV"),
+                    Err(error) => {
+                        state.say(layout::Feedback::Failure, format!("export failed: {error}"))
+                    }
                 }
             }
-        };
-        self.activate_tab(index);
-        self.open_query_field();
+        }
+        self.request_redraw();
     }
 
     /// Keys while the Query field has them. Return runs the statement,

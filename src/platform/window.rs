@@ -536,7 +536,19 @@ fn pane_holding(state: &State, path: &Path) -> Option<(usize, usize)> {
         .panes
         .iter()
         .enumerate()
-        .find_map(|(slot, pane)| pane.docs.index_of(&key).map(|tab| (slot, tab)))
+        .find_map(|(slot, pane)| {
+            pane.docs
+                .index_of(&key)
+                .or_else(|| {
+                    pane.docs.iter().position(|buffer| {
+                        state
+                            .queries
+                            .get(&buffer.id())
+                            .is_some_and(|view| view.preview && same_file(&view.source, &key))
+                    })
+                })
+                .map(|tab| (slot, tab))
+        })
         .map(|(slot, tab)| (slot + usize::from(slot >= state.focused_pane), tab))
 }
 
@@ -713,6 +725,7 @@ struct State {
     query: Option<crate::platform::table::QueryField>,
     /// A DuckDB query out on the worker.
     query_job: Option<query::QueryJob>,
+    data_preview_attempts: HashSet<u64>,
     /// Result tabs, by buffer id: the query each one shows the outcome of.
     queries: HashMap<u64, crate::platform::table::QueryView>,
     /// `format_on_save` from the settings.
@@ -2007,6 +2020,10 @@ define_class!(
                     self.query_back();
                     return;
                 }
+                Some(Hit::TableExport) => {
+                    self.query_export();
+                    return;
+                }
                 // A click on the grid selects a cell, not a place in the
                 // text behind it; two open the cell.
                 Some(Hit::TableBody) => {
@@ -2677,6 +2694,7 @@ define_class!(
                         | Hit::TableMode(_)
                         | Hit::TableQuery
                         | Hit::TableRun
+                        | Hit::TableExport
                         | Hit::TableBack
                         | Hit::ToolbarTerminal
                         | Hit::ToolbarInspector
@@ -2970,6 +2988,7 @@ define_class!(
                 self.request_redraw();
             }
             self.poll_http();
+            self.sync_data_preview();
             self.poll_query();
             self.poll_update();
             self.poll_ignored();
@@ -5577,6 +5596,7 @@ impl EditorView {
             self.request_redraw();
             return;
         }
+        self.sync_data_preview();
         self.sync_native_preview();
         self.sync_html_preview();
         let ready = match self.state() {
@@ -5889,6 +5909,18 @@ impl EditorView {
             return true;
         }
 
+        let existing_data = self.state().and_then(|state| {
+            state.docs.iter().position(|buffer| {
+                state
+                    .queries
+                    .get(&buffer.id())
+                    .is_some_and(|view| view.preview && same_file(&view.source, Path::new(path)))
+            })
+        });
+        if let Some(index) = existing_data {
+            self.activate_tab(index);
+            return true;
+        }
         let Some(mut state) = self.state_mut() else {
             return false;
         };
@@ -5955,6 +5987,7 @@ impl EditorView {
             spans,
             responses,
             queries,
+            data_preview_attempts,
             panes,
             ..
         } = &mut *state;
@@ -5967,6 +6000,7 @@ impl EditorView {
         syntax.retain(open);
         responses.retain(|id, _| open(*id));
         queries.retain(|id, _| open(*id));
+        data_preview_attempts.retain(|id| open(*id));
         if !syntax.has(docs.active().id()) {
             spans.clear();
         }
@@ -9887,6 +9921,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         cell_edit: None,
         query: None,
         query_job: None,
+        data_preview_attempts: HashSet::new(),
         queries: HashMap::new(),
         format_on_save: settings.format_on_save,
         saving_formatted: false,

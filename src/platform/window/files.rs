@@ -38,6 +38,15 @@ impl EditorView {
             let f = w.frame();
             (f.origin.x, f.origin.y, f.size.width, f.size.height)
         });
+        let session_path = |buffer: &Buffer| {
+            buffer.path.clone().or_else(|| {
+                state
+                    .queries
+                    .get(&buffer.id())
+                    .filter(|view| view.preview)
+                    .map(|view| view.source.clone())
+            })
+        };
         Some(Session {
             frame,
             sidebar_width: state.sidebar_width,
@@ -45,7 +54,7 @@ impl EditorView {
             // Every pane's files, focused pane first; they come back in one
             // pane. Splits are a way of looking, not something to restore.
             files: all_docs(&state)
-                .flat_map(|d| d.iter().filter_map(|b| b.path.clone()))
+                .flat_map(|d| d.iter().filter_map(session_path))
                 .collect(),
             // An index into `files`, which leaves out untitled documents, so
             // count only the named ones in front of the active tab. An
@@ -56,9 +65,9 @@ impl EditorView {
                     .docs
                     .iter()
                     .take(state.docs.active_index())
-                    .filter(|b| b.path.is_some())
+                    .filter(|b| session_path(b).is_some())
                     .count();
-                if state.docs.active().path.is_some() {
+                if session_path(state.docs.active()).is_some() {
                     before
                 } else {
                     before.saturating_sub(1)

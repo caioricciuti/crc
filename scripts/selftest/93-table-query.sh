@@ -36,6 +36,9 @@ text zzz
 key 36
 wait 300
 dump $T/query-readonly.out
+click @table.export
+wait 200
+dump $T/query-export.out
 click @table.back
 wait 300
 dump $T/query-back.out
@@ -52,7 +55,7 @@ wait 200
 dump $T/query-reopen.out
 quit
 SCRIPT
-CRC_DUCKDB_FAKE="$PWD/scripts/fake-duckdb.py" CRC_SELFTEST="$T/table-query.script" \
+CRC_QUERY_EXPORT="$T/query-export.csv" CRC_DUCKDB_FAKE="$PWD/scripts/fake-duckdb.py" CRC_SELFTEST="$T/table-query.script" \
     "$BIN" "$T/tablequery/people.csv" 2> "$T/table-query.err"
 # The grid, no field, nothing run.
 expect "$T/query-start.out" table "grid rows=4 cols=2 scroll=0 sel=- editing=false"
@@ -113,3 +116,8 @@ expect "$T/query-none.out" message "DuckDB is not installed (brew install duckdb
 expect "$T/query-none.out" tabs "people.csv"
 expect "$T/query-none.out" query "idle"
 expect "$T/query-none.out" query_sql "SELECT 42"
+
+expect "$T/query-export.out" message "exported CSV"
+expect "$T/query-export.out" dirty "false"
+printf 'a,b\n1,x\n2,y\n3,z\n' > "$T/query-export-expected.csv"
+cmp "$T/query-export.csv" "$T/query-export-expected.csv" || failed "query export differs from result"

@@ -55,6 +55,8 @@ def main(argv):
             write("n,word\n")
             for n in range(20000):
                 write("%d,row %d\n" % (n, n))
+        elif "SELECT name FROM here" in sql:
+            write("name\npeople\n")
         elif "FROM here" in sql:
             write("a,b\n1,x\n2,y\n3,z\n")
         elif sql.strip().rstrip(";").upper() == "SELECT 42":
