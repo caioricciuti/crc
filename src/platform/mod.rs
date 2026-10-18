@@ -17,7 +17,6 @@ pub mod mcp_panel;
 pub mod recovery;
 pub mod remote;
 pub mod report;
-pub mod review_page;
 pub mod search;
 pub mod selftest;
 pub mod session;

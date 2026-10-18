@@ -32,9 +32,8 @@ impl EditorView {
                 state.palette = None;
                 state.completion = None;
                 // A page over the editor column is left behind like any
-                // other: Agents mode hid the Review page but kept it open,
-                // so coming back to the editor found it over the tabs
-                // again, every time.
+                // other: hidden but kept open, it was over the tabs again
+                // on every switch back to the editor.
                 uncover_column(&mut state);
                 state.agents.refresh();
                 if state.agents.selected_index().is_none() {
@@ -1218,17 +1217,9 @@ impl EditorView {
         let add = |title: &str, action: Sel| menu.addItem(&menu_item(mtm, title, action));
         add("New Terminal", sel!(agentNewShell:));
         add("New Claude Session", sel!(agentNewClaude:));
-        // A remote workspace's folder is on its host, not for the editor,
-        // and its branches are not merged into a checkout or reviewed here.
+        // A remote workspace's folder is on its host, not for the editor.
         if !remote {
             add("Open in Editor", sel!(agentOpenInEditor:));
-        }
-        if !folder
-            && !main
-            && !remote
-            && let Some(base) = &base
-        {
-            add(&format!("Review Changes vs {base}"), sel!(agentReview:));
         }
         menu.addItem(&NSMenuItem::separatorItem(mtm));
         add(

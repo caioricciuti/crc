@@ -55,9 +55,6 @@ pub enum Action {
     OpenWorktree,
     /// A worktree strip's Terminal: a new shell in it.
     WorktreeTerminal,
-    /// A worktree strip's Review: its branch against the base, on the
-    /// Review page.
-    ReviewWorktree,
     /// A merged worktree strip's Clean up: the worktree and its branch
     /// removed.
     CleanUpWorktree,
@@ -90,7 +87,6 @@ impl Action {
             Action::OpenPullRequest => "open",
             Action::OpenWorktree => "worktree_open",
             Action::WorktreeTerminal => "worktree_terminal",
-            Action::ReviewWorktree => "worktree_review",
             Action::CleanUpWorktree => "worktree_cleanup",
             Action::OpenIssue(_) => "issue_open",
             Action::ToggleIssues => "issues_toggle",
@@ -1349,10 +1345,6 @@ impl Inspector {
             // it has the whole width.
             let mut right = x + width - 6.0;
             let by = top + 4.0;
-            let review_tip = match &tree.base {
-                Some(base) => format!("Changes on this branch since {base}, uncommitted included"),
-                None => "Changes on this branch, uncommitted included".to_owned(),
-            };
             let terminal = (
                 "Terminal",
                 Action::WorktreeTerminal,
@@ -1363,12 +1355,11 @@ impl Inspector {
                 Action::CleanUpWorktree,
                 "Remove this merged worktree and its branch".to_owned(),
             );
-            // A host's worktree is not reviewed from here.
+            // A merged worktree on a host keeps its Terminal beside Clean up.
             let buttons = match (merged, tree.host.is_some()) {
                 (true, true) => vec![clean_up, terminal],
-                (false, true) => vec![terminal],
-                (true, false) => vec![clean_up, ("Review", Action::ReviewWorktree, review_tip)],
-                (false, false) => vec![terminal, ("Review", Action::ReviewWorktree, review_tip)],
+                (false, _) => vec![terminal],
+                (true, false) => vec![clean_up],
             };
             for (label, action, tip) in buttons {
                 let probe = layout::Button::new(Viewport {

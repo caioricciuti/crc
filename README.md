@@ -218,16 +218,18 @@ the size and write it back.
   `~/Library/Application Support/crc/drops/` for a week. `Cmd-V` with
   an image on the clipboard in a terminal tab works the same way; a
   Claude tab takes it from the clipboard directly.
-- **Review agent changes**: Home lists each session that changed files,
-  and the tab says how many are waiting. Git > Review Agent Changes (also
-  in the palette) shows every file a session changed against the copy kept
-  before its first edit: Keep a change and it leaves the review, Undo it
-  and it comes out of the file, by hunk, by file or for a whole session.
-  Undo is refused while the file has unsaved edits in crc; an open clean
-  file reloads, and `Cmd-Z` there brings the agent's version back. Files
-  changed by shell commands while the terminal works are listed as well,
-  to keep only. The page reads in the background, so an agent writing
-  while it is open never stalls crc.
+- **Changed by agents**: the terminal tab says how many files its agent
+  changed are waiting, and Source Control lists them in a last group,
+  Changed by agents, each with the terminal's title and how long ago it
+  wrote the file. A row opens the file's diff as a Changes row does; its
+  menu keeps the change (the copy kept before the agent's first edit is
+  forgotten) or undoes it (the file goes back to that copy, or is
+  removed when the agent created it). Undo is refused while the file
+  has unsaved edits in crc, or when it changed since the agent wrote it;
+  an open clean file reloads, and `Cmd-Z` there brings the agent's
+  version back. Files changed by shell commands while the terminal
+  works are listed as well, to keep only. The counts are read in the
+  background, so an agent writing never stalls crc.
 - **Workspaces**: open a folder that holds several repositories and the
   notes about them, and Source Control shows one repository at a time
   with a menu to switch. Home becomes the workspace's front page: what
@@ -382,8 +384,8 @@ the size and write it back.
   editor (`/ide` in Claude Code reconnects it), and pull requests and
   checks are polled rather than live. Only the terminals of the folder
   open in the editor come back after a reboot. On a server workspace,
-  Claude runs without crc's review hooks (no Review page or undo for
-  it), the editor cannot open its files, and nothing about
+  Claude runs without crc's review hooks (no Changed by agents group
+  or undo for it), the editor cannot open its files, and nothing about
   the server itself (load, disk) is read. An ssh session typed in a
   local terminal is shown from its command line and `~/.ssh/config`
   alone.

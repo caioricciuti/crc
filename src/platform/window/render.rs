@@ -89,7 +89,6 @@ impl EditorView {
             commit_prompt,
             extensions,
             settings_page,
-            review_page,
             update_ready,
             replaced,
             blame: Blame { shown: blame, .. },
@@ -244,15 +243,6 @@ impl EditorView {
                 theme,
                 glyphs,
             );
-        } else if column == Column::AgentReview {
-            glyphs.clear();
-            crate::platform::review_page::draw(
-                review_page,
-                &mut renderer.atlas,
-                ext_details_rect,
-                theme,
-                glyphs,
-            );
         } else if let Some(page) = extensions.as_mut().filter(|_| column == Column::Extensions) {
             glyphs.clear();
             crate::platform::extensions::draw_details(
@@ -352,11 +342,6 @@ impl EditorView {
                     .tabs
                     .iter()
                     .map(|t| (t.name(), t.state()))
-                    .collect::<Vec<_>>(),
-                &review_page
-                    .summary
-                    .iter()
-                    .map(|(dir, title, n)| (title.clone(), *n, review_page.running.contains(dir)))
                     .collect::<Vec<_>>(),
                 update_ready.as_ref().map(|r| r.version.as_str()),
                 *replaced,
@@ -642,11 +627,8 @@ impl EditorView {
         // Under the Extensions details the tabs are still laid out, so
         // their hit list stays true, but drawn into nothing.
         let mut hidden = Vec::new();
-        let details = agents.on
-            || matches!(
-                column,
-                Column::Extensions | Column::Mcp | Column::Settings | Column::AgentReview
-            );
+        let details =
+            agents.on || matches!(column, Column::Extensions | Column::Mcp | Column::Settings);
         layout::build_tab_bar(
             docs,
             *tab_scroll,

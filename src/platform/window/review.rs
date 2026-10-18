@@ -1,20 +1,17 @@
-//! The Review page in the window: opening it, on agents' sessions or on a
-//! worktree's branch, what its buttons do, and keeping Home's counts
-//! current as agents write.
+//! Agents' sessions in the window: the terminal tabs' review counts, kept
+//! current as agents write, and Keep and Undo from the Git panel's
+//! "Changed by agents" rows.
 
 use super::*;
-use crate::platform::review_page::Action;
 use crate::project::review;
 
-/// The session folders this window's terminals write to.
-fn running(state: &State) -> Vec<std::path::PathBuf> {
-    state
-        .terminal
-        .tabs
-        .iter()
-        .filter(|t| t.tracks_review())
-        .map(|t| t.review.clone())
-        .collect()
+/// The agents' sessions being counted on a worker, for the terminal tabs.
+#[derive(Default)]
+pub(super) struct Review {
+    /// The summary being read on a worker, and whether more changed since
+    /// that read started, so one more follows it.
+    pub counting: Option<mpsc::Receiver<Vec<(std::path::PathBuf, String, usize)>>>,
+    pub recount: bool,
 }
 
 /// Which tab each live session belongs to, for the Git panel's "Changed
@@ -48,52 +45,35 @@ fn unsaved_refusal(file: &review::File) -> String {
     )
 }
 
-/// Every session with something to review, as Home lists it.
+/// Every session with something to review, its title and file count.
 fn read_summary() -> Vec<(std::path::PathBuf, String, usize)> {
     review::root().map_or_else(Vec::new, |r| review::summary(&r))
 }
 
-/// After anything that changes what is under review: Home's list, each
-/// terminal tab's count, and the page itself when it is open. The list is
-/// read on a worker, since agents write often and the store can hold
-/// thousands of files; a write while one is read asks for one more read
-/// after it. [`poll_counts`] applies what it finds.
+/// After anything that changes what is under review: the Git panel's
+/// group and each terminal tab's count. The list is read on a worker,
+/// since agents write often and the store can hold thousands of files; a
+/// write while one is read asks for one more read after it.
+/// [`poll_counts`] applies what it finds.
 pub(super) fn refresh_review(state: &mut State) {
     // The Git panel lists the agents' files with the repository's changes.
     state.git.set_agent_labels(agent_labels(state));
     state.git.refresh();
-    if state.review_page.counting.is_some() {
-        state.review_page.recount = true;
+    if state.review.counting.is_some() {
+        state.review.recount = true;
         return;
     }
     let (tx, rx) = mpsc::channel();
-    state.review_page.counting = Some(rx);
+    state.review.counting = Some(rx);
     std::thread::spawn(move || {
         let _ = tx.send(read_summary());
     });
 }
 
-/// [`refresh_review`], for what has to show a change: the page opening, or
-/// one of its buttons. The page is read again whatever the counts say (a
-/// hunk kept changes no count), on its own worker, so nothing is read here.
-fn refresh_review_now(state: &mut State) {
-    refresh_review(state);
-    state.review_page.running = running(state);
-    if state.review_page.open {
-        state.review_page.reload();
-    }
-}
-
-/// Whether the Review page is what the editor column draws: open, with
-/// no page over it and the terminal not covering the column.
-fn shown(state: &State) -> bool {
-    !state.agents.on && column_of(state) == Column::AgentReview
-}
-
 /// The counts a worker read, once they are in. Says whether anything
 /// changed on screen.
 fn poll_counts(state: &mut State) -> bool {
-    let Some(rx) = &state.review_page.counting else {
+    let Some(rx) = &state.review.counting else {
         return false;
     };
     let summary = match rx.try_recv() {
@@ -101,39 +81,25 @@ fn poll_counts(state: &mut State) -> bool {
         Err(mpsc::TryRecvError::Empty) => return false,
         Err(mpsc::TryRecvError::Disconnected) => None,
     };
-    state.review_page.counting = None;
+    state.review.counting = None;
     let applied = summary.is_some();
     if let Some(summary) = summary {
-        apply_summary(state, summary, false);
+        apply_summary(state, &summary);
     }
-    if std::mem::take(&mut state.review_page.recount) {
+    if std::mem::take(&mut state.review.recount) {
         refresh_review(state);
     }
     applied
 }
 
-/// Home's list and the tabs' counts take the summary; the page is read
-/// again (on a worker) when the counts changed and it is on screen, or
-/// when `force` says it has to be.
-fn apply_summary(
-    state: &mut State,
-    summary: Vec<(std::path::PathBuf, String, usize)>,
-    force: bool,
-) {
-    state.review_page.running = running(state);
-    let shown = shown(state);
-    let changed = state.review_page.take_summary(summary, shown);
+/// The tabs' counts take the summary.
+fn apply_summary(state: &mut State, summary: &[(std::path::PathBuf, String, usize)]) {
     for tab in &mut state.terminal.tabs {
-        tab.review_files = state
-            .review_page
-            .summary
+        tab.review_files = summary
             .iter()
             .filter(|_| tab.tracks_review())
             .find(|(dir, _, _)| *dir == tab.review)
             .map_or(0, |(_, _, n)| *n);
-    }
-    if changed || (force && state.review_page.open) {
-        state.review_page.reload();
     }
 }
 
@@ -145,7 +111,7 @@ const WORKING: std::time::Duration = std::time::Duration::from_secs(10);
 /// terminal that was working is noted in that terminal's session, with
 /// Git's staged copy to compare with. On a worker, since that asks Git.
 /// What the person saves from another editor meanwhile is noted as well;
-/// the page says such a file was changed without the hook.
+/// the Git panel says such a file was changed without the hook.
 pub(super) fn note_unhooked_writes(state: &mut State) {
     // One scan at a time; what changes meanwhile waits in the watcher.
     if state.review_scan.is_some() {
@@ -157,16 +123,6 @@ pub(super) fn note_unhooked_writes(state: &mut State) {
     let changed = watcher.take_files();
     if changed.is_empty() {
         return;
-    }
-    // A write to a file the page lists changes no count: the page is told
-    // itself, and reads again once the writes pause, or once it is back
-    // on screen.
-    if shown(state) {
-        for path in &changed {
-            state.review_page.touched_by(path);
-        }
-    } else if state.review_page.open && changed.iter().any(|p| state.review_page.lists(p)) {
-        state.review_page.stale = true;
     }
     let live: Vec<std::path::PathBuf> = state
         .terminal
@@ -231,85 +187,7 @@ pub(super) fn note_unhooked_writes(state: &mut State) {
 }
 
 impl EditorView {
-    /// The Review page in the editor column, read fresh on a worker; the
-    /// page shows its loading state meanwhile.
-    pub(super) fn open_review(&self) {
-        if let Some(mut state) = self.state_mut() {
-            state.review_page.open = true;
-            // Agents' sessions, not a branch reviewed before.
-            state.review_page.loading = None;
-            state.review_page.again = false;
-            state.review_page.sessions.clear();
-            if let Some(page) = &mut state.extensions {
-                page.details = false;
-            }
-            state.mcp.details = false;
-            state.settings_page.open = false;
-            refresh_review_now(&mut state);
-            state.review_page.diff_scroll = 0;
-            state.palette = None;
-            state.completion = None;
-        }
-        self.resume_display_link();
-        self.request_redraw();
-        self.pump();
-    }
-
-    /// The Review page on a worktree's branch: what it changes since it
-    /// left the default branch, uncommitted work included, read only. Read
-    /// on a worker; the page shows its loading state meanwhile. Agents
-    /// mode is left, as Open in Editor does, since the page has the
-    /// editor column.
-    pub(super) fn review_worktree(&self, path: &std::path::Path) {
-        let found = self.state().and_then(|state| {
-            let index = state.agents.by_id(&path.to_string_lossy())?;
-            let task = &state.agents.tasks[index];
-            Some((
-                task.path.clone(),
-                task.base.clone(),
-                state.agents.title(task),
-            ))
-        });
-        let Some((tree, base, title)) = found else {
-            return;
-        };
-        let Some(base) = base else {
-            if let Some(mut state) = self.state_mut() {
-                state.say(
-                    layout::Feedback::Failure,
-                    format!("{title} has no default branch to compare with"),
-                );
-            }
-            self.request_redraw();
-            return;
-        };
-        self.set_agents_mode(false);
-        if let Some(mut state) = self.state_mut() {
-            let page = &mut state.review_page;
-            page.open = true;
-            page.sessions.clear();
-            page.selected = (0, 0);
-            page.diff_scroll = 0;
-            page.list_scroll = 0.0;
-            page.confirm = None;
-            page.again = false;
-            page.load_branch(tree, base, title);
-            if let Some(page) = &mut state.extensions {
-                page.details = false;
-            }
-            state.mcp.details = false;
-            state.settings_page.open = false;
-            state.palette = None;
-            state.completion = None;
-        }
-        self.resume_display_link();
-        self.request_redraw();
-        self.pump();
-    }
-
-    /// Home's counts and what a worker read for the Review page, once they
-    /// are in. Counts that changed while the page was off screen are read
-    /// once it is back on.
+    /// The tabs' counts, once a worker has read them.
     pub(super) fn poll_review(&self) {
         let Some(mut state) = self.state_mut() else {
             return;
@@ -317,24 +195,11 @@ impl EditorView {
         if poll_counts(&mut state) {
             self.ivars().needs_redraw.set(true);
         }
-        if state.review_page.stale && shown(&state) {
-            state.review_page.stale = false;
-            state.review_page.reload();
-        }
-        let Some(said) = state.review_page.poll() else {
-            return;
-        };
-        if let Err(why) = said {
-            state.say(layout::Feedback::Failure, why);
-        }
-        drop(state);
-        self.request_redraw();
     }
 
-    /// Keep or Undo from an agent's row in Source Control: the whole file,
-    /// as the Review page's buttons do it. Undo is refused for a file with
-    /// unsaved edits in crc, and by the store for one not as the agent
-    /// left it; the status line says which.
+    /// Keep or Undo from an agent's row in Source Control: the whole file.
+    /// Undo is refused for a file with unsaved edits in crc, and by the
+    /// store for one not as the agent left it; the status line says which.
     pub(super) fn agent_row_action(&self, undo: bool) {
         let said = (|| -> Result<Option<String>, String> {
             let Some(state) = self.state() else {
@@ -357,7 +222,7 @@ impl EditorView {
             }
         })();
         if let Some(mut state) = self.state_mut() {
-            refresh_review_now(&mut state);
+            refresh_review(&mut state);
             match said {
                 Ok(Some(text)) => state.say(layout::Feedback::Success, text),
                 Ok(None) => {}
@@ -365,185 +230,13 @@ impl EditorView {
             }
         }
         self.resume_display_link();
-        // As after the page's Undo: a clean open document reloads, with
-        // the agent's text on its undo stack.
+        // crc's own writes do not come back through the watcher: open
+        // documents are checked now. A clean one reloads, and its old text
+        // goes on its undo stack, so Cmd-Z there brings the agent's back.
         if undo {
             self.check_open_files();
         }
         self.request_redraw();
         self.pump();
-    }
-
-    /// What a click on the Review page does.
-    pub(super) fn review_action(&self, action: Action) {
-        // The file shown, in the editor: the page gives the column back.
-        if action == Action::OpenFile {
-            let path = self.state_mut().and_then(|mut state| {
-                let path = state.review_page.selected_entry()?.file.path.clone();
-                state.review_page.open = false;
-                Some(path)
-            });
-            if let Some(path) = path {
-                self.run_pick(Pick::File(path));
-            }
-            self.request_redraw();
-            self.pump();
-            return;
-        }
-        let said = self.review_do(action);
-        let reload = matches!(
-            action,
-            Action::UndoHunk(_) | Action::UndoFile | Action::UndoSession(_)
-        );
-        if let Some(mut state) = self.state_mut() {
-            refresh_review_now(&mut state);
-            match said {
-                Ok(Some(text)) => state.say(layout::Feedback::Success, text),
-                Ok(None) => {}
-                Err(text) => state.say(layout::Feedback::Failure, text),
-            }
-        }
-        // The page's read lands on the display link.
-        self.resume_display_link();
-        // crc's own writes do not come back through the watcher: open
-        // documents are checked now. A clean one reloads, and its old text
-        // goes on its undo stack, so Cmd-Z there brings the agent's back.
-        if reload {
-            self.check_open_files();
-        }
-        self.request_redraw();
-        self.pump();
-    }
-
-    fn review_do(&self, action: Action) -> Result<Option<String>, String> {
-        let Some(mut state) = self.state_mut() else {
-            return Ok(None);
-        };
-        // A branch is reviewed read only: nothing to keep or undo.
-        let read_only = state
-            .review_page
-            .sessions
-            .first()
-            .is_some_and(crate::platform::review_page::Session::read_only);
-        if read_only && !matches!(action, Action::Close | Action::Select(..)) {
-            return Ok(None);
-        }
-        // A destructive action asks for a second click; anything else
-        // clicked in between cancels it.
-        let destructive = matches!(action, Action::UndoFile | Action::UndoSession(_));
-        if destructive && state.review_page.confirm != Some(action) {
-            state.review_page.confirm = Some(action);
-            return Ok(None);
-        }
-        state.review_page.confirm = None;
-        let page = &state.review_page;
-        let shown = page.selected;
-        let entry = page
-            .sessions
-            .get(shown.0)
-            .and_then(|s| s.files.get(shown.1).map(|e| (s.dir.clone(), e)));
-        let name = |file: &review::File| {
-            file.path
-                .file_name()
-                .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
-        };
-        let dirty = |path: &std::path::Path| dirty_in_crc(&state, path);
-        let refuse = unsaved_refusal;
-        match action {
-            Action::Close => {
-                state.review_page.open = false;
-                state.review_page.loading = None;
-                state.review_page.again = false;
-                // The sessions and their diffs go with the page: a store
-                // of thousands of files is not kept in memory for a page
-                // nobody is looking at. Opening reads them again.
-                state.review_page.sessions = Vec::new();
-                state.review_page.selected = (0, 0);
-                state.review_page.diff_scroll = 0;
-                Ok(None)
-            }
-            Action::Select(s, f) => {
-                state.review_page.selected = (s, f);
-                state.review_page.diff_scroll = 0;
-                Ok(None)
-            }
-            Action::KeepHunk(n) => {
-                let Some((dir, e)) = entry else {
-                    return Ok(None);
-                };
-                review::keep(&dir, &e.file, n, e.seen)?;
-                Ok(Some(format!("Kept a change in {}", name(&e.file))))
-            }
-            Action::UndoHunk(n) => {
-                let Some((dir, e)) = entry else {
-                    return Ok(None);
-                };
-                if dirty(&e.file.path) {
-                    return Err(refuse(&e.file));
-                }
-                let text = review::undone(&dir, &e.file, n, e.seen)?;
-                review::write_undone(&dir, &e.file, &text)?;
-                Ok(Some(format!("Undid a change in {}", name(&e.file))))
-            }
-            Action::KeepFile => {
-                let Some((dir, e)) = entry else {
-                    return Ok(None);
-                };
-                review::keep_all(&dir, &e.file)?;
-                Ok(Some(format!("Kept every change in {}", name(&e.file))))
-            }
-            Action::UndoFile => {
-                let Some((dir, e)) = entry else {
-                    return Ok(None);
-                };
-                if dirty(&e.file.path) {
-                    return Err(refuse(&e.file));
-                }
-                review::undo_all(&dir, &e.file)?;
-                Ok(Some(format!("Put {} back as it was", name(&e.file))))
-            }
-            Action::KeepSession(s) | Action::UndoSession(s) => {
-                let Some(session) = page.sessions.get(s) else {
-                    return Ok(None);
-                };
-                let undo = matches!(action, Action::UndoSession(_));
-                // Undo all leaves what has no copy to go back to.
-                let acted: Vec<_> = session
-                    .files
-                    .iter()
-                    .filter(|e| !undo || e.file.checkpoint.undoable())
-                    .collect();
-                if undo && let Some(e) = acted.iter().find(|e| dirty(&e.file.path)) {
-                    return Err(refuse(&e.file));
-                }
-                // Nothing is put back until every file may be: one changed
-                // since the agent wrote it stops the whole session's undo.
-                if undo
-                    && let Some(why) = acted
-                        .iter()
-                        .find_map(|e| review::undoable_now(&session.dir, &e.file).err())
-                {
-                    return Err(why);
-                }
-                for e in &acted {
-                    if undo {
-                        review::undo_all(&session.dir, &e.file)?;
-                    } else {
-                        review::keep_all(&session.dir, &e.file)?;
-                    }
-                }
-                let n = acted.len();
-                let files = if n == 1 { "file" } else { "files" };
-                let left = session.files.len() - n;
-                Ok(Some(match (undo, left) {
-                    (true, 0) => format!("Put {n} {files} back as they were"),
-                    (true, _) => format!(
-                        "Put {n} {files} back as they were; {left} changed by a command can only be kept"
-                    ),
-                    (false, _) => format!("Kept every change in {n} {files}"),
-                }))
-            }
-            Action::OpenFile => Ok(None),
-        }
     }
 }

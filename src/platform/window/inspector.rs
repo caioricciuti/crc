@@ -89,10 +89,7 @@ impl EditorView {
         // A worktree strip's buttons act on that worktree's workspace: one
         // on the host of the workspace shown, when it is remote.
         if let (
-            Action::OpenWorktree
-            | Action::WorktreeTerminal
-            | Action::ReviewWorktree
-            | Action::CleanUpWorktree,
+            Action::OpenWorktree | Action::WorktreeTerminal | Action::CleanUpWorktree,
             Some(path),
         ) = (action, &repo)
         {
@@ -103,8 +100,6 @@ impl EditorView {
             let id = crate::platform::agents::row_id(host.as_deref(), path);
             match action {
                 Action::OpenWorktree => self.open_worktree(&id),
-                Action::ReviewWorktree if host.is_none() => self.review_worktree(path),
-                Action::ReviewWorktree => {}
                 Action::CleanUpWorktree => self.clean_up_worktree(&id),
                 _ => self.worktree_terminal(&id),
             }
@@ -137,7 +132,6 @@ impl EditorView {
             Action::OpenPullRequest => self.agent_open_pull_request(),
             Action::OpenWorktree
             | Action::WorktreeTerminal
-            | Action::ReviewWorktree
             | Action::CleanUpWorktree
             | Action::OpenIssue(_)
             | Action::ToggleIssues

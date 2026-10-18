@@ -184,12 +184,6 @@ wait 500
 dump $T/garden-open.out
 key 18 ctrl 1
 wait 400
-click @inspector.worktree_review.0
-wait 1200
-dump $T/garden-review.out
-frame $T/garden-review.bmp
-key 0 cmd,shift A
-wait 700
 text git -C $GL merge -q --ff-only fix/seed-dates
 key 36
 wait 700
@@ -223,7 +217,7 @@ mkdir -p "$T/home/garden"
 HOME="$T/home/garden" CRC_TERMINAL_SHELL=/bin/sh CRC_SELFTEST="$T/garden.script" \
     "$BIN" "$GD" 2> "$T/garden.err"
 [ -z "${SELFTEST_FRAMES:-}" ] || cp -f "$T/garden-frame.bmp" "$T/garden-writing.bmp" \
-    "$T/garden-review.bmp" "$T/garden-merged.bmp" "$T/garden-merged-open.bmp" "$SELFTEST_FRAMES/"
+    "$T/garden-merged.bmp" "$T/garden-merged-open.bmp" "$SELFTEST_FRAMES/"
 expect "$T/garden.out" agents_tree "garden,>fix/seed-dates,>feat/compost-log"
 expect "$T/garden.out" inspector "branch=main base=- ahead=0 behind=0 upstream=- push=0 pull=0 dirty=0 changes=+0-0 tag=- buttons=push worktrees=fix/seed-dates:ahead=1:+3-0:files=1,feat/compost-log:ahead=0:+0-0:files=0"
 expect "$T/garden-terminal.out" agents "on tasks=garden,fix/seed-dates,feat/compost-log selected=feat/compost-log sessions=garden,*feat/compost-log claude=0 pair=- op=-"
@@ -245,9 +239,6 @@ case "$(grep '^agents:' "$T/garden-open.out")" in
 *" selected=fix/seed-dates "*) ;;
 *) failed "garden: Open did not select the worktree: $(grep '^agents:' "$T/garden-open.out")" ;;
 esac
-# Review on a strip: the branch against main, read only, the committed
-# file and the one written from a shell (not yet committed) both there.
-expect "$T/garden-review.out" review_page "open sessions=1 files=2 hunks=1 shown=dates.txt confirm=false targets=4 base=main"
 # main takes the branch: it is merged now. The other worktree, never
 # committed to, is on main too but not done. The strips follow the list,
 # where the merged one has moved last.

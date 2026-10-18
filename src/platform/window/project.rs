@@ -105,9 +105,6 @@ impl EditorView {
         }
         state.watch.tree_changed_at = None;
         super::review::note_unhooked_writes(&mut state);
-        if state.review_page.open {
-            super::review::refresh_review(&mut state);
-        }
         if let Some(indexer) = &state.watch.indexer {
             indexer.poke();
         }

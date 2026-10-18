@@ -741,7 +741,7 @@ impl EditorView {
                 let spans = state.spans.len();
                 let report = format!(
                     // First: the report ends with the document's text.
-                    "message: {}\npreview: {}\nmd: {md}\nspans: {spans}\nactivity: {}\npointer_targets: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nrepo: {}\ngit_note: {}\nhome: {}\nhome_scroll: {}\nmcp: {}\nmcp_page: {}\nsettings_page: {}\nreview_page: {}\nterminals: {}\nagents: {}\ninspector: {}\nteams: {}\nagents_tree: {}\nagents_activity: {}\nagents_prs: {}\nconflicts: {}\ngit_conflicts: {}\ntable: {}\nblame: {}\nfind_results: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\npeek: {}\ngutter: {}\nissue_tab: {}\nscrub: {}\nscrub_strip: {}\nscrub_fade: {}\nscrub_filter: {}\nscrub_compare: {}\nblame_heat: {}\nreplaced: {}\n{report}",
+                    "message: {}\npreview: {}\nmd: {md}\nspans: {spans}\nactivity: {}\npointer_targets: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nrepo: {}\ngit_note: {}\nhome: {}\nhome_scroll: {}\nmcp: {}\nmcp_page: {}\nsettings_page: {}\nterminals: {}\nagents: {}\ninspector: {}\nteams: {}\nagents_tree: {}\nagents_activity: {}\nagents_prs: {}\nconflicts: {}\ngit_conflicts: {}\ntable: {}\nblame: {}\nfind_results: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\npeek: {}\ngutter: {}\nissue_tab: {}\nscrub: {}\nscrub_strip: {}\nscrub_fade: {}\nscrub_filter: {}\nscrub_compare: {}\nblame_heat: {}\nreplaced: {}\n{report}",
                     state.message.as_ref().map_or("", |(text, _)| text.as_str()),
                     state.html_preview.as_ref().map_or("closed".to_string(), |p| format!(
                         "open ext={} view={} probe={}",
@@ -830,7 +830,6 @@ impl EditorView {
                     state.mcp.report(),
                     state.mcp.page_report(),
                     state.settings_page.report(),
-                    state.review_page.report(),
                     state
                         .terminal
                         .tabs
@@ -1085,7 +1084,6 @@ fn region_named(state: &mut State, name: &str) -> Option<Viewport> {
         Some(page) if name.starts_with("extensions.") => page.named(name),
         _ if name.starts_with("mcp.") => state.mcp.named(name),
         _ if name.starts_with("settings.") => state.settings_page.named(name),
-        _ if name.starts_with("review_page.") => state.review_page.named(name),
         _ if name.starts_with("agents.") => state.agents.named(name),
         _ if name.starts_with("peek.") => {
             let hits = state.peek.as_ref()?.hits?;
@@ -1167,11 +1165,6 @@ fn region_named(state: &mut State, name: &str) -> Option<Viewport> {
             let sidebar = chrome_of(state).sidebar?;
             layout::sidebar_empty_button(&mut state.renderer.atlas, sidebar)
         }
-        _ if name == "home.review" => state
-            .home_hits
-            .iter()
-            .find(|h| h.action == layout::HomeAction::OpenReview)
-            .map(|h| h.rect),
         _ if name == "home.update" => state
             .home_hits
             .iter()

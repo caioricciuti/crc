@@ -376,11 +376,10 @@ impl EditorView {
         ) {
             return false;
         }
-        let confirming = {
-            let page = state.extensions.as_mut();
-            page.is_some_and(|p| p.confirm.take().is_some())
-                || state.review_page.confirm.take().is_some()
-        };
+        let confirming = state
+            .extensions
+            .as_mut()
+            .is_some_and(|p| p.confirm.take().is_some());
         if !confirming {
             uncover_column(&mut state);
         }
@@ -1259,9 +1258,9 @@ fn task_digit(code: u16) -> Option<usize> {
 }
 
 /// Whether a page that takes the editor column whole (Extensions details,
-/// MCP, Settings, Review) is open.
+/// MCP, Settings) is open.
 fn page_covers(state: &State) -> bool {
-    ext_details(state) || mcp_details(state) || state.settings_page.open || state.review_page.open
+    ext_details(state) || mcp_details(state) || state.settings_page.open
 }
 
 /// Whether a key is Escape over a page that has the editor column, with

@@ -467,8 +467,6 @@ pub enum HomeAction {
     RunCall(std::path::PathBuf),
     /// Show this terminal session, with the keyboard.
     ShowTerminal(usize),
-    /// Open the Review page.
-    OpenReview,
     /// Install the downloaded update: Help > Restart to Update.
     RestartToUpdate,
     /// Open the app on disk again: Help > Restart crc.
@@ -605,15 +603,14 @@ pub fn build_home(
     recent: &[std::path::PathBuf],
     summary: Option<&crate::project::workspace::Summary>,
     terminals: &[(String, String)],
-    review: &[(String, usize, bool)],
     update: Option<&str>,
     replaced: bool,
     hits: &mut Vec<HomeHit>,
 ) {
     let mut view = HomeView::default();
     build_home_view(
-        out, atlas, rect, theme, project, recent, summary, terminals, review, update, replaced,
-        &mut view, hits,
+        out, atlas, rect, theme, project, recent, summary, terminals, update, replaced, &mut view,
+        hits,
     );
 }
 
@@ -630,7 +627,6 @@ pub fn build_home_view(
     recent: &[std::path::PathBuf],
     summary: Option<&crate::project::workspace::Summary>,
     terminals: &[(String, String)],
-    review: &[(String, usize, bool)],
     update: Option<&str>,
     replaced: bool,
     view: &mut HomeView,
@@ -700,37 +696,6 @@ pub fn build_home_view(
             action: HomeAction::RestartToUpdate,
         });
         y += ROW + GAP;
-    }
-
-    // What agents changed and nobody has looked at yet comes first.
-    if !review.is_empty() && y + 22.0 + ROW <= bottom {
-        section(out, atlas, &mut y, "Review");
-        for (title, files, running) in review {
-            if y + ROW > bottom {
-                break;
-            }
-            let detail = format!(
-                "{files} file{}{}",
-                if *files == 1 { "" } else { "s" },
-                if *running { " \u{b7} running" } else { "" }
-            );
-            let rect = home_row(
-                out,
-                atlas,
-                theme,
-                (x, width),
-                y,
-                icons::TERMINAL,
-                title,
-                &detail,
-            );
-            hits.push(HomeHit {
-                rect,
-                action: HomeAction::OpenReview,
-            });
-            y += ROW;
-        }
-        y += GAP;
     }
 
     // Terminals first: a session waiting on you matters more than what
@@ -3689,7 +3654,6 @@ mod home_tests {
             &recent,
             None,
             &[],
-            &[],
             None,
             false,
             &mut hits,
@@ -3765,7 +3729,6 @@ mod home_tests {
             &[],
             Some(&summary),
             &[("claude".into(), "waiting: Approve?".into())],
-            &[],
             None,
             false,
             &mut hits,
@@ -3867,7 +3830,6 @@ mod home_tests {
             std::slice::from_ref(&deep),
             None,
             &[],
-            &[],
             None,
             false,
             &mut hits,
@@ -3910,7 +3872,6 @@ mod home_tests {
                 None,
                 &[],
                 None,
-                &[],
                 &[],
                 None,
                 replaced,
@@ -3961,7 +3922,6 @@ mod home_tests {
                 None,
                 &recent,
                 None,
-                &[],
                 &[],
                 None,
                 false,
@@ -4034,7 +3994,6 @@ mod home_tests {
             None,
             &[],
             None,
-            &[],
             &[],
             None,
             false,

@@ -2,6 +2,21 @@
 
 One entry per tag, written for people who use the editor.
 
+## Unreleased
+
+- The Review page is gone; what agents changed is in Source Control.
+  A last group, Changed by agents, lists every file an agent's session
+  changed inside the repository, with the terminal's title and how
+  long ago it wrote the file. A row opens the file's diff as a Changes
+  row does, and its menu keeps the change or puts the file back as it
+  was before the agent (refused while the file has unsaved edits in
+  crc, or when it changed since the agent wrote it). The terminal tab
+  still says how many files are waiting. Home's Review list, Git >
+  Review Agent Changes and its palette entry, the inspector's Review
+  button on a worktree strip and the Agents row's Review Changes vs
+  base went with the page; `agent_review` now only says whether the
+  hooks keep a copy before each write.
+
 ## v0.2.0-alpha.26, 2026-10-18
 
 - CSV and TSV files open as a grid. The first row is the header and
