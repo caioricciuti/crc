@@ -2,7 +2,7 @@
 
 One entry per tag, written for people who use the editor.
 
-## Unreleased
+## v0.2.0-alpha.27, 2026-10-18
 
 - The Review page is gone; what agents changed is in Source Control.
   A last group, Changed by agents, lists every file an agent's session
@@ -16,6 +16,27 @@ One entry per tag, written for people who use the editor.
   button on a worktree strip and the Agents row's Review Changes vs
   base went with the page; `agent_review` now only says whether the
   hooks keep a copy before each write.
+- Undo of an agent change is safe: it refuses a file that changed since
+  the agent wrote it, so it can no longer put an old copy over newer
+  work. A terminal closing removes the copies it kept, copies older than
+  two days go, and the first launch of this build clears every copy
+  left by terminals that no longer run.
+- CSV and TSV tables can be queried with SQL. The Table strip has a
+  Query segment (also Table > Query...): type SQL over the open file,
+  where the table is called here, and Cmd-Return runs it through DuckDB
+  in the background. The result opens as a read-only grid in its own
+  tab with its row count and time, Back to file and Export CSV buttons;
+  an error shows in the strip. DuckDB is a tool you install (brew install
+  duckdb); crc ships none of it, and without it the status line says
+  how to get it.
+- With DuckDB installed, Parquet, JSONL, NDJSON and SQLite files
+  (`.sqlite` and `.db`) open as read-only grids. SQLite opens its first
+  table. The Query field runs SQL over the source as `here`, and a result
+  can be exported as CSV without changing the source file.
+- Busy terminal output causes shorter pauses for the interface, including
+  when saved sessions return after a restart. The terminal lets the
+  interface read its screen between smaller batches of output, helping
+  keep typing and clicking responsive in other workspaces.
 
 ## v0.2.0-alpha.26, 2026-10-18
 
