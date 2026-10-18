@@ -440,6 +440,12 @@ impl Panel {
         if index < self.tabs.len() {
             // Dropping the session hangs up on its program.
             let tab = self.tabs.remove(index);
+            // Its agent review session goes with it: what its agent changed
+            // is for the Git panel now. A tab left to a helper at quit is
+            // detached, not closed, and keeps its session.
+            if !tab.review.as_os_str().is_empty() {
+                crate::project::review::remove(&tab.review);
+            }
             if index == self.active {
                 self.closed_active = Some((tab.workspace.clone(), tab.folder.clone(), index));
             } else if index < self.active {
@@ -1460,6 +1466,34 @@ mod tests {
             probe_owed: false,
             seen: None,
         }
+    }
+
+    #[test]
+    fn closing_a_terminal_removes_its_session() {
+        let tree = crate::project::TempTree::new(
+            "terminal-close-session",
+            &[("sessions/one/files/", ""), ("sessions/two/events", "")],
+        );
+        let root = tree.0.join("sessions");
+        let mut panel = Panel::default();
+        for name in ["one", "two"] {
+            let mut tab = tab();
+            tab.review = root.join(name);
+            panel.tabs.push(tab);
+        }
+        panel.close_tab(0);
+        assert!(!root.join("one").exists(), "closed: its session goes");
+        assert!(root.join("two").is_dir(), "still open: its session stays");
+        assert_eq!(
+            crate::project::review::sessions(&root),
+            vec![root.join("two")]
+        );
+        // Removed on a thread, once moved aside.
+        let until = Instant::now() + Duration::from_secs(5);
+        while root.join("one.gone").exists() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!root.join("one.gone").exists());
     }
 
     #[test]

@@ -65,9 +65,7 @@ fn main() {
     };
 
     migrate_support_dir();
-    if let Some(sessions) = crc::project::review::root() {
-        crc::project::review::prune(&sessions, crc::project::review::MAX_AGE);
-    }
+    prune_sessions();
 
     // Before anything that can panic with documents open. Release builds
     // abort on panic, and the hook is what saves unsaved work first.
@@ -77,6 +75,32 @@ fn main() {
 
     let settings = Settings::load();
     window::run(buffer, folder, &settings.font, settings.font_size);
+}
+
+/// Agent review sessions whose terminal is gone: aged out, except those of
+/// the terminals helpers still hold, which come back with the window. Once,
+/// every session without a held terminal goes whatever its age: closing a
+/// terminal removes its session now, and the sessions of terminals closed
+/// under earlier builds stayed on disk, tens of thousands of files.
+fn prune_sessions() {
+    use crc::project::review;
+    let Some(sessions) = review::root() else {
+        return;
+    };
+    let held =
+        crc::term::hold::dir().map_or_else(Vec::new, |dir| crc::term::hold::held_reviews(&dir));
+    review::prune(&sessions, review::MAX_AGE, &held);
+    let Some(once) = crc::platform::app_support().map(|dir| dir.join("sessions-pruned")) else {
+        return;
+    };
+    if once.exists() {
+        return;
+    }
+    review::prune_closed(&sessions, &held);
+    if let Some(parent) = once.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(once, "");
 }
 
 /// The app was called caio-code until 2026-09-23. Its session and any

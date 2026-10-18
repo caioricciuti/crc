@@ -39,14 +39,15 @@ pub(super) fn refresh_review(state: &mut State) {
     });
 }
 
-/// [`refresh_review`] read here and now, for what has to show the change
-/// at once: the page opening, or one of its buttons. A read still running
-/// is dropped, as this one is newer. The page is read again whatever the
-/// counts say: a hunk kept changes no count.
+/// [`refresh_review`], for what has to show a change: the page opening, or
+/// one of its buttons. The page is read again whatever the counts say (a
+/// hunk kept changes no count), on its own worker, so nothing is read here.
 fn refresh_review_now(state: &mut State) {
-    state.review_page.counting = None;
-    state.review_page.recount = false;
-    apply_summary(state, read_summary(), true);
+    refresh_review(state);
+    state.review_page.running = running(state);
+    if state.review_page.open {
+        state.review_page.reload();
+    }
 }
 
 /// Whether the Review page is what the editor column draws: open, with
@@ -158,21 +159,20 @@ pub(super) fn note_unhooked_writes(state: &mut State) {
     if working.is_empty() {
         return;
     }
-    let mut notes = Vec::new();
-    for path in changed {
-        if !path.is_file() || live.iter().any(|dir| review::has(dir, &path)) {
-            continue;
-        }
-        // The most recently busy terminal whose folder holds the file.
-        let Some((dir, title, cwd, _)) = working
-            .iter()
-            .filter(|(_, _, cwd, _)| path.starts_with(cwd))
-            .max_by_key(|(_, _, _, at)| *at)
-        else {
-            continue;
-        };
-        notes.push((dir.clone(), title.clone(), cwd.clone(), path));
-    }
+    // Which terminal each file is under is known here; whether it is a
+    // file at all and whether a session has it already ask the disk, so
+    // the worker finds out.
+    let notes: Vec<_> = changed
+        .into_iter()
+        .filter_map(|path| {
+            // The most recently busy terminal whose folder holds the file.
+            let (dir, title, cwd, _) = working
+                .iter()
+                .filter(|(_, _, cwd, _)| path.starts_with(cwd))
+                .max_by_key(|(_, _, _, at)| *at)?;
+            Some((dir.clone(), title.clone(), cwd.clone(), path))
+        })
+        .collect();
     if notes.is_empty() {
         return;
     }
@@ -180,6 +180,9 @@ pub(super) fn note_unhooked_writes(state: &mut State) {
     state.review_scan = Some(rx);
     std::thread::spawn(move || {
         for (dir, title, cwd, path) in notes {
+            if !path.is_file() || live.iter().any(|dir| review::has(dir, &path)) {
+                continue;
+            }
             let staged = match crate::project::git::index_bytes(&path) {
                 Ok(crate::project::git::Indexed::Ignored) => continue,
                 Ok(crate::project::git::Indexed::Tracked(bytes)) => Some(bytes),
@@ -383,6 +386,12 @@ impl EditorView {
                 state.review_page.open = false;
                 state.review_page.loading = None;
                 state.review_page.again = false;
+                // The sessions and their diffs go with the page: a store
+                // of thousands of files is not kept in memory for a page
+                // nobody is looking at. Opening reads them again.
+                state.review_page.sessions = Vec::new();
+                state.review_page.selected = (0, 0);
+                state.review_page.diff_scroll = 0;
                 Ok(None)
             }
             Action::Select(s, f) => {
@@ -404,7 +413,7 @@ impl EditorView {
                 if dirty(&e.file.path) {
                     return Err(refuse(&e.file));
                 }
-                let text = review::undone(&e.file, n, e.seen)?;
+                let text = review::undone(&dir, &e.file, n, e.seen)?;
                 review::write_undone(&dir, &e.file, &text)?;
                 Ok(Some(format!("Undid a change in {}", name(&e.file))))
             }
@@ -438,6 +447,15 @@ impl EditorView {
                     .collect();
                 if undo && let Some(e) = acted.iter().find(|e| dirty(&e.file.path)) {
                     return Err(refuse(&e.file));
+                }
+                // Nothing is put back until every file may be: one changed
+                // since the agent wrote it stops the whole session's undo.
+                if undo
+                    && let Some(why) = acted
+                        .iter()
+                        .find_map(|e| review::undoable_now(&session.dir, &e.file).err())
+                {
+                    return Err(why);
                 }
                 for e in &acted {
                     if undo {

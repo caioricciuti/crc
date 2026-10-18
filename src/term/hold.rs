@@ -508,6 +508,33 @@ pub fn scan(dir: &Path) -> (Vec<Found>, Vec<Found>) {
     (live, lost)
 }
 
+/// The agent review session folders of the helpers in `dir` still
+/// running, read only: nothing of a helper that is gone is touched, as
+/// [`scan`] touches it, so this may run before the window claims them.
+pub fn held_reviews(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            name.strip_suffix(".spec").map(str::to_owned)
+        })
+        .filter(|id| {
+            std::fs::read_to_string(pid_path(dir, id))
+                .ok()
+                .and_then(|text| text.trim().parse::<i32>().ok())
+                .is_some_and(|pid| pid > 0 && crate::platform::send_signal(pid, 0))
+                && socket_path(id).is_ok_and(|socket| socket.exists())
+        })
+        .filter_map(|id| {
+            let spec = Spec::parse(&std::fs::read_to_string(spec_path(dir, &id)).ok()?);
+            (!spec.review.as_os_str().is_empty()).then_some(spec.review)
+        })
+        .collect()
+}
+
 /// Takes the sessions in `dir` for this process: `None` while another crc
 /// holds them. A helper serves only the window that connected last, so a
 /// second crc that took them too would steal the first one's terminals.

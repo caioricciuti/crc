@@ -4,8 +4,10 @@
 # ---- agent review sessions: the hook keeps the file, the tab says so ----------
 # Every terminal gets its own CRC_SESSION_DIR. An agent's PreToolUse hook
 # (`crc --hook pre`) keeps the file as it was before the write; its
-# Notification hook (`crc --hook notify`) marks the tab like an OSC 9 does.
-# The stand-in agent runs both hooks the way Claude Code would.
+# PostToolUse hook (`crc --hook post`) records the file as it left it,
+# which Undo checks; its Notification hook (`crc --hook notify`) marks the
+# tab like an OSC 9 does. The stand-in agent runs the hooks the way Claude
+# Code would, around every write.
 # The terminal runs in the project folder, so the binary by its full path.
 case "$BIN" in /*) hook_bin=$BIN ;; *) hook_bin=$PWD/$BIN ;; esac
 mkdir -p "$T/reviewproj"
@@ -14,24 +16,28 @@ cat > "$T/review-agent.sh" <<AGENT
 #!/bin/sh
 printf '{"cwd":"$T/reviewproj","tool_name":"Edit","tool_input":{"file_path":"notes.txt"}}' | "$hook_bin" --hook pre
 printf 'a\nB\nc\nd\ne\nf\ng\nh\ni\nj\nk\nL\n' > "$T/reviewproj/notes.txt"
+printf '{"cwd":"$T/reviewproj","tool_name":"Edit","tool_input":{"file_path":"notes.txt"}}' | "$hook_bin" --hook post
 printf '{"cwd":"$T/reviewproj","tool_name":"Write","tool_input":{"file_path":"new.txt"}}' | "$hook_bin" --hook pre
 printf 'made by the agent\n' > "$T/reviewproj/new.txt"
+printf '{"cwd":"$T/reviewproj","tool_name":"Write","tool_input":{"file_path":"new.txt"}}' | "$hook_bin" --hook post
 printf 'written by a shell command\n' > "$T/reviewproj/shell.txt"
 printf '{"message":"Claude is waiting for your input"}' | "$hook_bin" --hook notify
 printf 'done\n'
 # Then, with the page open, a burst of writes to a file already under
 # review, as an agent at work makes: 20 writes, one every 0.4 s, the
-# last of 20 lines.
+# last of 20 lines, each between its two hooks.
 sleep 3
 i=0
 while [ \$i -lt 20 ]; do
     i=\$((i+1))
     k=0
+    printf '{"cwd":"$T/reviewproj","tool_name":"Write","tool_input":{"file_path":"new.txt"}}' | "$hook_bin" --hook pre
     : > "$T/reviewproj/new.txt"
     while [ \$k -lt \$i ]; do
         k=\$((k+1))
         printf 'burst %s line %s\n' \$i \$k >> "$T/reviewproj/new.txt"
     done
+    printf '{"cwd":"$T/reviewproj","tool_name":"Write","tool_input":{"file_path":"new.txt"}}' | "$hook_bin" --hook post
     sleep 0.4
 done
 sleep 30
@@ -143,6 +149,7 @@ for n in \$(seq 30); do
     printf '{"cwd":"$T/reviewbig","tool_name":"Edit","tool_input":{"file_path":"f%s.txt"}}' "\$n" | "$hook_bin" --hook pre
     awk 'NR % 8 == 0 { sub("line", "row") } 1' "$T/reviewbig/f\$n.txt" > "$T/reviewbig/f\$n.tmp"
     mv "$T/reviewbig/f\$n.tmp" "$T/reviewbig/f\$n.txt"
+    printf '{"cwd":"$T/reviewbig","tool_name":"Edit","tool_input":{"file_path":"f%s.txt"}}' "\$n" | "$hook_bin" --hook post
 done
 printf 'done\n'
 sleep 30

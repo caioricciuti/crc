@@ -7,6 +7,8 @@
 //! MultiEdit and NotebookEdit) copies the file into it before the write
 //! lands, so there is no race with the watcher, and appends a line to its
 //! `events` file. The window reads new lines when the terminal prints.
+//! After the write, `crc --hook post` records the file as the agent left
+//! it, which is what Undo checks before it puts anything back.
 //!
 //! Layout of a session folder:
 //!
@@ -19,7 +21,21 @@
 //!   command) while the session was working, Git's staged copy as the only
 //!   baseline, or `files/<key>.untracked` when Git has none. No copy from
 //!   before the change exists, so such a file can be kept, never undone;
+//! - `files/<key>.after`: the file's size and a hash of its bytes as the
+//!   agent last left it, from the post hook; `files/<key>.pending` while a
+//!   write is between the two hooks. Undo refuses a file that does not
+//!   match its `.after`, or has none: the person changed it since, or the
+//!   agent may still be writing it;
 //! - `events`: one line per hook call, appended.
+//!
+//! One file, two sessions: a hook that finds the path claimed by another
+//! session under the same root writes nothing of its own for it. The file
+//! is listed once, under the session that first changed it, with the one
+//! copy from before any agent touched it.
+//!
+//! A session's folder goes when its terminal closes, moved aside as
+//! `<id>.gone` and removed on a thread; a terminal a helper holds across
+//! windows keeps its folder. [`prune`] at launch removes what that missed.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -31,8 +47,9 @@ pub const SESSION_VAR: &str = "CRC_SESSION_DIR";
 /// never undone.
 pub const MAX_CHECKPOINT: u64 = 8 << 20;
 
-/// How long a session nobody reviewed stays on disk.
-pub const MAX_AGE: std::time::Duration = std::time::Duration::from_secs(14 * 24 * 60 * 60);
+/// How long a session whose terminal is gone (a crash, a window that
+/// never came back) stays on disk.
+pub const MAX_AGE: std::time::Duration = std::time::Duration::from_secs(2 * 24 * 60 * 60);
 
 /// Where every session folder lives.
 pub fn root() -> Option<PathBuf> {
@@ -103,29 +120,45 @@ pub enum Event {
 
 /// What `crc --hook <kind>` does with the hook's JSON on stdin, for the
 /// session in `dir`. `pre` checkpoints the file a tool is about to write,
-/// `notify` records the agent's question.
-pub fn hook(kind: &str, input: &str, dir: &Path) -> Result<Event, String> {
+/// `post` records the file as the tool left it, `notify` records the
+/// agent's question. The event appended to the session's `events`, when
+/// the hook is one that is.
+pub fn hook(kind: &str, input: &str, dir: &Path) -> Result<Option<Event>, String> {
     let value = crate::json::parse(input).map_err(|e| format!("hook input: {e}"))?;
+    let written = || -> Result<(String, PathBuf), String> {
+        let tool = value
+            .get("tool_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+        let named = value
+            .path("tool_input.file_path")
+            .or_else(|| value.path("tool_input.notebook_path"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("{tool}: no file path in the tool input"))?;
+        let mut path = PathBuf::from(named);
+        if path.is_relative() {
+            let cwd = value.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
+            path = Path::new(cwd).join(path);
+        }
+        Ok((tool, resolve(&path)))
+    };
     let event = match kind {
         "pre" => {
-            let tool = value
-                .get("tool_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-            let named = value
-                .path("tool_input.file_path")
-                .or_else(|| value.path("tool_input.notebook_path"))
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| format!("{tool}: no file path in the tool input"))?;
-            let mut path = PathBuf::from(named);
-            if path.is_relative() {
-                let cwd = value.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
-                path = Path::new(cwd).join(path);
-            }
-            let path = resolve(&path);
-            checkpoint(dir, &path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let (tool, path) = written()?;
+            let said = |e: std::io::Error| format!("{}: {e}", path.display());
+            let holder = holder(dir, &path);
+            checkpoint(&holder, &path).map_err(said)?;
+            mark_pending(&holder, &path).map_err(said)?;
             Event::Wrote { tool, path }
+        }
+        "post" => {
+            let (_, path) = written()?;
+            let holder = holder(dir, &path);
+            if has(&holder, &path) {
+                record_after(&holder, &path).map_err(|e| format!("{}: {e}", path.display()))?;
+            }
+            return Ok(None);
         }
         "notify" => Event::Asked(
             value
@@ -161,7 +194,7 @@ pub fn hook(kind: &str, input: &str, dir: &Path) -> Result<Event, String> {
         other => return Err(format!("unknown hook {other:?}")),
     };
     append(dir, &event).map_err(|e| format!("events: {e}"))?;
-    Ok(event)
+    Ok(Some(event))
 }
 
 /// `crc --hook <kind>`: reads the hook's input and does [`hook`]. Never
@@ -208,6 +241,21 @@ fn key(path: &Path) -> String {
         "{:016x}",
         crate::platform::fnv1a(path.as_os_str().as_bytes())
     )
+}
+
+/// The session that holds `path`: `dir` when it has the file or no other
+/// session under the same root does, else that other session. Two agents
+/// on one file share the one checkpoint, from before either touched it.
+fn holder(dir: &Path, path: &Path) -> PathBuf {
+    if has(dir, path) {
+        return dir.to_path_buf();
+    }
+    dir.parent()
+        .map(sessions)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|other| other != dir && has(other, path))
+        .unwrap_or_else(|| dir.to_path_buf())
 }
 
 /// Keeps `path` as it is now, unless this session already has it.
@@ -276,6 +324,79 @@ pub fn has(dir: &Path, path: &Path) -> bool {
     dir.join("files")
         .join(format!("{}.path", key(path)))
         .exists()
+}
+
+/// The file's size and a hash of its bytes, as the post hook records them
+/// and Undo checks them; `absent` for a file that is not there.
+fn file_fingerprint(path: &Path) -> std::io::Result<String> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(format!(
+            "{} {:016x}",
+            bytes.len(),
+            crate::platform::fnv1a(&bytes)
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok("absent".into()),
+        Err(e) => Err(e),
+    }
+}
+
+/// The agent is about to write `path`: what the file is until the post
+/// hook runs is nobody's to undo.
+fn mark_pending(dir: &Path, path: &Path) -> std::io::Result<()> {
+    std::fs::write(dir.join("files").join(format!("{}.pending", key(path))), "")
+}
+
+/// Records `path` as the agent left it, in place of the pending mark.
+fn record_after(dir: &Path, path: &Path) -> std::io::Result<()> {
+    let files = dir.join("files");
+    let key = key(path);
+    let after = file_fingerprint(path)?;
+    crate::platform::write_atomically(&files.join(format!("{key}.after")), after.as_bytes())?;
+    match std::fs::remove_file(files.join(format!("{key}.pending"))) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// Whether [`undo_all`] would put the file back now, before anything is:
+/// for a session undone whole, where one file refused must stop the rest.
+pub fn undoable_now(dir: &Path, file: &File) -> Result<(), String> {
+    if file.checkpoint.undoable() {
+        as_agent_left(dir, file)
+    } else {
+        Ok(())
+    }
+}
+
+/// Whether the file is as the agent left it, so Undo may put it back:
+/// an error naming why not when it is not, or when nothing says.
+fn as_agent_left(dir: &Path, file: &File) -> Result<(), String> {
+    let name = file
+        .path
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    let files = dir.join("files");
+    let key = key(&file.path);
+    // Between the two hooks, or a `claude` started with settings from
+    // before the post hook existed: either way, what the agent left is not
+    // known.
+    if files.join(format!("{key}.pending")).exists() {
+        return Err(format!(
+            "{name}: the agent's write was not seen to finish: undo by hand"
+        ));
+    }
+    let Ok(after) = std::fs::read_to_string(files.join(format!("{key}.after"))) else {
+        return Err(format!(
+            "{name}: how the agent left it was not recorded: undo by hand"
+        ));
+    };
+    let now = file_fingerprint(&file.path).map_err(|e| format!("{name}: {e}"))?;
+    if now != after {
+        return Err(format!(
+            "{name} changed since the agent wrote it: undo by hand"
+        ));
+    }
+    Ok(())
 }
 
 /// Every file the session has a checkpoint for, in path order. A claim
@@ -429,9 +550,14 @@ pub fn read_events(dir: &Path, from: u64) -> (Vec<Event>, u64) {
     (events, from + end as u64 + 1)
 }
 
-/// Removes session folders untouched for longer than `max_age`, and says
-/// how many went. A folder's time is its newest event or checkpoint.
-pub fn prune(root: &Path, max_age: std::time::Duration) -> usize {
+/// The suffix of a session folder moved aside to be removed.
+const GONE: &str = ".gone";
+
+/// Removes session folders untouched for longer than `max_age`, except
+/// those in `keep` (the sessions of terminals still held), and whatever
+/// [`remove`] moved aside and did not finish; says how many went. A
+/// folder's time is its newest event or checkpoint.
+pub fn prune(root: &Path, max_age: std::time::Duration, keep: &[PathBuf]) -> usize {
     let Ok(entries) = std::fs::read_dir(root) else {
         return 0;
     };
@@ -439,6 +565,9 @@ pub fn prune(root: &Path, max_age: std::time::Duration) -> usize {
     let mut removed = 0;
     for entry in entries.filter_map(Result::ok) {
         let dir = entry.path();
+        if keep.contains(&dir) {
+            continue;
+        }
         let newest = [dir.join("events"), dir.join("files"), dir.clone()]
             .iter()
             .filter_map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
@@ -446,11 +575,52 @@ pub fn prune(root: &Path, max_age: std::time::Duration) -> usize {
         let old = newest
             .and_then(|at| now.duration_since(at).ok())
             .is_some_and(|age| age >= max_age);
-        if old && std::fs::remove_dir_all(&dir).is_ok() {
+        if (old || is_gone(&dir)) && std::fs::remove_dir_all(&dir).is_ok() {
             removed += 1;
         }
     }
     removed
+}
+
+/// Removes every session folder but those in `keep`, whatever its age:
+/// for the sessions of terminals closed before closing one removed its
+/// folder. Says how many went.
+pub fn prune_closed(root: &Path, keep: &[PathBuf]) -> usize {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|dir| dir.is_dir() && !keep.contains(dir))
+        .filter(|dir| std::fs::remove_dir_all(dir).is_ok())
+        .count()
+}
+
+/// Whether a folder is one [`remove`] moved aside.
+fn is_gone(dir: &Path) -> bool {
+    dir.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with(GONE))
+}
+
+/// Removes the session: its terminal closed. Moved aside first, so it
+/// leaves every listing at once, then removed on a thread, since a session
+/// can hold thousands of files.
+pub fn remove(dir: &Path) {
+    let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    if is_gone(dir) || !dir.is_dir() {
+        return;
+    }
+    let gone = dir.with_file_name(format!("{name}{GONE}"));
+    if std::fs::rename(dir, &gone).is_err() {
+        return;
+    }
+    std::thread::spawn(move || {
+        let _ = std::fs::remove_dir_all(gone);
+    });
 }
 
 /// Quoted for `sh`: the whole string, literally.
@@ -483,6 +653,15 @@ pub fn claude_settings(exe: &Path) -> String {
                 Value::Array(vec![object([
                     ("matcher", string("Write|Edit|MultiEdit|NotebookEdit")),
                     ("hooks", command("pre")),
+                ])]),
+            ),
+            // The write done: the file as the agent left it, which is what
+            // Undo checks against.
+            (
+                "PostToolUse",
+                Value::Array(vec![object([
+                    ("matcher", string("Write|Edit|MultiEdit|NotebookEdit")),
+                    ("hooks", command("post")),
                 ])]),
             ),
             (
@@ -527,7 +706,7 @@ pub fn claude_settings_arg() -> Option<String> {
     Some(shell_quote(&path.to_string_lossy()))
 }
 
-/// Every session folder under `root`.
+/// Every session folder under `root`, less any being removed.
 pub fn sessions(root: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(root) else {
         return Vec::new();
@@ -535,7 +714,7 @@ pub fn sessions(root: &Path) -> Vec<PathBuf> {
     entries
         .filter_map(Result::ok)
         .map(|e| e.path())
-        .filter(|p| p.is_dir())
+        .filter(|p| p.is_dir() && !is_gone(p))
         .collect()
 }
 
@@ -656,19 +835,24 @@ pub fn keep(dir: &Path, file: &File, hunk: usize, seen: u64) -> Result<(), Strin
 
 /// The file's text with one change undone, for the caller to put in place:
 /// through the open document when there is one, so it is one undo step,
-/// or with [`write_undone`] when there is not.
-pub fn undone(file: &File, hunk: usize, seen: u64) -> Result<String, String> {
+/// or with [`write_undone`] when there is not. Refused, like [`undo_all`],
+/// for a file that is not as the agent left it.
+pub fn undone(dir: &Path, file: &File, hunk: usize, seen: u64) -> Result<String, String> {
     if !file.checkpoint.undoable() {
         return Err("no copy from before the change was kept to undo to".into());
     }
+    as_agent_left(dir, file)?;
     let (old, new) = current(file, seen)?;
     crate::ide::diff::undo_hunk(&old, &new, hunk).ok_or_else(|| "that change is gone".into())
 }
 
 /// Writes [`undone`]'s text to the file, for a file not open in crc, and
-/// takes the file out of the session when nothing is left to review.
+/// takes the file out of the session when nothing is left to review. What
+/// it wrote is the state the next undo checks against.
 pub fn write_undone(dir: &Path, file: &File, text: &str) -> Result<(), String> {
-    std::fs::write(&file.path, text).map_err(|e| format!("{}: {e}", file.path.display()))?;
+    let said = |e: std::io::Error| format!("{}: {e}", file.path.display());
+    std::fs::write(&file.path, text).map_err(said)?;
+    record_after(dir, &file.path).map_err(said)?;
     settle(dir, file)
 }
 
@@ -687,9 +871,13 @@ pub fn keep_all(dir: &Path, file: &File) -> Result<(), String> {
 }
 
 /// Puts the whole file back as it was: its checkpoint copied over it, or
-/// the file removed when the agent created it.
+/// the file removed when the agent created it. Refused for a file that is
+/// not as the agent left it: the person's edits since are not undone.
 pub fn undo_all(dir: &Path, file: &File) -> Result<(), String> {
     let said = |e: std::io::Error| format!("{}: {e}", file.path.display());
+    if file.checkpoint.undoable() {
+        as_agent_left(dir, file)?;
+    }
     match &file.checkpoint {
         Checkpoint::Text(kept) => {
             std::fs::copy(kept, &file.path).map_err(said)?;
@@ -732,6 +920,8 @@ fn forget(dir: &Path, file: &File) -> Result<(), String> {
         ".unhooked",
         ".untracked",
         ".partial",
+        ".after",
+        ".pending",
         ".path",
     ] {
         match std::fs::remove_file(files.join(format!("{key}{suffix}"))) {
@@ -816,6 +1006,7 @@ mod tests {
         let file = files(&dir).remove(0);
         assert_eq!(texts(&file), Ok(("one\n".to_owned(), "one\n".to_owned())));
         std::fs::write(&path, vec![b'x'; MAX_CHECKPOINT as usize + 1]).expect("grow");
+        hook("post", &pre(&path), &dir).expect("hook");
         assert_eq!(
             texts(&file),
             Err("too large to review by change: keep or undo it whole".to_owned())
@@ -837,11 +1028,15 @@ mod tests {
         let b = crate::platform::canonical(&tree.0.join("src/b.rs"));
         assert_eq!(
             event,
-            Event::Wrote {
+            Some(Event::Wrote {
                 tool: "Write".into(),
                 path: b.clone()
-            }
+            })
         );
+        // The write done, the post hook records the file as the agent left
+        // it, and says nothing in the events.
+        assert_eq!(hook("post", &input, &dir).expect("hook"), None);
+        assert_eq!(read_events(&dir, 0).0.len(), 1);
         assert_eq!(files(&dir)[0].path, b);
     }
 
@@ -933,10 +1128,32 @@ mod tests {
 
     #[test]
     fn prune_removes_only_old_sessions() {
-        let tree = TempTree::new("review-prune", &[("fresh/events", "")]);
-        assert_eq!(prune(&tree.0, MAX_AGE), 0);
-        assert_eq!(prune(&tree.0, std::time::Duration::ZERO), 1);
+        let tree = TempTree::new(
+            "review-prune",
+            &[
+                ("fresh/events", ""),
+                ("held/events", ""),
+                ("left.gone/events", ""),
+            ],
+        );
+        let held = tree.0.join("held");
+        assert_eq!(
+            prune(&tree.0, MAX_AGE, &[]),
+            1,
+            "a removal left behind goes"
+        );
+        assert!(!tree.0.join("left.gone").exists());
+        // A session whose terminal is still held is never aged out.
+        assert_eq!(
+            prune(
+                &tree.0,
+                std::time::Duration::ZERO,
+                std::slice::from_ref(&held)
+            ),
+            1
+        );
         assert!(!tree.0.join("fresh").exists());
+        assert!(held.is_dir());
     }
 
     #[test]
@@ -955,6 +1172,7 @@ mod tests {
             .expect("command");
         assert_eq!(command, r"'/Applications/crc'\''s.app/crc' --hook pre");
         for (event, kind) in [
+            ("PostToolUse", "post"),
             ("Notification", "notify"),
             ("Stop", "stop"),
             ("TaskCreated", "task-created"),
@@ -987,6 +1205,7 @@ mod tests {
         let path = crate::platform::canonical(&path);
         hook("pre", &pre(&path), &dir).expect("hook");
         std::fs::write(&path, after).expect("agent writes");
+        hook("post", &pre(&path), &dir).expect("hook");
         let file = files(&dir).remove(0);
         (dir, file)
     }
@@ -1004,7 +1223,7 @@ mod tests {
         let (old, new) = texts(&file).expect("texts");
         assert_eq!(crate::ide::diff::diff(&old, &new).hunks.len(), 1);
 
-        let text = undone(&file, 0, fingerprint(&new)).expect("undo");
+        let text = undone(&dir, &file, 0, fingerprint(&new)).expect("undo");
         assert_eq!(text, "a\nB\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\n");
         write_undone(&dir, &file, &text).expect("write");
         assert_eq!(std::fs::read_to_string(&file.path).expect("read"), text);
@@ -1017,7 +1236,7 @@ mod tests {
         let (dir, file) = reviewed(&tree, "f.txt", BEFORE, AFTER);
         std::fs::write(&file.path, "moved on\n").expect("write");
         assert!(keep(&dir, &file, 0, fingerprint(AFTER)).is_err());
-        assert!(undone(&file, 0, fingerprint(AFTER)).is_err());
+        assert!(undone(&dir, &file, 0, fingerprint(AFTER)).is_err());
         assert_eq!(files(&dir).len(), 1);
     }
 
@@ -1031,11 +1250,126 @@ mod tests {
         let created = tree.0.join("new.txt");
         hook("pre", &pre(&created), &dir).expect("hook");
         std::fs::write(&created, "made by the agent\n").expect("write");
+        hook("post", &pre(&created), &dir).expect("hook");
         let file = files(&dir).remove(0);
         assert_eq!(file.checkpoint, Checkpoint::Absent);
         undo_all(&dir, &file).expect("undo all");
         assert!(!created.exists());
         assert!(files(&dir).is_empty());
+    }
+
+    #[test]
+    fn undo_refuses_a_file_changed_since_the_agent_wrote_it() {
+        let tree = TempTree::new("review-undo-guard", &[]);
+        let (dir, file) = reviewed(&tree, "f.txt", BEFORE, AFTER);
+        // The person edits the file after the agent: undo would lose that.
+        let edited = "a\nB\nc\nd\ne\nf\ng\nh\ni\nj\nk\nL\nmine\n";
+        std::fs::write(&file.path, edited).expect("edit");
+        let said = undo_all(&dir, &file).expect_err("refused");
+        assert!(said.contains("changed since the agent wrote it"), "{said}");
+        assert!(
+            undone(&dir, &file, 0, fingerprint(edited)).is_err(),
+            "one change neither"
+        );
+        assert_eq!(std::fs::read_to_string(&file.path).expect("read"), edited);
+        assert_eq!(files(&dir).len(), 1, "still under review");
+
+        // A file the hook saw before a write but never after is unknown,
+        // which is as unsafe: the agent may still be writing it.
+        let g = tree.0.join("g.txt");
+        std::fs::write(&g, BEFORE).expect("write");
+        let g = crate::platform::canonical(&g);
+        hook("pre", &pre(&g), &dir).expect("hook");
+        std::fs::write(&g, AFTER).expect("agent writes");
+        let file = files(&dir).into_iter().find(|f| f.path == g).expect("g");
+        let said = undo_all(&dir, &file).expect_err("refused");
+        assert!(said.contains("undo by hand"), "{said}");
+        assert_eq!(std::fs::read_to_string(&g).expect("read"), AFTER);
+    }
+
+    #[test]
+    fn an_unchanged_file_still_undoes() {
+        let tree = TempTree::new("review-undo-same", &[]);
+        let (dir, file) = reviewed(&tree, "f.txt", BEFORE, AFTER);
+        // One change undone through the page, then the rest: what the page
+        // wrote counts as the agent's state for the next undo.
+        let text = undone(&dir, &file, 1, fingerprint(AFTER)).expect("undo one");
+        write_undone(&dir, &file, &text).expect("write");
+        assert_eq!(std::fs::read_to_string(&file.path).expect("read"), text);
+        undo_all(&dir, &file).expect("undo all");
+        assert_eq!(std::fs::read_to_string(&file.path).expect("read"), BEFORE);
+        assert!(files(&dir).is_empty());
+
+        // The agent writes the same file again in a later turn: the hooks
+        // move the fingerprint along with it.
+        let path = crate::platform::canonical(&tree.0.join("f.txt"));
+        hook("pre", &pre(&path), &dir).expect("hook");
+        std::fs::write(&path, AFTER).expect("agent writes");
+        hook("post", &pre(&path), &dir).expect("hook");
+        hook("pre", &pre(&path), &dir).expect("hook");
+        std::fs::write(&path, "third\n").expect("agent writes");
+        hook("post", &pre(&path), &dir).expect("hook");
+        let file = files(&dir).remove(0);
+        undo_all(&dir, &file).expect("undo all");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), BEFORE);
+    }
+
+    #[test]
+    fn a_second_session_leaves_the_file_to_the_first() {
+        let tree = TempTree::new("review-two-agents", &[("f.txt", BEFORE)]);
+        let first = tree.0.join("session-a");
+        let second = tree.0.join("session-b");
+        let path = crate::platform::canonical(&tree.0.join("f.txt"));
+        hook("pre", &pre(&path), &first).expect("hook");
+        std::fs::write(&path, AFTER).expect("first agent writes");
+        hook("post", &pre(&path), &first).expect("hook");
+        // The second agent's hooks find the first's claim: no new baseline
+        // from after the first agent's change, and its fingerprint lands
+        // with the first session.
+        hook("pre", &pre(&path), &second).expect("hook");
+        std::fs::write(&path, "both\n").expect("second agent writes");
+        hook("post", &pre(&path), &second).expect("hook");
+        assert!(files(&second).is_empty(), "listed once, under the first");
+        let file = files(&first).remove(0);
+        let Checkpoint::Text(kept) = &file.checkpoint else {
+            panic!("{:?}", file.checkpoint);
+        };
+        assert_eq!(std::fs::read_to_string(kept).expect("read"), BEFORE);
+        undo_all(&first, &file).expect("undo all");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), BEFORE);
+        // The second session's events still say it wrote.
+        assert_eq!(read_events(&second, 0).0.len(), 1);
+    }
+
+    #[test]
+    fn a_closed_session_is_removed_and_a_live_one_kept() {
+        let tree = TempTree::new(
+            "review-prune-closed",
+            &[
+                ("live/files/", ""),
+                ("gone/files/", ""),
+                ("old.gone/files/", ""),
+            ],
+        );
+        let live = tree.0.join("live");
+        assert_eq!(
+            sessions(&tree.0).len(),
+            2,
+            "a folder being removed is not listed"
+        );
+        assert_eq!(prune_closed(&tree.0, std::slice::from_ref(&live)), 2);
+        assert!(live.is_dir());
+        assert!(!tree.0.join("gone").exists());
+        assert!(!tree.0.join("old.gone").exists());
+        // Removing a session takes it out of the listing at once.
+        remove(&live);
+        assert!(!live.exists());
+        assert!(sessions(&tree.0).is_empty());
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tree.0.join("live.gone").exists() && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!tree.0.join("live.gone").exists());
     }
 
     #[test]
@@ -1102,7 +1436,7 @@ mod tests {
         let (old, new) = texts(f).expect("texts");
         assert_eq!((old.as_str(), new.as_str()), (BEFORE, AFTER));
         assert!(!f.checkpoint.undoable());
-        assert!(undone(f, 0, fingerprint(AFTER)).is_err());
+        assert!(undone(&dir, f, 0, fingerprint(AFTER)).is_err());
         assert!(undo_all(&dir, f).is_err());
         assert!(keep(&dir, f, 0, fingerprint(AFTER)).is_err());
         assert_eq!(std::fs::read_to_string(&f.path).expect("read"), AFTER);
