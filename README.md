@@ -141,10 +141,11 @@ the size and write it back.
 - **Agents mode** (`Cmd-Shift-A`, or the Editor / Agents switch in the
   toolbar; crc opens on it unless launched on a file or folder): the
   terminal takes the editor column, the activity bar goes,
-  and the sidebar lists workspaces, one row each: its name, and under it
-  what a session waiting on you asks, what a working agent says, or its
-  terminals and branch; at the right how many wait on you and its pull
-  request, coloured by its checks. The terminal's tabs are the selected
+  and the sidebar lists workspaces, one row each: its name (a folder
+  workspace shows its folder's name, the full path on hover), and under
+  it what a session waiting on you asks, what a working agent says, or
+  its branch, changes and what is left to push and pull; at the right how
+  many wait on you and its pull request, coloured by its checks. The terminal's tabs are the selected
   workspace's sessions. The list is one for the whole app, not the
   folder open in the editor. New Workspace (`Cmd-Shift-N`) adds one on
   a folder you choose (a folder can hold several), with no folder at all
@@ -225,7 +226,8 @@ the size and write it back.
   Undo is refused while the file has unsaved edits in crc; an open clean
   file reloads, and `Cmd-Z` there brings the agent's version back. Files
   changed by shell commands while the terminal works are listed as well,
-  to keep only.
+  to keep only. The page reads in the background, so an agent writing
+  while it is open never stalls crc.
 - **Workspaces**: open a folder that holds several repositories and the
   notes about them, and Source Control shows one repository at a time
   with a menu to switch. Home becomes the workspace's front page: what
@@ -273,8 +275,9 @@ the size and write it back.
   can copy to the clipboard (OSC 52, as Claude Code does with what you
   drag over it), but never read it. A session that sends a notification
   (OSC 9, 777 or 99) or rings the bell gets a dot and a line in the status
-  bar saying what it asked, until you type into it; Home lists the
-  waiting ones first.
+  bar saying what it asked, until you type into it (a bell right after
+  your keystroke is the program answering you, and is not counted); Home
+  lists the waiting ones first.
 - **Local Git** (`Cmd-Option-G`): branch and status, changed files, staged
   and working-tree diffs, whole-file, hunk and line stage/unstage (Space in
   the diff stages the hunk under the cursor or the selected lines), Stage All and
@@ -288,8 +291,8 @@ the size and write it back.
   bar, an unmerged one only after asking; fetch, pull (fast-forward, or
   with rebase or merge when the branches have diverged) and push (never
   forced) from the buttons beside the branch, which count the commits to
-  pull and push, or from the Git menu; and the caret line's blame in the
-  status line.
+  pull and push and say when the branch was last checked, or from the Git
+  menu; and the caret line's blame in the status line.
 - **Merge conflicts**, however the merge, rebase, cherry-pick or stash pop
   that left them was run: conflicted files get their own group in Source
   Control and the status bar says `MERGING` or `REBASING`. In the file,

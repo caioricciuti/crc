@@ -57,6 +57,73 @@ One entry per tag, written for people who use the editor.
   list offers Restart crc, in place of a note telling you to quit and
   reopen by hand. crc looks for that when it comes to the front and every
   half minute while it draws.
+- The Review page no longer freezes crc. The previous build read every
+  checkpoint and current file on the main thread each time the watcher
+  reported a change, so with the page open in a busy checkout (an agent
+  writing) clicks stalled, and opening the page could take seconds. The
+  page now reads on a worker, once per change, a burst of writes folded
+  into at most one more read, and only while it is on screen; a page
+  left stale reads again when shown. Opening it returns at once and shows
+  sketched rows until the read lands. A write to a file already on the
+  page, which changed no count and so left the old diff showing, now
+  refreshes the page two seconds after the writes pause.
+- The status line names files, not paths: "Saved main.rs", with the full
+  path as the tooltip. News (opened, saved, created) fades after a
+  moment, and clears when you switch between the editor and Agents mode
+  or close the tab it was about; failures stay. A message that asks for
+  something carries a button: the one about a missing preview opens
+  Extensions with Markdown Preview selected. The rust-analyzer starting
+  text no longer hides the spinner.
+- Every panel with nothing to show says so the same way: an icon, a
+  title, one hint and at most one button. MCP with no servers, a Git
+  panel with nothing changed, a workspace without a terminal (with a New
+  Terminal button), the Workspace inspector before its first read, the
+  Extensions page with nothing picked and Home with no recent folders,
+  where each had its own grey line or nothing at all.
+- Controls share one scale. Corners come in three sizes and page titles
+  and headings in one; the Editor/Agents switch, File History's range
+  and the Table strip are the same segmented control; toolbar buttons sit
+  on the same fill as the switch; the find bar's toggles have a resting
+  fill and differ by colour alone when on; each page has one filled
+  primary button (Restore stays plain until a past version is shown);
+  the history timeline has one thumb; terminal tabs are the height of
+  editor tabs with the same close glyph. The palette's scrim is darker
+  and says the Escape hint once, the palette fades in over 120 ms, and
+  sketched rows breathe smoothly instead of stepping.
+- A file opened behind a page comes to the front. With a split and
+  Settings, Extensions, MCP or Review covering the focused pane, a file
+  opened from the palette, the sidebar, a dialog, a drop or Go to
+  Definition said opened and showed nothing: its tab landed behind the
+  page. The page now closes, the way Escape closes it, and the file shows.
+- Agents mode: a folder workspace's row and the inspector header show
+  the folder's name, with the parent folder only when two names clash and
+  the full path as the tooltip, and the row carries its branch, how many
+  files changed and what there is to push and pull, from the last read.
+  A row no longer says a session rang the bell when the shell only
+  answered a stray Escape: a bell within 300 ms of your keystroke is the
+  program answering you, not a call for attention. The wheel scrolls the
+  workspace list, which did not scroll at all before. Over a full-screen
+  program that does not take the mouse (a pager, an editor in the
+  terminal) the wheel sends Up and Down arrows, one per line, as other
+  terminals do.
+- Escape that closes a page no longer reaches the shell. With the
+  terminal focused, Escape went to the shell first, so a page over the
+  editor column stayed open and bash rang its bell on the stray key. A
+  key that closes a page is spent; only with nothing left to close does
+  Escape go to the shell.
+- The Git panel says what Pull and Push would do: the arrows carry how
+  many commits each would move, Pull is disabled when the branch has no
+  upstream, and Push stays live since it publishes the branch. The branch
+  row says "checked 14:32", from the last fetch, or "not checked", the
+  words the Workspace inspector uses. Each change row shows its staging
+  box at rest, empty or with a tick when staged.
+- Home is a centred column that scrolls with the wheel and the page keys,
+  so every section stays reachable in a short window instead of the
+  lower ones falling off. Recent and Repositories show the folder's name,
+  the path cut from the left when it does not fit and whole in the
+  tooltip. The Keys table draws key caps. The Explorer with no folder
+  open shows one Open Folder button instead of repeating Home's Start
+  list.
 
 ## v0.2.0-alpha.25, 2026-10-17
 
