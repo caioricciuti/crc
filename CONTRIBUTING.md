@@ -35,6 +35,22 @@ before sending the change:
 scripts/selftest.sh terminal merge
 ```
 
+Use isolated lanes to run the native suite concurrently (the build runs
+once). Each scenario within a lane has its own fixture directory,
+settings, history and terminal helpers, so project scans cannot pick up
+files or caches left by an earlier scenario.
+Filters still select scenarios before assignment. `--shuffle` changes
+the order within lanes reproducibly to check scenario independence:
+
+```sh
+scripts/selftest.sh --jobs 4
+scripts/selftest.sh --jobs 4 --shuffle
+```
+
+Failures keep the lane logs and fixtures at the printed artifact path;
+passing runs remove their temporary files. The scheduler checks run with
+`python3 -m unittest discover -s scripts -p 'test_selftest_parallel.py'`.
+
 For changes that send Objective-C messages (`msg_send!`, blocks, a new
 AppKit or WebKit call), run the suite once against a debug build too.
 Release builds skip objc2's type checks, so a wrong argument or return

@@ -88,6 +88,9 @@ jobs:
         timeout-minutes: 20
         run: cargo test --all-targets --locked --offline
 
+      - name: Native self-test scheduler
+        run: python3 -m unittest discover -s scripts -p 'test_selftest_parallel.py'
+
       # The renderer needs a GPU. GitHub's macOS runners have one, but not a
       # display, which is exactly why the offscreen path exists: it exercises
       # the real pipeline, shader and layout with no window.

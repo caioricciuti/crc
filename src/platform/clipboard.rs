@@ -11,7 +11,10 @@ use objc2_foundation::{NSDictionary, NSString};
 /// that copies never replaces what the person running it had copied.
 fn general() -> Retained<NSPasteboard> {
     if std::env::var_os("CRC_SELFTEST").is_some() {
-        return NSPasteboard::pasteboardWithName(&NSString::from_str("crc-selftest"));
+        return NSPasteboard::pasteboardWithName(&NSString::from_str(&format!(
+            "crc-selftest-{}",
+            std::process::id()
+        )));
     }
     NSPasteboard::generalPasteboard()
 }

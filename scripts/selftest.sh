@@ -14,6 +14,7 @@
 # includes dead keys: the input system only composes for the active app.
 #
 # Usage: scripts/selftest.sh        (builds first)
+#        scripts/selftest.sh --jobs 4 (isolated parallel lanes)
 #        scripts/selftest.sh --debug  (a debug build, which checks every
 #                                      Objective-C message's types)
 #        scripts/selftest.sh terminal conflicts   (only the scenarios in
@@ -42,23 +43,56 @@ elapsed() {
 run_start=$(now)
 
 debug=0
+jobs=1
+lane=""
+shuffle=0
 only=""
-for arg in "$@"; do
+while [ "$#" -gt 0 ]; do
+    arg=$1
+    shift
     case "$arg" in
         --debug) debug=1 ;;
+        --jobs|--lane)
+            [ "$#" -gt 0 ] || { echo "error: $arg needs a value" >&2; exit 2; }
+            if [ "$arg" = --jobs ]; then jobs=$1; else lane=$1; fi
+            shift ;;
+        --shuffle) shuffle=1 ;;
+        --*) echo "error: unknown option $arg" >&2; exit 2 ;;
         *) only="$only $arg" ;;
     esac
 done
+case "$jobs" in ''|*[!0-9]*|0) echo 'error: --jobs needs a positive integer' >&2; exit 2 ;; esac
+if ! [ "$jobs" -gt 0 ] 2>/dev/null; then
+    echo 'error: --jobs needs a positive integer' >&2
+    exit 2
+fi
+if [ "$shuffle" = 1 ] && [ "$jobs" = 1 ]; then
+    echo 'error: --shuffle requires --jobs greater than 1' >&2
+    exit 2
+fi
 build_start=$(now)
 if [ "$debug" = 1 ]; then
-    cargo build --locked
+    [ -n "$lane" ] || cargo build --locked
     BIN=target/debug/crc
 else
-    cargo build --release --locked
+    [ -n "$lane" ] || cargo build --release --locked
     BIN=target/release/crc
 fi
 build_secs=$(elapsed "$build_start")
-T=$(mktemp -d)
+if [ "$jobs" -gt 1 ]; then
+    # Filters are words, as in the serial runner. Build once before lanes
+    # replace HOME and isolate the native app's settings and helper records.
+    exec python3 scripts/selftest-parallel.py --jobs "$jobs" --debug "$debug" --shuffle "$shuffle" --build-secs "$build_secs" $only
+fi
+if [ -n "$lane" ]; then
+    T="$lane/fixture"
+    mkdir -p "$T"
+    : > "$lane/pass.list"
+    : > "$lane/fail.list"
+else
+    T=$(mktemp -d)
+fi
+run_root=$T
 # A Mac that sleeps mid-run (a closed lid) goes on only in short dark
 # wakes with the display off: no frames are drawn and every wait runs
 # long, so the scenarios then fail for no fault of their own. Say so.
@@ -74,7 +108,9 @@ slept_note() {
 }
 # Terminals run in helper processes that outlive each app launch (see
 # src/term/hold.rs); the run's are ended with it.
-trap 'result=$?; pkill -f -- "--hold $T/home/" 2>/dev/null || true; if [ "$result" -eq 0 ]; then rm -rf "$T"; else slept_note; echo "Self-test failure artifacts: $T (what failed: $T/selftest.log)"; fi' EXIT
+trap 'result=$?; pkill -f -- "--hold $run_root/" 2>/dev/null || true; if [ "$result" -eq 0 ]; then rm -rf "$run_root"; else [ -n "$lane" ] || slept_note; echo "Self-test failure artifacts: $run_root (what failed: $run_root/selftest.log)"; fi' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 # Everything said from here is also kept with the artifacts, so a failure
 # seen once can still be named after the terminal has scrolled past it.
 exec > >(tee "$T/selftest.log") 2>&1
@@ -155,8 +191,24 @@ expect_terminal() {
     fi
 }
 
+# Every parallel scenario has its own stderr files as well as its home.
+check_stderr() {
+    if ls "$T"/*.err >/dev/null 2>&1 && cat "$T"/*.err | grep -v '^slow frame' | grep -q .; then
+        echo "FAIL: the app wrote to stderr:"
+        cat "$T"/*.err | grep -v '^slow frame'
+        fail=1
+    fi
+}
+
 ran=""
-for scenario in scripts/selftest/[0-9][0-9]-*.sh; do
+scenarios=(scripts/selftest/[0-9][0-9]-*.sh)
+if [ -n "$lane" ]; then
+    scenarios=()
+    while IFS= read -r name; do
+        scenarios+=("scripts/selftest/$name.sh")
+    done < "$lane/scenarios.list"
+fi
+for scenario in "${scenarios[@]}"; do
     name=$(basename "$scenario" .sh)
     if [ -n "$only" ]; then
         wanted=0
@@ -166,8 +218,29 @@ for scenario in scripts/selftest/[0-9][0-9]-*.sh; do
         [ "$wanted" = 1 ] || continue
     fi
     scenario_start=$(now)
+    if [ -n "$lane" ]; then
+        # A scenario can open T itself as a project. Earlier scenarios'
+        # caches/toolchains must not enter that project's scan or replace
+        # its status message with a file-limit warning.
+        T="$run_root/$name"
+        mkdir -p "$T/home"
+        export HOME="$T/home"
+        export CLAUDE_CONFIG_DIR="$T/claude-config"
+        export CRC_HISTORY_DB="$T/history.db"
+    fi
+    previous_fail=$fail
+    fail=0
     # shellcheck source=/dev/null
     . "$scenario"
+    if [ -n "$lane" ]; then
+        check_stderr
+        if [ "$fail" = 0 ]; then
+            echo "$name" >> "$lane/pass.list"
+        else
+            echo "$name" >> "$lane/fail.list"
+        fi
+    fi
+    if [ "$previous_fail" != 0 ]; then fail=1; fi
     scenario_secs=$(elapsed "$scenario_start")
     echo "timing: ${name#[0-9][0-9]-} $scenario_secs"
     timings="$timings${name#[0-9][0-9]-} $scenario_secs
@@ -176,6 +249,7 @@ for scenario in scripts/selftest/[0-9][0-9]-*.sh; do
     # opens: a scenario's terminals, and their records, end with it.
     pkill -f -- "--hold $T/home/" 2>/dev/null || true
     find "$T/home" -type d -path '*/crc/held' -prune -exec rm -rf {} + 2>/dev/null || true
+    T=$run_root
     ran="$ran ${name#[0-9][0-9]-}"
 done
 if [ -z "$ran" ]; then
@@ -185,11 +259,7 @@ fi
 
 # "slow frame" lines are the app's own latency log, and a machine busy
 # compiling will produce them. Anything else on stderr is a finding.
-if ls "$T"/*.err >/dev/null 2>&1 && cat "$T"/*.err | grep -v '^slow frame' | grep -q .; then
-    echo "FAIL: the app wrote to stderr:"
-    cat "$T"/*.err | grep -v '^slow frame'
-    fail=1
-fi
+check_stderr
 
 # Where the time went: the whole run, the build, the scenarios together,
 # and the five that took longest, so a slow suite names its slow parts.
