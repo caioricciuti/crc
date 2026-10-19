@@ -1,0 +1,54 @@
+---
+title: Data tables and SQL queries
+description: Edit CSV and TSV grids, preview Parquet, JSONL and SQLite through DuckDB, and export query results.
+---
+
+## CSV and TSV
+
+CSV and TSV files up to 32 MiB open as a grid. The first row is the header;
+row numbers and the header stay visible while scrolling. Columns are sized
+from the first 200 values. The Table strip shows shape, delimiter and
+ragged rows, with **Grid** and **Text** segments. Escape switches to text.
+Larger files open as text.
+
+Click a cell, or move with arrows and Tab. Return, double-click or typing
+opens its editor. Return commits; Tab/Shift-Tab commits and moves; Escape
+cancels. The Table menu and right-click menu insert/delete rows and
+columns or clear a cell. Delete/Backspace clears the selected cell.
+
+Each change is one undo step in the file's text. Save preserves its
+detected comma, semicolon, tab or pipe delimiter, quoting rules, byte-order
+mark and line endings. Nothing is converted just by opening the grid.
+
+## Query a saved file
+
+**Table › Query…**, or **Query** in the strip, accepts SQL over the saved
+source, named `here`. For example:
+
+```sql
+SELECT * FROM here LIMIT 20;
+```
+
+**Cmd-Return** runs the query in the background through an installed
+`duckdb` command. crc does not bundle or install DuckDB. If it is missing,
+the status line explains how to get it. Save edits before querying them.
+
+Results open in a separate read-only grid with a row count and elapsed
+time. **Back to file** returns to the source; **Export CSV** saves the
+result without changing the source. Errors appear in the query strip.
+
+Queries have a 30-second timeout and captured output is bounded to 10,000
+data rows and 64 MiB. Truncated results are marked. The displayed grid is
+read-only; SQL is executed by an external DuckDB process, not a SQL
+security sandbox.
+
+## Other data formats
+
+With DuckDB installed, Parquet, JSONL, NDJSON and SQLite (`.sqlite`, `.db`)
+open as generated read-only grids. SQLite selects its first user table.
+The Query field runs over the saved source as `here`; exporting writes
+CSV, not edits to the source database or Parquet file.
+
+This is a bounded data preview and query workflow. There is no schema
+browser, database transaction editor or full SQLite workspace. Office
+documents (`.xlsx`, `.docx`, `.pptx`) still use read-only Quick Look.

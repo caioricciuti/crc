@@ -17,7 +17,6 @@ const icons = iconSet.icons as Record<string, Icon>;
 const iconFor = (name?: string): Icon => icons[name ?? "extensions"] ?? icons.extensions;
 
 const extensions = [...registry.extensions].sort((a, b) => a.name.localeCompare(b.name));
-const live = registry.source === "registry";
 const repo = "https://github.com/caioricciuti/crc-extensions";
 ---
 
@@ -67,7 +66,7 @@ const repo = "https://github.com/caioricciuti/crc-extensions";
         <h2 class="h2">{extensions.length} extensions, {extensions.reduce((n, e) => n + e.commands.length, 0)} commands.</h2>
         <p class="lead">
           In crc: <b>Extensions › Extensions…</b> (<kbd>⌘</kbd><kbd>⇧</kbd><kbd>X</kbd>), pick one, Install.
-          {!live && " The signed registry opens with its first published release; until then these install from a folder."}
+          This catalog is a build-time snapshot; check the app's signed registry for current versions and availability.
         </p>
       </div>
       <div class="cards">

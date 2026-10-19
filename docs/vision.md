@@ -37,22 +37,26 @@ out what it did afterwards.
 
 **It is native, and it is measured.** crc draws text on the GPU straight
 through Metal and CoreText, the same APIs macOS uses for itself. One draw
-call per frame, only the visible lines laid out. A keystroke reaches the GPU
-in 0.8 ms at p99 in a 100 MiB file, a tenth of a frame at 120 Hz, and the
-harness that proves it ships in the repository so you can run it yourself.
-The whole app is 17 MB.
+call per frame, only the visible lines laid out. The alpha.1 benchmark on
+2026-09-24 measured buffer edit through GPU completion at 0.803 ms p99 in
+a 100 MiB file. It excludes event delivery and display scanout; results
+vary by machine. The harness ships in the repository. Bundle builds
+enforce a 30 MiB size gate.
 
 **It is small enough to read.** The Rust dependency tree is 14 crates, one
 build script and zero proc macros, every one pinned to an exact version and
 read line by line. Where the OS already ships the thing, crc uses it: CoreText
 instead of a font stack, Metal instead of a graphics layer, the system SQLite
 instead of a crate. CI fails if a new build script or proc macro appears. No
-telemetry, no accounts, no web view, no JavaScript runtime.
+app telemetry or required crc account. The editor is native; restricted
+extension preview pages use the system WebKit view.
 
-**It is honest about your files.** Atomic saves. External changes, from Git
+**It is honest about your files.** Ordinary saves use atomic replacement;
+preserving hard links can require an in-place write. External changes, from Git
 or a formatter or an agent, reload a clean tab and ask before touching a
-dirty one. Unsaved text survives a crash as plain files you can open with
-anything.
+dirty one. The panic handler attempts to keep unsaved text as plain files;
+it is not a power-loss backup. Local history provides separately bounded
+versions and persistent undo.
 
 **It keeps the work, not just the code.** Real work is a folder: a few
 repositories and the notes about them, where things stand, what waits on
@@ -62,8 +66,8 @@ repository's state is one click away, and a commit that would carry a
 private note into a public repository is stopped before it is made.
 
 **It lets the agent in, where you can see it.** Claude Code connects to crc
-as its IDE. It sees your file, your selection and your diagnostics, and every
-edit it proposes opens as a diff you accept or reject. Files it writes show up
+as its IDE. It sees your file, your selection and your diagnostics. Edits
+proposed through the IDE bridge open as diffs you accept or reject. Files it writes show up
 in their tabs at once. The bridge listens on localhost only, behind a token
 only you can read.
 
@@ -91,8 +95,11 @@ An extension should be WebAssembly with a manifest that says what it may
 read, write and reach, and a host that enforces it. Installing an extension
 should never mean handing a stranger your home folder.
 
-*Not built yet.* crc has no extensions at all until this exists, on purpose.
-How they will work is in [the extensions design](extensions.md).
+*Built, with limited capabilities.* WASM extensions can read/replace
+selection or document text and return restricted preview pages. They
+cannot access the filesystem, network or subprocesses directly. The
+official registry is signature-checked; folder installs are marked unsigned.
+The contract is in [the extensions design](extensions.md).
 
 ### 3. An agent is a protocol client, not a sidebar
 
@@ -112,8 +119,9 @@ marked until you answer it. The general API is not built yet.
 - **Be cross-platform at the cost of being good on one.** macOS only, Apple
   Silicon only. A port would mean a second backend written from scratch, and
   that trade was made deliberately.
-- **Phone home.** Nothing is sent anywhere except a once-a-day check for a
-  newer release, which one setting turns off.
+- **Collect app telemetry.** crc has no app telemetry or required account.
+  Release checks, updates, the extension registry and connected tools do
+  use the network; Git, HTTP, SSH and MCP contact the services you use.
 - **Grow a dependency without an argument.** Every crate needs a reason
   written down, and a measurement where it claims speed.
 - **Pretend.** Features are described as built, partly built or not built.

@@ -6,8 +6,8 @@ description: What crc does not do yet, and what it does not do on purpose.
 import { Aside } from "@astrojs/starlight/components";
 
 <Aside type="caution" title="This is an alpha">
-  crc is used daily by its author and is now going to a small group of
-  testers. Passing tests are not a stability guarantee. Known problems are in
+  crc is used daily by its author. Passing tests are not a stability
+  guarantee. Known problems are in
   the [issue tracker](https://github.com/caioricciuti/crc/issues).
 </Aside>
 
@@ -24,11 +24,16 @@ import { Aside } from "@astrojs/starlight/components";
 - **Highlighting covers the [listed languages](/docs/features/syntax-highlighting/).**
   Each grammar is vendored generated C pinned in `third_party/CHECKSUMS`. SQL is
   not in the alpha.
-- **Five language servers**, and no code actions from them.
+- **Five language-server integrations.** Code actions depend on what the
+  installed server supplies; crc does not bundle language servers.
 
 ## Editor
 
 - **No minimap.**
+- **Markdown styling has edges.** Non-ASCII lines do not draw italic in its
+  own face, bold uses a doubled regular face, and right-to-left lines keep
+  syntax visible. Wrapped rows break by raw text width, including hidden
+  syntax. Headings use the body font size.
 - **Panes are a way of looking.** A file is open in one pane at a time, and a
   restored session puts every pane's files into one pane.
 - **Bounded by design.** Project search skips files over 2 MiB and shows the
@@ -42,9 +47,10 @@ import { Aside } from "@astrojs/starlight/components";
 - **Gutter marks compare with HEAD**, not the index, and stop at 2 MiB.
 - **Hunk staging covers tracked text changes**; other change types use
   whole-file actions.
-- **Pull is fast-forward only**, and crc has no merge or rebase command of
-  its own. Conflicts from one you ran are resolved in crc; finishing,
-  continuing or aborting it is Git's.
+- **History is per file.** There is no repository log or commit graph.
+  Diverged pulls can rebase or merge; starting an arbitrary branch merge or
+  rebase is still a terminal operation. crc resolves conflicts, aborts merge
+  or rebase, and continues a rebase.
 - **Conflict markers are Git's default seven characters.** A custom
   `conflict-marker-size` is not recognised, and files over 16 MiB are not
   scanned for conflicts.
@@ -54,13 +60,31 @@ import { Aside } from "@astrojs/starlight/components";
 - Files over **512 MB** open read-only; files over **2 GB** are refused. Both
   say why.
 - Crash recovery covers crashes in crc's own code, not a power cut.
+- Local history keeps bounded versions of files up to 2 MiB, with secret
+  exclusions and retention limits. It is not a complete backup.
+- Office documents remain read-only Quick Look previews. DuckDB data
+  grids are bounded, read-only snapshots, not full database editing.
 
 ## Updates and extensions
 
-- **Updates are announced, not installed.** Once a day crc asks GitHub whether
-  a newer release exists and says so in the status line. Nothing is
-  downloaded. `update_check = false` turns the check off.
-- **Extensions are new and narrow.** They can read and replace the
-  selection or the document and add commands; nothing else yet. The signed
-  registry is not live until its first release, so for now they install from
-  a folder. See [Extensions](/docs/features/extensions/).
+- **Updates require your action.** The daily check downloads nothing;
+  Check for Updates and Restart to Update download, verify and install
+  when you ask. Installation needs write access to the app location.
+- **Extensions are narrow.** Capabilities cover selection/document text and
+  a restricted preview page, not filesystem, network or process access.
+  See [Extensions](/docs/features/extensions/).
+
+## Agents and MCP
+
+- **Agent undo needs a copy from before the write.** crc-started Claude
+  Write/Edit hooks can provide one. Shell writes and unhooked agents are
+  keep-only. The separate Review page has been removed.
+- **Sessions after reboot are replacements.** The original process and
+  scrollback are lost; Claude resume chooses the folder's latest
+  conversation. A session reattached after an app restart needs `/ide`
+  to restore the IDE connection.
+- **Remote workspaces do not open remote files in the editor** or run
+  crc's review hooks on the host. Host CPU/disk are not monitored.
+- **MCP supports the core transports.** No OAuth login, server sampling,
+  elicitation or roots requests, or interactive MCP Apps rendering.
+  `crc --mcp` reads disk and index state, not unsaved buffers.

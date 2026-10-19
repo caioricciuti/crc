@@ -1,0 +1,63 @@
+---
+title: Workspaces and Agents mode
+description: Folder and worktree workspaces, persistent terminals, repository status and remote sessions.
+---
+
+## Workspaces
+
+A workspace groups a folder, its repositories and terminals. A folder
+holding several repositories shows each one's status in the inspector.
+**File › New Workspace** creates a workspace on a folder, or a branch in
+its own worktree. It can write workspace notes without replacing files
+already there. Workspace settings name the notes and private markers;
+Source Control refuses a commit whose staged lines contain those markers.
+This guard applies to commits made through crc, not every Git command.
+
+Home shows recent projects, repository status, waiting terminals and saved
+MCP calls. **Start Session** opens the workspace's state document;
+**End Session** opens its state and log for updating.
+
+## Agents mode
+
+Use **Cmd-Shift-A** or the Editor / Agents switch. A plain launch opens
+Agents mode; launching on a file or folder opens the editor. The sidebar
+lists workspaces across projects and the main column holds their terminals.
+The activity bar is hidden in this mode.
+
+- **Cmd-Shift-N** adds a workspace; a worktree is optional.
+- **Cmd-T** adds a shell session to the selected workspace.
+- **Ctrl-1…9** switches workspaces; **Cmd-Shift-U** finds a session waiting
+  for you.
+- **Cmd-Option-I** shows or hides the inspector.
+
+The inspector offers repository status and Git actions, pull request
+details and checks, and issue lists. GitHub actions use the installed `gh`
+command and its authentication; crc does not bundle or sign in to it.
+Pull requests and checks are polled, not streamed live.
+Merged worktrees fold into a group with cleanup actions.
+
+## Sessions and restarts
+
+Each terminal runs in a helper process. Quitting or restarting crc leaves
+the session running; reopening reattaches it with its output. Closing a
+terminal tab ends that session. Only one crc process claims the helpers.
+
+After a reboot the original processes and scrollback are gone. crc starts
+replacement sessions for the folder open in the editor: a shell in the
+same folder, or `claude --continue`. Claude chooses that folder's latest
+conversation, so two Claude sessions in one folder can resume the same
+conversation. A session reattached after an app restart also needs `/ide`
+in Claude Code to restore its editor connection.
+
+## Remote workspaces
+
+A `host:/path` workspace runs terminals and Claude through SSH and supports
+remote Git and GitHub reads/actions through the workspace inspector.
+It uses your SSH configuration and installed tools on the host.
+
+Remote files are not opened in the local editor, and remote Claude does
+not get crc's file-review hooks. crc does not monitor the host's CPU or
+disk. A manually typed SSH session is identified from its command line
+and SSH config; it is not a remote filesystem mount.
+
+See [Terminal](/docs/features/terminal/) and [Claude Code](/docs/features/claude-code/).

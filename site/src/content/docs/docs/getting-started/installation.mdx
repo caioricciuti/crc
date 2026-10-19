@@ -60,7 +60,9 @@ You need Rust 1.98 or newer. The repository pins the exact toolchain in
    scripts/bundle.sh --install
    ```
 
-   That puts an ad-hoc signed `crc.app` in `/Applications`.
+   That puts `crc.app` in `/Applications`, signed with a Developer ID when
+   one is available in your keychain, otherwise ad-hoc signed. Local
+   installs are not notarized by this command.
 
 3. For a fully offline, auditable build, vendor the crates first:
 
@@ -89,10 +91,20 @@ Inside crc, <kbd>⌘</kbd><kbd>O</kbd> opens a file and
 ## Updates
 
 Once a day crc asks GitHub for the list of releases and says in the status
-line when a newer one exists. **Help › Check for Updates** opens its page.
-Nothing is downloaded or installed for you; download the new DMG and replace
-the app. Set `update_check = false` in [settings](/docs/getting-started/settings/)
-to turn the daily check off.
+line when a newer one exists. The daily check downloads nothing.
+**Help › Check for Updates** downloads the newer release when you ask,
+then checks its SHA256SUMS, Developer ID signature, bundle identifier,
+notarization and version before offering **Restart to Update**.
+
+Restart follows a normal quit: unsaved files ask first, and Cancel keeps
+crc running. An app in a location you cannot write to cannot be replaced;
+the status line explains the failure. Set `update_check = false` in
+[settings](/docs/getting-started/settings/) to turn the daily check off.
+
+If you replaced the app manually or installed a local build while crc was
+open, **Help › Restart crc**, the status-line Restart button or Home's
+restart action loads the bundle now on disk. Existing terminal helpers
+survive this normal restart.
 
 ## Uninstall
 

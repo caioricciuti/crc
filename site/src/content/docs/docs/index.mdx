@@ -41,7 +41,8 @@ import editorLight from "../../../assets/editor-light.png";
 <CardGrid>
   <Card title="Claude Code" icon="star">
     Type `claude` in a crc terminal and it connects. It sees your file,
-    selection and diagnostics; its edits open as diffs.
+    selection and diagnostics; IDE-proposed edits open as diffs, while
+    hooked file writes are reviewed in Source Control.
     [Read more](/docs/features/claude-code/)
   </Card>
   <Card title="Completion that learns" icon="pencil">
@@ -53,7 +54,7 @@ import editorLight from "../../../assets/editor-light.png";
     written for crc. [Read more](/docs/features/terminal/)
   </Card>
   <Card title="Git" icon="github">
-    Stage files or single hunks, commit, switch branches, fetch, pull and push.
+    Stage files, hunks or lines, commit, switch branches, fetch, pull and push.
     [Read more](/docs/features/git/)
   </Card>
   <Card title="Language servers" icon="puzzle">
@@ -64,12 +65,28 @@ import editorLight from "../../../assets/editor-light.png";
     Send requests from `.http` files and read the response in a tab.
     [Read more](/docs/features/http-requests/)
   </Card>
+  <Card title="Workspaces and Agents" icon="seti:shell">
+    Folder and worktree workspaces, persistent sessions, repository status
+    and remote terminals. [Read more](/docs/features/workspaces/)
+  </Card>
+  <Card title="File and local history" icon="github">
+    Walk Git and local versions, restore as one edit, and keep undo across
+    restarts when the file still matches. [Read more](/docs/features/history/)
+  </Card>
+  <Card title="MCP" icon="puzzle">
+    Browse and call connected tools, or provide read-only project access to
+    agents. [Read more](/docs/features/mcp/)
+  </Card>
+  <Card title="Data tables" icon="pencil">
+    Edit CSV/TSV grids and query saved data through an installed DuckDB.
+    [Read more](/docs/features/data-tables/)
+  </Card>
 </CardGrid>
 
 ## What crc is not
 
 crc is an alpha for Apple Silicon Macs on macOS 14 or later. It is used daily
-by its author and is going to a small group of testers first. It has no
-extensions, no Intel, Linux or Windows builds, and a fixed set of languages.
+by its author. It has no Intel, Linux or Windows builds and a fixed set of
+language grammars. WASM extensions add commands and restricted previews.
 The full list is in [Known limits](/docs/reference/limitations/); why it is
 built this way is in [Why crc exists](/vision/).

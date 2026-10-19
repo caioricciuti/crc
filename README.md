@@ -8,8 +8,8 @@
 A text editor for macOS, drawn on the GPU straight from Metal and CoreText,
 with a terminal, local Git and Claude Code built in.
 
-**Alpha.** It is used daily by its author and is now going to a small group of
-testers. Passing tests are not a stability guarantee; known problems are in
+**Alpha.** It is used daily by its author. Passing tests are not a stability
+guarantee; known problems are in
 the [issue tracker](https://github.com/caioricciuti/crc/issues). Why the
 project exists is in [docs/vision.md](docs/vision.md).
 
@@ -129,14 +129,15 @@ the size and write it back.
 - **Claude Code inside crc**: type `claude` in any crc terminal and it
   connects to the window by itself, or press `Cmd-Shift-C` for a Claude tab.
   Claude sees the file and selection you are on and the language server
-  diagnostics, and every edit it proposes opens as a diff tab: Accept
+  diagnostics. An edit proposed through its IDE bridge opens as a diff tab: Accept
   (`Cmd-Return`) or Reject (`Esc`). Files Claude writes to disk show up in
   their tabs at once. The bridge listens on 127.0.0.1 only, behind a random
   token in a lock file readable by you alone; `CRC_NO_CLAUDE=1` turns it off.
   The Claude tab crc starts also runs crc's own hooks, passed with
   `--settings` so nothing in `~/.claude` changes: each file is kept as it
   was before Claude's first edit to it, in
-  `~/Library/Application Support/crc/sessions/` for 14 days, and Claude's
+  `~/Library/Application Support/crc/sessions/`; closing the terminal removes
+  its copies, and copies older than two days are pruned. Claude's
   questions mark its tab. `agent_review = false` turns them off.
 - **Agents mode** (`Cmd-Shift-A`, or the Editor / Agents switch in the
   toolbar; crc opens on it unless launched on a file or folder): the
@@ -306,8 +307,9 @@ the size and write it back.
   are left, and refuses while any are. Git > Abort Merge or Rebase gives
   the operation up after asking, and Continue Rebase goes on once the
   conflicts are resolved.
-- **Files you can trust**: atomic saves that keep mode, links and symlink
-  targets; a file changed by another program reloads if the tab is clean,
+- **Files you can trust**: ordinary saves use atomic replacement, keeping
+  mode, links and symlink targets (preserving hard links can require an
+  in-place write); a file changed by another program reloads if the tab is clean,
   and Save asks Overwrite, Cancel or Reload if it is not; a deleted file
   marks its tab unsaved; unsaved-changes prompts on close and quit; crash
   recovery of unsaved text; UTF-8 and UTF-16 BOMs, Windows-1252 and every
@@ -529,7 +531,7 @@ proposing a dependency.
 
 ```
 src/text/rope.rs        persistent B-tree rope
-src/text/buffer.rs      cursor, selection, undo, files, edit tracking
+src/text/buffer/        cursor, selection, undo, files, edit tracking
 src/text/documents.rs   open tabs
 src/syntax/             tree-sitter parsing and highlight queries
 src/project/tree.rs     sidebar file tree
@@ -545,7 +547,7 @@ src/lsp/                language servers: registry, stdio transport, client
 src/project/watch.rs    FSEvents watcher for the project root
 src/platform/dispatch.rs main-thread wake-ups from other threads
 src/render/font.rs      CoreText shaping and paged glyph rasterization
-src/render/layout.rs    visible lines to glyph quads, hit testing
+src/render/layout/      visible lines to glyph quads, hit testing
 src/render/metal.rs     pipeline, instance buffer, one draw call
 src/render/shader.metal vertex + fragment
 src/platform/window.rs  NSWindow, input, event loop

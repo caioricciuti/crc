@@ -15,9 +15,10 @@ does that.
   <div><span>Save as</span><span><kbd>⌘</kbd><kbd>⇧</kbd><kbd>S</kbd></span></div>
 </div>
 
-Saves are **atomic**: crc writes a new file and swaps it in, so a crash or a
-full disk mid-save never leaves half a file. The file's **mode**, **links**
-and **symlink targets** are kept.
+Ordinary saves write a new file and atomically swap it in. The file's
+**mode**, **hard links** and **symlink targets** are preserved. Keeping
+hard links or saving in a directory that cannot replace entries can require
+an in-place write; those saves do not have atomic replacement's guarantees.
 
 **File › Revert to Saved** throws away your edits and goes back to what is on
 disk.
@@ -41,9 +42,10 @@ Closing a tab or quitting crc with unsaved changes asks first.
 
 ## Crash recovery
 
-If crc crashes, the text of every unsaved document is written to
-`~/Library/Application Support/crc/recovery/` before the process ends. The
-next time crc starts, it asks whether to restore them.
+On a Rust panic, crc attempts to write unsaved documents to
+`~/Library/Application Support/crc/recovery/`. On the next start it offers
+recoverable entries. This cannot guarantee recovery from every process or
+system failure.
 
 <Aside type="tip" title="Plain files, on purpose">
   Each crash gets its own folder holding, for each unsaved document, `<n>.txt`
@@ -68,9 +70,19 @@ The encoding and line ending are shown in the status line.
 
 | Size | Behaviour |
 |---|---|
-| Up to 512 MB | Opens normally. A 100 MiB file costs what a small one does. |
+| Up to 512 MB | Opens for editing; loading, parsing and indexing still depend on the file. |
 | Over 512 MB | Opens **read-only**, and says why. |
 | Over 2 GB | Refused, and says why. |
 
 Lines too long to shape quickly are drawn without shaping, and the status
 line says so while one is on screen.
+
+## Local versions and undo
+
+crc keeps bounded local versions and can restore undo/redo across restarts
+when the file on disk still matches. See
+[File history and local versions](/docs/features/history/) for retention,
+secret exclusions, restoring text and clearing history.
+
+CSV/TSV editing and the read-only DuckDB previews are described in
+[Data tables and SQL queries](/docs/features/data-tables/).

@@ -1,18 +1,22 @@
 ---
 title: Where crc keeps things
-description: Every file and folder crc reads or writes outside your projects.
+description: Settings, local history, agent copies, held sessions and other crc data outside your projects.
 ---
 
 import { FileTree, Aside } from "@astrojs/starlight/components";
 
-crc keeps very little, all of it local. It sends nothing anywhere except the
-daily update check, which you can turn off.
+crc stores settings and histories locally and sends no app telemetry.
+Features you use can contact external services: release checks/downloads,
+the extension registry, Git remotes, GitHub through `gh`, HTTP requests,
+SSH hosts and configured MCP servers. Programs running in terminals have
+their own network behaviour and privacy settings.
 
 <FileTree>
 - ~/
   - .config/
     - crc/
       - config.toml your [settings](/docs/getting-started/settings/)
+      - mcp.json configured MCP servers
   - .claude/
     - ide/
       - PORT.lock the [Claude Code](/docs/features/claude-code/) bridge's port and token, while crc runs
@@ -20,12 +24,18 @@ daily update check, which you can turn off.
     - Application Support/
       - crc/
         - completion.db what you picked in completion, for ranking
+        - history.db local versions and persistent undo
+        - sessions/ copies kept by agent review hooks
+        - held/ terminal helper records for session reattachment
+        - agents/ workspace list, arrangement and cached issue data
+        - workspaces/ workspace settings and saved state
         - extensions/ installed [extensions](/docs/features/extensions/), one folder each
         - recovery/ unsaved text after a crash
         - session what was open last time
     - Caches/
       - crc/
         - index/ the project index for completion and symbols, rebuilt when deleted
+        - update/ downloaded update staging
     - Logs/
       - crc/ crash logs
 </FileTree>
@@ -37,9 +47,24 @@ daily update check, which you can turn off.
 | `~/Library/Application Support/crc/completion.db` | Yes, or use **Go › Forget Completion History**. |
 | `~/Library/Application Support/crc/recovery/` | Once you have restored what you need from it. |
 | `~/Library/Application Support/crc/extensions/` | Yes; that uninstalls every extension. |
+| `~/Library/Application Support/crc/history.db` | Deletes kept local versions and undo history; prefer Git's Clear History commands. |
+| `~/Library/Application Support/crc/sessions/` | Deletes the copies needed to undo hooked agent writes. |
+| `~/Library/Application Support/crc/held/` | Do not remove while sessions run; it holds reattachment records. |
+| `~/Library/Application Support/crc/agents/` | Removes workspace arrangement and cached agent-workspace data. |
 | `~/Library/Logs/crc/` | Yes. **Help › Show Crash Logs** opens it. |
 
 <Aside>
   `XDG_CONFIG_HOME` moves the settings file; `CLAUDE_CONFIG_DIR` moves the
   lock file.
 </Aside>
+
+Terminal helpers also use per-user sockets under the temporary directory.
+These are separate from the records above. Do not delete live helpers'
+sockets to reset the UI.
+
+Workspace notes and `.crc/workspace.toml`, when configured, live in the
+workspace folder outside member repositories. Plain-repository workspace
+settings live in Application Support instead.
+
+The website loads a page-view analytics script from `a.caioricciuti.com`.
+That is separate from the native app's telemetry policy.

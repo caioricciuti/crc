@@ -28,10 +28,10 @@ editor column: what it does, what it may touch, its commands and its README.
 - **Update** appears when the registry has a newer version. Updates are
   never installed on their own.
 
-<Aside type="caution" title="The registry is not live yet">
-  The official registry opens with its first signed release. Until then the
-  page says the registry is unavailable, and extensions install from a
-  folder.
+<Aside type="note" title="Registry availability">
+  The panel reads the signed official registry. If it cannot fetch or
+  verify that registry, it reports the problem; Install from Folder remains
+  available for packages you have reviewed separately.
 </Aside>
 
 ## Running commands
@@ -51,8 +51,11 @@ stopped.
 | Replace the selected text | change the selection |
 | Read the whole document | see the whole document |
 | Replace the whole document | change the whole document |
+| Show a preview | display a restricted page beside the editor or in the whole tab |
 
-That is the whole list today. There is no capability for files, the network
+Preview pages run no scripts or network requests. The host can load local
+images from the document's folder for a preview; the WASM extension does
+not get arbitrary filesystem access. There is no capability for files, the network
 or other programs.
 
 ## Signed and unsigned
@@ -67,9 +70,10 @@ before installing, and the page marks it.
 
 ## Official extensions
 
-| Extension | Commands | May |
-|---|---|---|
-| Sort Lines | Sort Lines, Sort Lines Descending, Remove Duplicate Lines | read and replace the selection or the document |
+The [official catalog](/extensions/) lists commands and capabilities from
+the site's registry data. The catalog is a build-time snapshot; if a build
+cannot refresh it from a verified registry, it keeps the committed list. The app's
+registry is the source for current install/update availability.
 
 The source is in [crc-extensions](https://github.com/caioricciuti/crc-extensions).
 To make your own, see [Writing an extension](/docs/features/writing-extensions/).

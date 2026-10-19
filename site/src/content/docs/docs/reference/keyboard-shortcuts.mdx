@@ -21,7 +21,7 @@ import { Aside } from "@astrojs/starlight/components";
 | <kbd>⌘</kbd><kbd>S</kbd> | Save |
 | <kbd>⌘</kbd><kbd>⇧</kbd><kbd>S</kbd> | Save as |
 | <kbd>⌘</kbd><kbd>W</kbd> | Close the tab |
-| <kbd>⌘</kbd><kbd>,</kbd> | Open the settings file |
+| <kbd>⌘</kbd><kbd>,</kbd> | Open the native settings page |
 | <kbd>⌘</kbd><kbd>Q</kbd> | Quit |
 
 ## Editing
@@ -37,6 +37,7 @@ import { Aside } from "@astrojs/starlight/components";
 | <kbd>Tab</kbd> / <kbd>⇧</kbd><kbd>Tab</kbd> | Indent, outdent the selection |
 | <kbd>⌘</kbd><kbd>D</kbd> | Select the word, then the next occurrence as another cursor |
 | <kbd>⌥</kbd>-click | Add a cursor |
+| <kbd>⌥</kbd>-drag | Column selection |
 | <kbd>Esc</kbd> | Back to one cursor |
 | <kbd>⌥</kbd> + arrows, <kbd>⌥</kbd><kbd>⌫</kbd> | Word-wise motion and deletion |
 | <kbd>⌃</kbd><kbd>A</kbd> <kbd>E</kbd> <kbd>K</kbd> <kbd>D</kbd> <kbd>B</kbd> <kbd>F</kbd> <kbd>P</kbd> <kbd>N</kbd> | The macOS Emacs bindings |
@@ -75,6 +76,7 @@ import { Aside } from "@astrojs/starlight/components";
 |---|---|
 | <kbd>⌘</kbd><kbd>B</kbd> | Toggle the sidebar |
 | <kbd>⌘</kbd><kbd>E</kbd> | Open or close the preview (with a preview extension) |
+| <kbd>⌘</kbd><kbd>⇧</kbd><kbd>E</kbd> | Preview in the whole tab |
 | <kbd>⌘</kbd><kbd>⌥</kbd><kbd>←</kbd> / <kbd>→</kbd> | Fold, unfold the block |
 | <kbd>⌥</kbd><kbd>Z</kbd> | Word wrap for this document |
 | <kbd>⌘</kbd><kbd>=</kbd> / <kbd>⌘</kbd><kbd>-</kbd> / <kbd>⌘</kbd><kbd>0</kbd> | Zoom in, out, back to 13 pt |
@@ -105,3 +107,29 @@ empty strip for a new file.
 | <kbd>⌘</kbd><kbd>↩</kbd> in Source Control | Commit the staged changes |
 | <kbd>⌘</kbd><kbd>↩</kbd> in a `.http` file | Send the request under the caret |
 | <kbd>Esc</kbd> in a picker or panel | Dismiss |
+
+## Workspaces and terminal output
+
+| Keys | Action |
+|---|---|
+| <kbd>⌘</kbd><kbd>⇧</kbd><kbd>A</kbd> | Editor / Agents mode |
+| <kbd>⌘</kbd><kbd>⇧</kbd><kbd>N</kbd> | New workspace |
+| <kbd>⌘</kbd><kbd>T</kbd> in Agents mode | New terminal in the workspace |
+| <kbd>⌃</kbd><kbd>1</kbd>…<kbd>9</kbd> | Switch workspace |
+| <kbd>⌘</kbd><kbd>⇧</kbd><kbd>U</kbd> | Next session waiting for you |
+| <kbd>⌘</kbd><kbd>⌥</kbd><kbd>I</kbd> | Toggle workspace inspector |
+| <kbd>⌘</kbd><kbd>F</kbd> / <kbd>⌘</kbd><kbd>G</kbd> in a terminal | Search output / next match |
+| <kbd>⌘</kbd><kbd>K</kbd> in a terminal | Clear output without sending input |
+| <kbd>⌘</kbd><kbd>⌥</kbd><kbd>C</kbd> in a terminal | Copy selection as one line |
+
+## History and data
+
+| Keys | Action |
+|---|---|
+| <kbd>⌘</kbd><kbd>⌥</kbd><kbd>Y</kbd> | File History |
+| <kbd>⌥</kbd><kbd>F5</kbd> / <kbd>⇧</kbd><kbd>⌥</kbd><kbd>F5</kbd> | Next / previous gutter change |
+| Left / Right in File History | Previous / next version |
+| Home / End in File History | Oldest / working text |
+| Space in a Git diff | Stage hunk or selected lines |
+| Return / Tab in a CSV cell editor | Commit / commit and move |
+| <kbd>⌘</kbd><kbd>↩</kbd> in Table Query or an MCP call | Run query or tool call |

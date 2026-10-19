@@ -1,6 +1,6 @@
 ---
 title: Claude Code
-description: Claude Code connects to crc as its IDE. It sees your file, selection and diagnostics, and every edit it proposes opens as a diff you accept or reject.
+description: The local IDE bridge, proposed diffs, and reviewing direct file writes from crc-started Claude tabs.
 ---
 
 import { Steps, Aside, Tabs, TabItem } from "@astrojs/starlight/components";
@@ -50,7 +50,8 @@ Without copying anything into the prompt, Claude can ask crc for:
 
 ## Reviewing edits
 
-Every edit Claude proposes opens as a **diff tab**. Read it, then:
+An edit proposed through the IDE bridge's `openDiff` tool opens as a
+**diff tab**. Read it, then:
 
 <div class="crc-keys">
   <div><span>Accept the change</span><span><kbd>⌘</kbd><kbd>↩</kbd></span></div>
@@ -63,6 +64,26 @@ Files that Claude writes to disk directly show up in their tabs at once, the
 same way any [file changed by another program](/docs/features/files/) does:
 a clean tab reloads, and a tab with unsaved edits asks before anything is
 overwritten.
+
+## Changed by agents
+
+The Claude tab crc starts also runs crc's file-review hooks, passed with
+`--settings` without changing your Claude configuration. They keep a copy
+before Claude's first Write or Edit to a file. **Source Control › Changed
+by agents** lists these files with the terminal title and time. A row opens
+the diff; its menu offers **Keep** or **Undo agent change**.
+
+Undo refuses when the file has unsaved edits in crc, or has changed since
+the agent wrote it. Files changed without a hook, including shell writes,
+can be listed but are keep-only: there is no copy from before the write.
+Typing `claude` in a shell does not add the review hooks automatically.
+
+`agent_review = false` disables the hooks. Closing a terminal removes its
+copies; copies older than two days are pruned. There is no separate Review
+page. See [Git](/docs/features/git/) and [storage](/docs/reference/storage/).
+
+Terminal sessions survive a normal app restart, but their link to the IDE
+does not; use Claude's `/ide` command to reconnect.
 
 ## Security
 
@@ -80,9 +101,8 @@ environment:
 CRC_NO_CLAUDE=1 open -a crc .
 ```
 
-## Where this is going
+## Other agent access
 
-Claude Code connecting to crc is the first step of a larger idea: an agent as
-a protocol client, reading the same buffer state, syntax tree and index the
-editor's own UI uses. That is not built yet; [Why crc exists](/vision/) says
-more.
+`crc --mcp` provides separate, read-only access to the project on disk and
+its index. It does not expose live editor buffers.
+See [MCP](/docs/features/mcp/).

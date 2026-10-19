@@ -10,16 +10,18 @@ import editorDark from "../../../../assets/editor-dark.png";
 import editorLight from "../../../../assets/editor-light.png";
 import terminalDark from "../../../../assets/terminal-dark.png";
 
-crc is one window per project. The text is drawn by crc itself on the GPU;
+The editor opens a project folder; Agents mode lists workspaces across
+projects. The text is drawn by crc itself on the GPU;
 around it is native macOS chrome in the system font, in light and dark, with
 the right pointer for every control.
 
 ## The home screen
 
 Open a folder with nothing else open and crc shows its home screen: **Start**
-actions (Open Folder, New File, Go to File), your **Recent** folders, and a
-short list of keys worth learning first. Start typing and it becomes an
-untitled document.
+actions, your **Recent** folders, and a short list of keys worth learning
+first. A workspace also adds repository status, waiting sessions, saved MCP
+calls and state/log actions. A plain launch opens Agents mode; use
+**Cmd-Shift-A** to switch to the editor.
 
 <div class="crc-shot">
   <Image src={homeDark} alt="crc's home screen: Start actions, recent folders and a list of keys." widths={[800, 1400]} sizes="46rem" />
@@ -39,7 +41,8 @@ From the top of the window down:
 - **The icon strip** at the far left picks what the sidebar shows:
   **Explorer**, the file tree, with buttons for a new file, a new folder,
   collapse and refresh; **Source Control**, the [Git panel](/docs/features/git/),
-  with a badge counting changed files; and **Extensions**, the
+  with a badge counting changed files; **MCP Servers**, for connected tools;
+  and **Extensions**, the
   [extensions](/docs/features/extensions/) list. Clicking the panel that is
   already showing hides the sidebar, and clicking it again brings it back;
   the strip stays. <kbd>⌘</kbd><kbd>B</kbd> hides and shows the sidebar too.
@@ -69,3 +72,7 @@ Trash and reveals in Finder. Right-click a tab to manage tabs.
 <Aside title="Sessions">
   crc remembers what was open last time and restores it when you come back.
 </Aside>
+
+The screenshots illustrate the editor, terminal and Home; they do not show
+every current control. For the workspace sidebar and persistent sessions,
+see [Workspaces and Agents mode](/docs/features/workspaces/).

@@ -55,7 +55,7 @@ const keys = [
 
 <Landing
   title="crc: the editor that keeps up with you"
-  description="A native macOS text editor drawn on the GPU with Metal and CoreText. Terminal, local Git and Claude Code built in. 0.8 ms keystroke to GPU."
+  description="A native macOS text editor drawn with Metal and CoreText. Persistent terminals, workspaces, local Git and history, Claude Code, MCP and data grids."
 >
   <!-- ================= HERO ================= -->
   <section class="hero">
@@ -77,8 +77,8 @@ const keys = [
       </h1>
       <p class="sub">
         A native macOS editor drawn on the GPU straight from Metal and CoreText.
-        Terminal, Git and Claude Code built in. No Electron, no web view,
-        and <strong>0.8&nbsp;ms</strong> from keystroke to GPU in a 100&nbsp;MiB file.
+        Persistent terminals, workspaces, Git and Claude Code built in.
+        A native editor, with local history, MCP tools and data grids.
       </p>
       <div class="cta">
         <a class="btn btn-light btn-lg" href={release}>
@@ -124,11 +124,12 @@ const keys = [
 
   <!-- ================= STATS ================= -->
   <section class="stats-band">
+    <p class="container fine">Native editor screenshots above; the feature illustrations below are schematic. See the handbook for current controls.</p>
     <div class="container stats" data-reveal>
-      <div><strong>0.8<small>ms</small></strong><span>keystroke to GPU, p99,<br />in a 100 MiB file</span></div>
+      <div><strong>0.8<small>ms</small></strong><span>viewport p99, alpha.1 benchmark<br /><a href="/docs/reference/performance/">measurement and scope</a></span></div>
       <div><strong>14</strong><span>crates in the whole<br />dependency tree</span></div>
-      <div><strong>17<small>MB</small></strong><span>on disk, signed<br />and notarized</span></div>
-      <div><strong>0</strong><span>web views, JS runtimes<br />or telemetry</span></div>
+      <div><strong>&lt;30<small>MiB</small></strong><span>app bundle size gate<br />checked on every bundle build</span></div>
+      <div><strong>0</strong><span>accounts required by crc<br />or app telemetry</span></div>
     </div>
   </section>
 
@@ -141,12 +142,12 @@ const keys = [
         <p class="lead">
           Type <code>claude</code> in any crc terminal and it connects to the window by itself,
           or press <kbd class="key">⌘</kbd><kbd class="key">⇧</kbd><kbd class="key">C</kbd> for a Claude tab.
-          Every change it proposes opens as a diff you accept or reject.
+          Edits proposed through the IDE bridge open as diffs you accept or reject.
         </p>
         <ul class="checks">
           <li><b>Context without copy-paste.</b> Claude sees the file and selection you are on, and the language server diagnostics.</li>
-          <li><b>Diffs, not surprises.</b> Accept with <kbd class="key">⌘</kbd><kbd class="key">↩</kbd>, reject with <kbd class="key">Esc</kbd>.</li>
-          <li><b>Live files.</b> Anything Claude writes to disk shows up in its tab at once.</li>
+          <li><b>IDE diffs.</b> Accept with <kbd class="key">⌘</kbd><kbd class="key">↩</kbd>, reject with <kbd class="key">Esc</kbd>.</li>
+          <li><b>Direct file writes.</b> Clean tabs reload. Hooks in crc-started Claude tabs keep copies for review in Source Control.</li>
           <li><b>Local only.</b> The bridge listens on 127.0.0.1 behind a random token readable by you alone.</li>
         </ul>
         <a class="more" href="/docs/features/claude-code/">How the bridge works <span>→</span></a>
@@ -195,7 +196,7 @@ const keys = [
         <p class="lead">
           Terminal sessions run your login shell in the project folder on an
           xterm-compatible emulator written for crc. Source Control stages whole
-          files or single hunks, commits, switches branches, fetches, pulls and pushes.
+          files, hunks or selected lines, commits, switches branches, fetches, pulls and pushes.
         </p>
       </div>
       <div class="tg" data-reveal>
@@ -223,9 +224,10 @@ const keys = [
         <span class="eyebrow">Performance</span>
         <h2 class="h2">A tenth of a frame.<br /><span class="soft">In a 100 MiB file.</span></h2>
         <p class="lead">
-          At 120 Hz a frame lasts 8.333 ms. crc goes from keystroke to finished GPU work
-          in 0.803 ms at p99 with the caret halfway through 2.7 million lines. The
-          harness ships in the repository, so you can measure it yourself.
+          At 120 Hz a frame lasts 8.333 ms. Measured on 2026-09-24 for alpha.1,
+          buffer edit through GPU completion took 0.803 ms at p99 with the caret
+          halfway through 2.7 million lines. This excludes event delivery and
+          display scanout; results vary by machine.
         </p>
       </div>
 
@@ -236,7 +238,7 @@ const keys = [
           <div class="bench-val">0.803 ms</div>
         </div>
         <div class="bench-row">
-          <div class="bench-label"><b>With toolbar, sidebar, tabs, status</b><span>the whole window</span></div>
+          <div class="bench-label"><b>With toolbar, sidebar, tabs, status</b><span>native chrome in the benchmark</span></div>
           <div class="bench-track"><div class="bench-bar alt" style="--w: 12.1%"></div></div>
           <div class="bench-val">1.009 ms</div>
         </div>
@@ -259,7 +261,7 @@ const keys = [
         <div>
           <span class="n">02</span>
           <h3>Only what you can see</h3>
-          <p>Layout touches the visible lines, so a 100 MiB file costs what a small one does.</p>
+          <p>Layout works on visible lines. File loading, indexing and background parsing have separate costs.</p>
         </div>
         <div>
           <span class="n">03</span>
@@ -354,7 +356,7 @@ const keys = [
             </div>
           </div>
           <h3>Files you can trust</h3>
-          <p>Atomic saves that keep mode and symlinks. Crash recovery for unsaved text. Every encoding and line ending preserved.</p>
+          <p>Ordinary saves use atomic replacement; mode, links and symlink targets are preserved. UTF-8, UTF-16, Windows-1252 and line endings are kept. <a href="/docs/features/files/">Save guarantees and limits.</a></p>
         </article>
 
         <article class="card">
@@ -374,6 +376,22 @@ const keys = [
           </div>
           <h3>Folding, word wrap and the rest</h3>
           <p>Fold a block or the whole file, wrap long lines, go to symbol, find and replace with regex, comment toggle, line move and duplicate, Emacs motions, full Unicode with emoji and CJK, session restore.</p>
+        </article>
+        <article class="card">
+          <h3>Workspaces and persistent sessions</h3>
+          <p>Folder and worktree workspaces, terminals that survive an app restart, repository status and remote SSH sessions. <a href="/docs/features/workspaces/">Workspaces and Agents mode.</a></p>
+        </article>
+        <article class="card">
+          <h3>Git and local history</h3>
+          <p>Walk a file's Git commits and local versions, restore text as one undoable edit, and keep undo across restarts when the file still matches. <a href="/docs/features/history/">History and limits.</a></p>
+        </article>
+        <article class="card">
+          <h3>MCP tools, directly</h3>
+          <p>Connect installed servers, browse tools and run saved calls. A separate read-only MCP server exposes the disk project and index to agents. <a href="/docs/features/mcp/">MCP support.</a></p>
+        </article>
+        <article class="card">
+          <h3>Data grids and SQL</h3>
+          <p>Edit CSV and TSV. With DuckDB installed, query saved files and preview Parquet, JSONL and SQLite in bounded read-only grids; export results as CSV. <a href="/docs/features/data-tables/">Supported formats.</a></p>
         </article>
       </div>
 
@@ -447,7 +465,7 @@ const keys = [
       <div>
         <span class="eyebrow warn">An honest alpha</span>
         <h2 class="h2">What it doesn't do yet.</h2>
-        <p class="lead">Used every day by its author, now going to a small group of testers. Passing tests are not a stability guarantee.</p>
+        <p class="lead">Used every day by its author. Passing tests are not a stability guarantee; limits are documented alongside the features.</p>
         <a class="more" href="/docs/reference/limitations/">Every known limit <span>→</span></a>
       </div>
       <ul class="nots">
@@ -456,7 +474,7 @@ const keys = [
         <li><b>No minimap.</b></li>
         <li><b>A file lives in one pane at a time.</b></li>
         <li><b>Updates are announced, not installed.</b> Nothing downloads itself.</li>
-        <li><b>Extensions are new and narrow.</b> They read and change text, and nothing else yet. <a href="/extensions/">See them →</a></li>
+        <li><b>Extensions have limited capabilities.</b> Text commands and restricted previews, without arbitrary file, network or process access. <a href="/extensions/">See them →</a></li>
       </ul>
     </div>
   </section>

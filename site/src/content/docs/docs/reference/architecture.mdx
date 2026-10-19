@@ -49,13 +49,17 @@ the [dependency review](/dependency-review/).
 - src/
   - text/
     - rope.rs persistent B-tree rope
-    - buffer.rs cursor, selection, undo, files, edit tracking
+    - buffer/ cursor, selection, undo, files, edit tracking
     - documents.rs open tabs
   - syntax/ tree-sitter parsing and highlight queries
   - complete/ completion ranking and history
   - index/ the SQLite project index
   - lsp/ language servers: registry, stdio transport, client
   - ide/ the Claude Code bridge: lock file, WebSocket, MCP
+  - history/ local versions and persistent undo storage
+  - mcp_client/ connected MCP servers
+  - mcp_server.rs read-only project MCP server
+  - ext/ WASM extension interpreter, manifests and registry
   - term/ the terminal emulator
   - http/ `.http` request files, environments, curl runner
   - markdown/ Markdown rendering
@@ -63,10 +67,14 @@ the [dependency review](/dependency-review/).
     - tree.rs sidebar file tree
     - finder.rs Cmd-P fuzzy matching
     - git.rs Git commands, status parsing and bounded diffs
+    - history.rs per-file Git history reader
+    - workspace.rs workspace settings and repositories
+    - review.rs copies and metadata for agent file writes
+    - duckdb.rs bounded external data queries
     - watch.rs FSEvents watcher for the project root
   - render/
     - font.rs CoreText shaping and paged glyph rasterization
-    - layout.rs visible lines to glyph quads, hit testing
+    - layout/ visible lines to glyph quads, hit testing and UI geometry
     - metal.rs pipeline, instance buffer, one draw call
     - shader.metal vertex and fragment
   - platform/
@@ -75,6 +83,8 @@ the [dependency review](/dependency-review/).
     - latency.rs keystroke-to-present timing
     - recovery.rs unsaved text through a crash
     - session.rs what was open last time
+    - agents.rs workspace/session state and repository inspection
+    - table.rs data grid state and geometry
   - json.rs JSON reader and printer, shared by HTTP and LSP
 - examples/ benchmarks and headless render dumps
 - third_party/ vendored C for tree-sitter and its grammars

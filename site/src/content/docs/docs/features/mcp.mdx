@@ -1,0 +1,41 @@
+---
+title: MCP tools and project access
+description: Use MCP servers directly in crc, or expose a read-only project index to agents.
+---
+
+## Connect servers you use
+
+The plug icon in the editor's activity bar opens the MCP Servers page.
+Each server card shows its command and status, with **Start** and **Stop**.
+Selecting a card lists tools, resources and prompts with their descriptions.
+
+**Add Server** selects an installed program; **Add by URL** adds a
+Streamable HTTP endpoint. Configuration is stored in
+`~/.config/crc/mcp.json` and reloaded when you save it in crc. It uses the
+same `mcpServers` object shape as Claude Code's config.
+
+Servers start only when you click Start. Commands that download and run
+code, such as `npx`, `bunx`, `uvx` and `pnpm dlx`, are refused.
+Install and review tools separately before connecting them.
+
+A tool opens a call document. Edit its arguments and press **Cmd-Return**
+to run it. A tool marked as able to change things asks first. Save a call
+to run it again from Home. The server is an external program or service;
+its access and behaviour are separate from crc's WASM extension sandbox.
+
+## What is supported
+
+crc supports stdio and Streamable HTTP servers. It does not implement
+OAuth sign-in or answer server requests for sampling, elicitation or
+roots. Interactive MCP Apps are not rendered; their results appear as text.
+
+## Expose a project to agents
+
+`crc --mcp [folder]` runs a separate stdio MCP server without opening a
+window. It provides symbols and files from the project index, bounded
+reads inside the folder, and workspace state and repository information.
+It is read-only and exposes disk/index state, not unsaved editor buffers.
+
+**Run › Copy crc MCP Server Command** copies the command to add to an
+agent's settings. This server is separate from the
+[Claude Code IDE bridge](/docs/features/claude-code/).

@@ -1,13 +1,15 @@
 ---
 title: Settings
-description: One commented TOML file. Saving it in crc applies it.
+description: The native settings page and every key in crc's commented configuration file.
 ---
 
 import { Aside } from "@astrojs/starlight/components";
 
-**crc › Settings…** (<kbd>⌘</kbd><kbd>,</kbd>) opens `~/.config/crc/config.toml`
-in a tab. The first time, it is created from a commented template. Saving the
-file in crc applies it; there is no settings window and nothing to restart.
+**crc › Settings…** (<kbd>⌘</kbd><kbd>,</kbd>) opens a native page listing
+every setting, its value, default and explanation. **Edit** opens
+`~/.config/crc/config.toml` at that key; **Open config.toml** opens the
+whole file. It is created from a commented template when needed. Saving
+the file in crc applies it; unusable lines are reported with their numbers.
 
 <Aside>
   When `XDG_CONFIG_HOME` is set, the file is `$XDG_CONFIG_HOME/crc/config.toml`
@@ -28,6 +30,10 @@ file in crc applies it; there is no settings window and nothing to restart.
 | `word_wrap` | `"auto"`, `"on"`, `"off"` | `"auto"` | `auto` wraps Markdown and text files only. <kbd>⌥</kbd><kbd>Z</kbd> flips it for one document. |
 | `ssh_auth_sock` | a path | unset | The SSH agent socket Git uses for fetch, pull and push. |
 | `conflict_view` | `"inline"`, `"side-by-side"` | `"inline"` | How a file with [merge conflicts](/docs/features/git/#merge-conflicts) opens. The strip above the file switches either way. |
+| `blame_heat` | `true`, `false` | `false` | Age strip from Git blame. The menu toggle lasts until quit. |
+| `agent_review` | `true`, `false` | `true` | Review hooks for Claude tabs crc starts; keeps copies before file writes. |
+| `local_history` | `true`, `false` | `true` | Record bounded local versions and undo history. |
+| `local_history_exclude` | comma-separated glob patterns | `""` | Additional files to exclude from local history; secrets are already excluded. |
 
 ## The template
 
@@ -75,6 +81,11 @@ word_wrap = "auto"
 # conflict in the text, or "side-by-side", as columns. The strip above
 # the file switches between them.
 conflict_view = "inline"
+
+blame_heat = false
+agent_review = true
+local_history = true
+local_history_exclude = ""
 ```
 
 ## Why `ssh_auth_sock` exists

@@ -46,6 +46,7 @@ function rewriteLinks(markdown, fromPath) {
       .join("/");
     // The README's limits section has its own page on the site.
     if (normal === "README.md" && anchor === "what-does-not") return "](/docs/reference/limitations/)";
+    if (normal === "README.md" && anchor === "the-number") return "](/docs/reference/performance/#the-number)";
     const slug = slugFor.get(normal);
     const suffix = anchor ? `#${anchor}` : "";
     if (slug) return `](/${slug}/${suffix})`;

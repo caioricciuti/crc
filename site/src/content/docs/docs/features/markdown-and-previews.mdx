@@ -7,7 +7,9 @@ description: Markdown styled as you write it, and Quick Look for images, PDFs, m
 
 Markdown opens as text, **styled where it is written**: headings in bold,
 bold and italic in their own faces, inline code on a tint, links and list
-markers set apart, and the characters that make the syntax drawn faint.
+markers set apart. Syntax is hidden on lines away from the caret where
+the text layout supports it; [known limits](/docs/reference/limitations/#editor)
+describes the remaining non-ASCII and wrapping cases.
 Fenced code blocks sit on a band, coloured by their language. Because it
 is text, selection, find, multiple cursors and undo work as in any file.
 
@@ -19,6 +21,7 @@ nothing from the network and follows no links.
 
 <div class="crc-keys">
   <div><span>Open or close the preview</span><span><kbd>⌘</kbd><kbd>E</kbd></span></div>
+  <div><span>Preview in the whole tab</span><span><kbd>⌘</kbd><kbd>⇧</kbd><kbd>E</kbd></span></div>
   <div><span>Word wrap on or off</span><span><kbd>⌥</kbd><kbd>Z</kbd></span></div>
 </div>
 
@@ -29,3 +32,6 @@ Markdown and text files wrap long lines by default. The `word_wrap`
 
 Images, PDFs, audio, video and office documents open as **Quick Look**
 previews, the same previews Finder shows.
+
+Office documents are read-only previews. CSV/TSV and supported DuckDB
+formats use [data grids](/docs/features/data-tables/) instead.

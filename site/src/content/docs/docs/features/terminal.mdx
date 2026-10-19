@@ -45,3 +45,28 @@ against the session's folder first, then the project's.
 
 Run `claude` in any crc terminal and it connects to the window by itself.
 See [Claude Code](/docs/features/claude-code/).
+
+## Selection, search and links
+
+Drag to select, including past the top or bottom to scroll history.
+Cmd-A selects the session's output; Cmd-C copies; Cmd-V pastes.
+Cmd-Option-C joins a wrapped selection into one line when copying.
+Cmd-F searches output, Cmd-G steps through matches, and Cmd-K clears the
+screen and history without sending input to the program.
+
+Cmd-click also opens web addresses and explicit OSC 8 links. Holding Cmd
+underlines the link under the pointer. Programs that request mouse input
+receive clicks, drags, scrolling and focus changes; hold Option or Shift
+to select text instead. OSC 52 lets a program copy to the clipboard, but
+does not let it read the clipboard.
+
+## Waiting sessions and persistence
+
+Bells and OSC notifications mark a session as waiting, with a dot and
+status message until you type into it. A bell immediately after a key is
+treated as the program's reply. Home lists waiting sessions first.
+
+Sessions survive quitting or restarting crc through helper processes;
+closing a tab ends its session. In [Agents mode](/docs/features/workspaces/)
+the terminal fills the main column and tabs belong to the selected
+workspace. The reboot and IDE-reconnection limits are documented there.

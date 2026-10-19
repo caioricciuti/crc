@@ -1,0 +1,56 @@
+---
+title: File history and local versions
+description: Step through a file's Git commits and local versions, restore text, and keep undo across restarts.
+---
+
+## File History
+
+**Git › File History** (**Cmd-Option-Y**) opens a read-only tab beside the
+file. It follows Git renames and lists commits that changed that file.
+Left/Right steps through versions, Home/End goes to oldest/working text,
+and the timeline can be dragged. Escape returns to the live file.
+
+Local versions sit between commits by time. Their Local pill says why
+they were kept, such as saved, idle or before reload. The filter beside
+Newer selects **All**, **Commits** or **Local**. A file outside Git can
+show its local versions alone.
+
+The view marks changes against the preceding version. **vs Working Tree**
+compares against your live text instead. Versions load into a bounded
+window; this is per-file history, not a repository log or commit graph.
+
+## Restore a version
+
+**Restore**, or **Git › Restore This Version**, replaces the live file's
+text as one edit. Nothing is written until Save; Undo returns to the text
+it replaced. crc keeps that replaced text in local history first.
+
+**Git › Recover Deleted File** opens the last kept version of a deleted
+file. **Clear History for This File** and **Clear All Local History**
+delete kept versions after confirmation.
+
+## What local history keeps
+
+Local history is enabled by default. It keeps files up to 2 MiB, for up to
+30 days: as opened, on save, before reload, when closed unsaved and after
+30 seconds without typing. `.env` files, keys and `~/.ssh` are excluded.
+Use `local_history_exclude` for additional comma-separated glob patterns,
+or `local_history = false` to disable recording.
+
+The database is `~/Library/Application Support/crc/history.db`.
+It is separate from Git commits and from the copies used to undo agent
+writes. Retention and size caps mean it is not a backup of every file.
+
+## Undo after restart
+
+Reopening a file restores its saved undo/redo history only when its disk
+contents still match the text crc last recorded. A file changed externally
+does not receive a stale undo stack. Crash recovery remains a separate
+mechanism; a power cut is not covered by its crash handler.
+
+## Blame Heat
+
+**Git › Blame Heat**, off by default, adds an age strip beside line
+numbers. Hover for commit details and Cmd-click to open that version in
+File History. Unsigned commits are dashed; signed commits are checked on
+first tooltip display. `blame_heat` sets the initial preference.

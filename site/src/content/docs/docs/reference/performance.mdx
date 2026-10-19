@@ -48,8 +48,8 @@ Other benchmarks in `examples/`:
 - **One draw call per frame.** Every glyph is an instance of one quad, so
   drawing a screen of text is a single `drawPrimitives` with no per-frame
   geometry work.
-- **Only the visible lines** are laid out, so a 100 MiB file costs what a small
-  one does.
+- **Visible-line layout** limits per-frame work. File loading, indexing,
+  long-line shaping and background parsing still have their own costs.
 - **A persistent rope.** The buffer is a B-tree whose clone is O(1), which
   makes undo snapshots cheap and lets background work read a consistent
   snapshot while you type.

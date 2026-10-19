@@ -1,12 +1,12 @@
 ---
 title: Git
-description: Status, diffs, file and hunk staging, commits, branches, fetch, pull and push, merge conflicts, gutter marks and blame.
+description: File, hunk and line staging, commits, branches, remotes, conflicts, history and agent changes.
 ---
 
 import { Aside, Steps } from "@astrojs/starlight/components";
 
-crc drives the `git` you already have. Git runs on worker threads, so the
-editor never waits on it, and your hooks and commit signing stay exactly as
+crc drives the `git` you already have. Git operations run on worker threads,
+and your hooks and commit signing stay as
 Git has them configured.
 
 ## Source Control
@@ -24,8 +24,8 @@ It shows:
 <Steps>
 
 1. Select a changed file to see its diff.
-2. Stage the **whole file**, or stage and unstage **single hunks** from the
-   diff.
+2. Stage the **whole file**, **single hunks** or **selected lines** from the
+   diff. Space stages the hunk under the cursor or the selected lines.
 3. Write a message and press <kbd>⌘</kbd><kbd>↩</kbd> to commit what is
    staged. **Git › Commit…** does the same from the menu.
 
@@ -35,9 +35,14 @@ Git reads the files as saved on disk, so save before staging an edit you want
 included.
 
 <Aside type="note">
-  Hunk staging covers tracked text changes. Other kinds of change use the
+Hunk and line staging cover tracked text changes. Other kinds of change use the
   whole-file actions.
 </Aside>
+
+The composer supports a subject and body, with subject length counted
+against 50 characters and body lines against 72. It completes conventional
+commit types. **Amend** is offered only while the last commit is not
+known to be pushed. Stage All and Unstage All act on their respective groups.
 
 ## Branches and remotes
 
@@ -47,9 +52,13 @@ The **Git** menu has:
 |---|---|
 | **Switch Branch…** | Lists your local branches in the palette. Type a name that is not one and it offers to create it. |
 | **Fetch** | `git fetch` |
-| **Pull** | `git pull --ff-only`: it never merges or rebases for you. |
+| **Pull** | Fast-forwards when possible; when histories diverge, offers rebase or merge. |
 | **Push** | `git push`, never forced. A branch with no upstream is pushed to `origin` and tracks it. |
 | **Refresh** | Re-reads the status. |
+
+The branch menu also creates, renames and deletes branches, with confirmation
+for an unmerged branch. The branch row shows upstream counts and when the
+remote was last checked.
 
 <Aside type="tip" title="SSH remotes from the Dock">
   An app opened from the Dock does not get your shell's `SSH_AUTH_SOCK`, so
@@ -84,7 +93,8 @@ it. **Previous** and **Next** walk the conflicts, wrapping around the file.
 Once no markers are left, **Mark Resolved** saves the file and stages it,
 which is how Git knows the conflict is over; it refuses while any markers
 remain, so they cannot end up in a commit. Finish the merge or rebase with
-Git as usual.
+Git as usual, or use **Git › Continue Rebase**. **Abort Merge or Rebase**
+asks before giving up that operation.
 
 Everything in the strip is also in the **Git** menu, and so in the
 palette: Next Conflict, Previous Conflict, Accept Current, Accept Incoming,
@@ -108,3 +118,14 @@ Accept Both, Accept Base, Conflicts Side by Side and Mark Resolved.
 
 Gutter marks compare with HEAD, not the index, and stop at files over 2 MiB.
 The full list is in [Known limits](/docs/reference/limitations/).
+
+## History and agent changes
+
+[File History and local versions](/docs/features/history/) covers the
+timeline, restore, persistent undo and Blame Heat.
+
+The final **Changed by agents** group lists files changed by terminal
+sessions in this repository. A row opens its diff; its menu keeps the
+change or undoes a write for which crc kept a copy. Unhooked writes are
+keep-only, and undo refuses newer or unsaved edits. This replaces the old
+Review page. See [Claude Code](/docs/features/claude-code/#changed-by-agents).
