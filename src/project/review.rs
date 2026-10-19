@@ -258,9 +258,18 @@ fn holder(dir: &Path, path: &Path) -> PathBuf {
         .unwrap_or_else(|| dir.to_path_buf())
 }
 
+/// Git metadata is never an agent working-file change, including in child
+/// repositories and linked-worktree .git files.
+fn git_metadata(path: &Path) -> bool {
+    path.components().any(|c| c.as_os_str() == ".git")
+}
+
 /// Keeps `path` as it is now, unless this session already has it.
 pub fn checkpoint(dir: &Path, path: &Path) -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
+    if git_metadata(path) {
+        return Ok(());
+    }
     let files = dir.join("files");
     std::fs::create_dir_all(&files)?;
     let key = key(path);
@@ -296,6 +305,9 @@ pub fn checkpoint(dir: &Path, path: &Path) -> std::io::Result<()> {
 /// session already has the file, hooked or not.
 pub fn note_unhooked(dir: &Path, path: &Path, staged: Option<&[u8]>) -> std::io::Result<bool> {
     use std::os::unix::ffi::OsStrExt;
+    if git_metadata(path) {
+        return Ok(false);
+    }
     let files = dir.join("files");
     std::fs::create_dir_all(&files)?;
     let key = key(path);
@@ -424,6 +436,9 @@ pub fn files(dir: &Path) -> Vec<File> {
             let name = entry.file_name().into_string().ok()?;
             let key = name.strip_suffix(".path")?;
             let path = crate::platform::path_from_bytes(std::fs::read(entry.path()).ok()?);
+            if git_metadata(&path) {
+                return None;
+            }
             let text = files.join(key);
             let unhooked = files.join(format!("{key}.unhooked"));
             let checkpoint = if text.is_file() {
@@ -447,9 +462,9 @@ pub fn files(dir: &Path) -> Vec<File> {
 }
 
 /// How many files [`files`] lists, from one listing of the folder: a claim
-/// counts when its copy or one of its markers is there by name. No file is
-/// read and none is looked up on its own, so a session of thousands of
-/// files costs one directory read.
+/// counts when its copy or one of its markers is there by name. No checkpoint
+/// contents are read. Claims are read to exclude legacy Git metadata
+/// without deleting any persisted records.
 pub fn count(dir: &Path) -> usize {
     let Ok(entries) = std::fs::read_dir(dir.join("files")) else {
         return 0;
@@ -462,6 +477,12 @@ pub fn count(dir: &Path) -> usize {
         .iter()
         .filter_map(|name| name.strip_suffix(".path"))
         .filter(|key| {
+            let Ok(bytes) = std::fs::read(dir.join("files").join(format!("{key}.path"))) else {
+                return false;
+            };
+            if git_metadata(&crate::platform::path_from_bytes(bytes)) {
+                return false;
+            }
             ["", ".unhooked", ".untracked", ".absent", ".large"]
                 .iter()
                 .any(|marker| names.contains(&format!("{key}{marker}")))
@@ -965,6 +986,38 @@ mod tests {
         assert_eq!(unique.len(), ids.len());
     }
     use crate::project::TempTree;
+
+    #[test]
+    fn metadata_is_excluded_from_new_and_persisted_reviews() {
+        use std::os::unix::ffi::OsStrExt;
+        let tree = TempTree::new("review-metadata", &[("repo/notes.txt", "notes")]);
+        let dir = tree.0.join("session");
+        let normal = tree.0.join("repo/notes.txt");
+        assert!(note_unhooked(&dir, &normal, None).unwrap());
+        for name in [
+            "repo/.git",
+            "repo/.git/index",
+            "nested/repo/.git/objects/ab/cd",
+        ] {
+            let path = tree.0.join(name);
+            assert!(!note_unhooked(&dir, &path, None).unwrap());
+            checkpoint(&dir, &path).unwrap();
+            assert!(!has(&dir, &path));
+            // Simulate records collected by an older installed build.
+            let files = dir.join("files");
+            let key = key(&path);
+            std::fs::write(
+                files.join(format!("{key}.path")),
+                path.as_os_str().as_bytes(),
+            )
+            .unwrap();
+            std::fs::write(files.join(format!("{key}.untracked")), "").unwrap();
+        }
+        assert_eq!(files(&dir).len(), 1);
+        assert_eq!(files(&dir)[0].path, normal);
+        assert_eq!(count(&dir), 1);
+        assert_eq!(std::fs::read_dir(dir.join("files")).unwrap().count(), 8);
+    }
 
     fn pre(path: &Path) -> String {
         format!(
@@ -1508,14 +1561,14 @@ mod tests {
     }
 
     #[test]
-    fn the_count_reads_no_file() {
+    fn the_count_reads_no_checkpoint_contents() {
         use std::os::unix::fs::PermissionsExt;
         let tree = TempTree::new("review-count-unread", &[]);
         let dir = mixed_session(&tree.0, 1000);
-        // Claims nobody may open: listing them is all the count can do.
+        // Checkpoint contents need not be readable; only path claims are read.
         for entry in std::fs::read_dir(dir.join("files")).expect("list") {
             let path = entry.expect("entry").path();
-            if path.extension().is_some_and(|e| e == "path") {
+            if path.extension().is_none_or(|e| e != "path") {
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
                     .expect("chmod");
             }

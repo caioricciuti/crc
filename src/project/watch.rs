@@ -338,13 +338,15 @@ pub fn classify(root: &Path, git_dirs: &[PathBuf], path: &Path) -> Option<Change
         return bookkeeping(names(inside));
     }
     let relative = path.strip_prefix(root).ok()?;
+    // Parent workspaces can contain repositories at any depth. Their
+    // metadata must refresh Git, never enter the changed-file queue.
+    if let Some(index) = relative.components().position(|c| c.as_os_str() == ".git") {
+        return bookkeeping(names(relative).into_iter().skip(index + 1).collect());
+    }
     let mut components = relative
         .components()
         .map(|c| c.as_os_str().to_string_lossy());
     let first = components.next()?;
-    if first == ".git" {
-        return bookkeeping(components.map(|c| c.into_owned()).collect());
-    }
     if super::SKIP_DIRS.contains(&first.as_ref()) || first == ".DS_Store" {
         return None;
     }
@@ -362,6 +364,32 @@ pub fn classify(root: &Path, git_dirs: &[PathBuf], path: &Path) -> Option<Change
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nested_repository_metadata_is_never_a_working_file() {
+        let root = Path::new("/workspace");
+        for prefix in ["repo/.git", "nested/repo/.git"] {
+            for name in ["HEAD", "index", "refs/heads/main"] {
+                assert_eq!(
+                    classify(root, &[], &root.join(prefix).join(name)),
+                    Some(Change::Git)
+                );
+            }
+            for name in [
+                "COMMIT_EDITMSG",
+                "FETCH_HEAD",
+                "MERGE_RR",
+                "index.lock",
+                "objects/ab/cd",
+            ] {
+                assert_eq!(classify(root, &[], &root.join(prefix).join(name)), None);
+            }
+        }
+        assert_eq!(
+            classify(root, &[], &root.join("repo/notes.txt")),
+            Some(Change::Tree)
+        );
+    }
 
     #[test]
     fn classifies_tree_git_and_noise() {
