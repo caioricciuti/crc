@@ -3385,7 +3385,11 @@ impl Panel {
                             );
                         }
                     }
-                    let state = activity.label();
+                    let state = if tab.retrying() {
+                        "retrying"
+                    } else {
+                        activity.label()
+                    };
                     let state_w = layout::ui_text_width(atlas, state) + 4.0;
                     layout::push_ui_text(
                         out,

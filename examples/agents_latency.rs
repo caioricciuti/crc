@@ -208,6 +208,7 @@ fn tab(title: &str, workspace: &Workspace, cols: usize, rows: usize) -> Tab {
         last_probe: None,
         probe_owed: false,
         seen: None,
+        retry: None,
     }
 }
 

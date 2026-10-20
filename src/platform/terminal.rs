@@ -117,6 +117,9 @@ pub struct Tab {
     /// What was shown of it when its output was last looked at; see
     /// [`Tab::face_changed`].
     pub seen: Option<Face>,
+    /// Its agent's streak of temporary API errors, while auto-continue
+    /// tries it again; see [`crate::platform::retry`].
+    pub retry: Option<crate::platform::retry::Retry>,
 }
 
 /// What a session is doing, as the Agents sidebar shows it.
@@ -232,9 +235,20 @@ impl Tab {
         }
     }
 
+    /// Whether auto-continue has a try scheduled for it.
+    pub fn retrying(&self) -> bool {
+        self.retry.is_some_and(|r| r.pending())
+    }
+
     /// How Home and the status line say what the tab is doing.
     pub fn state(&self) -> String {
         use crate::term::status::State;
+        if self.retrying() {
+            return match self.attention.as_deref() {
+                Some(text) if !text.is_empty() => format!("retrying: {text}"),
+                _ => "retrying".into(),
+            };
+        }
         if let Some(status) = &self.status {
             match status.state {
                 State::Working => return "working".into(),
@@ -1896,6 +1910,7 @@ mod tests {
             last_typed: None,
             last_probe: None,
             probe_owed: false,
+            retry: None,
             seen: None,
         }
     }

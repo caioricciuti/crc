@@ -116,12 +116,19 @@ pub enum Event {
     },
     /// A teammate has nothing left to do.
     TeammateIdle(String),
+    /// An API error ended the turn: Claude's StopFailure hook, with the
+    /// error's kind (`overloaded`, `rate_limit`, ...) and what it said.
+    ApiError { error: String, details: String },
 }
+
+/// What the Stop hook asks: the turn is over, the agent waits.
+pub const FINISHED: &str = "finished";
 
 /// What `crc --hook <kind>` does with the hook's JSON on stdin, for the
 /// session in `dir`. `pre` checkpoints the file a tool is about to write,
 /// `post` records the file as the tool left it, `notify` records the
-/// agent's question. The event appended to the session's `events`, when
+/// agent's question, `stop-failure` the API error that ended the turn. The
+/// event appended to the session's `events`, when
 /// the hook is one that is.
 pub fn hook(kind: &str, input: &str, dir: &Path) -> Result<Option<Event>, String> {
     let value = crate::json::parse(input).map_err(|e| format!("hook input: {e}"))?;
@@ -167,7 +174,22 @@ pub fn hook(kind: &str, input: &str, dir: &Path) -> Result<Option<Event>, String
                 .unwrap_or("")
                 .to_owned(),
         ),
-        "stop" => Event::Asked("finished".into()),
+        "stop" => Event::Asked(FINISHED.into()),
+        "stop-failure" => {
+            let text = |name: &str| {
+                value
+                    .get(name)
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
+                    .filter(|s| !s.is_empty())
+            };
+            Event::ApiError {
+                error: text("error").unwrap_or_else(|| "unknown".into()),
+                details: text("error_details")
+                    .or_else(|| text("last_assistant_message"))
+                    .unwrap_or_default(),
+            }
+        }
         "task-created" | "task-completed" => {
             let text = |name: &str| {
                 value
@@ -517,6 +539,9 @@ fn append(dir: &Path, event: &Event) -> std::io::Result<()> {
             clean(subject)
         ),
         Event::TeammateIdle(name) => format!("idle\t{}\n", clean(name)),
+        Event::ApiError { error, details } => {
+            format!("apierror\t{}\t{}\n", clean(error), clean(details))
+        }
     };
     std::fs::create_dir_all(dir)?;
     // One write of a short line with O_APPEND: hooks running at once do
@@ -576,6 +601,13 @@ pub fn read_events(dir: &Path, from: u64) -> (Vec<Event>, u64) {
                     }
                 }
                 "idle" => Event::TeammateIdle(rest.to_owned()),
+                "apierror" => {
+                    let (error, details) = rest.split_once('\t').unwrap_or((rest, ""));
+                    Event::ApiError {
+                        error: error.to_owned(),
+                        details: details.to_owned(),
+                    }
+                }
                 _ => return None,
             })
         })
@@ -662,9 +694,10 @@ pub fn shell_quote(text: &str) -> String {
 }
 
 /// Claude Code settings that run this binary's hooks, for `claude
-/// --settings`. Claude merges hooks from every settings source, so the
-/// person's own hooks still run.
-pub fn claude_settings(exe: &Path) -> String {
+/// --settings`: with `review` every hook, without it only StopFailure, for
+/// auto-continue, so no file is checkpointed. Claude merges hooks from
+/// every settings source, so the person's own hooks still run.
+pub fn claude_settings(exe: &Path, review: bool) -> String {
     use crate::json::{Value, object, string};
     let command = |kind: &str| {
         Value::Array(vec![object([
@@ -678,6 +711,15 @@ pub fn claude_settings(exe: &Path) -> String {
             ),
         ])])
     };
+    // An API error that ended the turn, of any kind: which are worth
+    // another try is decided here, not by a matcher.
+    let failure = (
+        "StopFailure",
+        Value::Array(vec![object([("hooks", command("stop-failure"))])]),
+    );
+    if !review {
+        return crate::json::pretty(&object([("hooks", object([failure]))]));
+    }
     let settings = object([(
         "hooks",
         object([
@@ -721,17 +763,25 @@ pub fn claude_settings(exe: &Path) -> String {
                 "TeammateIdle",
                 Value::Array(vec![object([("hooks", command("teammate-idle"))])]),
             ),
+            failure,
         ]),
     )]);
     crate::json::pretty(&settings)
 }
 
 /// Writes [`claude_settings`] for the running binary where `claude
-/// --settings` reads it, and returns that path quoted for the shell.
-pub fn claude_settings_arg() -> Option<String> {
+/// --settings` reads it, and returns that path quoted for the shell. Each
+/// kind has its own file: a session started with one keeps it when the
+/// setting changes.
+pub fn claude_settings_arg(review: bool) -> Option<String> {
     let exe = std::env::current_exe().ok()?;
-    let path = crate::platform::app_support()?.join("claude-hooks.json");
-    let text = claude_settings(&exe);
+    let name = if review {
+        "claude-hooks.json"
+    } else {
+        "claude-hooks-continue.json"
+    };
+    let path = crate::platform::app_support()?.join(name);
+    let text = claude_settings(&exe, review);
     if std::fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
         std::fs::create_dir_all(path.parent()?).ok()?;
         std::fs::write(&path, text).ok()?;
@@ -1223,7 +1273,7 @@ mod tests {
 
     #[test]
     fn claude_settings_quote_the_binary_for_the_shell() {
-        let text = claude_settings(Path::new("/Applications/crc's.app/crc"));
+        let text = claude_settings(Path::new("/Applications/crc's.app/crc"), true);
         let value = crate::json::parse(&text).expect("json");
         let command = value
             .path("hooks.PreToolUse")
@@ -1243,6 +1293,7 @@ mod tests {
             ("TaskCreated", "task-created"),
             ("TaskCompleted", "task-completed"),
             ("TeammateIdle", "teammate-idle"),
+            ("StopFailure", "stop-failure"),
         ] {
             let command = value
                 .path(&format!("hooks.{event}"))
@@ -1259,6 +1310,69 @@ mod tests {
                 "{event}: {command}"
             );
         }
+    }
+
+    #[test]
+    fn without_review_only_the_failure_hook_is_installed() {
+        let text = claude_settings(Path::new("/usr/local/bin/crc"), false);
+        let value = crate::json::parse(&text).expect("json");
+        let hooks = value.get("hooks").expect("hooks");
+        assert!(hooks.get("PreToolUse").is_none());
+        assert!(hooks.get("Stop").is_none());
+        let failure = hooks
+            .get("StopFailure")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .expect("StopFailure");
+        assert!(failure.get("matcher").is_none(), "every error, sorted here");
+        let command = failure
+            .path("hooks")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .and_then(|h| h.get("command"))
+            .and_then(|v| v.as_str())
+            .expect("command");
+        assert_eq!(command, "'/usr/local/bin/crc' --hook stop-failure");
+    }
+
+    #[test]
+    fn the_failure_hook_records_the_api_error() {
+        let tree = TempTree::new("review-stop-failure", &[]);
+        let dir = tree.0.join("session");
+        let event = hook(
+            "stop-failure",
+            r#"{"hook_event_name":"StopFailure","error":"server_error","error_details":"API Error: 500\n\t{\"type\":\"api_error\"}","last_assistant_message":"ignored"}"#,
+            &dir,
+        )
+        .expect("hook");
+        let said = Event::ApiError {
+            error: "server_error".into(),
+            details: r#"API Error: 500 {"type":"api_error"}"#.into(),
+        };
+        assert_eq!(event, Some(said.clone()));
+        // No details: the last message says it. No error named: unknown.
+        hook(
+            "stop-failure",
+            r#"{"last_assistant_message":"Connection dropped"}"#,
+            &dir,
+        )
+        .expect("hook");
+        hook("stop-failure", r#"{"error":"rate_limit"}"#, &dir).expect("hook");
+        let (events, _) = read_events(&dir, 0);
+        assert_eq!(
+            events,
+            vec![
+                said,
+                Event::ApiError {
+                    error: "unknown".into(),
+                    details: "Connection dropped".into(),
+                },
+                Event::ApiError {
+                    error: "rate_limit".into(),
+                    details: String::new(),
+                },
+            ]
+        );
     }
 
     /// A session holding `name` as `before`, with the agent's `after` on

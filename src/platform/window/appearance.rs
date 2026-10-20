@@ -227,6 +227,12 @@ impl EditorView {
             state.ssh_auth_sock = settings.ssh_auth_sock.clone();
             state.conflict_side = settings.conflict_side_by_side;
             state.agent_review = settings.agent_review;
+            state.auto_continue = settings.auto_continue;
+            if !settings.auto_continue {
+                for tab in &mut state.terminal.tabs {
+                    tab.retry = None;
+                }
+            }
             state
                 .history
                 .configure(settings.local_history, &settings.local_history_exclude);

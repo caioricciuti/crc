@@ -68,6 +68,10 @@ pub struct Settings {
     /// Whether the Claude Code crc starts runs its review hooks: each file
     /// kept as it was before Claude's first edit, for review and undo.
     pub agent_review: bool,
+    /// Whether a Claude Code turn that ended on a temporary API error (an
+    /// overloaded or failing server, a dropped connection) is told to
+    /// continue, a few times, unless the person types first.
+    pub auto_continue: bool,
     /// Whether the gutter shows how recently each line was changed, from
     /// Git's blame. Off unless asked for: it runs `git blame` per file.
     pub blame_heat: bool,
@@ -101,6 +105,7 @@ impl Default for Settings {
             ssh_auth_sock: None,
             conflict_side_by_side: false,
             agent_review: true,
+            auto_continue: true,
             blame_heat: false,
             local_history: true,
             local_history_exclude: String::new(),
@@ -161,6 +166,12 @@ blame_heat = false
 # before Claude's first edit to it, so the change can be reviewed and
 # undone. Nothing is sent anywhere; the copies stay in crc's folder.
 agent_review = true
+
+# When a Claude Code turn crc started ends on a temporary API error (an
+# overloaded or failing server, a dropped connection), type \"continue\"
+# into it after 20, 40 and 80 seconds, unless you type first. Usage limits,
+# billing and login errors are left to you.
+auto_continue = true
 
 # Keep past versions of the files you edit, in crc's folder in Application
 # Support: as opened, at each save, before a reload, when closed unsaved,
@@ -253,6 +264,7 @@ impl Settings {
                 "caret_blink" => set_bool(value, &mut settings.caret_blink),
                 "update_check" => set_bool(value, &mut settings.update_check),
                 "agent_review" => set_bool(value, &mut settings.agent_review),
+                "auto_continue" => set_bool(value, &mut settings.auto_continue),
                 "blame_heat" => set_bool(value, &mut settings.blame_heat),
                 "local_history" => set_bool(value, &mut settings.local_history),
                 "local_history_exclude" => match bare.as_deref() {
@@ -425,7 +437,7 @@ pub struct Described {
 
 /// Every key the file takes, in the page's order. A test checks this
 /// against the template, so a new key cannot ship without a sentence here.
-pub const DESCRIBED: [Described; 14] = [
+pub const DESCRIBED: [Described; 15] = [
     Described {
         key: "theme",
         group: "Appearance",
@@ -487,6 +499,11 @@ pub const DESCRIBED: [Described; 14] = [
         what: "Keep each file as it was before the Claude Code crc starts first edits it, so its changes can be reviewed and undone.",
     },
     Described {
+        key: "auto_continue",
+        group: "Agents",
+        what: "When a Claude Code turn ends on a temporary API error, type \"continue\" into it after 20, 40 and 80 seconds, unless you type first.",
+    },
+    Described {
         key: "local_history",
         group: "Local History",
         what: "Keep past versions of the files you edit: opened, saved, reloaded, closed unsaved, and after 30 seconds without typing. Never secrets.",
@@ -509,6 +526,7 @@ impl Settings {
             "caret_blink" => flag(self.caret_blink),
             "update_check" => flag(self.update_check),
             "agent_review" => flag(self.agent_review),
+            "auto_continue" => flag(self.auto_continue),
             "blame_heat" => flag(self.blame_heat),
             "local_history" => flag(self.local_history),
             "local_history_exclude" => quote(&self.local_history_exclude),
@@ -826,6 +844,21 @@ mod tests {
     }
 
     #[test]
+    fn auto_continue_defaults_on_and_takes_a_boolean() {
+        assert!(Settings::parse("").auto_continue);
+        assert!(Settings::parse(TEMPLATE).auto_continue);
+        assert!(!Settings::parse("auto_continue = false\n").auto_continue);
+        assert_eq!(
+            Settings::parse("auto_continue = false\n").value_of("auto_continue"),
+            "false"
+        );
+        assert!(
+            Settings::parse("auto_continue = \"false\"\n").auto_continue,
+            "a string is not a boolean"
+        );
+    }
+
+    #[test]
     fn parses_the_subset_and_ignores_the_rest() {
         let s = Settings::parse(
             "# a comment\nfont = \"Menlo\"  # trailing\nfont_size = 15\nunknown = [1, 2]\n",
@@ -857,6 +890,7 @@ mod tests {
             ssh_auth_sock: None,
             conflict_side_by_side: false,
             agent_review: true,
+            auto_continue: true,
             blame_heat: false,
             local_history: true,
             local_history_exclude: String::new(),

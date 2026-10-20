@@ -338,13 +338,13 @@ impl EditorView {
         let args = if claude {
             // A command given in CRC_CLAUDE_COMMAND runs as given, with
             // the prompt after it as for `claude`. Plain `claude` gets the
-            // review hooks as extra settings: Claude merges them with the
-            // person's own, and nothing in ~/.claude is touched.
+            // review hooks as extra settings, or with review off only the
+            // one auto-continue hears: Claude merges them with the person's
+            // own, and nothing in ~/.claude is touched.
             let command = match std::env::var("CRC_CLAUDE_COMMAND") {
                 Ok(command) => command,
-                Err(_) => match state
-                    .agent_review
-                    .then(crate::project::review::claude_settings_arg)
+                Err(_) => match (state.agent_review || state.auto_continue)
+                    .then(|| crate::project::review::claude_settings_arg(state.agent_review))
                     .flatten()
                 {
                     Some(settings) => format!("claude --settings {settings}"),
@@ -577,6 +577,7 @@ impl EditorView {
                     last_typed: None,
                     last_probe: None,
                     probe_owed: false,
+                    retry: None,
                     seen: None,
                     launch,
                     held,
@@ -732,6 +733,7 @@ impl EditorView {
                     last_typed: None,
                     last_probe: None,
                     probe_owed: false,
+                    retry: None,
                     seen: None,
                     launch,
                     held: Some(id),
@@ -1151,9 +1153,112 @@ impl EditorView {
             }
             tab.session.write(bytes);
             tab.last_typed = Some(Instant::now());
+            // The person answered: auto-continue leaves it to them.
+            tab.retry = None;
         }
         if answered {
             super::agents::sync_dock_badge(&state, MainThreadMarker::from(self));
+        }
+    }
+
+    /// Schedules the next look at auto-continue's tries, in place of any:
+    /// when the soonest is due. Nothing when none is.
+    pub(super) fn arm_auto_continue(&self) {
+        let _: () = unsafe {
+            msg_send![
+                objc2::class!(NSObject),
+                cancelPreviousPerformRequestsWithTarget: self,
+                selector: sel!(autoContinueTick:),
+                object: None::<&AnyObject>
+            ]
+        };
+        let Some(next) = self.state().and_then(|state| {
+            state
+                .terminal
+                .tabs
+                .iter()
+                .filter_map(|tab| tab.retry?.next_look())
+                .min()
+        }) else {
+            return;
+        };
+        let wait = next.saturating_duration_since(Instant::now()).as_secs_f64();
+        let _: () = unsafe {
+            msg_send![self, performSelector: sel!(autoContinueTick:),
+                withObject: None::<&AnyObject>, afterDelay: wait.max(0.05)]
+        };
+    }
+
+    /// Auto-continue: types "continue" into each session whose try came
+    /// due, and its Return a moment after. Each is checked again right
+    /// before: a session typed into since its error is the person's, and
+    /// one at work or being typed into now waits a second more. What crc
+    /// types is not the person typing: `last_typed` stays theirs.
+    pub(super) fn auto_continue_tick(&self) {
+        use crate::platform::terminal::Activity;
+        let now = Instant::now();
+        let mut changed = false;
+        {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            let showing = state.terminal.has_keys().then_some(state.terminal.active);
+            for (index, tab) in state.terminal.tabs.iter_mut().enumerate() {
+                let Some(mut retry) = tab.retry else {
+                    continue;
+                };
+                if retry.typed_since(tab.last_typed) {
+                    tab.retry = None;
+                    changed = true;
+                    continue;
+                }
+                if retry.enter_due(now, tab.last_typed) {
+                    tab.session.write(b"\r");
+                    retry.enter_at = None;
+                }
+                if retry.next_at.is_some_and(|at| now >= at) {
+                    if !retry.due(now, tab.last_typed, showing == Some(index))
+                        || tab.activity() == Activity::Working
+                    {
+                        retry.next_at = Some(now + Duration::from_secs(1));
+                    } else {
+                        let bracketed = tab
+                            .session
+                            .term
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .modes
+                            .bracketed_paste;
+                        tab.session.write(&crate::term::keys::paste(
+                            crate::platform::retry::WORD,
+                            bracketed,
+                        ));
+                        retry.sent(now);
+                        // Answered, as typing would: no longer waiting.
+                        tab.attention = None;
+                        if tab
+                            .session
+                            .term
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .status
+                            .acknowledge()
+                        {
+                            tab.status = None;
+                        }
+                        changed = true;
+                    }
+                }
+                tab.retry = Some(retry);
+            }
+            if changed {
+                super::agents::sync_dock_badge(&state, MainThreadMarker::from(self));
+            }
+        }
+        self.arm_auto_continue();
+        if changed {
+            self.request_redraw();
+            self.pump();
         }
     }
 
@@ -1194,6 +1299,9 @@ impl EditorView {
         let mut asked = false;
         let mut team_events = Vec::new();
         let mut written = Vec::new();
+        let mut retry = false;
+        let first_delay = crate::platform::retry::first_delay();
+        let auto_continue = state.auto_continue;
         for Noticed {
             index,
             mut notice,
@@ -1247,7 +1355,33 @@ impl EditorView {
                         wrote = true;
                         written.push(path);
                     }
-                    crate::project::review::Event::Asked(text) => notice = Some(text),
+                    crate::project::review::Event::Asked(text) => {
+                        // A turn that ended well: the next error starts
+                        // a new streak.
+                        if text == crate::project::review::FINISHED {
+                            tab.retry = None;
+                        }
+                        notice = Some(text);
+                    }
+                    crate::project::review::Event::ApiError { error, details } => {
+                        // The turn ended, as Stop says, on an error: the
+                        // tab waits, and a temporary one is tried again.
+                        if auto_continue && crate::platform::retry::temporary(&error, &details) {
+                            tab.retry = Some(crate::platform::retry::Retry::after_error(
+                                tab.retry.as_ref(),
+                                now,
+                                first_delay,
+                            ));
+                            retry |= tab.retrying();
+                        } else {
+                            tab.retry = None;
+                        }
+                        notice = Some(if details.is_empty() {
+                            format!("API error: {error}")
+                        } else {
+                            details
+                        });
+                    }
                     crate::project::review::Event::Failed(text) => {
                         said = Some(format!("{}: review hook: {text}", tab.name()));
                     }
@@ -1289,6 +1423,10 @@ impl EditorView {
             if !app.isActive() && std::env::var_os("CRC_SELFTEST").is_none() {
                 app.requestUserAttention(NSRequestUserAttentionType::InformationalRequest);
             }
+        }
+        drop(state);
+        if retry {
+            self.arm_auto_continue();
         }
         told
     }

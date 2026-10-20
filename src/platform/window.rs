@@ -771,6 +771,9 @@ struct State {
     conflict_side: bool,
     /// The Claude Code started here runs the review hooks.
     agent_review: bool,
+    /// A turn of it that ended on a temporary API error is told to
+    /// continue; see [`crate::platform::retry`].
+    auto_continue: bool,
     /// What the conflict controls' cursor rects were built for.
     conflict_cursor_key: Option<(u64, usize, usize, usize, usize, bool)>,
     /// The Extensions page's targets and the bulb, as last drawn, so their
@@ -4430,6 +4433,11 @@ define_class!(
         #[unsafe(method(sessionsTick:))]
         fn action_sessions_tick(&self, _sender: Option<&AnyObject>) {
             self.sessions_tick();
+        }
+
+        #[unsafe(method(autoContinueTick:))]
+        fn action_auto_continue_tick(&self, _sender: Option<&AnyObject>) {
+            self.auto_continue_tick();
         }
 
         #[unsafe(method(terminalSettle:))]
@@ -10175,6 +10183,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         tables: HashMap::new(),
         conflict_side: settings.conflict_side_by_side,
         agent_review: settings.agent_review,
+        auto_continue: settings.auto_continue,
         conflict_cursor_key: None,
         pointer_targets: Vec::new(),
         hotspots: Vec::new(),
