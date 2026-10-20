@@ -130,7 +130,29 @@ pub enum Activity {
     Idle,
 }
 
+impl Activity {
+    /// The word the sidebar and the switcher say it with.
+    pub fn label(self) -> &'static str {
+        match self {
+            Activity::Waiting => "waiting",
+            Activity::Working => "working",
+            Activity::Idle => "idle",
+        }
+    }
+}
+
 impl Tab {
+    /// What picks it again while it lives, its index moving as tabs open
+    /// and close: its review folder, which is its own, or for one without
+    /// (on a host) where its lifetime token lives.
+    pub fn id(&self) -> PathBuf {
+        if self.review.as_os_str().is_empty() {
+            PathBuf::from(format!("tab:{:p}", std::sync::Arc::as_ptr(&self.alive)))
+        } else {
+            self.review.clone()
+        }
+    }
+
     /// Whether what changes on this Mac can be its agent's, for review:
     /// it has a review folder, and is not ssh to a host (a remote
     /// workspace's terminal, or a shell in ssh now), whose writes are

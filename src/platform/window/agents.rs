@@ -255,6 +255,9 @@ impl EditorView {
                 .map(|i| tasks[i].id());
         }
         let ensure = changed && state.agents.on;
+        // A tab clicked, a session started or closed: what shows now is
+        // the latest place for the switcher.
+        note_focus(&mut state);
         let done = state.agents.take_done();
         let issue = state.agents.take_issue_detail();
         let mut start_in = None;
@@ -569,7 +572,9 @@ impl EditorView {
                 return;
             };
             let path = task.dir();
+            let key = switcher::workspace_key(&task.id());
             state.agents.select(index);
+            switcher::touch(&mut state.agents.focus, &key);
             let tasks = state.agents.tasks.clone();
             let mine: Vec<usize> = (0..state.terminal.tabs.len())
                 .filter(|i| task_of(&tasks, &state.terminal.tabs[*i]) == Some(index))
@@ -609,6 +614,7 @@ impl EditorView {
         self.set_agents_mode(true);
         self.focus_agent_terminal();
         if let Some(mut state) = self.state_mut() {
+            note_focus(&mut state);
             let active = state.terminal.active;
             if let Some(tab) = state.terminal.tabs.get_mut(active) {
                 tab.read_cwd();

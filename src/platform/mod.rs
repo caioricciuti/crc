@@ -22,6 +22,7 @@ pub mod selftest;
 pub mod session;
 pub mod settings;
 pub mod settings_page;
+pub mod switcher;
 pub mod symbols;
 pub mod table;
 pub mod terminal;

@@ -1252,8 +1252,10 @@ impl EditorView {
                     .map(|(host, repo)| shown_repo(host, &repo)),
                 task_rename: agents.renaming_name(),
                 commit: commit_prompt.as_deref(),
+                switch: switch_sources(agents, terminal_panel),
             };
             let mode = PaletteMode::of(&sources);
+            let switching = sources.switch.as_ref().map(|_| switcher::query(&text));
             let intent = sources.branches.map(|pick| &pick.intent);
             let rows: Vec<layout::PaletteRow> = palette_rows(&sources, &text)
                 .into_iter()
@@ -1289,6 +1291,9 @@ impl EditorView {
                         PaletteMode::McpUrl => "https://host/mcp",
                         PaletteMode::TaskName => "Workspace name",
                         PaletteMode::CommitMessage => "Commit message",
+                        PaletteMode::Open if switching.is_some() => {
+                            "Switch to\u{2026} (> commands, / files)"
+                        }
                         PaletteMode::Open => {
                             "Find a file  ·  > commands  ·  @ symbols  ·  # in project"
                         }
@@ -1309,6 +1314,8 @@ impl EditorView {
                         "Recover"
                     } else if mode == PaletteMode::Action || commands::query(&text).is_some() {
                         "Run"
+                    } else if matches!(switching, Some(switcher::Query::Switch(_))) {
+                        "Switch"
                     } else {
                         "Open"
                     },

@@ -1286,6 +1286,9 @@ pub struct Panel {
     pub inline: Option<(String, String, usize)>,
     pub scroll: usize,
     pub hits: Vec<(Viewport, Action)>,
+    /// The sessions and workspaces shown, latest first, for Cmd-P's
+    /// switcher (see [`crate::platform::switcher::touch`]).
+    pub focus: Vec<String>,
 }
 
 /// A task operation that worked: what to say, and a folder to start a
@@ -3382,11 +3385,7 @@ impl Panel {
                             );
                         }
                     }
-                    let state = match activity {
-                        Activity::Waiting => "waiting",
-                        Activity::Working => "working",
-                        Activity::Idle => "idle",
-                    };
+                    let state = activity.label();
                     let state_w = layout::ui_text_width(atlas, state) + 4.0;
                     layout::push_ui_text(
                         out,

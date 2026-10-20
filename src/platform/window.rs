@@ -40,6 +40,7 @@ use crate::platform::recovery;
 use crate::platform::search::{self, Options as SearchOptions, ProjectHit};
 use crate::platform::selftest::{self, Step};
 use crate::platform::session::Session;
+use crate::platform::switcher;
 use crate::platform::symbols;
 use crate::project::finder::Finder;
 use crate::project::tree::{Entry as TreeEntry, Tree, move_without_replace};
@@ -8059,6 +8060,10 @@ enum Pick {
     /// Commit everything in the workspace being asked about, with this
     /// message.
     CommitAll(String),
+    /// A session to show, by its [`crate::platform::terminal::Tab::id`].
+    Session(std::path::PathBuf),
+    /// A workspace with no session to select, by its id.
+    Workspace(String),
 }
 
 /// The New Workspace prompt's rows: a folder workspace on `folder` (or,
@@ -8463,6 +8468,8 @@ struct PaletteSources<'a> {
     task_rename: Option<&'a str>,
     /// Set while taking a commit message, the workspace's name.
     commit: Option<&'a str>,
+    /// Set in Agents mode: the sessions an unprefixed query switches to.
+    switch: Option<switcher::Sources>,
 }
 
 /// The rows of the open palette for its query; none when it is closed.
@@ -8492,6 +8499,79 @@ fn palette_sources(state: &State) -> PaletteSources<'_> {
             .map(|(host, repo)| shown_repo(host, &repo)),
         task_rename: state.agents.renaming_name(),
         commit: state.commit_prompt.as_deref(),
+        switch: switch_sources(&state.agents, &state.terminal),
+    }
+}
+
+/// What Cmd-P switches between in Agents mode; `None` outside it.
+fn switch_sources(
+    agents: &crate::platform::agents::Panel,
+    terminal: &crate::platform::terminal::Panel,
+) -> Option<switcher::Sources> {
+    if !agents.on {
+        return None;
+    }
+    let tasks = &agents.tasks;
+    let spaces = tasks
+        .iter()
+        .map(|task| switcher::Space {
+            id: task.id(),
+            name: task.name(),
+            branch: task.branch.clone(),
+            place: match &task.host {
+                Some(host) => host.clone(),
+                None if task.folderless() => String::new(),
+                None => shown_path(&task.path),
+            },
+            folder: task
+                .path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        })
+        .collect();
+    let sessions = terminal
+        .tabs
+        .iter()
+        .filter_map(|tab| {
+            Some(switcher::Session {
+                id: tab.id(),
+                title: tab.name(),
+                space: crate::platform::agents::task_of(tasks, tab)?,
+                state: tab.activity().label(),
+            })
+        })
+        .collect();
+    Some(switcher::Sources {
+        spaces,
+        sessions,
+        focus: agents.focus.clone(),
+        current: focus_key(agents, terminal),
+    })
+}
+
+/// What Agents mode shows, as the switcher remembers it: the session at
+/// the front when it is the selected workspace's, else that workspace.
+fn focus_key(
+    agents: &crate::platform::agents::Panel,
+    terminal: &crate::platform::terminal::Panel,
+) -> Option<String> {
+    let selected = agents.selected_index();
+    match terminal.active_tab() {
+        Some(tab) if crate::platform::agents::task_of(&agents.tasks, tab) == selected => {
+            Some(switcher::session_key(&tab.id()))
+        }
+        _ => selected.map(|i| switcher::workspace_key(&agents.tasks[i].id())),
+    }
+}
+
+/// Puts what Agents mode shows now at the front of the switcher's list.
+fn note_focus(state: &mut State) {
+    if !state.agents.on {
+        return;
+    }
+    if let Some(key) = focus_key(&state.agents, &state.terminal) {
+        switcher::touch(&mut state.agents.focus, &key);
     }
 }
 
@@ -8550,13 +8630,17 @@ struct PaletteWords {
 /// The palette's heading, what it says when nothing matches, and whether
 /// an empty list is still on its way, by mode.
 fn palette_words(sources: &PaletteSources<'_>, query: &str, mode: PaletteMode) -> PaletteWords {
-    let (heading, empty) = palette_heading(query, mode, sources.branches.map(|b| &b.intent));
+    let switching = sources.switch.as_ref().map(|_| switcher::query(query));
+    let (heading, empty) =
+        palette_heading(query, mode, sources.branches.map(|b| &b.intent), switching);
     let loading = match mode {
-        PaletteMode::Open => match symbols::query(query) {
-            Some((symbols::Scope::Project, "")) => false,
-            Some((scope, _)) => sources.symbols.loading(scope),
-            None if commands::query(query).is_some() => false,
-            None => sources.indexing && sources.finder.is_empty(),
+        PaletteMode::Open => match (switching, symbols::query(query)) {
+            (Some(switcher::Query::Switch(_)), _) => false,
+            (Some(switcher::Query::Files(_)), _) => sources.indexing && sources.finder.is_empty(),
+            (_, Some((symbols::Scope::Project, ""))) => false,
+            (_, Some((scope, _))) => sources.symbols.loading(scope),
+            (_, None) if commands::query(query).is_some() => false,
+            (_, None) => sources.indexing && sources.finder.is_empty(),
         },
         _ => false,
     };
@@ -8567,11 +8651,13 @@ fn palette_words(sources: &PaletteSources<'_>, query: &str, mode: PaletteMode) -
     }
 }
 
-/// The palette's heading and what it says when nothing matches, by mode.
+/// The palette's heading and what it says when nothing matches, by mode,
+/// and in Agents mode by what the query asks of the switcher.
 fn palette_heading(
     query: &str,
     mode: PaletteMode,
     intent: Option<&BranchIntent>,
+    switching: Option<switcher::Query<'_>>,
 ) -> (&'static str, &'static str) {
     match mode {
         PaletteMode::Branch => {
@@ -8612,6 +8698,11 @@ fn palette_heading(
         }
         PaletteMode::Open => {}
     }
+    match switching {
+        Some(switcher::Query::Switch(_)) => return ("Switch to a session", "No matching sessions"),
+        Some(switcher::Query::Files(_)) => return ("Project files", "No matching files"),
+        _ => {}
+    }
     match symbols::query(query) {
         Some((symbols::Scope::Document, _)) => ("Symbols in this file", "No matching symbols"),
         Some((symbols::Scope::Project, "")) => ("Symbols in the project", "Type a name"),
@@ -8622,7 +8713,8 @@ fn palette_heading(
 }
 
 /// The palette's rows for `query`: menu commands after a leading `>`,
-/// project files otherwise.
+/// project files otherwise; in Agents mode sessions, and files after a
+/// leading `/`.
 fn palette_rows(sources: &PaletteSources<'_>, query: &str) -> Vec<(layout::PaletteRow, Pick)> {
     let PaletteSources {
         finder,
@@ -8639,6 +8731,7 @@ fn palette_rows(sources: &PaletteSources<'_>, query: &str) -> Vec<(layout::Palet
         task_repo,
         task_rename,
         commit,
+        switch,
         indexing: _,
     } = sources;
     let (mcp_url, task) = (*mcp_url, *task);
@@ -8680,6 +8773,24 @@ fn palette_rows(sources: &PaletteSources<'_>, query: &str) -> Vec<(layout::Palet
     if let Some((server, actions)) = actions {
         return action_rows(*server, actions, query);
     }
+    if let Some(switch) = switch {
+        match switcher::query(query) {
+            switcher::Query::Switch(needle) => {
+                return switcher::rows(switch, needle)
+                    .into_iter()
+                    .map(|(row, target)| {
+                        let pick = match target {
+                            switcher::Target::Session(id) => Pick::Session(id),
+                            switcher::Target::Workspace(id) => Pick::Workspace(id),
+                        };
+                        (row, pick)
+                    })
+                    .collect();
+            }
+            switcher::Query::Files(needle) => return file_rows(finder, needle),
+            switcher::Query::Other => {}
+        }
+    }
     if let Some((scope, needle)) = symbols::query(query) {
         return symbol_list
             .search(scope, needle)
@@ -8715,6 +8826,11 @@ fn palette_rows(sources: &PaletteSources<'_>, query: &str) -> Vec<(layout::Palet
             })
             .collect();
     }
+    file_rows(finder, query)
+}
+
+/// The project's files matching `query`.
+fn file_rows(finder: &Finder, query: &str) -> Vec<(layout::PaletteRow, Pick)> {
     finder
         .search(query, layout::PALETTE_RESULTS)
         .iter()

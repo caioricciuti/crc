@@ -199,6 +199,22 @@ impl EditorView {
             Pick::Recover(path) => self.recover_file(path),
             Pick::Symbol(path, line) => self.go_to_symbol(path, line),
             Pick::Command(at, tag) => self.run_command(at, tag),
+            // By id, not place: a session may have closed, or the list
+            // moved, since the row was drawn.
+            Pick::Session(id) => {
+                let tab = self
+                    .state()
+                    .and_then(|state| state.terminal.tabs.iter().position(|t| t.id() == id));
+                if let Some(tab) = tab {
+                    self.show_session(tab);
+                }
+            }
+            Pick::Workspace(id) => {
+                let index = self.state().and_then(|state| state.agents.by_id(&id));
+                if let Some(index) = index {
+                    self.select_task(index);
+                }
+            }
             Pick::File(path) => {
                 self.load_path(&path.to_string_lossy());
                 // The title follows after the frame that shows the file:
