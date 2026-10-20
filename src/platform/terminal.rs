@@ -705,6 +705,226 @@ pub fn find_in(
         .collect())
 }
 
+/// Find in Terminals keeps this many matches of one session, the newest.
+pub const SEARCH_ALL_PER_TERMINAL: usize = 50;
+/// And this many in all.
+pub const SEARCH_ALL_LIMIT: usize = 500;
+/// A pause in typing this long starts the search.
+const SEARCH_ALL_DEBOUNCE: Duration = Duration::from_millis(150);
+/// A match's row shows this many characters of its line, this many of
+/// them before it.
+const SNIPPET: usize = 120;
+const SNIPPET_BEFORE: usize = 40;
+
+/// A session for Find in Terminals: its terminal's address, which picks it
+/// again, where it is ("workspace / title"), and its text, copied out.
+pub struct Searched {
+    pub term: usize,
+    pub place: String,
+    pub hay: term::Haystack,
+}
+
+/// A match of Find in Terminals: the session's terminal's address, where
+/// the match starts, and the palette row's words.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TermHit {
+    pub term: usize,
+    pub start: (u64, usize),
+    pub snippet: String,
+    pub detail: String,
+}
+
+/// The matches of `query` in every session, in their order, each one's
+/// newest first: at most [`SEARCH_ALL_PER_TERMINAL`] of a session and
+/// [`SEARCH_ALL_LIMIT`] in all. Stops early once `cancel` is set.
+pub fn search_all(
+    sessions: &[Searched],
+    query: &str,
+    options: crate::platform::search::Options,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<TermHit>, String> {
+    let mut hits = Vec::new();
+    if query.is_empty() {
+        return Ok(hits);
+    }
+    // An invalid pattern says so with no session open too.
+    find_in(&term::Haystack::default(), query, options)?;
+    for session in sessions {
+        let room = SEARCH_ALL_LIMIT - hits.len();
+        if room == 0 || cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+        let found = find_in(&session.hay, query, options)?;
+        let first = session.hay.first_line().unwrap_or(0);
+        for hit in found
+            .into_iter()
+            .rev()
+            .take(SEARCH_ALL_PER_TERMINAL.min(room))
+        {
+            let (line, col) = hit.start;
+            hits.push(TermHit {
+                term: session.term,
+                start: hit.start,
+                snippet: session
+                    .hay
+                    .row_text(line, col)
+                    .map(|(text, at)| snippet(text, at))
+                    .unwrap_or_default(),
+                detail: format!(
+                    "{}  \u{b7}  line {}",
+                    session.place,
+                    line.saturating_sub(first) + 1
+                ),
+            });
+        }
+    }
+    Ok(hits)
+}
+
+/// Up to [`SNIPPET`] characters of `text` around byte `at`, blanks
+/// trimmed, with an ellipsis where the line goes on.
+pub fn snippet(text: &str, at: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let index = text[..at.min(text.len())].chars().count();
+    let from = index
+        .saturating_sub(SNIPPET_BEFORE)
+        .min(chars.len().saturating_sub(SNIPPET));
+    let to = (from + SNIPPET).min(chars.len());
+    let shown: String = chars[from..to].iter().collect();
+    let mut out = String::new();
+    if from > 0 {
+        out.push('\u{2026}');
+    }
+    out.push_str(shown.trim());
+    if to < chars.len() {
+        out.push('\u{2026}');
+    }
+    out
+}
+
+/// Find in Terminals while the palette searches every session: what was
+/// typed, the search for it on a worker, and the last search's answer.
+#[derive(Default)]
+pub struct SearchAll {
+    /// The palette's query as last seen, and when its search is due.
+    typed: String,
+    due: Option<Instant>,
+    /// The search running: its number, and where its answer arrives.
+    running: Option<(u64, std::sync::mpsc::Receiver<SearchAnswer>)>,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    generation: u64,
+    /// The query the matches are for, the matches, and an invalid
+    /// pattern in the search's words.
+    pub query: String,
+    pub hits: Vec<TermHit>,
+    pub error: Option<String>,
+}
+
+/// A search's number, its query and what it found.
+type SearchAnswer = (u64, String, Result<Vec<TermHit>, String>);
+
+impl SearchAll {
+    /// Notes the palette's query; `true` when it changed, so a search is
+    /// due once typing pauses.
+    pub fn note(&mut self, query: &str) -> bool {
+        if query == self.typed {
+            return false;
+        }
+        self.typed = query.to_owned();
+        self.due = Some(Instant::now() + SEARCH_ALL_DEBOUNCE);
+        true
+    }
+
+    /// What the last search was asked, or the next will be.
+    pub fn typed(&self) -> &str {
+        &self.typed
+    }
+
+    /// Whether typing has paused long enough for the search to start.
+    pub fn due(&self, now: Instant) -> bool {
+        self.due.is_some_and(|at| now >= at)
+    }
+
+    /// Searches `sessions` for what was typed on a worker. A search still
+    /// running is stopped, and its answer dropped if it comes anyway.
+    pub fn start(&mut self, sessions: Vec<Searched>, options: crate::platform::search::Options) {
+        self.due = None;
+        self.stop();
+        self.generation += 1;
+        let query = self.typed.clone();
+        if query.is_empty() {
+            self.query = query;
+            self.hits.clear();
+            self.error = None;
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_cancel = std::sync::Arc::clone(&cancel);
+        let generation = self.generation;
+        std::thread::spawn(move || {
+            let found = search_all(&sessions, &query, options, &worker_cancel);
+            let _ = tx.send((generation, query, found));
+        });
+        self.running = Some((generation, rx));
+        self.cancel = Some(cancel);
+    }
+
+    /// Takes the worker's answer once it is there; `true` when it came.
+    pub fn poll(&mut self) -> bool {
+        let Some((generation, rx)) = &self.running else {
+            return false;
+        };
+        let answer = match rx.try_recv() {
+            Ok(answer) => Some(answer),
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+        };
+        let generation = *generation;
+        self.running = None;
+        self.cancel = None;
+        let Some((_, query, found)) = answer.filter(|(made, ..)| *made == generation) else {
+            return true;
+        };
+        self.query = query;
+        match found {
+            Ok(hits) => {
+                self.hits = hits;
+                self.error = None;
+            }
+            Err(error) => {
+                self.hits.clear();
+                self.error = Some(error);
+            }
+        }
+        true
+    }
+
+    /// Whether a search waits for typing to pause or for its worker.
+    pub fn busy(&self) -> bool {
+        self.due.is_some() || self.running.is_some()
+    }
+
+    /// Whether the list is empty only because its answer is on its way.
+    pub fn loading(&self) -> bool {
+        self.busy() && self.hits.is_empty() && self.error.is_none() && !self.typed.is_empty()
+    }
+
+    fn stop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.running = None;
+    }
+}
+
+impl Drop for SearchAll {
+    /// Closing the palette stops the worker.
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 /// The find bar over the session with the keyboard, in the panel `rect`:
 /// one row across the top of its pane, over the grid rather than taking
 /// room from it, which would resize the program's terminal.
@@ -1517,6 +1737,134 @@ mod tests {
         let after = find(&t, "needle", Options::default());
         assert!(after[0].start.0 > line);
         assert_eq!(after[0].start.0, t.view_line(0, 0));
+    }
+
+    fn searched(term: usize, place: &str, output: &str) -> Searched {
+        let mut t = term::Term::new(40, 4);
+        t.advance(output.as_bytes());
+        Searched {
+            term,
+            place: place.into(),
+            hay: t.haystack(),
+        }
+    }
+
+    fn search(
+        sessions: &[Searched],
+        query: &str,
+        options: Options,
+    ) -> Result<Vec<TermHit>, String> {
+        search_all(
+            sessions,
+            query,
+            options,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+    }
+
+    #[test]
+    fn a_snippet_is_the_matched_line_from_the_history() {
+        let mut t = term::Term::new(20, 3);
+        t.advance(b"  first needle here\r\n");
+        for n in 0..10 {
+            t.advance(format!("{n}\r\n").as_bytes());
+        }
+        let hay = t.haystack();
+        let hit = &find_in(&hay, "needle", Options::default()).unwrap()[0];
+        assert!(hit.start.0 < t.view_line(0, 0), "in the history");
+        let (text, at) = hay.row_text(hit.start.0, hit.start.1).unwrap();
+        assert_eq!((text, &text[at..]), ("  first needle here", "needle here"));
+        assert_eq!(snippet(text, at), "first needle here");
+    }
+
+    #[test]
+    fn a_wrapped_lines_snippet_joins_its_rows() {
+        let mut t = term::Term::new(10, 4);
+        t.advance(b"abcdefghijklmnop needle\r\nnext");
+        let hay = t.haystack();
+        let hit = &find_in(&hay, "needle", Options::default()).unwrap()[0];
+        assert_eq!(hit.start.0, t.view_line(0, 0) + 1);
+        let (text, at) = hay.row_text(hit.start.0, hit.start.1).unwrap();
+        assert_eq!(text, "abcdefghijklmnop needle");
+        assert_eq!(&text[at..], "needle");
+        // A long line keeps what is around the match, and says it goes on.
+        let long = format!("{}needle{}", "a".repeat(100), "b".repeat(100));
+        let shown = snippet(&long, 100);
+        assert_eq!(shown.chars().count(), SNIPPET + 2);
+        assert!(shown.starts_with('\u{2026}') && shown.ends_with('\u{2026}'));
+        assert!(shown.contains(&format!("{}needle", "a".repeat(SNIPPET_BEFORE))));
+    }
+
+    #[test]
+    fn searching_every_terminal_goes_in_tab_order_newest_first() {
+        let sessions = [
+            searched(1, "work / sh", "kiwi one\r\nplum\r\nkiwi two\r\n"),
+            searched(2, "zsh", "nothing\r\n"),
+            searched(3, "other / claude", "a kiwi\r\n"),
+        ];
+        let hits = search(&sessions, "kiwi", Options::default()).unwrap();
+        let shown: Vec<(usize, &str, &str)> = hits
+            .iter()
+            .map(|h| (h.term, h.snippet.as_str(), h.detail.as_str()))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                (1, "kiwi two", "work / sh  \u{b7}  line 3"),
+                (1, "kiwi one", "work / sh  \u{b7}  line 1"),
+                (3, "a kiwi", "other / claude  \u{b7}  line 1"),
+            ]
+        );
+        assert_eq!(hits[2].start.1, 2);
+        assert!(
+            search(&sessions, "", Options::default())
+                .unwrap()
+                .is_empty()
+        );
+        let regex = Options {
+            regex: true,
+            ..Options::default()
+        };
+        assert!(search(&sessions, "(", regex).is_err());
+        assert!(search(&[], "(", regex).is_err());
+    }
+
+    #[test]
+    fn searching_every_terminal_keeps_to_its_limits() {
+        let many: String = (0..SEARCH_ALL_PER_TERMINAL + 20)
+            .map(|n| format!("x{n}\r\n"))
+            .collect();
+        let sessions: Vec<Searched> = (0..12).map(|n| searched(n, "sh", &many)).collect();
+        let hits = search(&sessions, "x", Options::default()).unwrap();
+        assert_eq!(hits.len(), SEARCH_ALL_LIMIT);
+        assert!(hits[..SEARCH_ALL_PER_TERMINAL].iter().all(|h| h.term == 0));
+        assert_eq!(hits[SEARCH_ALL_PER_TERMINAL].term, 1);
+        // The newest of a session's matches, not its oldest.
+        let last = format!("x{}", SEARCH_ALL_PER_TERMINAL + 19);
+        assert_eq!(hits[0].snippet, last);
+        assert_eq!(hits.last().unwrap().term, 9);
+    }
+
+    #[test]
+    fn a_search_of_every_terminal_waits_for_typing_and_answers_once() {
+        let mut search = SearchAll::default();
+        assert!(!search.note(""), "nothing typed yet");
+        assert!(search.note("kiwi"));
+        assert!(search.busy() && search.loading());
+        assert!(!search.due(Instant::now()));
+        assert!(search.due(Instant::now() + SEARCH_ALL_DEBOUNCE));
+        search.start(vec![searched(7, "sh", "kiwi\r\n")], Options::default());
+        let started = Instant::now();
+        while !search.poll() && started.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(!search.busy());
+        assert_eq!(search.query, "kiwi");
+        assert_eq!(search.hits.len(), 1);
+        // Cleared: nothing, at once.
+        search.note("");
+        search.start(Vec::new(), Options::default());
+        assert!(!search.busy() && search.hits.is_empty());
     }
 
     fn tab() -> Tab {

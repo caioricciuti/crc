@@ -280,6 +280,30 @@ impl Haystack {
         }
         spans
     }
+
+    /// The number of the first line it holds.
+    pub fn first_line(&self) -> Option<u64> {
+        self.rows.first().map(|row| row.line)
+    }
+
+    /// The text of the line that line `line` is part of, with the rows the
+    /// terminal wrapped it over joined, and the byte in it where column
+    /// `col` of `line` is. For a match's snippet.
+    pub fn row_text(&self, line: u64, col: usize) -> Option<(&str, usize)> {
+        let row = &self.rows[self.rows.binary_search_by_key(&line, |r| r.line).ok()?];
+        let text = &self.text[row.start..row.end];
+        let at = row.start
+            + text
+                .char_indices()
+                .zip(&row.columns)
+                .find(|(_, (_, to))| *to as usize > col)
+                .map_or(text.len(), |((at, _), _)| at);
+        let start = self.text[..at].rfind('\n').map_or(0, |i| i + 1);
+        let end = self.text[at..]
+            .find('\n')
+            .map_or(self.text.len(), |i| at + i);
+        Some((&self.text[start..end], at - start))
+    }
 }
 
 /// A link on screen, from [`Term::link_at`]: where it goes, and the

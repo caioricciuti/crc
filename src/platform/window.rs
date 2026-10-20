@@ -950,6 +950,8 @@ struct State {
     finder: Finder,
     /// A project search or Find References in flight.
     project_search: ProjectSearch,
+    /// Find in Terminals, while the palette searches every session.
+    term_search: Option<crate::platform::terminal::SearchAll>,
     /// A request in flight: the id of its response tab's buffer, and where
     /// the reply arrives.
     http: Option<(u64, mpsc::Receiver<crate::http::view::Answer>)>,
@@ -2977,6 +2979,7 @@ define_class!(
             }
             self.poll_project_index();
             self.poll_project_search();
+            self.poll_terminal_search();
             self.poll_branches();
             self.poll_history_reply();
             self.poll_home();
@@ -3652,6 +3655,11 @@ define_class!(
             }
             self.request_redraw();
             self.pump();
+        }
+
+        #[unsafe(method(findInTerminals:))]
+        fn action_find_terminals(&self, _sender: Option<&AnyObject>) {
+            self.open_terminal_search();
         }
 
         #[unsafe(method(findNext:))]
@@ -4744,6 +4752,8 @@ define_class!(
                 state.update_ready.is_some() || crate::platform::update::replaced()
             } else if action == sel!(switchRepository:) {
                 state.workspace.has_several()
+            } else if action == sel!(findInTerminals:) {
+                !state.terminal.tabs.is_empty()
             } else if action == sel!(startIssueTask:) {
                 // The issue tab is the editor's: not while Agents hides it.
                 !state.agents.on && issues::active_issue(&state).is_some()
@@ -5603,6 +5613,7 @@ impl EditorView {
         self.sync_data_preview();
         self.sync_native_preview();
         self.sync_html_preview();
+        self.sync_terminal_search();
         let ready = match self.state() {
             Some(state) => match state.last_draw {
                 Some(t) => t.elapsed() >= state.frame_interval,
@@ -7149,6 +7160,7 @@ fn close_fields(state: &mut State) {
     state.cell_edit = None;
     query::close_query_field(state);
     state.palette = None;
+    state.term_search = None;
     state.goto = None;
     state.git_focus = false;
 }
@@ -8064,6 +8076,13 @@ enum Pick {
     Session(std::path::PathBuf),
     /// A workspace with no session to select, by its id.
     Workspace(String),
+    /// A match of Find in Terminals: its session's terminal's address,
+    /// where it starts, and the query it matched, for the find bar.
+    TerminalHit {
+        term: usize,
+        start: (u64, usize),
+        query: String,
+    },
 }
 
 /// The New Workspace prompt's rows: a folder workspace on `folder` (or,
@@ -8470,6 +8489,8 @@ struct PaletteSources<'a> {
     commit: Option<&'a str>,
     /// Set in Agents mode: the sessions an unprefixed query switches to.
     switch: Option<switcher::Sources>,
+    /// Set while finding in every terminal.
+    terminals: Option<&'a crate::platform::terminal::SearchAll>,
 }
 
 /// The rows of the open palette for its query; none when it is closed.
@@ -8500,6 +8521,7 @@ fn palette_sources(state: &State) -> PaletteSources<'_> {
         task_rename: state.agents.renaming_name(),
         commit: state.commit_prompt.as_deref(),
         switch: switch_sources(&state.agents, &state.terminal),
+        terminals: state.term_search.as_ref(),
     }
 }
 
@@ -8591,6 +8613,8 @@ enum PaletteMode {
     TaskName,
     /// A commit message.
     CommitMessage,
+    /// Text in every terminal's output.
+    Terminals,
 }
 
 impl PaletteMode {
@@ -8609,6 +8633,8 @@ impl PaletteMode {
             PaletteMode::Branch
         } else if sources.actions.is_some() {
             PaletteMode::Action
+        } else if sources.terminals.is_some() {
+            PaletteMode::Terminals
         } else {
             PaletteMode::Open
         }
@@ -8631,9 +8657,13 @@ struct PaletteWords {
 /// an empty list is still on its way, by mode.
 fn palette_words(sources: &PaletteSources<'_>, query: &str, mode: PaletteMode) -> PaletteWords {
     let switching = sources.switch.as_ref().map(|_| switcher::query(query));
-    let (heading, empty) =
+    let (heading, mut empty) =
         palette_heading(query, mode, sources.branches.map(|b| &b.intent), switching);
+    if sources.terminals.is_some_and(|s| s.error.is_some()) {
+        empty = "Not a valid regular expression";
+    }
     let loading = match mode {
+        PaletteMode::Terminals => sources.terminals.is_some_and(|s| s.loading()),
         PaletteMode::Open => match (switching, symbols::query(query)) {
             (Some(switcher::Query::Switch(_)), _) => false,
             (Some(switcher::Query::Files(_)), _) => sources.indexing && sources.finder.is_empty(),
@@ -8696,6 +8726,10 @@ fn palette_heading(
                 "Type a commit message",
             );
         }
+        PaletteMode::Terminals if query.is_empty() => {
+            return ("Find in terminals", "Type to search every open terminal");
+        }
+        PaletteMode::Terminals => return ("Find in terminals", "No matches in open terminals"),
         PaletteMode::Open => {}
     }
     match switching {
@@ -8732,6 +8766,7 @@ fn palette_rows(sources: &PaletteSources<'_>, query: &str) -> Vec<(layout::Palet
         task_rename,
         commit,
         switch,
+        terminals,
         indexing: _,
     } = sources;
     let (mcp_url, task) = (*mcp_url, *task);
@@ -8772,6 +8807,28 @@ fn palette_rows(sources: &PaletteSources<'_>, query: &str) -> Vec<(layout::Palet
     }
     if let Some((server, actions)) = actions {
         return action_rows(*server, actions, query);
+    }
+    // Ahead of the switcher: in Agents mode too, the query is the text.
+    if let Some(search) = terminals {
+        return search
+            .hits
+            .iter()
+            .map(|hit| {
+                (
+                    layout::PaletteRow {
+                        icon: Some(crate::project::icons::TERMINAL),
+                        title: hit.snippet.clone(),
+                        detail: hit.detail.clone(),
+                        shortcut: String::new(),
+                    },
+                    Pick::TerminalHit {
+                        term: hit.term,
+                        start: hit.start,
+                        query: search.query.clone(),
+                    },
+                )
+            })
+            .collect();
     }
     if let Some(switch) = switch {
         match switcher::query(query) {
@@ -9439,6 +9496,15 @@ fn install_menu(mtm: MainThreadMarker, app: &NSApplication) {
         "f",
         true,
     ));
+    let in_terminals = item(
+        "Find in Terminals\u{2026}",
+        sel!(findInTerminals:),
+        "f",
+        false,
+    );
+    in_terminals
+        .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
+    edit_menu.addItem(&in_terminals);
     edit_menu.addItem(&item("Replace All", sel!(replaceAll:), "", false));
     edit_menu.addItem(&item("Go to Line\u{2026}", sel!(goToLine:), "l", false));
     edit_menu.addItem(&NSMenuItem::separatorItem(mtm));
@@ -10032,6 +10098,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
             references: false,
             cancel: None,
         },
+        term_search: None,
         http: None,
         responses: HashMap::new(),
         claude: None,

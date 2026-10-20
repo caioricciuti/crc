@@ -135,6 +135,103 @@ impl EditorView {
         self.pump();
     }
 
+    /// Option-Cmd-F: the palette finding text in every terminal's output,
+    /// as Find in the terminal does, with each match's session.
+    pub(super) fn open_terminal_search(&self) {
+        {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            close_fields(&mut state);
+            state.branch_list = None;
+            state.repo_list = None;
+            state.deleted_list = None;
+            state.lsp.action_list = None;
+            state.mcp_url_prompt = false;
+            state.task_prompt = false;
+            state.commit_prompt = None;
+            state.palette = Some((Buffer::new(), 0));
+            state.palette_scroll = 0;
+            state.term_search = Some(Default::default());
+        }
+        self.request_redraw();
+        self.pump();
+    }
+
+    /// After a change: a new query in Find in Terminals is searched once
+    /// typing pauses, and the display link runs until it is.
+    pub(super) fn sync_terminal_search(&self) {
+        let changed = {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            let State {
+                palette,
+                term_search,
+                ..
+            } = &mut *state;
+            let (Some((query, _)), Some(search)) = (palette.as_ref(), term_search.as_mut()) else {
+                return;
+            };
+            search.note(&query.rope.to_string())
+        };
+        if changed {
+            self.resume_display_link();
+        }
+    }
+
+    /// Starts Find in Terminals' search once typing has paused, and takes
+    /// its answer when the worker has it.
+    pub(super) fn poll_terminal_search(&self) {
+        self.sync_terminal_search();
+        let sessions = self.state().and_then(|state| {
+            let search = state.term_search.as_ref()?;
+            if !search.due(Instant::now()) {
+                return None;
+            }
+            // With the find bar's options, so its matches are these.
+            let options = state
+                .find
+                .as_ref()
+                .map(|bar| bar.options)
+                .unwrap_or_default();
+            let sessions = if search.typed().is_empty() {
+                Vec::new()
+            } else {
+                searched_sessions(&state)
+            };
+            Some((sessions, options))
+        });
+        let arrived = {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            let State {
+                term_search,
+                palette,
+                palette_scroll,
+                ..
+            } = &mut *state;
+            let Some(search) = term_search.as_mut() else {
+                return;
+            };
+            let started = sessions.is_some();
+            if let Some((sessions, options)) = sessions {
+                search.start(sessions, options);
+            }
+            // A new list: its first row is the one chosen.
+            let arrived = search.poll() || started;
+            if arrived && let Some((_, selected)) = palette {
+                *selected = 0;
+                *palette_scroll = 0;
+            }
+            arrived
+        };
+        if arrived {
+            self.request_redraw();
+        }
+    }
+
     pub(super) fn palette_click(&self, x: f32, y: f32) {
         let chosen = {
             let Some(mut state) = self.state_mut() else {
@@ -213,6 +310,20 @@ impl EditorView {
                 let index = self.state().and_then(|state| state.agents.by_id(&id));
                 if let Some(index) = index {
                     self.select_task(index);
+                }
+            }
+            // Its session, if it is still open, with the find bar on it.
+            Pick::TerminalHit { term, start, query } => {
+                let tab = self.state().and_then(|state| {
+                    state
+                        .terminal
+                        .tabs
+                        .iter()
+                        .position(|t| Arc::as_ptr(&t.session.term) as usize == term)
+                });
+                if let Some(tab) = tab {
+                    self.show_session(tab);
+                    self.open_terminal_find_at(&query, start);
                 }
             }
             Pick::File(path) => {
@@ -294,6 +405,7 @@ impl EditorView {
                 return;
             };
             state.palette = None;
+            state.term_search = None;
             state.branch_list = None;
             state.repo_list = None;
             state.deleted_list = None;
@@ -421,4 +533,34 @@ impl EditorView {
         self.pump();
         true
     }
+}
+
+/// Every session's text for Find in Terminals, in tab order, with where
+/// it is: its workspace when it has one, and its title. A session whose
+/// terminal is locked (its output being parsed) is left out rather than
+/// waited for.
+fn searched_sessions(state: &State) -> Vec<crate::platform::terminal::Searched> {
+    let tasks = &state.agents.tasks;
+    state
+        .terminal
+        .tabs
+        .iter()
+        .filter_map(|tab| {
+            let hay = match tab.session.term.try_lock() {
+                Ok(term) => term.haystack(),
+                Err(std::sync::TryLockError::Poisoned(term)) => term.into_inner().haystack(),
+                Err(std::sync::TryLockError::WouldBlock) => return None,
+            };
+            let title = tab.name();
+            let place = match crate::platform::agents::task_of(tasks, tab) {
+                Some(task) => format!("{} / {title}", tasks[task].name()),
+                None => title,
+            };
+            Some(crate::platform::terminal::Searched {
+                term: Arc::as_ptr(&tab.session.term) as usize,
+                place,
+                hay,
+            })
+        })
+        .collect()
 }

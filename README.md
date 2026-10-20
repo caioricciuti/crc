@@ -462,6 +462,7 @@ the size and write it back.
 | `Ctrl-Space` | completion; Tab takes the suggestion, Up/Down pick another (then Return takes it too), Option-1 to 9 take one directly, Escape closes |
 | Escape in a picker/panel | dismiss |
 | `Cmd-F` / `Cmd-Shift-F` | find in file / find in project |
+| `Cmd-Option-F` | find in every terminal's history; Return shows the session with its find bar on the match |
 | `Cmd-L` | go to line |
 | `Cmd-D` | select word, then next occurrence as another cursor |
 | Option-click | add a cursor |

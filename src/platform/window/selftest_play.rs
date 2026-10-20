@@ -418,6 +418,8 @@ impl EditorView {
                     // The Review page's reads too, so a read asked for
                     // while one ran lands within the same wait.
                     self.poll_review();
+                    // And Find in Terminals', due after a pause in typing.
+                    self.poll_terminal_search();
                 }
                 self.check_open_files();
                 self.poll_tree_children();
@@ -518,7 +520,7 @@ impl EditorView {
                     )
                     .is_some();
                 let report = format!(
-                    "git_open: {}\ngit_focus: {}\ngit_diff: {}\ngit_pending: {}\ngit_changes: {}\ngit_staged: {}\ngit_hunks_staged: {}\ngit_hunks_working: {}\ngit_message: {}\ngit_message_lines: {}\ngit_message_caret: {}\ngit_subject_len: {}\ngit_amend: {}\ngit_sync: {}\ngit_diff_selection: {}\ngit_agents: {}\ngit_agents_first: {}\ngit_agent_rows: {}\nproject_menu_requested: {}\ncrumb_menu: {}\nlast_click_ms: {:.3}\nfinder_entries: {}\nsidebar_edit: {}\npalette_query: {}\npalette_first: {}\npalette_scroll: {}\npalette_loading: {}\nfind_searching: {}\npanes: {}\nfocused_pane: {}\nlsp: {}\ndiagnostics: {}\ncompletion: {}\nkey_handler_draws: {}\nwindow_title: {}\nshaping_pending: {}\ncaret_shaped: {}\nclaude: {}\nterminal: {}\n{}",
+                    "git_open: {}\ngit_focus: {}\ngit_diff: {}\ngit_pending: {}\ngit_changes: {}\ngit_staged: {}\ngit_hunks_staged: {}\ngit_hunks_working: {}\ngit_message: {}\ngit_message_lines: {}\ngit_message_caret: {}\ngit_subject_len: {}\ngit_amend: {}\ngit_sync: {}\ngit_diff_selection: {}\ngit_agents: {}\ngit_agents_first: {}\ngit_agent_rows: {}\nproject_menu_requested: {}\ncrumb_menu: {}\nlast_click_ms: {:.3}\nfinder_entries: {}\nsidebar_edit: {}\npalette_query: {}\npalette_first: {}\npalette_rows: {}\npalette_scroll: {}\npalette_loading: {}\nfind_searching: {}\npanes: {}\nfocused_pane: {}\nlsp: {}\ndiagnostics: {}\ncompletion: {}\nkey_handler_draws: {}\nwindow_title: {}\nshaping_pending: {}\ncaret_shaped: {}\nclaude: {}\nterminal: {}\n{}",
                     state.git_open,
                     state.git_focus,
                     diffing(&state),
@@ -585,6 +587,18 @@ impl EditorView {
                                 .next()
                         })
                         .map(|(row, _)| row.title)
+                        .unwrap_or_default(),
+                    // Every row, with its detail.
+                    state
+                        .palette
+                        .as_ref()
+                        .map(|(query, _)| {
+                            palette_rows(&palette_sources(&state), &query.rope.to_string())
+                                .into_iter()
+                                .map(|(row, _)| format!("{} ({})", row.title, row.detail))
+                                .collect::<Vec<_>>()
+                                .join("|")
+                        })
                         .unwrap_or_default(),
                     state.palette_scroll,
                     state.palette.as_ref().is_some_and(|(query, _)| {

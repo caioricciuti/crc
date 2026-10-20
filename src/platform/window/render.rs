@@ -87,6 +87,7 @@ impl EditorView {
             mcp_url_prompt,
             task_prompt,
             commit_prompt,
+            term_search,
             extensions,
             settings_page,
             update_ready,
@@ -1253,6 +1254,7 @@ impl EditorView {
                 task_rename: agents.renaming_name(),
                 commit: commit_prompt.as_deref(),
                 switch: switch_sources(agents, terminal_panel),
+                terminals: term_search.as_ref(),
             };
             let mode = PaletteMode::of(&sources);
             let switching = sources.switch.as_ref().map(|_| switcher::query(&text));
@@ -1291,6 +1293,7 @@ impl EditorView {
                         PaletteMode::McpUrl => "https://host/mcp",
                         PaletteMode::TaskName => "Workspace name",
                         PaletteMode::CommitMessage => "Commit message",
+                        PaletteMode::Terminals => "Text in every terminal",
                         PaletteMode::Open if switching.is_some() => {
                             "Switch to\u{2026} (> commands, / files)"
                         }
@@ -1312,6 +1315,8 @@ impl EditorView {
                         "Commit"
                     } else if mode == PaletteMode::Deleted {
                         "Recover"
+                    } else if mode == PaletteMode::Terminals {
+                        "Show"
                     } else if mode == PaletteMode::Action || commands::query(&text).is_some() {
                         "Run"
                     } else if matches!(switching, Some(switcher::Query::Switch(_))) {

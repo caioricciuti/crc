@@ -793,45 +793,68 @@ impl EditorView {
         let seed = self
             .terminal_selected_text(false)
             .filter(|t| !t.contains('\n') && t.len() < 200);
-        {
-            let Some(mut state) = self.state_mut() else {
-                return;
-            };
-            close_fields(&mut state);
-            if let Some(cancel) = state.project_search.cancel.take() {
-                cancel.store(true, Ordering::Relaxed);
-            }
-            state.project_search.rx = None;
-            // A document's bar moves over: its options come with it.
-            let bar = state.find.get_or_insert_with(|| FindBar {
-                query: Buffer::new(),
-                replacement: Buffer::new(),
-                replacing: false,
-                has_keys: true,
-                options: SearchOptions::default(),
-                project: false,
-                results: Vec::new(),
-                selected: 0,
-                result_scroll: 0,
-                searching: false,
-                terminal: None,
-            });
-            if let Some(seed) = &seed {
-                bar.query = Buffer::new();
-                bar.query.insert(seed);
-            }
-            bar.query.select_all();
-            bar.has_keys = true;
-            bar.replacing = false;
-            bar.project = false;
-            bar.searching = false;
-            bar.reset_results();
-            bar.terminal.get_or_insert_with(Default::default);
-        }
+        self.terminal_find_bar(seed.as_deref());
         self.terminal_find_sync(true);
         self.terminal_find_reveal();
         self.request_redraw();
         self.pump();
+    }
+
+    /// A match Find in Terminals listed: the find bar over the active
+    /// session with `query`, on the match at `start` (or the next after
+    /// it, should the output have moved on).
+    pub(super) fn open_terminal_find_at(&self, query: &str, start: (u64, usize)) {
+        self.terminal_find_bar(Some(query));
+        self.terminal_find_sync(true);
+        // After the search: one for another session forgets the anchor.
+        if let Some(mut state) = self.state_mut()
+            && let Some(find) = state.find.as_mut().and_then(|bar| bar.terminal.as_mut())
+        {
+            find.anchor = Some(start);
+            let matches = std::mem::take(&mut find.matches);
+            find.take(matches);
+        }
+        self.terminal_find_reveal();
+        self.request_redraw();
+        self.pump();
+    }
+
+    /// The find bar over the terminal, with the keys, `seed` its query
+    /// when given; the rest of it as it was.
+    fn terminal_find_bar(&self, seed: Option<&str>) {
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
+        close_fields(&mut state);
+        if let Some(cancel) = state.project_search.cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        state.project_search.rx = None;
+        // A document's bar moves over: its options come with it.
+        let bar = state.find.get_or_insert_with(|| FindBar {
+            query: Buffer::new(),
+            replacement: Buffer::new(),
+            replacing: false,
+            has_keys: true,
+            options: SearchOptions::default(),
+            project: false,
+            results: Vec::new(),
+            selected: 0,
+            result_scroll: 0,
+            searching: false,
+            terminal: None,
+        });
+        if let Some(seed) = seed {
+            bar.query = Buffer::new();
+            bar.query.insert(seed);
+        }
+        bar.query.select_all();
+        bar.has_keys = true;
+        bar.replacing = false;
+        bar.project = false;
+        bar.searching = false;
+        bar.reset_results();
+        bar.terminal.get_or_insert_with(Default::default);
     }
 
     /// Searches the active session again when its output, the query, the
@@ -1893,9 +1916,14 @@ impl EditorView {
             // The Mac line-editing shortcuts, as the shell's own keys.
             // The menu's shortcuts, for when the key never reached the menu.
             let shift = flags.contains(NSEventModifierFlags::Shift);
+            let option = flags.contains(NSEventModifierFlags::Option);
             match code {
                 key::K if !shift => {
                     self.clear_terminal();
+                    return true;
+                }
+                key::F if !shift && option => {
+                    self.open_terminal_search();
                     return true;
                 }
                 key::F if !shift => {
