@@ -299,13 +299,11 @@ impl EditorView {
                     .into_owned(),
             ));
         }
-        // A Claude Code session that started this editor (from its own
-        // terminal, say) left its markers in our environment. Passed on,
-        // they make the `claude` here think it is that session's child.
-        let unset = std::env::vars_os()
-            .filter_map(|(name, _)| name.into_string().ok())
-            .filter(|name| name == "CLAUDECODE" || name.starts_with("CLAUDE_CODE_"))
-            .collect();
+        // What an agent's shell that started this editor left in our
+        // environment: its markers, NO_COLOR, PAGER=cat.
+        let unset = crate::platform::terminal::inherited_unset(
+            std::env::vars_os().filter_map(|(name, _)| name.into_string().ok()),
+        );
         if let Some((host, path)) = remote {
             // ssh sends none of these variables but what the person's own
             // config says to; TERM it sends as the terminal's type. It runs

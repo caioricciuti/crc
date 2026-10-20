@@ -36,6 +36,34 @@ pub struct Launch {
     pub unset: Vec<String>,
 }
 
+/// Which of the editor's inherited variable `names` a new session must not
+/// see. Opened from an agent's shell (and kept by Restart to Update, which
+/// `open`s it with the same environment), the editor carries that shell's
+/// settings for a pipe: `NO_COLOR` turns colour off in `claude`, `ls` and
+/// the rest, `PAGER=cat` stops `git log` paging, `SHLVL` counts the agent's
+/// shells. Claude Code's and Codex's own markers make a `claude` here think
+/// it runs under them. A login shell sets back whatever its profile sets.
+pub fn inherited_unset(names: impl IntoIterator<Item = String>) -> Vec<String> {
+    const PLAIN: [&str; 7] = [
+        "NO_COLOR",
+        "FORCE_COLOR",
+        "PAGER",
+        "GIT_PAGER",
+        "GH_PAGER",
+        "SHLVL",
+        "AI_AGENT",
+    ];
+    names
+        .into_iter()
+        .filter(|name| {
+            PLAIN.contains(&name.as_str())
+                || name == "CLAUDECODE"
+                || name.starts_with("CLAUDE_CODE_")
+                || name.starts_with("CODEX_")
+        })
+        .collect()
+}
+
 pub struct Tab {
     pub session: Session,
     pub title: String,
@@ -1347,6 +1375,40 @@ mod tests {
 
     fn find(t: &term::Term, query: &str, options: Options) -> Vec<Hit> {
         find_in(&t.haystack(), query, options).unwrap()
+    }
+
+    #[test]
+    fn an_agent_shells_environment_stays_out_of_new_sessions() {
+        // What a Codex shell had set in the crc that lost its colours.
+        let names = [
+            "NO_COLOR",
+            "PAGER",
+            "GIT_PAGER",
+            "GH_PAGER",
+            "SHLVL",
+            "CODEX_CI",
+            "CLAUDECODE",
+            "CLAUDE_CODE_ENTRYPOINT",
+            "HOME",
+            "PATH",
+            "SSH_AUTH_SOCK",
+            "CLAUDE_EFFORT",
+            "EDITOR",
+        ];
+        let unset = inherited_unset(names.map(String::from));
+        assert_eq!(
+            unset,
+            [
+                "NO_COLOR",
+                "PAGER",
+                "GIT_PAGER",
+                "GH_PAGER",
+                "SHLVL",
+                "CODEX_CI",
+                "CLAUDECODE",
+                "CLAUDE_CODE_ENTRYPOINT",
+            ]
+        );
     }
 
     #[test]
