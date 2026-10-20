@@ -3368,6 +3368,11 @@ define_class!(
 
         #[unsafe(method(moveLineUp:))]
         fn action_move_line_up(&self, _sender: Option<&AnyObject>) {
+            // Its shortcut over a terminal goes to the previous prompt.
+            if self.terminal_has_keys() {
+                self.terminal_jump_prompt(false);
+                return;
+            }
             if let Some(mut state) = self.state_mut() {
                 state.docs.active_mut().move_lines(false);
             }
@@ -3376,6 +3381,11 @@ define_class!(
 
         #[unsafe(method(moveLineDown:))]
         fn action_move_line_down(&self, _sender: Option<&AnyObject>) {
+            // Its shortcut over a terminal goes to the next prompt.
+            if self.terminal_has_keys() {
+                self.terminal_jump_prompt(true);
+                return;
+            }
             if let Some(mut state) = self.state_mut() {
                 state.docs.active_mut().move_lines(true);
             }

@@ -578,6 +578,8 @@ impl EditorView {
                     last_probe: None,
                     probe_owed: false,
                     retry: None,
+                    last_return: None,
+                    marks: Default::default(),
                     seen: None,
                     launch,
                     held,
@@ -734,6 +736,8 @@ impl EditorView {
                     last_probe: None,
                     probe_owed: false,
                     retry: None,
+                    last_return: None,
+                    marks: Default::default(),
                     seen: None,
                     launch,
                     held: Some(id),
@@ -1112,16 +1116,122 @@ impl EditorView {
         panel.back = 0;
         panel.selection = None;
         panel.selecting = false;
-        if let Some(tab) = panel.active_tab() {
-            tab.session
-                .term
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clear_all();
+        if let Some(tab) = panel.active_tab_mut() {
+            let mut term = tab.session.term.lock().unwrap_or_else(|e| e.into_inner());
+            term.clear_all();
+            // Its prompt marks go with the history.
+            tab.marks.trim(term.first_line());
         }
         drop(state);
         self.request_redraw();
         self.pump();
+    }
+
+    /// Cmd-Shift-Up and Down over a terminal: the view scrolled to the
+    /// prompt sent to its agent before or after the one at its top, with
+    /// what led to it above; past the last, back to the output. Nothing
+    /// over a full-screen program, which has no history.
+    pub(super) fn terminal_jump_prompt(&self, forward: bool) {
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
+        if super::agents::active_hidden(&state) {
+            return;
+        }
+        // Under the find bar, a prompt jumped to shows below it.
+        let covered = if state
+            .find
+            .as_ref()
+            .is_some_and(|bar| bar.terminal.is_some())
+        {
+            crate::platform::terminal::find_bar_rows(&state.renderer.atlas)
+        } else {
+            0
+        };
+        let panel = &mut state.terminal;
+        let back = panel.back;
+        let Some(tab) = panel.active_tab_mut() else {
+            return;
+        };
+        let term = tab.session.term.lock().unwrap_or_else(|e| e.into_inner());
+        if term.is_alternate() {
+            return;
+        }
+        tab.marks.trim(term.first_line());
+        let history = term.scrollback_len();
+        let base = term.view_line(0, 0);
+        // The row a prompt jumped to sits on.
+        let at =
+            term.view_line(0, back) + (crate::platform::terminal::PROMPT_CONTEXT + covered) as u64;
+        let target = if forward {
+            tab.marks.next(at)
+        } else {
+            tab.marks.prev(at)
+        };
+        let back = match target {
+            Some(line) => crate::platform::terminal::prompt_back(line, base, history, covered),
+            None if forward => 0,
+            None => return,
+        };
+        drop(term);
+        panel.back = back;
+        drop(state);
+        self.request_redraw();
+        self.pump();
+    }
+
+    /// A press on a prompt's mark beside the screen: the view scrolled to
+    /// that prompt, as Cmd-Shift-Up would. False when the press is not on
+    /// one, to go on as any press does.
+    fn terminal_mark_press(&self, x: f32, y: f32) -> bool {
+        let Some((screen, _, _)) = self.terminal_screen() else {
+            return false;
+        };
+        let track = crate::platform::terminal::mark_track(screen);
+        if !track.contains(x, y) {
+            return false;
+        }
+        let Some(mut state) = self.state_mut() else {
+            return false;
+        };
+        // Under the find bar, a prompt jumped to shows below it.
+        let covered = if state
+            .find
+            .as_ref()
+            .is_some_and(|bar| bar.terminal.is_some())
+        {
+            crate::platform::terminal::find_bar_rows(&state.renderer.atlas)
+        } else {
+            0
+        };
+        let back = {
+            let Some(tab) = state.terminal.active_tab().filter(|t| !t.marks.is_empty()) else {
+                return false;
+            };
+            let term = tab.session.term.lock().unwrap_or_else(|e| e.into_inner());
+            if term.is_alternate() {
+                return false;
+            }
+            let first = term.first_line();
+            let total = term.scrollback_len() + term.rows();
+            let lines = tab.marks.iter().map(|m| m.line);
+            let Some(line) = crate::platform::terminal::mark_at(track, y, lines, first, total)
+            else {
+                return false;
+            };
+            crate::platform::terminal::prompt_back(
+                line,
+                term.view_line(0, 0),
+                term.scrollback_len(),
+                covered,
+            )
+        };
+        state.terminal.back = back;
+        state.terminal.selection = None;
+        drop(state);
+        self.request_redraw();
+        self.pump();
+        true
     }
 
     pub(super) fn terminal_write(&self, bytes: &[u8]) {
@@ -1140,17 +1250,17 @@ impl EditorView {
             // Typing into it is the answer to what it asked. A result
             // it reported is seen now; a block stays until it says so.
             answered = tab.attention.take().is_some();
-            if tab
-                .session
-                .term
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .status
-                .acknowledge()
-            {
+            let mut term = tab.session.term.lock().unwrap_or_else(|e| e.into_inner());
+            if term.status.acknowledge() {
                 tab.status = None;
                 answered = true;
             }
+            // Return sends an agent its prompt: the line it was sent from,
+            // for the mark its hook asks for.
+            if tab.claude && bytes == b"\r" {
+                tab.last_return = Some(term.view_line(term.cursor().0, 0));
+            }
+            drop(term);
             tab.session.write(bytes);
             tab.last_typed = Some(Instant::now());
             // The person answered: auto-continue leaves it to them.
@@ -1337,6 +1447,13 @@ impl EditorView {
                     tab.status = status;
                 }
             }
+            // Its prompt marks: gone with the history they were in, and
+            // moved onto their prompts as the agent prints them.
+            if printed && !tab.marks.is_empty() {
+                let term = tab.session.term.lock().unwrap_or_else(|e| e.into_inner());
+                tab.marks.trim(term.first_line());
+                tab.marks.resolve(&term);
+            }
             // What its agent's hooks wrote since the last look: an agent
             // writes files and asks questions while it prints.
             if !tab.tracks_review() {
@@ -1384,6 +1501,19 @@ impl EditorView {
                     }
                     crate::project::review::Event::Failed(text) => {
                         said = Some(format!("{}: review hook: {text}", tab.name()));
+                    }
+                    crate::project::review::Event::Prompted(text) => {
+                        // Where Return was typed, or failing that (a
+                        // prompt crc typed) where the cursor is now.
+                        let term = tab.session.term.lock().unwrap_or_else(|e| e.into_inner());
+                        let anchor = tab
+                            .last_return
+                            .take()
+                            .unwrap_or_else(|| term.view_line(term.cursor().0, 0));
+                        let end = term.view_line(term.rows().saturating_sub(1), 0);
+                        tab.marks.add(anchor, &text, end, term.rows());
+                        tab.marks.trim(term.first_line());
+                        tab.marks.resolve(&term);
                     }
                     event @ (crate::project::review::Event::Task { .. }
                     | crate::project::review::Event::TeammateIdle(_)) => {
@@ -1472,6 +1602,11 @@ impl EditorView {
         if switched && !mouse_kept(event.modifierFlags()) && self.mouse_pane(x, y).is_some() {
             self.request_redraw();
             self.pump();
+            return;
+        }
+        // A prompt's mark, beside the grid: crc's, even over a program
+        // that asked for the mouse.
+        if self.terminal_mark_press(x, y) {
             return;
         }
         if self.terminal_mouse_press(event, x, y, crate::term::mouse::Button::Left) {
@@ -2066,6 +2201,10 @@ impl EditorView {
                 }
                 key::F if !shift => {
                     self.open_find();
+                    return true;
+                }
+                key::UP | key::DOWN if shift && !option => {
+                    self.terminal_jump_prompt(code == key::DOWN);
                     return true;
                 }
                 _ => {}

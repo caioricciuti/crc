@@ -646,7 +646,7 @@ impl EditorView {
                         c.reviews.values().filter(|r| r.decided.is_none()).count()
                     )),
                     format_args!(
-                        "open={} focus={} height={} tabs={} selection={:?} screen={:?} scrollback={} back={} find={} link={} opened={}",
+                        "open={} focus={} height={} tabs={} selection={:?} screen={:?} scrollback={} back={} find={} link={} opened={} prompts={} top={}",
                         state.terminal.open,
                         state.terminal.focus,
                         state.terminal.height,
@@ -710,6 +710,14 @@ impl EditorView {
                                 format!("{}@{}", link.url, spans.join(","))
                             }),
                         state.terminal.opened.join("|"),
+                        state.terminal.active_tab().map_or(0, |t| t.marks.len()),
+                        // The view's top line: where a jump to a prompt
+                        // scrolled it.
+                        state.terminal.active_tab().map_or(String::new(), |t| {
+                            let term = t.session.term.lock().unwrap_or_else(|e| e.into_inner());
+                            let line = term.view_line(0, state.terminal.back);
+                            term.text_between((line, 0), (line, term.cols()))
+                        }),
                     ),
                     selftest::report(
                         state.docs.active(),
@@ -1182,6 +1190,37 @@ fn region_named(state: &mut State, name: &str) -> Option<Viewport> {
             let line = name["git.diff.".len()..].parse::<usize>().ok()?;
             let text = chrome_of(state).text;
             state.git.diff_line_rect(text, line)
+        }
+        // A prompt's mark beside the terminal's screen, in line order:
+        // `prompt_mark.1` is the first.
+        _ if name.starts_with("prompt_mark.") => {
+            let index = name["prompt_mark.".len()..]
+                .parse::<usize>()
+                .ok()?
+                .checked_sub(1)?;
+            let (_, screen) = crate::platform::terminal::split(chrome_of(state).terminal?);
+            let panel = &state.terminal;
+            let screen = panel
+                .screens(screen)
+                .into_iter()
+                .find(|(tab, _)| *tab == panel.active)
+                .map_or(screen, |(_, s)| s);
+            let tab = panel.active_tab()?;
+            let line = tab.marks.iter().nth(index)?.line;
+            let term = tab.session.term.lock().unwrap_or_else(|e| e.into_inner());
+            let track = crate::platform::terminal::mark_track(screen);
+            let y = crate::platform::terminal::tick_y(
+                track,
+                line,
+                term.first_line(),
+                term.scrollback_len() + term.rows(),
+            );
+            Some(Viewport {
+                x: track.x,
+                y,
+                width: track.width,
+                height: crate::platform::terminal::TICK_HEIGHT,
+            })
         }
         _ if name.starts_with("inspector.") => state.agents.inspector.named(name),
         // The Open Folder button of the Explorer with no folder.

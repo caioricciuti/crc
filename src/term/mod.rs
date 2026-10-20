@@ -14,6 +14,7 @@
 
 pub mod hold;
 pub mod keys;
+pub mod marks;
 pub mod mouse;
 mod parser;
 pub mod pty;
@@ -352,6 +353,12 @@ impl Term {
     /// The number of screen row 0, counting from the first line kept.
     fn screen_base(&self) -> u64 {
         self.dropped + self.scrollback.len() as u64
+    }
+
+    /// The number of the first line still kept: those before it are gone,
+    /// off the end of history or cleared.
+    pub fn first_line(&self) -> u64 {
+        self.dropped
     }
 
     /// The number of row `row` of the view scrolled `back` lines.

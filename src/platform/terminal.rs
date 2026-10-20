@@ -120,6 +120,12 @@ pub struct Tab {
     /// Its agent's streak of temporary API errors, while auto-continue
     /// tries it again; see [`crate::platform::retry`].
     pub retry: Option<crate::platform::retry::Retry>,
+    /// The cursor's line when Return was last typed into its agent: where
+    /// the prompt it sent is, until its hook says so.
+    pub last_return: Option<u64>,
+    /// Where the prompts sent to its agent are, for the marks down the
+    /// screen's right edge.
+    pub marks: crate::term::marks::PromptMarks,
 }
 
 /// What a session is doing, as the Agents sidebar shows it.
@@ -989,6 +995,65 @@ pub fn back_showing(
     (base + middle).saturating_sub(line).min(history as u64) as usize
 }
 
+/// The lines of what came before shown above a prompt jumped to.
+pub const PROMPT_CONTEXT: usize = 2;
+
+/// How far back to scroll so line `line` shows `covered` +
+/// [`PROMPT_CONTEXT`] rows down from the top, as far as the history goes:
+/// a prompt jumped to, under what led to it. `base` is the number of the
+/// screen's first line.
+pub fn prompt_back(line: u64, base: u64, history: usize, covered: usize) -> usize {
+    (base + (PROMPT_CONTEXT + covered) as u64)
+        .saturating_sub(line)
+        .min(history as u64) as usize
+}
+
+/// The width of the strip down a screen's right edge where its prompt
+/// marks are, in the padding beside the grid.
+const MARK_TRACK: f32 = 10.0;
+/// A mark's height.
+pub const TICK_HEIGHT: f32 = 2.0;
+/// How near a mark a press has to be to land on it.
+const TICK_REACH: f32 = 4.0;
+
+/// The strip of prompt marks beside `screen`.
+pub fn mark_track(screen: Viewport) -> Viewport {
+    Viewport {
+        x: screen.x + screen.width + PAD - MARK_TRACK,
+        y: screen.y,
+        width: MARK_TRACK,
+        height: screen.height,
+    }
+}
+
+/// The top of the mark for line `line`, out of `total` lines from line
+/// `first`: its share of the history is its share of the track.
+pub fn tick_y(track: Viewport, line: u64, first: u64, total: usize) -> f32 {
+    let run = (track.height - TICK_HEIGHT).max(0.0);
+    let at = line.saturating_sub(first) as f32 / total.max(1) as f32;
+    track.y + run * at.clamp(0.0, 1.0)
+}
+
+/// The line of the mark nearest `y`, when a press there lands on one:
+/// the hit test for [`tick_y`].
+pub fn mark_at(
+    track: Viewport,
+    y: f32,
+    lines: impl Iterator<Item = u64>,
+    first: u64,
+    total: usize,
+) -> Option<u64> {
+    lines
+        .filter(|&line| line >= first)
+        .map(|line| {
+            let centre = tick_y(track, line, first, total) + TICK_HEIGHT / 2.0;
+            (line, (centre - y).abs())
+        })
+        .filter(|&(_, off)| off <= TICK_REACH)
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(line, _)| line)
+}
+
 /// The row, the column boundary nearest the point and the column of the
 /// cell under it, for a point in `screen`, clamped into the grid.
 pub fn point(
@@ -1417,7 +1482,7 @@ fn draw_screen(
     // What is on screen, copied out under the lock and drawn after it is
     // let go: the reader thread takes the same lock for every burst of
     // output, and a frame's glyph work would hold it up.
-    let (rows, cols, back, visible, cursor, cursor_visible) = {
+    let (rows, cols, back, visible, cursor, cursor_visible, kept) = {
         let mut term = tab.session.term.lock().unwrap_or_else(|e| e.into_inner());
         let byte = |v: f64| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
         let rgb = |c: [f32; 4]| [byte(c[0] as f64), byte(c[1] as f64), byte(c[2] as f64)];
@@ -1450,6 +1515,15 @@ fn draw_screen(
             visible,
             term.cursor(),
             term.modes.cursor_visible,
+            // What the prompt marks are placed in: the first line kept and
+            // how many there are. None on a full-screen program's screen.
+            (!term.is_alternate()).then(|| {
+                (
+                    term.first_line(),
+                    term.scrollback_len() + term.rows(),
+                    term.view_line(0, back),
+                )
+            }),
         )
     };
     // Find's matches on the rows showing, the current one marked.
@@ -1621,6 +1695,64 @@ fn draw_screen(
         };
         layout::push_rounded_rect(out, pill, 6.0, theme.tab_hover);
         layout::push_ui_text_centered(out, atlas, pill, &note, theme.status_text);
+    }
+    if let Some((first, total, top)) = kept {
+        draw_marks(tab, screen, (first, total, top, rows), atlas, theme, out);
+    }
+}
+
+/// The prompts sent to a tab's agent, down its screen's right edge: a
+/// tick in the accent for each, where it is in the history, over a faint
+/// band for what the view shows, as the editor's scrollbar draws its
+/// thumb. Each tick names its prompt under the pointer. Nothing when the
+/// tab has no prompt still in its history.
+fn draw_marks(
+    tab: &Tab,
+    screen: Viewport,
+    (first, total, top, rows): (u64, usize, u64, usize),
+    atlas: &Atlas,
+    theme: &Theme,
+    out: &mut Vec<GlyphInstance>,
+) {
+    if !tab.marks.iter().any(|m| m.line >= first) {
+        return;
+    }
+    let track = mark_track(screen);
+    let [r, g, b, _] = theme.status_text;
+    let from = tick_y(track, top, first, total);
+    let to = tick_y(track, top + rows as u64, first, total) + TICK_HEIGHT;
+    let band = Viewport {
+        x: track.x + 3.0,
+        y: from,
+        width: track.width - 4.0,
+        height: (to - from).max(TICK_HEIGHT * 2.0),
+    };
+    layout::push_rounded_rect(out, band, 2.0, [r, g, b, 0.12]);
+    let mut last = f32::NEG_INFINITY;
+    for mark in tab.marks.iter().filter(|m| m.line >= first) {
+        let y = tick_y(track, mark.line, first, total);
+        // Prompts closer than a point draw, and answer, as one.
+        if y - last < 1.0 {
+            continue;
+        }
+        last = y;
+        layout::push_rect(
+            out,
+            atlas,
+            [track.x + 2.0, y],
+            [track.width - 2.0, TICK_HEIGHT],
+            theme.accent,
+        );
+        layout::hotspot(
+            Viewport {
+                x: track.x,
+                y: y + TICK_HEIGHT / 2.0 - TICK_REACH,
+                width: track.width,
+                height: TICK_REACH * 2.0,
+            },
+            layout::Cursor::Pointing,
+            (!mark.text.is_empty()).then_some(mark.text.as_str()),
+        );
     }
 }
 
@@ -1911,6 +2043,8 @@ mod tests {
             last_probe: None,
             probe_owed: false,
             retry: None,
+            last_return: None,
+            marks: Default::default(),
             seen: None,
         }
     }
@@ -2107,5 +2241,46 @@ mod tests {
             50,
             "as far as history goes"
         );
+    }
+
+    #[test]
+    fn a_prompt_jumped_to_shows_under_what_led_to_it() {
+        // The screen's first line 100, 100 lines of history.
+        assert_eq!(prompt_back(60, 100, 100, 0), 42);
+        assert_eq!(prompt_back(60, 100, 100, 2), 44, "below the find bar");
+        assert_eq!(prompt_back(1, 100, 50, 0), 50, "as far as history goes");
+        assert_eq!(prompt_back(108, 100, 100, 0), 0, "on the screen itself");
+    }
+
+    #[test]
+    fn a_mark_is_pressed_where_it_is_drawn() {
+        let track = mark_track(Viewport {
+            x: 0.0,
+            y: 30.0,
+            width: 400.0,
+            height: 202.0,
+        });
+        assert_eq!(track.x + track.width, 400.0 + PAD, "in the padding");
+        // 100 lines from line 1000: two points a line.
+        assert_eq!(tick_y(track, 1000, 1000, 100), 30.0);
+        assert_eq!(tick_y(track, 1050, 1000, 100), 130.0);
+        // Clamped into the track: a line dropped, one past the end.
+        assert_eq!(tick_y(track, 10, 1000, 100), 30.0);
+        assert_eq!(tick_y(track, 5000, 1000, 100), 230.0);
+        for line in [1000, 1003, 1050, 1099] {
+            let y = tick_y(track, line, 1000, 100) + TICK_HEIGHT / 2.0;
+            assert_eq!(
+                mark_at(track, y, [1000, 1003, 1050, 1099].into_iter(), 1000, 100),
+                Some(line)
+            );
+        }
+        let lines = || [1010, 1060, 900].into_iter();
+        assert_eq!(mark_at(track, 51.0 + 3.5, lines(), 1000, 100), Some(1010));
+        assert_eq!(
+            mark_at(track, 51.0 + 4.5, lines(), 1000, 100),
+            None,
+            "too far"
+        );
+        assert_eq!(mark_at(track, 31.0, lines(), 1000, 100), None, "dropped");
     }
 }

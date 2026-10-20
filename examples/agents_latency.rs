@@ -209,6 +209,8 @@ fn tab(title: &str, workspace: &Workspace, cols: usize, rows: usize) -> Tab {
         probe_owed: false,
         seen: None,
         retry: None,
+        last_return: None,
+        marks: Default::default(),
     }
 }
 

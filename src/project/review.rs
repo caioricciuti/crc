@@ -119,7 +119,13 @@ pub enum Event {
     /// An API error ended the turn: Claude's StopFailure hook, with the
     /// error's kind (`overloaded`, `rate_limit`, ...) and what it said.
     ApiError { error: String, details: String },
+    /// The person sent the agent a prompt: Claude's UserPromptSubmit
+    /// hook, with the prompt's first line, for the terminal's marks.
+    Prompted(String),
 }
+
+/// The most of a prompt's first line an event keeps.
+const PROMPT_CHARS: usize = 200;
 
 /// What the Stop hook asks: the turn is over, the agent waits.
 pub const FINISHED: &str = "finished";
@@ -127,9 +133,9 @@ pub const FINISHED: &str = "finished";
 /// What `crc --hook <kind>` does with the hook's JSON on stdin, for the
 /// session in `dir`. `pre` checkpoints the file a tool is about to write,
 /// `post` records the file as the tool left it, `notify` records the
-/// agent's question, `stop-failure` the API error that ended the turn. The
-/// event appended to the session's `events`, when
-/// the hook is one that is.
+/// agent's question, `stop-failure` the API error that ended the turn,
+/// `prompt` the first line of what the person sent. The event appended to
+/// the session's `events`, when the hook is one that is.
 pub fn hook(kind: &str, input: &str, dir: &Path) -> Result<Option<Event>, String> {
     let value = crate::json::parse(input).map_err(|e| format!("hook input: {e}"))?;
     let written = || -> Result<(String, PathBuf), String> {
@@ -206,6 +212,20 @@ pub fn hook(kind: &str, input: &str, dir: &Path) -> Result<Option<Event>, String
                 teammate: text("teammate_name"),
             }
         }
+        // Its first line, taken before the line breaks become spaces.
+        "prompt" => Event::Prompted(
+            value
+                .get("prompt")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .unwrap_or("")
+                .chars()
+                .take(PROMPT_CHARS)
+                .collect(),
+        ),
         "teammate-idle" => Event::TeammateIdle(
             value
                 .get("teammate_name")
@@ -542,6 +562,7 @@ fn append(dir: &Path, event: &Event) -> std::io::Result<()> {
         Event::ApiError { error, details } => {
             format!("apierror\t{}\t{}\n", clean(error), clean(details))
         }
+        Event::Prompted(text) => format!("prompted\t{}\n", clean(text)),
     };
     std::fs::create_dir_all(dir)?;
     // One write of a short line with O_APPEND: hooks running at once do
@@ -601,6 +622,7 @@ pub fn read_events(dir: &Path, from: u64) -> (Vec<Event>, u64) {
                     }
                 }
                 "idle" => Event::TeammateIdle(rest.to_owned()),
+                "prompted" => Event::Prompted(rest.to_owned()),
                 "apierror" => {
                     let (error, details) = rest.split_once('\t').unwrap_or((rest, ""));
                     Event::ApiError {
@@ -762,6 +784,11 @@ pub fn claude_settings(exe: &Path, review: bool) -> String {
             (
                 "TeammateIdle",
                 Value::Array(vec![object([("hooks", command("teammate-idle"))])]),
+            ),
+            // What the person sent, for the terminal's prompt marks.
+            (
+                "UserPromptSubmit",
+                Value::Array(vec![object([("hooks", command("prompt"))])]),
             ),
             failure,
         ]),
@@ -1293,6 +1320,7 @@ mod tests {
             ("TaskCreated", "task-created"),
             ("TaskCompleted", "task-completed"),
             ("TeammateIdle", "teammate-idle"),
+            ("UserPromptSubmit", "prompt"),
             ("StopFailure", "stop-failure"),
         ] {
             let command = value
@@ -1319,6 +1347,7 @@ mod tests {
         let hooks = value.get("hooks").expect("hooks");
         assert!(hooks.get("PreToolUse").is_none());
         assert!(hooks.get("Stop").is_none());
+        assert!(hooks.get("UserPromptSubmit").is_none());
         let failure = hooks
             .get("StopFailure")
             .and_then(|v| v.as_array())
@@ -1371,6 +1400,33 @@ mod tests {
                     error: "rate_limit".into(),
                     details: String::new(),
                 },
+            ]
+        );
+    }
+
+    #[test]
+    fn the_prompt_hook_records_the_first_line() {
+        let tree = TempTree::new("review-prompt", &[]);
+        let dir = tree.0.join("session");
+        let event = hook("prompt", r#"{"prompt":"a\nb"}"#, &dir).expect("hook");
+        assert_eq!(event, Some(Event::Prompted("a".into())));
+        // Blank lines first are not the prompt; a tab is kept as a space.
+        hook("prompt", r#"{"prompt":"\n  fix\tit  \nmore"}"#, &dir).expect("hook");
+        hook(
+            "prompt",
+            &format!(r#"{{"prompt":"{}"}}"#, "x".repeat(500)),
+            &dir,
+        )
+        .expect("hook");
+        hook("prompt", "{}", &dir).expect("hook");
+        let (events, _) = read_events(&dir, 0);
+        assert_eq!(
+            events,
+            vec![
+                Event::Prompted("a".into()),
+                Event::Prompted("fix it".into()),
+                Event::Prompted("x".repeat(PROMPT_CHARS)),
+                Event::Prompted(String::new()),
             ]
         );
     }

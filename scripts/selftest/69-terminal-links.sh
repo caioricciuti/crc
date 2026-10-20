@@ -66,7 +66,7 @@ expect_terminal "$T/links-hover-osc8.out" 'link=https://example.com/osc8/target@
 expect_terminal "$T/links-hover-wrapped.out" '/end@0-'
 expect_terminal "$T/links-moved-plain.out" 'link=none '
 expect_terminal "$T/links-opened.out" 'opened=https://example.com/owner/repo/pull/341|https://example.com/osc8/target|https://example.com/wrapped/www'
-if ! grep -m1 '^terminal: ' "$T/links-opened.out" | grep -Eq 'opened=[^ ]*\|https://example\.com/wrapped/w+/end$'; then
+if ! grep -m1 '^terminal: ' "$T/links-opened.out" | grep -Eq 'opened=[^ ]*\|https://example\.com/wrapped/w+/end( |$)'; then
     failed "links-opened.out: the wrapped address was not opened whole: $(grep -m1 '^terminal: ' "$T/links-opened.out")"
 fi
 # Only the plain click reached the program: a press and a release at
