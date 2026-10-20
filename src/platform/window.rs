@@ -20,10 +20,10 @@ use objc2_app_kit::{
     NSAlert, NSAlertStyle, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
     NSApplicationTerminateReply, NSBackingStoreType, NSCursor, NSDragOperation,
     NSDraggingDestination, NSDraggingInfo, NSEvent, NSEventModifierFlags, NSEventType, NSMenu,
-    NSMenuItem, NSOpenPanel, NSPasteboardTypeFileURL, NSPasteboardTypePNG, NSPasteboardTypeTIFF,
-    NSRequestUserAttentionType, NSSavePanel, NSScreen, NSTextInputClient, NSTrackingArea,
-    NSTrackingAreaOptions, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowDelegate,
-    NSWindowStyleMask, NSWindowTitleVisibility,
+    NSMenuDelegate, NSMenuItem, NSOpenPanel, NSPasteboardTypeFileURL, NSPasteboardTypePNG,
+    NSPasteboardTypeTIFF, NSRequestUserAttentionType, NSSavePanel, NSScreen, NSTextInputClient,
+    NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindow, NSWindowCollectionBehavior,
+    NSWindowDelegate, NSWindowStyleMask, NSWindowTitleVisibility,
 };
 use objc2_foundation::{
     NSArray, NSAttributedString, NSAttributedStringKey, NSFileManager, NSNotFound, NSNotification,
@@ -71,6 +71,7 @@ mod local_history;
 mod lsp;
 mod lsp_features;
 mod mcp;
+mod menubar;
 mod palette;
 mod project;
 mod query;
@@ -1517,6 +1518,26 @@ define_class!(
         fn caret_blink(&self, _sender: Option<&AnyObject>) {
             self.request_redraw();
             self.pump();
+        }
+
+        /// The menu bar item's Show crc.
+        #[unsafe(method(statusItemShow:))]
+        fn status_item_show_action(&self, _sender: Option<&AnyObject>) {
+            self.status_item_show();
+        }
+
+        /// A workspace's row in the menu bar item's menu, by the id it
+        /// carries.
+        #[unsafe(method(statusItemPick:))]
+        fn status_item_pick_action(&self, sender: Option<&NSMenuItem>) {
+            let id = sender
+                .and_then(|item| item.representedObject())
+                .and_then(|object| object.downcast::<NSString>().ok())
+                .map(|id| id.to_string());
+            match id {
+                Some(id) => self.status_item_pick(&id),
+                None => self.status_item_show(),
+            }
         }
 
         /// An idle snapshot fell due with no frame to notice it.
@@ -5116,6 +5137,14 @@ define_class!(
         }
 
     }
+
+    unsafe impl NSMenuDelegate for EditorView {
+        /// The menu bar item's menu, made as it opens: see menubar.rs.
+        #[unsafe(method(menuNeedsUpdate:))]
+        fn menu_needs_update(&self, menu: &NSMenu) {
+            menubar::fill(self, menu);
+        }
+    }
 );
 
 /// A fetched HEAD text arriving from a worker: the buffer it is for, the
@@ -5614,6 +5643,9 @@ impl EditorView {
         self.sync_native_preview();
         self.sync_html_preview();
         self.sync_terminal_search();
+        if let Some(state) = self.state() {
+            menubar::sync_if_changed(&state, MainThreadMarker::from(self));
+        }
         let ready = match self.state() {
             Some(state) => match state.last_draw {
                 Some(t) => t.elapsed() >= state.frame_interval,
@@ -10265,6 +10297,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
     view.apply_theme();
     view.lsp_sync_open();
     view.rebuild_extension_menu();
+    menubar::install(&view);
     // The delegate must outlive this function; NSApplication only holds a
     // weak reference to it, so it is leaked deliberately rather than dropped
     // at the end of `run` while AppKit still calls into it.

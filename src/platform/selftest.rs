@@ -171,6 +171,9 @@ pub enum Step {
     /// behind another app (`front off`); a test instance is never really
     /// either, and counts as in front until this says.
     Front(bool),
+    /// The menu bar item's menu, made as it opens, and its Nth workspace
+    /// row (from 1) chosen. A test instance has no item; this is its path.
+    MenuBar(usize),
     /// Holds the state, as a caller up the stack would, and drives the entry
     /// points AppKit can re-enter through: each must skip, none may abort.
     Reenter,
@@ -427,6 +430,7 @@ pub fn parse(script: &str) -> Result<Vec<Step>, String> {
             "wheel" => steps.push(Step::Wheel(rest.trim().parse().map_err(|_| bad())?)),
             "front" if rest == "on" || rest == "off" => steps.push(Step::Front(rest == "on")),
             "reenter" => steps.push(Step::Reenter),
+            "menubar" => steps.push(Step::MenuBar(rest.parse().map_err(|_| bad())?)),
             "quit" => steps.push(Step::Quit),
             "panic" => steps.push(Step::Panic),
             _ => return Err(bad()),
@@ -517,6 +521,8 @@ mod tests {
             }
         );
         assert_eq!(parse("fade 40\n").unwrap(), [Step::Fade(40)]);
+        assert_eq!(parse("menubar 2\n").unwrap(), [Step::MenuBar(2)]);
+        assert!(parse("menubar\n").is_err());
         assert_eq!(
             parse("wheelat @terminal 0.5 0.5 -40\n").unwrap(),
             [Step::WheelAt {

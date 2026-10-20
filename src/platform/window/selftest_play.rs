@@ -329,6 +329,7 @@ impl EditorView {
                 }
             }
             Step::Idle(_) => {}
+            Step::MenuBar(number) => self.selftest_menubar_pick(*number),
             Step::Front(front) => {
                 if let Some(mut state) = self.state_mut() {
                     state.agents.front = Some(*front);
@@ -758,7 +759,7 @@ impl EditorView {
                 let spans = state.spans.len();
                 let report = format!(
                     // First: the report ends with the document's text.
-                    "message: {}\npreview: {}\nmd: {md}\nspans: {spans}\nactivity: {}\npointer_targets: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nrepo: {}\ngit_note: {}\nhome: {}\nhome_scroll: {}\nmcp: {}\nmcp_page: {}\nsettings_page: {}\nterminals: {}\nagents: {}\ninspector: {}\nteams: {}\nagents_tree: {}\nagents_activity: {}\nagents_prs: {}\nconflicts: {}\ngit_conflicts: {}\ntable: {}\nquery: {}\nquery_sql: {}\nblame: {}\nfind_results: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\npeek: {}\ngutter: {}\nissue_tab: {}\nscrub: {}\nscrub_strip: {}\nscrub_fade: {}\nscrub_filter: {}\nscrub_compare: {}\nblame_heat: {}\nreplaced: {}\n{report}",
+                    "message: {}\npreview: {}\nmd: {md}\nspans: {spans}\nactivity: {}\npointer_targets: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nrepo: {}\ngit_note: {}\nhome: {}\nhome_scroll: {}\nmcp: {}\nmcp_page: {}\nsettings_page: {}\nterminals: {}\nagents: {}\ninspector: {}\nteams: {}\nagents_tree: {}\nagents_activity: {}\nagents_prs: {}\nmenubar: {}\nconflicts: {}\ngit_conflicts: {}\ntable: {}\nquery: {}\nquery_sql: {}\nblame: {}\nfind_results: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\npeek: {}\ngutter: {}\nissue_tab: {}\nscrub: {}\nscrub_strip: {}\nscrub_fade: {}\nscrub_filter: {}\nscrub_compare: {}\nblame_heat: {}\nreplaced: {}\n{report}",
                     state.message.as_ref().map_or("", |(text, _)| text.as_str()),
                     state.html_preview.as_ref().map_or("closed".to_string(), |p| format!(
                         "open ext={} view={} probe={}",
@@ -880,6 +881,7 @@ impl EditorView {
                     ),
                     state.agents.report_activity(),
                     state.agents.report_pull_requests(),
+                    super::menubar::report(&state),
                     active_conflicts(&state).map_or("none".to_string(), |v| format!(
                         "{} side={} unmerged={} resolvable={} scroll={}",
                         v.conflicts.len(),

@@ -92,6 +92,10 @@ objc2-app-kit = { version = "=0.3.2", default-features = false, features = [
     "NSPasteboardItem",    # each dropped file's URL
     "NSImageRep",          # NSBitmapImageRep -> NSImageRep
     "NSBitmapImageRep",    # a pasted TIFF (a screenshot) as PNG for an agent
+    "NSStatusBar",         # crc in the menu bar: the count waiting, and a
+    "NSStatusItem",        # menu of the workspaces
+    "NSStatusBarButton",   # the item's button: its symbol and count
+    "NSImage",             # the item's SF Symbol
 ] }
 
 objc2-quartz-core = { version = "=0.3.2", default-features = false, features = [

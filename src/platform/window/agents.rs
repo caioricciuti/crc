@@ -579,15 +579,11 @@ impl EditorView {
             let mine: Vec<usize> = (0..state.terminal.tabs.len())
                 .filter(|i| task_of(&tasks, &state.terminal.tabs[*i]) == Some(index))
                 .collect();
-            let pick = mine
-                .iter()
-                .copied()
-                .find(|i| state.terminal.tabs[*i].activity() == Activity::Waiting)
-                .or_else(|| {
-                    mine.contains(&state.terminal.active)
-                        .then_some(state.terminal.active)
-                })
-                .or_else(|| mine.last().copied());
+            let pick = super::menubar::best_tab(
+                &mine,
+                |i| state.terminal.tabs[i].activity() == Activity::Waiting,
+                state.terminal.active,
+            );
             (pick, path)
         };
         match found {
@@ -1831,16 +1827,12 @@ pub(super) fn forget_emptied(state: &mut State) {
     }
 }
 
-/// The number of sessions waiting on you, on the Dock icon; nothing when
-/// none is.
+/// The number of sessions waiting on you, on the Dock icon (nothing when
+/// none is) and the menu bar item.
 pub(super) fn sync_dock_badge(state: &State, mtm: MainThreadMarker) {
-    let waiting = state
-        .terminal
-        .tabs
-        .iter()
-        .filter(|t| t.activity() == Activity::Waiting)
-        .count();
+    let waiting = super::menubar::waiting_count(state.terminal.tabs.iter().map(|t| t.activity()));
     let tile = NSApplication::sharedApplication(mtm).dockTile();
     let label = (waiting > 0).then(|| NSString::from_str(&waiting.to_string()));
     tile.setBadgeLabel(label.as_deref());
+    super::menubar::sync_status_item(waiting, mtm);
 }
