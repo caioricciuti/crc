@@ -78,6 +78,85 @@ impl EditorView {
         })
     }
 
+    /// A successful Git snapshot is the authority: failed switches never
+    /// change tabs, and switches made in a terminal follow the same path.
+    pub(super) fn sync_branch_session(&self) {
+        let (key, previous, initial, agents) = {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            let Some(root) = state.git.root().map(Path::to_path_buf) else {
+                return;
+            };
+            let branch = state.git.branch();
+            // Detached HEAD gets a separate set, never a named branch's.
+            if branch.is_empty() {
+                return;
+            }
+            let key = (root, branch);
+            if state.branch_session.as_ref() == Some(&key) {
+                return;
+            }
+            let previous = state.branch_session.replace(key.clone());
+            let initial = std::mem::replace(&mut state.branch_restore_initial, false);
+            (key, previous, initial, state.agents.on)
+        };
+        if let Some((root, branch)) = previous.as_ref()
+            && let Some(session) = self.capture_session()
+        {
+            session.save_branch(root, branch);
+        }
+        // A file passed explicitly at launch wins over remembered tabs.
+        if previous.is_none() && !initial {
+            return;
+        }
+        let Some(session) = Session::load_branch(&key.0, &key.1) else {
+            return;
+        };
+        // Preserve dirty, untitled, read-only review tabs and files outside
+        // this checkout. Close through the normal path for history/LSP cleanup.
+        loop {
+            let next = self.state().and_then(|state| {
+                let eligible = |b: &&Buffer| {
+                    !b.is_dirty()
+                        && !b.is_read_only()
+                        && b.path.as_deref().is_some_and(|p| p.starts_with(&key.0))
+                };
+                if let Some(tab) = state.docs.iter().position(|b| eligible(&b)) {
+                    return Some((state.focused_pane, tab));
+                }
+                state.panes.iter().enumerate().find_map(|(slot, pane)| {
+                    let pane_index = if slot >= state.focused_pane {
+                        slot + 1
+                    } else {
+                        slot
+                    };
+                    pane.docs
+                        .iter()
+                        .position(|b| eligible(&b))
+                        .map(|tab| (pane_index, tab))
+                })
+            });
+            let Some((pane, tab)) = next else { break };
+            self.focus_pane(pane);
+            self.close_tab(tab);
+        }
+        let active = session.files.get(session.active).cloned();
+        for path in &session.files {
+            if let Some(path) = path.to_str() {
+                self.load_path(path);
+            }
+        }
+        if let Some(path) = active.and_then(|p| p.to_str().map(str::to_owned)) {
+            self.load_path(&path);
+        }
+        if agents {
+            self.set_agents_mode(true);
+        }
+        self.sync_title();
+        self.request_redraw();
+    }
+
     /// Asks about every document with unsaved changes, one at a time, showing
     /// each as it is asked about. Returns whether the window may go.
     ///

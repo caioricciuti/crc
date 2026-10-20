@@ -178,6 +178,83 @@ impl Session {
         out
     }
 
+    /// A checkout has its own branch sessions, including worktrees. The
+    /// contents carry the key too, so a hash collision cannot load another
+    /// checkout's tabs. No state is written into the repository.
+    fn branch_path(dir: &Path, root: &Path, branch: &str) -> PathBuf {
+        use std::os::unix::ffi::OsStrExt;
+        let mut key = root.as_os_str().as_bytes().to_vec();
+        key.push(0);
+        key.extend_from_slice(branch.as_bytes());
+        dir.join(format!("{:016x}", crate::platform::fnv1a(&key)))
+    }
+
+    pub fn load_branch(root: &Path, branch: &str) -> Option<Session> {
+        Self::read_branch(
+            &crate::platform::app_support()?.join("branch-sessions"),
+            root,
+            branch,
+        )
+    }
+
+    fn read_branch(dir: &Path, root: &Path, branch: &str) -> Option<Session> {
+        let path = Self::branch_path(dir, root, branch);
+        if std::fs::metadata(&path).ok()?.len() > 1024 * 1024 {
+            return None;
+        }
+        let bytes = std::fs::read(path).ok()?;
+        let (header, body) = bytes.split_at(bytes.iter().position(|&b| b == b'\n')? + 1);
+        if header != format!("branch={branch}\n").as_bytes() {
+            return None;
+        }
+        let mut session = Self::parse_bytes(body);
+        if session.folder.as_deref() != Some(root) {
+            return None;
+        }
+        session.files.retain(|p| p.starts_with(root));
+        session.prune();
+        Some(session)
+    }
+
+    /// Saves only this checkout's named documents. Untitled and dirty
+    /// buffers are kept alive by the window, never serialized as text here.
+    pub fn save_branch(&self, root: &Path, branch: &str) {
+        if let Some(dir) = crate::platform::app_support() {
+            let _ = self.write_branch(&dir.join("branch-sessions"), root, branch);
+        }
+    }
+
+    fn write_branch(&self, dir: &Path, root: &Path, branch: &str) -> std::io::Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+        if branch.contains(['\n', '\r'])
+            || root.as_os_str().as_bytes().contains(&b'\n')
+            || root.as_os_str().as_bytes().contains(&b'\r')
+        {
+            return Ok(());
+        }
+        let files: Vec<_> = self
+            .files
+            .iter()
+            .filter(|p| p.starts_with(root))
+            .cloned()
+            .collect();
+        let active = self
+            .files
+            .get(self.active)
+            .and_then(|p| files.iter().position(|f| f == p))
+            .unwrap_or(0);
+        let session = Session {
+            folder: Some(root.to_path_buf()),
+            files,
+            active,
+            ..Session::default()
+        };
+        let mut bytes = format!("branch={branch}\n").into_bytes();
+        bytes.extend(session.serialize());
+        std::fs::create_dir_all(dir)?;
+        crate::platform::write_atomically(&Self::branch_path(dir, root, branch), &bytes)
+    }
+
     /// Drops files that no longer exist, so a deleted file does not resurrect
     /// as an error tab on every launch.
     pub fn prune(&mut self) {
@@ -207,6 +284,49 @@ pub fn is_reopenable(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn branch_sessions_are_isolated_and_validate_their_key() {
+        let dir = std::env::temp_dir().join(format!("crc-branches-{}", std::process::id()));
+        let root = dir.join("checkout");
+        let other = dir.join("worktree");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let a = root.join("a.txt");
+        let b = root.join("b.txt");
+        std::fs::write(&a, "a").unwrap();
+        std::fs::write(&b, "b").unwrap();
+        let session = Session {
+            files: vec![other.join("outside"), a.clone(), b.clone()],
+            active: 2,
+            ..Session::default()
+        };
+        let store = dir.join("sessions");
+        session.write_branch(&store, &root, "feature/a").unwrap();
+        let saved = Session::read_branch(&store, &root, "feature/a").unwrap();
+        assert_eq!(saved.files, [a.clone(), b.clone()]);
+        assert_eq!(saved.active, 1);
+        assert!(Session::read_branch(&store, &root, "main").is_none());
+        assert!(Session::read_branch(&store, &other, "feature/a").is_none());
+        // Missing files are pruned without moving focus to the wrong file.
+        std::fs::remove_file(&a).unwrap();
+        let saved = Session::read_branch(&store, &root, "feature/a").unwrap();
+        assert_eq!(saved.files, [b]);
+        assert_eq!(saved.active, 0);
+        let path = Session::branch_path(&store, &root, "feature/a");
+        std::fs::write(&path, b"branch=wrong\nfile=/tmp/unrelated\n").unwrap();
+        assert!(Session::read_branch(&store, &root, "feature/a").is_none());
+        Session::default()
+            .write_branch(&store, &root, "main")
+            .unwrap();
+        assert!(
+            Session::read_branch(&store, &root, "main")
+                .unwrap()
+                .files
+                .is_empty()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn odd_paths_survive_and_pruning_keeps_the_active_file() {

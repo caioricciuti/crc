@@ -2,6 +2,12 @@
 
 One entry per tag, written for people who use the editor.
 
+## Unreleased
+
+- Each Git branch remembers its open files and active tab. Switching back
+  restores them, including switches from a terminal. Unsaved documents
+  stay open, and each checkout and worktree keeps its own sets.
+
 ## v0.2.0-alpha.27, 2026-10-18
 
 - The Review page is gone; what agents changed is in Source Control.

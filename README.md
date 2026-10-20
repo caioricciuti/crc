@@ -105,6 +105,13 @@ the size and write it back.
   and Cmd-click it (or click where no change mark is) to open File History
   at that commit. Unsigned commits draw it dashed; a signed commit's
   signature is checked the first time its tooltip shows.
+- **Tabs per branch**: switching a Git branch remembers its open files and
+  active tab, and restores them when you return, including switches from
+  a terminal. Each checkout and worktree keeps its own sets. A new branch
+  starts with the files already open. Dirty and untitled documents stay
+  open across switches; files outside the checkout stay too. Saved sets
+  survive a restart; an explicitly opened file wins at launch. Panes come
+  back as one set of tabs, and missing files are skipped.
 - **Completion that learns, in every language**: the best guess appears as
   ghost text at the caret (Tab takes it) and the alternatives as a single
   row of chips under the line, with a line saying why the picked one is

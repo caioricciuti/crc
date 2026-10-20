@@ -755,6 +755,8 @@ struct State {
     commit_prompt: Option<String>,
     /// The branch picker's list, being read by a worker.
     branch_rx: Option<mpsc::Receiver<Result<BranchPick, String>>>,
+    branch_session: Option<(std::path::PathBuf, String)>,
+    branch_restore_initial: bool,
     /// `organize_imports_on_save` from the settings.
     organize_on_save: bool,
     /// The Extensions page, when it has the editor column.
@@ -2966,6 +2968,7 @@ define_class!(
                 changed
             });
             if git_changed {
+                self.sync_branch_session();
                 self.request_redraw();
                 if let Some(window) = self.window() {
                     window.invalidateCursorRectsForView(self);
@@ -6256,8 +6259,13 @@ define_class!(
             let (session, ephemeral) = view.state_mut().map_or((None, true), |mut state| {
                 (state.quit_session.take(), state.ephemeral_session)
             });
-            if !ephemeral && let Some(session) = session {
-                session.save();
+            if let Some(session) = session {
+                if let Some((root, branch)) = view.state().and_then(|s| s.branch_session.clone()) {
+                    session.save_branch(&root, &branch);
+                }
+                if !ephemeral {
+                    session.save();
+                }
             }
             // Sessions a helper holds outlive this window when the session
             // is kept, each with what the next window needs to show it;
@@ -9944,6 +9952,8 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         review: Default::default(),
         mcp_calls: HashMap::new(),
         branch_rx: None,
+        branch_session: None,
+        branch_restore_initial: !launched_with_file,
         organize_on_save: settings.organize_imports_on_save,
         extensions: None,
         conflict_scans: HashMap::new(),

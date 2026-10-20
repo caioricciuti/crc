@@ -442,6 +442,8 @@ impl EditorView {
                 if let Some(mut state) = self.state_mut() {
                     state.git.poll();
                 }
+                // Wait can consume the snapshot before the display link.
+                self.sync_branch_session();
             }
             Step::Fade(ms) => {
                 if let Some(mut state) = self.state_mut() {
