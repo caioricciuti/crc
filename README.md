@@ -178,6 +178,22 @@ the size and write it back.
   then as made); nothing a terminal does moves a row. It is read again
   every minute, and pull requests on their own: every 20 s while checks
   run, every minute with open ones, and right after a push.
+  `Cmd-P` in Agents mode switches sessions and workspaces, the most
+  recent first and the one you came from on top, so `Cmd-P` then Return
+  goes back; `>` still runs commands and `/` opens files. crc also sits
+  in the menu bar with the number of sessions waiting on you; its menu
+  lists every workspace, those waiting first, and a pick brings crc
+  forward on it.
+- **Claude Code sessions** started by crc report through its hooks.
+  Each prompt you send leaves a tick on a thin track at the terminal's
+  right edge: click one, or `Cmd-Shift-Up/Down` in the terminal, to go
+  between your prompts, and hover one to see it. A turn that ends on a
+  temporary API error (overloaded, a server error, a dropped connection)
+  is continued for you after 20, 40 and 80 s, three times at most, and
+  the row says retrying; usage limits, sign-in and billing errors never
+  are, and anything you type into the session first cancels it
+  (`auto_continue` in Settings turns it off). Sessions started before an
+  update keep their old hooks until started again.
 - **Workspaces on a server**: type `host:/path` in New Workspace (an
   `~/.ssh/config` alias or `user@host`). Its terminals and Claude
   sessions open over `ssh` in that folder, one connection shared per
@@ -448,9 +464,9 @@ the size and write it back.
 | `Cmd-F` | find; Tab switches to replace; Enter cycles or replaces |
 | `Cmd-/` | toggle comment |
 | `Cmd-Shift-D` | duplicate line |
-| `Cmd-Shift-Up/Down` | move line |
+| `Cmd-Shift-Up/Down` | move line; in a terminal, the previous / next prompt sent to Claude Code |
 | Tab / Shift-Tab | indent / outdent selection |
-| `Cmd-P` | fuzzy file open |
+| `Cmd-P` | fuzzy file open; in Agents mode, switch sessions (`/` for files) |
 | `Cmd-Option-G` | local Source Control |
 | `Cmd-Return` in Source Control | commit staged changes |
 | `Cmd-Return` in a `.http` file | send the request under the caret |

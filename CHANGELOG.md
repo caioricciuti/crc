@@ -2,6 +2,32 @@
 
 One entry per tag, written for people who use the editor.
 
+## v0.2.0-alpha.29, 2026-10-20
+
+- `Cmd-P` in Agents mode switches sessions and workspaces: the most
+  recent first, with the one you came from on top, so `Cmd-P` then
+  Return goes back. Typing filters by name, branch and folder; `>`
+  still runs commands and `/` opens files.
+- `Cmd-Option-F` (Edit > Find in Terminals...) searches what every open
+  terminal printed. Return shows that session with its find bar on the
+  match. A session busy printing is skipped rather than waited on.
+- crc sits in the menu bar with the number of sessions waiting on you.
+  Its menu lists every workspace, those waiting first, and a pick brings
+  crc forward on it. The Dock badge no longer stays on after the
+  session it counted closed.
+- Each prompt sent to Claude Code leaves a tick on a thin track at the
+  terminal's right edge. Click one, or press `Cmd-Shift-Up/Down` in the
+  terminal, to go between your prompts; hover one to read it.
+- A Claude Code turn that ends on a temporary API error (overloaded, a
+  server error, a dropped connection) is continued for you after 20, 40
+  and 80 s, three times at most, and the session's row says retrying.
+  Usage limits, sign-in and billing errors are never retried, and
+  anything you type into the session first cancels it. `auto_continue`
+  in Settings turns it off.
+- Prompt ticks and continuing need sessions started after the update.
+- Terminals keep their colours after Restart to Update: a `NO_COLOR` or
+  pager setting from the shell that launched crc no longer reaches them.
+
 ## v0.2.0-alpha.28, 2026-10-20
 
 - Each Git branch remembers its open files and active tab. Switching back
