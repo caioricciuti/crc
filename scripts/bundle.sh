@@ -24,6 +24,24 @@
 # the environment or the repository.
 set -euo pipefail
 
+# Staples Apple's ticket to a notarized file. Fetching the ticket is a
+# network call the release runner sometimes loses mid-request (error 68,
+# NSURLErrorDomain -1005) after Apple has accepted the file, which used to
+# fail the whole release; so it is tried up to five times, 30 s apart.
+staple() {
+    local try
+    for try in 1 2 3 4 5; do
+        if xcrun stapler staple "$1" 2>&1 | sed 's/^/    /'; then
+            return 0
+        fi
+        [ "$try" -lt 5 ] || break
+        echo "    staple failed (try $try of 5), again in 30 s"
+        sleep 30
+    done
+    echo "error: could not staple $1" >&2
+    return 1
+}
+
 # Checked before anything is built.
 case "${1:-}" in
     "" | --install | --dmg | --release) ;;
@@ -189,7 +207,7 @@ if [ "$MODE" = "--release" ]; then
     # shellcheck disable=SC2086
     xcrun notarytool submit "$ZIP" --keychain-profile "$NOTARY_PROFILE" $NOTARY_KEYCHAIN --wait 2>&1 | sed 's/^/    /'
     rm -f "$ZIP"
-    xcrun stapler staple "$APP" 2>&1 | sed 's/^/    /'
+    staple "$APP"
     spctl -a -vv -t exec "$APP" 2>&1 | sed 's/^/    /'
 
     echo "==> disk image"
@@ -201,7 +219,7 @@ if [ "$MODE" = "--release" ]; then
     codesign --force --timestamp --sign "$IDENTITY" "$DMG"
     # shellcheck disable=SC2086
     xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" $NOTARY_KEYCHAIN --wait 2>&1 | sed 's/^/    /'
-    xcrun stapler staple "$DMG" 2>&1 | sed 's/^/    /'
+    staple "$DMG"
     spctl -a -vv -t open --context context:primary-signature "$DMG" 2>&1 | sed 's/^/    /'
     (cd target && shasum -a 256 "$(basename "$DMG")" > SHA256SUMS)
     echo "    $DMG ($(( $(stat -f %z "$DMG") / 1024 )) KB)"
