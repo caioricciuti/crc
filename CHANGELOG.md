@@ -2,7 +2,7 @@
 
 One entry per tag, written for people who use the editor.
 
-## v0.2.0-alpha.29, 2026-10-20
+## v0.2.0-alpha.30, 2026-10-21
 
 - `Cmd-P` in Agents mode switches sessions and workspaces: the most
   recent first, with the one you came from on top, so `Cmd-P` then
