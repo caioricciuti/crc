@@ -2,7 +2,7 @@
 
 One entry per tag, written for people who use the editor.
 
-## Unreleased
+## v0.2.0-alpha.31, 2026-10-25
 
 - Find, in terminals and documents: the match you are on is in a
   stronger amber than the others, so "3 of 17" can be seen as well as
