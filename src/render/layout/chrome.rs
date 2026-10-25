@@ -19,6 +19,12 @@ pub const BREADCRUMB_HEIGHT: f32 = 30.0;
 pub const SIDEBAR_HEADER_HEIGHT: f32 = 40.0;
 pub const SIDEBAR_ROW_HEIGHT: f32 = 26.0;
 pub const FIND_ROW_HEIGHT: f32 = 34.0;
+/// The find bar is a panel at most this wide at the top right of the
+/// text (or the terminal's screen), over it rather than taking rows
+/// from it, with this much air to the edges. It used to take two rows
+/// across the column, which moved the whole file down to search it.
+pub const FIND_PANEL_WIDTH: f32 = 560.0;
+pub const FIND_PANEL_MARGIN: f32 = 6.0;
 
 /// Every rectangle in the find bar, for drawing and for hit testing.
 ///
@@ -41,7 +47,9 @@ pub struct FindGeometry {
     /// buttons do in document and project mode respectively.
     pub replace_one: Viewport,
     pub replace_all: Viewport,
-    pub results: Viewport,
+    /// The chevron that shows and hides the replace row; no width
+    /// without one.
+    pub toggle: Viewport,
 }
 
 impl FindGeometry {
@@ -161,21 +169,56 @@ impl FindGeometry {
             close,
             replace_one,
             replace_all,
-            results: Viewport {
-                x: rect.x,
-                y: rect.y + FIND_ROW_HEIGHT * 2.0,
-                width: rect.width,
-                height: (rect.height - FIND_ROW_HEIGHT * 2.0).max(0.0),
+            toggle: Viewport {
+                width: 0.0,
+                ..find_field
             },
         }
     }
 
-    /// Which result row `y` falls on, if any.
-    pub fn result_row(&self, y: f32) -> Option<usize> {
-        (y >= self.results.y && y < self.results.y + self.results.height)
-            .then(|| ((y - self.results.y) / FIND_ROW_HEIGHT) as usize)
+    /// The bar as a panel with `rows` rows (find, and replace under it)
+    /// at the top right of `rect`, with its toggle for the replace row
+    /// at the left when `toggle`; the terminal's bar has neither.
+    pub fn panel(rect: Viewport, chips: usize, toggle: bool) -> Self {
+        let mut g = Self::with_chips(rect, chips);
+        if toggle {
+            const TOGGLE: f32 = 22.0;
+            g.toggle = Viewport {
+                x: g.find_field.x - 4.0,
+                width: TOGGLE,
+                ..g.find_field
+            };
+            g.find_field.x += TOGGLE;
+            g.find_field.width = (g.find_field.width - TOGGLE).max(0.0);
+            g.replace_field.x += TOGGLE;
+            g.replace_field.width = (g.replace_field.width - TOGGLE).max(0.0);
+        }
+        g
     }
 }
+/// The find bar's panel with `rows` rows at the top right of `column`,
+/// the room under the breadcrumbs: as wide as [`FIND_PANEL_WIDTH`] or
+/// the column less its margins.
+pub fn find_panel(column: Viewport, rows: usize) -> Viewport {
+    let width = FIND_PANEL_WIDTH
+        .min(column.width - FIND_PANEL_MARGIN * 2.0)
+        .max(0.0);
+    Viewport {
+        x: column.x + column.width - FIND_PANEL_MARGIN - width,
+        y: column.y + FIND_PANEL_MARGIN,
+        width,
+        height: FIND_ROW_HEIGHT * rows as f32,
+    }
+}
+
+/// The text rows under a find panel of `rows` rows: what it hides at
+/// the top of the text, for a match to be shown below it.
+pub fn find_panel_rows(rows: usize, line_height: f32) -> usize {
+    ((FIND_PANEL_MARGIN + FIND_ROW_HEIGHT * rows as f32 - TEXT_TOP_PAD) / line_height.max(1.0))
+        .ceil()
+        .max(0.0) as usize
+}
+
 /// Air above the first line, so text is not glued to whatever is above it.
 pub const TEXT_TOP_PAD: f32 = 8.0;
 /// The response strip: one row of status and facts, one of segment buttons.
@@ -344,12 +387,9 @@ impl Chrome {
 
         let (tabs, rest) = column.split_top(TAB_BAR_HEIGHT);
         let (breadcrumbs, rest) = rest.split_top(BREADCRUMB_HEIGHT);
-        let (find, rest) = match find_rows {
-            0 => (None, rest),
-            rows => {
-                let (find, rest) = rest.split_top(FIND_ROW_HEIGHT * rows as f32);
-                (Some(find), rest)
-            }
+        let find = match find_rows {
+            0 => None,
+            rows => Some(find_panel(rest, rows)),
         };
         let (response, rest) = if response {
             let (strip, rest) = rest.split_top(RESPONSE_STRIP_HEIGHT);
@@ -2627,23 +2667,25 @@ pub fn sidebar_rows(viewport: Viewport) -> usize {
 pub const ACTIVITY_WIDTH: f32 = 44.0;
 
 /// The panels the icon strip switches between, top to bottom.
-pub const ACTIVITY_ICONS: [(char, &str); 4] = [
+pub const ACTIVITY_ICONS: [(char, &str); 5] = [
     ('\u{eaf0}', "explorer"),       // cod-files
+    ('\u{ea6d}', "search"),         // cod-search
     ('\u{ea68}', "source-control"), // cod-source_control
     ('\u{eae6}', "extensions"),     // cod-extensions
     ('\u{eb2d}', "mcp"),            // cod-plug
 ];
 
 /// What each icon in the strip is, said when the pointer rests on it.
-pub const ACTIVITY_TIPS: [&str; 4] = [
+pub const ACTIVITY_TIPS: [&str; 5] = [
     "Explorer",
+    "Search  \u{21e7}\u{2318}F",
     "Source Control  \u{2325}\u{2318}G",
     "Extensions",
     "MCP Servers",
 ];
 
 /// Each icon's square in the strip.
-pub fn activity_items(strip: Viewport) -> [Viewport; 4] {
+pub fn activity_items(strip: Viewport) -> [Viewport; 5] {
     let size = ACTIVITY_WIDTH;
     std::array::from_fn(|i| Viewport {
         x: strip.x,
@@ -2719,7 +2761,8 @@ pub fn push_activity(
             },
             1.45,
         );
-        if i == 1 {
+        // Source Control's count, on its own icon.
+        if i == 2 {
             push_badge(out, atlas, rect, badge, theme.sidebar_background, theme);
         }
     }
@@ -3181,7 +3224,8 @@ pub enum Hit {
     TerminalHide,
     /// The terminal's screen.
     Terminal,
-    /// An icon in the strip: 0 Explorer, 1 Source Control, 2 Extensions.
+    /// An icon in the strip: 0 Explorer, 1 Search, 2 Source Control,
+    /// 3 Extensions, 4 MCP.
     Activity(usize),
     /// New file, new folder, collapse all, refresh.
     SidebarAction(usize),
@@ -3257,6 +3301,12 @@ pub enum Hit {
     /// control.
     GitRow(usize),
     GitToggle(usize),
+    /// The Search view's controls, named for scripts: `collapse`,
+    /// `clear`, `filters`, `toggle`, `query`, `case`, `word`, `regex`,
+    /// `replace`, `replace-all`, `include`, `exclude`; and the `n`th row
+    /// of its list, counted over every row listed.
+    Search(&'static str),
+    SearchRow(usize),
     /// An unfocused editor pane, tabs through text. A click gives it the
     /// keyboard and is then handled as a click in the focused pane.
     Pane(usize),
@@ -3341,6 +3391,8 @@ impl Hit {
             Hit::Git(name) => format!("git.{name}"),
             Hit::GitRow(i) => format!("git.row.{i}"),
             Hit::GitToggle(i) => format!("git.toggle.{i}"),
+            Hit::Search(name) => format!("search.{name}"),
+            Hit::SearchRow(i) => format!("search.row.{i}"),
             Hit::Pane(i) => format!("pane.{i}"),
         }
     }

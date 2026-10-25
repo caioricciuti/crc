@@ -607,7 +607,7 @@ impl EditorView {
                         let text = query.rope.to_string();
                         palette_words(&sources, &text, PaletteMode::of(&sources)).loading
                     }),
-                    state.find.as_ref().is_some_and(|bar| bar.searching),
+                    state.search.searching,
                     pane_count(&state),
                     state.focused_pane,
                     state
@@ -736,6 +736,8 @@ impl EditorView {
                         "extensions"
                     } else if state.git_open {
                         "source-control"
+                    } else if state.search_open {
+                        "search"
                     } else {
                         "explorer"
                     },
@@ -910,49 +912,44 @@ impl EditorView {
                         .as_ref()
                         .map_or("", |(_, _, text)| text.as_str()),
                     state
-                        .find
-                        .as_ref()
-                        .map(|bar| {
-                            bar.results
-                                .iter()
-                                .map(|h| {
-                                    format!(
-                                        "{}:{}",
-                                        h.path
-                                            .file_name()
-                                            .map(|n| n.to_string_lossy().into_owned())
-                                            .unwrap_or_default(),
-                                        h.line + 1
-                                    )
-                                })
-                                .collect::<Vec<_>>()
-                                .join("|")
+                        .search
+                        .results
+                        .iter()
+                        .map(|h| {
+                            format!(
+                                "{}:{}",
+                                h.path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_default(),
+                                h.line + 1
+                            )
                         })
-                        .unwrap_or_default(),
-                    state
-                        .find
-                        .as_ref()
-                        .map(|bar| {
-                            bar.rows
-                                .iter()
-                                .map(|row| match row {
-                                    super::ResultRow::File { first, count } => format!(
-                                        "{} ({count})",
-                                        bar.results[*first]
-                                            .path
-                                            .file_name()
-                                            .map(|n| n.to_string_lossy().into_owned())
-                                            .unwrap_or_default()
-                                    ),
-                                    super::ResultRow::Line { hits } => {
-                                        let hit = &bar.results[hits.start];
-                                        format!("{} {}", hit.line + 1, hit.snippet)
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                                .join("|")
-                        })
-                        .unwrap_or_default(),
+                        .collect::<Vec<_>>()
+                        .join("|"),
+                    {
+                        use crate::platform::search_panel::Row;
+                        let search = &state.search;
+                        search
+                            .listed()
+                            .into_iter()
+                            .map(|index| match &search.rows()[index] {
+                                Row::File { first, count } => format!(
+                                    "{} ({count})",
+                                    search.results[*first]
+                                        .path
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().into_owned())
+                                        .unwrap_or_default()
+                                ),
+                                Row::Line { hits } => {
+                                    let hit = &search.results[hits.start];
+                                    format!("{} {}", hit.line + 1, hit.snippet)
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("|")
+                    },
                     state
                         .lsp.signature
                         .as_ref()

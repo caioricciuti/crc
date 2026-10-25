@@ -17,38 +17,25 @@ impl EditorView {
         };
 
         const TAB: u16 = 48;
-        if matches!(code, key::UP | key::DOWN)
-            && self
-                .ivars()
-                .state
-                .borrow()
-                .find
-                .as_ref()
-                .is_some_and(|b| b.project && !b.rows.is_empty())
-        {
-            let Some(mut state) = self.state_mut() else {
-                return false;
-            };
-            let bar = state.find.as_mut().expect("checked above");
-            bar.select_step(code == key::DOWN);
-            drop(state);
-            self.request_redraw();
-            self.pump();
-            return true;
-        }
         match code {
             ESCAPE => {
                 self.close_find();
                 return true;
             }
             TAB => {
-                // Tab crosses between Find and Replace rather than inserting;
-                // over the terminal there is no Replace.
+                // Tab crosses between Find and Replace rather than inserting,
+                // showing the replace row first; over the terminal there is
+                // no Replace.
                 let Some(mut state) = self.state_mut() else {
                     return false;
                 };
                 if let Some(find) = state.find.as_mut().filter(|f| f.terminal.is_none()) {
-                    find.replacing = !find.replacing;
+                    if !find.show_replace {
+                        find.show_replace = true;
+                        find.replacing = true;
+                    } else {
+                        find.replacing = !find.replacing;
+                    }
                 }
                 drop(state);
                 self.request_redraw();
@@ -56,36 +43,14 @@ impl EditorView {
                 return true;
             }
             key::RETURN => {
-                let (replacing, project) = self
+                let replacing = self
                     .ivars()
                     .state
                     .borrow()
                     .find
                     .as_ref()
-                    .map(|f| (f.replacing, f.project))
-                    .unwrap_or((false, false));
-                if project {
-                    // A search still to start (the query just changed)
-                    // starts now; otherwise the selected row opens.
-                    let selected = {
-                        let Some(mut state) = self.state_mut() else {
-                            return false;
-                        };
-                        let Some(bar) = state.find.as_mut() else {
-                            return false;
-                        };
-                        if bar.due.take().is_some() {
-                            None
-                        } else {
-                            bar.rows.get(bar.selected).map(ResultRow::hit)
-                        }
-                    };
-                    if let Some(index) = selected {
-                        self.open_project_result(index);
-                    } else {
-                        self.search_project();
-                    }
-                } else if replacing {
+                    .is_some_and(|f| f.replacing);
+                if replacing {
                     self.replace_one();
                 } else {
                     self.find_step(!shift);
@@ -95,9 +60,8 @@ impl EditorView {
             _ => {}
         }
 
-        // The find fields are real editors. Handle the familiar shortcuts
-        // here as well as through menu actions, because AppKit does not send
-        // every key equivalent through the menu on every keyboard layout.
+        // The find fields are real editors: the familiar shortcuts work in
+        // them as in every field.
         if command {
             let letter = event
                 .charactersIgnoringModifiers()
@@ -115,51 +79,10 @@ impl EditorView {
             } else {
                 &mut bar.query
             };
-            let mut changed = false;
-            match (code, letter) {
-                (key::DELETE, _) => {
-                    field.delete_to_line_start();
-                    changed = true;
-                }
-                (key::FORWARD_DELETE, _) => {
-                    field.delete_to_line_end();
-                    changed = true;
-                }
-                (key::LEFT, _) => {
-                    field.move_line_start(if shift { Motion::Extend } else { Motion::Move })
-                }
-                (key::RIGHT, _) => {
-                    field.move_line_end(if shift { Motion::Extend } else { Motion::Move })
-                }
-                (_, Some('a')) => field.select_all(),
-                (_, Some('c')) => {
-                    if let Some(text) = field.selected_text() {
-                        clipboard::write_text(&text);
-                    }
-                }
-                (_, Some('x')) => {
-                    if let Some(text) = field.selected_text() {
-                        clipboard::write_text(&text);
-                        field.backspace();
-                        changed = true;
-                    }
-                }
-                (_, Some('v')) => {
-                    if let Some(text) = clipboard::read_text() {
-                        field.insert(&single_line(&text));
-                        changed = true;
-                    }
-                }
-                (_, Some('z')) => {
-                    if shift {
-                        field.redo();
-                    } else {
-                        field.undo();
-                    }
-                    changed = true;
-                }
-                _ => return false,
-            }
+            let Some(changed) = super::search_view::field_shortcut(field, code, letter, shift)
+            else {
+                return false;
+            };
             drop(state);
             if changed && !replacing {
                 self.refresh_find();
@@ -248,32 +171,6 @@ impl EditorView {
             self.terminal_find_reveal();
             return;
         }
-        {
-            let Some(mut state) = self.state_mut() else {
-                return;
-            };
-            if let Some(cancel) = state.project_search.cancel.take() {
-                cancel.store(true, Ordering::Relaxed);
-            }
-            state.project_search.rx = None;
-            if let Some(bar) = &mut state.find
-                && bar.project
-            {
-                // The project is searched for the new query once typing
-                // pauses; the last results stay until then, and go
-                // with an empty query.
-                bar.searching = false;
-                if bar.query.rope.len_bytes() == 0 {
-                    bar.reset_results();
-                    bar.due = None;
-                } else {
-                    bar.due = Some(Instant::now() + FIND_PROJECT_DEBOUNCE);
-                    drop(state);
-                    self.resume_display_link();
-                }
-                return;
-            }
-        }
         let at = {
             let Some(state) = self.state() else {
                 return;
@@ -293,11 +190,15 @@ impl EditorView {
             let Some(mut state) = self.state_mut() else {
                 return;
             };
+            let covered = find_covered_rows(&state);
             state
                 .docs
                 .active_mut()
                 .select_range(found.range.start, found.range.end);
-            state.docs.active_mut().scroll_to_cursor(rows, cols);
+            state
+                .docs
+                .active_mut()
+                .scroll_to_cursor_below(rows, cols, covered);
         }
     }
 
@@ -385,14 +286,8 @@ impl EditorView {
                 replacement: Buffer::new(),
                 replacing: false,
                 has_keys: true,
+                show_replace: false,
                 options,
-                project: false,
-                results: Vec::new(),
-                rows: Vec::new(),
-                selected: 0,
-                result_scroll: 0,
-                searching: false,
-                due: None,
                 terminal: None,
             });
         }
@@ -407,10 +302,6 @@ impl EditorView {
         let Some(mut state) = self.state_mut() else {
             return;
         };
-        if let Some(cancel) = state.project_search.cancel.take() {
-            cancel.store(true, Ordering::Relaxed);
-        }
-        state.project_search.rx = None;
         let Some(bar) = state.find.take() else {
             return;
         };
@@ -424,156 +315,14 @@ impl EditorView {
         self.pump();
     }
 
-    pub(super) fn search_project(&self) {
-        let (query, options, root) = {
-            let Some(mut state) = self.state_mut() else {
-                return;
-            };
-            let Some(bar) = &mut state.find else { return };
-            bar.due = None;
-            (
-                bar.query.rope.to_string(),
-                bar.options,
-                state.tree.root().map(Path::to_path_buf),
-            )
-        };
-        let Some(root) = root else { return };
-        if query.is_empty() {
-            return;
-        }
-        if let Err(error) = search::find("", &query, "", options) {
-            if let Some(mut state) = self.state_mut() {
-                state.message = Some((format!("invalid regex: {error}"), Instant::now()));
-            }
-            return;
-        }
-        let (tx, rx) = mpsc::channel();
-        let cancel = Arc::new(AtomicBool::new(false));
-        let worker_cancel = Arc::clone(&cancel);
-        std::thread::spawn(move || {
-            if let Some(result) = search::search_tree(root, &query, options, &worker_cancel) {
-                let _ = tx.send(result);
-            }
-        });
-        let Some(mut state) = self.state_mut() else {
-            return;
-        };
-        if let Some(old) = state.project_search.cancel.replace(cancel) {
-            old.store(true, Ordering::Relaxed);
-        }
-        state.project_search.rx = Some(rx);
-        state.project_search.references = false;
-        if let Some(bar) = &mut state.find {
-            bar.reset_results();
-            bar.searching = true;
-        }
-        drop(state);
-        self.request_redraw();
-        self.pump();
-    }
-
-    pub(super) fn poll_project_search(&self) {
-        // A search due after a pause in typing.
-        let due = self.state().is_some_and(|state| {
-            state
-                .find
-                .as_ref()
-                .and_then(|bar| bar.due)
-                .is_some_and(|at| Instant::now() >= at)
-        });
-        if due {
-            self.search_project();
-        }
-        let Some(mut state) = self.state_mut() else {
-            return;
-        };
-        let Some(rx) = &state.project_search.rx else {
-            return;
-        };
-        let result = match rx.try_recv() {
-            Ok(result) => result,
-            Err(mpsc::TryRecvError::Empty) => return,
-            Err(mpsc::TryRecvError::Disconnected) => Err("project search stopped".into()),
-        };
-        state.project_search.rx = None;
-        state.project_search.cancel = None;
-        if let Some(bar) = &mut state.find {
-            bar.searching = false;
-            match result {
-                Ok(results) => {
-                    let count = results.len();
-                    bar.take_results(results);
-                    let text = if state.project_search.references {
-                        format!("{count} reference{}", if count == 1 { "" } else { "s" })
-                    } else {
-                        format!(
-                            "{count} project matches{}",
-                            if count == 500 { " (first 500)" } else { "" }
-                        )
-                    };
-                    state.message = Some((text, Instant::now()));
-                }
-                Err(error) => {
-                    state.message = Some((format!("project search: {error}"), Instant::now()))
-                }
-            }
-        }
-        drop(state);
-        self.request_redraw();
-    }
-
-    pub(super) fn open_project_result(&self, index: usize) {
-        let target = {
-            let Some(state) = self.state() else {
-                return;
-            };
-            state
-                .find
-                .as_ref()
-                .and_then(|bar| bar.results.get(index))
-                .map(|hit| (hit.path.clone(), hit.line, hit.column, hit.range.len()))
-        };
-        let Some((path, line, column, len)) = target else {
-            return;
-        };
-        self.load_path(&path.to_string_lossy());
-        let (rows, cols) = self.grid();
-        {
-            // By line and column: the open document may have been edited
-            // above the hit since the search read the file from disk.
-            let Some(mut state) = self.state_mut() else {
-                return;
-            };
-            let buffer = state.docs.active_mut();
-            let line = line.min(buffer.rope.len_lines().saturating_sub(1));
-            let line_start = buffer.rope.line_to_byte(line);
-            let line_end = crate::text::wrap::line_end(&buffer.rope, line);
-            let start = (line_start + column).min(line_end);
-            let end = (start + len).min(buffer.rope.len_bytes());
-            buffer.select_range(start, end);
-            state.docs.active_mut().scroll_to_cursor(rows, cols);
-        }
-        self.sync_title();
-        self.reparse();
-        self.request_redraw();
-        self.pump();
-    }
-
     pub(super) fn find_click(&self, x: f32, y: f32, rect: Viewport) {
         // The same rectangles the bar was drawn from. This used to re-derive
         // them: `right - 180.0` here and `right - 180.0` there, option slots
         // 66pt wide in the handler and 62pt wide on screen, so a click beside
         // a chip still toggled it.
         let terminal = self.searching_terminal();
-        // The terminal's bar: Aa, Word and .*, one row, no Replace.
-        let g = layout::FindGeometry::with_chips(rect, if terminal { 3 } else { 4 });
-        let project = self
-            .ivars()
-            .state
-            .borrow()
-            .find
-            .as_ref()
-            .is_some_and(|bar| bar.project);
+        // Aa, Word and .*; over the terminal, one row with no Replace.
+        let g = layout::FindGeometry::panel(rect, 3, !terminal);
 
         for (slot, hit) in g.options.iter().enumerate() {
             if !hit.contains(x, y) {
@@ -587,10 +336,8 @@ impl EditorView {
                     match slot {
                         0 => bar.options.case_sensitive = !bar.options.case_sensitive,
                         1 => bar.options.whole_word = !bar.options.whole_word,
-                        2 => bar.options.regex = !bar.options.regex,
-                        _ => bar.project = !bar.project,
+                        _ => bar.options.regex = !bar.options.regex,
                     }
-                    bar.reset_results();
                 }
             }
             self.refresh_find();
@@ -601,50 +348,26 @@ impl EditorView {
 
         if g.close.contains(x, y) {
             self.close_find();
-        } else if g.previous.contains(x, y) || g.next.contains(x, y) {
-            let forward = g.next.contains(x, y);
-            if project {
-                let Some(mut state) = self.state_mut() else {
-                    return;
-                };
-                if let Some(bar) = &mut state.find {
-                    bar.select_step(forward);
+        } else if g.toggle.contains(x, y) {
+            // The chevron: the replace row shows or hides; hidden, the
+            // keys are the find field's.
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            if let Some(bar) = &mut state.find {
+                bar.show_replace = !bar.show_replace;
+                if !bar.show_replace {
+                    bar.replacing = false;
                 }
-            } else {
-                self.find_step(forward);
             }
+        } else if g.previous.contains(x, y) || g.next.contains(x, y) {
+            self.find_step(g.next.contains(x, y));
         } else if terminal && !g.find_field.contains(x, y) {
             // Nothing else of the bar is over the terminal.
         } else if g.replace_one.contains(x, y) {
-            if project {
-                self.search_project();
-            } else {
-                self.replace_one();
-            }
+            self.replace_one();
         } else if g.replace_all.contains(x, y) {
-            if project {
-                self.replace_in_project();
-            } else {
-                self.replace_all();
-            }
-        } else if let Some(row) = g.result_row(y).filter(|_| project) {
-            let hit = {
-                let Some(mut state) = self.state_mut() else {
-                    return;
-                };
-                let Some(bar) = state.find.as_mut() else {
-                    return;
-                };
-                let row = bar.result_scroll + row;
-                bar.rows.get(row).map(|r| {
-                    bar.selected = row;
-                    r.hit()
-                })
-            };
-            if let Some(index) = hit {
-                self.open_project_result(index);
-            }
-            return;
+            self.replace_all();
         } else if g.find_field.contains(x, y) || g.replace_field.contains(x, y) {
             // Clicking a field focuses it and puts the caret where the
             // pointer is, measured through the same shaping that drew it.
@@ -709,139 +432,6 @@ impl EditorView {
             self.reparse();
         }
         self.request_redraw();
-        self.pump();
-    }
-
-    /// Replace All in project mode: every file in the results, searched
-    /// again now so the edits fit the text as it is. Open documents are
-    /// edited in place, one undo step each, and left unsaved; other files
-    /// are written through the normal save path. Refused when the results
-    /// were cut at 500, since files past the cut would be missed.
-    pub(super) fn replace_in_project(&self) {
-        let (needle, replacement, options, files, matches) = {
-            let Some(state) = self.state() else {
-                return;
-            };
-            let Some(bar) = &state.find else { return };
-            let mut files: Vec<std::path::PathBuf> = Vec::new();
-            for hit in &bar.results {
-                if !files.contains(&hit.path) {
-                    files.push(hit.path.clone());
-                }
-            }
-            (
-                bar.query.rope.to_string(),
-                bar.replacement.rope.to_string(),
-                bar.options,
-                files,
-                bar.results.len(),
-            )
-        };
-        let say = |text: String| {
-            if let Some(mut state) = self.state_mut() {
-                state.message = Some((text, Instant::now()));
-            }
-            self.request_redraw();
-        };
-        if needle.is_empty() || files.is_empty() {
-            return say("search the project first; Replace All uses its results".into());
-        }
-        if matches >= 500 {
-            return say("over 500 matches: narrow the search before replacing".into());
-        }
-        if !self.ivars().testing {
-            let question = format!(
-                "Replace {matches} match{} in {} file{}?",
-                if matches == 1 { "" } else { "es" },
-                files.len(),
-                if files.len() == 1 { "" } else { "s" }
-            );
-            let answer = ask(
-                MainThreadMarker::from(self),
-                &question,
-                "Open files are changed in their tabs and can be undone there. \
-                 Files that are not open are saved to disk.",
-                &["Replace", "Cancel"],
-            );
-            if answer != 0 {
-                return;
-            }
-        }
-        let mut replaced = 0;
-        let mut outcome = EditOutcome::default();
-        {
-            let Some(mut state) = self.state_mut() else {
-                return;
-            };
-            let mut touched = Vec::new();
-            let edit = |_: &Path, buffer: &mut Buffer| -> Option<usize> {
-                let text = buffer.rope.to_string();
-                let found = search::find(&text, &needle, &replacement, options).ok()?;
-                let edits: Vec<_> = found
-                    .into_iter()
-                    .map(|m| (m.range, m.replacement))
-                    .collect();
-                Some(if edits.is_empty() {
-                    0
-                } else {
-                    buffer.replace_ranges(&edits)
-                })
-            };
-            let mut on_disk = Vec::new();
-            for path in &files {
-                let found = open_doc_index(&all_docs(&state).collect::<Vec<_>>(), path);
-                let Some((d, i)) = found else {
-                    on_disk.push(path.clone());
-                    continue;
-                };
-                let buffer = all_docs_mut(&mut state)
-                    .into_iter()
-                    .nth(d)
-                    .and_then(|docs| docs.iter_mut().nth(i));
-                let Some(buffer) = buffer else { continue };
-                match edit(path, buffer) {
-                    Some(0) => {}
-                    Some(n) => {
-                        replaced += n;
-                        outcome.open += 1;
-                        touched.push(buffer.id());
-                    }
-                    None => outcome.failed.push(path.clone()),
-                }
-            }
-            for (path, done) in on_disk
-                .iter()
-                .zip(edit_on_disk(&on_disk, edit, &mut state.history))
-            {
-                match done {
-                    Some(0) => {}
-                    Some(n) => {
-                        replaced += n;
-                        outcome.written += 1;
-                    }
-                    None => outcome.failed.push(path.clone()),
-                }
-            }
-            note_documents_edited(&mut state, touched);
-            if outcome.written > 0 {
-                note_files_written(&mut state);
-            }
-        }
-        self.lsp_flush_changes();
-        let note = format!("replaced {replaced} in {}", outcome.describe());
-        // The list described text that is gone. Not searched again: project
-        // search reads the disk, and the open files' changes are not saved.
-        {
-            let Some(mut state) = self.state_mut() else {
-                return;
-            };
-            if let Some(bar) = &mut state.find {
-                bar.reset_results();
-            }
-        }
-        self.reparse();
-        self.sync_title();
-        say(note);
         self.pump();
     }
 
@@ -926,12 +516,26 @@ impl EditorView {
             return;
         };
 
+        let covered = find_covered_rows(&state);
         state
             .docs
             .active_mut()
             .select_range(found.range.start, found.range.end);
-        state.docs.active_mut().scroll_to_cursor(rows, cols);
+        state
+            .docs
+            .active_mut()
+            .scroll_to_cursor_below(rows, cols, covered);
     }
+}
+
+/// The text rows the document's find panel covers, so a match is shown
+/// below it rather than under it. None over the terminal, or closed.
+pub(super) fn find_covered_rows(state: &State) -> usize {
+    let rows = match state.find.as_ref() {
+        Some(bar) if bar.terminal.is_none() => 1 + usize::from(bar.show_replace),
+        _ => return 0,
+    };
+    layout::find_panel_rows(rows, state.renderer.atlas.metrics.line_height)
 }
 
 /// Keeps `bar`'s query and options for the next bar, when it has a query.

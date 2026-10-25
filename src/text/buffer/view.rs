@@ -404,6 +404,25 @@ impl Buffer {
     }
 
     // ---- scrolling -------------------------------------------------------
+    /// [`Self::scroll_to_cursor`], then on down so the cursor is not in
+    /// the top `covered` rows either: under the find bar's panel there.
+    pub fn scroll_to_cursor_below(&mut self, rows: usize, cols: usize, covered: usize) {
+        self.scroll_to_cursor(rows, cols);
+        if covered == 0 || covered >= rows {
+            return;
+        }
+        let top = (self.scroll_line, self.scroll_row);
+        let caret = if self.row_mode() {
+            self.cursor_row()
+        } else {
+            (self.cursor_position().0, 0)
+        };
+        if self.step_rows(top, covered as isize) > caret {
+            (self.scroll_line, self.scroll_row) = self.step_rows(caret, -(covered as isize));
+            self.scroll_fraction = 0.0;
+        }
+    }
+
     /// Scrolls so the cursor is visible, given a viewport of `rows` lines and
     /// `cols` columns.
     ///

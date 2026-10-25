@@ -121,28 +121,23 @@ impl EditorView {
         let name = buffer
             .rope
             .slice_to_string(buffer.word_range_at(buffer.cursor()));
-        let mut query = Buffer::new();
-        query.insert(&name);
-        state.find = Some(FindBar {
-            query,
-            replacement: Buffer::new(),
-            replacing: false,
-            has_keys: true,
-            options: SearchOptions {
-                case_sensitive: true,
-                whole_word: true,
-                regex: false,
-            },
-            project: true,
-            results: Vec::new(),
-            rows: Vec::new(),
-            selected: 0,
-            result_scroll: 0,
-            searching: true,
-            due: None,
-            terminal: None,
-        });
+        // Listed in the Search view, as the symbol's name searched whole
+        // and by case; the keys stay in the document.
+        state.search.query = Buffer::from_text(&name);
+        state.search.options = SearchOptions {
+            case_sensitive: true,
+            whole_word: true,
+            regex: false,
+        };
+        state.search.clear();
+        state.search.references = true;
+        state.search.searching = true;
+        state.search.due = None;
         drop(state);
+        self.show_search_view();
+        if let Some(mut state) = self.state_mut() {
+            state.search_focus = None;
+        }
         self.resume_display_link();
         self.request_redraw();
         self.pump();
@@ -747,10 +742,12 @@ impl EditorView {
                 return;
             };
             let current = if state.mcp.open {
-                3
+                4
             } else if state.extensions.is_some() {
-                2
+                3
             } else if state.git_open {
+                2
+            } else if state.search_open {
                 1
             } else {
                 0
@@ -769,8 +766,9 @@ impl EditorView {
         }
         match index {
             0 => self.set_sidebar_view(false),
-            1 => self.set_sidebar_view(true),
-            2 => self.open_extensions(),
+            1 => self.open_search(),
+            2 => self.set_sidebar_view(true),
+            3 => self.open_extensions(),
             _ => self.open_mcp(),
         }
         let Some(mut state) = self.state_mut() else {

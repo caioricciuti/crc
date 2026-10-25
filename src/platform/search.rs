@@ -201,12 +201,63 @@ pub const PROJECT_HITS: usize = 500;
 /// Files larger than this are not searched.
 const PROJECT_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
-/// Searches every file under `root` the project index would list, up to
-/// [`PROJECT_HITS`] hits. `None` when `cancel` was set before it finished.
+/// Which files a search looks in: the Search view's "files to include"
+/// and "files to exclude", each a comma-separated list of patterns as
+/// `.gitignore` reads them (`src`, `*.rs`, `docs/**`, `tests/`). A
+/// file is searched when some include pattern matches it or a folder
+/// it is in (every file, with no includes), and no exclude pattern does.
+#[derive(Default)]
+pub struct Filter {
+    include: Vec<crate::complete::glob::Pattern>,
+    exclude: Vec<crate::complete::glob::Pattern>,
+}
+
+impl Filter {
+    pub fn parse(include: &str, exclude: &str) -> Self {
+        let patterns = |text: &str| {
+            text.split(',')
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .filter_map(crate::complete::glob::parse)
+                .collect::<Vec<_>>()
+        };
+        Filter {
+            include: patterns(include),
+            exclude: patterns(exclude),
+        }
+    }
+
+    /// Whether the file at `relative` (slash-separated, from the root)
+    /// is searched.
+    pub fn allows(&self, relative: &str) -> bool {
+        let hit = |patterns: &[crate::complete::glob::Pattern]| {
+            patterns.iter().any(|pattern| {
+                if pattern.matches(relative, false) {
+                    return true;
+                }
+                // A folder the file is in: `src` means everything under src.
+                let mut end = relative.len();
+                while let Some(slash) = relative[..end].rfind('/') {
+                    if pattern.matches(&relative[..slash], true) {
+                        return true;
+                    }
+                    end = slash;
+                }
+                false
+            })
+        };
+        (self.include.is_empty() || hit(&self.include)) && !hit(&self.exclude)
+    }
+}
+
+/// Searches every file under `root` the project index would list and
+/// `filter` allows, up to [`PROJECT_HITS`] hits. `None` when `cancel`
+/// was set before it finished.
 pub fn search_tree(
     root: PathBuf,
     query: &str,
     options: Options,
+    filter: &Filter,
     cancel: &AtomicBool,
 ) -> Option<Result<Vec<ProjectHit>, String>> {
     let mut finder = crate::project::finder::Finder::new();
@@ -216,7 +267,11 @@ pub fn search_tree(
         if cancel.load(Ordering::Relaxed) {
             return None;
         }
-        let Some(path) = finder.entry(i).map(|e| e.path.clone()) else {
+        let Some(path) = finder
+            .entry(i)
+            .filter(|e| filter.allows(&e.relative))
+            .map(|e| e.path.clone())
+        else {
             continue;
         };
         if !std::fs::metadata(&path).is_ok_and(|m| m.len() <= PROJECT_FILE_BYTES) {
@@ -375,6 +430,25 @@ mod tests {
         assert_eq!(hits[0].snippet.chars().count(), 102, "100 and two ellipses");
         assert!(hits[0].snippet.starts_with("\u{2026}é"));
         assert_eq!(&hits[0].snippet[hits[0].at.clone()], "needle");
+    }
+
+    #[test]
+    fn the_filter_reads_include_and_exclude_patterns() {
+        let none = Filter::parse("", "");
+        assert!(none.allows("src/main.rs"));
+        let src = Filter::parse("src, *.md", "");
+        assert!(src.allows("src/main.rs"));
+        assert!(src.allows("src/deep/down.rs"));
+        assert!(src.allows("docs/notes.md"));
+        assert!(!src.allows("tests/held.rs"));
+        let not_tests = Filter::parse("", "tests/, *.lock");
+        assert!(not_tests.allows("src/main.rs"));
+        assert!(!not_tests.allows("tests/held.rs"));
+        assert!(!not_tests.allows("Cargo.lock"));
+        let anchored = Filter::parse("docs/**", "docs/old");
+        assert!(anchored.allows("docs/a/b.md"));
+        assert!(!anchored.allows("docs/old/x.md"));
+        assert!(!anchored.allows("src/docs/x.md"));
     }
 
     #[test]

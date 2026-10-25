@@ -36,7 +36,7 @@ expect "$T/find-replace-mc.out" selection '"cat"'
 # is pressed: the capture must expand for the current match alone.
 cat > "$T/find-replace-mc-regex.script" <<SCRIPT
 key 3 cmd f
-clickin @find 620 13
+clickin @find 411 13
 text c(a)t
 key 48
 text _\$1_
@@ -46,7 +46,7 @@ key 2 cmd d
 key 2 cmd d
 key 2 cmd d
 dump $T/find-replace-mc-regex-before.out
-clickin @find 542 47
+clickin @find 333 47
 dump $T/find-replace-mc-regex.out
 quit
 SCRIPT

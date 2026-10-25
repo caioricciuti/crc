@@ -66,6 +66,9 @@ impl EditorView {
             mcp,
             find,
             find_cache,
+            search,
+            search_open,
+            search_focus,
             tab_hits,
             tab_scroll,
             hovered_tab,
@@ -780,7 +783,7 @@ impl EditorView {
                 let at = found.iter().position(|m| m.range.start >= from);
                 (at.unwrap_or(0), found.len())
             });
-            draw_find_bar(glyphs, renderer, theme, rect, bar, count, tree);
+            draw_find_bar(glyphs, renderer, theme, rect, bar, count);
         }
 
         if activity_rect.width > 0.0 {
@@ -791,10 +794,12 @@ impl EditorView {
                 theme,
                 sidebar_rect.filter(|_| !agents.on).map(|_| {
                     if mcp.open {
-                        3
+                        4
                     } else if extensions.is_some() {
-                        2
+                        3
                     } else if *git_open {
+                        2
+                    } else if *search_open {
                         1
                     } else {
                         0
@@ -914,6 +919,24 @@ impl EditorView {
             && mcp.open
         {
             mcp.draw(&mut renderer.atlas, rect, theme, glyphs);
+        } else if let Some(rect) = sidebar_rect
+            && *search_open
+        {
+            layout::push_rect(
+                glyphs,
+                &renderer.atlas,
+                [rect.x, rect.y],
+                [rect.width, rect.height],
+                theme.sidebar_background,
+            );
+            search.draw(
+                &mut renderer.atlas,
+                rect,
+                *search_focus,
+                tree.root(),
+                theme,
+                glyphs,
+            );
         } else if let Some(rect) = sidebar_rect {
             let edit_text = sidebar_edit.as_ref().map(|e| e.field.rope.to_string());
             let edit = sidebar_edit
@@ -983,7 +1006,7 @@ impl EditorView {
             && let Some(searching) = bar.terminal.as_ref()
         {
             let count = searching.error.is_none().then(|| searching.count());
-            draw_find_bar(glyphs, renderer, theme, rect, bar, count, tree);
+            draw_find_bar(glyphs, renderer, theme, rect, bar, count);
         }
 
         // Status line along the bottom, spanning the full width.
@@ -1351,24 +1374,27 @@ fn draw_find_bar(
     rect: Viewport,
     bar: &FindBar,
     count: Option<(usize, usize)>,
-    tree: &Tree,
 ) {
     let terminal = bar.terminal.is_some();
-    if terminal {
-        // A panel floating over the screen, with the palette's edge, so
-        // it reads as laid on the output rather than cut into it.
-        layout::push_panel(glyphs, rect, layout::UI_RADIUS_LG, theme);
-    } else {
-        layout::push_rect(
-            glyphs,
-            &renderer.atlas,
-            [rect.x, rect.y],
-            [rect.width, rect.height],
-            theme.find_background,
-        );
+    // A panel floating over the text or the screen, with the palette's
+    // edge, so it reads as laid on it rather than cut into it.
+    layout::push_panel(glyphs, rect, layout::UI_RADIUS_LG, theme);
+    let g = layout::FindGeometry::panel(rect, 3, !terminal);
+    if !terminal {
+        Button::new(g.toggle)
+            .icon(if bar.show_replace {
+                icons::CHEVRON_DOWN
+            } else {
+                icons::CHEVRON_RIGHT
+            })
+            .tone(Tone::Ghost)
+            .tip(if bar.show_replace {
+                "Hide Replace"
+            } else {
+                "Replace  \u{21e5}"
+            })
+            .draw(glyphs, &mut renderer.atlas, theme);
     }
-    let chips = if terminal { 3 } else { 4 };
-    let g = layout::FindGeometry::with_chips(rect, chips);
 
     // A field that looks like a field. There was no box at all: a
     // "Find" label sat at the far left and the text began eleven
@@ -1422,42 +1448,30 @@ fn draw_find_bar(
     // reported at all: there was no way to tell a search that found
     // nothing from one that found everything. Nothing found is said in
     // the removed-lines red, the one colour here that means "no".
-    let said = if bar.project {
-        (!bar.results.is_empty())
-            .then(|| (format!("{} found", bar.results.len()), theme.status_text))
-    } else {
-        count.map(|(at, total)| match total {
-            0 => ("No matches".to_string(), theme.diff_removed),
-            // The terminal's search stops at a limit; past it, more.
-            n if terminal && n >= crate::platform::terminal::FIND_LIMIT => {
-                (format!("{} of {n}+", at + 1), theme.status_text)
-            }
-            n => (format!("{} of {n}", at + 1), theme.status_text),
-        })
-    };
+    let said = count.map(|(at, total)| match total {
+        0 => ("No matches".to_string(), theme.diff_removed),
+        // The terminal's search stops at a limit; past it, more.
+        n if terminal && n >= crate::platform::terminal::FIND_LIMIT => {
+            (format!("{} of {n}+", at + 1), theme.status_text)
+        }
+        n => (format!("{} of {n}", at + 1), theme.status_text),
+    });
     field(
         glyphs,
         &mut renderer.atlas,
         g.find_field,
-        if bar.project {
-            "Search the project"
-        } else {
-            "Find"
-        },
+        "Find",
         &bar.query,
         bar.has_keys && !bar.replacing,
         said.as_ref().map(|(text, colour)| (text.as_str(), *colour)),
     );
-    if !terminal {
+    let replace_row = !terminal && bar.show_replace;
+    if replace_row {
         field(
             glyphs,
             &mut renderer.atlas,
             g.replace_field,
-            if bar.project {
-                "Replace in every file listed"
-            } else {
-                "Replace with"
-            },
+            "Replace with",
             &bar.replacement,
             bar.has_keys && bar.replacing,
             None,
@@ -1467,11 +1481,7 @@ fn draw_find_bar(
     // The shared button: the same height, corners and hover as every
     // other control, with arrows and a cross from the icon font rather
     // than guillemets and a multiplication sign.
-    let has_matches = if bar.project {
-        !bar.results.is_empty()
-    } else {
-        count.is_some_and(|(_, total)| total > 0)
-    };
+    let has_matches = count.is_some_and(|(_, total)| total > 0);
     let atlas = &mut renderer.atlas;
     Button::new(g.previous)
         .icon(icons::ARROW_UP)
@@ -1490,9 +1500,8 @@ fn draw_find_bar(
         .tone(Tone::Ghost)
         .tip("Close  \u{238b}")
         .draw(glyphs, atlas, theme);
-    if terminal {
-        // One row: nothing to replace in a terminal.
-    } else if !bar.project {
+    // One row over a terminal, or until the replace row is asked for.
+    if replace_row {
         Button::new(g.replace_one)
             .label("Replace")
             .enabled(has_matches)
@@ -1502,17 +1511,6 @@ fn draw_find_bar(
             .enabled(has_matches)
             .tip("Replace All")
             .draw(glyphs, atlas, theme);
-    } else {
-        Button::new(g.replace_one)
-            .label("Search")
-            .draw(glyphs, atlas, theme);
-        // Rows open with a click or Return; this button replaces
-        // in every file the results list.
-        Button::new(g.replace_all)
-            .label("Replace All")
-            .tone(Tone::Danger)
-            .enabled(has_matches)
-            .draw(glyphs, atlas, theme);
     }
 
     // Toggles that show their state: filled and accented when on,
@@ -1521,14 +1519,8 @@ fn draw_find_bar(
         ("Aa", bar.options.case_sensitive, "Match Case"),
         ("Word", bar.options.whole_word, "Match Whole Word"),
         (".*", bar.options.regex, "Use Regular Expression"),
-        (
-            "Project",
-            bar.project,
-            "Search the Whole Project  \u{21e7}\u{2318}F",
-        ),
     ]
     .into_iter()
-    .take(chips)
     .enumerate()
     {
         Button::new(g.options[slot])
@@ -1536,169 +1528,6 @@ fn draw_find_bar(
             .on(on)
             .tip(tip)
             .draw(glyphs, atlas, theme);
-    }
-    if bar.project {
-        for (row, result) in bar
-            .rows
-            .iter()
-            .skip(bar.result_scroll)
-            .take(FIND_RESULT_ROWS)
-            .enumerate()
-        {
-            let y = g.results.y + layout::FIND_ROW_HEIGHT * row as f32;
-            let row_rect = Viewport {
-                x: g.results.x + 8.0,
-                y,
-                width: (g.results.width - 16.0).max(0.0),
-                height: layout::FIND_ROW_HEIGHT,
-            };
-            layout::hotspot(row_rect, layout::Cursor::Pointing, None);
-            if bar.selected == bar.result_scroll + row {
-                layout::push_rounded_rect(
-                    glyphs,
-                    Viewport {
-                        y: y + 1.0,
-                        height: layout::FIND_ROW_HEIGHT - 2.0,
-                        ..row_rect
-                    },
-                    layout::UI_RADIUS_SM,
-                    theme.palette_selected,
-                );
-            } else if layout::hovered(row_rect) {
-                layout::push_rounded_rect(
-                    glyphs,
-                    Viewport {
-                        y: y + 1.0,
-                        height: layout::FIND_ROW_HEIGHT - 2.0,
-                        ..row_rect
-                    },
-                    layout::UI_RADIUS_SM,
-                    theme.row_hover,
-                );
-            }
-            let atlas = &mut renderer.atlas;
-            match result {
-                // The file, and how many of the matches are in it.
-                ResultRow::File { first, count } => {
-                    let hit = &bar.results[*first];
-                    let path = tree
-                        .root()
-                        .and_then(|root| hit.path.strip_prefix(root).ok())
-                        .unwrap_or(&hit.path);
-                    let name = path.display().to_string();
-                    let width = layout::ui_text_width(atlas, &name);
-                    layout::push_ui_text(
-                        glyphs,
-                        atlas,
-                        Viewport {
-                            x: row_rect.x + 8.0,
-                            ..row_rect
-                        },
-                        &name,
-                        theme.text,
-                    );
-                    layout::push_ui_text(
-                        glyphs,
-                        atlas,
-                        Viewport {
-                            x: row_rect.x + 16.0 + width,
-                            width: (row_rect.width - 24.0 - width).max(0.0),
-                            ..row_rect
-                        },
-                        &format!("{count}"),
-                        theme.status_text,
-                    );
-                }
-                // One line: its number, then the line with each match
-                // on it marked as the document marks them.
-                ResultRow::Line { hits } => {
-                    let hit = &bar.results[hits.start];
-                    let number = (hit.line + 1).to_string();
-                    layout::push_ui_text_right(
-                        glyphs,
-                        atlas,
-                        Viewport {
-                            x: row_rect.x + 16.0,
-                            width: 36.0,
-                            ..row_rect
-                        },
-                        &number,
-                        theme.status_text,
-                    );
-                    let text_rect = Viewport {
-                        x: row_rect.x + 64.0,
-                        width: (row_rect.width - 72.0).max(0.0),
-                        ..row_rect
-                    };
-                    for h in &bar.results[hits.clone()] {
-                        let before = layout::ui_text_width(atlas, &hit.snippet[..h.at.start]);
-                        let span = layout::ui_text_width(atlas, &hit.snippet[h.at.clone()]);
-                        if span <= 0.0 || before >= text_rect.width {
-                            continue;
-                        }
-                        layout::push_rounded_rect(
-                            glyphs,
-                            Viewport {
-                                x: text_rect.x + before - 1.0,
-                                y: y + 7.0,
-                                width: (span + 2.0).min(text_rect.width - before),
-                                height: layout::FIND_ROW_HEIGHT - 14.0,
-                            },
-                            3.0,
-                            theme.find_match,
-                        );
-                    }
-                    layout::push_ui_text(
-                        glyphs,
-                        atlas,
-                        text_rect,
-                        &hit.snippet,
-                        theme.sidebar_text,
-                    );
-                }
-            }
-        }
-        if bar.searching {
-            // Under way: a spinner by the words, and until the first
-            // results land the shape of the rows to come. Both stop with
-            // the search, whether it found anything or not.
-            let row = Viewport {
-                x: g.results.x + 16.0,
-                y: g.results.y,
-                width: (g.results.width - 32.0).max(0.0),
-                height: layout::FIND_ROW_HEIGHT,
-            };
-            let w = layout::push_spinner(glyphs, row.x, row, theme.accent);
-            layout::push_ui_text(
-                glyphs,
-                &mut renderer.atlas,
-                Viewport {
-                    x: row.x + w + 8.0,
-                    width: (row.width - w - 8.0).max(0.0),
-                    ..row
-                },
-                "Searching project\u{2026}",
-                theme.status_text,
-            );
-            if bar.results.is_empty() {
-                for (n, widths) in [(0.28, 0.0), (0.44, 0.0), (0.36, 0.0)]
-                    .into_iter()
-                    .enumerate()
-                {
-                    layout::push_skeleton_row(
-                        glyphs,
-                        Viewport {
-                            y: row.y + layout::FIND_ROW_HEIGHT * (n as f32 + 1.0),
-                            ..row
-                        },
-                        0.0,
-                        widths,
-                        false,
-                        theme,
-                    );
-                }
-            }
-        }
     }
 }
 

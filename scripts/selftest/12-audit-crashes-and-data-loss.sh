@@ -207,9 +207,10 @@ key 36
 wait 300
 wait 200
 dump $T/project-replace-found.out
+click @search.toggle
 key 48
 text thread
-clickin @find 685 51
+click @search.replace-all
 wait 300
 wait 200
 dump $T/project-replace.out

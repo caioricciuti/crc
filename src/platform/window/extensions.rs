@@ -21,6 +21,8 @@ impl EditorView {
             state.palette = None;
             state.completion = None;
             state.git_open = false;
+            state.search_open = false;
+            state.search_focus = None;
             state.sidebar = true;
         }
         self.refresh_registry();

@@ -659,6 +659,14 @@ impl EditorView {
         if git_turn && self.handle_git_key(event) {
             return true;
         }
+        // A field of the Search view, once clicked or opened, has the keys.
+        if self
+            .state()
+            .is_some_and(|state| state.search_open && state.search_focus.is_some())
+            && self.handle_search_key(event)
+        {
+            return true;
+        }
         // The Extensions, MCP or Settings page has the column: Escape
         // leaves its confirmation, then the page; nothing types into the
         // document underneath. The palette, opened over it, keeps its own
@@ -999,7 +1007,7 @@ impl EditorView {
             let text = match focus {
                 Focus::Document => inserted_text(text),
                 Focus::Goto => text.chars().filter(char::is_ascii_digit).collect(),
-                Focus::FindQuery | Focus::Field => single_line(text),
+                Focus::FindQuery | Focus::Field | Focus::Search(_) => single_line(text),
                 Focus::Message => message_text(text),
             };
             if text.is_empty() {
@@ -1029,6 +1037,7 @@ impl EditorView {
                 self.lsp_after_key(true);
                 self.lsp_typed(text);
             }
+            Focus::Search(field) => self.search_changed(field),
             Focus::Goto | Focus::Message => {}
         }
         focus
@@ -1073,6 +1082,7 @@ impl EditorView {
             rename,
             cell_edit,
             query,
+            search,
             ..
         } = &mut *state;
         let field = match owner {
@@ -1088,6 +1098,15 @@ impl EditorView {
                 .map(|edit| (&mut edit.field, Focus::Field)),
             Keys::Query => query.as_mut().map(|field| (&mut field.field, Focus::Field)),
             Keys::GitMessage => Some((&mut git.message, Focus::Message)),
+            Keys::Search(field) => Some((
+                match field {
+                    crate::platform::search_panel::Field::Query => &mut search.query,
+                    crate::platform::search_panel::Field::Replace => &mut search.replacement,
+                    crate::platform::search_panel::Field::Include => &mut search.include,
+                    crate::platform::search_panel::Field::Exclude => &mut search.exclude,
+                },
+                Focus::Search(field),
+            )),
             Keys::Goto => goto.as_mut().map(|field| (field, Focus::Goto)),
             Keys::Palette => palette.as_mut().map(|(query, _)| (query, Focus::Field)),
             Keys::FindQuery => find.as_mut().map(|bar| (&mut bar.query, Focus::FindQuery)),
@@ -1109,6 +1128,7 @@ impl EditorView {
         match focus {
             Focus::Document => return self.after_edit(),
             Focus::FindQuery => self.refresh_find(),
+            Focus::Search(field) => self.search_changed(field),
             Focus::Goto | Focus::Message => {}
             Focus::Field => {
                 // A different palette query invalidates the selected row.

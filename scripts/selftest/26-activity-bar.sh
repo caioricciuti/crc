@@ -32,6 +32,12 @@ dump $T/act-ext-list.out
 click @activity.explorer
 wait 100
 dump $T/act-explorer.out
+click @activity.search
+wait 100
+dump $T/act-search.out
+click @activity.explorer
+wait 100
+dump $T/act-search-left.out
 quit
 SCRIPT
 HOME="$T/acthome" CRC_SELFTEST="$T/act.script" "$BIN" "$T/actproj" 2> "$T/act.err"
@@ -45,3 +51,6 @@ grep -q '^extensions: open ' "$T/act-ext.out" || failed "act-ext: the details di
 grep -q '^extensions: list ' "$T/act-ext-list.out" || failed "act-ext-list: Close did not keep the list"
 expect "$T/act-explorer.out" activity "explorer sidebar=on"
 expect "$T/act-explorer.out" extensions "closed"
+# The Search view has its own icon, between Explorer and Source Control.
+expect "$T/act-search.out" activity "search sidebar=on"
+expect "$T/act-search-left.out" activity "explorer sidebar=on"

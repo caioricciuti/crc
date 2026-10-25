@@ -351,9 +351,10 @@ the size and write it back.
   version again, and Git > Clear History for This File or Clear All
   Local History deletes what was kept, after asking.
 - **Split panes** (`Cmd-\`), up to four, each with its own tabs.
-- **Project search** (`Cmd-Shift-F`) in the background as you type, listed
-  by file and line with each match marked; `Cmd-P` fuzzy file open, and
-  `>` in the same box to run any menu command.
+- **Search view** (`Cmd-Shift-F`) in the sidebar: the project searched as
+  you type, listed by file and line with each match marked, folding
+  files, files to include and exclude, and Replace All; `Cmd-P` fuzzy
+  file open, and `>` in the same box to run any menu command.
 - **HTTP requests from `.http` files** (`Cmd-Return`) in the JetBrains and
   VS Code REST Client format, with environments and a response tab.
 - **Markdown** is styled where it is written: its syntax hidden on lines
@@ -374,9 +375,10 @@ the size and write it back.
   system or your setting, a home screen with recent projects, overlay
   scrollbars, font zoom, and the right pointer for every control.
 - Everything an editor needs: multiple cursors (`Cmd-D`, Option-click,
-  Option-drag for a box), find and replace with regex (the current match
-  in a stronger colour, a tick per match on the scrollbar, the last search
-  offered again), go to line, comment toggle, line move and
+  Option-drag for a box), find and replace with regex in a small panel
+  over the text (the current match in a stronger colour, a tick per
+  match on the scrollbar, the last search offered again), go to line,
+  comment toggle, line move and
   duplicate, auto-indent and auto-close, word-wise and Emacs motions, full
   Unicode with emoji and CJK, session restore, Dock and Finder integration.
 
@@ -481,7 +483,7 @@ the size and write it back.
 | `F1` | hover information for the symbol at the caret |
 | `Ctrl-Space` | completion; Tab takes the suggestion, Up/Down pick another (then Return takes it too), Option-1 to 9 take one directly, Escape closes |
 | Escape in a picker/panel | dismiss |
-| `Cmd-F` / `Cmd-Shift-F` | find in file / find in project |
+| `Cmd-F` / `Cmd-Shift-F` | find in file / the Search view in the sidebar |
 | `Cmd-Option-F` | find in every terminal's history; Return shows the session with its find bar on the match |
 | `Cmd-L` | go to line |
 | `Cmd-D` | select word, then next occurrence as another cursor |

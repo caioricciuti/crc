@@ -2244,7 +2244,7 @@ mod tests {
             chrome.status,
         ];
         out.extend(chrome.sidebar);
-        out.extend(chrome.find);
+        // The find bar floats over the text by design: not a tile.
         out
     }
 
@@ -2291,17 +2291,26 @@ mod tests {
         assert_eq!(chrome.tabs.y, TOOLBAR_HEIGHT, "tabs follow the toolbar");
         assert_eq!(
             find.y,
-            TOOLBAR_HEIGHT + TAB_BAR_HEIGHT + BREADCRUMB_HEIGHT,
-            "find sits under the tabs, not over them"
+            TOOLBAR_HEIGHT + TAB_BAR_HEIGHT + BREADCRUMB_HEIGHT + FIND_PANEL_MARGIN,
+            "find floats under the breadcrumbs, not over them"
         );
         assert_eq!(find.height, 2.0 * FIND_ROW_HEIGHT);
+        assert_eq!(find.width, FIND_PANEL_WIDTH);
+        assert_eq!(
+            find.x + find.width + FIND_PANEL_MARGIN,
+            chrome.text.x + chrome.text.width,
+            "at the column's right edge"
+        );
+        let plain = Chrome::new(Viewport::new(1100.0, 760.0), Some(240.0), 0);
+        assert_eq!(
+            chrome.text, plain.text,
+            "the panel takes no room from the text"
+        );
+        assert_eq!(find_panel_rows(1, 20.0), 2);
+        assert_eq!(find_panel_rows(2, 20.0), 4);
         assert_eq!(
             chrome.text.y,
-            TOOLBAR_HEIGHT
-                + TAB_BAR_HEIGHT
-                + BREADCRUMB_HEIGHT
-                + 2.0 * FIND_ROW_HEIGHT
-                + TEXT_TOP_PAD
+            TOOLBAR_HEIGHT + TAB_BAR_HEIGHT + BREADCRUMB_HEIGHT + TEXT_TOP_PAD
         );
         assert_eq!(
             chrome.text.x,
@@ -2447,21 +2456,29 @@ mod find_geometry_tests {
         assert!(g.replace_field.y > g.find_field.y);
     }
 
-    /// Result rows begin below both input rows, so a click on a result can
-    /// never be read as a click in a field.
+    /// The document's panel keeps a chevron at the left of its fields; the
+    /// terminal's has none, and its field starts where the chevron would.
     #[test]
-    fn result_rows_start_below_the_inputs() {
+    fn the_panel_toggle_takes_room_from_the_fields_only() {
         let rect = Viewport {
             x: 0.0,
             y: 0.0,
-            width: 1100.0,
-            height: FIND_ROW_HEIGHT * 6.0,
+            width: FIND_PANEL_WIDTH,
+            height: FIND_ROW_HEIGHT * 2.0,
         };
-        let g = FindGeometry::new(rect);
-        assert!(g.results.y >= g.replace_field.y + g.replace_field.height);
-        assert_eq!(g.result_row(g.results.y + 1.0), Some(0));
-        assert_eq!(g.result_row(g.results.y + FIND_ROW_HEIGHT + 1.0), Some(1));
-        assert_eq!(g.result_row(g.find_field.y), None);
+        let plain = FindGeometry::panel(rect, 3, false);
+        let toggled = FindGeometry::panel(rect, 3, true);
+        assert_eq!(plain.toggle.width, 0.0);
+        assert!(toggled.toggle.width > 0.0);
+        assert!(toggled.find_field.x > plain.find_field.x);
+        assert_eq!(
+            toggled.find_field.x + toggled.find_field.width,
+            plain.find_field.x + plain.find_field.width,
+            "the field keeps its right edge"
+        );
+        assert_eq!(toggled.replace_field.x, toggled.find_field.x);
+        assert_eq!(toggled.options, plain.options, "the chips stay put");
+        assert_eq!(toggled.close, plain.close);
     }
 }
 

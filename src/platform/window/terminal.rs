@@ -845,15 +845,9 @@ impl EditorView {
                 query: Buffer::from_text(&query),
                 replacement: Buffer::new(),
                 replacing: false,
+                show_replace: false,
                 has_keys: true,
                 options,
-                project: false,
-                results: Vec::new(),
-                rows: Vec::new(),
-                selected: 0,
-                result_scroll: 0,
-                searching: false,
-                due: None,
                 terminal: None,
             }
         });
@@ -864,9 +858,6 @@ impl EditorView {
         bar.query.select_all();
         bar.has_keys = true;
         bar.replacing = false;
-        bar.project = false;
-        bar.searching = false;
-        bar.reset_results();
         bar.terminal.get_or_insert_with(Default::default);
     }
 

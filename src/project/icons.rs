@@ -31,6 +31,7 @@ pub const REMOVE: char = '\u{eb3b}'; // cod-remove
 pub const CLOSE: char = '\u{ea76}'; // cod-close
 pub const SYNC: char = '\u{ea77}'; // cod-sync
 pub const ELLIPSIS: char = '\u{ea7c}'; // cod-ellipsis
+pub const REPLACE_ALL: char = '\u{eb3c}'; // cod-replace_all
 pub const TRASH: char = '\u{ea81}'; // cod-trash
 pub const DISCARD: char = '\u{eae2}'; // cod-discard
 pub const ARROW_UP: char = '\u{eaa1}'; // cod-arrow_up

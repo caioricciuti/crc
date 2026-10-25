@@ -78,6 +78,7 @@ mod query;
 mod render;
 mod review;
 mod scrub;
+mod search_view;
 mod selftest_play;
 mod sidebar;
 mod state;
@@ -629,6 +630,8 @@ enum Focus {
     Field,
     /// The commit message, which holds several lines.
     Message,
+    /// A field of the Search view, where a change searches again.
+    Search(crate::platform::search_panel::Field),
 }
 
 /// Whether to log scroll events. Checked once: an env lookup per scroll
@@ -874,6 +877,12 @@ struct State {
     /// and offered when it opens with nothing selected, as every Mac
     /// find does. Shared between the document's bar and the terminal's.
     last_find: Option<(String, SearchOptions)>,
+    /// The Search view: project search and Find References, in the
+    /// sidebar while `search_open`; `search_focus` is its field with
+    /// the keyboard.
+    search: crate::platform::search_panel::Panel,
+    search_open: bool,
+    search_focus: Option<crate::platform::search_panel::Field>,
     /// Whether the sidebar is showing.
     sidebar: bool,
     /// Sidebar width in logical points, draggable.
@@ -1345,143 +1354,23 @@ fn fill_find_cache<'a>(
     Ok(cache.as_ref().map_or(&[], |c| c.matches.as_slice()))
 }
 
-/// Project search rows shown under the find bar at a time.
-const FIND_RESULT_ROWS: usize = 12;
-/// A pause in typing this long starts the project search.
-const FIND_PROJECT_DEBOUNCE: Duration = Duration::from_millis(250);
-
-/// A row of the project search's list: a file, or one line of it with
-/// every match on that line. The hits used to be listed one per row,
-/// so three matches on a line were three rows saying the same thing,
-/// with nothing to say which part of the line had matched.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum ResultRow {
-    /// The file of the hits from `first`, and how many of them.
-    File { first: usize, count: usize },
-    /// The hits `hits` of `results`, on one line, with one snippet.
-    Line { hits: std::ops::Range<usize> },
-}
-
-impl ResultRow {
-    /// The hit the row opens: a file's first, a line's first.
-    fn hit(&self) -> usize {
-        match self {
-            ResultRow::File { first, .. } => *first,
-            ResultRow::Line { hits } => hits.start,
-        }
-    }
-}
-
-/// The rows for `hits`, which project search lists by file and line: a
-/// file row, then a row per line of it with the same snippet.
-fn group_hits(hits: &[ProjectHit]) -> Vec<ResultRow> {
-    let mut rows = Vec::new();
-    let mut i = 0;
-    while i < hits.len() {
-        let file_from = i;
-        while i < hits.len() && hits[i].path == hits[file_from].path {
-            i += 1;
-        }
-        rows.push(ResultRow::File {
-            first: file_from,
-            count: i - file_from,
-        });
-        let mut j = file_from;
-        while j < i {
-            let line_from = j;
-            while j < i
-                && hits[j].line == hits[line_from].line
-                && hits[j].snippet == hits[line_from].snippet
-            {
-                j += 1;
-            }
-            rows.push(ResultRow::Line { hits: line_from..j });
-        }
-    }
-    rows
-}
-/// Rows the bar keeps while a project search runs with nothing found
-/// yet: "Searching project…" and three rows sketched under it.
-const FIND_SEARCHING_ROWS: usize = 4;
-
 struct FindBar {
     query: Buffer,
     replacement: Buffer,
     /// Tab moves between them.
     replacing: bool,
+    /// Whether the replace row shows under the find row: the chevron at
+    /// the bar's left, or Tab, opens it.
+    show_replace: bool,
     /// Whether typing goes to the bar. A click in the text gives the
     /// document the keys and leaves the bar open with its matches drawn;
     /// Cmd-F or a click on a field gives them back.
     has_keys: bool,
     options: SearchOptions,
-    project: bool,
-    results: Vec<ProjectHit>,
-    /// `results` by file and line, as listed; `selected` is a row.
-    rows: Vec<ResultRow>,
-    selected: usize,
-    result_scroll: usize,
-    searching: bool,
-    /// When the project search for what was typed starts, once typing
-    /// has paused; Return starts it at once.
-    due: Option<Instant>,
     /// Searching the terminal with the keyboard rather than the document:
     /// its matches and the current one. Drawn over the terminal's top
-    /// row, with no replace row and no Project.
+    /// rows, with no replace row.
     terminal: Option<crate::platform::terminal::Find>,
-}
-
-impl FindBar {
-    /// No results, the first selected, scrolled to the top.
-    fn reset_results(&mut self) {
-        self.results.clear();
-        self.rows.clear();
-        self.selected = 0;
-        self.result_scroll = 0;
-    }
-
-    /// Takes a search's results, listed by file and line, on the first
-    /// line row.
-    fn take_results(&mut self, results: Vec<ProjectHit>) {
-        self.rows = group_hits(&results);
-        self.results = results;
-        self.selected = self
-            .rows
-            .iter()
-            .position(|row| matches!(row, ResultRow::Line { .. }))
-            .unwrap_or(0);
-        self.result_scroll = 0;
-    }
-
-    /// The next or previous line row from the selected one, which the
-    /// arrows step through; file rows are headings.
-    fn select_step(&mut self, forward: bool) {
-        let lines = || {
-            self.rows
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| matches!(r, ResultRow::Line { .. }))
-                .map(|(i, _)| i)
-        };
-        let next = if forward {
-            lines().find(|&i| i > self.selected)
-        } else {
-            lines().rev().find(|&i| i < self.selected)
-        };
-        if let Some(next) = next {
-            self.selected = next;
-            self.follow_selection();
-        }
-    }
-
-    /// Scrolls the result list so the selected row is in its window.
-    fn follow_selection(&mut self) {
-        if self.selected < self.result_scroll {
-            self.result_scroll = self.selected;
-        }
-        if self.selected >= self.result_scroll + FIND_RESULT_ROWS {
-            self.result_scroll = self.selected + 1 - FIND_RESULT_ROWS;
-        }
-    }
 }
 
 /// F2's field. The name goes to the server that knows `path`.
@@ -2355,6 +2244,8 @@ define_class!(
                 | Some(Hit::Git(_))
                 | Some(Hit::GitRow(_))
                 | Some(Hit::GitToggle(_))
+                | Some(Hit::Search(_))
+                | Some(Hit::SearchRow(_))
                 | None => {}
             }
 
@@ -2382,6 +2273,17 @@ define_class!(
                 }
                 if self.state().is_some_and(|state| state.git_open) {
                     self.git_click(rect, x, y);
+                    return;
+                }
+                if self.state().is_some_and(|state| state.search_open) {
+                    if !self.search_click(rect, x, y) {
+                        // Off every control: the keys go back to the
+                        // document, as a click in it would take them.
+                        if let Some(mut state) = self.state_mut() {
+                            state.search_focus = None;
+                        }
+                        self.request_redraw();
+                    }
                     return;
                 }
                 if self.state().is_some_and(|state| state.mcp.open) {
@@ -2847,12 +2749,7 @@ define_class!(
                 }
             }
             // The find bar's fields and buttons are shared controls with
-            // hotspots of their own; only the project results are added here.
-            if let Some(find) = chrome.find
-                && find.height > layout::FIND_ROW_HEIGHT * 2.0
-            {
-                add(Viewport { y: find.y + layout::FIND_ROW_HEIGHT * 2.0, height: find.height - layout::FIND_ROW_HEIGHT * 2.0, ..find }, &NSCursor::pointingHandCursor());
-            }
+            // hotspots of their own.
             if let Some(rect) = chrome.sidebar {
                 if state.git_open {
                     // Every control of Source Control is a shared one, with
@@ -3003,12 +2900,34 @@ define_class!(
                     return;
                 }
             }
-            let (git_open, diff_shown) = {
+            let (git_open, diff_shown, search_open) = {
                 let Some(state) = self.state() else {
                     return;
                 };
-                (state.git_open, diffing(&state))
+                (state.git_open, diffing(&state), state.search_open)
             };
+            if search_open && !git_open {
+                let point = self.convertPoint_fromView(event.locationInWindow(), None);
+                let (x, y) = (point.x as f32, point.y as f32);
+                let chrome = self.chrome();
+                if let Some(rect) = chrome.sidebar.filter(|r| r.contains(x, y)) {
+                    let lines = self.wheel_lines(event, WheelTarget::Git);
+                    let Some(mut state) = self.state_mut() else {
+                        return;
+                    };
+                    let visible = state.search.geometry(rect).visible_rows();
+                    if lines != 0 {
+                        state.search.scroll_by(lines, visible);
+                    }
+                    drop(state);
+                    self.request_redraw();
+                    if let Some(window) = self.window() {
+                        window.invalidateCursorRectsForView(self);
+                    }
+                    self.pump();
+                    return;
+                }
+            }
             if git_open || diff_shown {
                 let point = self.convertPoint_fromView(event.locationInWindow(), None);
                 let (x, y) = (point.x as f32, point.y as f32);
@@ -3376,13 +3295,6 @@ define_class!(
                 .state()
                 .is_some_and(|state| state.find.as_ref().is_some_and(|bar| bar.terminal.is_some()))
             {
-                return;
-            }
-            if self
-                .state()
-                .is_some_and(|state| state.find.as_ref().is_some_and(|bar| bar.project))
-            {
-                self.replace_in_project();
                 return;
             }
             self.replace_all();
@@ -3778,14 +3690,7 @@ define_class!(
 
         #[unsafe(method(findInProject:))]
         fn action_find_project(&self, _sender: Option<&AnyObject>) {
-            self.open_document_find();
-            if let Some(mut state) = self.state_mut()
-                && let Some(bar) = &mut state.find
-            {
-                bar.project = true;
-            }
-            self.request_redraw();
-            self.pump();
+            self.open_search();
         }
 
         #[unsafe(method(findInTerminals:))]
@@ -4816,7 +4721,7 @@ define_class!(
                 let text = match focus {
                     Focus::Document => text,
                     Focus::Goto => text.chars().filter(char::is_ascii_digit).collect(),
-                    Focus::FindQuery | Focus::Field => single_line(&text),
+                    Focus::FindQuery | Focus::Field | Focus::Search(_) => single_line(&text),
                     Focus::Message => message_text(&text),
                 };
                 if !text.is_empty() {
@@ -7301,6 +7206,7 @@ impl crate::ide::mcp::Host for ClaudeHost<'_> {
 /// order they are checked in is not the order they were opened in. The find
 /// bar stays; the others sit ahead of it.
 fn close_fields(state: &mut State) {
+    state.search_focus = None;
     state.sidebar_edit = None;
     state.agents_edit = None;
     state.rename = None;
@@ -7386,6 +7292,8 @@ enum Keys {
     Query,
     /// The commit message, once it has been clicked.
     GitMessage,
+    /// A field of the Search view, once clicked or opened.
+    Search(crate::platform::search_panel::Field),
     Goto,
     Palette,
     FindQuery,
@@ -7410,6 +7318,8 @@ fn keys(state: &State) -> Keys {
         Keys::Query
     } else if state.git_open && state.git_focus {
         Keys::GitMessage
+    } else if let Some(field) = state.search_focus.filter(|_| state.search_open) {
+        Keys::Search(field)
     } else if state.goto.is_some() {
         Keys::Goto
     } else if state.palette.is_some() {
@@ -7450,6 +7360,12 @@ fn focused_buffer(state: &State) -> &Buffer {
         Keys::Cell => state.cell_edit.as_ref().map(|edit| &edit.field),
         Keys::Query => state.query.as_ref().map(|field| &field.field),
         Keys::GitMessage => Some(&state.git.message),
+        Keys::Search(field) => Some(match field {
+            crate::platform::search_panel::Field::Query => &state.search.query,
+            crate::platform::search_panel::Field::Replace => &state.search.replacement,
+            crate::platform::search_panel::Field::Include => &state.search.include,
+            crate::platform::search_panel::Field::Exclude => &state.search.exclude,
+        }),
         Keys::Goto => state.goto.as_ref(),
         Keys::Palette => state.palette.as_ref().map(|(query, _)| query),
         Keys::FindQuery => state.find.as_ref().map(|bar| &bar.query),
@@ -7702,6 +7618,8 @@ fn frame_of(state: &mut State) -> Frame {
         diff_tab,
         issue_tabs,
         agents,
+        search,
+        search_open,
         ..
     } = state;
     for (index, item) in layout::activity_items(chrome.activity)
@@ -7792,7 +7710,31 @@ fn frame_of(state: &mut State) -> Frame {
                 frame.push(Hit::GitRow(i), rect);
             }
         }
-        if !*git_open && extensions.is_none() && !mcp.open && !agents.on {
+        if *search_open && !*git_open && extensions.is_none() && !mcp.open && !agents.on {
+            let g = search.geometry(rect);
+            for (name, rect) in [
+                ("collapse", g.actions[0]),
+                ("clear", g.actions[1]),
+                ("filters", g.actions[2]),
+                ("toggle", g.toggle),
+                ("query", g.query),
+                ("case", g.chips[0]),
+                ("word", g.chips[1]),
+                ("regex", g.chips[2]),
+                ("replace", g.replace),
+                ("replace-all", g.replace_all),
+                ("include", g.include),
+                ("exclude", g.exclude),
+            ] {
+                if rect.height > 0.0 && rect.width > 0.0 {
+                    frame.push(Hit::Search(name), rect);
+                }
+            }
+            for (index, rect) in search.visible(g) {
+                frame.push(Hit::SearchRow(index), rect);
+            }
+        }
+        if !*search_open && !*git_open && extensions.is_none() && !mcp.open && !agents.on {
             let (_, actions) = layout::sidebar_actions(rect);
             for (index, action) in actions.into_iter().enumerate() {
                 frame.push(Hit::SidebarAction(index), action);
@@ -8021,23 +7963,13 @@ fn chrome_of(state: &State) -> Chrome {
             .metrics
             .snap(state.sidebar_width.clamp(SIDEBAR_MIN, SIDEBAR_MAX))
     });
-    // Two rows: find and replace. The option chips used to need a third,
-    // spanning the window with four small toggles and nothing else on it.
-    // Over the terminal, the bar takes no room from the document.
+    // The panel over the text: find, and replace under it when shown.
+    // The terminal's is placed by the terminal.
     let find_rows = state
         .find
         .as_ref()
         .filter(|bar| bar.terminal.is_none())
-        .map_or(0, |bar| {
-            2 + if bar.project && bar.searching && bar.results.is_empty() {
-                // Room for "Searching project…" and the rows sketched under it.
-                FIND_SEARCHING_ROWS
-            } else if bar.project {
-                bar.rows.len().min(FIND_RESULT_ROWS)
-            } else {
-                0
-            }
-        });
+        .map_or(0, |bar| if bar.show_replace { 2 } else { 1 });
     let response = state.responses.contains_key(&state.docs.active().id())
         || active_review(state).is_some()
         || active_conflicts(state).is_some()
@@ -10199,6 +10131,9 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         find: None,
         find_cache: None,
         last_find: None,
+        search: Default::default(),
+        search_open: false,
+        search_focus: None,
         sidebar,
         sidebar_width: session.sidebar_width,
         drag: None,
@@ -10520,42 +10455,6 @@ mod tests {
         spawn_project_refresh, typed_text,
     };
     use std::time::Duration;
-
-    #[test]
-    fn project_hits_are_listed_by_file_and_line() {
-        use super::{ResultRow, group_hits};
-        use crate::platform::search::ProjectHit;
-        let hit = |path: &str, line: usize, snippet: &str| ProjectHit {
-            path: path.into(),
-            range: 0..1,
-            line,
-            column: 0,
-            snippet: snippet.to_string(),
-            at: 0..1,
-        };
-        let hits = vec![
-            hit("a.rs", 4, "let plant = plants[0];"),
-            hit("a.rs", 4, "let plant = plants[0];"),
-            hit("a.rs", 9, "plant"),
-            hit("b.rs", 0, "plant"),
-        ];
-        let rows = group_hits(&hits);
-        assert_eq!(
-            rows,
-            vec![
-                ResultRow::File { first: 0, count: 3 },
-                ResultRow::Line { hits: 0..2 },
-                ResultRow::Line { hits: 2..3 },
-                ResultRow::File { first: 3, count: 1 },
-                ResultRow::Line { hits: 3..4 },
-            ]
-        );
-        assert_eq!(
-            rows.iter().map(ResultRow::hit).collect::<Vec<_>>(),
-            [0, 0, 2, 3, 3]
-        );
-        assert!(group_hits(&[]).is_empty());
-    }
 
     #[test]
     fn a_plain_launch_opens_on_agents() {

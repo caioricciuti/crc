@@ -22,6 +22,8 @@ impl EditorView {
             state.extensions = None;
             state.git_open = false;
             state.git_focus = false;
+            state.search_open = false;
+            state.search_focus = None;
             state.palette = None;
             state.completion = None;
             if !state.mcp.loaded {

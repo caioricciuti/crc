@@ -13,10 +13,20 @@ One entry per tag, written for people who use the editor.
   are) and on the editor's scrollbar, so a search over a long session or
   file shows where it hit; click a tick to go there. The bar opens on
   your last search, selected, when nothing is selected in the text.
-- Project search (`Cmd-Shift-F`) searches as you type, once typing
-  pauses, and lists what it finds by file and line: a row per file with
-  its count, then one row per line with each match on it marked. Three
-  matches on a line used to be three rows saying the same thing.
+- The document's find bar is the same small panel as the terminal's,
+  at the top right of the text, instead of two rows across the column
+  that pushed the file down. Its chevron (or Tab) opens the replace row.
+- A Search view in the sidebar (`Cmd-Shift-F`, or its icon in the
+  strip) replaces the project search that lived under the find bar. It
+  searches as you type, once typing pauses, and lists what it finds by
+  file and line: a row per file with its count, folding on a click,
+  then one row per line with each match on it marked. Aa, whole word
+  and regex are chips in the query; the chevron opens Replace with a
+  Replace All beside it; the dots open "files to include" and "files
+  to exclude", comma-separated patterns as `.gitignore` reads them
+  (`src`, `*.rs`, `docs/**`). Up and Down walk the results from the
+  query, Return opens one, Escape gives the keys back to the document
+  and keeps the view. Find References lists its places there too.
 
 ## v0.2.0-alpha.30, 2026-10-21
 
