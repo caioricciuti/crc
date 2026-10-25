@@ -870,6 +870,10 @@ struct State {
     /// The find bar's matches in the active document, kept while neither
     /// changes: drawing asks for them every frame.
     find_cache: Option<FindCache>,
+    /// The last search: its query and options, kept when the bar closes
+    /// and offered when it opens with nothing selected, as every Mac
+    /// find does. Shared between the document's bar and the terminal's.
+    last_find: Option<(String, SearchOptions)>,
     /// Whether the sidebar is showing.
     sidebar: bool,
     /// Sidebar width in logical points, draggable.
@@ -1341,8 +1345,61 @@ fn fill_find_cache<'a>(
     Ok(cache.as_ref().map_or(&[], |c| c.matches.as_slice()))
 }
 
-/// Project search results shown under the find bar at a time.
-const FIND_RESULT_ROWS: usize = 8;
+/// Project search rows shown under the find bar at a time.
+const FIND_RESULT_ROWS: usize = 12;
+/// A pause in typing this long starts the project search.
+const FIND_PROJECT_DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// A row of the project search's list: a file, or one line of it with
+/// every match on that line. The hits used to be listed one per row,
+/// so three matches on a line were three rows saying the same thing,
+/// with nothing to say which part of the line had matched.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ResultRow {
+    /// The file of the hits from `first`, and how many of them.
+    File { first: usize, count: usize },
+    /// The hits `hits` of `results`, on one line, with one snippet.
+    Line { hits: std::ops::Range<usize> },
+}
+
+impl ResultRow {
+    /// The hit the row opens: a file's first, a line's first.
+    fn hit(&self) -> usize {
+        match self {
+            ResultRow::File { first, .. } => *first,
+            ResultRow::Line { hits } => hits.start,
+        }
+    }
+}
+
+/// The rows for `hits`, which project search lists by file and line: a
+/// file row, then a row per line of it with the same snippet.
+fn group_hits(hits: &[ProjectHit]) -> Vec<ResultRow> {
+    let mut rows = Vec::new();
+    let mut i = 0;
+    while i < hits.len() {
+        let file_from = i;
+        while i < hits.len() && hits[i].path == hits[file_from].path {
+            i += 1;
+        }
+        rows.push(ResultRow::File {
+            first: file_from,
+            count: i - file_from,
+        });
+        let mut j = file_from;
+        while j < i {
+            let line_from = j;
+            while j < i
+                && hits[j].line == hits[line_from].line
+                && hits[j].snippet == hits[line_from].snippet
+            {
+                j += 1;
+            }
+            rows.push(ResultRow::Line { hits: line_from..j });
+        }
+    }
+    rows
+}
 /// Rows the bar keeps while a project search runs with nothing found
 /// yet: "Searching project…" and three rows sketched under it.
 const FIND_SEARCHING_ROWS: usize = 4;
@@ -1359,9 +1416,14 @@ struct FindBar {
     options: SearchOptions,
     project: bool,
     results: Vec<ProjectHit>,
+    /// `results` by file and line, as listed; `selected` is a row.
+    rows: Vec<ResultRow>,
     selected: usize,
     result_scroll: usize,
     searching: bool,
+    /// When the project search for what was typed starts, once typing
+    /// has paused; Return starts it at once.
+    due: Option<Instant>,
     /// Searching the terminal with the keyboard rather than the document:
     /// its matches and the current one. Drawn over the terminal's top
     /// row, with no replace row and no Project.
@@ -1372,8 +1434,43 @@ impl FindBar {
     /// No results, the first selected, scrolled to the top.
     fn reset_results(&mut self) {
         self.results.clear();
+        self.rows.clear();
         self.selected = 0;
         self.result_scroll = 0;
+    }
+
+    /// Takes a search's results, listed by file and line, on the first
+    /// line row.
+    fn take_results(&mut self, results: Vec<ProjectHit>) {
+        self.rows = group_hits(&results);
+        self.results = results;
+        self.selected = self
+            .rows
+            .iter()
+            .position(|row| matches!(row, ResultRow::Line { .. }))
+            .unwrap_or(0);
+        self.result_scroll = 0;
+    }
+
+    /// The next or previous line row from the selected one, which the
+    /// arrows step through; file rows are headings.
+    fn select_step(&mut self, forward: bool) {
+        let lines = || {
+            self.rows
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| matches!(r, ResultRow::Line { .. }))
+                .map(|(i, _)| i)
+        };
+        let next = if forward {
+            lines().find(|&i| i > self.selected)
+        } else {
+            lines().rev().find(|&i| i < self.selected)
+        };
+        if let Some(next) = next {
+            self.selected = next;
+            self.follow_selection();
+        }
     }
 
     /// Scrolls the result list so the selected row is in its window.
@@ -7936,7 +8033,7 @@ fn chrome_of(state: &State) -> Chrome {
                 // Room for "Searching project…" and the rows sketched under it.
                 FIND_SEARCHING_ROWS
             } else if bar.project {
-                bar.results.len().min(FIND_RESULT_ROWS)
+                bar.rows.len().min(FIND_RESULT_ROWS)
             } else {
                 0
             }
@@ -10101,6 +10198,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         tree_version: 0,
         find: None,
         find_cache: None,
+        last_find: None,
         sidebar,
         sidebar_width: session.sidebar_width,
         drag: None,
@@ -10422,6 +10520,42 @@ mod tests {
         spawn_project_refresh, typed_text,
     };
     use std::time::Duration;
+
+    #[test]
+    fn project_hits_are_listed_by_file_and_line() {
+        use super::{ResultRow, group_hits};
+        use crate::platform::search::ProjectHit;
+        let hit = |path: &str, line: usize, snippet: &str| ProjectHit {
+            path: path.into(),
+            range: 0..1,
+            line,
+            column: 0,
+            snippet: snippet.to_string(),
+            at: 0..1,
+        };
+        let hits = vec![
+            hit("a.rs", 4, "let plant = plants[0];"),
+            hit("a.rs", 4, "let plant = plants[0];"),
+            hit("a.rs", 9, "plant"),
+            hit("b.rs", 0, "plant"),
+        ];
+        let rows = group_hits(&hits);
+        assert_eq!(
+            rows,
+            vec![
+                ResultRow::File { first: 0, count: 3 },
+                ResultRow::Line { hits: 0..2 },
+                ResultRow::Line { hits: 2..3 },
+                ResultRow::File { first: 3, count: 1 },
+                ResultRow::Line { hits: 3..4 },
+            ]
+        );
+        assert_eq!(
+            rows.iter().map(ResultRow::hit).collect::<Vec<_>>(),
+            [0, 0, 2, 3, 3]
+        );
+        assert!(group_hits(&[]).is_empty());
+    }
 
     #[test]
     fn a_plain_launch_opens_on_agents() {

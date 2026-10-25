@@ -24,18 +24,13 @@ impl EditorView {
                 .borrow()
                 .find
                 .as_ref()
-                .is_some_and(|b| b.project && !b.results.is_empty())
+                .is_some_and(|b| b.project && !b.rows.is_empty())
         {
             let Some(mut state) = self.state_mut() else {
                 return false;
             };
             let bar = state.find.as_mut().expect("checked above");
-            bar.selected = if code == key::DOWN {
-                (bar.selected + 1).min(bar.results.len() - 1)
-            } else {
-                bar.selected.saturating_sub(1)
-            };
-            bar.follow_selection();
+            bar.select_step(code == key::DOWN);
             drop(state);
             self.request_redraw();
             self.pump();
@@ -70,14 +65,20 @@ impl EditorView {
                     .map(|f| (f.replacing, f.project))
                     .unwrap_or((false, false));
                 if project {
+                    // A search still to start (the query just changed)
+                    // starts now; otherwise the selected row opens.
                     let selected = {
-                        let Some(state) = self.state() else {
+                        let Some(mut state) = self.state_mut() else {
                             return false;
                         };
-                        state
-                            .find
-                            .as_ref()
-                            .and_then(|bar| (!bar.results.is_empty()).then_some(bar.selected))
+                        let Some(bar) = state.find.as_mut() else {
+                            return false;
+                        };
+                        if bar.due.take().is_some() {
+                            None
+                        } else {
+                            bar.rows.get(bar.selected).map(ResultRow::hit)
+                        }
                     };
                     if let Some(index) = selected {
                         self.open_project_result(index);
@@ -258,8 +259,18 @@ impl EditorView {
             if let Some(bar) = &mut state.find
                 && bar.project
             {
-                bar.reset_results();
+                // The project is searched for the new query once typing
+                // pauses; the last results stay until then, and go
+                // with an empty query.
                 bar.searching = false;
+                if bar.query.rope.len_bytes() == 0 {
+                    bar.reset_results();
+                    bar.due = None;
+                } else {
+                    bar.due = Some(Instant::now() + FIND_PROJECT_DEBOUNCE);
+                    drop(state);
+                    self.resume_display_link();
+                }
                 return;
             }
         }
@@ -338,6 +349,16 @@ impl EditorView {
         if let Some(mut state) = self.state_mut() {
             close_fields(&mut state);
         }
+        // Nothing selected: the last search, selected, so typing replaces
+        // it and Return repeats it.
+        let mut options = SearchOptions::default();
+        if seed.is_none()
+            && let Some((last, last_options)) = self.state().and_then(|s| s.last_find.clone())
+        {
+            query.insert(&last);
+            query.select_all();
+            options = last_options;
+        }
         if let Some(mut state) = self.state_mut()
             && let Some(bar) = &mut state.find
         {
@@ -364,14 +385,19 @@ impl EditorView {
                 replacement: Buffer::new(),
                 replacing: false,
                 has_keys: true,
-                options: SearchOptions::default(),
+                options,
                 project: false,
                 results: Vec::new(),
+                rows: Vec::new(),
                 selected: 0,
                 result_scroll: 0,
                 searching: false,
+                due: None,
                 terminal: None,
             });
+        }
+        if seed.is_none() {
+            self.refresh_find();
         }
         self.request_redraw();
         self.pump();
@@ -385,8 +411,12 @@ impl EditorView {
             cancel.store(true, Ordering::Relaxed);
         }
         state.project_search.rx = None;
+        let Some(bar) = state.find.take() else {
+            return;
+        };
+        remember_find(&mut state, &bar);
         // The terminal it searched has the keyboard again.
-        if state.find.take().is_some_and(|bar| bar.terminal.is_some()) && state.terminal.open {
+        if bar.terminal.is_some() && state.terminal.open {
             state.terminal.focus = true;
         }
         drop(state);
@@ -396,10 +426,11 @@ impl EditorView {
 
     pub(super) fn search_project(&self) {
         let (query, options, root) = {
-            let Some(state) = self.state() else {
+            let Some(mut state) = self.state_mut() else {
                 return;
             };
-            let Some(bar) = &state.find else { return };
+            let Some(bar) = &mut state.find else { return };
+            bar.due = None;
             (
                 bar.query.rope.to_string(),
                 bar.options,
@@ -442,6 +473,17 @@ impl EditorView {
     }
 
     pub(super) fn poll_project_search(&self) {
+        // A search due after a pause in typing.
+        let due = self.state().is_some_and(|state| {
+            state
+                .find
+                .as_ref()
+                .and_then(|bar| bar.due)
+                .is_some_and(|at| Instant::now() >= at)
+        });
+        if due {
+            self.search_project();
+        }
         let Some(mut state) = self.state_mut() else {
             return;
         };
@@ -460,9 +502,7 @@ impl EditorView {
             match result {
                 Ok(results) => {
                     let count = results.len();
-                    bar.results = results;
-                    bar.selected = 0;
-                    bar.result_scroll = 0;
+                    bar.take_results(results);
                     let text = if state.project_search.references {
                         format!("{count} reference{}", if count == 1 { "" } else { "s" })
                     } else {
@@ -567,15 +607,8 @@ impl EditorView {
                 let Some(mut state) = self.state_mut() else {
                     return;
                 };
-                if let Some(bar) = &mut state.find
-                    && !bar.results.is_empty()
-                {
-                    bar.selected = if forward {
-                        (bar.selected + 1).min(bar.results.len() - 1)
-                    } else {
-                        bar.selected.saturating_sub(1)
-                    };
-                    bar.follow_selection();
+                if let Some(bar) = &mut state.find {
+                    bar.select_step(forward);
                 }
             } else {
                 self.find_step(forward);
@@ -595,17 +628,20 @@ impl EditorView {
                 self.replace_all();
             }
         } else if let Some(row) = g.result_row(y).filter(|_| project) {
-            let selected = {
-                let Some(state) = self.state() else {
+            let hit = {
+                let Some(mut state) = self.state_mut() else {
                     return;
                 };
-                state
-                    .find
-                    .as_ref()
-                    .filter(|bar| bar.result_scroll + row < bar.results.len())
-                    .map(|bar| bar.result_scroll + row)
+                let Some(bar) = state.find.as_mut() else {
+                    return;
+                };
+                let row = bar.result_scroll + row;
+                bar.rows.get(row).map(|r| {
+                    bar.selected = row;
+                    r.hit()
+                })
             };
-            if let Some(index) = selected {
+            if let Some(index) = hit {
                 self.open_project_result(index);
             }
             return;
@@ -895,5 +931,13 @@ impl EditorView {
             .active_mut()
             .select_range(found.range.start, found.range.end);
         state.docs.active_mut().scroll_to_cursor(rows, cols);
+    }
+}
+
+/// Keeps `bar`'s query and options for the next bar, when it has a query.
+pub(super) fn remember_find(state: &mut State, bar: &FindBar) {
+    let query = bar.query.rope.to_string();
+    if !query.is_empty() {
+        state.last_find = Some((query, bar.options));
     }
 }

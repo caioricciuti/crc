@@ -94,18 +94,18 @@ impl EditorView {
                 let end = crate::lsp::offset_of(rope, location.end).max(start);
                 let line = rope.byte_to_line(start);
                 let line_start = rope.line_to_byte(line);
-                let line_end = rope.line_range(line).end;
+                let line_end = rope.line_range(line).end.max(end);
+                let (snippet, at) = search::snippet_around(
+                    &rope.slice_to_string(line_start..line_end),
+                    start - line_start..end - line_start,
+                );
                 results.push(ProjectHit {
                     path: location.path.clone(),
                     range: start..end,
                     line,
                     column: start - line_start,
-                    snippet: rope
-                        .slice_to_string(line_start..line_end)
-                        .trim()
-                        .chars()
-                        .take(100)
-                        .collect(),
+                    snippet,
+                    at,
                 });
             }
             let _ = tx.send(Ok(results));
@@ -135,9 +135,11 @@ impl EditorView {
             },
             project: true,
             results: Vec::new(),
+            rows: Vec::new(),
             selected: 0,
             result_scroll: 0,
             searching: true,
+            due: None,
             terminal: None,
         });
         drop(state);

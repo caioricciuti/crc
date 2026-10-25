@@ -58,6 +58,10 @@ key 36
 wait 500
 wait 500
 dump $T/tfind-closed.out
+key 3 cmd f
+wait 200
+dump $T/tfind-remembered.out
+key 53
 click @text
 key 3 cmd f
 text untouched
@@ -79,6 +83,9 @@ expect_terminal "$T/tfind-clicked.out" 'find=needle 3 of 3 target=terminal keys=
 expect_terminal "$T/tfind-again.out" 'find=needle 3 of 3 target=terminal keys=true'
 expect_terminal "$T/tfind-closed.out" ' find=none'
 expect_terminal "$T/tfind-closed.out" '\ntyped'
+# Closed and opened again with nothing selected: the last search, on
+# the newest match (the "typed" line holds none).
+expect_terminal "$T/tfind-remembered.out" 'find=needle 3 of 3 target=terminal keys=true'
 expect_line "$T/tfind-closed.out" 1 "untouched"
 expect "$T/tfind-closed.out" dirty false
 expect_terminal "$T/tfind-document.out" 'find=untouched target=document keys=true'

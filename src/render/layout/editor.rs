@@ -469,20 +469,21 @@ pub fn build_text_appending(
             }
         }
 
-        // Search matches, behind the text alongside the selection.
+        // Search matches, behind the text alongside the selection. The
+        // one the find bar is on is the selection; it gets the stronger
+        // colour, so it stands out from the rest as well as from the text.
         if !matches.is_empty() {
             for range in &matches {
                 let (at, end) = (range.start, range.end);
                 if end <= row_start || at >= row_end {
                     continue;
                 }
-                band(
-                    out,
-                    at.max(row_start),
-                    end.min(row_end),
-                    0.0,
-                    theme.find_match,
-                );
+                let colour = if selection.as_ref() == Some(range) {
+                    theme.find_current
+                } else {
+                    theme.find_match
+                };
+                band(out, at.max(row_start), end.min(row_end), 0.0, colour);
             }
         }
 
@@ -832,6 +833,41 @@ pub fn build_text_appending(
     if let Some(thumb) = scrollbar_thumb(buffer, viewport, m.line_height) {
         let [r, g, b, _] = theme.status_text;
         push_rounded_rect(out, thumb, SCROLLBAR_WIDTH / 2.0, [r, g, b, 0.4]);
+        // Find's matches down the track, where each is in the file: the
+        // current one (the selection) wider, in the stronger colour.
+        if let Some(ranges) = search_ranges {
+            let track = scrollbar_track(viewport);
+            let [r, g, b, _] = theme.find_match;
+            let mut last = f32::NEG_INFINITY;
+            for range in ranges {
+                let current = selection.as_ref() == Some(range);
+                let line = buffer.rope.byte_to_line(range.start);
+                let Some(y) = scrollbar_tick_y(buffer, viewport, m.line_height, line) else {
+                    break;
+                };
+                if y - last < 1.0 && !current {
+                    continue;
+                }
+                last = y;
+                if current {
+                    push_rect(
+                        out,
+                        atlas,
+                        [track.x - 2.0, y - 1.0],
+                        [track.width + 4.0, SCROLLBAR_TICK + 2.0],
+                        theme.find_current,
+                    );
+                } else {
+                    push_rect(
+                        out,
+                        atlas,
+                        [track.x, y],
+                        [track.width, SCROLLBAR_TICK],
+                        [r, g, b, 0.9],
+                    );
+                }
+            }
+        }
     }
 
     stats.quads = out.len();

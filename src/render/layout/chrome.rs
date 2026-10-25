@@ -1407,6 +1407,35 @@ pub fn scrollbar_thumb(buffer: &Buffer, viewport: Viewport, line_height: f32) ->
     })
 }
 
+/// A match tick's height on the scrollbar's track.
+pub const SCROLLBAR_TICK: f32 = 2.0;
+
+/// Where on the track line `line` is, as the thumb measures it: the top
+/// of a tick for a find match there, or `None` when the document fits
+/// the view and there is no thumb to read it against.
+pub fn scrollbar_tick_y(
+    buffer: &Buffer,
+    viewport: Viewport,
+    line_height: f32,
+    line: usize,
+) -> Option<f32> {
+    scrollbar_thumb(buffer, viewport, line_height)?;
+    let (total, _, units) = scroll_extent(buffer);
+    let unit = if !units.is_empty() {
+        units.partition_point(|&l| l < line)
+    } else {
+        let hidden: usize = buffer
+            .folds
+            .iter()
+            .map(|&(a, b)| (b + 1).min(line).saturating_sub(a))
+            .sum();
+        line - hidden
+    };
+    let track = scrollbar_track(viewport);
+    let run = (track.height - SCROLLBAR_TICK).max(0.0);
+    Some(track.y + run * (unit as f32 / total.max(1) as f32).clamp(0.0, 1.0))
+}
+
 /// The scroll line that puts the thumb's top at `y` on the track, for a
 /// drag: the inverse of [`scrollbar_thumb`].
 pub fn scrollbar_line_at(buffer: &Buffer, viewport: Viewport, line_height: f32, y: f32) -> usize {

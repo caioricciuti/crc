@@ -836,19 +836,26 @@ impl EditorView {
             cancel.store(true, Ordering::Relaxed);
         }
         state.project_search.rx = None;
-        // A document's bar moves over: its options come with it.
-        let bar = state.find.get_or_insert_with(|| FindBar {
-            query: Buffer::new(),
-            replacement: Buffer::new(),
-            replacing: false,
-            has_keys: true,
-            options: SearchOptions::default(),
-            project: false,
-            results: Vec::new(),
-            selected: 0,
-            result_scroll: 0,
-            searching: false,
-            terminal: None,
+        // A document's bar moves over: its options come with it. A new
+        // bar starts on the last search, as the document's does.
+        let last = state.last_find.clone();
+        let bar = state.find.get_or_insert_with(|| {
+            let (query, options) = last.unwrap_or_default();
+            FindBar {
+                query: Buffer::from_text(&query),
+                replacement: Buffer::new(),
+                replacing: false,
+                has_keys: true,
+                options,
+                project: false,
+                results: Vec::new(),
+                rows: Vec::new(),
+                selected: 0,
+                result_scroll: 0,
+                searching: false,
+                due: None,
+                terminal: None,
+            }
         });
         if let Some(seed) = seed {
             bar.query = Buffer::new();
@@ -1014,8 +1021,10 @@ impl EditorView {
                 && !(state.terminal.open && !state.terminal.tabs.is_empty())
         });
         if gone {
-            if let Some(mut state) = self.state_mut() {
-                state.find = None;
+            if let Some(mut state) = self.state_mut()
+                && let Some(bar) = state.find.take()
+            {
+                super::find::remember_find(&mut state, &bar);
             }
             self.request_redraw();
             self.resume_display_link();
@@ -1180,10 +1189,56 @@ impl EditorView {
         self.pump();
     }
 
+    /// A press on a find tick beside the screen: the bar goes to that
+    /// match, as stepping to it would. False when the press is not on one.
+    fn terminal_find_tick_press(&self, x: f32, y: f32) -> bool {
+        let Some((screen, _, _)) = self.terminal_screen() else {
+            return false;
+        };
+        let track = crate::platform::terminal::mark_track(screen);
+        if !track.contains(x, y) {
+            return false;
+        }
+        {
+            let Some(mut state) = self.state_mut() else {
+                return false;
+            };
+            let State { find, terminal, .. } = &mut *state;
+            let Some(find) = find.as_mut().and_then(|bar| bar.terminal.as_mut()) else {
+                return false;
+            };
+            let Some(tab) = terminal.active_tab() else {
+                return false;
+            };
+            let term = tab.session.term.lock().unwrap_or_else(|e| e.into_inner());
+            if term.is_alternate() {
+                return false;
+            }
+            let first = term.first_line();
+            let total = term.scrollback_len() + term.rows();
+            drop(term);
+            let Some(index) =
+                crate::platform::terminal::find_tick_at(track, y, &find.matches, first, total)
+            else {
+                return false;
+            };
+            find.current = Some(index);
+            find.anchor = Some(find.matches[index].start);
+        }
+        self.terminal_find_reveal();
+        self.request_redraw();
+        self.pump();
+        true
+    }
+
     /// A press on a prompt's mark beside the screen: the view scrolled to
     /// that prompt, as Cmd-Shift-Up would. False when the press is not on
-    /// one, to go on as any press does.
+    /// one, to go on as any press does. A find tick under the press wins,
+    /// while the bar is open.
     fn terminal_mark_press(&self, x: f32, y: f32) -> bool {
+        if self.terminal_find_tick_press(x, y) {
+            return true;
+        }
         let Some((screen, _, _)) = self.terminal_screen() else {
             return false;
         };

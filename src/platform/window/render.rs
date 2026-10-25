@@ -984,13 +984,6 @@ impl EditorView {
         {
             let count = searching.error.is_none().then(|| searching.count());
             draw_find_bar(glyphs, renderer, theme, rect, bar, count, tree);
-            layout::push_rect(
-                glyphs,
-                &renderer.atlas,
-                [rect.x, rect.y + rect.height - 1.0],
-                [rect.width, 1.0],
-                theme.hairline,
-            );
         }
 
         // Status line along the bottom, spanning the full width.
@@ -1361,13 +1354,19 @@ fn draw_find_bar(
     tree: &Tree,
 ) {
     let terminal = bar.terminal.is_some();
-    layout::push_rect(
-        glyphs,
-        &renderer.atlas,
-        [rect.x, rect.y],
-        [rect.width, rect.height],
-        theme.find_background,
-    );
+    if terminal {
+        // A panel floating over the screen, with the palette's edge, so
+        // it reads as laid on the output rather than cut into it.
+        layout::push_panel(glyphs, rect, layout::UI_RADIUS_LG, theme);
+    } else {
+        layout::push_rect(
+            glyphs,
+            &renderer.atlas,
+            [rect.x, rect.y],
+            [rect.width, rect.height],
+            theme.find_background,
+        );
+    }
     let chips = if terminal { 3 } else { 4 };
     let g = layout::FindGeometry::with_chips(rect, chips);
 
@@ -1381,7 +1380,7 @@ fn draw_find_bar(
                  placeholder: &str,
                  buffer: &Buffer,
                  focused: bool,
-                 trailing: Option<&str>| {
+                 trailing: Option<(&str, [f32; 4])>| {
         if focused {
             layout::push_focus_ring(glyphs, box_rect, layout::UI_RADIUS, 1.5, theme);
         }
@@ -1396,8 +1395,8 @@ fn draw_find_bar(
         // The match count first, so the text knows how much room is
         // left and never runs underneath it.
         let mut room = inner.width;
-        if let Some(trailing) = trailing {
-            layout::push_ui_text_right(glyphs, atlas, inner, trailing, theme.status_text);
+        if let Some((trailing, colour)) = trailing {
+            layout::push_ui_text_right(glyphs, atlas, inner, trailing, colour);
             room = (room - layout::ui_text_width(atlas, trailing) - 12.0).max(0.0);
         }
         layout::push_ui_field(
@@ -1421,17 +1420,19 @@ fn draw_find_bar(
 
     // "3 of 17" in the field it belongs to, which the bar never
     // reported at all: there was no way to tell a search that found
-    // nothing from one that found everything.
+    // nothing from one that found everything. Nothing found is said in
+    // the removed-lines red, the one colour here that means "no".
     let said = if bar.project {
-        (!bar.results.is_empty()).then(|| format!("{} found", bar.results.len()))
+        (!bar.results.is_empty())
+            .then(|| (format!("{} found", bar.results.len()), theme.status_text))
     } else {
         count.map(|(at, total)| match total {
-            0 => "No matches".to_string(),
+            0 => ("No matches".to_string(), theme.diff_removed),
             // The terminal's search stops at a limit; past it, more.
             n if terminal && n >= crate::platform::terminal::FIND_LIMIT => {
-                format!("{} of {n}+", at + 1)
+                (format!("{} of {n}+", at + 1), theme.status_text)
             }
-            n => format!("{} of {n}", at + 1),
+            n => (format!("{} of {n}", at + 1), theme.status_text),
         })
     };
     field(
@@ -1445,7 +1446,7 @@ fn draw_find_bar(
         },
         &bar.query,
         bar.has_keys && !bar.replacing,
-        said.as_deref(),
+        said.as_ref().map(|(text, colour)| (text.as_str(), *colour)),
     );
     if !terminal {
         field(
@@ -1537,8 +1538,8 @@ fn draw_find_bar(
             .draw(glyphs, atlas, theme);
     }
     if bar.project {
-        for (row, hit) in bar
-            .results
+        for (row, result) in bar
+            .rows
             .iter()
             .skip(bar.result_scroll)
             .take(FIND_RESULT_ROWS)
@@ -1551,6 +1552,7 @@ fn draw_find_bar(
                 width: (g.results.width - 16.0).max(0.0),
                 height: layout::FIND_ROW_HEIGHT,
             };
+            layout::hotspot(row_rect, layout::Cursor::Pointing, None);
             if bar.selected == bar.result_scroll + row {
                 layout::push_rounded_rect(
                     glyphs,
@@ -1562,36 +1564,99 @@ fn draw_find_bar(
                     layout::UI_RADIUS_SM,
                     theme.palette_selected,
                 );
+            } else if layout::hovered(row_rect) {
+                layout::push_rounded_rect(
+                    glyphs,
+                    Viewport {
+                        y: y + 1.0,
+                        height: layout::FIND_ROW_HEIGHT - 2.0,
+                        ..row_rect
+                    },
+                    layout::UI_RADIUS_SM,
+                    theme.row_hover,
+                );
             }
-            let path = tree
-                .root()
-                .and_then(|root| hit.path.strip_prefix(root).ok())
-                .unwrap_or(&hit.path);
-            // Where it is, then what it says, told apart by colour
-            // rather than run together into one monospace string.
-            let where_it_is = format!("{}:{}", path.display(), hit.line + 1);
-            let width = layout::ui_text_width(&mut renderer.atlas, &where_it_is);
-            layout::push_ui_text(
-                glyphs,
-                &mut renderer.atlas,
-                Viewport {
-                    x: row_rect.x + 8.0,
-                    ..row_rect
-                },
-                &where_it_is,
-                theme.accent,
-            );
-            layout::push_ui_text(
-                glyphs,
-                &mut renderer.atlas,
-                Viewport {
-                    x: row_rect.x + 20.0 + width,
-                    width: (row_rect.width - 28.0 - width).max(0.0),
-                    ..row_rect
-                },
-                hit.snippet.trim(),
-                theme.sidebar_text,
-            );
+            let atlas = &mut renderer.atlas;
+            match result {
+                // The file, and how many of the matches are in it.
+                ResultRow::File { first, count } => {
+                    let hit = &bar.results[*first];
+                    let path = tree
+                        .root()
+                        .and_then(|root| hit.path.strip_prefix(root).ok())
+                        .unwrap_or(&hit.path);
+                    let name = path.display().to_string();
+                    let width = layout::ui_text_width(atlas, &name);
+                    layout::push_ui_text(
+                        glyphs,
+                        atlas,
+                        Viewport {
+                            x: row_rect.x + 8.0,
+                            ..row_rect
+                        },
+                        &name,
+                        theme.text,
+                    );
+                    layout::push_ui_text(
+                        glyphs,
+                        atlas,
+                        Viewport {
+                            x: row_rect.x + 16.0 + width,
+                            width: (row_rect.width - 24.0 - width).max(0.0),
+                            ..row_rect
+                        },
+                        &format!("{count}"),
+                        theme.status_text,
+                    );
+                }
+                // One line: its number, then the line with each match
+                // on it marked as the document marks them.
+                ResultRow::Line { hits } => {
+                    let hit = &bar.results[hits.start];
+                    let number = (hit.line + 1).to_string();
+                    layout::push_ui_text_right(
+                        glyphs,
+                        atlas,
+                        Viewport {
+                            x: row_rect.x + 16.0,
+                            width: 36.0,
+                            ..row_rect
+                        },
+                        &number,
+                        theme.status_text,
+                    );
+                    let text_rect = Viewport {
+                        x: row_rect.x + 64.0,
+                        width: (row_rect.width - 72.0).max(0.0),
+                        ..row_rect
+                    };
+                    for h in &bar.results[hits.clone()] {
+                        let before = layout::ui_text_width(atlas, &hit.snippet[..h.at.start]);
+                        let span = layout::ui_text_width(atlas, &hit.snippet[h.at.clone()]);
+                        if span <= 0.0 || before >= text_rect.width {
+                            continue;
+                        }
+                        layout::push_rounded_rect(
+                            glyphs,
+                            Viewport {
+                                x: text_rect.x + before - 1.0,
+                                y: y + 7.0,
+                                width: (span + 2.0).min(text_rect.width - before),
+                                height: layout::FIND_ROW_HEIGHT - 14.0,
+                            },
+                            3.0,
+                            theme.find_match,
+                        );
+                    }
+                    layout::push_ui_text(
+                        glyphs,
+                        atlas,
+                        text_rect,
+                        &hit.snippet,
+                        theme.sidebar_text,
+                    );
+                }
+            }
         }
         if bar.searching {
             // Under way: a spinner by the words, and until the first

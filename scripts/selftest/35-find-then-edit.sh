@@ -20,9 +20,14 @@ key 53
 key 126 cmd
 text Y
 dump $T/find-edit-closed.out
+key 3 cmd f
+dump $T/find-edit-reopened.out
 quit
 SCRIPT
 CRC_SELFTEST="$T/find-edit.script" "$BIN" "$T/find-edit.txt" 2> "$T/find-edit.err"
 expect_line "$T/find-edit-typed.out" 1 "Zline 1"
 expect_line "$T/find-edit-refocused.out" 1 "Zline 1"
 expect_line "$T/find-edit-closed.out" 1 "YZline 1"
+# Cmd-F with nothing selected opens on the last search (the "q" that
+# replaced the selected "line 2" above), selected, with the keys.
+expect_terminal "$T/find-edit-reopened.out" 'find=q target=document keys=true'

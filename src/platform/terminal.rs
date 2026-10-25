@@ -945,9 +945,17 @@ impl Drop for SearchAll {
     }
 }
 
+/// The find bar is at most this wide: a panel at the top right of the
+/// pane, over the grid rather than taking room from it, which would
+/// resize the program's terminal. It used to span the pane, and hid a
+/// whole row of what the program printed for the sake of one field.
+const FIND_BAR_WIDTH: f32 = 560.0;
+/// Air between the bar and the pane's top and right edges.
+pub const FIND_BAR_MARGIN: f32 = 6.0;
+
 /// The find bar over the session with the keyboard, in the panel `rect`:
-/// one row across the top of its pane, over the grid rather than taking
-/// room from it, which would resize the program's terminal.
+/// one row at the top right of its pane, as wide as [`FIND_BAR_WIDTH`]
+/// or the pane.
 pub fn find_bar_rect(panel: &Panel, rect: Viewport) -> Viewport {
     let (header, screen) = split(rect);
     let pane = panel
@@ -955,17 +963,19 @@ pub fn find_bar_rect(panel: &Panel, rect: Viewport) -> Viewport {
         .into_iter()
         .find(|(tab, _)| *tab == panel.active)
         .map_or(screen, |(_, s)| s);
+    let room = pane.width + PAD * 2.0 - FIND_BAR_MARGIN;
+    let width = FIND_BAR_WIDTH.min(room).max(0.0);
     Viewport {
-        x: pane.x - PAD,
-        y: header.y + header.height,
-        width: pane.width + PAD * 2.0,
+        x: pane.x + pane.width + PAD - FIND_BAR_MARGIN - width,
+        y: header.y + header.height + FIND_BAR_MARGIN,
+        width,
         height: layout::FIND_ROW_HEIGHT,
     }
 }
 
 /// The screen rows the find bar hides, at the top.
 pub fn find_bar_rows(atlas: &Atlas) -> usize {
-    ((layout::FIND_ROW_HEIGHT - PAD * 0.5) / row_height(atlas)).ceil() as usize
+    ((FIND_BAR_MARGIN + layout::FIND_ROW_HEIGHT - PAD * 0.5) / row_height(atlas)).ceil() as usize
 }
 
 /// How far back to scroll so line `line` shows below the top `covered`
@@ -1565,8 +1575,8 @@ fn draw_screen(
                 );
             }
         }
-        // Find's matches, as the editor draws them: the current one also
-        // in the selection's colour, as the editor selects it.
+        // Find's matches, as the editor draws them: the current one in
+        // the stronger colour, so "2 of 7" can be seen as well as read.
         for &(_, from, to, current) in found.iter().filter(|f| f.0 == line) {
             let to = to.min(cols);
             if to <= from {
@@ -1574,10 +1584,12 @@ fn draw_screen(
             }
             let x = screen.x + from as f32 * advance;
             let width = (to - from) as f32 * advance;
-            layout::push_rect(out, atlas, [x, y], [width, row_h], theme.find_match);
-            if current {
-                layout::push_rect(out, atlas, [x, y], [width, row_h], theme.selection);
-            }
+            let colour = if current {
+                theme.find_current
+            } else {
+                theme.find_match
+            };
+            layout::push_rect(out, atlas, [x, y], [width, row_h], colour);
         }
         // The selection, over the backgrounds and under the text.
         if let Some((a, b)) = panel.selection.filter(|_| active) {
@@ -1687,9 +1699,16 @@ fn draw_screen(
     if back > 0 {
         let note = format!("↑ {back} lines");
         let width = layout::ui_text_width(atlas, &note) + 20.0;
+        // Under the find bar while it is open, which sits where the
+        // pill does.
+        let below_bar = if find.is_some() && active {
+            FIND_BAR_MARGIN * 2.0 + layout::FIND_ROW_HEIGHT - PAD * 0.5
+        } else {
+            0.0
+        };
         let pill = Viewport {
             x: screen.x + screen.width - width,
-            y: screen.y,
+            y: screen.y + below_bar,
             width,
             height: 22.0,
         };
@@ -1697,26 +1716,30 @@ fn draw_screen(
         layout::push_ui_text_centered(out, atlas, pill, &note, theme.status_text);
     }
     if let Some((first, total, top)) = kept {
-        draw_marks(tab, screen, (first, total, top, rows), atlas, theme, out);
+        let place = (first, total, top, rows);
+        let has_marks = tab.marks.iter().any(|m| m.line >= first);
+        let has_finds = find.is_some_and(|f| f.matches.iter().any(|h| h.start.0 >= first));
+        if has_marks || has_finds {
+            draw_track_band(screen, place, theme, out);
+        }
+        if has_marks {
+            draw_marks(tab, screen, (first, total), atlas, theme, out);
+        }
+        if let Some(find) = find.filter(|_| has_finds) {
+            draw_find_ticks(find, screen, place, atlas, theme, out);
+        }
     }
 }
 
-/// The prompts sent to a tab's agent, down its screen's right edge: a
-/// tick in the accent for each, where it is in the history, over a faint
-/// band for what the view shows, as the editor's scrollbar draws its
-/// thumb. Each tick names its prompt under the pointer. Nothing when the
-/// tab has no prompt still in its history.
-fn draw_marks(
-    tab: &Tab,
+/// The faint band down the track for what the view shows, as the
+/// editor's scrollbar draws its thumb: under the prompt marks and the
+/// find ticks, so each is read against where the view is.
+fn draw_track_band(
     screen: Viewport,
     (first, total, top, rows): (u64, usize, u64, usize),
-    atlas: &Atlas,
     theme: &Theme,
     out: &mut Vec<GlyphInstance>,
 ) {
-    if !tab.marks.iter().any(|m| m.line >= first) {
-        return;
-    }
     let track = mark_track(screen);
     let [r, g, b, _] = theme.status_text;
     let from = tick_y(track, top, first, total);
@@ -1728,6 +1751,94 @@ fn draw_marks(
         height: (to - from).max(TICK_HEIGHT * 2.0),
     };
     layout::push_rounded_rect(out, band, 2.0, [r, g, b, 0.12]);
+}
+
+/// Find's matches down the track: a tick in the match colour where each
+/// is in the history, the current one wider and in the stronger colour,
+/// so a search over a long session shows where it hit before the bar is
+/// stepped through. A press on one goes to it ([`find_tick_at`]).
+fn draw_find_ticks(
+    find: &Find,
+    screen: Viewport,
+    (first, total, _, _): (u64, usize, u64, usize),
+    atlas: &Atlas,
+    theme: &Theme,
+    out: &mut Vec<GlyphInstance>,
+) {
+    let track = mark_track(screen);
+    let mut last = f32::NEG_INFINITY;
+    let [r, g, b, _] = theme.find_match;
+    for (i, hit) in find.matches.iter().enumerate() {
+        if hit.start.0 < first {
+            continue;
+        }
+        let y = tick_y(track, hit.start.0, first, total);
+        let current = find.current == Some(i);
+        // Matches closer than a point draw as one; the current one always.
+        if y - last < 1.0 && !current {
+            continue;
+        }
+        last = y;
+        if current {
+            layout::push_rect(
+                out,
+                atlas,
+                [track.x, y - 1.0],
+                [track.width, TICK_HEIGHT + 2.0],
+                theme.find_current,
+            );
+        } else {
+            layout::push_rect(
+                out,
+                atlas,
+                [track.x + 2.0, y],
+                [track.width - 2.0, TICK_HEIGHT],
+                [r, g, b, 0.9],
+            );
+        }
+        layout::hotspot(
+            Viewport {
+                x: track.x,
+                y: y + TICK_HEIGHT / 2.0 - TICK_REACH,
+                width: track.width,
+                height: TICK_REACH * 2.0,
+            },
+            layout::Cursor::Pointing,
+            None,
+        );
+    }
+}
+
+/// The match whose tick is nearest `y` on the track, when a press there
+/// lands on one: the first of the matches on that line.
+pub fn find_tick_at(
+    track: Viewport,
+    y: f32,
+    matches: &[Hit],
+    first: u64,
+    total: usize,
+) -> Option<usize> {
+    let line = mark_at(track, y, matches.iter().map(|h| h.start.0), first, total)?;
+    matches.iter().position(|h| h.start.0 == line)
+}
+
+/// The prompts sent to a tab's agent, down its screen's right edge: a
+/// tick in the accent for each, where it is in the history, over a faint
+/// band for what the view shows, as the editor's scrollbar draws its
+/// thumb. Each tick names its prompt under the pointer. Nothing when the
+/// tab has no prompt still in its history.
+fn draw_marks(
+    tab: &Tab,
+    screen: Viewport,
+    (first, total): (u64, usize),
+    atlas: &Atlas,
+    theme: &Theme,
+    out: &mut Vec<GlyphInstance>,
+) {
+    if !tab.marks.iter().any(|m| m.line >= first) {
+        return;
+    }
+    let track = mark_track(screen);
     let mut last = f32::NEG_INFINITY;
     for mark in tab.marks.iter().filter(|m| m.line >= first) {
         let y = tick_y(track, mark.line, first, total);
@@ -2188,6 +2299,26 @@ mod tests {
             start: (line, col),
             spans: vec![(line, col, col + 1)],
         }
+    }
+
+    #[test]
+    fn a_press_on_a_find_tick_picks_the_first_match_of_its_line() {
+        let track = mark_track(Viewport {
+            x: 0.0,
+            y: 30.0,
+            width: 400.0,
+            height: 202.0,
+        });
+        let matches = vec![hit(1000, 0), hit(1050, 2), hit(1050, 9), hit(1099, 0)];
+        let at = |line: u64| tick_y(track, line, 1000, 100) + TICK_HEIGHT / 2.0;
+        assert_eq!(find_tick_at(track, at(1050), &matches, 1000, 100), Some(1));
+        assert_eq!(find_tick_at(track, at(1099), &matches, 1000, 100), Some(3));
+        assert_eq!(
+            find_tick_at(track, at(1000) + 3.5, &matches, 1000, 100),
+            Some(0)
+        );
+        assert_eq!(find_tick_at(track, at(1025), &matches, 1000, 100), None);
+        assert_eq!(find_tick_at(track, at(1050), &[], 1000, 100), None);
     }
 
     #[test]

@@ -200,6 +200,9 @@ cat > "$T/project-replace.script" <<SCRIPT
 wait 300
 key 3 cmd,shift f
 text needle
+wait 300
+wait 300
+dump $T/project-replace-typed.out
 key 36
 wait 300
 wait 200
@@ -213,6 +216,9 @@ dump $T/project-replace.out
 quit
 SCRIPT
 CRC_SELFTEST="$T/project-replace.script" "$BIN" "$T/replproj/a.txt" 2> "$T/project-replace.err"
+# Typed and left: searched without Return, listed by file and line.
+expect "$T/project-replace-typed.out" find_results "a.txt:1|a.txt:2|b.txt:1"
+expect "$T/project-replace-typed.out" find_rows "a.txt (2)|1 needle one|2 needle two|b.txt (1)|1 a needle in b"
 expect "$T/project-replace-found.out" find_results "a.txt:1|a.txt:2|b.txt:1"
 expect "$T/project-replace.out" message "replaced 3 in 2 files, 1 open and unsaved"
 expect_line "$T/project-replace.out" 1 "thread one"

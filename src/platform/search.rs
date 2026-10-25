@@ -149,7 +149,50 @@ pub struct ProjectHit {
     /// Bytes from the start of `line` to the match: how the hit is found
     /// again in an open document edited since the search read the disk.
     pub column: usize,
+    /// The line around the match, from [`snippet_around`].
     pub snippet: String,
+    /// The match's bytes in `snippet`, to show which part of the line hit.
+    pub at: Range<usize>,
+}
+
+/// A snippet shows this many characters of a line, this many of them
+/// before the match.
+const SNIPPET_WIDTH: usize = 100;
+const SNIPPET_BEFORE: usize = 30;
+
+/// Up to [`SNIPPET_WIDTH`] characters of `line` around the match at
+/// `at` (bytes of `line`), with an ellipsis at each end that was cut,
+/// leading blanks left out and trailing ones trimmed; and where the
+/// match is in it. The hits of one line get the same window, so the
+/// rows that list them can be one row with each match marked.
+pub fn snippet_around(line: &str, at: Range<usize>) -> (String, Range<usize>) {
+    let chars: Vec<(usize, char)> = line.char_indices().collect();
+    let count = chars.len();
+    let index = chars.partition_point(|&(b, _)| b < at.start.min(line.len()));
+    let mut from = index
+        .saturating_sub(SNIPPET_BEFORE)
+        .min(count.saturating_sub(SNIPPET_WIDTH));
+    // Blanks at the window's start are left out, not cut: an ellipsis
+    // stands only for characters.
+    let cut = from > 0;
+    while from < index && chars[from].1.is_whitespace() {
+        from += 1;
+    }
+    let to = (from + SNIPPET_WIDTH).min(count);
+    let byte_at = |i: usize| chars.get(i).map_or(line.len(), |&(b, _)| b);
+    let shown = line[byte_at(from)..byte_at(to)].trim_end();
+    let mut out = String::new();
+    if cut {
+        out.push('\u{2026}');
+    }
+    let lead = out.len();
+    out.push_str(shown);
+    if to < count {
+        out.push('\u{2026}');
+    }
+    let start = (at.start.min(line.len()).saturating_sub(byte_at(from))).min(shown.len());
+    let end = (at.end.min(line.len()).saturating_sub(byte_at(from))).clamp(start, shown.len());
+    (out, lead + start..lead + end)
 }
 
 /// Project search shows this many hits at most.
@@ -241,12 +284,17 @@ pub fn hits_in(
         let end = text[found.range.end..hi]
             .find('\n')
             .map_or(hi, |i| found.range.end + i);
+        let (snippet, at) = snippet_around(
+            &text[start..end],
+            found.range.start - start..found.range.end - start,
+        );
         hits.push(ProjectHit {
             path: path.to_path_buf(),
             column: found.range.start - line_start,
             range: found.range,
             line,
-            snippet: text[start..end].trim().chars().take(100).collect(),
+            snippet,
+            at,
         });
     }
     Ok(Some(hits))
@@ -295,6 +343,7 @@ mod tests {
             .collect();
         assert_eq!(at, [(1, 2, "water: evening"), (2, 0, "water the beds")]);
         assert_eq!(&text[hits[0].range.clone()], "water");
+        assert_eq!(&hits[0].snippet[hits[0].at.clone()], "water");
 
         let one = hits_in(text, path, "water", Options::default(), 1, &none)
             .unwrap()
@@ -323,7 +372,25 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(hits[0].column, 600);
-        assert_eq!(hits[0].snippet.chars().count(), 100);
-        assert!(hits[0].snippet.starts_with('é'));
+        assert_eq!(hits[0].snippet.chars().count(), 102, "100 and two ellipses");
+        assert!(hits[0].snippet.starts_with("\u{2026}é"));
+        assert_eq!(&hits[0].snippet[hits[0].at.clone()], "needle");
+    }
+
+    #[test]
+    fn a_snippet_marks_the_match_and_shares_a_short_line() {
+        let (snippet, at) = snippet_around("    let plant = plants[0];", 8..13);
+        assert_eq!(snippet, "let plant = plants[0];");
+        assert_eq!(&snippet[at], "plant");
+        // The second match of the same line: the same window, so a row
+        // can mark both.
+        let (again, at) = snippet_around("    let plant = plants[0];", 16..21);
+        assert_eq!(again, snippet);
+        assert_eq!(&again[at], "plant");
+        // Empty and out-of-range stay inside the string.
+        let (s, at) = snippet_around("", 0..0);
+        assert_eq!((s.as_str(), at), ("", 0..0));
+        let (s, at) = snippet_around("abc", 10..12);
+        assert_eq!((s.as_str(), at), ("abc", 3..3));
     }
 }

@@ -293,9 +293,11 @@ the size and write it back.
   is underlined. Drag to select (past the top or bottom scrolls the
   history under the pointer), `Cmd-A` selects everything the session
   printed, `Cmd-C` copies, `Cmd-V` pastes. `Cmd-F` searches what the
-  session printed (history and screen) with the same find bar as
-  documents, `Cmd-G` steps through the matches, and `Cmd-K` clears the
-  screen and history without sending anything to the program. A program
+  session printed (history and screen) from a small bar at the top
+  right of the session: the match you are on is the strong amber, every
+  match is a tick on the right-edge track (click one to go there),
+  `Cmd-G` steps through them, and `Cmd-K` clears the screen and history
+  without sending anything to the program. A program
   that asks for the mouse gets clicks, drags, the wheel and focus
   changes; hold Option or Shift to select text in it instead. A program
   can copy to the clipboard (OSC 52, as Claude Code does with what you
@@ -349,8 +351,9 @@ the size and write it back.
   version again, and Git > Clear History for This File or Clear All
   Local History deletes what was kept, after asking.
 - **Split panes** (`Cmd-\`), up to four, each with its own tabs.
-- **Project search** (`Cmd-Shift-F`) in the background, `Cmd-P` fuzzy file
-  open, and `>` in the same box to run any menu command.
+- **Project search** (`Cmd-Shift-F`) in the background as you type, listed
+  by file and line with each match marked; `Cmd-P` fuzzy file open, and
+  `>` in the same box to run any menu command.
 - **HTTP requests from `.http` files** (`Cmd-Return`) in the JetBrains and
   VS Code REST Client format, with environments and a response tab.
 - **Markdown** is styled where it is written: its syntax hidden on lines
@@ -371,8 +374,9 @@ the size and write it back.
   system or your setting, a home screen with recent projects, overlay
   scrollbars, font zoom, and the right pointer for every control.
 - Everything an editor needs: multiple cursors (`Cmd-D`, Option-click,
-  Option-drag for a box), find
-  and replace with regex, go to line, comment toggle, line move and
+  Option-drag for a box), find and replace with regex (the current match
+  in a stronger colour, a tick per match on the scrollbar, the last search
+  offered again), go to line, comment toggle, line move and
   duplicate, auto-indent and auto-close, word-wise and Emacs motions, full
   Unicode with emoji and CJK, session restore, Dock and Finder integration.
 

@@ -2,6 +2,22 @@
 
 One entry per tag, written for people who use the editor.
 
+## Unreleased
+
+- Find, in terminals and documents: the match you are on is in a
+  stronger amber than the others, so "3 of 17" can be seen as well as
+  read; "No matches" is said in red. The terminal's find bar is a small
+  panel at the top right of the session instead of a strip across it,
+  so it no longer hides a row of what the program printed. Every match
+  gets a tick on the terminal's right-edge track (where the prompt ticks
+  are) and on the editor's scrollbar, so a search over a long session or
+  file shows where it hit; click a tick to go there. The bar opens on
+  your last search, selected, when nothing is selected in the text.
+- Project search (`Cmd-Shift-F`) searches as you type, once typing
+  pauses, and lists what it finds by file and line: a row per file with
+  its count, then one row per line with each match on it marked. Three
+  matches on a line used to be three rows saying the same thing.
+
 ## v0.2.0-alpha.30, 2026-10-21
 
 - `Cmd-P` in Agents mode switches sessions and workspaces: the most
