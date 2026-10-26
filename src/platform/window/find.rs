@@ -17,9 +17,34 @@ impl EditorView {
         };
 
         const TAB: u16 = 48;
+        let option = flags.contains(NSEventModifierFlags::Option);
+        // Filter mode's list takes the arrows, Return and Escape; typing
+        // still edits the query, and the list follows it.
+        if self.terminal_filter_open() && !command {
+            match code {
+                ESCAPE => {
+                    self.toggle_terminal_filter();
+                    return true;
+                }
+                key::UP | key::DOWN => {
+                    self.terminal_filter_move(if code == key::UP { -1 } else { 1 });
+                    return true;
+                }
+                key::RETURN if !option => {
+                    self.terminal_filter_pick(None);
+                    return true;
+                }
+                _ => {}
+            }
+        }
         match code {
             ESCAPE => {
                 self.close_find();
+                return true;
+            }
+            // Over the terminal, Option-Return lists the lines with a match.
+            key::RETURN if option && self.searching_terminal() => {
+                self.toggle_terminal_filter();
                 return true;
             }
             TAB => {
@@ -321,12 +346,18 @@ impl EditorView {
         // 66pt wide in the handler and 62pt wide on screen, so a click beside
         // a chip still toggled it.
         let terminal = self.searching_terminal();
-        // Aa, Word and .*; over the terminal, one row with no Replace.
-        let g = layout::FindGeometry::panel(rect, 3, !terminal);
+        // Aa, Word and .*; over the terminal, one row with no Replace and
+        // Filter after them.
+        let g = layout::FindGeometry::panel(rect, super::render::find_chips(terminal), !terminal);
 
         for (slot, hit) in g.options.iter().enumerate() {
             if !hit.contains(x, y) {
                 continue;
+            }
+            if slot == 3 {
+                // Only the terminal's bar has a fourth chip: Filter.
+                self.toggle_terminal_filter();
+                return;
             }
             {
                 let Some(mut state) = self.state_mut() else {

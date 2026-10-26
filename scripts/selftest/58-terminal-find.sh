@@ -132,3 +132,93 @@ HOME="$T/home/tfindagents" CRC_TERMINAL_SHELL=/bin/sh CRC_SELFTEST="$T/tfindagen
 expect_terminal "$T/tfindagents-open.out" 'find=needle 3 of 3 target=terminal keys=true'
 # The command and what it printed: the new pane's own two.
 expect_terminal "$T/tfindagents-split.out" 'find=needle 2 of 2 target=terminal keys=true'
+
+# ---- find while a program prints, and filter mode -----------------------------
+# The bar stays open over a shell printing two hundred thousand lines: the
+# search runs on a worker as the output arrives, and once it stops the
+# count is right. Then the lines with a match: Option-Return lists them
+# over the screen, on the current match's line (the first after where the
+# last query's was); Down and Up choose another and Return jumps to its
+# match, scrolled into view, with the list gone. Escape closes the list
+# before the bar. The Filter chip opens it too, and a click on a row
+# jumps.
+mkdir -p "$T/tfindbig"
+printf 'untouched\n' > "$T/tfindbig/notes.txt"
+cp "$T/tfindproj/lines.sh" "$T/tfindbig/lines.sh"
+cat > "$T/tfindbig.script" <<SCRIPT
+wait 500
+click @toolbar.terminal
+wait 700
+wait 700
+text cd $T/tfindbig
+key 36
+key 3 cmd f
+text 199999
+wait 200
+clickin @terminal 30 200
+text clear; seq 1 200000; sh lines.sh
+key 36
+wait 1500
+wait 1500
+wait 1500
+dump $T/tfindbig-count.out
+key 3 cmd f
+text needle
+wait 300
+key 36 opt
+wait 200
+dump $T/tfindbig-filter.out
+key 125
+key 125
+key 126
+key 36
+wait 200
+dump $T/tfindbig-picked.out
+key 36 opt
+wait 200
+key 53
+wait 200
+dump $T/tfindbig-escaped.out
+click @find.filter
+wait 200
+dump $T/tfindbig-chip.out
+click @find.filter.row.2
+wait 200
+dump $T/tfindbig-third.out
+key 36 opt
+wait 200
+click @find.filter.row.1
+wait 200
+dump $T/tfindbig-clicked.out
+quit
+SCRIPT
+CRC_TERMINAL_SHELL=/bin/sh CRC_SELFTEST="$T/tfindbig.script" "$BIN" "$T/tfindbig/notes.txt" 2> "$T/tfindbig.err"
+# The newest line of the output is the only one with 199999; the command
+# typed is not in the history any more.
+expect_terminal "$T/tfindbig-count.out" 'find=199999 1 of 1 target=terminal keys=false'
+if ! grep -qF 'terminal_find: busy=false searching=false ' "$T/tfindbig-count.out"; then
+    failed "tfindbig-count.out: a search is still on its way: $(grep -m1 '^terminal_find: ' "$T/tfindbig-count.out")"
+fi
+# One row per line, the wrapped one once, each match in brackets; the
+# current match's line chosen: the first after 199999, which comes before
+# the script's output.
+filter_rows() {
+    grep -m1 '^terminal_find: ' "$1" | sed 's/.* filter=//'
+}
+if ! filter_rows "$T/tfindbig-filter.out" \
+    | grep -qE '^\*[0-9]+ alpha \[needle\] one\|[0-9]+ .0+ \[needle\] two\|[0-9]+ omega \[needle\] three$'; then
+    failed "tfindbig-filter.out: the list is [$(filter_rows "$T/tfindbig-filter.out")]"
+fi
+expect_terminal "$T/tfindbig-filter.out" 'find=needle 1 of 3 target=terminal keys=true'
+# Down to the last row, up to the wrapped line, and Return: its match.
+expect_terminal "$T/tfindbig-picked.out" 'find=needle 2 of 3 target=terminal keys=true'
+expect "$T/tfindbig-picked.out" terminal_find 'busy=false searching=false shown=true filter=off'
+expect_terminal "$T/tfindbig-escaped.out" 'find=needle 2 of 3 target=terminal keys=true'
+expect "$T/tfindbig-escaped.out" terminal_find 'busy=false searching=false shown=true filter=off'
+if ! filter_rows "$T/tfindbig-chip.out" | grep -qE '^[0-9]+ alpha \[needle\] one\|\*[0-9]+ '; then
+    failed "tfindbig-chip.out: the list is [$(filter_rows "$T/tfindbig-chip.out")]"
+fi
+expect_terminal "$T/tfindbig-third.out" 'find=needle 3 of 3 target=terminal keys=true'
+expect "$T/tfindbig-third.out" terminal_find 'busy=false searching=false shown=true filter=off'
+expect_terminal "$T/tfindbig-clicked.out" 'find=needle 2 of 3 target=terminal keys=true'
+expect "$T/tfindbig-clicked.out" terminal_find 'busy=false searching=false shown=true filter=off'

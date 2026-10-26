@@ -486,6 +486,11 @@ impl State {
             && !(self.terminal.selecting && self.terminal.drag_point.is_some())
             && self.project_search.rx.is_none()
             && self.term_search.as_ref().is_none_or(|s| !s.busy())
+            && self
+                .find
+                .as_ref()
+                .and_then(|bar| bar.terminal.as_ref())
+                .is_none_or(|find| !find.busy())
             && self.http.is_none()
             && self.query_job.is_none()
             && self.update.is_none()

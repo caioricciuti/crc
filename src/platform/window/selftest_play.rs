@@ -419,8 +419,10 @@ impl EditorView {
                     // The Review page's reads too, so a read asked for
                     // while one ran lands within the same wait.
                     self.poll_review();
-                    // And Find in Terminals', due after a pause in typing.
+                    // And Find in Terminals', due after a pause in typing,
+                    // and the terminal find bar's.
                     self.poll_terminal_search();
+                    self.poll_terminal_find();
                 }
                 self.check_open_files();
                 self.poll_tree_children();
@@ -767,9 +769,57 @@ impl EditorView {
                 };
                 // Syntax spans the last frame drew the editor with.
                 let spans = state.spans.len();
+                // The terminal's find: whether a search is on its way, and
+                // filter mode's list, each row "number text" with its
+                // matches in brackets, the chosen one starred; and whether
+                // the current match is in view below the bar.
+                let terminal_find = state
+                    .find
+                    .as_ref()
+                    .and_then(|bar| bar.terminal.as_ref())
+                    .map_or("none".to_string(), |find| {
+                        let rows = find.filter.map_or("off".to_string(), |filter| {
+                            find.rows
+                                .iter()
+                                .enumerate()
+                                .map(|(i, row)| {
+                                    let mut text = String::new();
+                                    for (at, ch) in row.text.chars().enumerate() {
+                                        if row.marks.iter().any(|m| m.0 == at) {
+                                            text.push('[');
+                                        }
+                                        text.push(ch);
+                                        if row.marks.iter().any(|m| m.1 == at + 1) {
+                                            text.push(']');
+                                        }
+                                    }
+                                    let star = if i == filter.selected { "*" } else { "" };
+                                    let number = row.line.saturating_sub(find.first_line) + 1;
+                                    format!("{star}{number} {text}")
+                                })
+                                .collect::<Vec<_>>()
+                                .join("|")
+                        });
+                        let shown = find.current_hit().is_some_and(|hit| {
+                            state.terminal.active_tab().is_some_and(|tab| {
+                                let term =
+                                    tab.session.term.lock().unwrap_or_else(|e| e.into_inner());
+                                let covered =
+                                    crate::platform::terminal::find_bar_rows(&state.renderer.atlas);
+                                let top = term.view_line(0, state.terminal.back);
+                                hit.start.0 >= top + covered as u64
+                                    && hit.start.0 < top + term.rows() as u64
+                            })
+                        });
+                        format!(
+                            "busy={} searching={} shown={shown} filter={rows}",
+                            find.busy(),
+                            find.searching()
+                        )
+                    });
                 let report = format!(
                     // First: the report ends with the document's text.
-                    "message: {}\npreview: {}\nmd: {md}\nspans: {spans}\nactivity: {}\npointer_targets: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nrepo: {}\ngit_note: {}\nhome: {}\nhome_scroll: {}\nmcp: {}\nmcp_page: {}\nsettings_page: {}\nterminals: {}\nagents: {}\ninspector: {}\nteams: {}\nagents_tree: {}\nagents_activity: {}\nagents_prs: {}\nmenubar: {}\nconflicts: {}\ngit_conflicts: {}\ntable: {}\nquery: {}\nquery_sql: {}\nblame: {}\nfind_results: {}\nfind_rows: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\npeek: {}\ngutter: {}\nissue_tab: {}\nscrub: {}\nscrub_strip: {}\nscrub_fade: {}\nscrub_filter: {}\nscrub_compare: {}\nblame_heat: {}\nreplaced: {}\n{report}",
+                    "message: {}\npreview: {}\nmd: {md}\nspans: {spans}\nterminal_find: {terminal_find}\nactivity: {}\npointer_targets: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nrepo: {}\ngit_note: {}\nhome: {}\nhome_scroll: {}\nmcp: {}\nmcp_page: {}\nsettings_page: {}\nterminals: {}\nagents: {}\ninspector: {}\nteams: {}\nagents_tree: {}\nagents_activity: {}\nagents_prs: {}\nmenubar: {}\nconflicts: {}\ngit_conflicts: {}\ntable: {}\nquery: {}\nquery_sql: {}\nblame: {}\nfind_results: {}\nfind_rows: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\npeek: {}\ngutter: {}\nissue_tab: {}\nscrub: {}\nscrub_strip: {}\nscrub_fade: {}\nscrub_filter: {}\nscrub_compare: {}\nblame_heat: {}\nreplaced: {}\n{report}",
                     state.message.as_ref().map_or("", |(text, _)| text.as_str()),
                     state.html_preview.as_ref().map_or("closed".to_string(), |p| format!(
                         "open ext={} view={} probe={}",

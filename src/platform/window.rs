@@ -2002,11 +2002,15 @@ define_class!(
                 }
                 Some(Hit::Terminal) => {
                     // Its find bar stays open with its matches; typing
-                    // goes to the terminal again.
+                    // goes to the terminal again, and filter mode's list,
+                    // which only the bar's keys move, goes.
                     if let Some(mut state) = self.state_mut()
                         && let Some(bar) = state.find.as_mut().filter(|b| b.terminal.is_some())
                     {
                         bar.has_keys = false;
+                        if let Some(find) = bar.terminal.as_mut() {
+                            find.filter = None;
+                        }
                     }
                     self.terminal_press(event, x, y);
                     return;
@@ -2174,6 +2178,27 @@ define_class!(
                     }
                     return;
                 }
+                Some(Hit::FindFilter) => {
+                    self.toggle_terminal_filter();
+                    return;
+                }
+                Some(Hit::FindFilterRow(n)) => {
+                    let row = self.state().and_then(|state| {
+                        let find = state.find.as_ref()?.terminal.as_ref()?;
+                        let visible = terminal::filter_visible(&state);
+                        let first = crate::platform::terminal::filter_first(
+                            find.filter?.scroll,
+                            find.rows.len(),
+                            visible,
+                        );
+                        Some(first + n)
+                    });
+                    self.terminal_filter_pick(row);
+                    return;
+                }
+                // Between its rows, the list keeps the press from the
+                // screen under it.
+                Some(Hit::FindFilterList) => return,
                 Some(Hit::Pane(index)) => {
                     // The click gives the pane the keyboard and then lands
                     // in it as a click in the focused pane would.
@@ -3020,6 +3045,7 @@ define_class!(
             self.poll_project_index();
             self.poll_project_search();
             self.poll_terminal_search();
+            self.poll_terminal_find();
             self.poll_branches();
             self.poll_history_reply();
             self.poll_home();
@@ -7601,6 +7627,26 @@ fn frame_of(state: &mut State) -> Frame {
         }
         _ => Vec::new(),
     };
+    // Filter mode's rows showing, then its list around them.
+    let mut filter_hits = Vec::new();
+    if let Some(list) = terminal::filter_rect(state, &chrome)
+        && let Some(find) = state.find.as_ref().and_then(|bar| bar.terminal.as_ref())
+    {
+        let atlas = &state.renderer.atlas;
+        let visible = crate::platform::terminal::filter_visible(list, atlas);
+        let first = crate::platform::terminal::filter_first(
+            find.filter.map_or(0, |f| f.scroll),
+            find.rows.len(),
+            visible,
+        );
+        for n in 0..visible.min(find.rows.len() - first) {
+            filter_hits.push((
+                Hit::FindFilterRow(n),
+                crate::platform::terminal::filter_row_rect(list, n, atlas),
+            ));
+        }
+        filter_hits.push((Hit::FindFilterList, list));
+    }
     let mut frame = Frame::default();
     let State {
         tree,
@@ -7839,9 +7885,17 @@ fn frame_of(state: &mut State) -> Frame {
             frame.push(hit, rect);
         }
     }
-    // Before the terminal: the terminal's bar is over its screen.
+    // Before the terminal: the terminal's bar is over its screen, and so
+    // is filter mode's list.
+    if let Some(bar) = terminal_find.filter(|_| chrome.find.is_none()) {
+        let g = layout::FindGeometry::panel(bar, render::find_chips(true), false);
+        frame.push(Hit::FindFilter, g.options[3]);
+    }
     if let Some(find) = chrome.find.or(terminal_find) {
         frame.push(Hit::Find, find);
+    }
+    for (hit, rect) in filter_hits {
+        frame.push(hit, rect);
     }
     if let Some(rect) = chrome.terminal {
         let (header, _) = crate::platform::terminal::split(rect);

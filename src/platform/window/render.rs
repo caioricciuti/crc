@@ -56,6 +56,7 @@ impl EditorView {
         let column = column_of(&state);
         let chrome = chrome_of(&state);
         let terminal_find_rect = super::terminal::find_rect(&state, &chrome);
+        let terminal_filter_rect = super::terminal::filter_rect(&state, &chrome);
         let carets_on = !self.caret_blinks(&state) || caret_phase(state.caret_since.elapsed()).0;
         let State {
             docs,
@@ -1007,6 +1008,16 @@ impl EditorView {
         {
             let count = searching.error.is_none().then(|| searching.count());
             draw_find_bar(glyphs, renderer, theme, rect, bar, count);
+            // Filter mode's list, under the bar and over the screen.
+            if let Some(list) = terminal_filter_rect {
+                crate::platform::terminal::draw_filter(
+                    searching,
+                    &mut renderer.atlas,
+                    list,
+                    theme,
+                    glyphs,
+                );
+            }
         }
 
         // Status line along the bottom, spanning the full width.
@@ -1366,7 +1377,8 @@ impl EditorView {
 /// The find bar: its two fields, the buttons and options beside them and,
 /// for a project search, the results under them. `count` is the current
 /// match's place from 0 and how many there are, in the document or the
-/// terminal. Over the terminal it is one row: no Replace, no Project.
+/// terminal. Over the terminal it is one row: no Replace, no Project, and
+/// a Filter chip for the list of the lines with a match.
 fn draw_find_bar(
     glyphs: &mut Vec<GlyphInstance>,
     renderer: &mut Renderer,
@@ -1379,7 +1391,7 @@ fn draw_find_bar(
     // A panel floating over the text or the screen, with the palette's
     // edge, so it reads as laid on it rather than cut into it.
     layout::push_panel(glyphs, rect, layout::UI_RADIUS_LG, theme);
-    let g = layout::FindGeometry::panel(rect, 3, !terminal);
+    let g = layout::FindGeometry::panel(rect, find_chips(terminal), !terminal);
     if !terminal {
         Button::new(g.toggle)
             .icon(if bar.show_replace {
@@ -1448,7 +1460,14 @@ fn draw_find_bar(
     // reported at all: there was no way to tell a search that found
     // nothing from one that found everything. Nothing found is said in
     // the removed-lines red, the one colour here that means "no".
+    // A terminal search for a new query that is taking a while says so
+    // where its count will be.
+    let searching = bar
+        .terminal
+        .as_ref()
+        .is_some_and(|find| find.searching_shown());
     let said = count.map(|(at, total)| match total {
+        _ if searching => ("Searching\u{2026}".to_string(), theme.status_text),
         0 => ("No matches".to_string(), theme.diff_removed),
         // The terminal's search stops at a limit; past it, more.
         n if terminal && n >= crate::platform::terminal::FIND_LIMIT => {
@@ -1529,6 +1548,19 @@ fn draw_find_bar(
             .tip(tip)
             .draw(glyphs, atlas, theme);
     }
+    if let Some(find) = bar.terminal.as_ref() {
+        Button::new(g.options[3])
+            .label("Filter")
+            .on(find.filter.is_some())
+            .tip("Show Matching Lines  \u{2325}\u{21b5}")
+            .draw(glyphs, atlas, theme);
+    }
+}
+
+/// The find bar's option chips: Aa, Word and .*, and over the terminal
+/// Filter too.
+pub(super) fn find_chips(terminal: bool) -> usize {
+    if terminal { 4 } else { 3 }
 }
 
 /// A one-line prompt over the status row: its label, then the field with

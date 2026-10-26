@@ -3282,6 +3282,11 @@ pub enum Hit {
     /// A part of the breadcrumb path, left to right.
     Breadcrumb(usize),
     Find,
+    /// The terminal's find bar's Filter chip, filter mode's list, and the
+    /// `n`th row showing in it.
+    FindFilter,
+    FindFilterList,
+    FindFilterRow(usize),
     Text,
     Status,
     /// The branch named in the status bar: it opens the branch list.
@@ -3382,6 +3387,9 @@ impl Hit {
             Hit::TableExport => "table.export".into(),
             Hit::Breadcrumb(i) => format!("breadcrumb.{i}"),
             Hit::Find => "find".into(),
+            Hit::FindFilter => "find.filter".into(),
+            Hit::FindFilterList => "find.filter.list".into(),
+            Hit::FindFilterRow(i) => format!("find.filter.row.{i}"),
             Hit::Text => "text".into(),
             Hit::Status => "status".into(),
             Hit::StatusBranch => "status.branch".into(),

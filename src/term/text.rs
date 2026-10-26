@@ -101,50 +101,37 @@ impl Term {
     /// wrapped joined, the rest each ending in a newline without their
     /// trailing blanks.
     pub fn haystack(&self) -> Haystack {
+        hay_of(
+            self.searched()
+                .filter_map(|number| Some((number, self.line(number)?))),
+        )
+    }
+
+    /// The cells [`Term::haystack`] reads, copied out, the blanks after
+    /// each line that ends in a newline left behind: what has to be done
+    /// under the lock, so the text can be made and searched after it is
+    /// let go. Copying cells is the cheap half of making the text.
+    pub fn find_lines(&self) -> Lines {
+        Lines {
+            rows: self
+                .searched()
+                .filter_map(|number| {
+                    let cells = self.line(number)?;
+                    Some((number, cells[..kept(cells)].to_vec()))
+                })
+                .collect(),
+            first: self.dropped,
+        }
+    }
+
+    /// The numbers of the lines Find searches.
+    fn searched(&self) -> std::ops::Range<u64> {
         let first = if self.alternate {
             self.screen_base()
         } else {
             self.dropped
         };
-        let last = self.screen_base() + self.rows as u64;
-        let mut hay = Haystack::default();
-        for number in first..last {
-            let Some(cells) = self.line(number) else {
-                continue;
-            };
-            let wrapped = cells.last().is_some_and(|c| c.flags & WRAPPED != 0);
-            let end = if wrapped {
-                cells.len()
-            } else {
-                cells
-                    .iter()
-                    .rposition(|c| c.ch != ' ' || c.flags & WIDE_TAIL != 0)
-                    .map_or(0, |i| i + 1)
-            };
-            let mut row = HayRow {
-                line: number,
-                start: hay.text.len(),
-                end: 0,
-                columns: Vec::new(),
-            };
-            for (col, cell) in cells[..end].iter().enumerate() {
-                if cell.flags & WIDE_TAIL != 0 {
-                    // The left half's character spans this column too.
-                    if let Some(last) = row.columns.last_mut() {
-                        last.1 = col as u16 + 1;
-                    }
-                    continue;
-                }
-                hay.text.push(cell.ch);
-                row.columns.push((col as u16, col as u16 + 1));
-            }
-            row.end = hay.text.len();
-            hay.rows.push(row);
-            if !wrapped {
-                hay.text.push('\n');
-            }
-        }
-        hay
+        first..self.screen_base() + self.rows as u64
     }
 
     /// The link under column `col` of line `line`, for a Command-click:
@@ -231,6 +218,77 @@ impl Term {
                     .collect()
             })
             .unwrap_or_default()
+    }
+}
+
+/// The cells of `cells` a search reads: all of a line the terminal
+/// wrapped, otherwise up to its last character.
+fn kept(cells: &[Cell]) -> usize {
+    if cells.last().is_some_and(|c| c.flags & WRAPPED != 0) {
+        return cells.len();
+    }
+    cells
+        .iter()
+        .rposition(|c| c.ch != ' ' || c.flags & WIDE_TAIL != 0)
+        .map_or(0, |i| i + 1)
+}
+
+/// The text of `lines`, each a number and its cells, as one: lines the
+/// terminal wrapped joined, the rest each ending in a newline without
+/// their trailing blanks.
+fn hay_of<'a>(lines: impl Iterator<Item = (u64, &'a [Cell])>) -> Haystack {
+    let mut hay = Haystack::default();
+    for (number, cells) in lines {
+        let wrapped = cells.last().is_some_and(|c| c.flags & WRAPPED != 0);
+        let mut row = HayRow {
+            line: number,
+            start: hay.text.len(),
+            end: 0,
+            columns: Vec::new(),
+        };
+        for (col, cell) in cells[..kept(cells)].iter().enumerate() {
+            if cell.flags & WIDE_TAIL != 0 {
+                // The left half's character spans this column too.
+                if let Some(last) = row.columns.last_mut() {
+                    last.1 = col as u16 + 1;
+                }
+                continue;
+            }
+            hay.text.push(cell.ch);
+            row.columns.push((col as u16, col as u16 + 1));
+        }
+        row.end = hay.text.len();
+        hay.rows.push(row);
+        if !wrapped {
+            hay.text.push('\n');
+        }
+    }
+    hay
+}
+
+/// What Find searches in a terminal, copied out by [`Term::find_lines`]:
+/// each line's number and cells, and the number of the first line the
+/// terminal still kept.
+#[derive(Default)]
+pub struct Lines {
+    rows: Vec<(u64, Vec<Cell>)>,
+    first: u64,
+}
+
+impl Lines {
+    /// The text a search runs over, as [`Term::haystack`] makes it.
+    pub fn haystack(&self) -> Haystack {
+        hay_of(
+            self.rows
+                .iter()
+                .map(|(number, cells)| (*number, &cells[..])),
+        )
+    }
+
+    /// The number of the first line the terminal still kept when they
+    /// were copied.
+    pub fn first_line(&self) -> u64 {
+        self.first
     }
 }
 

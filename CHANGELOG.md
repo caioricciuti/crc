@@ -7,6 +7,14 @@ One entry per tag, written for people who use the editor.
 - Agents mode: a workspace comes back on the tab you left it on. Going
   to another workspace and back used to land on a waiting session or on
   the newest tab instead.
+- Find in a terminal searches on a worker thread, so a long history or
+  a program printing fast no longer stalls typing; the count stays until
+  the new one is ready, and says "Searching..." when a search takes a
+  moment. Cmd-G pressed meanwhile waits for the answer.
+- Filter mode in the terminal's find bar: Option-Return or the Filter
+  chip lists each line with a match over the screen, matches marked.
+  Up and Down choose a line, Return or a click jumps to it, Escape closes
+  the list.
 
 ## v0.2.0-alpha.31, 2026-10-25
 

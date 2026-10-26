@@ -640,14 +640,71 @@ pub struct Hit {
     pub spans: Vec<(u64, usize, usize)>,
 }
 
+/// What a search of a session is for: the session (its terminal's
+/// address), its generation, the query and the options.
+pub type FindKey = (usize, u64, String, crate::platform::search::Options);
+
+/// Output alone is searched again at most this often, so a busy program
+/// is not searched on every frame.
+pub const FIND_AGAIN_AFTER: Duration = Duration::from_millis(100);
+/// A search for a new query running this long has the bar say so.
+const SEARCHING_SHOWN_AFTER: Duration = Duration::from_millis(150);
+
+/// A line of filter mode's list: the first match on it, the line it
+/// starts on, the line's text around it, and the characters `[from, to)`
+/// of that text each match on the line covers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FilterRow {
+    /// Its first match, by its place in [`Find::matches`].
+    pub hit: usize,
+    pub line: u64,
+    pub text: String,
+    pub marks: Vec<(usize, usize)>,
+}
+
+/// Filter mode's list while it shows: the row chosen, and the first row
+/// showing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Filter {
+    pub selected: usize,
+    pub scroll: usize,
+}
+
+/// What a search of a session found: the matches, the list of the lines
+/// they are on, and the number of the first line the session kept.
+#[derive(Default)]
+pub struct Found {
+    pub matches: Vec<Hit>,
+    pub rows: Vec<FilterRow>,
+    pub first: u64,
+}
+
+/// A terminal search's number and what it found.
+type FindAnswer = (u64, Found);
+
+/// What [`Find::sync`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Synced {
+    /// The matches are for what was asked, or on their way.
+    Fresh,
+    /// Only the output changed, and it was searched a moment ago: a frame
+    /// has to look again.
+    Later,
+    /// A search started on a worker.
+    Started,
+    /// Answered at once: an empty query, or a pattern that is not valid,
+    /// in the search's words.
+    Done(Option<String>),
+}
+
 /// Find in the terminal: the active session's matches and the one the bar
-/// is on. Searched again when the output, the query, the options or the
-/// session change; see [`Find::stale`].
+/// is on. Searched on a worker when the output, the query, the options or
+/// the session change (see [`Find::sync`]); the matches it has stay drawn
+/// until the answer comes.
 #[derive(Default)]
 pub struct Find {
-    /// The session (its terminal's address), its generation, the query
-    /// and the options the matches are for.
-    pub made_for: Option<(usize, u64, String, crate::platform::search::Options)>,
+    /// What the matches are for.
+    pub made_for: Option<FindKey>,
     pub matches: Vec<Hit>,
     pub current: Option<usize>,
     /// Where the current match starts, so it stays current while output
@@ -655,7 +712,27 @@ pub struct Find {
     pub anchor: Option<(u64, usize)>,
     /// An invalid pattern, in the search's words.
     pub error: Option<String>,
-    pub searched: Option<std::time::Instant>,
+    /// When the last search started.
+    pub searched: Option<Instant>,
+    /// One row per line with a match, for filter mode, and the number of
+    /// the first line the session kept when they were found.
+    pub rows: Vec<FilterRow>,
+    pub first_line: u64,
+    /// Filter mode's list, while it shows over the screen.
+    pub filter: Option<Filter>,
+    /// A step asked for before the matches of a new query came, forward
+    /// or back: taken once they do.
+    pub pending_step: Option<bool>,
+    /// The current match is to be scrolled into view once the answer
+    /// comes.
+    pub reveal: bool,
+    /// A frame was asked for to say the search is taking a while.
+    pub said_searching: bool,
+    /// The search running: its number, what it is for, and where its
+    /// answer arrives.
+    running: Option<(u64, FindKey, std::sync::mpsc::Receiver<FindAnswer>)>,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    generation: u64,
 }
 
 impl Find {
@@ -665,6 +742,11 @@ impl Find {
     pub fn take(&mut self, matches: Vec<Hit>) {
         self.matches = matches;
         self.error = None;
+        self.place();
+    }
+
+    /// The current match from the anchor, as [`Find::take`] says.
+    fn place(&mut self) {
         self.current = match self.anchor {
             _ if self.matches.is_empty() => None,
             None => Some(self.matches.len() - 1),
@@ -703,6 +785,209 @@ impl Find {
     pub fn count(&self) -> (usize, usize) {
         (self.current.unwrap_or(0), self.matches.len())
     }
+
+    /// Whether a search runs on a worker.
+    pub fn busy(&self) -> bool {
+        self.running.is_some()
+    }
+
+    /// Whether the matches shown are for another query, other options or
+    /// another session than the search on its way: a step waits for the
+    /// answer.
+    pub fn searching(&self) -> bool {
+        let Some((_, asked, _)) = &self.running else {
+            return false;
+        };
+        self.made_for
+            .as_ref()
+            .is_none_or(|made| made.0 != asked.0 || made.2 != asked.2 || made.3 != asked.3)
+    }
+
+    /// Whether the bar says it is searching: [`Find::searching`] for a
+    /// moment already. Most searches answer before a frame would show it,
+    /// and saying so for one frame on every key typed would only flicker.
+    pub fn searching_shown(&self) -> bool {
+        self.searching()
+            && self
+                .searched
+                .is_some_and(|at| at.elapsed() >= SEARCHING_SHOWN_AFTER)
+    }
+
+    /// The main thread's part of keeping the matches up to date with `key`
+    /// in `term`, which the caller holds locked: the matches of lines the
+    /// session no longer keeps go, and a search starts when the session,
+    /// the query or the options changed, or the output did and it was not
+    /// searched in the last [`FIND_AGAIN_AFTER`] (`forced` or not). One
+    /// for the output alone waits for the one running; one for anything
+    /// else stops it. Only the cells are copied here; the text is made
+    /// and searched on the worker.
+    pub fn sync(&mut self, key: FindKey, term: &term::Term, forced: bool) -> Synced {
+        self.prune(term.first_line());
+        let asked = self
+            .running
+            .as_ref()
+            .map(|(_, asked, _)| asked)
+            .or(self.made_for.as_ref());
+        if let Some(asked) = asked {
+            if *asked == key {
+                return Synced::Fresh;
+            }
+            let output_only = asked.0 == key.0 && asked.2 == key.2 && asked.3 == key.3;
+            if output_only && self.running.is_some() {
+                return Synced::Fresh;
+            }
+            if output_only
+                && !forced
+                && self
+                    .searched
+                    .is_some_and(|at| at.elapsed() < FIND_AGAIN_AFTER)
+            {
+                return Synced::Later;
+            }
+        }
+        // Another session: its matches, and where the last one's match
+        // was, mean nothing here.
+        if self.made_for.as_ref().is_none_or(|m| m.0 != key.0) {
+            self.stop();
+            self.made_for = None;
+            self.matches.clear();
+            self.rows.clear();
+            self.current = None;
+            self.anchor = None;
+        }
+        // An empty query and an invalid pattern are answered at once,
+        // with no worker: a pattern is checked against no text.
+        let checked = match key.2.as_str() {
+            "" => Ok(()),
+            query => find_in(&term::Haystack::default(), query, key.3).map(|_| ()),
+        };
+        if key.2.is_empty() || checked.is_err() {
+            self.stop();
+            self.made_for = Some(key);
+            self.searched = Some(Instant::now());
+            self.matches.clear();
+            self.rows.clear();
+            self.current = None;
+            self.pending_step = None;
+            self.error = checked.err();
+            return Synced::Done(self.error.clone());
+        }
+        self.start(key, term.find_lines());
+        Synced::Started
+    }
+
+    /// Searches `lines` for `key`'s query on a worker. A search still
+    /// running is stopped, and its answer dropped if it comes anyway.
+    fn start(&mut self, key: FindKey, lines: term::Lines) {
+        self.stop();
+        self.generation += 1;
+        let generation = self.generation;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_cancel = std::sync::Arc::clone(&cancel);
+        let (query, options) = (key.2.clone(), key.3);
+        std::thread::spawn(move || {
+            if let Some(found) = search_lines(&lines, &query, options, &worker_cancel) {
+                let _ = tx.send((generation, found));
+            }
+        });
+        self.running = Some((generation, key, rx));
+        self.cancel = Some(cancel);
+        self.searched = Some(Instant::now());
+        self.said_searching = false;
+    }
+
+    /// Takes the worker's answer once it is there; `true` when it came.
+    pub fn poll(&mut self) -> bool {
+        let Some((_, _, rx)) = &self.running else {
+            return false;
+        };
+        let answer = match rx.try_recv() {
+            Ok(answer) => Some(answer),
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+        };
+        let Some((_, key, _)) = self.running.take() else {
+            return false;
+        };
+        self.cancel = None;
+        answer.is_some_and(|(made, found)| self.land(made, key, found))
+    }
+
+    /// The answer of search number `made`, for `key`: dropped unless it is
+    /// the last search started. The current match keeps its anchor, and a
+    /// step asked for while it was on its way is taken. `true` when it
+    /// was taken.
+    fn land(&mut self, made: u64, key: FindKey, found: Found) -> bool {
+        if made != self.generation {
+            return false;
+        }
+        self.made_for = Some(key);
+        self.rows = found.rows;
+        self.first_line = found.first;
+        self.take(found.matches);
+        if let Some(forward) = self.pending_step.take() {
+            self.step(forward);
+            self.reveal = true;
+        }
+        if let Some(filter) = self.filter.as_mut() {
+            filter.selected = filter.selected.min(self.rows.len().saturating_sub(1));
+        }
+        true
+    }
+
+    /// Lets go of the matches on lines before `first`, which the session
+    /// no longer keeps. A current match among them falls to the next one.
+    pub fn prune(&mut self, first: u64) {
+        let gone = self.matches.partition_point(|h| h.start.0 < first);
+        if gone == 0 {
+            return;
+        }
+        self.matches.drain(..gone);
+        let rows = self.rows.len();
+        self.rows.retain_mut(|row| {
+            row.hit = match row.hit.checked_sub(gone) {
+                Some(hit) => hit,
+                None => return false,
+            };
+            true
+        });
+        // The rows gone were the list's first: the rest move up.
+        let dropped = rows - self.rows.len();
+        if let Some(filter) = self.filter.as_mut() {
+            filter.selected = filter
+                .selected
+                .saturating_sub(dropped)
+                .min(self.rows.len().saturating_sub(1));
+            filter.scroll = filter.scroll.saturating_sub(dropped);
+        }
+        if self.current.is_some() {
+            self.place();
+        }
+    }
+
+    /// The row of filter mode's list the current match is on, or the
+    /// nearest before it.
+    pub fn current_row(&self) -> usize {
+        let at = self.current.unwrap_or(0);
+        self.rows
+            .partition_point(|row| row.hit <= at)
+            .saturating_sub(1)
+    }
+
+    fn stop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.running = None;
+    }
+}
+
+impl Drop for Find {
+    /// Closing the bar stops the worker.
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 /// The matches of `query` in a session's text, at most [`FIND_LIMIT`].
@@ -711,18 +996,94 @@ pub fn find_in(
     query: &str,
     options: crate::platform::search::Options,
 ) -> Result<Vec<Hit>, String> {
+    Ok(found_in(hay, query, options)?
+        .into_iter()
+        .map(|(hit, _)| hit)
+        .collect())
+}
+
+/// [`find_in`], with the bytes of the text each match covers.
+fn found_in(
+    hay: &term::Haystack,
+    query: &str,
+    options: crate::platform::search::Options,
+) -> Result<Vec<(Hit, std::ops::Range<usize>)>, String> {
     let found = crate::platform::search::find_first(&hay.text, query, "", options, FIND_LIMIT)?;
     Ok(found
         .into_iter()
         .filter_map(|m| {
-            let spans = hay.spans(m.range);
+            let spans = hay.spans(m.range.clone());
             let (line, from, _) = *spans.first()?;
-            Some(Hit {
-                start: (line, from),
-                spans,
-            })
+            Some((
+                Hit {
+                    start: (line, from),
+                    spans,
+                },
+                m.range,
+            ))
         })
         .collect())
+}
+
+/// The worker's part of a search: the text of `lines` made, searched for
+/// `query`, and the list of the lines with a match made. Nothing once
+/// `cancel` is set.
+pub fn search_lines(
+    lines: &term::Lines,
+    query: &str,
+    options: crate::platform::search::Options,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Option<Found> {
+    let cancelled = || cancel.load(std::sync::atomic::Ordering::Relaxed);
+    let hay = lines.haystack();
+    if cancelled() {
+        return None;
+    }
+    let found = found_in(&hay, query, options).unwrap_or_default();
+    if cancelled() {
+        return None;
+    }
+    let rows = filter_rows(&hay.text, &found);
+    Some(Found {
+        matches: found.into_iter().map(|(hit, _)| hit).collect(),
+        rows,
+        first: lines.first_line(),
+    })
+}
+
+/// One row per line of `text` with a match in `found`, in order: the
+/// line's text around its first match, with every match on it marked.
+/// A line the terminal wrapped is one line.
+pub fn filter_rows(text: &str, found: &[(Hit, std::ops::Range<usize>)]) -> Vec<FilterRow> {
+    let mut rows = Vec::new();
+    let mut index = 0;
+    while index < found.len() {
+        let (hit, range) = &found[index];
+        let start = text[..range.start].rfind('\n').map_or(0, |i| i + 1);
+        let end = text[range.start..]
+            .find('\n')
+            .map_or(text.len(), |i| range.start + i);
+        let next = index
+            + 1
+            + found[index + 1..]
+                .iter()
+                .take_while(|(_, r)| r.start < end)
+                .count();
+        // Each match's bytes in the line, as far as the line goes.
+        let on_line: Vec<_> = found[index..next]
+            .iter()
+            .map(|(_, r)| r.start - start..r.end.min(end) - start)
+            .collect();
+        let (snippet, marks) = marked_snippet(&text[start..end], range.start - start, &on_line);
+        rows.push(FilterRow {
+            hit: index,
+            line: hit.start.0,
+            text: snippet,
+            marks,
+        });
+        index = next;
+    }
+    rows
 }
 
 /// Find in Terminals keeps this many matches of one session, the newest.
@@ -804,22 +1165,46 @@ pub fn search_all(
 /// Up to [`SNIPPET`] characters of `text` around byte `at`, blanks
 /// trimmed, with an ellipsis where the line goes on.
 pub fn snippet(text: &str, at: usize) -> String {
+    marked_snippet(text, at, &[]).0
+}
+
+/// [`snippet`], and the characters `[from, to)` of it that the bytes
+/// `marks` of `text` cover, as much of each as it shows.
+pub fn marked_snippet(
+    text: &str,
+    at: usize,
+    marks: &[std::ops::Range<usize>],
+) -> (String, Vec<(usize, usize)>) {
+    let starts: Vec<usize> = text.char_indices().map(|(at, _)| at).collect();
+    let index = |byte: usize| starts.partition_point(|&b| b < byte);
     let chars: Vec<char> = text.chars().collect();
-    let index = text[..at.min(text.len())].chars().count();
-    let from = index
+    let from = index(at)
         .saturating_sub(SNIPPET_BEFORE)
         .min(chars.len().saturating_sub(SNIPPET));
     let to = (from + SNIPPET).min(chars.len());
     let shown: String = chars[from..to].iter().collect();
+    let lead = shown.chars().take_while(|c| c.is_whitespace()).count();
+    let trimmed = shown.trim();
     let mut out = String::new();
     if from > 0 {
         out.push('\u{2026}');
     }
-    out.push_str(shown.trim());
+    // Where the shown characters start in `out`, and how many there are.
+    let (base, kept) = (from + lead, trimmed.chars().count());
+    let shift = usize::from(from > 0);
+    out.push_str(trimmed);
     if to < chars.len() {
         out.push('\u{2026}');
     }
-    out
+    let marked = marks
+        .iter()
+        .filter_map(|range| {
+            let a = index(range.start).max(base);
+            let b = index(range.end).min(base + kept);
+            (b > a).then(|| (a - base + shift, b - base + shift))
+        })
+        .collect();
+    (out, marked)
 }
 
 /// Find in Terminals while the palette searches every session: what was
@@ -958,11 +1343,7 @@ pub const FIND_BAR_MARGIN: f32 = 6.0;
 /// or the pane.
 pub fn find_bar_rect(panel: &Panel, rect: Viewport) -> Viewport {
     let (header, screen) = split(rect);
-    let pane = panel
-        .screens(screen)
-        .into_iter()
-        .find(|(tab, _)| *tab == panel.active)
-        .map_or(screen, |(_, s)| s);
+    let pane = active_pane(panel, screen);
     let room = pane.width + PAD * 2.0 - FIND_BAR_MARGIN;
     let width = FIND_BAR_WIDTH.min(room).max(0.0);
     Viewport {
@@ -976,6 +1357,207 @@ pub fn find_bar_rect(panel: &Panel, rect: Viewport) -> Viewport {
 /// The screen rows the find bar hides, at the top.
 pub fn find_bar_rows(atlas: &Atlas) -> usize {
     ((FIND_BAR_MARGIN + layout::FIND_ROW_HEIGHT - PAD * 0.5) / row_height(atlas)).ceil() as usize
+}
+
+/// The screen of the session with the keyboard, in the panel's `screen`.
+fn active_pane(panel: &Panel, screen: Viewport) -> Viewport {
+    panel
+        .screens(screen)
+        .into_iter()
+        .find(|(tab, _)| *tab == panel.active)
+        .map_or(screen, |(_, s)| s)
+}
+
+/// Air inside filter mode's list, above its first row and below its last.
+const FILTER_INSET: f32 = 4.0;
+
+/// The height of a row of filter mode's list: a line of the terminal's
+/// font with room around it.
+pub fn filter_row_height(atlas: &Atlas) -> f32 {
+    (atlas.metrics.line_height + 8.0).round().max(22.0)
+}
+
+/// Filter mode's list for `rows` rows, in the panel `rect`: under the
+/// find bar `bar`, across the pane of the session with the keyboard to
+/// the bar's right edge, as tall as its rows or down to the pane's foot.
+pub fn filter_rect(
+    panel: &Panel,
+    rect: Viewport,
+    bar: Viewport,
+    rows: usize,
+    atlas: &Atlas,
+) -> Viewport {
+    let pane = active_pane(panel, split(rect).1);
+    let x = pane.x - PAD + FIND_BAR_MARGIN;
+    let y = bar.y + bar.height + FIND_BAR_MARGIN;
+    // Whole rows only, so the list ends where its last row does.
+    let row_h = filter_row_height(atlas);
+    let fit = ((pane.y + pane.height - y - FILTER_INSET * 2.0) / row_h)
+        .floor()
+        .max(0.0) as usize;
+    let room = fit as f32 * row_h + FILTER_INSET * 2.0;
+    let wanted = rows.clamp(1, 10_000) as f32 * row_h + FILTER_INSET * 2.0;
+    Viewport {
+        x,
+        y,
+        width: (bar.x + bar.width - x).max(0.0),
+        height: wanted.min(room),
+    }
+}
+
+/// How many rows filter mode's `list` shows at once.
+pub fn filter_visible(list: Viewport, atlas: &Atlas) -> usize {
+    ((list.height - FILTER_INSET * 2.0) / filter_row_height(atlas))
+        .floor()
+        .max(0.0) as usize
+}
+
+/// The `n`th row showing in filter mode's `list`.
+pub fn filter_row_rect(list: Viewport, n: usize, atlas: &Atlas) -> Viewport {
+    let height = filter_row_height(atlas);
+    Viewport {
+        x: list.x + FILTER_INSET,
+        y: list.y + FILTER_INSET + n as f32 * height,
+        width: (list.width - FILTER_INSET * 2.0).max(0.0),
+        height,
+    }
+}
+
+/// The first of `rows` rows filter mode's list shows, `visible` at a
+/// time, scrolled to `scroll`.
+pub fn filter_first(scroll: usize, rows: usize, visible: usize) -> usize {
+    scroll.min(rows.saturating_sub(visible))
+}
+
+/// Filter mode's list in `list`: one row per line with a match, its
+/// number in the session and its text in the terminal's font, each match
+/// on it marked, those of the current match's line in the stronger
+/// colour, and the row chosen lit. Only the rows showing are laid out.
+pub fn draw_filter(
+    find: &Find,
+    atlas: &mut Atlas,
+    list: Viewport,
+    theme: &Theme,
+    out: &mut Vec<GlyphInstance>,
+) {
+    layout::push_panel(out, list, layout::UI_RADIUS_LG, theme);
+    let row_h = filter_row_height(atlas);
+    if find.rows.is_empty() {
+        let says = if find.error.is_some() {
+            "Not a valid regular expression"
+        } else if find.searching() {
+            "Searching\u{2026}"
+        } else {
+            "No matching lines"
+        };
+        let row = filter_row_rect(list, 0, atlas);
+        layout::push_ui_text(
+            out,
+            atlas,
+            Viewport {
+                x: row.x + 8.0,
+                width: (row.width - 16.0).max(0.0),
+                ..row
+            },
+            says,
+            theme.status_text,
+        );
+        return;
+    }
+    let filter = find.filter.unwrap_or_default();
+    let visible = filter_visible(list, atlas);
+    let first = filter_first(filter.scroll, find.rows.len(), visible);
+    let shown = &find.rows[first..(first + visible).min(find.rows.len())];
+    let m = atlas.metrics;
+    let advance = m.advance;
+    let number = |row: &FilterRow| (row.line.saturating_sub(find.first_line) + 1).to_string();
+    // The numbers right-aligned in a gutter as wide as the widest showing.
+    let digits = shown.iter().map(|r| number(r).len()).max().unwrap_or(1);
+    let gutter = digits as f32 * advance + 14.0;
+    for (n, row) in shown.iter().enumerate() {
+        let index = first + n;
+        let rect = filter_row_rect(list, n, atlas);
+        if index == filter.selected {
+            layout::push_rounded_rect(out, rect, layout::UI_RADIUS, theme.palette_selected);
+        } else if layout::hovered(rect) {
+            layout::push_rounded_rect(out, rect, layout::UI_RADIUS, theme.row_hover);
+        }
+        layout::hotspot(rect, layout::Cursor::Pointing, None);
+        let y = rect.y + ((row_h - m.line_height) * 0.5).round();
+        let label = number(row);
+        let label_x = rect.x + 6.0 + (digits - label.len()) as f32 * advance;
+        layout::push_text(out, atlas, label_x, y, &label, theme.gutter_text);
+        // As much of the text as the row has room for, from a little
+        // before its first match when the whole would not fit.
+        let x = rect.x + 6.0 + gutter;
+        let room = ((rect.x + rect.width - 8.0 - x) / advance).floor().max(0.0) as usize;
+        let chars: Vec<char> = row.text.chars().collect();
+        let mut columns = Vec::with_capacity(chars.len() + 1);
+        let mut column = 0;
+        for ch in &chars {
+            columns.push(column);
+            column += crate::render::font::display_width(*ch);
+        }
+        columns.push(column);
+        let skip = match row.marks.first() {
+            Some(&(_, to)) if columns[to] > room => {
+                let want = columns[to].saturating_sub(room * 2 / 3);
+                columns.partition_point(|&c| c < want).min(chars.len())
+            }
+            _ => 0,
+        };
+        let fits = columns.partition_point(|&c| c <= columns[skip] + room) - 1;
+        let end = fits.max(skip);
+        let at = |i: usize| x + (columns[i] - columns[skip]) as f32 * advance;
+        // The row the current match is on has its matches in the
+        // stronger colour: it lies between the row's first match and the
+        // next row's.
+        let next = find.rows.get(index + 1).map_or(usize::MAX, |r| r.hit);
+        let current = find.current.is_some_and(|c| c >= row.hit && c < next);
+        let colour = if current {
+            theme.find_current
+        } else {
+            theme.find_match
+        };
+        for &(from, to) in &row.marks {
+            let (from, to) = (from.max(skip), to.min(end));
+            if to <= from {
+                continue;
+            }
+            layout::push_rounded_rect(
+                out,
+                Viewport {
+                    x: at(from),
+                    y: rect.y + 3.0,
+                    width: at(to) - at(from),
+                    height: row_h - 6.0,
+                },
+                3.0,
+                colour,
+            );
+        }
+        let text: String = chars[skip..end].iter().collect();
+        layout::push_text(out, atlas, x, y, &text, theme.text);
+    }
+    if find.rows.len() > visible && visible > 0 {
+        // An overlay scrollbar, as the palette's: a thumb in the trailing
+        // gutter, sized by the share of rows in view.
+        let track = visible as f32 * row_h - 8.0;
+        let thumb = (track * visible as f32 / find.rows.len() as f32).max(24.0);
+        let at = first as f32 / (find.rows.len() - visible) as f32;
+        let [r, g, b, _] = theme.status_text;
+        layout::push_rounded_rect(
+            out,
+            Viewport {
+                x: list.x + list.width - 7.0,
+                y: list.y + FILTER_INSET + 4.0 + (track - thumb) * at,
+                width: 4.0,
+                height: thumb,
+            },
+            2.0,
+            [r, g, b, 0.45],
+        );
+    }
 }
 
 /// How far back to scroll so line `line` shows below the top `covered`
@@ -2319,6 +2901,192 @@ mod tests {
         );
         assert_eq!(find_tick_at(track, at(1025), &matches, 1000, 100), None);
         assert_eq!(find_tick_at(track, at(1050), &[], 1000, 100), None);
+    }
+
+    /// Waits for `find`'s worker to answer; `false` if it never did.
+    fn answered(find: &mut Find) -> bool {
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(20) {
+            if find.poll() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        false
+    }
+
+    fn key(t: &term::Term, query: &str) -> FindKey {
+        (1, t.generation, query.into(), Options::default())
+    }
+
+    #[test]
+    fn an_answer_for_a_search_since_replaced_is_dropped() {
+        let mut t = term::Term::new(20, 4);
+        t.advance(b"kiwi\r\nlime\r\n");
+        let mut find = Find::default();
+        assert_eq!(find.sync(key(&t, "kiwi"), &t, true), Synced::Started);
+        assert!(answered(&mut find));
+        assert_eq!(find.count(), (0, 1));
+        // A new query: the old matches stay until its answer, a step
+        // waits for it, and the first search's answer, should it come
+        // after all, is dropped.
+        assert_eq!(find.sync(key(&t, "lime"), &t, true), Synced::Started);
+        assert!(find.searching() && find.busy());
+        assert_eq!(find.sync(key(&t, "lime"), &t, false), Synced::Fresh);
+        assert_eq!(find.current_hit().map(|h| h.start), Some((0, 0)));
+        find.pending_step = Some(false);
+        let stale = Found {
+            matches: vec![hit(0, 0), hit(0, 2)],
+            ..Found::default()
+        };
+        assert!(!find.land(1, key(&t, "kiwi"), stale));
+        assert_eq!(find.made_for.as_ref().map(|m| m.2.as_str()), Some("kiwi"));
+        assert!(answered(&mut find));
+        assert!(!find.busy() && !find.searching());
+        assert_eq!(find.made_for.as_ref().map(|m| m.2.as_str()), Some("lime"));
+        assert_eq!(find.current_hit().map(|h| h.start), Some((1, 0)));
+        assert!(
+            find.reveal && find.pending_step.is_none(),
+            "the step was taken"
+        );
+        // Output alone: searched again, but not more than so often.
+        t.advance(b"lime\r\n");
+        assert_eq!(find.sync(key(&t, "lime"), &t, false), Synced::Later);
+        assert_eq!(find.sync(key(&t, "lime"), &t, true), Synced::Started);
+        assert!(!find.searching(), "the matches are this query's");
+        assert!(answered(&mut find));
+        assert_eq!(find.count(), (0, 2));
+        // An empty query and an invalid pattern need no worker.
+        assert_eq!(find.sync(key(&t, ""), &t, true), Synced::Done(None));
+        assert!(find.matches.is_empty() && !find.busy());
+        let regex = Options {
+            regex: true,
+            ..Options::default()
+        };
+        let invalid = (1, t.generation, "(".to_string(), regex);
+        assert!(matches!(
+            find.sync(invalid, &t, true),
+            Synced::Done(Some(_))
+        ));
+        assert!(find.error.is_some() && !find.busy());
+    }
+
+    #[test]
+    fn matches_on_lines_let_go_of_go_and_the_current_falls_to_the_next() {
+        let row = |hit: usize, line: u64| FilterRow {
+            hit,
+            line,
+            text: String::new(),
+            marks: Vec::new(),
+        };
+        let mut find = Find::default();
+        find.take(vec![hit(1, 0), hit(5, 2), hit(5, 6), hit(9, 0)]);
+        find.rows = vec![row(0, 1), row(1, 5), row(3, 9)];
+        find.filter = Some(Filter {
+            selected: 1,
+            scroll: 1,
+        });
+        find.step(true);
+        assert_eq!(find.anchor, Some((1, 0)));
+        find.prune(1);
+        assert_eq!(find.matches.len(), 4, "line 1 is still kept");
+        find.prune(4);
+        assert_eq!(find.matches, [hit(5, 2), hit(5, 6), hit(9, 0)]);
+        assert_eq!((find.current, find.anchor), (Some(0), Some((5, 2))));
+        assert_eq!(find.rows, [row(0, 5), row(2, 9)]);
+        assert_eq!(
+            find.filter,
+            Some(Filter {
+                selected: 0,
+                scroll: 0
+            })
+        );
+        assert_eq!(find.current_row(), 0);
+        find.step(false);
+        assert_eq!(find.current_row(), 1);
+        find.prune(100);
+        assert!(find.matches.is_empty() && find.rows.is_empty());
+        assert_eq!(find.current, None);
+    }
+
+    #[test]
+    fn a_search_of_a_full_history_leaves_the_main_thread_at_once() {
+        let mut t = term::Term::new(120, 40);
+        for n in 0..12_000 {
+            let line = format!("{n:06} the quick brown fox jumps over the lazy dog, {n} times\r\n");
+            t.advance(line.as_bytes());
+        }
+        assert!(t.scrollback_len() >= 9_000);
+        // Slow on purpose: from every place on a line, to its end and back.
+        let query = r".*cat";
+        let options = Options {
+            regex: true,
+            ..Options::default()
+        };
+        // What searching on this thread costs, for comparison.
+        let started = Instant::now();
+        assert!(find_in(&t.haystack(), query, options).unwrap().is_empty());
+        let inline = started.elapsed();
+        let mut find = Find::default();
+        let started = Instant::now();
+        let synced = find.sync((1, t.generation, query.into(), options), &t, true);
+        let main = started.elapsed();
+        assert_eq!(synced, Synced::Started);
+        assert!(answered(&mut find));
+        assert!(find.matches.is_empty() && find.error.is_none());
+        // A few milliseconds of copying, against the whole search: well
+        // under a tenth of it, whatever the machine's speed.
+        assert!(
+            main < Duration::from_millis(25) && main * 10 < inline,
+            "the main thread's part took {main:?}, searching took {inline:?}"
+        );
+    }
+
+    #[test]
+    fn filter_mode_lists_each_line_once_with_its_matches_marked() {
+        let mut t = term::Term::new(10, 6);
+        t.advance(b"ab ab x\r\nnone\r\nxxxxxxxxabab\r\nab");
+        let first = t.view_line(0, 0);
+        let found = search_lines(
+            &t.find_lines(),
+            "ab",
+            Options::default(),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(found.matches.len(), 5);
+        let rows: Vec<_> = found
+            .rows
+            .iter()
+            .map(|r| (r.hit, r.line - first, r.text.as_str(), r.marks.clone()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (0, 0, "ab ab x", vec![(0, 2), (3, 5)]),
+                // Wrapped over two rows: one line, both of its matches.
+                (2, 2, "xxxxxxxxabab", vec![(8, 10), (10, 12)]),
+                (4, 4, "ab", vec![(0, 2)]),
+            ]
+        );
+        // Cancelled: no answer.
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        assert!(search_lines(&t.find_lines(), "ab", Options::default(), &cancel).is_none());
+    }
+
+    #[test]
+    fn a_long_line_is_cut_around_its_match_with_the_marks_moved() {
+        let text = format!("{}needle{}", "x".repeat(200), " y".repeat(100));
+        let (shown, marks) = marked_snippet(&text, 200, &[200..206, 0..4, 400..402]);
+        assert!(shown.starts_with('\u{2026}') && shown.ends_with('\u{2026}'));
+        let chars: Vec<char> = shown.chars().collect();
+        let (from, to) = marks[0];
+        assert_eq!(chars[from..to].iter().collect::<String>(), "needle");
+        assert_eq!(marks.len(), 1, "the others are not in what shows");
+        assert_eq!(shown, snippet(&text, 200));
+        // Blanks trimmed off the front move the marks too.
+        let (shown, marks) = marked_snippet("   ab", 3, std::slice::from_ref(&(3..5)));
+        assert_eq!((shown.as_str(), marks), ("ab", vec![(0, 2)]));
     }
 
     #[test]

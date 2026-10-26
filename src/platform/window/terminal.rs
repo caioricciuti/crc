@@ -812,13 +812,19 @@ impl EditorView {
     pub(super) fn open_terminal_find_at(&self, query: &str, start: (u64, usize)) {
         self.terminal_find_bar(Some(query));
         self.terminal_find_sync(true);
-        // After the search: one for another session forgets the anchor.
+        // After the search starts: one for another session forgets the
+        // anchor. The answer lands on it; matches already for this query
+        // are placed on it now.
         if let Some(mut state) = self.state_mut()
             && let Some(find) = state.find.as_mut().and_then(|bar| bar.terminal.as_mut())
         {
             find.anchor = Some(start);
-            let matches = std::mem::take(&mut find.matches);
-            find.take(matches);
+            if find.searching() {
+                find.reveal = true;
+            } else {
+                let matches = std::mem::take(&mut find.matches);
+                find.take(matches);
+            }
         }
         self.terminal_find_reveal();
         self.request_redraw();
@@ -862,89 +868,119 @@ impl EditorView {
     }
 
     /// Searches the active session again when its output, the query, the
-    /// options or the session changed since the last search. Output alone
-    /// is searched again at most every so often (`forced` or not), so a
-    /// busy program is not searched on every frame; until then a frame is
-    /// asked for to look again. `forced` (the query or a step) also says
-    /// an invalid pattern in the status line.
+    /// options or the session changed since the last search, on a worker
+    /// (see [`crate::platform::terminal::Find::sync`]); the answer is
+    /// taken by [`EditorView::poll_terminal_find`]. Output alone is
+    /// searched again at most every so often; until then a frame is asked
+    /// for to look again. `forced` (the query or a step) waits for the
+    /// session's lock rather than trying again next frame, has the current
+    /// match scrolled into view once found, and says an invalid pattern
+    /// in the status line.
     pub(super) fn terminal_find_sync(&self, forced: bool) {
-        const AGAIN_AFTER: Duration = Duration::from_millis(100);
-        let (made_for, hay) = {
-            let Some(state) = self.state() else {
+        use crate::platform::terminal::Synced;
+        let synced = {
+            let Some(mut state) = self.state_mut() else {
                 return;
             };
-            let Some(bar) = state.find.as_ref() else {
+            let State {
+                find,
+                terminal,
+                message,
+                ..
+            } = &mut *state;
+            let Some(bar) = find.as_mut() else {
                 return;
             };
-            let Some(find) = bar.terminal.as_ref() else {
+            let (query, options) = (bar.query.rope.to_string(), bar.options);
+            let Some(find) = bar.terminal.as_mut() else {
                 return;
             };
-            let Some(tab) = state.terminal.active_tab() else {
+            let Some(tab) = terminal.active_tab() else {
                 return;
             };
-            // Copied out under the lock; searched after it is let go.
-            let term = tab.session.term.lock().unwrap_or_else(|e| e.into_inner());
-            let key = (
-                Arc::as_ptr(&tab.session.term) as usize,
-                term.generation,
-                bar.query.rope.to_string(),
-                bar.options,
-            );
-            if let Some(made) = &find.made_for {
-                if *made == key {
-                    return;
+            // A frame does not wait while the reader holds the lock for a
+            // burst of output: the next one looks again.
+            let term = if forced {
+                Some(tab.session.term.lock().unwrap_or_else(|e| e.into_inner()))
+            } else {
+                match tab.session.term.try_lock() {
+                    Ok(term) => Some(term),
+                    Err(std::sync::TryLockError::Poisoned(term)) => Some(term.into_inner()),
+                    Err(std::sync::TryLockError::WouldBlock) => None,
                 }
-                let output_only = made.0 == key.0 && made.2 == key.2 && made.3 == key.3;
-                if !forced
-                    && output_only
-                    && find.searched.is_some_and(|at| at.elapsed() < AGAIN_AFTER)
-                {
+            };
+            match term {
+                None => Synced::Later,
+                Some(term) => {
+                    let key = (
+                        Arc::as_ptr(&tab.session.term) as usize,
+                        term.generation,
+                        query,
+                        options,
+                    );
+                    let synced = find.sync(key, &term, forced);
                     drop(term);
-                    drop(state);
-                    self.request_redraw();
-                    self.resume_display_link();
-                    return;
+                    match &synced {
+                        Synced::Started if forced => find.reveal = true,
+                        Synced::Done(Some(error)) if forced => {
+                            *message = Some((format!("invalid regex: {error}"), Instant::now()));
+                        }
+                        _ => {}
+                    }
+                    synced
                 }
             }
-            (key, term.haystack())
         };
-        let found = match made_for.2.as_str() {
-            "" => Ok(Vec::new()),
-            query => crate::platform::terminal::find_in(&hay, query, made_for.3),
-        };
-        let Some(mut state) = self.state_mut() else {
-            return;
-        };
-        let State { find, message, .. } = &mut *state;
-        let Some(find) = find.as_mut().and_then(|bar| bar.terminal.as_mut()) else {
-            return;
-        };
-        // Another session: where the last one's match was means nothing.
-        if find.made_for.as_ref().is_none_or(|m| m.0 != made_for.0) {
-            find.anchor = None;
-        }
-        find.made_for = Some(made_for);
-        find.searched = Some(Instant::now());
-        match found {
-            Ok(matches) => find.take(matches),
-            Err(error) => {
-                find.matches.clear();
-                find.current = None;
-                if forced {
-                    *message = Some((format!("invalid regex: {error}"), Instant::now()));
-                }
-                find.error = Some(error);
+        match synced {
+            Synced::Fresh => {}
+            // The worker's answer is polled for by the display link.
+            Synced::Started => self.resume_display_link(),
+            Synced::Later | Synced::Done(_) => {
+                self.request_redraw();
+                self.resume_display_link();
             }
-        }
-        // Found after the frame was drawn: another shows it.
-        if !forced {
-            drop(state);
-            self.request_redraw();
-            self.resume_display_link();
         }
     }
 
-    /// Scrolls the active session so its current match shows below the bar.
+    /// Takes the terminal search's answer once it is there: drawn, with
+    /// the current match scrolled into view when that was asked for, and a
+    /// step that waited for it taken.
+    pub(super) fn poll_terminal_find(&self) {
+        let reveal = {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            let State { find, message, .. } = &mut *state;
+            let Some(bar) = find.as_mut() else {
+                return;
+            };
+            let query = bar.query.rope.to_string();
+            let Some(find) = bar.terminal.as_mut() else {
+                return;
+            };
+            let stepping = find.pending_step.is_some();
+            if !find.poll() {
+                // Taking a while: the bar says it is searching, once.
+                if find.searching_shown() && !std::mem::replace(&mut find.said_searching, true) {
+                    drop(state);
+                    self.request_redraw();
+                }
+                return;
+            }
+            if stepping && find.matches.is_empty() && !query.is_empty() {
+                *message = Some((format!("no match for {query:?}"), Instant::now()));
+            }
+            std::mem::take(&mut find.reveal)
+        };
+        if reveal {
+            self.terminal_find_reveal();
+        }
+        self.request_redraw();
+    }
+
+    /// Scrolls the active session so its current match shows below the
+    /// bar. Not while the matches are another query's: the new ones are
+    /// shown when they come.
     pub(super) fn terminal_find_reveal(&self) {
         let Some(mut state) = self.state_mut() else {
             return;
@@ -954,6 +990,7 @@ impl EditorView {
         let Some(line) = find
             .as_ref()
             .and_then(|bar| bar.terminal.as_ref())
+            .filter(|find| !find.searching())
             .and_then(|find| find.current_hit())
             .map(|hit| hit.start.0)
         else {
@@ -976,7 +1013,8 @@ impl EditorView {
     }
 
     /// Enter, Cmd-G and the bar's arrows over the terminal: the next or
-    /// previous match, around the ends, scrolled into view.
+    /// previous match, around the ends, scrolled into view. While the
+    /// matches of a new query are on their way, the step waits for them.
     pub(super) fn terminal_find_step(&self, forward: bool) {
         self.terminal_find_sync(true);
         {
@@ -991,9 +1029,131 @@ impl EditorView {
             let Some(find) = bar.terminal.as_mut() else {
                 return;
             };
+            if find.searching() {
+                find.pending_step = Some(forward);
+                return;
+            }
             find.step(forward);
             if find.matches.is_empty() && find.error.is_none() && !query.is_empty() {
                 *message = Some((format!("no match for {query:?}"), Instant::now()));
+            }
+        }
+        self.terminal_find_reveal();
+        self.request_redraw();
+        self.pump();
+    }
+
+    /// Whether filter mode's list shows over the terminal.
+    pub(super) fn terminal_filter_open(&self) -> bool {
+        self.state().is_some_and(|state| {
+            state
+                .find
+                .as_ref()
+                .and_then(|bar| bar.terminal.as_ref())
+                .is_some_and(|find| find.filter.is_some())
+        })
+    }
+
+    /// Option-Return and the bar's Filter chip: the list of the lines
+    /// with a match shows over the screen, on the current match's line,
+    /// with the keys in the bar; or it goes.
+    pub(super) fn toggle_terminal_filter(&self) {
+        {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            let visible = filter_visible(&state);
+            let Some(bar) = state.find.as_mut() else {
+                return;
+            };
+            bar.has_keys = true;
+            bar.replacing = false;
+            let Some(find) = bar.terminal.as_mut() else {
+                return;
+            };
+            find.filter = match find.filter {
+                Some(_) => None,
+                None => {
+                    let selected = find.current_row();
+                    Some(crate::platform::terminal::Filter {
+                        selected,
+                        scroll: (selected + 1).saturating_sub(visible),
+                    })
+                }
+            };
+        }
+        self.request_redraw();
+        self.pump();
+    }
+
+    /// Up and Down in filter mode's list: the row chosen moves by `by`,
+    /// kept in view.
+    pub(super) fn terminal_filter_move(&self, by: isize) {
+        {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            let visible = filter_visible(&state).max(1);
+            let Some(find) = state.find.as_mut().and_then(|bar| bar.terminal.as_mut()) else {
+                return;
+            };
+            let last = find.rows.len().saturating_sub(1);
+            let Some(filter) = find.filter.as_mut() else {
+                return;
+            };
+            filter.selected = filter.selected.saturating_add_signed(by).min(last);
+            if filter.selected < filter.scroll {
+                filter.scroll = filter.selected;
+            } else if filter.selected >= filter.scroll + visible {
+                filter.scroll = filter.selected + 1 - visible;
+            }
+        }
+        self.request_redraw();
+        self.pump();
+    }
+
+    /// The wheel over filter mode's list: `lines` rows on, as far as it
+    /// goes.
+    pub(super) fn terminal_filter_wheel(&self, lines: isize) {
+        {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            let visible = filter_visible(&state);
+            let Some(find) = state.find.as_mut().and_then(|bar| bar.terminal.as_mut()) else {
+                return;
+            };
+            let most = find.rows.len().saturating_sub(visible);
+            let Some(filter) = find.filter.as_mut() else {
+                return;
+            };
+            filter.scroll = filter.scroll.saturating_add_signed(lines).min(most);
+        }
+        self.request_redraw();
+        self.pump();
+    }
+
+    /// Return or a click on filter mode's row `row` (the chosen one when
+    /// `None`): its line's first match is the current one, scrolled into
+    /// view, and the list goes.
+    pub(super) fn terminal_filter_pick(&self, row: Option<usize>) {
+        {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            let Some(find) = state.find.as_mut().and_then(|bar| bar.terminal.as_mut()) else {
+                return;
+            };
+            let Some(filter) = find.filter.take() else {
+                return;
+            };
+            let row = row.unwrap_or(filter.selected);
+            let Some(hit) = find.rows.get(row).map(|r| r.hit) else {
+                return;
+            };
+            if let Some(start) = find.matches.get(hit).map(|h| h.start) {
+                find.current = Some(hit);
+                find.anchor = Some(start);
             }
         }
         self.terminal_find_reveal();
@@ -2026,6 +2186,14 @@ impl EditorView {
     /// that did not (xterm's alternate scroll, so a pager still moves);
     /// and otherwise a scroll through the history.
     pub(super) fn terminal_wheel(&self, x: f32, y: f32, lines: isize, flags: NSEventModifierFlags) {
+        // Over filter mode's list, the wheel scrolls the list.
+        let over_filter = self.state().is_some_and(|state| {
+            filter_rect(&state, &chrome_of(&state)).is_some_and(|list| list.contains(x, y))
+        });
+        if over_filter {
+            self.terminal_filter_wheel(lines);
+            return;
+        }
         let target = (lines != 0 && !mouse_kept(flags))
             .then(|| self.mouse_pane(x, y))
             .flatten()
@@ -2367,6 +2535,36 @@ pub(super) fn find_rect(state: &State, chrome: &Chrome) -> Option<Viewport> {
     let rect = chrome.terminal?;
     (!state.terminal.tabs.is_empty())
         .then(|| crate::platform::terminal::find_bar_rect(&state.terminal, rect))
+}
+
+/// Filter mode's list over the terminal, while it shows.
+pub(super) fn filter_rect(state: &State, chrome: &Chrome) -> Option<Viewport> {
+    let find = state.find.as_ref()?.terminal.as_ref()?;
+    find.filter?;
+    let bar = find_rect(state, chrome)?;
+    Some(crate::platform::terminal::filter_rect(
+        &state.terminal,
+        chrome.terminal?,
+        bar,
+        find.rows.len(),
+        &state.renderer.atlas,
+    ))
+}
+
+/// How many of filter mode's rows its list has room for, under the bar.
+pub(super) fn filter_visible(state: &State) -> usize {
+    let chrome = chrome_of(state);
+    let (Some(bar), Some(rect)) = (find_rect(state, &chrome), chrome.terminal) else {
+        return 0;
+    };
+    let list = crate::platform::terminal::filter_rect(
+        &state.terminal,
+        rect,
+        bar,
+        usize::MAX,
+        &state.renderer.atlas,
+    );
+    crate::platform::terminal::filter_visible(list, &state.renderer.atlas)
 }
 
 /// What a look at a tab found: its newest notification, whether it

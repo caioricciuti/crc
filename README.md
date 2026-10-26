@@ -485,6 +485,7 @@ the size and write it back.
 | Escape in a picker/panel | dismiss |
 | `Cmd-F` / `Cmd-Shift-F` | find in file / the Search view in the sidebar |
 | `Cmd-Option-F` | find in every terminal's history; Return shows the session with its find bar on the match |
+| Option-Return in a terminal's find bar | list the lines with a match over the screen (or the bar's Filter chip); Up/Down choose, Return or a click jumps, Escape closes the list |
 | `Cmd-L` | go to line |
 | `Cmd-D` | select word, then next occurrence as another cursor |
 | Option-click | add a cursor |
