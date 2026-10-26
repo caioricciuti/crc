@@ -561,8 +561,9 @@ impl EditorView {
         state.agents.tasks.get(index).map(|t| t.dir())
     }
 
-    /// Shows a task: its waiting session first, else the newest one it
-    /// has, else a new shell in its folder.
+    /// Shows a task: the session you last had in front in it, else its
+    /// waiting one, else the newest it has, else a new shell in its
+    /// folder.
     pub(super) fn select_task(&self, index: usize) {
         let found = {
             let Some(mut state) = self.state_mut() else {
@@ -579,11 +580,17 @@ impl EditorView {
             let mine: Vec<usize> = (0..state.terminal.tabs.len())
                 .filter(|i| task_of(&tasks, &state.terminal.tabs[*i]) == Some(index))
                 .collect();
-            let pick = super::menubar::best_tab(
-                &mine,
-                |i| state.terminal.tabs[i].activity() == Activity::Waiting,
-                state.terminal.active,
-            );
+            let tabs = &state.terminal.tabs;
+            let pick = switcher::latest(&state.agents.focus, &mine, |i| {
+                switcher::session_key(&tabs[i].id())
+            })
+            .or_else(|| {
+                super::menubar::best_tab(
+                    &mine,
+                    |i| tabs[i].activity() == Activity::Waiting,
+                    state.terminal.active,
+                )
+            });
             (pick, path)
         };
         match found {

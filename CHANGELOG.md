@@ -2,6 +2,12 @@
 
 One entry per tag, written for people who use the editor.
 
+## Unreleased
+
+- Agents mode: a workspace comes back on the tab you left it on. Going
+  to another workspace and back used to land on a waiting session or on
+  the newest tab instead.
+
 ## v0.2.0-alpha.31, 2026-10-25
 
 - Find, in terminals and documents: the match you are on is in a

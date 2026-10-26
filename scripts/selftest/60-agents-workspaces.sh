@@ -11,7 +11,8 @@
 # exits, in the background or at the front, or one closed in a pair, gives
 # way to its own workspace's next, never another's; when a workspace's last
 # one exits, that workspace stays selected, empty: nothing typed or Cmd-W
-# reaches the other workspace's terminal behind it. Last, a workspace from a
+# reaches the other workspace's terminal behind it. A workspace left on
+# its first tab comes back on it, not on its newest. Last, a workspace from a
 # name alone: no folder, its shell and Claude in the home folder.
 W="$T/deskproj"
 mkdir -p "$W" "$T/home/ws-home"
@@ -53,6 +54,20 @@ wait 300
 key 17 cmd t
 wait 700
 dump $T/ws-four.out
+key 18 ctrl 1
+wait 300
+key 18 cmd
+wait 300
+key 19 ctrl 2
+wait 300
+dump $T/ws-left.out
+key 18 ctrl 1
+wait 300
+dump $T/ws-back.out
+key 19 cmd
+wait 300
+key 19 ctrl 2
+wait 300
 key 18 cmd
 wait 300
 text sleep 2; exit
@@ -127,6 +142,9 @@ expect "$T/ws-renamed.out" agents "on tasks=deskproj,notes selected=notes sessio
     || failed "workspaces: two on one folder were not kept apart: $(cat "$ws_kept" 2>/dev/null)"
 # Interleaved: deskproj's at 0 and 2, notes' at 1 and 3.
 expect "$T/ws-four.out" agents "on tasks=deskproj,notes selected=notes sessions=deskproj,notes,deskproj,*notes claude=0 pair=- op=-"
+# deskproj left on its first tab: back on it, not its newest (BUG-061).
+expect "$T/ws-left.out" agents "on tasks=deskproj,notes selected=notes sessions=deskproj,notes,deskproj,*notes claude=0 pair=- op=-"
+expect "$T/ws-back.out" agents "on tasks=deskproj,notes selected=deskproj sessions=*deskproj,notes,deskproj,notes claude=0 pair=- op=-"
 expect "$T/ws-before-exit.out" agents "on tasks=deskproj,notes selected=deskproj sessions=deskproj,notes,*deskproj,notes claude=0 pair=- op=-"
 # notes' first exits behind deskproj's: deskproj's stays at the front.
 expect "$T/ws-background.out" agents "on tasks=deskproj,notes selected=deskproj sessions=deskproj,*deskproj,notes claude=0 pair=- op=-"

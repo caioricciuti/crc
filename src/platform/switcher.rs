@@ -62,6 +62,16 @@ pub fn rank_of(focus: &[String], key: &str) -> Option<usize> {
     focus.iter().position(|k| k == key)
 }
 
+/// Of `tabs`, the one shown most recently, by `key` (its session
+/// key): a workspace goes back to the tab you left it on.
+pub fn latest(focus: &[String], tabs: &[usize], key: impl Fn(usize) -> String) -> Option<usize> {
+    tabs.iter()
+        .copied()
+        .filter_map(|i| rank_of(focus, &key(i)).map(|rank| (rank, i)))
+        .min()
+        .map(|(_, i)| i)
+}
+
 /// A workspace, as the switcher shows it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Space {
@@ -246,6 +256,18 @@ mod tests {
             sessions: vec![session("/s/1", "shell", 0), session("/s/2", "claude", 1)],
             ..Sources::default()
         }
+    }
+
+    #[test]
+    fn latest_is_the_tab_shown_last_of_the_ones_given() {
+        let focus: Vec<String> = ["s:/s/3", "w:a", "s:/s/1", "s:/s/2"]
+            .map(String::from)
+            .into();
+        let key = |i: usize| format!("s:/s/{i}");
+        assert_eq!(latest(&focus, &[1, 2], key), Some(1));
+        assert_eq!(latest(&focus, &[2, 3], key), Some(3));
+        assert_eq!(latest(&focus, &[4, 5], key), None);
+        assert_eq!(latest(&focus, &[], key), None);
     }
 
     #[test]
