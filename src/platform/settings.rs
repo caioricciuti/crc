@@ -72,6 +72,10 @@ pub struct Settings {
     /// overloaded or failing server, a dropped connection) is told to
     /// continue, a few times, unless the person types first.
     pub auto_continue: bool,
+    /// Whether a session that starts waiting on you, when it is not the
+    /// one in front of you, says so in a macOS notification you can reply
+    /// from.
+    pub notify_waiting: bool,
     /// Whether the gutter shows how recently each line was changed, from
     /// Git's blame. Off unless asked for: it runs `git blame` per file.
     pub blame_heat: bool,
@@ -106,6 +110,7 @@ impl Default for Settings {
             conflict_side_by_side: false,
             agent_review: true,
             auto_continue: true,
+            notify_waiting: true,
             blame_heat: false,
             local_history: true,
             local_history_exclude: String::new(),
@@ -172,6 +177,11 @@ agent_review = true
 # into it after 20, 40 and 80 seconds, unless you type first. Usage limits,
 # billing and login errors are left to you.
 auto_continue = true
+
+# When a session starts waiting on you and it is not the one in front of
+# you, say so in a macOS notification. Reply from it to type the answer
+# into the session; click it to go there.
+notify_waiting = true
 
 # Keep past versions of the files you edit, in crc's folder in Application
 # Support: as opened, at each save, before a reload, when closed unsaved,
@@ -265,6 +275,7 @@ impl Settings {
                 "update_check" => set_bool(value, &mut settings.update_check),
                 "agent_review" => set_bool(value, &mut settings.agent_review),
                 "auto_continue" => set_bool(value, &mut settings.auto_continue),
+                "notify_waiting" => set_bool(value, &mut settings.notify_waiting),
                 "blame_heat" => set_bool(value, &mut settings.blame_heat),
                 "local_history" => set_bool(value, &mut settings.local_history),
                 "local_history_exclude" => match bare.as_deref() {
@@ -437,7 +448,7 @@ pub struct Described {
 
 /// Every key the file takes, in the page's order. A test checks this
 /// against the template, so a new key cannot ship without a sentence here.
-pub const DESCRIBED: [Described; 15] = [
+pub const DESCRIBED: [Described; 16] = [
     Described {
         key: "theme",
         group: "Appearance",
@@ -504,6 +515,11 @@ pub const DESCRIBED: [Described; 15] = [
         what: "When a Claude Code turn ends on a temporary API error, type \"continue\" into it after 20, 40 and 80 seconds, unless you type first.",
     },
     Described {
+        key: "notify_waiting",
+        group: "Agents",
+        what: "Notify when an agent waits: a macOS notification for a session that starts waiting while it is not the one in front of you. Reply from it, or click it to go there.",
+    },
+    Described {
         key: "local_history",
         group: "Local History",
         what: "Keep past versions of the files you edit: opened, saved, reloaded, closed unsaved, and after 30 seconds without typing. Never secrets.",
@@ -527,6 +543,7 @@ impl Settings {
             "update_check" => flag(self.update_check),
             "agent_review" => flag(self.agent_review),
             "auto_continue" => flag(self.auto_continue),
+            "notify_waiting" => flag(self.notify_waiting),
             "blame_heat" => flag(self.blame_heat),
             "local_history" => flag(self.local_history),
             "local_history_exclude" => quote(&self.local_history_exclude),
@@ -859,6 +876,17 @@ mod tests {
     }
 
     #[test]
+    fn notify_waiting_defaults_on_and_takes_a_boolean() {
+        assert!(Settings::parse("").notify_waiting);
+        assert!(Settings::parse(TEMPLATE).notify_waiting);
+        assert!(!Settings::parse("notify_waiting = false\n").notify_waiting);
+        assert_eq!(
+            Settings::parse("notify_waiting = false\n").value_of("notify_waiting"),
+            "false"
+        );
+    }
+
+    #[test]
     fn parses_the_subset_and_ignores_the_rest() {
         let s = Settings::parse(
             "# a comment\nfont = \"Menlo\"  # trailing\nfont_size = 15\nunknown = [1, 2]\n",
@@ -891,6 +919,7 @@ mod tests {
             conflict_side_by_side: false,
             agent_review: true,
             auto_continue: true,
+            notify_waiting: true,
             blame_heat: false,
             local_history: true,
             local_history_exclude: String::new(),

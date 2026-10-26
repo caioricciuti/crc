@@ -330,6 +330,7 @@ impl EditorView {
             }
             Step::Idle(_) => {}
             Step::MenuBar(number) => self.selftest_menubar_pick(*number),
+            Step::Notify(number, reply) => self.selftest_notify(*number, reply.as_deref()),
             Step::Front(front) => {
                 if let Some(mut state) = self.state_mut() {
                     state.agents.front = Some(*front);
@@ -941,7 +942,12 @@ impl EditorView {
                     ),
                     state.agents.report_activity(),
                     state.agents.report_pull_requests(),
-                    super::menubar::report(&state),
+                    // With what the notifications did, on a line of its own.
+                    format_args!(
+                        "{}\nnotified: {}",
+                        super::menubar::report(&state),
+                        super::notify::report()
+                    ),
                     active_conflicts(&state).map_or("none".to_string(), |v| format!(
                         "{} side={} unmerged={} resolvable={} scroll={}",
                         v.conflicts.len(),

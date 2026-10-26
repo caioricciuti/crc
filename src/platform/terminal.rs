@@ -126,6 +126,10 @@ pub struct Tab {
     /// Where the prompts sent to its agent are, for the marks down the
     /// screen's right edge.
     pub marks: crate::term::marks::PromptMarks,
+    /// Its wait has been told, by a notification or by showing: set when
+    /// it starts waiting, cleared when it stops (see `notify::edge` in the
+    /// window).
+    pub notified: bool,
 }
 
 /// What a session is doing, as the Agents sidebar shows it.
@@ -331,6 +335,30 @@ impl Tab {
             .last_typed
             .is_some_and(|at| now.saturating_duration_since(at) < BELL_ECHO)
     }
+
+    /// `bytes` typed into it by the person, a keystroke or a reply from a
+    /// notification. Returns whether that answered something it asked.
+    pub fn type_in(&mut self, bytes: &[u8]) -> bool {
+        // Typing into it is the answer to what it asked. A result it
+        // reported is seen now; a block stays until it says so.
+        let mut answered = self.attention.take().is_some();
+        let mut term = self.session.term.lock().unwrap_or_else(|e| e.into_inner());
+        if term.status.acknowledge() {
+            self.status = None;
+            answered = true;
+        }
+        // Return sends an agent its prompt: the line it was sent from,
+        // for the mark its hook asks for.
+        if self.claude && bytes == b"\r" {
+            self.last_return = Some(term.view_line(term.cursor().0, 0));
+        }
+        drop(term);
+        self.session.write(bytes);
+        self.last_typed = Some(Instant::now());
+        // The person answered: auto-continue leaves it to them.
+        self.retry = None;
+        answered
+    }
 }
 
 /// How long after a keystroke a bell is taken as the program's answer to
@@ -383,6 +411,9 @@ pub struct Panel {
     /// What Command-clicks on links opened, under a self-test, which
     /// opens nothing.
     pub opened: Vec<String>,
+    /// The ids of tabs closed while their wait was told, whose
+    /// notifications are still to be taken back.
+    pub withdrawn: Vec<String>,
 }
 
 impl Default for Panel {
@@ -406,6 +437,7 @@ impl Default for Panel {
             mouse_cell: None,
             link: None,
             opened: Vec::new(),
+            withdrawn: Vec::new(),
         }
     }
 }
@@ -417,6 +449,13 @@ impl Panel {
 
     pub fn active_tab_mut(&mut self) -> Option<&mut Tab> {
         self.tabs.get_mut(self.active)
+    }
+
+    /// The tab whose [`Tab::id`] is `id`, while it lives.
+    pub fn tab_by_id(&self, id: &str) -> Option<usize> {
+        self.tabs
+            .iter()
+            .position(|tab| tab.id().as_os_str() == std::ffi::OsStr::new(id))
     }
 
     /// Whether keys should go to the terminal.
@@ -510,6 +549,9 @@ impl Panel {
         if index < self.tabs.len() {
             // Dropping the session hangs up on its program.
             let tab = self.tabs.remove(index);
+            if tab.notified {
+                self.withdrawn.push(tab.id().to_string_lossy().into_owned());
+            }
             // Its agent review session goes with it: what its agent changed
             // is for the Git panel now. A tab left to a helper at quit is
             // detached, not closed, and keeps its session.
@@ -2738,8 +2780,30 @@ mod tests {
             retry: None,
             last_return: None,
             marks: Default::default(),
+            notified: false,
             seen: None,
         }
+    }
+
+    #[test]
+    fn a_tab_is_found_by_id_until_it_closes_and_a_told_one_is_withdrawn() {
+        let mut panel = Panel::default();
+        for name in ["one", "two", "three"] {
+            let mut tab = tab();
+            tab.review = PathBuf::from(format!("/nonexistent/sessions/{name}"));
+            panel.tabs.push(tab);
+        }
+        panel.tabs[1].notified = true;
+        assert_eq!(panel.tab_by_id("/nonexistent/sessions/two"), Some(1));
+        panel.close_tab(0);
+        assert_eq!(panel.tab_by_id("/nonexistent/sessions/two"), Some(0));
+        assert!(
+            panel.withdrawn.is_empty(),
+            "never told: nothing to take back"
+        );
+        panel.close_tab(0);
+        assert_eq!(panel.tab_by_id("/nonexistent/sessions/two"), None);
+        assert_eq!(panel.withdrawn, ["/nonexistent/sessions/two"]);
     }
 
     #[test]

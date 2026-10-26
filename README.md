@@ -183,7 +183,10 @@ the size and write it back.
   goes back; `>` still runs commands and `/` opens files. crc also sits
   in the menu bar with the number of sessions waiting on you; its menu
   lists every workspace, those waiting first, and a pick brings crc
-  forward on it.
+  forward on it. A session that starts waiting while it is not the one
+  in front of you posts a macOS notification: reply from it to type the
+  answer into the session, or click it to go there (`notify_waiting` in
+  Settings turns it off).
 - **Claude Code sessions** started by crc report through its hooks.
   Each prompt you send leaves a tick on a thin track at the terminal's
   right edge: click one, or `Cmd-Shift-Up/Down` in the terminal, to go

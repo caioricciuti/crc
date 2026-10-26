@@ -211,6 +211,7 @@ fn tab(title: &str, workspace: &Workspace, cols: usize, rows: usize) -> Tab {
         retry: None,
         last_return: None,
         marks: Default::default(),
+        notified: false,
     }
 }
 

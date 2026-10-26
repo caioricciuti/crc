@@ -228,6 +228,7 @@ impl EditorView {
             state.conflict_side = settings.conflict_side_by_side;
             state.agent_review = settings.agent_review;
             state.auto_continue = settings.auto_continue;
+            state.notify_waiting = settings.notify_waiting;
             if !settings.auto_continue {
                 for tab in &mut state.terminal.tabs {
                     tab.retry = None;

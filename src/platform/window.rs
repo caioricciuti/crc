@@ -72,6 +72,7 @@ mod lsp;
 mod lsp_features;
 mod mcp;
 mod menubar;
+mod notify;
 mod palette;
 mod project;
 mod query;
@@ -777,6 +778,9 @@ struct State {
     /// A turn of it that ended on a temporary API error is told to
     /// continue; see [`crate::platform::retry`].
     auto_continue: bool,
+    /// A session that starts waiting while not in front of you posts a
+    /// notification; see notify.rs.
+    notify_waiting: bool,
     /// What the conflict controls' cursor rects were built for.
     conflict_cursor_key: Option<(u64, usize, usize, usize, usize, bool)>,
     /// The Extensions page's targets and the bulb, as last drawn, so their
@@ -4478,6 +4482,15 @@ define_class!(
             self.auto_continue_tick();
         }
 
+        /// The Return after a reply from a notification, a moment after
+        /// its text; see notify.rs.
+        #[unsafe(method(notifyReturn:))]
+        fn action_notify_return(&self, id: Option<&NSString>) {
+            if let Some(id) = id {
+                self.reply_return(&id.to_string());
+            }
+        }
+
         #[unsafe(method(terminalSettle:))]
         fn action_terminal_settle(&self, _sender: Option<&AnyObject>) {
             self.terminal_settle();
@@ -5692,6 +5705,7 @@ impl EditorView {
         if let Some(state) = self.state() {
             menubar::sync_if_changed(&state, MainThreadMarker::from(self));
         }
+        notify::sync_if_changed(self);
         let ready = match self.state() {
             Some(state) => match state.last_draw {
                 Some(t) => t.elapsed() >= state.frame_interval,
@@ -10281,6 +10295,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         conflict_side: settings.conflict_side_by_side,
         agent_review: settings.agent_review,
         auto_continue: settings.auto_continue,
+        notify_waiting: settings.notify_waiting,
         conflict_cursor_key: None,
         pointer_targets: Vec::new(),
         hotspots: Vec::new(),
@@ -10404,6 +10419,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
     view.lsp_sync_open();
     view.rebuild_extension_menu();
     menubar::install(&view);
+    notify::install(&view);
     // The delegate must outlive this function; NSApplication only holds a
     // weak reference to it, so it is leaked deliberately rather than dropped
     // at the end of `run` while AppKit still calls into it.

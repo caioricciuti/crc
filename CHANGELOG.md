@@ -4,6 +4,12 @@ One entry per tag, written for people who use the editor.
 
 ## Unreleased
 
+- Agents mode: a session that starts waiting on you while it is not
+  the one in front of you posts a macOS notification, once per wait,
+  taken back when it stops waiting or closes. Type a reply in the
+  notification and it goes into the session with its Return, as if
+  typed there; click it to bring crc forward on that session. The
+  setting `notify_waiting` turns it off.
 - Agents mode: a workspace comes back on the tab you left it on. Going
   to another workspace and back used to land on a waiting session or on
   the newest tab instead.

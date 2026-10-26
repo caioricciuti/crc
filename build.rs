@@ -25,6 +25,8 @@ fn main() {
     println!("cargo:rustc-link-lib=framework=WebKit");
     // FSEvents, for the project watcher.
     println!("cargo:rustc-link-lib=framework=CoreServices");
+    // UNUserNotificationCenter, for a notification when an agent waits.
+    println!("cargo:rustc-link-lib=framework=UserNotifications");
     let revision = Command::new("git")
         .args(["rev-parse", "--short=8", "HEAD"])
         .output()

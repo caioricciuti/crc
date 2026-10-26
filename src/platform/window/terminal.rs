@@ -580,6 +580,7 @@ impl EditorView {
                     retry: None,
                     last_return: None,
                     marks: Default::default(),
+                    notified: false,
                     seen: None,
                     launch,
                     held,
@@ -738,6 +739,7 @@ impl EditorView {
                     retry: None,
                     last_return: None,
                     marks: Default::default(),
+                    notified: false,
                     seen: None,
                     launch,
                     held: Some(id),
@@ -1453,24 +1455,7 @@ impl EditorView {
         state.terminal.selection = None;
         let mut answered = false;
         if let Some(tab) = state.terminal.active_tab_mut() {
-            // Typing into it is the answer to what it asked. A result
-            // it reported is seen now; a block stays until it says so.
-            answered = tab.attention.take().is_some();
-            let mut term = tab.session.term.lock().unwrap_or_else(|e| e.into_inner());
-            if term.status.acknowledge() {
-                tab.status = None;
-                answered = true;
-            }
-            // Return sends an agent its prompt: the line it was sent from,
-            // for the mark its hook asks for.
-            if tab.claude && bytes == b"\r" {
-                tab.last_return = Some(term.view_line(term.cursor().0, 0));
-            }
-            drop(term);
-            tab.session.write(bytes);
-            tab.last_typed = Some(Instant::now());
-            // The person answered: auto-continue leaves it to them.
-            tab.retry = None;
+            answered = tab.type_in(bytes);
         }
         if answered {
             super::agents::sync_dock_badge(&state, MainThreadMarker::from(self));
