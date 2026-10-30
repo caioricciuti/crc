@@ -11,9 +11,10 @@
 # front, it posts nothing; a reply answers it, and the notification is
 # taken back. Behind another app, its next wait posts one. A reply to the
 # shell runs there, a click shows it, and closing the waiting agent takes
-# its notification back. The wait before going behind takes the run past
-# the app's first ten seconds, in which a wait counts as told: a fast run
-# reached it inside them and saw nothing posted.
+# its notification back. A wait that follows a reply is seen when the
+# window next reads the hook's events, up to a second after the hook
+# writes them, so the step behind waits that long and more before its
+# dump: a busy machine missed it at 1.4 s.
 case "$BIN" in /*) nr_bin=$BIN ;; *) nr_bin=$PWD/$BIN ;; esac
 mkdir -p "$T/nrproj" "$T/home/nr-home"
 printf 'x\n' > "$T/nrproj/a.txt"
@@ -41,9 +42,10 @@ notify 2 hello
 wait 700
 wait 700
 dump $T/nr-hello.out
-wait 4000
 front off
 notify 2 again
+wait 700
+wait 700
 wait 700
 wait 700
 dump $T/nr-behind.out
