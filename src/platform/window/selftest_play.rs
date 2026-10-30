@@ -820,7 +820,7 @@ impl EditorView {
                     });
                 let report = format!(
                     // First: the report ends with the document's text.
-                    "message: {}\npreview: {}\nmd: {md}\nspans: {spans}\nterminal_find: {terminal_find}\nactivity: {}\npointer_targets: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nrepo: {}\ngit_note: {}\nhome: {}\nhome_scroll: {}\nmcp: {}\nmcp_page: {}\nsettings_page: {}\nterminals: {}\nagents: {}\ninspector: {}\nteams: {}\nagents_tree: {}\nagents_activity: {}\nagents_prs: {}\nmenubar: {}\nconflicts: {}\ngit_conflicts: {}\ntable: {}\nquery: {}\nquery_sql: {}\nblame: {}\nfind_results: {}\nfind_rows: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\npeek: {}\ngutter: {}\nissue_tab: {}\nscrub: {}\nscrub_strip: {}\nscrub_fade: {}\nscrub_filter: {}\nscrub_compare: {}\nblame_heat: {}\nreplaced: {}\nreceipt: {}\n{report}",
+                    "message: {}\npreview: {}\nmd: {md}\nspans: {spans}\nterminal_find: {terminal_find}\nactivity: {}\npointer_targets: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nrepo: {}\ngit_note: {}\nhome: {}\nhome_scroll: {}\nmcp: {}\nmcp_page: {}\nsettings_page: {}\nterminals: {}\nagents: {}\ninspector: {}\nteams: {}\nagents_tree: {}\nagents_activity: {}\nagents_prs: {}\nmenubar: {}\nconflicts: {}\ngit_conflicts: {}\ntable: {}\nquery: {}\nquery_sql: {}\nblame: {}\nfind_results: {}\nfind_rows: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\npeek: {}\ngutter: {}\nissue_tab: {}\nscrub: {}\nscrub_strip: {}\nscrub_fade: {}\nscrub_filter: {}\nscrub_compare: {}\nblame_heat: {}\nreplaced: {}\nreceipt: {}\nmonitor: {}\n{report}",
                     state.message.as_ref().map_or("", |(text, _)| text.as_str()),
                     state.html_preview.as_ref().map_or("closed".to_string(), |p| format!(
                         "open ext={} view={} probe={}",
@@ -1122,6 +1122,7 @@ impl EditorView {
                     },
                     state.replaced,
                     state.agents.inspector.report_receipt(),
+                    state.agents.activity.report(state.agents.arrangement.activity_folded),
                 );
                 if let Err(e) = std::fs::write(path, report) {
                     eprintln!("crc: selftest could not write {path}: {e}");

@@ -236,6 +236,8 @@ impl EditorView {
             return;
         };
         let mut changed = state.agents.poll();
+        // A read the wake missed (the state was busy then) lands here.
+        let landed = state.agents.activity.poll();
         // The selected workspace's folder, once a minute in front, and one
         // just selected whose last read is older: read here, not only at
         // the tick, so selecting it reads it at once.
@@ -320,8 +322,37 @@ impl EditorView {
             }
             None => {}
         }
-        if changed {
+        if changed || landed {
             self.request_redraw();
+        }
+    }
+
+    /// From the Activity panel's worker: a read landed.
+    pub(super) fn poll_activity(&self) {
+        let landed = self
+            .state_mut()
+            .is_some_and(|mut state| state.agents.activity.poll());
+        if landed {
+            self.request_redraw();
+            self.pump();
+        }
+    }
+
+    /// After every frame: the Activity panel's worker runs while the panel
+    /// was drawn unfolded, and stops after a frame without it (folded, the
+    /// sidebar hidden, the editor back).
+    pub(super) fn activity_after_frame(&self) {
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
+        let monitor = &mut state.agents.activity;
+        if monitor.shown == monitor.running() {
+            return;
+        }
+        if monitor.shown {
+            monitor.start(self.wake(EditorView::poll_activity));
+        } else {
+            monitor.stop();
         }
     }
 
@@ -542,6 +573,11 @@ impl EditorView {
             // empty part of the list does nothing.
             Action::Blank if event.clickCount() >= 2 => self.new_blank_workspace(),
             Action::Blank => {}
+            Action::Activity => {
+                if let Some(mut state) = self.state_mut() {
+                    state.agents.toggle_activity();
+                }
+            }
             Action::Menu(index) => {
                 if let Some(mut state) = self.state_mut() {
                     state.agents.menu_task = state.agents.tasks.get(index).map(|t| t.id());

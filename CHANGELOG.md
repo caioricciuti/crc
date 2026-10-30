@@ -17,6 +17,10 @@ One entry per tag, written for people who use the editor.
   named instead of guessed at. A slow turn is also sampled while it
   runs, so its line names the functions it was in, the most first, and
   the system library each was inside.
+- Agents mode: an Activity panel at the bottom of the sidebar shows the
+  whole Mac: CPU with a short history, memory used and its pressure,
+  disk and network rates, and the three processes using the most CPU
+  with their memory. Its title folds it, and folded it reads nothing.
 - Agents mode: a session that starts waiting on you while it is not
   the one in front of you posts a macOS notification, once per wait,
   taken back when it stops waiting or closes. Type a reply in the

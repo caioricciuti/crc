@@ -5971,6 +5971,7 @@ impl EditorView {
         self.terminal_after_frame();
         self.history_after_frame();
         self.scrub_after_frame();
+        self.activity_after_frame();
     }
 
     /// Creates the display link on first use and unpauses it.

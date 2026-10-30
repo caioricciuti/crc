@@ -821,6 +821,8 @@ impl EditorView {
                 })
                 .collect()
         });
+        // Set again by the list when it draws the Activity panel open.
+        agents.activity.shown = false;
         if let Some(rect) = sidebar_rect
             && agents.on
         {

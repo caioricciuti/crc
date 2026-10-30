@@ -50,6 +50,8 @@ pub enum Action {
     /// The line over a folder workspace's merged worktrees: shows or hides
     /// them; its menu cleans them all up.
     Merged(usize),
+    /// The Activity panel's title row: folds it, or opens it.
+    Activity,
 }
 
 /// What a worker read of the folder workspaces: per folder workspace (by
@@ -559,7 +561,13 @@ pub struct Arrangement {
     pub issues: std::collections::HashSet<RepoKey>,
     /// Repositories whose inspector card is folded to its name row.
     pub folded_repos: std::collections::HashSet<RepoKey>,
+    /// The Activity panel at the foot of the list is folded to its title.
+    pub activity_folded: bool,
 }
+
+/// The arrangement's line for a folded Activity panel: no tab, so a build
+/// from before it skips the line.
+const ACTIVITY_FOLDED: &str = "activity-folded";
 
 impl Arrangement {
     /// One per line: the flags (`pin`, `fold`, `merged`, comma-separated)
@@ -567,10 +575,14 @@ impl Arrangement {
     /// before folding has `pin` or `-` alone. A repository's line has no id:
     /// its flags (`issues`, `fold`), two tabs, its host (empty for this
     /// Mac's), a tab and its main checkout; a build from before them skips
-    /// it.
+    /// it. A folded Activity panel is a line of its own.
     pub fn parse(text: &str) -> Arrangement {
         let mut out = Arrangement::default();
         for line in text.lines() {
+            if line == ACTIVITY_FOLDED {
+                out.activity_folded = true;
+                continue;
+            }
             let mut parts = line.splitn(3, '\t');
             let (Some(flag), Some(id)) = (parts.next(), parts.next()) else {
                 continue;
@@ -662,6 +674,7 @@ impl Arrangement {
                 )
             })
             .chain(repos)
+            .chain(self.activity_folded.then(|| format!("{ACTIVITY_FOLDED}\n")))
             .collect()
     }
 
@@ -1255,6 +1268,8 @@ pub struct Panel {
     pub menu_task: Option<String>,
     /// The column at the right: the selected workspace's Git state.
     pub inspector: crate::platform::inspector::Inspector,
+    /// The whole Mac's load, pinned at the foot of the list.
+    pub activity: crate::platform::activity::Monitor,
     /// When every folder workspace's worktrees were last read.
     pub refreshed_at: Option<std::time::Instant>,
     /// Per folder workspace, by id, when its worktrees were last read: the
@@ -1899,6 +1914,23 @@ impl Panel {
             self.arrangement.folded_repos.insert(repo);
         }
         self.save_arrangement();
+    }
+
+    /// Folds the Activity panel to its title row, or opens it.
+    pub fn toggle_activity(&mut self) {
+        self.arrangement.activity_folded = !self.arrangement.activity_folded;
+        self.save_arrangement();
+    }
+
+    /// The Activity panel's height at the foot of `column`: none when the
+    /// column is too short to keep a few rows of the list above it.
+    fn activity_height(&self, column: Viewport) -> f32 {
+        let h = crate::platform::activity::Monitor::height(self.arrangement.activity_folded);
+        if column.height - layout::SIDEBAR_HEADER_HEIGHT - h < ROW * 3.0 {
+            0.0
+        } else {
+            h
+        }
     }
 
     /// Reads the issues of the selected workspace's repositories that are
@@ -2974,12 +3006,13 @@ impl Panel {
         0
     }
 
-    fn room(column: Viewport) -> f32 {
-        (column.height - layout::SIDEBAR_HEADER_HEIGHT).max(0.0)
+    /// The list's height: under the header, over the Activity panel.
+    fn room(&self, column: Viewport) -> f32 {
+        (column.height - layout::SIDEBAR_HEADER_HEIGHT - self.activity_height(column)).max(0.0)
     }
 
     pub fn scroll_by(&mut self, lines: isize, column: Viewport, tabs: &[Tab]) {
-        let max = self.max_scroll(&self.lines(tabs), Panel::room(column));
+        let max = self.max_scroll(&self.lines(tabs), self.room(column));
         self.scroll = (self.scroll as isize + lines).clamp(0, max as isize) as usize;
     }
 
@@ -3139,7 +3172,8 @@ impl Panel {
     /// A region by the name a self-test script uses: `agents.new`,
     /// `agents.refresh`, `agents.task.0`, `agents.session.1`,
     /// `agents.add.0`, `agents.menu.0`, `agents.fold.0`, `agents.merged.0`
-    /// (by the folder workspace's index), `agents.blank`. As last drawn.
+    /// (by the folder workspace's index), `agents.blank`, `agents.activity`
+    /// (the Activity panel's title). As last drawn.
     pub fn named(&self, name: &str) -> Option<Viewport> {
         let rest = name.strip_prefix("agents.")?;
         let (kind, n) = rest.split_once('.').unwrap_or((rest, ""));
@@ -3154,6 +3188,7 @@ impl Panel {
             "menu" => Action::Menu(n),
             "fold" => Action::Fold(n),
             "merged" => Action::Merged(n),
+            "activity" => Action::Activity,
             _ => return None,
         };
         self.hits
@@ -3220,7 +3255,9 @@ impl Panel {
         let x = column.x + 10.0;
         let width = (column.width - 20.0).max(0.0);
         let lines = self.lines(tabs);
-        let room = Panel::room(column);
+        let room = self.room(column);
+        let activity_h = self.activity_height(column);
+        let foot = column.y + column.height - activity_h;
         self.scroll = self.scroll.min(self.max_scroll(&lines, room));
         let selected = self.selected_index();
         // The worktrees last under their folder workspace: the guide stops
@@ -3301,7 +3338,7 @@ impl Panel {
                 );
             }
         }
-        let blank_bottom = column.y + column.height - if self.op.is_some() { ROW } else { 0.0 };
+        let blank_bottom = foot - if self.op.is_some() { ROW } else { 0.0 };
         if blank_bottom - blank_top >= ROW {
             self.hits.push((
                 Viewport {
@@ -3527,7 +3564,7 @@ impl Panel {
         if let Some((said, _)) = &self.op {
             let bottom = Viewport {
                 x: column.x + 4.0,
-                y: column.y + column.height - ROW,
+                y: foot - ROW,
                 width: (column.width - 8.0).max(0.0),
                 height: ROW,
             };
@@ -3551,6 +3588,25 @@ impl Panel {
                 said,
                 theme.status_text,
             );
+        }
+        // The whole Mac's load, pinned under the list; its worker runs
+        // while it shows unfolded (see `Monitor::shown`).
+        let folded = self.arrangement.activity_folded;
+        self.activity.shown = activity_h > 0.0 && !folded;
+        if activity_h > 0.0 {
+            let title = self.activity.draw(
+                folded,
+                atlas,
+                Viewport {
+                    x: column.x,
+                    y: foot,
+                    width: column.width,
+                    height: activity_h,
+                },
+                theme,
+                out,
+            );
+            self.hits.push((title, Action::Activity));
         }
     }
 }
@@ -4275,6 +4331,48 @@ mod tests {
         assert_eq!(back, a);
         a.rename_id("folder:notes", "folder:ideas");
         assert_eq!(a.order[0], "folder:ideas");
+    }
+
+    #[test]
+    fn a_folded_activity_panel_is_kept_and_takes_no_workspace_place() {
+        let mut a = Arrangement::default();
+        a.order.push("/r".into());
+        a.activity_folded = true;
+        let back = Arrangement::parse(&a.text());
+        assert_eq!(back, a);
+        assert_eq!(back.order, ["/r"]);
+        a.activity_folded = false;
+        assert!(!Arrangement::parse(&a.text()).activity_folded);
+    }
+
+    #[test]
+    fn the_activity_panel_takes_its_height_from_the_list() {
+        let mut panel = Panel::default();
+        let column = Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: 260.0,
+            height: 800.0,
+        };
+        let open = crate::platform::activity::Monitor::height(false);
+        assert_eq!(
+            panel.room(column),
+            800.0 - layout::SIDEBAR_HEADER_HEIGHT - open
+        );
+        panel.arrangement.activity_folded = true;
+        let folded = crate::platform::activity::Monitor::height(true);
+        assert!(folded < open);
+        assert_eq!(
+            panel.room(column),
+            800.0 - layout::SIDEBAR_HEADER_HEIGHT - folded
+        );
+        // Too short a column keeps its rows for the list.
+        let short = Viewport {
+            height: layout::SIDEBAR_HEADER_HEIGHT + open + ROW,
+            ..column
+        };
+        panel.arrangement.activity_folded = false;
+        assert_eq!(panel.activity_height(short), 0.0);
     }
 
     #[test]

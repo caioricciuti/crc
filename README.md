@@ -244,6 +244,11 @@ the size and write it back.
   the newest six with their result (ok, exit N, stopped, background)
   and when; hover a row for the whole command. Only Claude sessions crc
   starts, with `agent_review` on.
+  At the bottom of the Agents sidebar, the Activity panel shows the
+  whole Mac every two seconds: CPU with a short history, memory used
+  and its pressure, disk and network rates, and the three processes
+  using the most CPU with their memory. Click its title to fold it;
+  folded, it reads nothing.
 - **Drop files and images** anywhere on the window. On the terminal
   the paths are typed into the session, quoted, which is how an agent
   gets a screenshot; on the editor the files open. An image with no

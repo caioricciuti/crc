@@ -838,6 +838,50 @@ pub fn push_skeleton_row(
     ANIMATING.with(|a| a.set(true));
 }
 
+/// A run of values as at most `bars` bars, in order: a run longer than
+/// that averaged in groups as even as they come.
+pub fn spark_buckets(values: &[f32], bars: usize) -> Vec<f32> {
+    if values.len() <= bars {
+        return values.to_vec();
+    }
+    (0..bars)
+        .map(|b| {
+            let group = &values[values.len() * b / bars..values.len() * (b + 1) / bars];
+            group.iter().sum::<f32>() / group.len() as f32
+        })
+        .collect()
+}
+
+/// A sparkline: `values` from 0 to 1, oldest first, as bars standing on
+/// the bottom of `rect`, the newest at its right. Each is at least a point
+/// tall, so a quiet run still reads as a line.
+pub fn push_sparkline(
+    out: &mut Vec<GlyphInstance>,
+    rect: Viewport,
+    values: &[f32],
+    colour: [f32; 4],
+) {
+    const BAR: f32 = 2.0;
+    const GAP: f32 = 1.0;
+    let bars = ((rect.width + GAP) / (BAR + GAP)).floor().max(0.0) as usize;
+    let levels = spark_buckets(values, bars);
+    let right = rect.x + rect.width;
+    for (n, level) in levels.iter().rev().enumerate() {
+        let h = (level.clamp(0.0, 1.0) * rect.height).round().max(1.0);
+        push_rounded_rect(
+            out,
+            Viewport {
+                x: right - BAR - n as f32 * (BAR + GAP),
+                y: rect.y + rect.height - h,
+                width: BAR,
+                height: h,
+            },
+            1.0,
+            colour,
+        );
+    }
+}
+
 /// A heading in bold prose at `size` points, top-left at `(x, y)`; its
 /// width. For page titles, which the 13pt UI face is too small for.
 #[allow(clippy::too_many_arguments)]
@@ -1348,6 +1392,33 @@ mod tests {
         set_pressed(None);
         set_pointer(None);
         assert!(!hovered(r));
+    }
+
+    #[test]
+    fn a_sparkline_averages_a_long_run_into_its_bars() {
+        assert_eq!(spark_buckets(&[0.1, 0.2], 5), vec![0.1, 0.2]);
+        assert_eq!(spark_buckets(&[0.0, 1.0, 0.5, 0.5], 2), vec![0.5, 0.5]);
+        // Thirty into seven: groups of four or five, every value in one.
+        let run: Vec<f32> = (0..30).map(|i| i as f32).collect();
+        let bars = spark_buckets(&run, 7);
+        assert_eq!(bars.len(), 7);
+        assert_eq!(bars[0], 1.5);
+        assert_eq!(bars[6], 27.0);
+        assert!(spark_buckets(&run, 0).is_empty());
+        // Drawn: a bar each, the newest at the right edge, none under a
+        // point tall.
+        let mut out = Vec::new();
+        let rect = Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: 20.0,
+            height: 10.0,
+        };
+        push_sparkline(&mut out, rect, &[0.0, 1.0], [1.0; 4]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].pos[0] + out[0].size[0], 20.0);
+        assert_eq!(out[0].size[1], 10.0);
+        assert_eq!(out[1].size[1], 1.0);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Platform layer: the AppKit window, input, clipboard, files, session, and
 //! timing.
 
+pub mod activity;
 pub mod agents;
 pub mod claude;
 pub mod clipboard;
