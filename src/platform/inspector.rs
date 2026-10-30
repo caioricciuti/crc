@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use crate::platform::agents::{IssueSet, Pace, RepoKey, Workspace};
 use crate::project::icons;
+use crate::project::receipt::{Outcome, Receipt};
 use crate::project::worktree::{CheckState, PullRequest, Status};
 use crate::render::{
     font::Atlas,
@@ -127,6 +128,9 @@ pub type Want = (PathBuf, Option<String>, bool);
 /// A card row: its label, and its values with their colours.
 type Fact<'a> = (&'a str, Vec<(String, [f32; 4])>);
 
+/// The newest commands the receipt card lists.
+const RECEIPT_ROWS: usize = 6;
+
 /// A worktree strip's height: its branch, where it stands, and its last
 /// commit.
 const STRIP: f32 = 64.0;
@@ -231,6 +235,8 @@ pub struct Inspector {
     max_scroll: f32,
     /// The ssh session shown last frame, for the self-test.
     shown_remote: Option<String>,
+    /// The receipt shown last frame, as the self-test reads it.
+    shown_receipt: Option<String>,
     /// The remote workspace shown last frame, `host:path`, for the
     /// self-test.
     shown_host: Option<String>,
@@ -701,6 +707,7 @@ impl Inspector {
         repos: Option<&[PathBuf]>,
         worktrees: &[(Workspace, String, Pace, bool)],
         remote: Option<&crate::platform::remote::Remote>,
+        receipt: Option<&Receipt>,
         pull_request: Option<Option<&PullRequest>>,
         github: bool,
         issues: Issues,
@@ -714,6 +721,7 @@ impl Inspector {
         self.shown_issues.clear();
         self.shown_folded.clear();
         self.shown_remote = remote.map(|r| r.login());
+        self.shown_receipt = None;
         self.shown_host = workspace
             .filter(|_| remote.is_none())
             .and_then(|w| Some(format!("{}:{}", w.host.as_ref()?, w.path.display())));
@@ -787,6 +795,7 @@ impl Inspector {
             repos,
             worktrees,
             remote,
+            receipt,
             pull_request,
             github,
             issues,
@@ -825,6 +834,88 @@ impl Inspector {
         self.hits.extend(hits);
     }
 
+    /// The receipt card: how many commands the session's agent ran and
+    /// how many failed, then the newest few, each with how it ended and
+    /// when. The whole command is a row's tooltip. The bottom it reached.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_receipt(
+        &mut self,
+        receipt: &Receipt,
+        atlas: &mut Atlas,
+        x: f32,
+        y: f32,
+        width: f32,
+        theme: &Theme,
+        out: &mut Vec<GlyphInstance>,
+    ) -> f32 {
+        text(out, atlas, x, y, width, "RECEIPT", theme.status_text);
+        let y = y + ROW;
+        let now = crate::platform::unix_seconds();
+        let failed = if receipt.failed == 0 {
+            ("none failed".to_owned(), theme.gutter_text)
+        } else {
+            (format!("{} failed", receipt.failed), theme.diff_removed)
+        };
+        let mut labels = vec!["Commands".to_owned()];
+        let mut values = vec![vec![(format!("{} ran", receipt.total), theme.text), failed]];
+        let mut whole = Vec::new();
+        // The command gets what the values leave of the row.
+        let inner = width - 20.0;
+        for ran in receipt.latest(RECEIPT_ROWS) {
+            let ink = match ran.outcome {
+                Outcome::Passed => theme.diff_added,
+                Outcome::Background => theme.gutter_text,
+                _ => theme.diff_removed,
+            };
+            let age = crate::platform::git_panel::agent_age(Duration::from_secs(
+                now.saturating_sub(ran.at),
+            ));
+            let row = vec![(ran.outcome.label(), ink), (age, theme.gutter_text)];
+            let taken: f32 = row
+                .iter()
+                .map(|(v, _)| layout::ui_text_width(atlas, v) + 6.0)
+                .sum();
+            // As it ran, wrappers and all: a receipt does not tidy up.
+            labels.push(fit(atlas, &ran.command, (inner - taken - 12.0).max(0.0)));
+            values.push(row);
+            whole.push(ran.command.clone());
+        }
+        let facts: Vec<Fact> = labels.iter().map(String::as_str).zip(values).collect();
+        let bottom = card(out, atlas, x, y, width, &facts, theme);
+        for (n, command) in whole.iter().enumerate() {
+            layout::hotspot(
+                Viewport {
+                    x,
+                    y: y + 4.0 + (n + 1) as f32 * ROW,
+                    width,
+                    height: ROW,
+                },
+                layout::Cursor::Arrow,
+                Some(command),
+            );
+        }
+        self.shown_receipt = Some(format!(
+            "ran={} failed={} rows={} last={}",
+            receipt.total,
+            receipt.failed,
+            whole.len(),
+            receipt
+                .latest(1)
+                .next()
+                .map_or_else(String::new, |r| format!(
+                    "{}:{}",
+                    r.outcome.code(),
+                    r.command
+                )),
+        ));
+        bottom
+    }
+
+    /// For the self-test: the receipt card as last drawn, or `-`.
+    pub fn report_receipt(&self) -> String {
+        self.shown_receipt.clone().unwrap_or_else(|| "-".into())
+    }
+
     /// Scrolls the body by `points`, down the content positive.
     pub fn scroll_by(&mut self, points: f32) {
         self.scroll = (self.scroll + points).clamp(0.0, self.max_scroll);
@@ -838,6 +929,7 @@ impl Inspector {
         repos: Option<&[PathBuf]>,
         worktrees: &[(Workspace, String, Pace, bool)],
         remote: Option<&crate::platform::remote::Remote>,
+        receipt: Option<&Receipt>,
         pull_request: Option<Option<&PullRequest>>,
         github: bool,
         issues: Issues,
@@ -906,6 +998,10 @@ impl Inspector {
         );
         text(out, atlas, x, y, width, &shown, theme.gutter_text);
         y += ROW;
+        // The session showing: what its agent ran, as its hooks said.
+        if let Some(receipt) = receipt.filter(|r| !r.is_empty()) {
+            y = self.draw_receipt(receipt, atlas, x, y, width, theme, out) + 14.0;
+        }
         // The terminal showing is in ssh: where it is, not this Mac's Git.
         if let Some(remote) = remote {
             text(out, atlas, x, y, width, "SSH SESSION", theme.status_text);
@@ -2442,6 +2538,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
             true,
             Issues {
                 read,
@@ -2631,6 +2728,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
             true,
             Issues {
                 read: &read,
@@ -2764,6 +2862,7 @@ mod tests {
                 Some(&workspace),
                 Some(&repos),
                 &[],
+                None,
                 None,
                 None,
                 true,
@@ -2932,6 +3031,7 @@ mod tests {
             Some(&workspace),
             Some(&[PathBuf::from("/r")]),
             &[],
+            None,
             None,
             None,
             true,

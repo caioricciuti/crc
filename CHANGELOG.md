@@ -4,6 +4,13 @@ One entry per tag, written for people who use the editor.
 
 ## Unreleased
 
+- Agents mode: a receipt for each Claude session crc starts. Claude
+  Code's own hooks report every shell command the agent runs and how
+  it ended, and the inspector's Receipt card shows how many ran and how
+  many failed, then the newest six with their result (ok, exit 101,
+  stopped, background) and when. What the agent later says about its
+  tests can be checked against what actually ran. Needs `agent_review`
+  on, as it is by default.
 - A lag you can feel now leaves a trace: any turn of the main thread
   over 33 ms writes one line to `~/Library/Logs/crc/jank.log` naming
   what took the time (a poll, layout, the GPU), so a slow moment can be

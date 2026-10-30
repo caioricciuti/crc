@@ -122,6 +122,9 @@ pub enum Event {
     /// The person sent the agent a prompt: Claude's UserPromptSubmit
     /// hook, with the prompt's first line, for the terminal's marks.
     Prompted(String),
+    /// The agent ran a shell command, and this is how it ended: Claude's
+    /// PostToolUse or PostToolUseFailure hook on Bash, for the receipt.
+    Ran(crate::project::receipt::Ran),
 }
 
 /// The most of a prompt's first line an event keeps.
@@ -226,6 +229,31 @@ pub fn hook(kind: &str, input: &str, dir: &Path) -> Result<Option<Event>, String
                 .take(PROMPT_CHARS)
                 .collect(),
         ),
+        "ran" | "ran-failed" => {
+            use crate::project::receipt::{Outcome, Ran, clean_command, failure_outcome};
+            let command = value
+                .path("tool_input.command")
+                .and_then(|v| v.as_str())
+                .ok_or("no command in the tool input")?;
+            let outcome = if kind == "ran-failed" {
+                let error = value.get("error").and_then(|v| v.as_str()).unwrap_or("");
+                let interrupted = value.get("is_interrupt").and_then(|v| v.as_bool()) == Some(true);
+                failure_outcome(error, interrupted)
+            } else if value
+                .path("tool_input.run_in_background")
+                .and_then(|v| v.as_bool())
+                == Some(true)
+            {
+                Outcome::Background
+            } else {
+                Outcome::Passed
+            };
+            Event::Ran(Ran {
+                at: crate::platform::unix_seconds(),
+                outcome,
+                command: clean_command(command),
+            })
+        }
         "teammate-idle" => Event::TeammateIdle(
             value
                 .get("teammate_name")
@@ -563,6 +591,12 @@ fn append(dir: &Path, event: &Event) -> std::io::Result<()> {
             format!("apierror\t{}\t{}\n", clean(error), clean(details))
         }
         Event::Prompted(text) => format!("prompted\t{}\n", clean(text)),
+        Event::Ran(ran) => format!(
+            "ran\t{}\t{}\t{}\n",
+            ran.at,
+            ran.outcome.code(),
+            clean(&ran.command)
+        ),
     };
     std::fs::create_dir_all(dir)?;
     // One write of a short line with O_APPEND: hooks running at once do
@@ -594,47 +628,75 @@ pub fn read_events(dir: &Path, from: u64) -> (Vec<Event>, u64) {
         return (Vec::new(), from);
     };
     let text = String::from_utf8_lossy(&bytes[..end]);
-    let events = text
-        .lines()
-        .filter_map(|line| {
-            let (kind, rest) = line.split_once('\t').unwrap_or((line, ""));
-            Some(match kind {
-                "wrote" => {
-                    let (tool, path) = rest.split_once('\t')?;
-                    Event::Wrote {
-                        tool: tool.to_owned(),
-                        path: PathBuf::from(path),
-                    }
-                }
-                "asked" => Event::Asked(rest.to_owned()),
-                "failed" => Event::Failed(rest.to_owned()),
-                "task" => {
-                    let mut parts = rest.splitn(4, '\t');
-                    let id = parts.next()?.to_owned();
-                    let done = parts.next()? == "done";
-                    let teammate = parts.next().filter(|t| !t.is_empty()).map(str::to_owned);
-                    let subject = parts.next().unwrap_or("").to_owned();
-                    Event::Task {
-                        id,
-                        subject,
-                        done,
-                        teammate,
-                    }
-                }
-                "idle" => Event::TeammateIdle(rest.to_owned()),
-                "prompted" => Event::Prompted(rest.to_owned()),
-                "apierror" => {
-                    let (error, details) = rest.split_once('\t').unwrap_or((rest, ""));
-                    Event::ApiError {
-                        error: error.to_owned(),
-                        details: details.to_owned(),
-                    }
-                }
-                _ => return None,
-            })
-        })
-        .collect();
+    let events = text.lines().filter_map(parse_event).collect();
     (events, from + end as u64 + 1)
+}
+
+/// One line of the events file; `None` for a line this build cannot read.
+fn parse_event(line: &str) -> Option<Event> {
+    let (kind, rest) = line.split_once('\t').unwrap_or((line, ""));
+    Some(match kind {
+        "wrote" => {
+            let (tool, path) = rest.split_once('\t')?;
+            Event::Wrote {
+                tool: tool.to_owned(),
+                path: PathBuf::from(path),
+            }
+        }
+        "asked" => Event::Asked(rest.to_owned()),
+        "failed" => Event::Failed(rest.to_owned()),
+        "task" => {
+            let mut parts = rest.splitn(4, '\t');
+            let id = parts.next()?.to_owned();
+            let done = parts.next()? == "done";
+            let teammate = parts.next().filter(|t| !t.is_empty()).map(str::to_owned);
+            let subject = parts.next().unwrap_or("").to_owned();
+            Event::Task {
+                id,
+                subject,
+                done,
+                teammate,
+            }
+        }
+        "idle" => Event::TeammateIdle(rest.to_owned()),
+        "prompted" => Event::Prompted(rest.to_owned()),
+        "ran" => {
+            let mut parts = rest.splitn(3, '\t');
+            let at = parts.next()?.parse().ok()?;
+            let outcome = crate::project::receipt::Outcome::from_code(parts.next()?)?;
+            Event::Ran(crate::project::receipt::Ran {
+                at,
+                outcome,
+                command: parts.next()?.to_owned(),
+            })
+        }
+        "apierror" => {
+            let (error, details) = rest.split_once('\t').unwrap_or((rest, ""));
+            Event::ApiError {
+                error: error.to_owned(),
+                details: details.to_owned(),
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// The commands a session's events record before byte `until`: the
+/// receipt of a terminal that comes back with its events already read.
+pub fn receipt_until(dir: &Path, until: u64) -> crate::project::receipt::Receipt {
+    let mut receipt = crate::project::receipt::Receipt::default();
+    let Ok(bytes) = std::fs::read(dir.join("events")) else {
+        return receipt;
+    };
+    let end = usize::try_from(until)
+        .unwrap_or(usize::MAX)
+        .min(bytes.len());
+    for line in String::from_utf8_lossy(&bytes[..end]).lines() {
+        if let Some(Event::Ran(ran)) = parse_event(line) {
+            receipt.note(ran);
+        }
+    }
+    receipt
 }
 
 /// The suffix of a session folder moved aside to be removed.
@@ -753,12 +815,24 @@ pub fn claude_settings(exe: &Path, review: bool) -> String {
                 ])]),
             ),
             // The write done: the file as the agent left it, which is what
-            // Undo checks against.
+            // Undo checks against. And every shell command and how it
+            // ended, for the receipt: a success has no exit code, a
+            // failure says it in its error.
             (
                 "PostToolUse",
+                Value::Array(vec![
+                    object([
+                        ("matcher", string("Write|Edit|MultiEdit|NotebookEdit")),
+                        ("hooks", command("post")),
+                    ]),
+                    object([("matcher", string("Bash")), ("hooks", command("ran"))]),
+                ]),
+            ),
+            (
+                "PostToolUseFailure",
                 Value::Array(vec![object([
-                    ("matcher", string("Write|Edit|MultiEdit|NotebookEdit")),
-                    ("hooks", command("post")),
+                    ("matcher", string("Bash")),
+                    ("hooks", command("ran-failed")),
                 ])]),
             ),
             (
@@ -1748,5 +1822,118 @@ mod tests {
         assert_eq!(summary(&tree.0)[0].2, 5000);
         // Generous: a CI runner busy with the whole suite took over 500 ms.
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    /// The hook inputs as Claude Code sent them (2.1.314, probed
+    /// 2026-10-30): a success through PostToolUse, with no exit code; a
+    /// failure through PostToolUseFailure, its code in the error.
+    #[test]
+    fn the_bash_hooks_record_each_command_and_how_it_ended() {
+        use crate::project::receipt::Outcome;
+        let tree = TempTree::new("review-ran", &[]);
+        let dir = tree.0.join("session");
+        let ran = |kind: &str, input: &str| match hook(kind, input, &dir).expect("hook") {
+            Some(Event::Ran(ran)) => (ran.outcome, ran.command),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            ran(
+                "ran",
+                r#"{"hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"echo ok","description":"Print ok"},"tool_response":{"stdout":"ok","stderr":"","interrupted":false}}"#
+            ),
+            (Outcome::Passed, "echo ok".into())
+        );
+        assert_eq!(
+            ran(
+                "ran-failed",
+                r#"{"hook_event_name":"PostToolUseFailure","tool_name":"Bash","tool_input":{"command":"cargo test\n  --offline"},"error":"Exit code 101\nerror: 1 test failed","is_interrupt":false}"#
+            ),
+            (Outcome::Failed(101), "cargo test --offline".into())
+        );
+        assert_eq!(
+            ran(
+                "ran-failed",
+                r#"{"tool_input":{"command":"sleep 99"},"error":"Interrupted","is_interrupt":true}"#
+            )
+            .0,
+            Outcome::Interrupted
+        );
+        assert_eq!(
+            ran(
+                "ran",
+                r#"{"tool_input":{"command":"npm run dev","run_in_background":true},"tool_response":{"backgroundTaskId":"b1"}}"#
+            )
+            .0,
+            Outcome::Background
+        );
+        // No command: the hook says so, and records nothing.
+        assert!(hook("ran", r#"{"tool_input":{}}"#, &dir).is_err());
+        let (events, read) = read_events(&dir, 0);
+        let outcomes: Vec<_> = events
+            .iter()
+            .map(|e| match e {
+                Event::Ran(r) => (r.outcome, r.command.as_str()),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            outcomes,
+            [
+                (Outcome::Passed, "echo ok"),
+                (Outcome::Failed(101), "cargo test --offline"),
+                (Outcome::Interrupted, "sleep 99"),
+                (Outcome::Background, "npm run dev"),
+            ]
+        );
+        // A terminal back from its helper had read the first two.
+        let first_two = std::fs::read_to_string(dir.join("events"))
+            .expect("events")
+            .lines()
+            .take(2)
+            .map(|l| l.len() as u64 + 1)
+            .sum();
+        let receipt = receipt_until(&dir, first_two);
+        assert_eq!((receipt.total, receipt.failed), (2, 1));
+        assert_eq!(receipt_until(&dir, read).total, 4);
+    }
+
+    #[test]
+    fn the_review_settings_hook_every_shell_command() {
+        let text = claude_settings(Path::new("/usr/local/bin/crc"), true);
+        let value = crate::json::parse(&text).expect("json");
+        let entries = |event: &str| -> Vec<(String, String)> {
+            value
+                .path(&format!("hooks.{event}"))
+                .and_then(|v| v.as_array())
+                .expect(event)
+                .iter()
+                .map(|m| {
+                    let matcher = m.get("matcher").and_then(|v| v.as_str()).unwrap_or("");
+                    let command = m
+                        .path("hooks")
+                        .and_then(|v| v.as_array())
+                        .and_then(|a| a.first())
+                        .and_then(|h| h.get("command"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    (matcher.to_owned(), command.to_owned())
+                })
+                .collect()
+        };
+        let crc = "'/usr/local/bin/crc' --hook";
+        assert_eq!(
+            entries("PostToolUse"),
+            [
+                (
+                    "Write|Edit|MultiEdit|NotebookEdit".into(),
+                    format!("{crc} post")
+                ),
+                ("Bash".into(), format!("{crc} ran")),
+            ]
+        );
+        assert_eq!(
+            entries("PostToolUseFailure"),
+            [("Bash".into(), format!("{crc} ran-failed"))]
+        );
     }
 }

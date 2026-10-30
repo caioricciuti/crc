@@ -238,6 +238,12 @@ the size and write it back.
   permission, a question or a login, finished, or failed, with its
   message. With agent teams on in Claude Code, the session's task list
   shows under it, each task with its teammate and a check when done.
+  Above the repositories, the Receipt card lists what the session
+  showing actually ran, as Claude Code's hooks report it rather than as
+  the agent tells it: how many shell commands and how many failed, then
+  the newest six with their result (ok, exit N, stopped, background)
+  and when; hover a row for the whole command. Only Claude sessions crc
+  starts, with `agent_review` on.
 - **Drop files and images** anywhere on the window. On the terminal
   the paths are typed into the session, quoted, which is how an agent
   gets a screenshot; on the editor the files open. An image with no

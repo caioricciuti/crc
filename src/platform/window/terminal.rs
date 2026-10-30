@@ -566,6 +566,7 @@ impl EditorView {
                     last_output: None,
                     review,
                     events_read: 0,
+                    receipt: Default::default(),
                     review_files: 0,
                     folder: crate::platform::canonical(&launch.cwd),
                     workspace,
@@ -719,6 +720,7 @@ impl EditorView {
                     claude: spec.claude,
                     attention: None,
                     last_output: None,
+                    receipt: crate::project::review::receipt_until(&spec.review, left.events_read),
                     review: spec.review,
                     events_read: left.events_read,
                     review_files: 0,
@@ -1601,6 +1603,7 @@ impl EditorView {
         let mut team_events = Vec::new();
         let mut written = Vec::new();
         let mut retry = false;
+        let mut ran_any = false;
         let first_delay = crate::platform::retry::first_delay();
         let auto_continue = state.auto_continue;
         for Noticed {
@@ -1706,6 +1709,10 @@ impl EditorView {
                         tab.marks.trim(term.first_line());
                         tab.marks.resolve(&term);
                     }
+                    crate::project::review::Event::Ran(ran) => {
+                        tab.receipt.note(ran);
+                        ran_any = true;
+                    }
                     event @ (crate::project::review::Event::Task { .. }
                     | crate::project::review::Event::TeammateIdle(_)) => {
                         team_events.push((tab.review.clone(), event));
@@ -1721,7 +1728,7 @@ impl EditorView {
                 }
             }
         }
-        let told = said.is_some() || wrote || asked || !team_events.is_empty();
+        let told = said.is_some() || wrote || asked || ran_any || !team_events.is_empty();
         for (review, event) in team_events {
             state.agents.teams.entry(review).or_default().apply(&event);
         }

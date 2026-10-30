@@ -79,6 +79,8 @@ pub struct Tab {
     pub review: PathBuf,
     /// How far into the session's events the window has read.
     pub events_read: u64,
+    /// Every shell command its agent ran, and how each ended.
+    pub receipt: crate::project::receipt::Receipt,
     /// Files the session has checkpoints for.
     pub review_files: usize,
     /// Its folder, resolved, for the workspace it belongs to when it was
@@ -2764,6 +2766,7 @@ mod tests {
             last_output: None,
             review: PathBuf::new(),
             events_read: 0,
+            receipt: Default::default(),
             review_files: 0,
             folder: PathBuf::from("/srv/plot"),
             workspace: None,

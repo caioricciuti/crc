@@ -891,11 +891,21 @@ impl EditorView {
                 agents.inspector.folder_label = selected.as_ref().map_or_else(String::new, |w| {
                     crate::platform::agents::folder_name(w, &agents.tasks)
                 });
+                // The receipt of the terminal showing, when it is this
+                // workspace's.
+                let receipt = terminal_panel
+                    .active_tab()
+                    .filter(|t| {
+                        crate::platform::agents::task_of(&agents.tasks, t)
+                            == agents.selected_index()
+                    })
+                    .map(|t| &t.receipt);
                 agents.inspector.draw(
                     selected.as_ref(),
                     repos.as_deref(),
                     &worktrees,
                     remote.as_ref(),
+                    receipt,
                     pull_request.as_ref().map(Option::as_ref),
                     github,
                     issues,
