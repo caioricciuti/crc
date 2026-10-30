@@ -4,6 +4,10 @@ One entry per tag, written for people who use the editor.
 
 ## Unreleased
 
+- A lag you can feel now leaves a trace: any turn of the main thread
+  over 33 ms writes one line to `~/Library/Logs/crc/jank.log` naming
+  what took the time (a poll, layout, the GPU), so a slow moment can be
+  named instead of guessed at.
 - Agents mode: a session that starts waiting on you while it is not
   the one in front of you posts a macOS notification, once per wait,
   taken back when it stops waiting or closes. Type a reply in the

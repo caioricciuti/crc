@@ -166,6 +166,7 @@ impl EditorView {
             Instant::now(),
         );
 
+        crate::platform::jank::lap("draw.publish");
         let viewport = *viewport;
         if viewport.width <= 0.0 || viewport.height <= 0.0 {
             return None;
@@ -1366,7 +1367,9 @@ impl EditorView {
         }
 
         let background = theme.background;
+        crate::platform::jank::lap("draw.build");
         let timing = renderer.draw(layer, glyphs, (viewport.width, viewport.height), background);
+        crate::platform::jank::lap("draw.gpu");
         if timing.is_some() {
             *drew_once = true;
         }

@@ -487,6 +487,7 @@ struct QueuedPoll {
 unsafe extern "C" fn poll_on_main(context: *mut std::ffi::c_void) {
     // SAFETY: `wake` queued exactly this box, and it runs once.
     let queued = unsafe { Box::from_raw(context as *mut QueuedPoll) };
+    let _jank = crate::platform::jank::enter("wake");
     // SAFETY: the view lives for the process; see `ViewPointer`.
     (queued.poll)(unsafe { &*queued.view });
 }
@@ -1579,6 +1580,7 @@ define_class!(
 
         #[unsafe(method(mouseMoved:))]
         fn mouse_moved(&self, event: &NSEvent) {
+            let _jank = crate::platform::jank::enter("mouseMoved");
             if self.ivars().testing && event.timestamp() != 0.0 { return; }
             let point = self.convertPoint_fromView(event.locationInWindow(), None);
             self.note_hover(point.x as f32, point.y as f32);
@@ -1639,6 +1641,7 @@ define_class!(
 
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
+            let _jank = crate::platform::jank::enter("keyDown");
             if self.ivars().testing && event.timestamp() != 0.0 { return; }
             // Timestamp before any of our own work, so nothing we do hides
             // inside the measurement.
@@ -1670,6 +1673,7 @@ define_class!(
 
         #[unsafe(method(mouseDown:))]
         fn mouse_down(&self, event: &NSEvent) {
+            let _jank = crate::platform::jank::enter("mouseDown");
             if self.ivars().testing && event.timestamp() != 0.0 { return; }
             let started = Instant::now();
             let point = self.convertPoint_fromView(event.locationInWindow(), None);
@@ -2432,6 +2436,7 @@ define_class!(
 
         #[unsafe(method(mouseDragged:))]
         fn mouse_dragged(&self, event: &NSEvent) {
+            let _jank = crate::platform::jank::enter("mouseDragged");
             if self.ivars().testing && event.timestamp() != 0.0 { return; }
             let point = self.convertPoint_fromView(event.locationInWindow(), None);
             layout::set_pointer(Some((point.x as f32, point.y as f32)));
@@ -2654,6 +2659,7 @@ define_class!(
 
         #[unsafe(method(mouseUp:))]
         fn mouse_up(&self, _event: &NSEvent) {
+            let _jank = crate::platform::jank::enter("mouseUp");
             if self.ivars().testing && _event.timestamp() != 0.0 { return; }
             layout::set_pressed(None);
             self.request_redraw();
@@ -2815,6 +2821,7 @@ define_class!(
 
         #[unsafe(method(scrollWheel:))]
         fn scroll_wheel(&self, event: &NSEvent) {
+            let _jank = crate::platform::jank::enter("scrollWheel");
             // The palette is modal: the wheel scrolls its list, and never
             // the document or terminal behind it.
             if self.state().is_some_and(|state| state.palette.is_some()) {
@@ -3021,6 +3028,7 @@ define_class!(
         /// when the buffer is idle.
         #[unsafe(method(onDisplayLink:))]
         fn on_display_link(&self, link: &CADisplayLink) {
+            let _jank = crate::platform::jank::enter("displayLink");
             if let Some(size) = self.ivars().deferred_size.take() {
                 self.resize(size);
             }
@@ -3031,7 +3039,9 @@ define_class!(
             if git {
                 self.project_changed(crate::project::watch::Change::Git);
             }
+            crate::platform::jank::lap("deferred");
             self.poll_tree_children();
+            crate::platform::jank::lap("poll_tree_children");
             let git_changed = self.state_mut().is_some_and(|mut state| {
                 let changed = state.git.poll();
                 if let Some(note) = state.git.take_announcement() {
@@ -3046,39 +3056,69 @@ define_class!(
                     window.invalidateCursorRectsForView(self);
                 }
             }
+            crate::platform::jank::lap("git.poll");
             self.poll_project_index();
+            crate::platform::jank::lap("poll_project_index");
             self.poll_project_search();
+            crate::platform::jank::lap("poll_project_search");
             self.poll_terminal_search();
+            crate::platform::jank::lap("poll_terminal_search");
             self.poll_terminal_find();
+            crate::platform::jank::lap("poll_terminal_find");
             self.poll_branches();
+            crate::platform::jank::lap("poll_branches");
             self.poll_history_reply();
+            crate::platform::jank::lap("poll_history_reply");
             self.poll_home();
+            crate::platform::jank::lap("poll_home");
             self.poll_mcp();
+            crate::platform::jank::lap("poll_mcp");
             self.poll_agents();
+            crate::platform::jank::lap("poll_agents");
             self.poll_review();
+            crate::platform::jank::lap("poll_review");
             self.poll_reloads();
+            crate::platform::jank::lap("poll_reloads");
             self.poll_history();
+            crate::platform::jank::lap("poll_history");
             self.poll_syntax();
+            crate::platform::jank::lap("poll_syntax");
             if self
                 .state_mut().is_some_and(|mut state| state.symbols.poll())
             {
                 self.request_redraw();
             }
+            crate::platform::jank::lap("symbols.poll");
             self.poll_http();
+            crate::platform::jank::lap("poll_http");
             self.sync_data_preview();
+            crate::platform::jank::lap("sync_data_preview");
             self.poll_query();
+            crate::platform::jank::lap("poll_query");
             self.poll_update();
+            crate::platform::jank::lap("poll_update");
             self.poll_ignored();
+            crate::platform::jank::lap("poll_ignored");
             self.refresh_after_watch();
+            crate::platform::jank::lap("refresh_after_watch");
             self.lsp_flush_changes();
+            crate::platform::jank::lap("lsp_flush_changes");
             self.gutter_refresh();
+            crate::platform::jank::lap("gutter_refresh");
             self.blame_refresh();
+            crate::platform::jank::lap("blame_refresh");
             self.heat_refresh();
+            crate::platform::jank::lap("heat_refresh");
             self.poll_scrub();
+            crate::platform::jank::lap("poll_scrub");
             self.bulb_refresh();
+            crate::platform::jank::lap("bulb_refresh");
             self.ext_poll();
+            crate::platform::jank::lap("ext_poll");
             self.sync_html_preview();
+            crate::platform::jank::lap("sync_html_preview");
             self.claude_flush_selection();
+            crate::platform::jank::lap("claude_flush_selection");
             {
                 // The link fires on any run-loop iteration, nested modal
                 // loops included. Busy means try again next refresh.
@@ -4997,6 +5037,7 @@ define_class!(
     unsafe impl NSTextInputClient for EditorView {
         #[unsafe(method(insertText:replacementRange:))]
         fn insert_text(&self, string: &AnyObject, replacement: NSRange) {
+            let _jank = crate::platform::jank::enter("insertText");
             let text = text_of(string);
             if let Some(mut state) = self.state_mut() {
                 state.marked = None;
@@ -5780,6 +5821,7 @@ impl EditorView {
             self.ivars().needs_redraw.set(false);
             return;
         }
+        crate::platform::jank::lap("draw.start");
         let Some(timing) = self.render() else {
             // No drawable, or the state was busy: nothing reached the screen.
             // The request stands, whatever it was for, and the display link
