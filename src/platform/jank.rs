@@ -8,7 +8,8 @@
 //! A turn opened inside another (a nested modal loop, a draw from a key)
 //! belongs to the outer one. A slow turn appends one line to
 //! ~/Library/Logs/crc/jank.log: when, what opened it, how long, and the
-//! laps that took the most. The rest of the time is "unnamed".
+//! laps that took the most. The rest of the time is "unnamed". After
+//! them, from [`super::sampler`], the functions the turn was in.
 
 use std::cell::RefCell;
 use std::io::Write;
@@ -57,6 +58,7 @@ pub fn enter(entry: &'static str) -> Entry {
             last: now,
             laps,
         });
+        super::sampler::begin();
         Entry { outer: true }
     })
 }
@@ -87,8 +89,14 @@ impl Drop for Entry {
             return;
         };
         let took = turn.started.elapsed();
+        let samples = super::sampler::end();
         if took >= SLOW {
-            write(&line(turn.entry, took, &turn.laps));
+            let mut line = line(turn.entry, took, &turn.laps);
+            let said = super::sampler::summary(&samples);
+            if !said.is_empty() {
+                line.insert_str(line.len() - 1, &format!(" | {said}"));
+            }
+            write(&line);
         }
         SPARE.with_borrow_mut(|spare| *spare = turn.laps);
     }

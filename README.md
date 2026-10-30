@@ -602,10 +602,10 @@ Help > Report a Problem opens a new GitHub issue in your browser with the
 version, your macOS version and the last crash (if any) filled in; crc
 sends nothing itself. Crash logs are in `~/Library/Logs/crc` (Help > Show
 Crash Logs), and so is `jank.log`, one line for each moment the window
-took longer than 33 ms, with what took the time. Or open an issue by
-hand with what you did, what you expected, what happened, and the
-version from crc > About crc or `crc --version`. A screenshot helps
-more than a long description.
+took longer than 33 ms, with what took the time and the functions it
+was in. Or open an issue by hand with what you did, what you
+expected, what happened, and the version from crc > About crc or
+`crc --version`. A screenshot helps more than a long description.
 
 ## Contributing
 

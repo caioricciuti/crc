@@ -19,6 +19,7 @@ pub mod recovery;
 pub mod remote;
 pub mod report;
 pub mod retry;
+pub mod sampler;
 pub mod search;
 pub mod search_panel;
 pub mod selftest;
