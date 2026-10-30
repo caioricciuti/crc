@@ -4,9 +4,9 @@
 //! two in the whole dependency tree. It exists so that syntax highlighting
 //! does not cost the `tree-sitter` crate, which drags in `serde`,
 //! `serde_derive`, `proc-macro2`, `quote` and `syn` as *build* dependencies:
-//! nineteen extra crates, nasdasdine extra build scripts and a proc macro, all
+//! nineteen extra crates, nine extra build scripts and a proc macro, all
 //! executing during every build. See docs/dependency-review.md.
-//!asd
+//!
 //! What it does: hands `cc` our synchronous CoreText/NSString bridges and the C under
 //! third_party/ and emits static
 //! libraries, one for the runtime and one per grammar. No
