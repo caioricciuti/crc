@@ -414,6 +414,10 @@ pub fn start(dir: &Path, spec: &Spec, helper: &Path) -> std::io::Result<(String,
     }
     let deadline = Instant::now() + START_TIMEOUT;
     let socket = socket_path(&id)?;
+    // The helper is listening a few milliseconds after it starts, and a
+    // new terminal waits for it on the main thread: look again soon at
+    // first, then less often.
+    let mut pause = Duration::from_millis(1);
     loop {
         match UnixStream::connect(&socket) {
             Ok(socket) => return Ok((id, socket)),
@@ -433,7 +437,8 @@ pub fn start(dir: &Path, spec: &Spec, helper: &Path) -> std::io::Result<(String,
                         format!("the session helper did not answer: {e}"),
                     ));
                 }
-                std::thread::sleep(Duration::from_millis(20));
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(Duration::from_millis(16));
             }
         }
     }
