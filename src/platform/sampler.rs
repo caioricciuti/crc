@@ -231,7 +231,11 @@ impl Names {
                 symbol(place_marker as *const () as usize).map_or_else(String::new, |(_, f)| f)
             })
             .clone();
+        // What it was inside, below crc's own code: the standard library's
+        // function when there is one (it is built into the same image),
+        // else the system library.
         let mut library = None;
+        let mut standard = None;
         for (n, &address) in stack.iter().enumerate() {
             // A return address points after its call: one back is the call.
             let at = if n == 0 { address } else { address - 1 };
@@ -239,17 +243,51 @@ impl Names {
                 continue;
             };
             if file == ours {
-                return Some(Place {
-                    function: short_name(&function),
-                    library,
-                });
-            }
-            if library.is_none() {
+                if crate_of(&function) == Some("crc") {
+                    return Some(Place {
+                        function: short_name(&function),
+                        library: standard.or(library),
+                    });
+                }
+                standard.get_or_insert_with(|| short_name(&function));
+            } else if library.is_none() {
                 library = file.rsplit('/').next().map(str::to_owned);
             }
         }
         None
     }
+}
+
+/// The crate a Rust symbol's function belongs to: its first identifier.
+fn crate_of(symbol: &str) -> Option<&str> {
+    let body = symbol
+        .strip_prefix("_R")
+        .or_else(|| symbol.strip_prefix("_ZN"))?;
+    let v0 = symbol.starts_with("_R");
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'0'..=b'9' => {
+                let digits = bytes[i..].iter().take_while(|b| b.is_ascii_digit()).count();
+                let len: usize = body[i..i + digits].parse().ok()?;
+                let mut from = i + digits;
+                if v0 && bytes.get(from) == Some(&b'_') {
+                    from += 1;
+                }
+                return body.get(from..from + len);
+            }
+            b'B' | b's' if v0 => {
+                i += bytes[i..]
+                    .iter()
+                    .position(|&b| b == b'_')
+                    .map_or(bytes.len(), |p| p + 1);
+            }
+            b'N' if v0 => i += 2,
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 /// An address inside crc's own image, to know it by.
@@ -456,6 +494,27 @@ mod tests {
         );
         assert_eq!(short_name("_objc_msgSend"), "objc_msgSend");
         assert_eq!(short_name("-[NSView display]"), "-[NSView display]");
+    }
+
+    #[test]
+    fn a_symbol_belongs_to_the_crate_named_first() {
+        assert_eq!(
+            crate_of("_RNvNtNtCsiXgLn5Xs9Su_3crc8platform8terminal4draw"),
+            Some("crc")
+        );
+        assert_eq!(
+            crate_of("_RNvMs1_NtNtCsiXgLn5Xs9Su_3crc6render4fontNtB5_5Atlas5known"),
+            Some("crc")
+        );
+        assert_eq!(
+            crate_of("_RNvMNtCs7mRY9FNn263_3std7processNtB2_7Command6output"),
+            Some("std")
+        );
+        assert_eq!(
+            crate_of("_ZN3std2io5stdio6_print17h0123456789abcdefE"),
+            Some("std")
+        );
+        assert_eq!(crate_of("_objc_msgSend"), None);
     }
 
     #[test]
