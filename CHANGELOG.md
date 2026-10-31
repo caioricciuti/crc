@@ -2,6 +2,14 @@
 
 One entry per tag, written for people who use the editor.
 
+## v0.2.0-alpha.33, 2026-10-31
+
+- Switching to a workspace in another folder no longer stalls the
+  window for about 40 ms. crc used to run Git twice and write two small
+  files on the click to find the repository and tell Claude Code about
+  the new folder; it now reads the repository from disk and does the
+  writes in the background.
+
 ## v0.2.0-alpha.32, 2026-10-31
 
 - Agents mode: a receipt for each Claude session crc starts. Claude
