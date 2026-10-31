@@ -7,7 +7,9 @@
 # the tab from the reports, not from output or hooks, and typing into it
 # takes a result as seen (the echo of the typing counts as output, so
 # the tab reads working for three seconds, then idle). Claude Code reports
-# this way since 2.1.295.
+# this way since 2.1.295. A scripted wait runs nearer 850 ms than its
+# 700, so each dump is placed by the agent's own clock: working lasts from
+# about 2 s to 4 s after blocked, and its dump lands near 3 s.
 mkdir -p "$T/statusproj"
 printf 'one\n' > "$T/statusproj/a.txt"
 msg=$(printf 'Run cargo test?' | base64)
@@ -32,7 +34,6 @@ key 8 cmd,shift C
 wait 700
 wait 700
 dump $T/status-blocked.out
-wait 700
 wait 700
 wait 700
 dump $T/status-working.out
