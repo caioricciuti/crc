@@ -852,34 +852,159 @@ pub fn spark_buckets(values: &[f32], bars: usize) -> Vec<f32> {
         .collect()
 }
 
-/// A sparkline: `values` from 0 to 1, oldest first, as bars standing on
-/// the bottom of `rect`, the newest at its right. Each is at least a point
-/// tall, so a quiet run still reads as a line.
+/// The top of a sparkline's scale: the smallest of a quarter, a half and
+/// the whole that holds the highest of `values`, so a quiet run fills the
+/// chart and a busy one still fits.
+pub fn spark_ceiling(values: &[f32]) -> f32 {
+    let peak = values.iter().copied().fold(0.0, f32::max);
+    [0.25, 0.5].into_iter().find(|c| peak <= *c).unwrap_or(1.0)
+}
+
+/// A sparkline: `values` from 0 to 1, oldest first, as `slots` bars in a
+/// faint well, the newest at its right. The scale tops out at
+/// [`spark_ceiling`], marked by a hairline and named in the well's corner,
+/// so a bar's height never overstates. A bar over `hot.0` is drawn in
+/// `hot.1`. A slot without a value draws nothing, and an idle one next to
+/// nothing.
+#[allow(clippy::too_many_arguments)]
 pub fn push_sparkline(
     out: &mut Vec<GlyphInstance>,
+    atlas: &mut Atlas,
     rect: Viewport,
     values: &[f32],
+    slots: usize,
     colour: [f32; 4],
+    hot: (f32, [f32; 4]),
+    theme: &Theme,
 ) {
-    const BAR: f32 = 2.0;
     const GAP: f32 = 1.0;
-    let bars = ((rect.width + GAP) / (BAR + GAP)).floor().max(0.0) as usize;
-    let levels = spark_buckets(values, bars);
-    let right = rect.x + rect.width;
-    for (n, level) in levels.iter().rev().enumerate() {
-        let h = (level.clamp(0.0, 1.0) * rect.height).round().max(1.0);
+    const INSET: f32 = 3.0;
+    // The well is the card's tone stepped toward the sidebar under it:
+    // sunk in dark, lifted in light, either way a place of its own.
+    push_rounded_rect(
+        out,
+        rect,
+        UI_RADIUS_SM,
+        faded(theme.sidebar_background, 0.6),
+    );
+    let plot = Viewport {
+        x: rect.x + INSET,
+        y: rect.y + INSET,
+        width: (rect.width - 2.0 * INSET).max(0.0),
+        height: (rect.height - INSET).max(0.0),
+    };
+    let levels = spark_buckets(values, slots);
+    // Nothing read yet: the well alone, which is the chart's skeleton.
+    if levels.is_empty() || plot.width <= 0.0 || plot.height <= 0.0 {
+        return;
+    }
+    let ceiling = spark_ceiling(&levels);
+    let step = (plot.width + GAP) / slots as f32;
+    let first = slots - levels.len();
+    for (n, level) in levels.iter().enumerate() {
+        let slot = first + n;
+        // Under half a percent is idle: nothing, not a sliver.
+        if *level <= 0.005 {
+            continue;
+        }
+        let h = (level.min(1.0) / ceiling * plot.height)
+            .min(plot.height)
+            .max(1.0);
+        let x = (plot.x + slot as f32 * step).round();
+        let bar = Viewport {
+            x,
+            y: plot.y + plot.height - h,
+            width: ((plot.x + (slot + 1) as f32 * step - GAP).round() - x).max(1.0),
+            height: h,
+        };
+        let ink = if *level > hot.0 { hot.1 } else { colour };
+        push_rounded_rect(out, bar, 1.0, ink);
+    }
+    // The scale, over the bars: its top as a hairline, its value as a word.
+    push_rect(
+        out,
+        atlas,
+        [plot.x, plot.y],
+        [plot.width, 1.0],
+        theme.hairline,
+    );
+    const SCALE: f32 = 0.7;
+    let label = match ceiling {
+        c if c <= 0.25 => "25%",
+        c if c <= 0.5 => "50%",
+        _ => "100%",
+    };
+    let (_, ch) = atlas.cell_size();
+    let label_w = ui_text_width(atlas, label) * SCALE;
+    push_ui_text_scaled(
+        out,
+        atlas,
+        Viewport {
+            x: plot.x + 1.0,
+            y: plot.y + 1.0,
+            width: label_w,
+            height: ch * SCALE,
+        },
+        label,
+        theme.gutter_text,
+        SCALE,
+    );
+}
+
+/// A meter: `fraction` of a rounded track filled in `colour` from the
+/// left, for a share such as memory in use.
+pub fn push_meter(
+    out: &mut Vec<GlyphInstance>,
+    rect: Viewport,
+    fraction: f32,
+    colour: [f32; 4],
+    theme: &Theme,
+) {
+    let radius = rect.height * 0.5;
+    push_rounded_rect(out, rect, radius, theme.control_hover);
+    let fill = (rect.width * fraction.clamp(0.0, 1.0)).round();
+    if fill > 0.0 {
         push_rounded_rect(
             out,
             Viewport {
-                x: right - BAR - n as f32 * (BAR + GAP),
-                y: rect.y + rect.height - h,
-                width: BAR,
-                height: h,
+                width: fill.max(rect.height),
+                ..rect
             },
-            1.0,
+            radius,
             colour,
         );
     }
+}
+
+/// The scale of a [`push_tag`]'s label.
+const TAG_SCALE: f32 = 0.78;
+
+/// How wide [`push_tag`] draws `label`.
+pub fn tag_width(atlas: &mut Atlas, label: &str) -> f32 {
+    (ui_text_width(atlas, label) * TAG_SCALE + 10.0).round()
+}
+
+/// A word that flags a value, such as a state that needs a look: a small
+/// pill tinted with `colour` and the word in it, at `x` on `row`'s centre.
+/// Its width.
+pub fn push_tag(
+    out: &mut Vec<GlyphInstance>,
+    atlas: &mut Atlas,
+    x: f32,
+    row: Viewport,
+    label: &str,
+    colour: [f32; 4],
+) -> f32 {
+    const H: f32 = 16.0;
+    let pill = Viewport {
+        x,
+        y: row.y + ((row.height - H) * 0.5).round(),
+        width: tag_width(atlas, label),
+        height: H,
+    };
+    push_rounded_rect(out, pill, UI_RADIUS_SM, faded(colour, 0.18));
+    push_ui_text_scaled(out, atlas, pill, label, colour, TAG_SCALE);
+    pill.width
 }
 
 /// A heading in bold prose at `size` points, top-left at `(x, y)`; its
@@ -1405,20 +1530,62 @@ mod tests {
         assert_eq!(bars[0], 1.5);
         assert_eq!(bars[6], 27.0);
         assert!(spark_buckets(&run, 0).is_empty());
-        // Drawn: a bar each, the newest at the right edge, none under a
-        // point tall.
+        // Drawn in a well inset 3 from its sides and top, the newest at
+        // the right edge.
         let mut out = Vec::new();
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let theme = Theme::dark();
         let rect = Viewport {
             x: 0.0,
             y: 0.0,
-            width: 20.0,
-            height: 10.0,
+            width: 34.0,
+            height: 28.0,
         };
-        push_sparkline(&mut out, rect, &[0.0, 1.0], [1.0; 4]);
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0].pos[0] + out[0].size[0], 20.0);
-        assert_eq!(out[0].size[1], 10.0);
-        assert_eq!(out[1].size[1], 1.0);
+        // Scaled to a quarter: 0.25 fills the plot, 0.1 a bit under half,
+        // a trace a point, an idle one nothing, one over the hot
+        // mark its own colour.
+        let (bar, hot) = ([0.1, 0.2, 0.3, 1.0], [0.3, 0.2, 0.1, 1.0]);
+        push_sparkline(
+            &mut out,
+            &mut atlas,
+            rect,
+            &[0.25, 0.1, 0.006, 0.001],
+            4,
+            bar,
+            (0.8, hot),
+            &theme,
+        );
+        let bars: Vec<_> = out.iter().filter(|g| g.color == bar).collect();
+        assert_eq!(bars.len(), 3);
+        assert_eq!(bars[0].size[1], 25.0);
+        assert_eq!(bars[1].size[1], 10.0);
+        assert_eq!(bars[2].size[1], 1.0);
+        assert_eq!(bars[0].pos[0], 3.0);
+        out.clear();
+        push_sparkline(
+            &mut out,
+            &mut atlas,
+            rect,
+            &[0.9],
+            4,
+            bar,
+            (0.8, hot),
+            &theme,
+        );
+        let red: Vec<_> = out.iter().filter(|g| g.color == hot).collect();
+        assert_eq!(red.len(), 1);
+        assert_eq!(red[0].pos[0] + red[0].size[0], 31.0);
+    }
+
+    #[test]
+    fn a_sparkline_scale_is_the_smallest_ceiling_over_its_peak() {
+        assert_eq!(spark_ceiling(&[]), 0.25);
+        assert_eq!(spark_ceiling(&[0.05, 0.2]), 0.25);
+        assert_eq!(spark_ceiling(&[0.25]), 0.25);
+        assert_eq!(spark_ceiling(&[0.1, 0.26]), 0.5);
+        assert_eq!(spark_ceiling(&[0.5, 0.2]), 0.5);
+        assert_eq!(spark_ceiling(&[0.51]), 1.0);
+        assert_eq!(spark_ceiling(&[1.4]), 1.0);
     }
 
     #[test]

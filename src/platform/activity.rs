@@ -32,8 +32,18 @@ const HOT: f32 = 80.0;
 const TITLE: f32 = 26.0;
 /// A total's or a process's line.
 const LINE: f32 = 20.0;
-/// The rule between the totals and the processes.
-const RULE: f32 = 9.0;
+/// The CPU chart under its line.
+const CHART: f32 = 28.0;
+/// The memory meter under its line.
+const METER: f32 = 4.0;
+/// A card's inset: its lines from its sides, and from its top and bottom.
+const PAD_X: f32 = 10.0;
+const PAD_Y: f32 = 4.0;
+/// The card of totals: CPU and its chart, memory and its meter, disk and
+/// network.
+const CARD: f32 = PAD_Y + LINE + 2.0 + CHART + 6.0 + LINE + 2.0 + METER + 6.0 + 2.0 * LINE + PAD_Y;
+/// The small heading over the processes.
+const HEADING: f32 = 18.0;
 /// Air under the last line.
 const FOOT: f32 = 6.0;
 
@@ -56,11 +66,13 @@ impl Pressure {
         }
     }
 
-    fn label(self) -> &'static str {
+    /// The word its tag says; none when memory is not pressed, which
+    /// needs no word.
+    fn label(self) -> Option<&'static str> {
         match self {
-            Pressure::Ok => "pressure: ok",
-            Pressure::Warn => "pressure: warn",
-            Pressure::Critical => "pressure: critical",
+            Pressure::Ok => None,
+            Pressure::Warn => Some("High"),
+            Pressure::Critical => Some("Critical"),
         }
     }
 }
@@ -84,9 +96,13 @@ pub struct Sample {
     /// Whole-Mac CPU from 0 to 1, oldest first, for the sparkline.
     pub history: Vec<f32>,
     pub memory: String,
+    /// Memory in use, from 0 to 1, for the meter.
+    pub memory_used: f32,
     pub pressure: Pressure,
-    pub disk: String,
-    pub net: String,
+    /// Bytes a second read and written.
+    pub disk: [String; 2],
+    /// Bytes a second in and out.
+    pub net: [String; 2],
     pub top: Vec<Busy>,
 }
 
@@ -193,11 +209,11 @@ pub fn rate(bytes_per_second: u64) -> String {
     format!("{}/s", size(bytes_per_second))
 }
 
-/// Memory used of all of it, in whole gigabytes (of 1024^3): `22/36 GB`.
+/// Memory used of all of it, in whole gigabytes (of 1024^3): `22 / 36 GB`.
 pub fn memory(used: u64, total: u64) -> String {
     const GB: f64 = (1u64 << 30) as f64;
     format!(
-        "{}/{} GB",
+        "{} / {} GB",
         (used as f64 / GB).round(),
         (total as f64 / GB).round()
     )
@@ -239,17 +255,14 @@ fn sample(
         cpu_hot: cpu > HOT,
         history: history.clone(),
         memory: memory(used, total),
+        memory_used: if total > 0 {
+            (used as f64 / total as f64) as f32
+        } else {
+            0.0
+        },
         pressure,
-        disk: format!(
-            "r {}  w {}",
-            rate(per_second(read, seconds)),
-            rate(per_second(written, seconds))
-        ),
-        net: format!(
-            "\u{2193} {}  \u{2191} {}",
-            rate(per_second(down, seconds)),
-            rate(per_second(up, seconds))
-        ),
+        disk: [read, written].map(|b| rate(per_second(b, seconds))),
+        net: [down, up].map(|b| rate(per_second(b, seconds))),
         top,
     }
 }
@@ -376,7 +389,7 @@ impl Monitor {
         if folded {
             TITLE
         } else {
-            TITLE + 4.0 * LINE + RULE + TOP as f32 * LINE + FOOT
+            TITLE + 2.0 + CARD + 6.0 + HEADING + TOP as f32 * LINE + FOOT
         }
     }
 
@@ -424,103 +437,161 @@ impl Monitor {
         if folded {
             return title;
         }
-        // Under the title's text: past its chevron.
-        let x =
-            title.x + 8.0 + layout::icon_width(atlas, crate::project::icons::CHEVRON_DOWN) + 2.0;
-        let width = (rect.x + rect.width - 10.0 - x).max(0.0);
-        let line = |n: usize| Viewport {
+        // The totals on a card, as the inspector groups its facts; the
+        // processes under it, on the card's lines.
+        let card = Viewport {
+            x: rect.x + 8.0,
+            y: rect.y + TITLE + 2.0,
+            width: (rect.width - 16.0).max(0.0),
+            height: CARD,
+        };
+        layout::push_card(out, card, theme);
+        let x = card.x + PAD_X;
+        let width = (card.width - 2.0 * PAD_X).max(0.0);
+        let at = |y: f32, height: f32| Viewport {
             x,
-            y: rect.y + TITLE + n as f32 * LINE,
+            y,
             width,
-            height: LINE,
+            height,
         };
-        let rule_y = rect.y + TITLE + 4.0 * LINE + (RULE * 0.5).floor();
-        layout::push_rect(out, atlas, [x, rule_y], [width, 1.0], theme.hairline);
-        let process = |n: usize| Viewport {
-            y: rect.y + TITLE + 4.0 * LINE + RULE + n as f32 * LINE,
-            ..line(0)
-        };
+        let cpu = at(card.y + PAD_Y, LINE);
+        let chart = at(cpu.y + LINE + 2.0, CHART);
+        let mem = at(chart.y + CHART + 6.0, LINE);
+        let meter = at(mem.y + LINE + 2.0, METER);
+        let disk = at(meter.y + METER + 6.0, LINE);
+        let net = at(disk.y + LINE, LINE);
+        let heading = at(card.y + CARD + 6.0, HEADING);
+        let process = |n: usize| at(heading.y + HEADING + n as f32 * LINE, LINE);
+        const SMALL: f32 = 0.85;
+        const PROCESSES: &str = "TOP PROCESSES";
+        let heading_w = layout::ui_text_width(atlas, PROCESSES) * SMALL;
+        layout::push_ui_text_scaled(
+            out,
+            atlas,
+            Viewport {
+                width: heading_w,
+                ..heading
+            },
+            PROCESSES,
+            theme.gutter_text,
+            SMALL,
+        );
         let Some(sample) = &self.sample else {
-            for (n, w) in [0.62, 0.7, 0.8, 0.85].into_iter().enumerate() {
-                layout::push_skeleton_row(out, line(n), 0.0, (w, 0.0), false, theme);
+            // The shape of what is coming: the chart's empty well and the
+            // meter's track, a bar for each line's figures.
+            for (row, w) in [(cpu, 0.3), (mem, 0.45), (disk, 0.8), (net, 0.8)] {
+                layout::push_skeleton_row(out, row, 0.0, (w, 0.0), false, theme);
             }
+            layout::push_sparkline(
+                out,
+                atlas,
+                chart,
+                &[],
+                HISTORY,
+                theme.accent,
+                (HOT / 100.0, theme.diff_removed),
+                theme,
+            );
+            layout::push_meter(out, meter, 0.0, theme.accent, theme);
             for (n, w) in [0.9, 0.75, 0.82].into_iter().take(TOP).enumerate() {
                 layout::push_skeleton_row(out, process(n), 0.0, (w, 0.0), false, theme);
             }
             return title;
         };
-        const LABEL: f32 = 38.0;
-        let value = |row: Viewport, right: f32| Viewport {
-            x: row.x + LABEL,
-            width: (row.width - LABEL - right).max(0.0),
-            ..row
+        layout::push_ui_text(out, atlas, cpu, "CPU", theme.status_text);
+        let cpu_colour = if sample.cpu_hot {
+            theme.diff_removed
+        } else {
+            theme.text
         };
-        let pressure = match sample.pressure {
-            Pressure::Ok => theme.gutter_text,
+        layout::push_ui_text_right(out, atlas, cpu, &sample.cpu, cpu_colour);
+        layout::push_sparkline(
+            out,
+            atlas,
+            chart,
+            &sample.history,
+            HISTORY,
+            theme.accent,
+            (HOT / 100.0, theme.diff_removed),
+            theme,
+        );
+        let pressed = match sample.pressure {
+            Pressure::Ok => theme.accent,
             Pressure::Warn => theme.diff_modified,
             Pressure::Critical => theme.diff_removed,
         };
-        let pressure_w = layout::ui_text_width(atlas, sample.pressure.label());
-        let spark_w = (width - LABEL - 44.0).clamp(0.0, 90.0);
-        let rows: [(&str, &str, [f32; 4], f32); 4] = [
-            (
-                "CPU",
-                sample.cpu.as_str(),
-                if sample.cpu_hot {
-                    theme.diff_removed
-                } else {
-                    theme.text
-                },
-                spark_w + 6.0,
-            ),
-            ("Mem", sample.memory.as_str(), theme.text, pressure_w + 8.0),
-            ("Disk", sample.disk.as_str(), theme.text, 0.0),
-            ("Net", sample.net.as_str(), theme.text, 0.0),
-        ];
-        for (n, (label, text, colour, right)) in rows.into_iter().enumerate() {
-            let row = line(n);
-            layout::push_ui_text(out, atlas, row, label, theme.gutter_text);
-            layout::push_ui_text(out, atlas, value(row, right), text, colour);
+        layout::push_ui_text(out, atlas, mem, "Memory", theme.status_text);
+        layout::push_ui_text_right(out, atlas, mem, &sample.memory, theme.text);
+        if let Some(word) = sample.pressure.label() {
+            let tag_x = mem.x + mem.width
+                - layout::ui_text_width(atlas, &sample.memory)
+                - layout::UI_GAP
+                - layout::tag_width(atlas, word);
+            layout::push_tag(out, atlas, tag_x, mem, word, pressed);
         }
-        let cpu = line(0);
-        layout::push_sparkline(
-            out,
-            Viewport {
-                x: cpu.x + cpu.width - spark_w,
-                y: cpu.y + 5.0,
-                width: spark_w,
-                height: LINE - 9.0,
-            },
-            &sample.history,
-            if sample.cpu_hot {
-                theme.diff_removed
-            } else {
-                theme.accent
-            },
-        );
-        layout::push_ui_text_right(out, atlas, line(1), sample.pressure.label(), pressure);
-        // Name, then CPU and memory in columns that hold still from one
-        // read to the next.
-        const CPU_W: f32 = 46.0;
-        const MEMORY_W: f32 = 54.0;
+        layout::push_meter(out, meter, sample.memory_used, pressed, theme);
+        // In and out in two columns as wide as a busy rate, figures to
+        // their right edge so both lines' units stand one above the other;
+        // each arrow just before its figure.
+        let arrow_w = layout::ui_text_width(atlas, "\u{2193}");
+        let column = ["999 KB/s", "1023 B/s", "99.9 MB/s"]
+            .into_iter()
+            .map(|widest| layout::ui_text_width(atlas, widest))
+            .fold(0.0, f32::max);
+        for (row, label, [down, up]) in
+            [(disk, "Disk", &sample.disk), (net, "Network", &sample.net)]
+        {
+            layout::push_ui_text(out, atlas, row, label, theme.status_text);
+            let right = row.x + row.width;
+            for (n, (arrow, value)) in [("\u{2193}", down), ("\u{2191}", up)]
+                .into_iter()
+                .enumerate()
+            {
+                let end = right - (1 - n) as f32 * (column + PAD_X + arrow_w + 3.0);
+                let value_w = layout::ui_text_width(atlas, value);
+                let arrow_at = Viewport {
+                    x: end - value_w - 3.0 - arrow_w,
+                    width: arrow_w,
+                    ..row
+                };
+                layout::push_ui_text(out, atlas, arrow_at, arrow, theme.gutter_text);
+                layout::push_ui_text_right(
+                    out,
+                    atlas,
+                    Viewport {
+                        width: end - row.x,
+                        ..row
+                    },
+                    value,
+                    theme.text,
+                );
+            }
+        }
+        // Name, then CPU and memory in columns as wide as their widest
+        // plausible figure, so they hold still from one read to the next.
+        let cpu_w = layout::ui_text_width(atlas, "999%");
+        let memory_w =
+            layout::ui_text_width(atlas, "1023 MB").max(layout::ui_text_width(atlas, "99.9 GB"));
         for (n, busy) in sample.top.iter().enumerate() {
             let row = process(n);
+            let name_w = (row.width - cpu_w - memory_w - 2.0 * PAD_X).max(0.0);
+            let name = crate::platform::inspector::fit(atlas, &busy.name, name_w);
             layout::push_ui_text(
                 out,
                 atlas,
                 Viewport {
-                    width: (row.width - CPU_W - MEMORY_W - 4.0).max(0.0),
+                    width: name_w,
                     ..row
                 },
-                &busy.name,
+                &name,
                 theme.text,
             );
             layout::push_ui_text_right(
                 out,
                 atlas,
                 Viewport {
-                    x: row.x + row.width - CPU_W - MEMORY_W,
-                    width: CPU_W,
+                    x: row.x + row.width - memory_w - PAD_X - cpu_w,
+                    width: cpu_w,
                     ..row
                 },
                 &busy.cpu,
@@ -530,12 +601,12 @@ impl Monitor {
                 out,
                 atlas,
                 Viewport {
-                    x: row.x + row.width - MEMORY_W,
-                    width: MEMORY_W,
+                    x: row.x + row.width - memory_w,
+                    width: memory_w,
                     ..row
                 },
                 &busy.memory,
-                theme.gutter_text,
+                theme.status_text,
             );
         }
         title
@@ -1002,7 +1073,7 @@ mod tests {
     #[test]
     fn memory_and_percentages_are_whole() {
         let gb = 1u64 << 30;
-        assert_eq!(memory(22 * gb + gb / 3, 36 * gb), "22/36 GB");
+        assert_eq!(memory(22 * gb + gb / 3, 36 * gb), "22 / 36 GB");
         assert_eq!(percent(212.4), "212%");
         assert_eq!(percent(40.6), "41%");
         assert_eq!(percent(-1.0), "0%");
@@ -1013,7 +1084,8 @@ mod tests {
         assert_eq!(Pressure::of(1), Pressure::Ok);
         assert_eq!(Pressure::of(2), Pressure::Warn);
         assert_eq!(Pressure::of(4), Pressure::Critical);
-        assert_eq!(Pressure::of(0).label(), "pressure: ok");
+        assert_eq!(Pressure::of(0).label(), None);
+        assert_eq!(Pressure::of(4).label(), Some("Critical"));
     }
 
     #[test]
@@ -1032,7 +1104,7 @@ mod tests {
         assert!(s.cpu_hot);
         assert_eq!(s.history.len(), HISTORY);
         assert_eq!(s.history.last(), Some(&0.9));
-        assert_eq!(s.disk, "r 0 B/s  w 0 B/s");
+        assert_eq!(s.disk, ["0 B/s", "0 B/s"]);
     }
 
     #[test]
