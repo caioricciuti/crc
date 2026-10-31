@@ -1663,6 +1663,7 @@ impl EditorView {
                             &tab.base_name(),
                             &tab.launch.cwd,
                         );
+                        tab.receipt.note_wrote();
                         wrote = true;
                         written.push(path);
                     }
@@ -1697,6 +1698,7 @@ impl EditorView {
                         said = Some(format!("{}: review hook: {text}", tab.name()));
                     }
                     crate::project::review::Event::Prompted(text) => {
+                        tab.receipt.note_prompt();
                         // Where Return was typed, or failing that (a
                         // prompt crc typed) where the cursor is now.
                         let term = tab.session.term.lock().unwrap_or_else(|e| e.into_inner());
@@ -1711,6 +1713,10 @@ impl EditorView {
                     }
                     crate::project::review::Event::Ran(ran) => {
                         tab.receipt.note(ran);
+                        ran_any = true;
+                    }
+                    crate::project::review::Event::Said(sentences) => {
+                        tab.receipt.note_said(&sentences);
                         ran_any = true;
                     }
                     event @ (crate::project::review::Event::Task { .. }

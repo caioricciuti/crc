@@ -8,9 +8,12 @@ One entry per tag, written for people who use the editor.
   Code's own hooks report every shell command the agent runs and how
   it ended, and the inspector's Receipt card shows how many ran and how
   many failed, then the newest six with their result (ok, exit 101,
-  stopped, background) and when. What the agent later says about its
-  tests can be checked against what actually ran. Needs `agent_review`
-  on, as it is by default.
+  stopped, background) and when. When a turn ends with the agent saying
+  the tests pass, it builds or the lint is clean, each claim is checked
+  against the newest command of that kind the turn ran, and the card
+  says so: checked, exit 101, not run, or before last edit when a file
+  was written after the passing run. Needs `agent_review` on, as it is
+  by default.
 - A lag you can feel now leaves a trace: any turn of the main thread
   over 33 ms writes one line to `~/Library/Logs/crc/jank.log` naming
   what took the time (a poll, layout, the GPU), so a slow moment can be

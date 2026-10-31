@@ -125,6 +125,9 @@ pub enum Event {
     /// The agent ran a shell command, and this is how it ended: Claude's
     /// PostToolUse or PostToolUseFailure hook on Bash, for the receipt.
     Ran(crate::project::receipt::Ran),
+    /// What the agent said as its turn ended, in sentences: Claude's Stop
+    /// hook, so the receipt can check its claims.
+    Said(Vec<String>),
 }
 
 /// The most of a prompt's first line an event keeps.
@@ -183,7 +186,19 @@ pub fn hook(kind: &str, input: &str, dir: &Path) -> Result<Option<Event>, String
                 .unwrap_or("")
                 .to_owned(),
         ),
-        "stop" => Event::Asked(FINISHED.into()),
+        // What the agent said goes first, so the receipt has checked it
+        // by the time the turn shows as finished.
+        "stop" => {
+            let said = value
+                .get("last_assistant_message")
+                .and_then(|v| v.as_str())
+                .map(crate::project::receipt::sentences)
+                .unwrap_or_default();
+            if !said.is_empty() {
+                append(dir, &Event::Said(said)).map_err(|e| format!("events: {e}"))?;
+            }
+            Event::Asked(FINISHED.into())
+        }
         "stop-failure" => {
             let text = |name: &str| {
                 value
@@ -591,6 +606,10 @@ fn append(dir: &Path, event: &Event) -> std::io::Result<()> {
             format!("apierror\t{}\t{}\n", clean(error), clean(details))
         }
         Event::Prompted(text) => format!("prompted\t{}\n", clean(text)),
+        Event::Said(sentences) => {
+            let sentences: Vec<String> = sentences.iter().map(|s| clean(s)).collect();
+            format!("said\t{}\n", sentences.join("\t"))
+        }
         Event::Ran(ran) => format!(
             "ran\t{}\t{}\t{}\n",
             ran.at,
@@ -660,6 +679,7 @@ fn parse_event(line: &str) -> Option<Event> {
         }
         "idle" => Event::TeammateIdle(rest.to_owned()),
         "prompted" => Event::Prompted(rest.to_owned()),
+        "said" => Event::Said(rest.split('\t').map(str::to_owned).collect()),
         "ran" => {
             let mut parts = rest.splitn(3, '\t');
             let at = parts.next()?.parse().ok()?;
@@ -692,8 +712,12 @@ pub fn receipt_until(dir: &Path, until: u64) -> crate::project::receipt::Receipt
         .unwrap_or(usize::MAX)
         .min(bytes.len());
     for line in String::from_utf8_lossy(&bytes[..end]).lines() {
-        if let Some(Event::Ran(ran)) = parse_event(line) {
-            receipt.note(ran);
+        match parse_event(line) {
+            Some(Event::Ran(ran)) => receipt.note(ran),
+            Some(Event::Prompted(_)) => receipt.note_prompt(),
+            Some(Event::Wrote { .. }) => receipt.note_wrote(),
+            Some(Event::Said(sentences)) => receipt.note_said(&sentences),
+            _ => {}
         }
     }
     receipt
@@ -1895,6 +1919,50 @@ mod tests {
         let receipt = receipt_until(&dir, first_two);
         assert_eq!((receipt.total, receipt.failed), (2, 1));
         assert_eq!(receipt_until(&dir, read).total, 4);
+    }
+
+    /// The Stop input as Claude Code sent it (2.1.316, probed
+    /// 2026-10-31): the agent's last words in `last_assistant_message`,
+    /// kept as sentences ahead of the turn's end, and checked against the
+    /// turn's commands when a held terminal comes back.
+    #[test]
+    fn stop_keeps_what_the_agent_said_for_the_receipt() {
+        use crate::project::receipt::{Kind, Verdict};
+        let tree = TempTree::new("review-said", &[]);
+        let dir = tree.0.join("session");
+        hook("prompt", r#"{"prompt":"fix the parser"}"#, &dir).expect("prompt");
+        hook(
+            "ran-failed",
+            r#"{"tool_input":{"command":"cargo test"},"error":"Exit code 101","is_interrupt":false}"#,
+            &dir,
+        )
+        .expect("ran");
+        let stop = r#"{"session_id":"s","hook_event_name":"Stop","stop_hook_active":false,"last_assistant_message":"Fixed the parser.\n\nAll tests pass\tnow. Want me to commit?","background_tasks":[],"session_crons":[]}"#;
+        assert_eq!(
+            hook("stop", stop, &dir).expect("stop"),
+            Some(Event::Asked(FINISHED.into()))
+        );
+        let (events, read) = read_events(&dir, 0);
+        assert_eq!(
+            events[2],
+            Event::Said(vec![
+                "Fixed the parser.".into(),
+                "All tests pass now.".into(),
+                "Want me to commit?".into(),
+            ])
+        );
+        assert_eq!(events[3], Event::Asked(FINISHED.into()));
+        let receipt = receipt_until(&dir, read);
+        assert_eq!(receipt.claims.len(), 1);
+        assert_eq!(receipt.claims[0].kind, Kind::Tests);
+        assert!(matches!(
+            receipt.claims[0].verdict,
+            Verdict::Contradicted { .. }
+        ));
+        // Nothing said, nothing kept: only the turn's end.
+        hook("stop", r#"{"last_assistant_message":""}"#, &dir).expect("stop");
+        let (events, _) = read_events(&dir, read);
+        assert_eq!(events, [Event::Asked(FINISHED.into())]);
     }
 
     #[test]

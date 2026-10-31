@@ -242,8 +242,13 @@ the size and write it back.
   showing actually ran, as Claude Code's hooks report it rather than as
   the agent tells it: how many shell commands and how many failed, then
   the newest six with their result (ok, exit N, stopped, background)
-  and when; hover a row for the whole command. Only Claude sessions crc
-  starts, with `agent_review` on.
+  and when; hover a row for the whole command. When the agent finishes
+  a turn saying the tests pass, the code builds or the lint is clean, a
+  card above it holds each claim up to the newest command of that kind
+  the turn ran: checked, the failing exit code, not run, before last
+  edit (it passed, then the agent wrote a file), or unseen (it ran in
+  the background). Hover a claim for the sentence and the command
+  behind it. Only Claude sessions crc starts, with `agent_review` on.
   At the bottom of the Agents sidebar, the Activity panel shows the
   whole Mac every two seconds: CPU with a short history, memory used
   and its pressure, disk and network rates, and the three processes

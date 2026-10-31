@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use crate::platform::agents::{IssueSet, Pace, RepoKey, Workspace};
 use crate::project::icons;
-use crate::project::receipt::{Outcome, Receipt};
+use crate::project::receipt::{Outcome, Receipt, Verdict};
 use crate::project::worktree::{CheckState, PullRequest, Status};
 use crate::render::{
     font::Atlas,
@@ -834,9 +834,11 @@ impl Inspector {
         self.hits.extend(hits);
     }
 
-    /// The receipt card: how many commands the session's agent ran and
-    /// how many failed, then the newest few, each with how it ended and
-    /// when. The whole command is a row's tooltip. The bottom it reached.
+    /// The receipt card: what the agent's last message claimed, each with
+    /// how the turn's commands bear it out, then how many commands it ran
+    /// and how many failed, then the newest few, each with how it ended
+    /// and when. A claim's tooltip is the sentence and the command behind
+    /// it; a command's, the whole command. The bottom it reached.
     #[allow(clippy::too_many_arguments)]
     fn draw_receipt(
         &mut self,
@@ -856,6 +858,35 @@ impl Inspector {
         } else {
             (format!("{} failed", receipt.failed), theme.diff_removed)
         };
+        // The claims on a card of their own, above what bears them out.
+        let mut labels = Vec::new();
+        let mut values = Vec::new();
+        let mut whole = Vec::new();
+        for claim in &receipt.claims {
+            let ink = match claim.verdict {
+                Verdict::Backed(_) => theme.diff_added,
+                Verdict::Contradicted { .. } => theme.diff_removed,
+                Verdict::Stale(_) | Verdict::Unrun => theme.diff_modified,
+                Verdict::Background(_) => theme.gutter_text,
+            };
+            labels.push(claim.kind.said().to_owned());
+            values.push(vec![(claim.verdict.label(), ink)]);
+            whole.push(match claim.verdict.command() {
+                Some(command) => format!("\u{201c}{}\u{201d}\n{command}", claim.sentence),
+                None => format!(
+                    "\u{201c}{}\u{201d}\nNo {} command ran this turn.",
+                    claim.sentence,
+                    claim.kind.name()
+                ),
+            });
+        }
+        let mut y = y;
+        if !labels.is_empty() {
+            let facts: Vec<Fact> = labels.iter().map(String::as_str).zip(values).collect();
+            let bottom = card(out, atlas, x, y, width, &facts, theme);
+            rows_hotspots(x, y, width, 0, &whole);
+            y = bottom + 8.0;
+        }
         let mut labels = vec!["Commands".to_owned()];
         let mut values = vec![vec![(format!("{} ran", receipt.total), theme.text), failed]];
         let mut whole = Vec::new();
@@ -882,20 +913,19 @@ impl Inspector {
         }
         let facts: Vec<Fact> = labels.iter().map(String::as_str).zip(values).collect();
         let bottom = card(out, atlas, x, y, width, &facts, theme);
-        for (n, command) in whole.iter().enumerate() {
-            layout::hotspot(
-                Viewport {
-                    x,
-                    y: y + 4.0 + (n + 1) as f32 * ROW,
-                    width,
-                    height: ROW,
-                },
-                layout::Cursor::Arrow,
-                Some(command),
-            );
-        }
+        rows_hotspots(x, y, width, 1, &whole);
+        let checked: Vec<String> = receipt
+            .claims
+            .iter()
+            .map(|c| format!("{}:{}", c.kind.name(), c.verdict.label()))
+            .collect();
         self.shown_receipt = Some(format!(
-            "ran={} failed={} rows={} last={}",
+            "claims={} ran={} failed={} rows={} last={}",
+            if checked.is_empty() {
+                "-".into()
+            } else {
+                checked.join(",")
+            },
             receipt.total,
             receipt.failed,
             whole.len(),
@@ -999,7 +1029,7 @@ impl Inspector {
         text(out, atlas, x, y, width, &shown, theme.gutter_text);
         y += ROW;
         // The session showing: what its agent ran, as its hooks said.
-        if let Some(receipt) = receipt.filter(|r| !r.is_empty()) {
+        if let Some(receipt) = receipt.filter(|r| r.shown()) {
             y = self.draw_receipt(receipt, atlas, x, y, width, theme, out) + 14.0;
         }
         // The terminal showing is in ssh: where it is, not this Mac's Git.
@@ -2246,6 +2276,22 @@ fn card(
         }
     }
     y + height
+}
+
+/// A tooltip for each of a card's rows from `first` down.
+fn rows_hotspots(x: f32, y: f32, width: f32, first: usize, tips: &[String]) {
+    for (n, tip) in tips.iter().enumerate() {
+        layout::hotspot(
+            Viewport {
+                x,
+                y: y + 4.0 + (first + n) as f32 * ROW,
+                width,
+                height: ROW,
+            },
+            layout::Cursor::Arrow,
+            Some(tip),
+        );
+    }
 }
 
 fn text(
