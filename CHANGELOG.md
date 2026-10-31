@@ -2,7 +2,7 @@
 
 One entry per tag, written for people who use the editor.
 
-## Unreleased
+## v0.2.0-alpha.32, 2026-10-31
 
 - Agents mode: a receipt for each Claude session crc starts. Claude
   Code's own hooks report every shell command the agent runs and how
