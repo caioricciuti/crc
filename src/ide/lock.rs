@@ -12,6 +12,7 @@ use std::fs::File;
 use std::io::Write;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use crate::json::{self, Value};
 
@@ -33,6 +34,15 @@ pub struct Lock {
     path: PathBuf,
     port: u16,
     token: String,
+    /// Serializes `update_later`'s workers with each other and with the
+    /// removal on drop.
+    writes: Arc<Mutex<Writes>>,
+}
+
+/// The newest folder list asked for, and whether the file is gone.
+struct Writes {
+    latest: u64,
+    removed: bool,
 }
 
 impl Lock {
@@ -45,6 +55,10 @@ impl Lock {
             path: dir.join(format!("{port}.lock")),
             port,
             token: token.to_owned(),
+            writes: Arc::new(Mutex::new(Writes {
+                latest: 0,
+                removed: false,
+            })),
         };
         lock.update(folders)?;
         Ok(lock)
@@ -55,6 +69,32 @@ impl Lock {
         let body = json::compact(&contents(std::process::id(), folders, &self.token));
         crate::platform::write_atomically_with(&self.path, 0o600, |file| {
             file.write_all(body.as_bytes())
+        })
+    }
+
+    /// `update` on a worker, for the main thread: the write ends in an
+    /// fsync, which was 4-5 ms of a 40 ms click on a workspace in another
+    /// folder. When the folders change again before a worker runs, only
+    /// the newest list is written, and nothing once the lock is dropped.
+    pub fn update_later(&self, folders: &[PathBuf]) -> std::thread::JoinHandle<()> {
+        let generation = self.next_generation();
+        self.write_on_worker(generation, folders)
+    }
+
+    fn next_generation(&self) -> u64 {
+        let mut writes = self.writes.lock().unwrap_or_else(|e| e.into_inner());
+        writes.latest += 1;
+        writes.latest
+    }
+
+    fn write_on_worker(&self, generation: u64, folders: &[PathBuf]) -> std::thread::JoinHandle<()> {
+        let writes = Arc::clone(&self.writes);
+        let path = self.path.clone();
+        let body = json::compact(&contents(std::process::id(), folders, &self.token));
+        std::thread::spawn(move || {
+            if let Err(e) = write_if_current(&writes, generation, &path, &body) {
+                eprintln!("crc: cannot update {}: {e}", path.display());
+            }
         })
     }
 
@@ -69,8 +109,27 @@ impl Lock {
 
 impl Drop for Lock {
     fn drop(&mut self) {
+        // Held while removing, so a worker yet to run sees `removed` and
+        // cannot bring the file back.
+        let mut writes = self.writes.lock().unwrap_or_else(|e| e.into_inner());
+        writes.removed = true;
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+/// A worker's write: skipped when a newer list was asked for since, or the
+/// lock is gone.
+fn write_if_current(
+    writes: &Mutex<Writes>,
+    generation: u64,
+    path: &Path,
+    body: &str,
+) -> std::io::Result<()> {
+    let writes = writes.lock().unwrap_or_else(|e| e.into_inner());
+    if writes.removed || writes.latest != generation {
+        return Ok(());
+    }
+    crate::platform::write_atomically_with(path, 0o600, |file| file.write_all(body.as_bytes()))
 }
 
 fn contents(pid: u32, folders: &[PathBuf], token: &str) -> Value {
@@ -197,6 +256,38 @@ mod tests {
         let path = lock.path().to_path_buf();
         drop(lock);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_later_update_lands_off_thread_and_never_after_drop() {
+        let dir = temp("later").join("ide");
+        let lock = Lock::write(&dir, 45679, "abc123", &[PathBuf::from("/p/one")]).unwrap();
+        lock.update_later(&[PathBuf::from("/p/two")])
+            .join()
+            .unwrap();
+        assert_eq!(folders(&read(lock.path()).unwrap()), ["/p/two"]);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+
+        // A worker that runs after a newer request writes nothing, even
+        // when it runs last.
+        let older = lock.next_generation();
+        let newer = lock.next_generation();
+        lock.write_on_worker(newer, &[PathBuf::from("/p/new")])
+            .join()
+            .unwrap();
+        lock.write_on_worker(older, &[PathBuf::from("/p/old")])
+            .join()
+            .unwrap();
+        assert_eq!(folders(&read(lock.path()).unwrap()), ["/p/new"]);
+
+        // One that runs after the drop does not bring the file back.
+        let generation = lock.next_generation();
+        let writes = Arc::clone(&lock.writes);
+        let path = lock.path().to_path_buf();
+        drop(lock);
+        write_if_current(&writes, generation, &path, "{}").unwrap();
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
     }
 
     #[test]

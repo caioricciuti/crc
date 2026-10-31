@@ -88,9 +88,12 @@ impl Bridge {
         self.root == crate::platform::canonical(root)
     }
 
+    /// Points the lock file at `root`. The write happens on a worker; a
+    /// failure there is logged, not returned.
     pub fn set_root(&mut self, root: &Path) -> std::io::Result<()> {
         self.root = crate::platform::canonical(root);
-        self.lock.update(std::slice::from_ref(&self.root))
+        self.lock.update_later(std::slice::from_ref(&self.root));
+        Ok(())
     }
 
     pub fn root(&self) -> &Path {

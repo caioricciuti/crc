@@ -8506,10 +8506,18 @@ fn repo_rows(repos: &[RepoRow], query: &str) -> Vec<(layout::PaletteRow, Pick)> 
         .collect()
 }
 
-/// The previous visit to the workspace at `root`, recording this one.
+/// The previous visit to the workspace at `root`, recording this one on a
+/// worker: the write ends in an fsync, and this runs on a click. The lock
+/// keeps two quick visits from writing the same temporary file at once.
 fn visit_workspace(root: &Path) -> Option<u64> {
+    static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let before = crate::project::workspace::last_seen(root);
-    crate::project::workspace::mark_seen(root, crate::platform::unix_seconds());
+    let root = root.to_path_buf();
+    let now = crate::platform::unix_seconds();
+    std::thread::spawn(move || {
+        let _writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+        crate::project::workspace::mark_seen(&root, now);
+    });
     before
 }
 

@@ -493,23 +493,43 @@ pub fn toplevel(directory: &Path) -> Result<PathBuf, String> {
 
 /// The Git directories of the repository `directory` is in: its own and,
 /// for a linked worktree, the common one. Empty outside a repository.
+///
+/// Read from disk, not from `git rev-parse`: the watcher asks on the main
+/// thread whenever the project folder changes, and two Git processes there
+/// were most of a 40 ms click.
 pub fn git_dirs(directory: &Path) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    for args in [
-        &["rev-parse", "--absolute-git-dir"][..],
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"][..],
-    ] {
-        if let Ok(mut bytes) = run(directory, args) {
-            if bytes.last() == Some(&b'\n') {
-                bytes.pop();
-            }
-            let dir = path_from_bytes(bytes);
-            if !dir.as_os_str().is_empty() && !dirs.contains(&dir) {
-                dirs.push(dir);
-            }
-        }
+    let Some(own) = std::iter::successors(Some(directory), |d| d.parent()).find_map(own_git_dir)
+    else {
+        return Vec::new();
+    };
+    let common = common_git_dir(&own);
+    let mut dirs = vec![own];
+    if !dirs.contains(&common) {
+        dirs.push(common);
     }
     dirs
+}
+
+/// The Git directory of a working tree whose top is `top`: `.git` itself,
+/// or for a linked worktree or submodule, the directory its `.git` file
+/// names (relative to `top` when not absolute).
+pub fn own_git_dir(top: &Path) -> Option<PathBuf> {
+    let dot_git = top.join(".git");
+    if dot_git.is_dir() {
+        return Some(dot_git);
+    }
+    let text = std::fs::read_to_string(&dot_git).ok()?;
+    let named = text.strip_prefix("gitdir:")?.trim();
+    Some(top.join(named)).filter(|dir| dir.is_dir())
+}
+
+/// The directory shared by every worktree of the repository whose own Git
+/// directory is `git_dir`: what its `commondir` file names, else itself.
+pub fn common_git_dir(git_dir: &Path) -> PathBuf {
+    match std::fs::read_to_string(git_dir.join("commondir")) {
+        Ok(common) => git_dir.join(common.trim()),
+        Err(_) => git_dir.to_path_buf(),
+    }
 }
 
 /// The text of `path` as of HEAD, or `None` when HEAD has no such file:
@@ -2010,6 +2030,58 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn git_dirs_read_from_disk_match_what_git_says() {
+        let repo = TempRepo::new("git-dirs");
+        let top = repo.path();
+        std::fs::create_dir_all(top.join("sub/deeper")).unwrap();
+        std::fs::write(top.join("a.txt"), "a").unwrap();
+        run(top, &["add", "a.txt"]).unwrap();
+        run(top, &["commit", "--quiet", "-m", "first"]).unwrap();
+        let linked = top.join("sub/linked");
+        let linked_arg = linked.to_string_lossy().into_owned();
+        run(top, &["worktree", "add", "--quiet", &linked_arg]).unwrap();
+        let plain = top.with_extension("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+
+        let canonical = |dirs: Vec<PathBuf>| -> Vec<PathBuf> {
+            dirs.iter()
+                .map(|d| std::fs::canonicalize(d).unwrap())
+                .collect()
+        };
+        let said_by_git = |dir: &Path| -> Vec<PathBuf> {
+            let mut dirs = Vec::new();
+            for args in [
+                &["rev-parse", "--absolute-git-dir"][..],
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"][..],
+            ] {
+                if let Ok(bytes) = run(dir, args) {
+                    let dir = path_from_bytes(bytes.trim_ascii_end().to_vec());
+                    if !dirs.contains(&dir) {
+                        dirs.push(dir);
+                    }
+                }
+            }
+            canonical(dirs)
+        };
+        for dir in [
+            top.to_path_buf(),
+            top.join("sub/deeper"),
+            linked.clone(),
+            plain.clone(),
+        ] {
+            assert_eq!(
+                canonical(git_dirs(&dir)),
+                said_by_git(&dir),
+                "{}",
+                dir.display()
+            );
+        }
+        assert_eq!(git_dirs(&linked).len(), 2);
+        assert!(git_dirs(&plain).is_empty());
+        let _ = std::fs::remove_dir_all(&plain);
     }
 
     #[test]
