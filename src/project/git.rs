@@ -385,7 +385,8 @@ pub fn staged_additions(root: &Path) -> Result<Vec<Added>, String> {
     Ok(parse_additions(&String::from_utf8_lossy(&out)))
 }
 
-fn parse_additions(diff: &str) -> Vec<Added> {
+/// [`staged_additions`] from the diff's text, for one read elsewhere.
+pub(crate) fn parse_additions(diff: &str) -> Vec<Added> {
     let mut added = Vec::new();
     let mut path = String::new();
     let mut line = 0;
@@ -537,14 +538,26 @@ pub fn common_git_dir(git_dir: &Path) -> PathBuf {
 /// normalised to what the editor keeps in its rope, so a CRLF file does
 /// not read as changed on every line.
 pub fn head_text(root: &Path, path: &Path) -> Result<Option<String>, String> {
-    let relative = path
-        .strip_prefix(root)
-        .map_err(|_| "outside the repository".to_string())?;
-    Ok(rev_bytes(root, "HEAD", relative)?.map(|bytes| {
+    let relative = relative_to(root, path)?;
+    Ok(rev_bytes(root, "HEAD", &relative)?.map(|bytes| {
         // Line breaks as the buffer has them: CRLF and a lone CR are LF.
         let text = String::from_utf8_lossy(&bytes);
         crate::text::buffer::normalize_newlines(&text).into_owned()
     }))
+}
+
+/// `path` relative to `root`, the repository's top as Git gives it (a
+/// real path): as given when it is under the root, else through its real
+/// path, for a document opened as `/var/...` in a repository Git calls
+/// `/private/var/...`. `Err` when it is under neither.
+fn relative_to(root: &Path, path: &Path) -> Result<PathBuf, String> {
+    if let Ok(relative) = path.strip_prefix(root) {
+        return Ok(relative.to_path_buf());
+    }
+    crate::platform::canonical(path)
+        .strip_prefix(root)
+        .map(Path::to_path_buf)
+        .map_err(|_| "outside the repository".to_string())
 }
 
 /// The bytes of `relative` as of `rev`, or `None` when that commit has no
@@ -674,9 +687,7 @@ pub enum Indexed {
 pub fn index_bytes(path: &Path) -> Result<Indexed, String> {
     let dir = path.parent().ok_or("no folder")?;
     let root = crate::platform::canonical(&toplevel(dir)?);
-    let relative = path
-        .strip_prefix(&root)
-        .map_err(|_| "outside the repository".to_string())?;
+    let relative = relative_to(&root, path)?;
     let relative = relative.to_string_lossy();
     let output = command(&root)
         .args(["show", &format!(":{relative}")])
@@ -1373,8 +1384,15 @@ pub fn stage(root: &Path, change: &Change, staged: bool) -> Result<(), String> {
 }
 
 /// Commits what is staged with `message`; with `amend`, replaces HEAD
-/// instead, which with nothing staged rewords it.
-pub fn commit(root: &Path, message: &str, amend: bool) -> Result<(), String> {
+/// instead, which with nothing staged rewords it. A signed commit waits
+/// on its key, and a key on a person's touch: stopped after [`WAIT`],
+/// with `ssh_auth_sock` for a key an agent holds (see [`with_agent`]).
+pub fn commit(
+    root: &Path,
+    message: &str,
+    amend: bool,
+    ssh_auth_sock: Option<&Path>,
+) -> Result<(), String> {
     if message.trim().is_empty() {
         return Err("Write a commit message first".into());
     }
@@ -1383,7 +1401,12 @@ pub fn commit(root: &Path, message: &str, amend: bool) -> Result<(), String> {
     if amend {
         cmd.arg("--amend");
     }
-    run_with_stdin(&mut cmd, message.as_bytes().to_vec()).map(|_| ())
+    with_agent(&mut cmd, ssh_auth_sock);
+    ended_ok(bounded(
+        &mut cmd,
+        Some(message.as_bytes().to_vec()),
+        "commit",
+    )?)
 }
 
 /// A local branch.
@@ -1483,16 +1506,13 @@ pub fn abort(root: &Path, what: InProgress) -> Result<(), String> {
 }
 
 /// Goes on with a rebase whose conflicts are resolved and added. The
-/// commit keeps the message it had; no editor opens.
-pub fn continue_rebase(root: &Path) -> Result<(), String> {
-    checked(
-        command(root)
-            .env("GIT_EDITOR", "true")
-            .args(["rebase", "--continue"])
-            .output()
-            .map_err(|e| e.to_string())?,
-    )
-    .map(|_| ())
+/// commit keeps the message it had; no editor opens. It is a commit, and
+/// may sign: bounded and given the agent as [`commit`] is.
+pub fn continue_rebase(root: &Path, ssh_auth_sock: Option<&Path>) -> Result<(), String> {
+    let mut cmd = command(root);
+    cmd.env("GIT_EDITOR", "true").args(["rebase", "--continue"]);
+    with_agent(&mut cmd, ssh_auth_sock);
+    ended_ok(bounded(&mut cmd, None, "rebase")?)
 }
 
 /// A command that talks to a remote.
@@ -1553,44 +1573,53 @@ pub fn remote_args(
     Ok(args)
 }
 
-/// How long a remote command may take before it is stopped.
-const REMOTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// How long a command that waits on something outside crc runs before it
+/// is stopped: a server, or a person's touch on a signing key.
+pub const WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// Runs a remote command. `ssh_auth_sock` is the agent socket from the
-/// settings: an app started from the Dock does not inherit the shell's, and
-/// crc does not read the shell profile to find it. Nothing can prompt:
-/// there is no terminal and `GIT_TERMINAL_PROMPT` is 0, so a credential
-/// that is missing fails with Git's message instead of hanging.
-pub fn remote(root: &Path, what: Remote, ssh_auth_sock: Option<&Path>) -> Result<String, String> {
-    let branch = run(root, &["symbolic-ref", "--quiet", "--short", "HEAD"])
-        .map(|b| String::from_utf8_lossy(&b).trim().to_owned())
-        .ok();
-    let upstream = run(
-        root,
-        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
-    )
-    .is_ok();
-    let args = remote_args(what, branch.as_deref(), upstream, || {
-        let remotes = run(root, &["remote"]).unwrap_or_default();
-        String::from_utf8_lossy(&remotes)
-            .lines()
-            .any(|r| r == "origin")
-    })?;
-    let mut cmd = command(root);
-    cmd.args(&args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if let Some(sock) = ssh_auth_sock {
-        cmd.env("SSH_AUTH_SOCK", sock);
-    }
+/// How a bounded command ended, with the tails of what it printed.
+#[derive(Debug)]
+pub struct Ended {
+    pub status: std::process::ExitStatus,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+/// Runs `cmd` for at most [`WAIT`], with `input` on its standard input
+/// (nothing when `None`), and answers how it ended; past the wait it is
+/// killed, and the error names it `git <name>`. Both pipes are read while
+/// it runs: a fetch of many refs or a push whose server talks a lot fills
+/// a pipe's 64 KiB and would wait on us for ever. Only the end of each is
+/// kept; that is where Git says what happened. The tails come over a
+/// channel: a helper Git starts (a credential cache daemon) can keep a
+/// pipe open after Git itself has exited. The input is written from its
+/// own thread, as [`run_with_stdin`] does; a write cut short because Git
+/// exited is Git's error to report, not the pipe's.
+pub fn bounded(cmd: &mut Command, input: Option<Vec<u8>>, name: &str) -> Result<Ended, String> {
+    bounded_for(cmd, input, name, WAIT)
+}
+
+/// [`bounded`], stopped after `wait`.
+fn bounded_for(
+    cmd: &mut Command,
+    input: Option<Vec<u8>>,
+    name: &str,
+    wait: std::time::Duration,
+) -> Result<Ended, String> {
+    cmd.stdin(if input.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| e.to_string())?;
-    // Both pipes are read while it runs: a fetch of many refs or a push
-    // whose server talks a lot fills a pipe's 64 KiB and would wait on us
-    // for ever. Only the end of stderr is kept; that is where Git says
-    // what happened.
-    // Handed back over a channel: a helper Git starts (a credential cache
-    // daemon) can keep a pipe open after Git itself has exited.
+    if let Some(input) = input {
+        let mut stdin = child.stdin.take().ok_or("Missing Git stdin")?;
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&input);
+        });
+    }
     let tail = |pipe: Option<Box<dyn Read + Send>>| {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -1633,23 +1662,71 @@ pub fn remote(root: &Path, what: Remote, ssh_auth_sock: Option<&Path>) -> Result
     let status = loop {
         match child.try_wait().map_err(|e| e.to_string())? {
             Some(status) => break status,
-            None if started.elapsed() > REMOTE_TIMEOUT => {
+            None if started.elapsed() > wait => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!(
-                    "git {} took over two minutes and was stopped",
-                    args[0]
-                ));
+                let span = if wait >= WAIT {
+                    "two minutes".to_owned()
+                } else {
+                    format!("{} ms", wait.as_millis())
+                };
+                return Err(format!("git {name} took over {span} and was stopped"));
             }
             None => std::thread::sleep(std::time::Duration::from_millis(50)),
         }
     };
-    drop(out);
-    let stderr = err
-        .recv_timeout(std::time::Duration::from_secs(2))
-        .unwrap_or_default();
-    let said = String::from_utf8_lossy(&stderr).trim().to_owned();
-    if status.success() {
+    let grace = std::time::Duration::from_secs(2);
+    Ok(Ended {
+        status,
+        stdout: out.recv_timeout(grace).unwrap_or_default(),
+        stderr: err.recv_timeout(grace).unwrap_or_default(),
+    })
+}
+
+/// `Ok` when a bounded command succeeded, else what it said on stderr.
+fn ended_ok(ended: Ended) -> Result<(), String> {
+    if ended.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&ended.stderr).trim().to_owned())
+    }
+}
+
+/// Gives `cmd` the key agent's socket from the settings, when there is
+/// one: an app started from the Dock does not inherit the shell's, and
+/// crc does not read the shell profile to find it. For what talks to a
+/// server over ssh, and for a commit signed with a key the agent holds.
+fn with_agent(cmd: &mut Command, ssh_auth_sock: Option<&Path>) {
+    if let Some(sock) = ssh_auth_sock {
+        cmd.env("SSH_AUTH_SOCK", sock);
+    }
+}
+
+/// Runs a remote command, for at most [`WAIT`]. `ssh_auth_sock` is the
+/// agent socket from the settings (see [`with_agent`]). Nothing can
+/// prompt: there is no terminal and `GIT_TERMINAL_PROMPT` is 0, so a
+/// credential that is missing fails with Git's message instead of hanging.
+pub fn remote(root: &Path, what: Remote, ssh_auth_sock: Option<&Path>) -> Result<String, String> {
+    let branch = run(root, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .map(|b| String::from_utf8_lossy(&b).trim().to_owned())
+        .ok();
+    let upstream = run(
+        root,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    )
+    .is_ok();
+    let args = remote_args(what, branch.as_deref(), upstream, || {
+        let remotes = run(root, &["remote"]).unwrap_or_default();
+        String::from_utf8_lossy(&remotes)
+            .lines()
+            .any(|r| r == "origin")
+    })?;
+    let mut cmd = command(root);
+    cmd.args(&args);
+    with_agent(&mut cmd, ssh_auth_sock);
+    let ended = bounded(&mut cmd, None, &args[0])?;
+    let said = String::from_utf8_lossy(&ended.stderr).trim().to_owned();
+    if ended.status.success() {
         Ok(said)
     } else if what == Remote::Pull && said.contains("fast-forward") {
         // Git's own hint names `git config` and command-line flags.
@@ -2142,20 +2219,20 @@ mod tests {
         let dir = base.path();
         std::fs::write(dir.join("a.txt"), "a\n").unwrap();
         run(dir, &["add", "a.txt"]).unwrap();
-        commit(dir, "plant the beans\n\nA body line.", false).unwrap();
+        commit(dir, "plant the beans\n\nA body line.", false, None).unwrap();
         assert_eq!(
             head_message(dir).unwrap(),
             "plant the beans\n\nA body line."
         );
         std::fs::write(dir.join("b.txt"), "b\n").unwrap();
         run(dir, &["add", "b.txt"]).unwrap();
-        commit(dir, "plant the beans and water them", true).unwrap();
+        commit(dir, "plant the beans and water them", true, None).unwrap();
         assert_eq!(count(dir), "1", "amended, not added");
         assert_eq!(head_message(dir).unwrap(), "plant the beans and water them");
         let files = run(dir, &["show", "--name-only", "--format=", "HEAD"]).unwrap();
         assert_eq!(String::from_utf8_lossy(&files).trim(), "a.txt\nb.txt");
         // Nothing staged: a reword.
-        commit(dir, "water the beans", true).unwrap();
+        commit(dir, "water the beans", true, None).unwrap();
         assert_eq!(count(dir), "1");
         assert_eq!(head_message(dir).unwrap(), "water the beans");
     }
@@ -2177,7 +2254,7 @@ mod tests {
         let add = |file: &str| {
             std::fs::write(work.join(file), file).unwrap();
             run(&work, &["add", file]).unwrap();
-            commit(&work, file, false).unwrap();
+            commit(&work, file, false, None).unwrap();
         };
         let read = || {
             let mut snapshot = snapshot(&work).unwrap();
@@ -2282,7 +2359,7 @@ mod tests {
         assert_eq!(InProgress::read(&git_dir), Some(InProgress::Rebase));
         std::fs::write(mine.join("shared.txt"), "both\n").unwrap();
         run(&mine, &["add", "shared.txt"]).unwrap();
-        continue_rebase(&mine).unwrap();
+        continue_rebase(&mine, None).unwrap();
         assert_eq!(InProgress::read(&git_dir), None);
         assert!(origin.exists());
     }
@@ -2709,6 +2786,51 @@ mod tests {
     }
 
     #[test]
+    fn a_bounded_command_is_stopped_past_its_wait() {
+        let mut slow = Command::new("sleep");
+        slow.arg("30");
+        let said = bounded_for(
+            &mut slow,
+            None,
+            "sleep",
+            std::time::Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert_eq!(said, "git sleep took over 100 ms and was stopped");
+        // One that ends in time answers its status and what it printed,
+        // its input written while it runs.
+        let ended = bounded_for(
+            &mut Command::new("cat"),
+            Some(b"hello".to_vec()),
+            "cat",
+            WAIT,
+        )
+        .unwrap();
+        assert!(ended.status.success());
+        assert_eq!(ended.stdout, b"hello");
+        assert!(ended.stderr.is_empty());
+    }
+
+    #[test]
+    fn head_and_index_are_read_through_a_path_that_is_not_canonical() {
+        let repo = TempRepo::new("alias");
+        let root = repo.path().to_path_buf();
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        run(&root, &["add", "a.txt"]).unwrap();
+        run(&root, &["commit", "-qm", "one"]).unwrap();
+        // A symlink to the repository, as /var is to /private/var.
+        let alias = root.with_extension("alias");
+        let _ = std::fs::remove_file(&alias);
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let through = alias.join("a.txt");
+        let head = head_text(&root, &through);
+        let index = index_bytes(&through);
+        let _ = std::fs::remove_file(&alias);
+        assert_eq!(head, Ok(Some("one\n".to_owned())));
+        assert_eq!(index, Ok(Indexed::Tracked(b"one\n".to_vec())));
+    }
+
+    #[test]
     fn parses_name_status_with_renames() {
         let raw = b"M\0src/a.rs\0A\0new.txt\0D\0gone.txt\0R087\0old.md\0moved.md\0T\0link\0";
         let got = parse_name_status(raw);
@@ -2931,7 +3053,7 @@ mod tests {
         stage(&root, &s.changes[0], false).unwrap();
         assert!(!snapshot(&root).unwrap().changes[0].staged());
         stage(&root, &snapshot(&root).unwrap().changes[0], true).unwrap();
-        commit(&root, "Initial personal sample", false).unwrap();
+        commit(&root, "Initial personal sample", false, None).unwrap();
         assert!(snapshot(&root).unwrap().changes.is_empty());
         std::fs::write(root.join("a file.txt"), "hello again\n").unwrap();
         let s = snapshot(&root).unwrap();
@@ -2969,11 +3091,11 @@ mod tests {
         run(&root, &["add", "-A"]).unwrap();
         // A message several times a pipe's buffer goes in whole.
         let body = "a long commit message line\n".repeat(12_000);
-        commit(&root, &format!("Everything\n\n{body}"), false).unwrap();
+        commit(&root, &format!("Everything\n\n{body}"), false, None).unwrap();
         let logged = run(&root, &["log", "-1", "--format=%B"]).unwrap();
         assert!(logged.len() > body.len(), "{} bytes", logged.len());
         // Nothing staged: Git's own refusal, not a broken pipe.
-        let error = commit(&root, &body, false).unwrap_err();
+        let error = commit(&root, &body, false, None).unwrap_err();
         assert!(!error.to_lowercase().contains("pipe"), "{error}");
         run(&root, &["mv", "a file.txt", "moved.txt"]).unwrap();
         std::fs::write(root.join("moved.txt"), "moved and edited\n").unwrap();

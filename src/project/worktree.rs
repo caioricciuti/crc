@@ -301,7 +301,9 @@ pub fn ssh_write(
 
 /// Runs Git commands in `dir` that change something, one after another
 /// until one fails: here, or in one ssh call on a host. The last one's
-/// stdout and stderr, or what the failing one said.
+/// stdout and stderr, or what the failing one said. Here, each is stopped
+/// after [`crate::project::git::WAIT`], as over ssh: a merge or a commit
+/// may sign, and the key wait on a touch that never comes.
 fn write_on(
     runner: &Runner,
     dir: &Path,
@@ -311,16 +313,13 @@ fn write_on(
         Runner::Local => {
             let mut said = (String::new(), String::new());
             for args in commands {
-                let output = git(dir)
-                    .args(args)
-                    .stdin(std::process::Stdio::null())
-                    .output()
-                    .map_err(|e| e.to_string())?;
-                let err = String::from_utf8_lossy(&output.stderr).into_owned();
-                if !output.status.success() {
+                let name = args.first().map_or("", String::as_str);
+                let ended = crate::project::git::bounded(git(dir).args(args), None, name)?;
+                let err = String::from_utf8_lossy(&ended.stderr).into_owned();
+                if !ended.status.success() {
                     return Err(git_said(&err));
                 }
-                said = (String::from_utf8_lossy(&output.stdout).into_owned(), err);
+                said = (String::from_utf8_lossy(&ended.stdout).into_owned(), err);
             }
             Ok(said)
         }
@@ -511,7 +510,66 @@ pub fn is_dirty_on(runner: &Runner, dir: &Path) -> Result<bool, String> {
     .is_empty())
 }
 
-/// Removes a task's worktree, refused while it has changes. The branch is
+/// Build output a worktree may hold without being kept: a build makes it
+/// again, so removing it with the worktree loses nothing. Finder's
+/// `.DS_Store` is as expendable.
+const BUILD_OUTPUT: &[&str] = &[
+    "target",
+    "node_modules",
+    ".venv",
+    "dist",
+    "build",
+    "__pycache__",
+    ".DS_Store",
+];
+
+/// The files in the checkout at `dir` that Git ignores and `worktree
+/// remove` deletes without a word, since its own clean check does not see
+/// them: a `.env`, a local database, an agent's scratch file. Build output
+/// (see [`BUILD_OUTPUT`]) is left out. Each is the path Git shows,
+/// relative to `dir`.
+pub fn ignored_files(dir: &Path) -> Result<Vec<String>, String> {
+    ignored_files_on(&Runner::Local, dir)
+}
+
+/// [`ignored_files`], by `runner`.
+pub fn ignored_files_on(runner: &Runner, dir: &Path) -> Result<Vec<String>, String> {
+    Ok(parse_ignored(&run_on(
+        runner,
+        dir,
+        &[
+            "status",
+            "--porcelain",
+            "--ignored=matching",
+            "--untracked-files=normal",
+        ],
+    )?))
+}
+
+/// The ignored entries of a porcelain status, build output left out. An
+/// ignored folder is one entry, without its trailing slash.
+pub fn parse_ignored(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| line.strip_prefix("!! "))
+        .map(|path| path.trim_end_matches('/'))
+        .filter(|path| !path.split('/').any(|part| BUILD_OUTPUT.contains(&part)))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// A few of `files` by name, and how many more there are.
+fn some_of(files: &[String]) -> String {
+    const NAMED: usize = 3;
+    let mut said = files[..files.len().min(NAMED)].join(", ");
+    if files.len() > NAMED {
+        said.push_str(&format!(" and {} more", files.len() - NAMED));
+    }
+    said
+}
+
+/// Removes a task's worktree, refused while it has changes, or holds
+/// files Git ignores that are not build output (see [`ignored_files`]):
+/// Git would delete them without a word. The branch is
 /// deleted too when it is merged: into `base` (the default branch), or,
 /// for a squash merge Git cannot see, when it is still at the head of its
 /// merged pull request (`merged_pr_head`). Otherwise `branch -d` decides,
@@ -541,6 +599,14 @@ pub fn remove_on(
         return Err(format!(
             "{} has uncommitted changes; commit or discard them first",
             tree.name()
+        ));
+    }
+    let kept = ignored_files_on(runner, &tree.path)?;
+    if !kept.is_empty() {
+        return Err(format!(
+            "{} holds files Git ignores ({}); move or delete them first",
+            tree.name(),
+            some_of(&kept)
         ));
     }
     let target = tree.path.to_string_lossy().into_owned();
@@ -644,21 +710,40 @@ pub fn own_commits_on(
         .collect())
 }
 
-/// Merges a task's branch into whatever the main checkout has out.
-/// Refused while the main checkout has changes of its own; a conflict
-/// leaves the merge in progress for Source Control to finish or abort.
+/// Merges a task's branch into the branch the main checkout has out.
+/// Refused while the main checkout has changes of its own, or has no
+/// branch out (a detached HEAD would take a merge commit no branch
+/// holds); a conflict leaves the merge in progress for Source Control to
+/// finish or abort. The merge commit may sign: stopped after
+/// [`crate::project::git::WAIT`].
 pub fn merge(main: &Path, branch: &str) -> Result<String, String> {
     if is_dirty(main)? {
         return Err("The main checkout has uncommitted changes; commit or stash them first".into());
     }
     let into = run(main, &["branch", "--show-current"])?.trim().to_owned();
-    match run(main, &["merge", "--no-edit", branch]) {
-        Ok(_) => Ok(format!("Merged {branch} into {into}")),
-        Err(e) if e.contains("CONFLICT") || e.contains("Automatic merge failed") => Err(format!(
-            "Merging {branch} into {into} stopped on conflicts; resolve them in Source Control"
-        )),
-        Err(e) => Err(e),
+    if into.is_empty() {
+        return Err("The main checkout is not on a branch; check one out to merge into".into());
     }
+    let ended = crate::project::git::bounded(
+        git(main).args(["merge", "--no-edit", branch]),
+        None,
+        "merge",
+    )?;
+    if ended.status.success() {
+        return Ok(format!("Merged {branch} into {into}"));
+    }
+    // Git tells of conflicts on stdout, and of a refusal on stderr.
+    let out = String::from_utf8_lossy(&ended.stdout);
+    let err = String::from_utf8_lossy(&ended.stderr);
+    if [&out, &err]
+        .iter()
+        .any(|said| said.contains("CONFLICT") || said.contains("Automatic merge failed"))
+    {
+        return Err(format!(
+            "Merging {branch} into {into} stopped on conflicts; resolve them in Source Control"
+        ));
+    }
+    Err(git_said(&err))
 }
 
 /// How far the task's branch is from `base` (the default branch; `None`
@@ -1411,9 +1496,60 @@ pub fn update_from_on(runner: &Runner, dir: &Path, base: &str) -> Result<String,
     }
 }
 
+/// How a commit the workspace's leak guard refused begins; the rest names
+/// the line and the marker (see [`refusal`]). Source Control reads it to
+/// tell the refusal from a Git failure.
+pub const REFUSED: &str = "Not committed: ";
+
+/// The refusal for `hit`, the staged line holding a private marker as
+/// [`crate::project::workspace::leak`] names it.
+pub fn refusal(hit: &str) -> String {
+    format!(
+        "{REFUSED}{hit}, which this workspace keeps out of its repositories. \
+         Remove it from the staged change, or change private_markers in .crc/workspace.toml."
+    )
+}
+
+/// The first staged line in `dir` that holds one of `markers`, the
+/// workspace's private markers (see `Workspace::guard`), read by `runner`;
+/// `None` with no markers, and no read.
+fn staged_leak_on(
+    runner: &Runner,
+    dir: &Path,
+    markers: &[String],
+) -> Result<Option<String>, String> {
+    if markers.is_empty() {
+        return Ok(None);
+    }
+    let diff = run_on(
+        runner,
+        dir,
+        &[
+            "diff",
+            "--cached",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-renames",
+            "-U0",
+        ],
+    )?;
+    Ok(crate::project::workspace::leak(
+        &crate::project::git::parse_additions(&diff),
+        markers,
+    ))
+}
+
 /// Stages everything in the workspace, untracked files too, and commits
-/// it with `message`.
-pub fn commit_all(dir: &Path, message: &str) -> Result<String, String> {
+/// it with `message`. Refused, and the staging undone, when a line it
+/// would add holds one of `markers`, as Source Control refuses a commit.
+/// `ssh_auth_sock` is for the commit's signature, as [`crate::project::git::commit`]
+/// takes it.
+pub fn commit_all(
+    dir: &Path,
+    message: &str,
+    markers: &[String],
+    ssh_auth_sock: Option<&Path>,
+) -> Result<String, String> {
     if message.trim().is_empty() {
         return Err("Write a commit message first".into());
     }
@@ -1425,7 +1561,11 @@ pub fn commit_all(dir: &Path, message: &str) -> Result<String, String> {
         return Err("Nothing to commit".into());
     }
     run(dir, &["add", "--all"])?;
-    crate::project::git::commit(dir, message, false)?;
+    if let Some(hit) = staged_leak_on(&Runner::Local, dir, markers)? {
+        run(dir, &["reset", "-q"])?;
+        return Err(refusal(&hit));
+    }
+    crate::project::git::commit(dir, message, false, ssh_auth_sock)?;
     Ok(committed(files))
 }
 
@@ -1438,9 +1578,20 @@ fn committed(files: usize) -> String {
 
 /// [`commit_all`], by `runner`. On a host the message goes as an argument
 /// (`-m`, which Git cleans up as it does a message from a file) and the
-/// commit is made with the host's own Git settings: one that signs with a
-/// key wanting a passphrase fails, saying so, as nothing can be asked.
-pub fn commit_all_on(runner: &Runner, dir: &Path, message: &str) -> Result<String, String> {
+/// commit is made with the host's own Git settings and key agent, not
+/// `ssh_auth_sock`: one that signs with a key wanting a passphrase fails,
+/// saying so, as nothing can be asked. With `markers`, the staged lines
+/// are read between the add and the commit, one more round trip.
+pub fn commit_all_on(
+    runner: &Runner,
+    dir: &Path,
+    message: &str,
+    markers: &[String],
+    ssh_auth_sock: Option<&Path>,
+) -> Result<String, String> {
+    if *runner == Runner::Local {
+        return commit_all(dir, message, markers, ssh_auth_sock);
+    }
     if message.trim().is_empty() {
         return Err("Write a commit message first".into());
     }
@@ -1451,14 +1602,18 @@ pub fn commit_all_on(runner: &Runner, dir: &Path, message: &str) -> Result<Strin
     if files == 0 {
         return Err("Nothing to commit".into());
     }
-    write_on(
-        runner,
-        dir,
-        &[
-            strings(&["add", "--all"]),
-            strings(&["commit", "-q", "-m", message]),
-        ],
-    )?;
+    let add = strings(&["add", "--all"]);
+    let commit = strings(&["commit", "-q", "-m", message]);
+    if markers.is_empty() {
+        write_on(runner, dir, &[add, commit])?;
+        return Ok(committed(files));
+    }
+    write_on(runner, dir, &[add])?;
+    if let Some(hit) = staged_leak_on(runner, dir, markers)? {
+        write_on(runner, dir, &[strings(&["reset", "-q"])])?;
+        return Err(refusal(&hit));
+    }
+    write_on(runner, dir, &[commit])?;
     Ok(committed(files))
 }
 
@@ -2889,16 +3044,16 @@ mod tests {
         // The bare origin is inside the checkout: kept out of what is committed.
         std::fs::write(repo.join(".git/info/exclude"), "origin.git/\n").unwrap();
         assert_eq!(
-            commit_all_on(&runner, repo, "  "),
+            commit_all_on(&runner, repo, "  ", &[], None),
             Err("Write a commit message first".to_owned())
         );
         assert_eq!(
-            commit_all_on(&runner, repo, "wip"),
+            commit_all_on(&runner, repo, "wip", &[], None),
             Err("Nothing to commit".to_owned())
         );
         std::fs::write(repo.join("b.txt"), "b\n").unwrap();
         assert_eq!(
-            commit_all_on(&runner, repo, "wip"),
+            commit_all_on(&runner, repo, "wip", &[], None),
             Ok("Committed 1 file".to_owned())
         );
         remote_on(&runner, repo, Remote::Push).unwrap();
@@ -2919,6 +3074,8 @@ mod tests {
         let ok = |args: &[&str]| assert!(git(repo).args(args).output().unwrap().status.success());
         ok(&["init", "-q", "-b", branch]);
         ok(&["config", "commit.gpgsign", "false"]);
+        ok(&["config", "user.name", "t"]);
+        ok(&["config", "user.email", "t@t"]);
         ok(&["add", "a.txt"]);
         ok(&[
             "-c",
@@ -3085,6 +3242,78 @@ mod tests {
     }
 
     #[test]
+    fn remove_refuses_a_worktree_holding_ignored_files() {
+        let tree = fixture("remove-ignored", "main", &[]);
+        let repo = &tree.0;
+        let (dir, task) = linked(repo, "ignored-task");
+        std::fs::write(dir.join(".gitignore"), ".env\ntarget/\n").unwrap();
+        ok_in(&dir, &["add", ".gitignore"]);
+        ok_in(&dir, &["commit", "-qm", "ignore"]);
+        // Build output alone does not keep a worktree.
+        std::fs::create_dir_all(dir.join("target/debug")).unwrap();
+        std::fs::write(dir.join("target/debug/out"), "x").unwrap();
+        assert_eq!(ignored_files(&dir), Ok(vec![]));
+        // A gitignored file Git's own clean check does not see.
+        std::fs::write(dir.join(".env"), "SECRET=1\n").unwrap();
+        assert_eq!(is_dirty(&dir), Ok(false));
+        assert_eq!(ignored_files(&dir), Ok(vec![".env".to_owned()]));
+        let said = remove(repo, &task, Some("main"), None).unwrap_err();
+        assert!(said.contains(".env"), "{said}");
+        assert!(dir.join(".env").is_file());
+        std::fs::remove_file(dir.join(".env")).unwrap();
+        assert!(remove(repo, &task, Some("main"), None).is_ok());
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn commit_all_refuses_a_private_marker() {
+        let tree = fixture("commit-marker", "main", &[]);
+        let repo = &tree.0;
+        let markers = vec!["secret-client".to_owned()];
+        std::fs::write(repo.join("notes.md"), "see secret-client\n").unwrap();
+        let said = commit_all(repo, "notes", &markers, None).unwrap_err();
+        assert!(said.starts_with(REFUSED), "{said}");
+        assert!(said.contains("notes.md:1 mentions"), "{said}");
+        let commits = |repo: &Path| run(repo, &["rev-list", "--count", "HEAD"]).unwrap();
+        assert_eq!(commits(repo).trim(), "1");
+        // The add is undone: the file is as it was before the attempt.
+        let status = run(repo, &["status", "--porcelain"]).unwrap();
+        assert_eq!(status.trim(), "?? notes.md");
+        // Without the marker it commits, the markers still checked.
+        std::fs::write(repo.join("notes.md"), "see the client\n").unwrap();
+        assert_eq!(
+            commit_all(repo, "notes", &markers, None),
+            Ok("Committed 1 file".to_owned())
+        );
+        // The runner's way refuses the same.
+        std::fs::write(repo.join("b.md"), "secret-client\n").unwrap();
+        let said = commit_all_on(&Runner::Local, repo, "b", &markers, None).unwrap_err();
+        assert!(said.starts_with(REFUSED), "{said}");
+        assert_eq!(commits(repo).trim(), "2");
+        assert!(
+            parse_ignored("!! .env\n!! target/\n?? a\n!! src/__pycache__/\n!! db/local.sqlite\n")
+                == vec![".env".to_owned(), "db/local.sqlite".to_owned()]
+        );
+    }
+
+    #[test]
+    fn merge_refuses_a_detached_main_checkout() {
+        let tree = fixture("merge-detached", "main", &["side"]);
+        let repo = &tree.0;
+        ok_in(repo, &["checkout", "-q", "side"]);
+        std::fs::write(repo.join("b.txt"), "two\n").unwrap();
+        ok_in(repo, &["add", "b.txt"]);
+        ok_in(repo, &["commit", "-qm", "two"]);
+        ok_in(repo, &["checkout", "-q", "--detach", "main"]);
+        let before = run(repo, &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(
+            merge(repo, "side"),
+            Err("The main checkout is not on a branch; check one out to merge into".to_owned())
+        );
+        assert_eq!(run(repo, &["rev-parse", "HEAD"]).unwrap(), before);
+    }
+
+    #[test]
     fn merged_needs_own_commits() {
         let tree = fixture("merged-own", "main", &[]);
         let repo = &tree.0;
@@ -3238,7 +3467,7 @@ mod tests {
         assert!(remove_on(&runner, repo, &task, Some("main"), None).is_err());
         assert!(dir.is_dir());
         assert_eq!(
-            commit_all_on(&runner, &dir, "two\nlines! and \\ a backslash"),
+            commit_all_on(&runner, &dir, "two\nlines! and \\ a backslash", &[], None),
             Ok("Committed 1 file".to_owned())
         );
         let log = run(&dir, &["log", "-1", "--format=%B"]).unwrap();

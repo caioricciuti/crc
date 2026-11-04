@@ -549,14 +549,28 @@ impl EditorView {
     /// The palette's answer: stage everything and commit it.
     pub(super) fn agent_commit_all(&self, message: String) {
         let host = self.menu_host();
+        // The workspace's private markers, as Source Control checks them,
+        // and the key agent's socket for the commit's signature.
+        let (guard, sock) = self
+            .state()
+            .map(|state| (state.git.guard.clone(), state.ssh_auth_sock.clone()))
+            .unwrap_or_default();
         self.agent_operation(
             |t| format!("Committing in {}\u{2026}", t.name()),
             move |path| match host {
                 Some(host) => {
                     let runner = crate::platform::agents::runner(Some(&host));
-                    crate::project::worktree::commit_all_on(&runner, &path, &message)
+                    crate::project::worktree::commit_all_on(
+                        &runner,
+                        &path,
+                        &message,
+                        &guard,
+                        sock.as_deref(),
+                    )
                 }
-                None => crate::project::worktree::commit_all(&path, &message),
+                None => {
+                    crate::project::worktree::commit_all(&path, &message, &guard, sock.as_deref())
+                }
             },
         );
     }

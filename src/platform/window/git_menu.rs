@@ -88,6 +88,7 @@ impl EditorView {
                 return;
             }
             state.git = git_panel_for(&state.workspace);
+            state.git.ssh_auth_sock = state.ssh_auth_sock.clone();
         }
         self.resume_display_link();
         self.request_redraw();

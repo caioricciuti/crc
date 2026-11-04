@@ -96,10 +96,11 @@ pub(super) fn read_head(path: &Path) -> Option<String> {
 /// The active document's HEAD text and its changes against it, current to
 /// the text in the buffer, or why there are none to act on. The gutter
 /// diffs a pause after typing; when it is behind, the diff runs now rather
-/// than acting on lines that have moved. With `fresh`, for what writes a
-/// HEAD text somewhere, a HEAD that may have moved is read now, rather
-/// than acting on the one the gutter still draws; stepping and peeking
-/// take that one while the new read is on its way.
+/// than acting on lines that have moved. With `fresh`, for Revert Change,
+/// which writes HEAD's text into the document, a HEAD that may have moved
+/// is read now (two Git processes, on this thread), rather than acting on
+/// the one the gutter still draws; stepping, peeking and staging take that
+/// one while the new read is on its way.
 fn active_changes(
     state: &mut State,
     fresh: bool,
@@ -161,7 +162,10 @@ fn stage_job(
             "cannot stage one change of a file that is not plain UTF-8; {ELSEWHERE}"
         ));
     }
-    let (head, changes) = active_changes(state, true)?;
+    // The gutter's HEAD, not a fresh read on the click: the patch is made
+    // of it, and Git checks it against the index before applying it, so
+    // a HEAD that moved refuses rather than stages the wrong lines.
+    let (head, changes) = active_changes(state, false)?;
     let change = crate::ide::diff::change_at(&changes, line)
         .map(|index| changes[index])
         .ok_or("the caret is not on a change")?;

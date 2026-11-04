@@ -2,6 +2,7 @@
 use crate::project::git::{self, Change, Snapshot};
 use crate::project::icons;
 use crate::project::review;
+use crate::project::worktree::{REFUSED, refusal};
 use crate::render::{
     font::Atlas,
     layout::{self, Button, Theme, Tone, Viewport},
@@ -344,13 +345,28 @@ struct InFlight {
     stages_from_diff: bool,
     /// Whether the status line says what runs, beside the panel's note.
     told: bool,
+    /// When it started, for the note on a commit that waits on its key.
+    started: std::time::Instant,
+    /// A commit, or a rebase going on with one: it may sign, and the key
+    /// wait on a touch.
+    signs: bool,
+    /// Whether the note already says it waits on the key.
+    touch_said: bool,
 }
+
+/// How long a commit runs before the note says it waits on the signing
+/// key: a FIDO key lights up and waits for its touch with nothing on
+/// screen to say so.
+const TOUCH_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 pub struct Panel {
     directory: PathBuf,
     /// The repository's name in a workspace of several, drawn as a menu
     /// in the header row; `None` when there is nothing to choose.
     pub repo: Option<String>,
+    /// The key agent's socket from the settings, for a commit signed with
+    /// a key the agent holds, as `remote` is handed it for a push.
+    pub ssh_auth_sock: Option<PathBuf>,
     /// Text a commit must not add (see `Workspace::guard`); empty for
     /// no check.
     pub guard: Vec<String>,
@@ -403,10 +419,11 @@ pub struct Panel {
     resolve_queued: std::collections::VecDeque<PathBuf>,
     /// A change clicked while Git was busy, shown once it is done.
     select_queued: Option<PathBuf>,
-    /// What was asked for while Git was busy (a stage, a commit, a
-    /// refresh the watcher wanted), run once it is done. The latest wins;
-    /// a refresh never replaces something the person asked for.
-    queued: Option<Operation>,
+    /// What was asked for while Git was busy (stages, a commit, a refresh
+    /// the watcher wanted), run in that order once it is done: a stage
+    /// clicked during a refresh, then Cmd-Return, commits with it in. A
+    /// refresh waits once, and a commit asked for twice is one commit.
+    queued: std::collections::VecDeque<Operation>,
     /// Counts the worker's answers, so a view derived from the snapshot
     /// knows when to look again.
     generation: u64,
@@ -418,9 +435,6 @@ pub struct Panel {
     /// lands on what is on screen.
     branch_width: std::cell::Cell<Option<f32>>,
 }
-
-/// How a commit the workspace's leak guard refused is said.
-const REFUSED: &str = "Not committed: ";
 
 /// Height of one file row in the change list.
 pub const ROW: f32 = 26.0;
@@ -705,6 +719,7 @@ impl Panel {
         Self {
             directory,
             repo: None,
+            ssh_auth_sock: None,
             guard: Vec::new(),
             snapshot,
             selected: 0,
@@ -729,7 +744,7 @@ impl Panel {
             announcement: None,
             resolve_queued: Default::default(),
             select_queued: None,
-            queued: None,
+            queued: Default::default(),
             generation: 0,
             fetched_at: None,
             branch_width: Default::default(),
@@ -1412,8 +1427,16 @@ impl Panel {
     }
     fn start(&mut self, operation: Operation) {
         if self.busy() {
-            if !matches!(operation, Operation::Refresh) || self.queued.is_none() {
-                self.queued = Some(operation);
+            let repeat = match &operation {
+                Operation::Refresh => self.queued.iter().any(|q| matches!(q, Operation::Refresh)),
+                Operation::Commit(message, amend) => self
+                    .queued
+                    .iter()
+                    .any(|q| matches!(q, Operation::Commit(m, a) if m == message && a == amend)),
+                _ => false,
+            };
+            if !repeat {
+                self.queued.push_back(operation);
             }
             return;
         }
@@ -1422,6 +1445,7 @@ impl Panel {
         } else {
             None
         };
+        let signs = matches!(operation, Operation::Commit(..) | Operation::ContinueRebase);
         let announces = matches!(
             operation,
             Operation::Switch(_)
@@ -1444,6 +1468,7 @@ impl Panel {
         let keeps_place = stages_from_diff || matches!(operation, Operation::Refresh);
         let directory = self.directory.clone();
         let guard = self.guard.clone();
+        let sock = self.ssh_auth_sock.clone();
         let labels = self.agent_labels.clone();
         let previous = self.selected_change().map(|c| c.path.clone());
         let (tx, rx) = mpsc::channel();
@@ -1455,6 +1480,9 @@ impl Panel {
             keeps_place,
             stages_from_diff,
             told: operation.told(),
+            started: std::time::Instant::now(),
+            signs,
+            touch_said: false,
         });
         self.note_success = false;
         std::thread::spawn(move || {
@@ -1496,7 +1524,8 @@ impl Panel {
                         }
                         Err(error) => Some(error),
                     },
-                    Operation::ContinueRebase => match git::continue_rebase(&root) {
+                    Operation::ContinueRebase => match git::continue_rebase(&root, sock.as_deref())
+                    {
                         Ok(()) => {
                             done = Some("rebase continued".into());
                             None
@@ -1606,11 +1635,8 @@ impl Panel {
                             crate::project::workspace::leak(&git::staged_additions(&root)?, &guard)
                         };
                         match leaked {
-                            Some(hit) => Some(format!(
-                                "{REFUSED}{hit}, which this workspace keeps out of its repositories. \
-                                 Remove it from the staged change, or change private_markers in .crc/workspace.toml."
-                            )),
-                            None => match git::commit(&root, &message, amend) {
+                            Some(hit) => Some(refusal(&hit)),
+                            None => match git::commit(&root, &message, amend, sock.as_deref()) {
                                 Ok(()) => {
                                     committed = true;
                                     amended = amend;
@@ -1660,7 +1686,18 @@ impl Panel {
         };
         let reply = match flight.rx.try_recv() {
             Ok(reply) => reply,
-            Err(mpsc::TryRecvError::Empty) => return false,
+            Err(mpsc::TryRecvError::Empty) => {
+                // A commit still running after a while is most likely
+                // signing, its key waiting for a touch: the note says so.
+                let waits =
+                    flight.signs && !flight.touch_said && flight.started.elapsed() > TOUCH_WAIT;
+                if waits && let Some(flight) = self.in_flight.as_mut() {
+                    flight.touch_said = true;
+                    self.note.push_str(" waiting for the signing key");
+                    return true;
+                }
+                return false;
+            }
             Err(mpsc::TryRecvError::Disconnected) => Err("Git worker stopped".into()),
         };
         let Some(flight) = self.in_flight.take() else {
@@ -1774,7 +1811,7 @@ impl Panel {
         }
         if let Some(path) = self.resolve_queued.pop_front() {
             self.mark_resolved(path);
-        } else if let Some(operation) = self.queued.take() {
+        } else if let Some(operation) = self.queued.pop_front() {
             self.start(operation);
         } else if let Some(path) = self.select_queued.take() {
             self.start(Operation::Select(path));
@@ -3221,6 +3258,41 @@ mod tests {
         assert_eq!(first.note, "Reading repository…");
         assert_eq!(first.working(), None);
         assert!(first.busy());
+    }
+
+    #[test]
+    fn operations_asked_for_while_busy_run_in_order() {
+        // Each worker fails fast on /tmp; its answer starts the next.
+        let settle = |panel: &mut Panel| {
+            let started = std::time::Instant::now();
+            while !panel.poll() {
+                assert!(started.elapsed() < std::time::Duration::from_secs(10));
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        let mut panel = panel(vec![change("b.txt", b' ', b'M')]);
+        panel.start(Operation::Refresh);
+        assert!(panel.busy());
+        // A stage, then a commit: both wait, in that order, and a refresh
+        // asked for while one is queued is not queued twice.
+        panel.start(Operation::Stage(change("b.txt", b' ', b'M'), true));
+        panel.start(Operation::Commit("plant".into(), false));
+        panel.start(Operation::Refresh);
+        panel.start(Operation::Refresh);
+        assert_eq!(panel.queued.len(), 3);
+        settle(&mut panel);
+        assert_eq!(panel.note, "Staging…");
+        assert_eq!(panel.in_flight.as_ref().unwrap().submitted, None);
+        settle(&mut panel);
+        assert_eq!(panel.note, "Committing…");
+        assert_eq!(
+            panel.in_flight.as_ref().unwrap().submitted.as_deref(),
+            Some("plant")
+        );
+        settle(&mut panel);
+        assert_eq!(panel.note, "Refreshing…");
+        settle(&mut panel);
+        assert!(!panel.busy());
     }
 
     #[test]
