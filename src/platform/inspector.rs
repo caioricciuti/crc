@@ -2210,28 +2210,67 @@ impl Inspector {
         }
         // The main checkout has nothing to take main's commits from.
         buttons.retain(|b| b.1 != Action::UpdateFromBase || status.base.is_some());
-        let half = ((width - layout::UI_GAP) * 0.5).floor();
-        for (n, (label, action, enabled, tip, icon)) in buttons.iter().enumerate() {
-            let b = Viewport {
-                x: x + (n % 2) as f32 * (half + layout::UI_GAP),
-                y: y + (n / 2) as f32 * (layout::UI_CONTROL + layout::UI_GAP),
-                width: half,
-                height: layout::UI_CONTROL,
-            };
-            let mut button = layout::Button::new(b)
-                .label(label)
-                .enabled(*enabled)
-                .tip(tip);
-            if let Some(icon) = icon {
-                button = button.icon(*icon);
-            }
-            button.draw(out, atlas, theme);
-            if *enabled {
-                self.hits.push((b, *action, Some(repo.to_path_buf())));
+        // Up to three a row when the widest label fits a third of the
+        // card, else one under another, full width. Two a row left Push
+        // alone on its own row, which read as an orphan.
+        let third = ((width - layout::UI_GAP * 2.0) / 3.0).floor();
+        let widest = buttons
+            .iter()
+            .map(|(label, _, _, _, icon)| {
+                let probe = layout::Button::new(Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 0.0,
+                    height: 0.0,
+                })
+                .label(label);
+                let probe = icon.map_or(probe, |i| probe.icon(i));
+                probe.content_width(atlas, BUTTON_PAD)
+            })
+            .fold(0.0, f32::max);
+        let columns = if widest <= third { 3 } else { 1 };
+        let rows = button_rows(buttons.len(), columns);
+        let mut next = buttons.iter();
+        for (row, in_row) in rows.iter().enumerate() {
+            let w = ((width - layout::UI_GAP * (in_row - 1) as f32) / *in_row as f32).floor();
+            for (column, (label, action, enabled, tip, icon)) in
+                next.by_ref().take(*in_row).enumerate()
+            {
+                let b = Viewport {
+                    x: x + column as f32 * (w + layout::UI_GAP),
+                    y: y + row as f32 * (layout::UI_CONTROL + layout::UI_GAP),
+                    width: w,
+                    height: layout::UI_CONTROL,
+                };
+                let mut button = layout::Button::new(b)
+                    .label(label)
+                    .enabled(*enabled)
+                    .tip(tip);
+                if let Some(icon) = icon {
+                    button = button.icon(*icon);
+                }
+                button.draw(out, atlas, theme);
+                if *enabled {
+                    self.hits.push((b, *action, Some(repo.to_path_buf())));
+                }
             }
         }
-        y + buttons.len().div_ceil(2) as f32 * (layout::UI_CONTROL + layout::UI_GAP) + 14.0
+        y + rows.len() as f32 * (layout::UI_CONTROL + layout::UI_GAP) + 14.0
     }
+}
+
+/// Air on each side of a button's label for it to count as fitting.
+const BUTTON_PAD: f32 = 8.0;
+
+/// How many of `count` buttons go on each row, at most `columns` a row,
+/// spread so no row is left with one: five are three then two, four are
+/// two and two.
+fn button_rows(count: usize, columns: usize) -> Vec<usize> {
+    let rows = count.div_ceil(columns.max(1)).max(1);
+    (0..rows)
+        .map(|row| count / rows + usize::from(row < count % rows))
+        .filter(|&n| n > 0)
+        .collect()
 }
 
 /// A card of label and value rows; returns the y under it.
@@ -2959,6 +2998,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn buttons_share_rows_without_leaving_one_alone() {
+        assert_eq!(button_rows(3, 3), [3]);
+        assert_eq!(button_rows(4, 3), [2, 2]);
+        assert_eq!(button_rows(5, 3), [3, 2]);
+        assert_eq!(button_rows(2, 3), [2]);
+        assert_eq!(button_rows(3, 1), [1, 1, 1]);
+        assert_eq!(button_rows(0, 3), Vec::<usize>::new());
+    }
+
     /// `fit` as it was, measuring every shorter cut in turn: the oracle.
     fn fit_by_measuring(atlas: &mut Atlas, s: &str, width: f32) -> String {
         let width = width + 0.5;
@@ -3055,6 +3104,11 @@ mod tests {
 
     /// A repository at `/r` on this Mac with `status`, drawn.
     fn drawn_status(inspector: &mut Inspector, status: Status) {
+        drawn_status_at(inspector, status, WIDTH);
+    }
+
+    /// [`drawn_status`] in a panel `width` wide.
+    fn drawn_status_at(inspector: &mut Inspector, status: Status, width: f32) {
         let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
         let workspace = Workspace {
             name: "orchard".into(),
@@ -3093,11 +3147,41 @@ mod tests {
             Viewport {
                 x: 0.0,
                 y: 0.0,
-                width: WIDTH,
+                width,
                 height: 4000.0,
             },
             &Theme::dark(),
             &mut out,
+        );
+    }
+
+    #[test]
+    fn the_buttons_share_a_row_when_wide_and_stack_when_narrow() {
+        let dirty = || Status {
+            branch: Some("main".into()),
+            dirty: 2,
+            ..Default::default()
+        };
+        // Commit All, Pull (off: no upstream) and Push, in one row.
+        let mut inspector = Inspector::default();
+        drawn_status_at(&mut inspector, dirty(), WIDTH);
+        let commit = inspector.named("inspector.commit").unwrap();
+        let push = inspector.named("inspector.push").unwrap();
+        assert!(inspector.named("inspector.pull").is_none());
+        assert_eq!(commit.y, push.y);
+        assert!(push.x > commit.x + commit.width);
+        assert_eq!(commit.width, push.width);
+        assert_eq!(push.x + push.width, commit.x + (WIDTH - 2.0 * PAD));
+        // Too narrow for three across: one under another, full width.
+        let mut inspector = Inspector::default();
+        drawn_status_at(&mut inspector, dirty(), 180.0);
+        let commit = inspector.named("inspector.commit").unwrap();
+        let push = inspector.named("inspector.push").unwrap();
+        assert_eq!(commit.x, push.x);
+        assert_eq!(commit.width, 180.0 - 2.0 * PAD);
+        assert_eq!(
+            push.y,
+            commit.y + 2.0 * (layout::UI_CONTROL + layout::UI_GAP)
         );
     }
 

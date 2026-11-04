@@ -9,6 +9,7 @@
 //! them. A view of its own keeps the results while you read and edit,
 //! the way Source Control keeps its changes.
 
+use crate::platform::inspector::fit;
 use crate::platform::search::{Options, ProjectHit};
 use crate::project::icons;
 use crate::render::{
@@ -665,7 +666,10 @@ impl Panel {
                     let room =
                         (rect.x + rect.width - layout::UI_INSET - count_width - 8.0 - text_x)
                             .max(0.0);
+                    // Elided, never cut mid-glyph: the count keeps its place.
+                    let name = fit(atlas, &name, room);
                     let name_width = layout::ui_text_width(atlas, &name).min(room);
+                    let dir = fit(atlas, &dir, room - name_width - 6.0);
                     layout::push_ui_text(
                         out,
                         atlas,
@@ -709,9 +713,17 @@ impl Panel {
                         width: (rect.width - layout::UI_INSET * 2.0 - LINE_INDENT).max(0.0),
                         ..rect
                     };
+                    // Elided at the panel's edge, never cut mid-glyph; a
+                    // match past the cut has nothing to mark, one across
+                    // it marks what is kept.
+                    let shown = fit(atlas, &hit.snippet, text_rect.width);
+                    let kept = kept_bytes(&hit.snippet, &shown);
                     for h in &self.results[hits.clone()] {
-                        let before = layout::ui_text_width(atlas, &hit.snippet[..h.at.start]);
-                        let span = layout::ui_text_width(atlas, &hit.snippet[h.at.clone()]);
+                        let Some(at) = within(&h.at, kept) else {
+                            continue;
+                        };
+                        let before = layout::ui_text_width(atlas, &hit.snippet[..at.start]);
+                        let span = layout::ui_text_width(atlas, &hit.snippet[at]);
                         if span <= 0.0 || before >= text_rect.width {
                             continue;
                         }
@@ -727,12 +739,28 @@ impl Panel {
                             theme.find_match,
                         );
                     }
-                    layout::push_ui_text(out, atlas, text_rect, &hit.snippet, theme.sidebar_text);
+                    layout::push_ui_text(out, atlas, text_rect, &shown, theme.sidebar_text);
                 }
             }
         }
         layout::clip_hotspots(from, g.list);
     }
+}
+
+/// How many bytes of `snippet` the elided `shown` keeps before its
+/// ellipsis: all of them when it was shown whole.
+fn kept_bytes(snippet: &str, shown: &str) -> usize {
+    if shown == snippet {
+        snippet.len()
+    } else {
+        shown.len() - '\u{2026}'.len_utf8()
+    }
+}
+
+/// The part of a match `at` inside the `kept` bytes of its snippet, or
+/// none when the match starts past the cut.
+fn within(at: &Range<usize>, kept: usize) -> Option<Range<usize>> {
+    (at.start < kept && at.start < at.end).then(|| at.start..at.end.min(kept))
 }
 
 /// A field that looks like a field: a box, a ring while it has the keys,
@@ -881,6 +909,22 @@ mod tests {
         assert_eq!(panel.note().as_deref(), Some("1 result in 1 file"));
         panel.take_results(Vec::new());
         assert_eq!(panel.note().as_deref(), Some("No results"));
+    }
+
+    #[test]
+    fn a_match_is_marked_only_where_the_elided_snippet_keeps_it() {
+        let snippet = "fn plan(plants: &[Plant]) -> BTreeMap";
+        assert_eq!(kept_bytes(snippet, snippet), snippet.len());
+        let cut = "fn plan(plants: &[Pl\u{2026}";
+        assert_eq!(kept_bytes(snippet, cut), 20);
+        // Inside the kept part: as it was.
+        assert_eq!(within(&(8..14), 20), Some(8..14));
+        // Across the cut: what is kept of it.
+        assert_eq!(within(&(18..23), 20), Some(18..20));
+        // Past it, or empty: nothing to mark.
+        assert_eq!(within(&(20..25), 20), None);
+        assert_eq!(within(&(30..35), 20), None);
+        assert_eq!(within(&(5..5), 20), None);
     }
 
     #[test]

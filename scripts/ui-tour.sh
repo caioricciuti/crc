@@ -44,6 +44,12 @@ export CLAUDE_CONFIG_DIR="$T/claude-config"
 export CRC_HISTORY_DB="$T/history.db"
 export CRC_TERMINAL_SHELL=/bin/sh
 unset XDG_CONFIG_HOME
+# The runs below swap HOME for an empty one. A rustup proxy on PATH (the
+# Homebrew rust-analyzer is one) looks for its toolchain under HOME and
+# fails without it, which painted "rust-analyzer exited" in red across
+# every frame. Point it at the real toolchain instead.
+export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 trap 'pkill -f -- "--hold $T/home/" 2>/dev/null || true; rm -rf "$T"' EXIT
 
 # ---- fixture ---------------------------------------------------------------
