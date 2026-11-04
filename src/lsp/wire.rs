@@ -190,33 +190,47 @@ pub(super) fn parse_workspace_edit(value: &Value) -> Vec<FileEdits> {
             .unwrap_or_default()
     };
     if let Some(changes) = value.get("documentChanges").and_then(Value::as_array) {
-        return changes
-            .iter()
-            .filter_map(|change| {
-                let uri = change.path("textDocument.uri")?.as_str()?;
-                Some(FileEdits {
-                    path: path_for(uri)?,
-                    // The protocol's guard that the edits still apply; null
-                    // for a file the server does not have open.
-                    version: change.path("textDocument.version").and_then(Value::as_u64),
-                    edits: edits(change.get("edits")),
-                })
+        return merge_by_path(changes.iter().filter_map(|change| {
+            let uri = change.path("textDocument.uri")?.as_str()?;
+            Some(FileEdits {
+                path: path_for(uri)?,
+                // The protocol's guard that the edits still apply; null
+                // for a file the server does not have open.
+                version: change.path("textDocument.version").and_then(Value::as_u64),
+                edits: edits(change.get("edits")),
             })
-            .collect();
+        }));
     }
     match value.get("changes") {
-        Some(Value::Object(files)) => files
-            .iter()
-            .filter_map(|(uri, list)| {
-                Some(FileEdits {
-                    path: path_for(uri)?,
-                    version: None,
-                    edits: edits(Some(list)),
-                })
+        Some(Value::Object(files)) => merge_by_path(files.iter().filter_map(|(uri, list)| {
+            Some(FileEdits {
+                path: path_for(uri)?,
+                version: None,
+                edits: edits(Some(list)),
             })
-            .collect(),
+        })),
         _ => Vec::new(),
     }
+}
+
+/// One entry per file, in first-seen order, with the edits of every entry
+/// for that file in the order sent. A server may list a document more than
+/// once, and two URIs can name the same file; applying the first entry and
+/// dropping the rest would leave a rename half done.
+fn merge_by_path(files: impl Iterator<Item = FileEdits>) -> Vec<FileEdits> {
+    let mut merged: Vec<FileEdits> = Vec::new();
+    for file in files {
+        match merged.iter_mut().find(|f| f.path == file.path) {
+            Some(seen) => {
+                seen.edits.extend(file.edits);
+                if seen.version.is_none() {
+                    seen.version = file.version;
+                }
+            }
+            None => merged.push(file),
+        }
+    }
+    merged
 }
 
 /// The active signature and parameter, from a SignatureHelp.

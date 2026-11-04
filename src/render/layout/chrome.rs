@@ -1335,9 +1335,16 @@ fn home_workspace(
 
 /// `/Users/name/...` as `~/...`, the way people read their own paths.
 pub(super) fn shorten_home(path: &str) -> String {
-    match std::env::var("HOME") {
-        Ok(home) if !home.is_empty() && path.starts_with(&home) => {
-            format!("~{}", &path[home.len()..])
+    let home = std::env::var("HOME").unwrap_or_default();
+    shorten_home_in(path, &home)
+}
+/// [`shorten_home`] against a given home folder. The prefix has to end at
+/// a path boundary, or a neighbour whose name starts with the user's own
+/// would be shown as inside the home folder.
+fn shorten_home_in(path: &str, home: &str) -> String {
+    match path.strip_prefix(home) {
+        Some(rest) if !home.is_empty() && (rest.is_empty() || rest.starts_with('/')) => {
+            format!("~{rest}")
         }
         _ => path.to_owned(),
     }
@@ -3730,6 +3737,20 @@ pub fn build_breadcrumbs(
 #[cfg(test)]
 mod home_tests {
     use super::*;
+
+    /// `~` stands for the home folder itself, never for a longer name that
+    /// merely starts the same way.
+    #[test]
+    fn shorten_home_needs_a_path_boundary() {
+        assert_eq!(shorten_home_in("/home/sam/notes", "/home/sam"), "~/notes");
+        assert_eq!(shorten_home_in("/home/sam", "/home/sam"), "~");
+        assert_eq!(
+            shorten_home_in("/home/samantha/notes", "/home/sam"),
+            "/home/samantha/notes"
+        );
+        assert_eq!(shorten_home_in("/tmp/notes", "/home/sam"), "/tmp/notes");
+        assert_eq!(shorten_home_in("/tmp/notes", ""), "/tmp/notes");
+    }
 
     #[test]
     fn every_action_row_is_a_hit_and_recents_skip_the_open_project() {

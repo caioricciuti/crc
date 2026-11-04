@@ -21,7 +21,7 @@
 //!
 //! The log (stderr) never carries a tool's arguments.
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::json::{self, Value, object, string};
@@ -29,6 +29,9 @@ use crate::mcp_client::{LEGACY, MODERN};
 
 /// The most of a file `project.read` returns.
 const READ_LIMIT: usize = 64 * 1024;
+/// How far into a file the `read` tool looks for the lines asked for. Past
+/// this the answer says truncated; the whole file is never held in memory.
+const SCAN_LIMIT: u64 = 8 * 1024 * 1024;
 /// The most results a search returns.
 const RESULT_LIMIT: usize = 200;
 /// How many candidates the index is asked for before ranking.
@@ -265,15 +268,30 @@ impl Server {
             .get("end_line")
             .and_then(Value::as_u64)
             .map(|n| n as usize);
-        let bytes = std::fs::read(&path).map_err(|e| format!("{rel}: {e}"))?;
-        let text = String::from_utf8_lossy(&bytes);
+        let (file, len) = open_regular(&path).map_err(|e| format!("{rel}: {e}"))?;
+        // Streamed a line at a time, and never past the scan limit: a huge
+        // file costs the lines asked for, not its size in memory.
+        let mut reader = std::io::BufReader::new(file.take(SCAN_LIMIT));
         let mut out = String::new();
-        let mut truncated = false;
+        let mut truncated = len > SCAN_LIMIT;
         let mut last = start.saturating_sub(1);
-        for (n, line) in text.lines().enumerate().skip(start - 1) {
-            if end.is_some_and(|e| n + 1 > e) {
+        let mut lines_in_file = 0;
+        let mut raw = Vec::new();
+        loop {
+            raw.clear();
+            let read = reader
+                .read_until(b'\n', &mut raw)
+                .map_err(|e| format!("{rel}: {e}"))?;
+            if read == 0 {
                 break;
             }
+            let n = lines_in_file;
+            lines_in_file += 1;
+            if n + 1 < start || end.is_some_and(|e| n + 1 > e) {
+                continue;
+            }
+            let line = String::from_utf8_lossy(&raw);
+            let line = line.trim_end_matches(['\n', '\r']);
             if out.len() + line.len() + 1 > READ_LIMIT {
                 truncated = true;
                 break;
@@ -286,7 +304,7 @@ impl Server {
             ("path", string(&rel)),
             ("start_line", json::number(start)),
             ("end_line", json::number(last)),
-            ("lines_in_file", json::number(text.lines().count())),
+            ("lines_in_file", json::number(lines_in_file)),
             ("truncated", Value::Bool(truncated)),
             ("text", string(&out)),
         ]))
@@ -297,7 +315,11 @@ impl Server {
         let Some(path) = settings.state else {
             return Err("this workspace names no state doc (.crc/workspace.toml `state`)".into());
         };
-        let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let (file, len) = open_regular(&path).map_err(|e| e.to_string())?;
+        let mut text = String::new();
+        file.take(SCAN_LIMIT)
+            .read_to_string(&mut text)
+            .map_err(|e| e.to_string())?;
         let waiting =
             crate::project::workspace::waiting_items(&text, settings.waiting_heading.as_deref());
         let shown: String = text.chars().take(READ_LIMIT).collect();
@@ -315,7 +337,10 @@ impl Server {
                 "waiting",
                 Value::Array(waiting.iter().map(|w| string(w)).collect()),
             ),
-            ("truncated", Value::Bool(shown.len() < text.len())),
+            (
+                "truncated",
+                Value::Bool(shown.len() < text.len() || len > SCAN_LIMIT),
+            ),
             ("text", string(&shown)),
         ]))
     }
@@ -364,6 +389,23 @@ fn inside(root: &Path, rel: &str) -> Result<PathBuf, String> {
         return Err(format!("{rel}: not a file"));
     }
     Ok(resolved)
+}
+
+/// Opens `path` for reading once it is known to be a regular file, with its
+/// length. Checked before the open: opening a pipe with no writer blocks
+/// the server for good, and a device would never end.
+fn open_regular(path: &Path) -> std::io::Result<(std::fs::File, u64)> {
+    let not_regular =
+        || std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file");
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(not_regular());
+    }
+    let file = std::fs::File::open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(not_regular());
+    }
+    Ok((file, meta.len()))
 }
 
 fn text_arg(args: &Value, key: &str) -> Result<String, String> {
@@ -622,6 +664,67 @@ mod tests {
             Some(true)
         );
         let _ = std::fs::remove_file(t.0.join("../mcp-outside.txt"));
+    }
+
+    /// A pipe would block the server for good and a huge file would be
+    /// read whole into memory; neither gets past the metadata check and the
+    /// bounded read.
+    #[test]
+    fn read_refuses_a_fifo_and_caps_a_huge_file() {
+        let t = TempTree::new(
+            "mcp-server-bounds",
+            &[(".crc/workspace.toml", "state = \"pipe\"\n")],
+        );
+        let status = std::process::Command::new("mkfifo")
+            .arg(t.0.join("pipe"))
+            .status()
+            .expect("mkfifo");
+        assert!(status.success());
+        // Sparse: a gigabyte of zeros that takes no disk, and would take a
+        // gigabyte of memory to read whole.
+        std::fs::File::create(t.0.join("big.bin"))
+            .expect("create")
+            .set_len(1 << 30)
+            .expect("set_len");
+        let server = Server::new(&t.0, false);
+        let call = |name: &str, args: &str| {
+            ask(
+                &server,
+                &format!(
+                    r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{name}","arguments":{args}}}}}"#
+                ),
+            )
+        };
+        let started = std::time::Instant::now();
+        let pipe = call("project.read", r#"{"path":"pipe"}"#);
+        assert_eq!(
+            pipe.path("result.isError").and_then(Value::as_bool),
+            Some(true),
+            "{pipe:?}"
+        );
+        let state = call("workspace.state", "{}");
+        assert_eq!(
+            state.path("result.isError").and_then(Value::as_bool),
+            Some(true),
+            "{state:?}"
+        );
+        let big = call("project.read", r#"{"path":"big.bin"}"#);
+        assert_eq!(
+            big.path("result.structuredContent.truncated")
+                .and_then(Value::as_bool),
+            Some(true),
+            "{big:?}"
+        );
+        let text = big
+            .path("result.structuredContent.text")
+            .and_then(Value::as_str)
+            .expect("text");
+        assert!(text.len() <= READ_LIMIT);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "all three answers came back promptly: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

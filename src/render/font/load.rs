@@ -2,6 +2,7 @@
 //! the icon font.
 
 use super::*;
+use objc2_core_text::CTFontUIFontType;
 
 pub(super) fn load_icon_font(size_px: f32) -> Option<CFRetained<CTFont>> {
     let data = CFData::from_static_bytes(ICON_FONT);
@@ -46,10 +47,68 @@ pub(super) fn load_monospace(preferred: &str, size_px: f32) -> Loaded {
         }
     }
 
-    panic!("no monospace font among {tried:?}; all resolved to proportional or incomplete fonts");
+    // None by name. The system's own fixed-pitch font is what Terminal and
+    // Xcode fall back to, whatever is installed.
+    let system = unsafe {
+        CTFont::new_ui_font_for_language(CTFontUIFontType::UserFixedPitch, size_px as CGFloat, None)
+    };
+    if let Some(loaded) = system
+        .clone()
+        .and_then(|font| measure_if_monospace(font, SYSTEM_FIXED_PITCH))
+    {
+        return loaded;
+    }
+
+    // Still nothing. This runs on the shaping and glyph worker threads, so
+    // a panic here would end them and leave every window blank for good.
+    // Columns may misalign with a proportional face; text still shows.
+    let (font, name) = match system {
+        Some(font) => (font, SYSTEM_FIXED_PITCH),
+        None => {
+            let cf = CFString::from_str(LAST_RESORT);
+            let font = unsafe { CTFont::with_name(&cf, size_px as CGFloat, std::ptr::null()) };
+            (font, LAST_RESORT)
+        }
+    };
+    if !WARNED_NO_MONOSPACE.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "crc: no monospace font among {tried:?}; drawing with {name} as it is, columns may misalign"
+        );
+    }
+    let mut loaded = measure(font, name).loaded;
+    if loaded.advance_px <= 0.0 {
+        // No advance at all; a plausible cell keeps the grid finite.
+        loaded.advance_px = (size_px * 0.6).max(1.0);
+    }
+    loaded
 }
+/// The name recorded for the system fixed-pitch font, which has no
+/// PostScript name of its own to ask for.
+const SYSTEM_FIXED_PITCH: &str = "system fixed pitch";
+/// Drawn with when nothing else resolves at all; `with_name` always returns
+/// some font for it.
+const LAST_RESORT: &str = "Menlo-Regular";
+/// Set once the first worker has said that no monospace font was found, so
+/// the other workers do not say it again.
+static WARNED_NO_MONOSPACE: AtomicBool = AtomicBool::new(false);
 /// Resolves ASCII glyphs and returns the font only if every advance matches.
 pub(super) fn measure_if_monospace(font: CFRetained<CTFont>, name: &str) -> Option<Loaded> {
+    let measured = measure(font, name);
+    (measured.complete && measured.uniform).then_some(measured.loaded)
+}
+/// A font measured over ASCII, with what the measurement found.
+struct Measured {
+    loaded: Loaded,
+    /// Every character has a glyph.
+    complete: bool,
+    /// Every advance matches the first, which is positive.
+    uniform: bool,
+}
+/// Resolves ASCII glyphs and measures their advances, judging nothing: the
+/// caller decides whether the font passes. `advance_px` is the first
+/// advance, or the widest when the first is empty, so even a font that
+/// fails has a cell width to draw with.
+fn measure(font: CFRetained<CTFont>, name: &str) -> Measured {
     let count = (LAST_ASCII - FIRST_ASCII + 1) as usize;
     let chars: Vec<u16> = (FIRST_ASCII..=LAST_ASCII).map(|c| c as u16).collect();
     let mut glyphs = vec![0u16; count];
@@ -62,9 +121,6 @@ pub(super) fn measure_if_monospace(font: CFRetained<CTFont>, name: &str) -> Opti
             count as isize,
         )
     };
-    if !complete {
-        return None;
-    }
 
     let mut advances = vec![
         CGSize {
@@ -83,22 +139,44 @@ pub(super) fn measure_if_monospace(font: CFRetained<CTFont>, name: &str) -> Opti
     }
 
     let first = advances[0].width as f32;
-    if first <= 0.0 {
-        return None;
-    }
     // A real monospace font reports identical advances; allow a hair of
     // floating-point slack but nothing that would visibly misalign a column.
-    let uniform = advances
-        .iter()
-        .all(|a| ((a.width as f32) - first).abs() < 0.01);
-    if !uniform {
-        return None;
-    }
+    let uniform = first > 0.0
+        && advances
+            .iter()
+            .all(|a| ((a.width as f32) - first).abs() < 0.01);
+    let advance_px = if first > 0.0 {
+        first
+    } else {
+        advances.iter().map(|a| a.width as f32).fold(0.0, f32::max)
+    };
 
-    Some(Loaded {
-        font,
-        glyphs,
-        advance_px: first,
-        resolved_name: name.to_string(),
-    })
+    Measured {
+        loaded: Loaded {
+            font,
+            glyphs,
+            advance_px,
+            resolved_name: name.to_string(),
+        },
+        complete,
+        uniform,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The last resort draws with a font that failed the monospace check,
+    /// so measuring one must still give usable glyphs and a cell width.
+    #[test]
+    fn a_proportional_font_still_measures_for_the_last_resort() {
+        let cf = CFString::from_str("Helvetica");
+        let font = unsafe { CTFont::with_name(&cf, 13.0, std::ptr::null()) };
+        assert!(measure_if_monospace(font.clone(), "Helvetica").is_none());
+        let measured = measure(font, "Helvetica");
+        assert!(!measured.uniform);
+        assert!(measured.loaded.advance_px > 0.0);
+        assert_eq!(measured.loaded.resolved_name, "Helvetica");
+    }
 }

@@ -225,7 +225,11 @@ impl Buffer {
             std::fs::metadata(&path)?;
             return Ok(Self::preview_file(path));
         }
-        let len = std::fs::metadata(&path)?.len();
+        // Stamped before the bytes are read: a write that lands during the
+        // read then leaves a stamp the file no longer matches, and the next
+        // check reloads instead of saving over the complete file.
+        let meta = std::fs::metadata(&path)?;
+        let len = meta.len();
         if len > max {
             let name = path.file_name().map_or_else(
                 || path.display().to_string(),
@@ -254,7 +258,7 @@ impl Buffer {
         // the same document. Without it a symlink, a `..`, or a path from
         // the sidebar versus one from Cmd-P are different keys and open a
         // second tab onto identical text, which can then diverge.
-        buffer.stamp = DiskStamp::of(&path).ok();
+        buffer.stamp = Some(DiskStamp::from(&meta));
         buffer.path = Some(crate::platform::canonical(&path));
         buffer.saved = Some(buffer.rope.clone());
         buffer.read_only = len > read_only_at;
@@ -349,12 +353,24 @@ impl Buffer {
     /// The file at `path` as a reload would take it. Touches nothing of a
     /// buffer, so a large file can be read on another thread.
     pub fn read_disk(path: &std::path::Path) -> std::io::Result<DiskRead> {
+        Self::read_disk_with(path, || {})
+    }
+    /// [`Buffer::read_disk`] with `between` run after the stamp is taken
+    /// and before the bytes are read: a test's stand-in for a write that
+    /// lands during the read.
+    pub(super) fn read_disk_with(
+        path: &std::path::Path,
+        between: impl FnOnce(),
+    ) -> std::io::Result<DiskRead> {
+        // Taken first, for the same reason as in `open`.
+        let stamp = DiskStamp::of(path).ok();
+        between();
         let raw = std::fs::read(path)?;
         let (text, format) = file_format::decode(&raw)?;
         Ok(DiskRead {
             rope: Rope::from_text(&text),
             format,
-            stamp: DiskStamp::of(path).ok(),
+            stamp,
         })
     }
     /// Takes the text [`Buffer::read_disk`] read, keeping the old text under
@@ -379,6 +395,9 @@ impl Buffer {
         self.disk_event = (self.disk_event.0 + 1, DiskEvent::Reloaded);
         self.conflict_noticed = false;
         self.dirty = false;
+        // The next keystroke starts its own undo step, so one Undo lands on
+        // the reloaded text rather than before it.
+        self.last_edit = None;
     }
     /// The file behind the buffer was deleted by something else. The text
     /// is now the only copy, which is what "unsaved" means: the tab gets its
@@ -560,6 +579,9 @@ impl Buffer {
         self.disk_event = (self.disk_event.0 + 1, DiskEvent::Saved);
         self.dirty = false;
         self.makes_folder = false;
+        // A keystroke right after the save must not fold into the step
+        // before it, or one Undo jumps past the saved text.
+        self.last_edit = None;
         Ok(())
     }
     /// The format to write the text with. A file with mixed line endings

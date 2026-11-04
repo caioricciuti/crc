@@ -3167,6 +3167,62 @@ mod tests {
         std::fs::remove_dir_all(dir).expect("cleanup");
     }
 
+    /// A save ends the typing run: the keystroke after Cmd-S starts a new
+    /// undo step, so one Undo lands on the saved text rather than before it.
+    #[test]
+    fn typing_after_save_is_its_own_undo_step() {
+        let dir = scratch_dir("undo-after-save");
+        let path = dir.join("u.txt");
+        std::fs::write(&path, "").expect("write");
+        let mut b = Buffer::open(&path).expect("open");
+        b.insert("a");
+        b.save(None).expect("save");
+        b.insert("b");
+        b.undo();
+        assert_eq!(
+            b.rope.to_string(),
+            "a",
+            "one undo is back at the saved text"
+        );
+        assert!(!b.is_dirty());
+        // The same after a reload, which also puts the file's text in place.
+        std::fs::write(&path, "ab").expect("external write");
+        b.reload().expect("reload");
+        b.insert("c");
+        b.undo();
+        assert_eq!(
+            b.rope.to_string(),
+            "ab",
+            "one undo is back at the reloaded text"
+        );
+        assert!(!b.is_dirty());
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    /// The stamp is what `stat` said before the bytes were read, so a write
+    /// that lands during the read leaves a stamp the file no longer matches
+    /// and the next check reloads instead of trusting partial text.
+    #[test]
+    fn disk_stamp_is_taken_before_the_read() {
+        let dir = scratch_dir("stamp-before-read");
+        let path = dir.join("s.txt");
+        std::fs::write(&path, "short").expect("write");
+        let mut b = Buffer::open(&path).expect("open");
+        let read = Buffer::read_disk_with(&path, || {
+            std::fs::write(&path, "a much longer text").expect("write during the read");
+        })
+        .expect("read");
+        assert_ne!(
+            read.stamp(),
+            DiskStamp::of(&path).ok(),
+            "the stamp predates the write, so the file reads as changed"
+        );
+        b.apply_disk(read);
+        assert_eq!(b.rope.to_string(), "a much longer text");
+        assert_eq!(b.disk_state(), DiskState::Changed);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
     #[test]
     fn up_and_down_keep_the_column_on_screen_past_tabs() {
         let text = "\tab\nabcdefgh\n";

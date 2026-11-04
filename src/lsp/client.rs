@@ -987,6 +987,32 @@ mod tests {
         );
     }
 
+    /// A server may list the same document twice in `documentChanges`;
+    /// every edit to it is kept, under one entry, in the order sent.
+    #[test]
+    fn workspace_edit_merges_repeated_documents() {
+        let edit = |line: u64, text: &str| {
+            format!(
+                r#"{{"range":{{"start":{{"line":{line},"character":0}},"end":{{"line":{line},"character":3}}}},"newText":"{text}"}}"#
+            )
+        };
+        let document = crate::json::parse(&format!(
+            r#"{{"documentChanges":[{{"textDocument":{{"uri":"file:///p/a.rs","version":3}},"edits":[{}]}},{{"textDocument":{{"uri":"file:///p/b.rs","version":null}},"edits":[{}]}},{{"textDocument":{{"uri":"file:///p/a.rs","version":3}},"edits":[{}]}}]}}"#,
+            edit(1, "x"),
+            edit(0, "y"),
+            edit(5, "z")
+        ))
+        .unwrap();
+        let parsed = parse_workspace_edit(&document);
+        assert_eq!(parsed.len(), 2, "one entry per file: {parsed:?}");
+        assert_eq!(parsed[0].path, PathBuf::from("/p/a.rs"));
+        assert_eq!(parsed[0].version, Some(3));
+        let texts: Vec<&str> = parsed[0].edits.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(texts, ["x", "z"]);
+        assert_eq!(parsed[1].path, PathBuf::from("/p/b.rs"));
+        assert_eq!(parsed[1].edits.len(), 1);
+    }
+
     #[test]
     fn signature_parameters_by_substring_or_utf16_bounds() {
         let by_text = crate::json::parse(
