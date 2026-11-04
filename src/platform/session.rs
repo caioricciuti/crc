@@ -12,8 +12,11 @@
 //! worth refusing to launch over.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Session {
     /// Window frame in screen coordinates: x, y, width, height.
     pub frame: Option<(f64, f64, f64, f64)>,
@@ -33,6 +36,13 @@ pub struct Session {
 
 /// How many recent projects the session keeps.
 pub const RECENT_LIMIT: usize = 8;
+
+/// Every save is numbered when it is asked for, and the number of the
+/// last one written is kept: a save done on a worker that lands after a
+/// later one (the write at quit, say) is dropped, so the file always
+/// holds the newest snapshot.
+static NEXT_SAVE: AtomicU64 = AtomicU64::new(1);
+static LAST_WRITTEN: Mutex<u64> = Mutex::new(0);
 
 /// Hand-written rather than derived: `#[derive(Default)]` would make
 /// `sidebar` false, which is not the default anyone wants and quietly
@@ -135,13 +145,33 @@ impl Session {
     /// Errors are swallowed on purpose: failing to record where a window was
     /// is not something to interrupt a quit over.
     pub fn save(&self) {
+        let generation = NEXT_SAVE.fetch_add(1, Ordering::SeqCst);
+        if let Some(path) = Session::path() {
+            self.save_to(&path, generation);
+        }
+    }
+
+    /// Writes the session on a worker, so a tab opened or closed costs the
+    /// main thread nothing. Ordered with `save`: whichever snapshot was
+    /// taken last is the one left on disk.
+    pub fn save_in_background(self) {
+        let generation = NEXT_SAVE.fetch_add(1, Ordering::SeqCst);
         let Some(path) = Session::path() else {
             return;
         };
+        std::thread::spawn(move || self.save_to(&path, generation));
+    }
+
+    fn save_to(&self, path: &Path, generation: u64) {
+        let mut last = LAST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        if generation < *last {
+            return;
+        }
+        *last = generation;
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let _ = crate::platform::write_atomically(&path, &self.serialize());
+        let _ = crate::platform::write_atomically(path, &self.serialize());
     }
 
     /// The session file. Paths are written as their bytes (`display` would
@@ -279,6 +309,55 @@ impl Session {
 /// True when `path` is somewhere sensible to reopen from.
 pub fn is_reopenable(path: &Path) -> bool {
     path.is_file()
+}
+
+/// Saves the session a moment after it last changed, so a crash, a kill
+/// or the power going leaves the tabs that were open, not the ones from
+/// the last clean quit. The window shows it each snapshot; it says when
+/// one is due to be written.
+#[derive(Default)]
+pub struct Autosave {
+    /// The last snapshot handed out for writing.
+    written: Option<Session>,
+    /// A snapshot that differs from it, and when it is due.
+    pending: Option<(Session, Instant)>,
+}
+
+impl Autosave {
+    /// How long the session has to stay the same before it is written.
+    pub const DELAY: Duration = Duration::from_secs(1);
+
+    /// Looks at the current snapshot. Whether a write is now waiting.
+    pub fn observe(&mut self, session: Session, now: Instant) -> bool {
+        if self.written.as_ref() == Some(&session) {
+            // What is on disk already, or back to it before the write.
+            self.pending = None;
+        } else if self
+            .pending
+            .as_ref()
+            .is_none_or(|(waiting, _)| *waiting != session)
+        {
+            // The same change still waiting keeps its moment; a new one
+            // starts the clock again.
+            self.pending = Some((session, now + Self::DELAY));
+        }
+        self.pending.is_some()
+    }
+
+    /// The snapshot to write, once the quiet moment has passed.
+    pub fn take_due(&mut self, now: Instant) -> Option<Session> {
+        if self.pending.as_ref().is_none_or(|(_, due)| now < *due) {
+            return None;
+        }
+        let (session, _) = self.pending.take()?;
+        self.written = Some(session.clone());
+        Some(session)
+    }
+
+    /// Whether a write is waiting for its moment.
+    pub fn pending(&self) -> bool {
+        self.pending.is_some()
+    }
 }
 
 #[cfg(test)]
@@ -448,5 +527,65 @@ mod tests {
     fn paths_with_spaces_survive() {
         let s = Session::parse("file=/tmp/a file with spaces.rs\n");
         assert_eq!(s.files[0], PathBuf::from("/tmp/a file with spaces.rs"));
+    }
+
+    #[test]
+    fn autosave_writes_a_second_after_the_last_change() {
+        let one = Session {
+            files: vec![PathBuf::from("/tmp/a.rs")],
+            ..Session::default()
+        };
+        let two = Session {
+            files: vec![PathBuf::from("/tmp/a.rs"), PathBuf::from("/tmp/b.rs")],
+            ..Session::default()
+        };
+        let t0 = Instant::now();
+        let mut autosave = Autosave::default();
+        assert!(autosave.observe(one.clone(), t0));
+        assert!(autosave.take_due(t0 + Duration::from_millis(500)).is_none());
+        // The same snapshot again does not push the write back.
+        assert!(autosave.observe(one.clone(), t0 + Duration::from_millis(800)));
+        assert_eq!(autosave.take_due(t0 + Autosave::DELAY), Some(one.clone()));
+        assert!(!autosave.pending());
+        // Unchanged since the write: nothing waits.
+        assert!(!autosave.observe(one.clone(), t0 + Duration::from_secs(2)));
+        // A change restarts the clock from its own moment.
+        let t1 = t0 + Duration::from_secs(3);
+        assert!(autosave.observe(two.clone(), t1));
+        assert!(autosave.take_due(t1 + Duration::from_millis(900)).is_none());
+        assert_eq!(autosave.take_due(t1 + Autosave::DELAY), Some(two));
+        // Changed and changed back within the second: nothing to write.
+        let t2 = t1 + Duration::from_secs(2);
+        let _ = autosave.take_due(t2);
+        assert!(autosave.observe(one.clone(), t2));
+        let three = Session {
+            files: vec![PathBuf::from("/tmp/a.rs"), PathBuf::from("/tmp/b.rs")],
+            ..Session::default()
+        };
+        assert!(!autosave.observe(three, t2 + Duration::from_millis(100)));
+        assert!(autosave.take_due(t2 + Duration::from_secs(2)).is_none());
+    }
+
+    #[test]
+    fn an_older_save_never_replaces_a_newer_one() {
+        let dir = std::env::temp_dir().join(format!("crc-session-order-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session");
+        let older = Session {
+            files: vec![PathBuf::from("/tmp/old.rs")],
+            ..Session::default()
+        };
+        let newer = Session {
+            files: vec![PathBuf::from("/tmp/new.rs")],
+            ..Session::default()
+        };
+        // Numbered in the order they were asked for, written the other
+        // way round, as a worker that lands after the write at quit does.
+        let first = NEXT_SAVE.fetch_add(1, Ordering::SeqCst);
+        let second = NEXT_SAVE.fetch_add(1, Ordering::SeqCst);
+        newer.save_to(&path, second);
+        older.save_to(&path, first);
+        assert_eq!(Session::parse_bytes(&std::fs::read(&path).unwrap()), newer);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

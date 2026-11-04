@@ -152,6 +152,7 @@ fn set_project_root(state: &mut State, dir: &Path) {
     state.tree.set_root(dir);
     state.workspace = crate::project::workspace::Workspace::open(dir);
     state.git = git_panel_for(&state.workspace);
+    state.git.ssh_auth_sock = state.ssh_auth_sock.clone();
     state.home = None;
     state.home_since = visit_workspace(dir);
     start_home_summary(state);
@@ -1019,14 +1020,12 @@ struct State {
     /// quick edit, often as `$EDITOR`, and quitting it must not replace the
     /// saved session of the real project with one stray file.
     ephemeral_session: bool,
-    /// Every dirty document has already been asked about on the way to
-    /// closing the window. Closing the last window terminates the app, and
-    /// without this the terminate path asks the same questions again, by
-    /// then with no window left to cancel back to.
-    discard_confirmed: bool,
-    /// What was open when those questions started. Answering Don't Save
-    /// closes the tab, and the session written at quit should still list it.
-    quit_session: Option<Session>,
+    /// The questions asked on the way to closing the window or quitting,
+    /// and the session to write once quitting is certain.
+    quit: files::QuitGate,
+    /// The session written a moment after the tabs or the folder change,
+    /// so a crash or a kill keeps them (the write at quit is the last).
+    session_autosave: crate::platform::session::Autosave,
 
     // ---- frame pacing ----------------------------------------------------
     /// When the last frame was presented, to decide whether drawing now would
@@ -3157,7 +3156,14 @@ define_class!(
                 {
                     self.ivars().needs_redraw.set(true);
                 }
-                if !self.ivars().needs_redraw.get() && !self.ivars().animating.get() && state.idle() {
+                if let Some(session) = state.session_autosave.take_due(Instant::now()) {
+                    session.save_in_background();
+                }
+                if !self.ivars().needs_redraw.get()
+                    && !self.ivars().animating.get()
+                    && state.idle()
+                    && !state.session_autosave.pending()
+                {
                     link.setPaused(true);
                     return;
                 }
@@ -4646,6 +4652,14 @@ define_class!(
             self.open_git();
         }
 
+        /// Quit crc, as the menu item does. A self-test sends menu actions
+        /// to the view, so Cmd-Q in a script lands here and goes on to the
+        /// app, through `applicationShouldTerminate:` and its questions.
+        #[unsafe(method(terminate:))]
+        fn action_terminate(&self, _sender: Option<&AnyObject>) {
+            NSApplication::sharedApplication(MainThreadMarker::from(self)).terminate(None);
+        }
+
         #[unsafe(method(gitRefresh:))]
         fn action_git_refresh(&self, _sender: Option<&AnyObject>) {
             // Showing the view refreshes it.
@@ -5834,10 +5848,19 @@ impl EditorView {
         self.ivars().needs_redraw.set(false);
         self.ivars().animating.set(layout::take_animating());
         self.arm_caret_blink();
+        // Every change to the tabs or the folder is drawn, so the frame is
+        // where the session is looked at; it is written a moment later.
+        let snapshot = self.session_snapshot();
 
         let Some(mut state) = self.state_mut() else {
             return;
         };
+        if let Some(snapshot) = snapshot
+            && state.session_autosave.observe(snapshot, Instant::now())
+            && let Some(link) = self.ivars().display_link.get()
+        {
+            link.setPaused(false);
+        }
         if state.renderer.atlas.has_pending_shaping() {
             self.ivars().needs_redraw.set(true);
             if let Some(link) = self.ivars().display_link.get() {
@@ -5972,6 +5995,24 @@ impl EditorView {
         self.history_after_frame();
         self.scrub_after_frame();
         self.activity_after_frame();
+    }
+
+    /// The session as the autosave sees it after a frame: what would be
+    /// written, or nothing for a window whose session is not kept. A test
+    /// instance keeps one only when its scenario asks (`CRC_SELFTEST_SESSION`):
+    /// the scenarios launch on folders of their own and share a home, and
+    /// a later one launched on nothing must not find their tabs.
+    fn session_snapshot(&self) -> Option<Session> {
+        static IN_TESTS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if self.state()?.ephemeral_session {
+            return None;
+        }
+        if self.ivars().testing
+            && !IN_TESTS.get_or_init(|| std::env::var_os("CRC_SELFTEST_SESSION").is_some())
+        {
+            return None;
+        }
+        self.capture_session()
     }
 
     /// Creates the display link on first use and unpauses it.
@@ -6380,6 +6421,7 @@ define_class!(
             let view = &self.ivars().view;
             if !view.confirm_discard_all() {
                 if let Some(mut state) = view.state_mut() {
+                    state.quit.cancel();
                     state.restart_on_quit = None;
                 }
                 return NSApplicationTerminateReply::TerminateCancel;
@@ -6395,16 +6437,23 @@ define_class!(
                 && let Err(e) = restart.perform(crate::platform::update::running_app().as_deref())
             {
                 if let Some(mut state) = view.state_mut() {
+                    // Not quitting after all: the next attempt asks again.
+                    state.quit.cancel();
                     state.say(layout::Feedback::Failure, e);
                 }
                 view.request_redraw();
                 return NSApplicationTerminateReply::TerminateCancel;
             }
+            // The Agents panel's arrangement goes to disk on a worker; a
+            // fold or a toggle just before this still has to land.
+            if let Some(state) = view.state() {
+                state.agents.flush_arrangement();
+            }
             // Written only once quitting is certain: recording a session for
             // a quit the user then cancelled would overwrite the real one.
             // Busy: quit without the session rather than abort.
             let (session, ephemeral) = view.state_mut().map_or((None, true), |mut state| {
-                (state.quit_session.take(), state.ephemeral_session)
+                (state.quit.take_session(), state.ephemeral_session)
             });
             if let Some(session) = session {
                 if let Some((root, branch)) = view.state().and_then(|s| s.branch_session.clone()) {
@@ -8543,6 +8592,27 @@ fn start_home_summary(state: &mut State) {
     }
 }
 
+/// Opens the last session's files into `docs` and brings back the one that
+/// was showing. By path, not by the saved index: a file that cannot be
+/// opened now is skipped, and the index would then land on its neighbour.
+fn restore_session_files(docs: &mut Documents, files: &[std::path::PathBuf], active: usize) {
+    let showing = files.get(active).cloned();
+    for path in files {
+        let _ = docs.open(path);
+    }
+    if let Some(index) = showing.and_then(|path| docs.index_of(&path)) {
+        docs.switch(index);
+    }
+}
+
+/// Source Control with no project open: no repository to read. Not the
+/// process's own directory, as it was: `crc` run from a terminal inside a
+/// checkout put that checkout's branch in the status line with nothing
+/// open. The root is a folder Git never finds a repository in.
+fn git_panel_unopened() -> crate::platform::git_panel::Panel {
+    crate::platform::git_panel::Panel::new(std::path::PathBuf::from("/"))
+}
+
 /// Source Control for the workspace's selected repository, named in its
 /// header when there are several to choose from.
 fn git_panel_for(
@@ -10184,10 +10254,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
             tree.set_root(folder);
             project_index_rx = Some(spawn_project_index(folder.clone()));
         }
-        for path in &session.files {
-            let _ = docs.open(path);
-        }
-        docs.switch(session.active);
+        restore_session_files(&mut docs, &session.files, session.active);
         if let Some(path) = docs.active().path.clone() {
             tree.reveal(&path);
         }
@@ -10221,7 +10288,10 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
             &std::env::current_dir().unwrap_or_default(),
         ),
     };
-    let git = git_panel_for(&workspace);
+    let mut git = match tree.root() {
+        Some(_) => git_panel_for(&workspace),
+        None => git_panel_unopened(),
+    };
     let home_since = tree.root().and_then(visit_workspace);
     let home_rx = tree
         .root()
@@ -10231,6 +10301,8 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
     // it could not use is said once the window is up.
     let (settings, settings_problems) = crate::platform::settings::Settings::load_checked();
     let settings_said = crate::platform::settings::Settings::describe_problems(&settings_problems);
+    // Commits sign through the same agent fetch, pull and push use.
+    git.ssh_auth_sock = settings.ssh_auth_sock.clone();
     let state = State {
         docs,
         native_preview: None,
@@ -10287,8 +10359,8 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         context_ext: None,
         context_mcp: None,
         ephemeral_session: launched_with_file,
-        discard_confirmed: false,
-        quit_session: None,
+        quit: Default::default(),
+        session_autosave: Default::default(),
         home_hits: Vec::new(),
         home_view: layout::HomeView::default(),
         recent_projects,
@@ -10576,6 +10648,34 @@ mod tests {
         spawn_project_refresh, typed_text,
     };
     use std::time::Duration;
+
+    /// Regression: the files were opened skipping the missing ones and the
+    /// saved index then switched to the wrong neighbour.
+    #[test]
+    fn session_restore_keeps_the_active_file_when_one_is_missing() {
+        use super::restore_session_files;
+        use crate::text::buffer::Buffer;
+        use crate::text::documents::Documents;
+        let dir = std::env::temp_dir().join(format!("crc-restore-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (b, c) = (dir.join("b.txt"), dir.join("c.txt"));
+        std::fs::write(&b, "b").unwrap();
+        std::fs::write(&c, "c").unwrap();
+        let files = [dir.join("missing.txt"), b.clone(), c];
+        let mut docs = Documents::new(Buffer::new());
+        restore_session_files(&mut docs, &files, 1);
+        assert_eq!(docs.len(), 2);
+        assert_eq!(
+            docs.active().path.as_deref(),
+            Some(crate::platform::canonical(&b).as_path()),
+            "b was showing, not c"
+        );
+        // The showing file itself gone: whatever opened last is fine.
+        let mut docs = Documents::new(Buffer::new());
+        restore_session_files(&mut docs, &files, 0);
+        assert_eq!(docs.len(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn a_plain_launch_opens_on_agents() {

@@ -103,17 +103,21 @@ pub fn publish<'a>(buffers: impl Iterator<Item = &'a Buffer>) {
 }
 
 /// Installs the panic hook. The previous hook, which prints the message and
-/// location, still runs first.
-pub fn install(dir: PathBuf) {
+/// location, still runs first. With no `dir` (no home to write under)
+/// nothing can be saved, but the hook is still what keeps a self-test's
+/// panic from ending in a Problem Report.
+pub fn install(dir: Option<PathBuf>) {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         previous(info);
-        match dump(&dir) {
-            Ok(Some(written)) => {
-                eprintln!("crc: unsaved work written to {}", written.display())
+        if let Some(dir) = &dir {
+            match dump(dir) {
+                Ok(Some(written)) => {
+                    eprintln!("crc: unsaved work written to {}", written.display())
+                }
+                Ok(None) => {}
+                Err(e) => eprintln!("crc: could not write unsaved work: {e}"),
             }
-            Ok(None) => {}
-            Err(e) => eprintln!("crc: could not write unsaved work: {e}"),
         }
         // Then the log, for Help > Report a Problem. Unsaved work first:
         // it is the thing that cannot be reproduced.
@@ -512,7 +516,7 @@ mod tests {
     fn a_panic_leaves_the_unsaved_text_on_disk() {
         const CHILD: &str = "CRC_RECOVERY_TEST_DIR";
         if let Some(dir) = std::env::var_os(CHILD) {
-            install(PathBuf::from(dir));
+            install(Some(PathBuf::from(dir)));
             let buffer = dirty("typed just before the crash", Some("/tmp/victim.rs"));
             publish(std::iter::once(&buffer));
             // What actually happens in the app: the state is borrowed when

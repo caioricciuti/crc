@@ -40,6 +40,12 @@ fn main() {
         return;
     }
 
+    // First, before anything below can panic. Release builds abort on
+    // panic, and the hook is what saves unsaved work first; under the
+    // self-test it is also what keeps a panic from ending in a Problem
+    // Report, which it does with or without a folder to write to.
+    recovery::install(recovery::default_dir());
+
     // What this window runs from, to notice an install over it.
     crc::platform::update::note_launch();
 
@@ -48,9 +54,7 @@ fn main() {
         .filter(|path| std::path::Path::new(path).is_dir())
         .map(|path| crc::platform::canonical(std::path::Path::new(path)));
     let buffer = match args.first().filter(|_| folder.is_none()) {
-        // Buffer::open rather than reading the file here: it records the
-        // path, which is what makes Cmd-S save back rather than fail.
-        Some(path) => match Buffer::open(path) {
+        Some(path) => match open_argument(path) {
             Ok(buffer) => buffer,
             Err(err) => {
                 eprintln!("crc: cannot read {path}: {err}");
@@ -67,14 +71,33 @@ fn main() {
     migrate_support_dir();
     prune_sessions();
 
-    // Before anything that can panic with documents open. Release builds
-    // abort on panic, and the hook is what saves unsaved work first.
-    if let Some(dir) = recovery::default_dir() {
-        recovery::install(dir);
-    }
-
     let settings = Settings::load();
     window::run(buffer, folder, &settings.font, settings.font_size);
+}
+
+/// The document for a path named on the command line. `Buffer::open` rather
+/// than reading the file here: it records the path, which is what makes
+/// Cmd-S save back rather than fail. A path that does not exist yet, in a
+/// folder that does, is a new file, as `crc notes.txt` means it in a
+/// terminal: an empty document with that path, which Cmd-S creates.
+fn open_argument(path: &str) -> std::io::Result<Buffer> {
+    match Buffer::open(path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let absolute = std::path::absolute(path)?;
+            let (Some(parent), Some(name)) = (absolute.parent(), absolute.file_name()) else {
+                return Err(err);
+            };
+            if !parent.is_dir() {
+                return Err(err);
+            }
+            let mut buffer = Buffer::new();
+            // The folder resolved as an opened file's path would be, so the
+            // save and the tab agree on the key.
+            buffer.path = Some(crc::platform::canonical(parent).join(name));
+            Ok(buffer)
+        }
+        result => result,
+    }
 }
 
 /// Agent review sessions whose terminal is gone: aged out, except those of
@@ -120,5 +143,42 @@ fn migrate_support_dir() {
             old.display(),
             new.display()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::open_argument;
+
+    /// Regression: `crc newfile.txt` for a file not there yet exited with
+    /// "cannot read" instead of starting the file.
+    #[test]
+    fn a_missing_file_in_a_folder_that_exists_starts_a_new_document() {
+        let dir = std::env::temp_dir().join(format!("crc-open-argument-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("new.txt");
+        let mut buffer = open_argument(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            buffer.path.as_deref(),
+            Some(crc::platform::canonical(&dir).join("new.txt").as_path())
+        );
+        assert!(!buffer.is_dirty());
+        assert_eq!(buffer.rope.len_bytes(), 0);
+        // Cmd-S creates it, no Save As panel in between.
+        buffer.insert("hello");
+        buffer.save(None).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
+        // A file that is there reads as before.
+        assert_eq!(
+            open_argument(path.to_str().unwrap())
+                .unwrap()
+                .rope
+                .to_string(),
+            "hello"
+        );
+        // A folder that is not there is still the error it was.
+        let missing = dir.join("no-such-folder").join("new.txt");
+        assert!(open_argument(missing.to_str().unwrap()).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

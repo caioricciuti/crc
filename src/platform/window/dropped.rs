@@ -99,7 +99,9 @@ impl EditorView {
         self.pump();
     }
 
-    /// Opens a dropped file in a tab, or says why not.
+    /// Opens a dropped file in a tab, or says why not. Through `load_path`,
+    /// as every other route: a file already open in another pane comes to
+    /// the front there instead of opening a second copy that could diverge.
     fn open_dropped_file(&self, path: &Path) {
         if path.is_dir() {
             if let Some(mut state) = self.state_mut() {
@@ -110,28 +112,9 @@ impl EditorView {
             }
             return;
         }
-        {
-            let Some(mut state) = self.state_mut() else {
-                return;
-            };
-            match Buffer::open(path) {
-                Ok(buffer) => {
-                    state.docs.add(buffer);
-                    uncover_column(&mut state);
-                    reveal_active_tab(&mut state);
-                }
-                Err(e) => {
-                    state.say(
-                        layout::Feedback::Failure,
-                        format!("{}: {e}", path.display()),
-                    );
-                    return;
-                }
-            }
-        }
+        self.load_path(&path.to_string_lossy());
         self.sync_title();
         self.reparse();
-        self.lsp_sync_open();
         self.request_redraw();
         self.pump();
     }

@@ -3,6 +3,58 @@
 
 use super::*;
 
+/// The questions asked on the way out, and what they settled. Closing the
+/// window and quitting both ask about every unsaved document; closing the
+/// last window then terminates the app, which would ask again, by then
+/// with no window to cancel back to. A quit that does not happen after all
+/// (a restart that failed, say) starts over: the next one asks again.
+#[derive(Default)]
+pub(super) struct QuitGate {
+    confirmed: bool,
+    /// What was open when the questions started. Answering Don't Save
+    /// closes the tab, and the session written at quit should still list it.
+    session: Option<Session>,
+}
+
+impl QuitGate {
+    /// Whether the unsaved documents still have to be asked about.
+    pub(super) fn needs_prompt(&self) -> bool {
+        !self.confirmed
+    }
+
+    /// Every question answered; `session` is what to write at quit.
+    pub(super) fn confirm(&mut self, session: Option<Session>) {
+        self.confirmed = true;
+        self.session = session;
+    }
+
+    /// The quit was called off: the next one asks again, and the session
+    /// it would have written is forgotten.
+    pub(super) fn cancel(&mut self) {
+        self.confirmed = false;
+        self.session = None;
+    }
+
+    /// Quitting is certain: the session to write, once.
+    pub(super) fn take_session(&mut self) -> Option<Session> {
+        self.session.take()
+    }
+}
+
+/// Answers for a test instance's unsaved-changes alerts, taken in order
+/// from `CRC_DISCARD_ANSWER` (`save`, `dont-save` or `cancel`, comma
+/// separated); the last one repeats.
+static SCRIPTED_ANSWERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn scripted_answer(script: &str, asked: usize) -> usize {
+    let answers: Vec<&str> = script.split(',').map(str::trim).collect();
+    match answers.get(asked).or(answers.last()) {
+        Some(&"save") => 0,
+        Some(&"dont-save") => 2,
+        _ => 1,
+    }
+}
+
 impl EditorView {
     /// Saves a document the formatter just changed, without formatting it
     /// again on the way out.
@@ -164,23 +216,23 @@ impl EditorView {
     /// one in front, so asking about the active document alone let the rest
     /// vanish without a word.
     pub(super) fn confirm_discard_all(&self) -> bool {
-        if self.state().is_some_and(|state| state.discard_confirmed) {
+        if self.state().is_some_and(|state| !state.quit.needs_prompt()) {
             return true;
         }
         // Where the person was: the pane, and the document by identity,
-        // since the loop moves between panes and closes tabs.
+        // since the loop moves between panes.
         let (original_pane, original_doc) = {
             let Some(state) = self.state() else {
                 return false;
             };
             (state.focused_pane, state.docs.active().id())
         };
-        if let Some(session) = self.capture_session()
-            && let Some(mut state) = self.state_mut()
-        {
-            state.quit_session = Some(session);
-        }
+        // Documents answered with Don't Save. They stay open until every
+        // question is answered: a Cancel later in the round calls the whole
+        // quit off, and nothing may have gone by then.
+        let mut dropped: Vec<u64> = Vec::new();
         loop {
+            let asking = |b: &Buffer| b.is_dirty() && !dropped.contains(&b.id());
             // Whichever pane has a dirty document comes to the front first.
             let elsewhere = {
                 let Some(state) = self.state() else {
@@ -191,14 +243,14 @@ impl EditorView {
                         && state.panes[p - usize::from(*p > state.focused_pane)]
                             .docs
                             .iter()
-                            .any(|b| b.is_dirty())
+                            .any(asking)
                 })
             };
             let next = {
                 let Some(state) = self.state() else {
                     return false;
                 };
-                state.docs.iter().position(|b| b.is_dirty())
+                state.docs.iter().position(asking)
             };
             let index = match (next, elsewhere) {
                 (Some(index), _) => index,
@@ -219,7 +271,7 @@ impl EditorView {
             match self.ask_about_active() {
                 Discard::Cancel => {
                     if let Some(mut state) = self.state_mut() {
-                        state.quit_session = None;
+                        state.quit.cancel();
                     }
                     self.focus_pane(original_pane);
                     let at = {
@@ -237,17 +289,27 @@ impl EditorView {
                 }
                 // Saved: no longer dirty, so the scan moves on by itself.
                 Discard::Saved => {}
-                // Not saved and not wanted. Closing the tab is what stops the
-                // scan finding it again, and the window is going anyway.
+                // Not saved and not wanted: the scan skips it from here.
                 Discard::Dropped => {
-                    if let Some(mut state) = self.state_mut() {
-                        state.docs.close(index);
+                    if let Some(state) = self.state() {
+                        dropped.push(state.docs.active().id());
                     }
                 }
             }
         }
+        // Every question answered, so the window is going. The session
+        // is taken before the dropped tabs close: it should list them.
+        let session = self.capture_session();
         if let Some(mut state) = self.state_mut() {
-            state.discard_confirmed = true;
+            for id in dropped {
+                for docs in all_docs_mut(&mut state) {
+                    let at = docs.iter().position(|b| b.id() == id);
+                    if let Some(index) = at {
+                        docs.close(index);
+                    }
+                }
+            }
+            state.quit.confirm(session);
         }
         true
     }
@@ -536,13 +598,13 @@ impl EditorView {
         }
 
         let answer = if self.ivars().testing {
-            // A test instance cannot answer a modal: it takes the answer
-            // from the environment, and cancels without one.
-            match std::env::var("CRC_DISCARD_ANSWER").as_deref() {
-                Ok("save") => 0,
-                Ok("dont-save") => 2,
-                _ => 1,
-            }
+            // A test instance cannot answer a modal: it takes the answers
+            // from the environment, in order, and cancels without one.
+            let asked = SCRIPTED_ANSWERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            scripted_answer(
+                &std::env::var("CRC_DISCARD_ANSWER").unwrap_or_default(),
+                asked,
+            )
         } else {
             // Save first: the first button is the default.
             ask(
@@ -751,5 +813,42 @@ impl EditorView {
         self.after_saved(saved_path, ok);
         self.sync_title();
         ok
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{QuitGate, scripted_answer};
+    use crate::platform::session::Session;
+
+    /// Regression: the flag that skips the questions was set at confirm
+    /// and never cleared, so a quit called off after it (a restart that
+    /// failed) left the next Cmd-Q quitting with no prompt at all.
+    #[test]
+    fn a_cancelled_quit_asks_again() {
+        let mut gate = QuitGate::default();
+        assert!(gate.needs_prompt());
+        gate.confirm(Some(Session::default()));
+        assert!(!gate.needs_prompt());
+        gate.cancel();
+        assert!(gate.needs_prompt());
+        assert!(
+            gate.take_session().is_none(),
+            "the stale session is forgotten"
+        );
+        gate.confirm(Some(Session::default()));
+        assert!(gate.take_session().is_some());
+        assert!(gate.take_session().is_none(), "written once");
+    }
+
+    #[test]
+    fn scripted_answers_are_taken_in_order_and_the_last_repeats() {
+        assert_eq!(scripted_answer("dont-save,cancel", 0), 2);
+        assert_eq!(scripted_answer("dont-save,cancel", 1), 1);
+        assert_eq!(scripted_answer("dont-save,cancel", 2), 1);
+        assert_eq!(scripted_answer("save", 5), 0);
+        assert_eq!(scripted_answer("dont-save", 3), 2);
+        assert_eq!(scripted_answer("", 0), 1);
+        assert_eq!(scripted_answer("dont-save, save", 1), 0);
     }
 }
