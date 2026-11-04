@@ -537,30 +537,64 @@ impl EditorView {
 
 /// Every session's text for Find in Terminals, in tab order, with where
 /// it is: its workspace when it has one, and its title. A session whose
-/// terminal is locked (its output being parsed) is left out rather than
-/// waited for.
+/// terminal is locked (its output being parsed) is waited for: its reader
+/// holds the lock for one slice of output at a time, so the wait is short,
+/// and the busy session is the one most likely to hold what is looked for.
 fn searched_sessions(state: &State) -> Vec<crate::platform::terminal::Searched> {
     let tasks = &state.agents.tasks;
     state
         .terminal
         .tabs
         .iter()
-        .filter_map(|tab| {
-            let hay = match tab.session.term.try_lock() {
-                Ok(term) => term.haystack(),
-                Err(std::sync::TryLockError::Poisoned(term)) => term.into_inner().haystack(),
-                Err(std::sync::TryLockError::WouldBlock) => return None,
-            };
+        .map(|tab| {
+            let hay = session_haystack(&tab.session.term);
             let title = tab.name();
             let place = match crate::platform::agents::task_of(tasks, tab) {
                 Some(task) => format!("{} / {title}", tasks[task].name()),
                 None => title,
             };
-            Some(crate::platform::terminal::Searched {
+            crate::platform::terminal::Searched {
                 term: Arc::as_ptr(&tab.session.term) as usize,
                 place,
                 hay,
-            })
+            }
         })
         .collect()
+}
+
+/// A session's text for Find in Terminals: its lines copied out under the
+/// terminal's lock, which is taken however busy the session is, and made
+/// into text once it is let go.
+fn session_haystack(term: &std::sync::Mutex<crate::term::Term>) -> crate::term::Haystack {
+    let lines = term.lock().unwrap_or_else(|e| e.into_inner()).find_lines();
+    lines.haystack()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn find_in_terminals_waits_for_a_busy_session() {
+        let term = Arc::new(std::sync::Mutex::new(crate::term::Term::new(20, 5)));
+        term.lock().unwrap().advance(b"a needle here");
+        // Its reader, mid-slice: the lock is held for a moment.
+        let busy = term.clone();
+        let (locked, is_locked) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let guard = busy.lock().unwrap();
+            locked.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            drop(guard);
+        });
+        is_locked.recv().unwrap();
+        let started = Instant::now();
+        let hay = session_haystack(&term);
+        assert!(
+            started.elapsed() >= Duration::from_millis(40),
+            "waited for it"
+        );
+        assert!(hay.text.contains("a needle here"), "{:?}", hay.text);
+    }
 }

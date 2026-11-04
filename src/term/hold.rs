@@ -42,6 +42,24 @@ const SIGCONT: i32 = 19;
 /// How long a program has to end after each signal of a Kill.
 const KILL_GRACE: Duration = Duration::from_secs(1);
 
+/// How long the helper gives its reader, once the program has exited, to
+/// pass on the last of the output before telling the window of the end.
+/// A background job the program left holding the terminal keeps the reader
+/// from ever seeing the end, so the wait is bounded.
+const DRAIN_GRACE: Duration = Duration::from_secs(1);
+
+/// Polls `flag` until it is set or `timeout` is up; whether it was set.
+fn wait_until(flag: &AtomicBool, timeout: Duration) -> bool {
+    let until = Instant::now() + timeout;
+    while Instant::now() < until {
+        if flag.load(Ordering::Acquire) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    flag.load(Ordering::Acquire)
+}
+
 /// Where the helpers' files live: `CRC_HELD_DIR`, or `held` under
 /// Application Support.
 pub fn dir() -> Option<PathBuf> {
@@ -341,16 +359,7 @@ fn end(pid: i32, ended: &Arc<AtomicBool>, dir: &Path, id: &str) {
     crate::platform::send_signal(-pid, SIGHUP);
     let (ended, dir, id) = (ended.clone(), dir.to_path_buf(), id.to_owned());
     std::thread::spawn(move || {
-        let gone = || {
-            let until = Instant::now() + KILL_GRACE;
-            while Instant::now() < until {
-                if ended.load(Ordering::Acquire) {
-                    return true;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            ended.load(Ordering::Acquire)
-        };
+        let gone = || wait_until(&ended, KILL_GRACE);
         if gone() {
             return;
         }
@@ -640,6 +649,20 @@ impl Hold {
     }
 }
 
+/// The helper's reader: the program's output, kept and passed to the
+/// window attached, until the program's side of the terminal closes. Then
+/// `drained` is set, for the wait thread: the window must not hear of the
+/// end before it has the end of the output.
+fn relay_output(reader: &mut impl Read, hold: &Mutex<Hold>, drained: &AtomicBool) {
+    let mut buffer = vec![0u8; 64 * 1024];
+    while let Some(n) = super::pty::read_output(reader, &mut buffer) {
+        let mut hold = hold.lock().unwrap_or_else(|e| e.into_inner());
+        hold.keep(&buffer[..n]);
+        hold.tell(&Frame::Output(buffer[..n].to_vec()));
+    }
+    drained.store(true, Ordering::Release);
+}
+
 /// The helper: runs the spec's program in `dir` as `id` until it ends or a
 /// window ends it. Never returns.
 pub fn run(dir: &Path, id: &str) -> ! {
@@ -702,15 +725,19 @@ pub fn run(dir: &Path, id: &str) -> ! {
         rows: spec.rows,
     }));
     let ended = Arc::new(AtomicBool::new(false));
+    let drained = Arc::new(AtomicBool::new(false));
     let (dir, id) = (dir.to_path_buf(), id.to_owned());
 
-    // Reaped on a thread of its own; the program's end is the helper's.
+    // Reaped on a thread of its own; the program's end is the helper's,
+    // once the reader has passed on the last of what it printed.
     {
         let (hold, dir, id, ended) = (hold.clone(), dir.clone(), id.clone(), ended.clone());
+        let drained = drained.clone();
         std::thread::spawn(move || {
             let mut child = child;
             let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
             ended.store(true, Ordering::Release);
+            wait_until(&drained, DRAIN_GRACE);
             hold.lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .tell(&Frame::Exited(code));
@@ -721,18 +748,10 @@ pub fn run(dir: &Path, id: &str) -> ! {
     // The program's output: kept, and passed to the window attached.
     {
         let (hold, dir, id, ended) = (hold.clone(), dir.clone(), id.clone(), ended.clone());
+        let drained = drained.clone();
         let mut reader = master.try_clone().unwrap_or_else(|_| std::process::exit(2));
         std::thread::spawn(move || {
-            let mut buffer = vec![0u8; 64 * 1024];
-            loop {
-                let n = match reader.read(&mut buffer) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => n,
-                };
-                let mut hold = hold.lock().unwrap_or_else(|e| e.into_inner());
-                hold.keep(&buffer[..n]);
-                hold.tell(&Frame::Output(buffer[..n].to_vec()));
-            }
+            relay_output(&mut reader, &hold, &drained);
             // The terminal closed: the program is ending, or ended and left
             // nothing holding it. A moment for the wait thread to say so
             // with the real code; then this is the end either way.
@@ -937,5 +956,65 @@ mod tests {
         hold.keep(&vec![3u8; KEEP + 5]);
         assert_eq!(hold.kept.len(), KEEP);
         assert!(hold.kept.iter().all(|b| *b == 3));
+    }
+
+    /// A terminal whose read is interrupted once before `data` and the end.
+    struct Interrupted<'a> {
+        data: &'a [u8],
+        interrupted: bool,
+    }
+
+    impl Read for Interrupted<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            let n = self.data.len().min(buffer.len());
+            buffer[..n].copy_from_slice(&self.data[..n]);
+            self.data = &self.data[n..];
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn the_reader_keeps_everything_to_the_end_and_says_when_it_has() {
+        let hold = Mutex::new(Hold {
+            client: None,
+            clients: 0,
+            kept: VecDeque::new(),
+            cols: 80,
+            rows: 24,
+        });
+        let drained = AtomicBool::new(false);
+        let mut reader = Interrupted {
+            data: b"last words",
+            interrupted: false,
+        };
+        relay_output(&mut reader, &hold, &drained);
+        let kept: Vec<u8> = hold.lock().unwrap().kept.iter().copied().collect();
+        assert_eq!(kept, b"last words", "an interrupted read is not the end");
+        assert!(drained.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn the_wait_thread_gives_the_reader_a_moment_and_no_more() {
+        let drained = Arc::new(AtomicBool::new(false));
+        let setter = drained.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            setter.store(true, Ordering::Release);
+        });
+        let started = Instant::now();
+        assert!(wait_until(&drained, DRAIN_GRACE), "set within the grace");
+        assert!(
+            started.elapsed() < DRAIN_GRACE,
+            "returns as soon as it is set"
+        );
+        // Never set, as when a background job holds the terminal: bounded.
+        let never = AtomicBool::new(false);
+        let started = Instant::now();
+        assert!(!wait_until(&never, Duration::from_millis(60)));
+        assert!(started.elapsed() >= Duration::from_millis(60));
     }
 }

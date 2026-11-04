@@ -70,7 +70,11 @@ impl Term {
             pieces.push(Piece {
                 text: cells_text(&cells[from.min(cells.len())..to.min(cells.len())]),
                 wrapped: to_end && cells.last().is_some_and(|c| c.flags & WRAPPED != 0),
+                // A history line is kept only as wide as its text: one
+                // shorter than the grid ended in blanks and did not reach
+                // the edge.
                 full: to_end
+                    && cells.len() == self.cols
                     && cells
                         .last()
                         .is_some_and(|c| c.ch != ' ' || c.flags & WIDE_TAIL != 0),

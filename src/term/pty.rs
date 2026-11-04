@@ -5,9 +5,10 @@
 //! `TIOCSCTTY`, and the master side is read on a thread that feeds a shared
 //! [`Term`]. Parsing happens there, off the main thread, so a program that
 //! prints a lot costs the editor a mutex and a redraw, not the parse. Replies
-//! the terminal owes (cursor reports and the like) go straight back from
-//! that thread. Wake-ups to the main thread are coalesced: one is queued at
-//! a time, however much arrives.
+//! the terminal owes (cursor reports and the like) go to the writer thread,
+//! behind what was typed, so the reader never waits on a program that has
+//! stopped reading. Wake-ups to the main thread are coalesced: one is queued
+//! at a time, however much arrives.
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -17,15 +18,22 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use super::Term;
+use super::hold::{self, Frame};
 
 /// Keep a busy session from holding up the UI's status and screen reads
 /// for a whole 64 KiB burst (or a 2 MiB held-session replay). Parser state
 /// survives a slice ending inside UTF-8 or a control sequence.
 const OUTPUT_SLICE: usize = 4096;
+
+/// How much may wait for the writer thread before the replies the terminal
+/// owes are dropped instead of queued: a program that floods queries and
+/// never reads its input would otherwise grow the queue without bound.
+const REPLY_LIMIT: usize = 64 * 1024;
 
 fn advance_output(term: &Mutex<Term>, bytes: &[u8], mut reply: impl FnMut(Vec<u8>)) {
     for slice in bytes.chunks(OUTPUT_SLICE) {
@@ -37,6 +45,21 @@ fn advance_output(term: &Mutex<Term>, bytes: &[u8], mut reply: impl FnMut(Vec<u8
         // The UI can acquire the terminal between slices; writes back to
         // the program must not extend the time spent holding its lock.
         reply(replies);
+    }
+}
+
+/// The next read of a program's output: how much came, or `None` once its
+/// side closed, which a closed slave reports as 0 or as EIO depending on
+/// timing. A read a signal interrupted is tried again, not taken as the
+/// end.
+pub(super) fn read_output(reader: &mut impl Read, buffer: &mut [u8]) -> Option<usize> {
+    loop {
+        match reader.read(buffer) {
+            Ok(0) => return None,
+            Ok(n) => return Some(n),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
     }
 }
 
@@ -162,9 +185,10 @@ pub(crate) fn resize_master(master: &File, cols: usize, rows: usize) {
 /// A running program and its screen.
 pub struct Session {
     pub term: Arc<Mutex<Term>>,
-    /// Input for the writer thread: a program that stops reading (a paste
-    /// into one that is busy) blocks that thread, never the editor.
-    input: std::sync::mpsc::Sender<Vec<u8>>,
+    /// The way to the program, through the writer thread: a program that
+    /// stops reading (a paste into one that is busy) blocks that thread,
+    /// never the editor.
+    out: Outgoing,
     /// The program's side: the terminal here, or a helper holding it.
     control: Control,
     /// What the reader and wait threads have seen.
@@ -176,13 +200,72 @@ enum Control {
     /// This process: the master, for the window-size ioctl, and the
     /// program's pid.
     Pty { master: File, pid: i32 },
-    /// A `crc --hold` helper (see [`super::hold`]): frames go over its
-    /// socket, under one lock so they never interleave. `detached` once the
-    /// window has let go of it without ending it.
-    Held {
-        socket: Arc<Mutex<UnixStream>>,
-        detached: bool,
-    },
+    /// A `crc --hold` helper (see [`super::hold`]): every frame to it goes
+    /// the way of the input, so only the writer thread touches its socket.
+    /// `detached` once the window has let go of it without ending it.
+    Held { detached: bool },
+}
+
+/// What goes to the program, in order, through the writer thread: typed
+/// and pasted input, the replies the terminal owes, and for a held program
+/// its size changes and its end. Counts the bytes of input the writer has
+/// not written yet, so a reply can be dropped when too much is waiting;
+/// what was typed always goes.
+#[derive(Clone)]
+struct Outgoing {
+    frames: Sender<Frame>,
+    queued: Arc<AtomicUsize>,
+}
+
+impl Outgoing {
+    fn new() -> (Outgoing, Receiver<Frame>) {
+        let (frames, receiver) = std::sync::mpsc::channel();
+        let out = Outgoing {
+            frames,
+            queued: Arc::new(AtomicUsize::new(0)),
+        };
+        (out, receiver)
+    }
+
+    fn send(&self, frame: Frame) {
+        self.queued.fetch_add(input_bytes(&frame), Ordering::AcqRel);
+        let _ = self.frames.send(frame);
+    }
+
+    /// Queues a reply the terminal owes, unless the writer is already
+    /// [`REPLY_LIMIT`] behind: the program has stopped reading, and a
+    /// late report is worth less than a bounded queue. Whether it went.
+    fn reply(&self, bytes: Vec<u8>) -> bool {
+        if bytes.is_empty() || self.queued.load(Ordering::Acquire) > REPLY_LIMIT {
+            return false;
+        }
+        self.send(Frame::Input(bytes));
+        true
+    }
+}
+
+/// The bytes of input a frame carries.
+fn input_bytes(frame: &Frame) -> usize {
+    match frame {
+        Frame::Input(bytes) => bytes.len(),
+        _ => 0,
+    }
+}
+
+/// The writer thread: hands each frame to `deliver`, in order, until the
+/// session is gone or the program's side fails.
+fn write_frames(
+    frames: Receiver<Frame>,
+    queued: Arc<AtomicUsize>,
+    mut deliver: impl FnMut(&Frame) -> std::io::Result<()>,
+) {
+    for frame in frames {
+        let delivered = deliver(&frame);
+        queued.fetch_sub(input_bytes(&frame), Ordering::AcqRel);
+        if delivered.is_err() {
+            return;
+        }
+    }
 }
 
 /// Set by the reader thread and the wait thread, read by the session.
@@ -208,6 +291,50 @@ impl Status {
     fn queue_wake(&self) -> bool {
         !self.woken.swap(true, Ordering::AcqRel)
     }
+}
+
+/// The reader thread of a held session: the helper's frames, from after
+/// its size, into the screen, until the program exits or the helper is
+/// gone. The first output frame is the helper's replay of what the program
+/// printed before this window: the queries in it were answered when they
+/// were asked, so its replies are dropped rather than sent again.
+fn relay_held(
+    reader: &mut impl Read,
+    term: &Mutex<Term>,
+    status: &Status,
+    out: &Outgoing,
+    wake: &dyn Fn(),
+) {
+    let mut replay = true;
+    loop {
+        match hold::receive(reader) {
+            Ok(Frame::Output(bytes)) => {
+                if replay {
+                    advance_output(term, &bytes, |_| {});
+                    replay = false;
+                } else {
+                    advance_output(term, &bytes, |reply| {
+                        out.reply(reply);
+                    });
+                }
+                if status.queue_wake() {
+                    wake();
+                }
+            }
+            Ok(Frame::Exited(code)) => {
+                status.code.store(code, Ordering::Release);
+                status.reaped.store(true, Ordering::Release);
+                break;
+            }
+            // Size changes come only on attach; anything else, or a
+            // helper gone, ends the session.
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    status.exited.store(true, Ordering::Release);
+    status.woken.store(true, Ordering::Release);
+    wake();
 }
 
 impl Session {
@@ -249,30 +376,24 @@ impl Session {
         let master = File::from(master);
         let mut writer = master.try_clone()?;
         let control = master.try_clone()?;
-        let mut replies = master.try_clone()?;
         let term = Arc::new(Mutex::new(Term::new(cols, rows)));
-        let (input, typed) = std::sync::mpsc::channel::<Vec<u8>>();
-        std::thread::spawn(move || {
-            for bytes in typed {
-                if writer.write_all(&bytes).is_err() {
-                    return;
-                }
-            }
-        });
-        let (shared, seen) = (term.clone(), status.clone());
+        let (out, frames) = Outgoing::new();
+        {
+            let queued = out.queued.clone();
+            std::thread::spawn(move || {
+                write_frames(frames, queued, |frame| match frame {
+                    Frame::Input(bytes) => writer.write_all(bytes),
+                    _ => Ok(()),
+                })
+            });
+        }
+        let (shared, seen, replies) = (term.clone(), status.clone(), out.clone());
         std::thread::spawn(move || {
             let mut reader = master;
             let mut buffer = vec![0u8; 64 * 1024];
-            loop {
-                // A closed slave reads as 0 or as EIO, depending on timing.
-                let n = match reader.read(&mut buffer) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => n,
-                };
+            while let Some(n) = read_output(&mut reader, &mut buffer) {
                 advance_output(&shared, &buffer[..n], |reply| {
-                    if !reply.is_empty() {
-                        let _ = replies.write_all(&reply);
-                    }
+                    replies.reply(reply);
                 });
                 if seen.queue_wake() {
                     wake();
@@ -284,7 +405,7 @@ impl Session {
         });
         Ok(Session {
             term,
-            input,
+            out,
             control: Control::Pty {
                 master: control,
                 pid,
@@ -297,7 +418,6 @@ impl Session {
     /// rebuilt from the output the helper kept, at the size it has there.
     /// The window resizes it to its grid as it does any session.
     pub fn attach(mut socket: UnixStream, wake: Wake) -> std::io::Result<Session> {
-        use super::hold::{self, Frame};
         // The helper says its size first, before any output.
         let (cols, rows) = match hold::receive(&mut socket)? {
             Frame::Size(cols, rows) => (cols, rows),
@@ -311,55 +431,20 @@ impl Session {
         let status = Arc::new(Status::default());
         let term = Arc::new(Mutex::new(Term::new(cols, rows)));
         let mut reader = socket.try_clone()?;
-        let socket = Arc::new(Mutex::new(socket));
-        let (input, typed) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (out, frames) = Outgoing::new();
         {
-            let socket = socket.clone();
+            let queued = out.queued.clone();
+            let mut socket = socket;
             std::thread::spawn(move || {
-                for bytes in typed {
-                    let mut socket = socket.lock().unwrap_or_else(|e| e.into_inner());
-                    if hold::send(&mut *socket, &Frame::Input(bytes)).is_err() {
-                        return;
-                    }
-                }
+                write_frames(frames, queued, |frame| hold::send(&mut socket, frame))
             });
         }
-        let (shared, seen, replies) = (term.clone(), status.clone(), input.clone());
-        std::thread::spawn(move || {
-            loop {
-                match hold::receive(&mut reader) {
-                    Ok(Frame::Output(bytes)) => {
-                        advance_output(&shared, &bytes, |reply| {
-                            if !reply.is_empty() {
-                                let _ = replies.send(reply);
-                            }
-                        });
-                        if seen.queue_wake() {
-                            wake();
-                        }
-                    }
-                    Ok(Frame::Exited(code)) => {
-                        seen.code.store(code, Ordering::Release);
-                        seen.reaped.store(true, Ordering::Release);
-                        break;
-                    }
-                    // Size changes come only on attach; anything else, or
-                    // a helper gone, ends the session.
-                    Ok(_) => {}
-                    Err(_) => break,
-                }
-            }
-            seen.exited.store(true, Ordering::Release);
-            seen.woken.store(true, Ordering::Release);
-            wake();
-        });
+        let (shared, seen, replies) = (term.clone(), status.clone(), out.clone());
+        std::thread::spawn(move || relay_held(&mut reader, &shared, &seen, &replies, &*wake));
         Ok(Session {
             term,
-            input,
-            control: Control::Held {
-                socket,
-                detached: false,
-            },
+            out,
+            control: Control::Held { detached: false },
             status,
         })
     }
@@ -369,14 +454,10 @@ impl Session {
     /// it ends nothing.
     #[doc(hidden)]
     pub fn offline(cols: usize, rows: usize) -> std::io::Result<Session> {
-        let (socket, _) = UnixStream::pair()?;
         Ok(Session {
             term: Arc::new(Mutex::new(Term::new(cols, rows))),
-            input: std::sync::mpsc::channel::<Vec<u8>>().0,
-            control: Control::Held {
-                socket: Arc::new(Mutex::new(socket)),
-                detached: true,
-            },
+            out: Outgoing::new().0,
+            control: Control::Held { detached: true },
             status: Arc::new(Status::default()),
         })
     }
@@ -392,21 +473,19 @@ impl Session {
 
     /// Sends input, as typed or pasted, through the writer thread.
     pub fn write(&mut self, bytes: &[u8]) {
-        let _ = self.input.send(bytes.to_vec());
+        self.out.send(Frame::Input(bytes.to_vec()));
     }
 
-    /// Changes the terminal's size; the program hears SIGWINCH.
+    /// Changes the terminal's size; the program hears SIGWINCH. A held
+    /// program hears it after the input queued before, from the writer
+    /// thread: this never waits on the helper.
     pub fn resize(&self, cols: usize, rows: usize) {
         let mut term = self.term.lock().unwrap_or_else(|e| e.into_inner());
         if (term.cols(), term.rows()) != (cols.max(2), rows.max(1)) {
             term.resize(cols, rows);
             match &self.control {
                 Control::Pty { master, .. } => set_size(master.as_raw_fd(), cols, rows),
-                Control::Held { socket, .. } => {
-                    let mut socket = socket.lock().unwrap_or_else(|e| e.into_inner());
-                    let _ =
-                        super::hold::send(&mut *socket, &super::hold::Frame::Resize(cols, rows));
-                }
+                Control::Held { .. } => self.out.send(Frame::Resize(cols, rows)),
             }
         }
     }
@@ -432,10 +511,7 @@ impl Session {
                     crate::platform::send_signal(-pid, SIGHUP);
                 }
             }
-            Control::Held { socket, .. } => {
-                let mut socket = socket.lock().unwrap_or_else(|e| e.into_inner());
-                let _ = super::hold::send(&mut *socket, &super::hold::Frame::Kill);
-            }
+            Control::Held { .. } => self.out.send(Frame::Kill),
         }
     }
 
@@ -474,7 +550,7 @@ impl Drop for Session {
         // once the program is gone, since its pid may have been reused. A
         // background job it left behind keeps the terminal until it closes.
         // A held program the window let go of stays with its helper.
-        if let Control::Held { detached: true, .. } = self.control {
+        if let Control::Held { detached: true } = self.control {
             return;
         }
         self.end();
@@ -522,15 +598,139 @@ mod tests {
         assert_eq!(actual.take_clipboard(), expected.take_clipboard());
     }
 
-    fn wait_for(session: &Session, what: impl Fn(&Term) -> bool) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(5);
+    /// A reader that is interrupted once, then has `data`, then ends.
+    struct Interrupted<'a> {
+        data: &'a [u8],
+        interrupted: bool,
+    }
+
+    impl Read for Interrupted<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            let n = self.data.len().min(buffer.len());
+            buffer[..n].copy_from_slice(&self.data[..n]);
+            self.data = &self.data[n..];
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn an_interrupted_read_is_not_the_end_of_the_output() {
+        let mut reader = Interrupted {
+            data: b"after",
+            interrupted: false,
+        };
+        let mut buffer = [0u8; 16];
+        assert_eq!(read_output(&mut reader, &mut buffer), Some(5));
+        assert_eq!(&buffer[..5], b"after");
+        assert_eq!(read_output(&mut reader, &mut buffer), None, "EOF ends it");
+    }
+
+    #[test]
+    fn replies_are_bounded_when_the_program_stops_reading() {
+        // Nobody takes the writer's end: the queue only ever grows.
+        let (out, unread) = Outgoing::new();
+        let queries = b"\x1b[5n".repeat(200_000);
+        let terminal = Mutex::new(Term::new(80, 24));
+        let (mut sent, mut dropped) = (0usize, 0usize);
+        advance_output(&terminal, &queries, |reply| {
+            if out.reply(reply) {
+                sent += 1;
+            } else {
+                dropped += 1;
+            }
+        });
+        assert!(dropped > 0, "{sent} sent, none dropped");
+        let queued = out.queued.load(Ordering::Acquire);
+        // At most one slice's worth past the limit.
+        assert!(
+            queued <= REPLY_LIMIT + OUTPUT_SLICE * 4,
+            "{queued} bytes queued"
+        );
+        assert_eq!(unread.try_iter().count(), sent);
+    }
+
+    #[test]
+    fn the_replay_on_attach_is_not_answered_but_live_output_is() {
+        let queries = b"\x1b[6n\x1b[c".to_vec();
+        let mut frames = Vec::new();
+        hold::send(&mut frames, &Frame::Output(queries.clone())).unwrap();
+        hold::send(&mut frames, &Frame::Output(queries)).unwrap();
+        let (out, sent) = Outgoing::new();
+        let terminal = Mutex::new(Term::new(80, 24));
+        let status = Status::default();
+        relay_held(&mut frames.as_slice(), &terminal, &status, &out, &|| {});
+        let answers: Vec<Frame> = sent.try_iter().collect();
+        assert_eq!(answers.len(), 1, "{answers:?}");
+        let Frame::Input(reply) = &answers[0] else {
+            panic!("{answers:?}");
+        };
+        let reply = String::from_utf8_lossy(reply);
+        assert!(reply.contains("\x1b[1;1R"), "{reply:?}");
+        assert!(reply.ends_with('c'), "{reply:?}");
+        assert!(
+            status.exited.load(Ordering::Acquire),
+            "EOF ends the session"
+        );
+    }
+
+    fn until(timeout: Duration, done: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
-            if what(&session.term.lock().unwrap()) {
+            if done() {
                 return true;
             }
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(5));
         }
-        false
+        done()
+    }
+
+    #[test]
+    fn resize_and_end_of_a_held_session_never_wait_on_the_helper() {
+        let (ours, mut helper) = UnixStream::pair().unwrap();
+        hold::send(&mut helper, &Frame::Size(80, 24)).unwrap();
+        let mut session = Session::attach(ours, Box::new(|| {})).unwrap();
+        // More than the socket takes while the other end reads nothing:
+        // the writer thread is stuck on it once a few frames are in.
+        for _ in 0..256 {
+            session.write(&[b'x'; 1024]);
+        }
+        assert!(until(Duration::from_secs(5), || {
+            session.out.queued.load(Ordering::Acquire) < 256 * 1024
+        }));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            session.resize(100, 30);
+            session.end();
+            tx.send(session).unwrap();
+        });
+        let session = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("resize and end return while the socket is full");
+        assert!(session.is_held());
+        // Drained, the helper hears everything in order: the input, then
+        // the size, then the end.
+        let mut seen = Vec::new();
+        loop {
+            match hold::receive(&mut helper).unwrap() {
+                Frame::Input(_) => {}
+                frame @ Frame::Kill => {
+                    seen.push(frame);
+                    break;
+                }
+                frame => seen.push(frame),
+            }
+        }
+        assert_eq!(seen, [Frame::Resize(100, 30), Frame::Kill]);
+    }
+
+    fn wait_for(session: &Session, what: impl Fn(&Term) -> bool) -> bool {
+        until(Duration::from_secs(5), || {
+            what(&session.term.lock().unwrap())
+        })
     }
 
     #[test]
@@ -560,10 +760,6 @@ mod tests {
         assert!(wait_for(&session, |t| t.screen_text().contains("8 50")));
         assert!(session.drain_wake());
         session.write(b"exit\n");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !session.has_exited() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(session.has_exited());
+        assert!(until(Duration::from_secs(5), || session.has_exited()));
     }
 }

@@ -151,11 +151,17 @@ pub fn alternate_scroll(lines: isize, app_cursor: bool) -> Vec<u8> {
 }
 
 /// Text to paste. Inside bracketed paste the program is told where it
-/// starts and ends, and the end marker cannot be smuggled inside it.
+/// starts and ends, and the end marker cannot be smuggled inside it: every
+/// escape goes, since removing the marker alone lets the pieces around it
+/// join into a new one, and the C1 controls with it, which are the other
+/// way to start a control sequence.
 pub fn paste(text: &str, bracketed: bool) -> Vec<u8> {
     let text = text.replace("\r\n", "\r").replace('\n', "\r");
     if bracketed {
-        let clean = text.replace("\x1b[201~", "");
+        let clean: String = text
+            .chars()
+            .filter(|c| *c != '\x1b' && !('\u{80}'..='\u{9f}').contains(c))
+            .collect();
         format!("\x1b[200~{clean}\x1b[201~").into_bytes()
     } else {
         text.into_bytes()
@@ -290,7 +296,28 @@ mod tests {
     #[test]
     fn pastes_are_bracketed_and_cannot_close_early() {
         assert_eq!(paste("a\nb", false), b"a\rb".to_vec());
-        assert_eq!(paste("x\x1b[201~y", true), b"\x1b[200~xy\x1b[201~".to_vec());
+        // The escape goes; the rest of the marker is plain text.
+        assert_eq!(
+            paste("x\x1b[201~y", true),
+            b"\x1b[200~x[201~y\x1b[201~".to_vec()
+        );
+    }
+
+    #[test]
+    fn a_split_end_marker_does_not_re_form_once_the_whole_one_is_gone() {
+        // Removing the whole marker in one pass joins the halves around it
+        // into a live marker, with the text after it typed to the shell.
+        let out = paste("a\x1b[20\x1b[201~1~b\n", true);
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.matches("\x1b[201~").count(), 1);
+        assert!(text.ends_with("\x1b[201~"), "{text:?}");
+        assert!(text.starts_with("\x1b[200~a"), "{text:?}");
+        // C1 controls are the other spelling of an escape sequence start.
+        let out = paste("x\u{9b}201~y", true);
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text, "\x1b[200~x201~y\x1b[201~");
+        // Returns inside the paste still reach the program as returns.
+        assert_eq!(paste("a\r\nb", true), b"\x1b[200~a\rb\x1b[201~".to_vec());
     }
 
     #[test]

@@ -976,12 +976,22 @@ fn mouse_tracking(n: usize) -> mouse::Tracking {
 
 /// Adds a line to history, counting in `dropped` the oldest line when it
 /// had to go to make room. Free, not a method: callers drain the screen
-/// while they push.
-fn retire(history: &mut VecDeque<Vec<Cell>>, dropped: &mut u64, line: Vec<Cell>) {
+/// while they push. The blanks after the line's text are not kept, since
+/// most lines are short and history at the grid's full width costs tens of
+/// megabytes a tab; every reader of a history line takes a short one as
+/// blank past its end. A wrap mark or a coloured blank on the last cell
+/// is not a default cell, so a line that has one keeps its width.
+fn retire(history: &mut VecDeque<Vec<Cell>>, dropped: &mut u64, mut line: Vec<Cell>) {
     if history.len() == SCROLLBACK {
         history.pop_front();
         *dropped += 1;
     }
+    let text = line
+        .iter()
+        .rposition(|c| *c != Cell::default())
+        .map_or(0, |i| i + 1);
+    line.truncate(text);
+    line.shrink_to_fit();
     history.push_back(line);
 }
 
@@ -1168,6 +1178,53 @@ mod tests {
         assert_eq!(first.trim_end(), "01234567890123456789");
         let second: String = t.visible_row(1, 2).iter().map(|c| c.ch).collect();
         assert_eq!(second.trim_end(), "01");
+    }
+
+    #[test]
+    fn history_keeps_a_line_only_as_wide_as_its_text() {
+        // The blanks after a short line are not kept, or history costs the
+        // full width of the grid for every line that ever scrolled off.
+        let t = term("ab\r\n\x1b[41mc\x1b[0m\r\n\r\n3\r\n4\r\n5\r\n6\r\n7");
+        assert_eq!(t.scrollback_len(), 3);
+        assert_eq!(t.line(0).unwrap().len(), 2);
+        // A coloured blank is part of the line; the default ones after it
+        // are not.
+        assert_eq!(t.line(1).unwrap().len(), 1);
+        assert!(t.line(2).unwrap().is_empty());
+        let wrapped = term("0123456789012345678901\r\n3\r\n4\r\n5\r\n6\r\n7");
+        // A line the terminal wrapped says so on its last cell, which is
+        // kept whole.
+        assert_eq!(wrapped.line(0).unwrap().len(), 20);
+        assert_eq!(wrapped.line(1).unwrap().len(), 2);
+        // Every reader of history takes a short line as the rest blank.
+        assert_eq!(t.text_between((0, 0), (0, 20)), "ab");
+        assert_eq!(t.word_at(0, 15), Some((0, 2)));
+        assert_eq!(t.one_line_between((0, 0), (1, 20)), "ab c");
+        assert!(t.haystack().text.starts_with("ab\nc\n\n3"));
+        assert_eq!(t.line_chars(0).len(), 2);
+        assert!(t.link_at(0, 15).is_none());
+    }
+
+    #[test]
+    fn short_history_lines_of_long_words_copy_as_one_line_with_a_space() {
+        // Neither line reached the right edge, so the program broke them
+        // itself: a space belongs between the words, even though the two
+        // together are wider than the grid. A line trimmed in history must
+        // not pass for one that filled its row.
+        let t = term("aaaaaaaaaaaaaaa\r\nbbbbbbbbbbbbbbb\r\n3\r\n4\r\n5\r\n6\r\n7");
+        assert_eq!(t.scrollback_len(), 2);
+        assert!(t.line(0).unwrap().len() < t.cols());
+        assert_eq!(
+            t.one_line_between((0, 0), (1, 20)),
+            "aaaaaaaaaaaaaaa bbbbbbbbbbbbbbb"
+        );
+        // Lines that did fill their rows are joined as the edge broke them.
+        let full = term("aaaaaaaaaaaaaaaaaaaa\r\nbbbbbbbbbbbbbbbbbbbb\r\n3\r\n4\r\n5\r\n6\r\n7");
+        assert_eq!(full.line(0).unwrap().len(), 20);
+        assert_eq!(
+            full.one_line_between((0, 0), (1, 20)),
+            "aaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbb"
+        );
     }
 
     #[test]
