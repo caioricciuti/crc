@@ -2,6 +2,49 @@
 
 One entry per tag, written for people who use the editor.
 
+## v0.2.0-alpha.34, 2026-11-04
+
+A fix release from a code audit of the whole app: 36 findings, most of
+them about lost edits, wrong Git actions and stalls.
+
+- Quitting with several unsaved documents asks about each one and acts
+  only once every answer is in: Don't Save on one and Cancel on the next
+  keeps every tab open and quits nothing. The session (open files, panes,
+  terminals) is saved a second after each change rather than only at
+  quit, so a crash or a forced quit loses at most a second of layout.
+- One Undo right after Cmd-S goes back to the saved text, not past it; the
+  same after a reload. A file another program writes while crc is reading
+  it is noticed and reloaded instead of being overwritten by the next save.
+- Git: removing a worktree that still holds files Git ignores (build
+  output, local notes) is refused and names them. Merging into a detached
+  main checkout is refused with a note to check out a branch. Commit All
+  in a worktree runs the same private-marker check as Source Control and
+  is signed with your configured key agent. A commit waiting on a signing
+  key gives up after two minutes with an error instead of a hung panel,
+  and the panel says when it has waited on the key for more than three
+  seconds. Stage Change refuses when HEAD moved under it rather than
+  staging the wrong lines.
+- Terminals: a program that stops reading its input no longer stalls the
+  resize or close of a held session; scrollback replayed on reattach is
+  never answered as if it were a live query; pasted text cannot carry an
+  end-of-paste marker; copying a wrapped long word from history gives one
+  line; Find in Terminals waits for a busy session instead of skipping it.
+- Agents mode: auto-continue after an API error never sends a prompt you
+  are still typing, and stops once the agent is gone; connection resets,
+  refused connections and timeouts are retried like the API error. A
+  layout change right before Cmd-Q is on disk when the app ends. Clean up
+  and Remove check for ignored files before offering to remove a worktree.
+- Project search rows that run past the panel are elided with the match
+  highlight kept inside the row; the workspace card's Commit All, Pull and
+  Push buttons fit a narrow inspector.
+- Smaller: `crc newfile.txt` for a path that does not exist opens an empty
+  document instead of exiting; a workspace edit from a language server
+  that lists the same file twice keeps every edit; the MCP read tools
+  refuse pipes and read at most 8 MB; a neighbouring folder whose name
+  merely starts with your home folder's name is no longer shown as `~`;
+  when no monospace font passes its check crc draws with the system
+  fixed-pitch font instead of going blank.
+
 ## v0.2.0-alpha.33, 2026-10-31
 
 - Switching to a workspace in another folder no longer stalls the
