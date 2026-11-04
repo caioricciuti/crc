@@ -576,6 +576,7 @@ impl EditorView {
                     remote: None,
                     told_focus: false,
                     last_typed: None,
+                    draft_pending: false,
                     last_probe: None,
                     probe_owed: false,
                     retry: None,
@@ -634,12 +635,21 @@ impl EditorView {
                 .into_iter()
                 .find(|w| !w.is_empty())
                 .cloned();
+            // The spawn adds a tab at the end, or none at all (no shell to
+            // run, a pty that could not be opened): then there is nothing
+            // to type into, least of all whatever tab was last.
+            let had = self.state().map_or(0, |state| state.terminal.tabs.len());
             self.spawn_terminal_into(false, Some(&spec.cwd), workspace);
+            let Some(mut state) = self.state_mut() else {
+                continue;
+            };
+            if state.terminal.tabs.len() <= had {
+                continue;
+            }
             restored += 1;
             // A Claude tab crc started counts even when crc never got to
             // write down what ran (a crash, a forced quit).
             if (left.agent || spec.claude)
-                && let Some(mut state) = self.state_mut()
                 && let Some(tab) = state.terminal.tabs.last_mut()
             {
                 tab.session.write(b"claude --continue\n");
@@ -736,6 +746,7 @@ impl EditorView {
                     remote: None,
                     told_focus: false,
                     last_typed: None,
+                    draft_pending: false,
                     last_probe: None,
                     probe_owed: false,
                     retry: None,
@@ -1494,8 +1505,10 @@ impl EditorView {
 
     /// Auto-continue: types "continue" into each session whose try came
     /// due, and its Return a moment after. Each is checked again right
-    /// before: a session typed into since its error is the person's, and
-    /// one at work or being typed into now waits a second more. What crc
+    /// before: a session typed into since its error is the person's, as
+    /// is one with words left in its prompt; one whose agent has left
+    /// (back at the shell, which would get the word) is dropped; and one
+    /// at work or being typed into now waits a second more. What crc
     /// types is not the person typing: `last_typed` stays theirs.
     pub(super) fn auto_continue_tick(&self) {
         use crate::platform::terminal::Activity;
@@ -1510,7 +1523,7 @@ impl EditorView {
                 let Some(mut retry) = tab.retry else {
                     continue;
                 };
-                if retry.typed_since(tab.last_typed) {
+                if retry.typed_since(tab.last_typed) || tab.draft_pending || !tab.agent_in_front() {
                     tab.retry = None;
                     changed = true;
                     continue;
@@ -1520,8 +1533,12 @@ impl EditorView {
                     retry.enter_at = None;
                 }
                 if retry.next_at.is_some_and(|at| now >= at) {
-                    if !retry.due(now, tab.last_typed, showing == Some(index))
-                        || tab.activity() == Activity::Working
+                    if !retry.due(
+                        now,
+                        tab.last_typed,
+                        showing == Some(index),
+                        tab.draft_pending,
+                    ) || tab.activity() == Activity::Working
                     {
                         retry.next_at = Some(now + Duration::from_secs(1));
                     } else {
@@ -1677,8 +1694,13 @@ impl EditorView {
                     }
                     crate::project::review::Event::ApiError { error, details } => {
                         // The turn ended, as Stop says, on an error: the
-                        // tab waits, and a temporary one is tried again.
-                        if auto_continue && crate::platform::retry::temporary(&error, &details) {
+                        // tab waits, and a temporary one is tried again,
+                        // unless words typed into its prompt wait there,
+                        // which the word would be sent after.
+                        if auto_continue
+                            && !tab.draft_pending
+                            && crate::platform::retry::temporary(&error, &details)
+                        {
                             tab.retry = Some(crate::platform::retry::Retry::after_error(
                                 tab.retry.as_ref(),
                                 now,

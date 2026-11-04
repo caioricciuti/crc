@@ -111,6 +111,10 @@ pub struct Tab {
     pub told_focus: bool,
     /// When something was last typed into it; see [`Tab::heeds_bell`].
     pub last_typed: Option<Instant>,
+    /// Words were typed into its prompt and not sent: auto-continue
+    /// leaves it alone, since its word would go after them. See
+    /// [`draft_after`].
+    pub draft_pending: bool,
     /// When its process was last read for where it is and whether it runs
     /// ssh; see [`Tab::probe`].
     pub last_probe: Option<Instant>,
@@ -357,9 +361,59 @@ impl Tab {
         drop(term);
         self.session.write(bytes);
         self.last_typed = Some(Instant::now());
+        self.draft_pending = draft_after(bytes, self.draft_pending);
         // The person answered: auto-continue leaves it to them.
         self.retry = None;
         answered
+    }
+
+    /// Whether the agent its hooks speak for is still what the keyboard
+    /// reaches. The shell crc started is still its program (the kernel
+    /// has the arguments it was started with) and runs nothing: the agent
+    /// typed into it has left, and what is typed now goes to the shell.
+    /// A program that took the shell's place (`-c claude` is exec'd) or a
+    /// shell with something in front counts as the agent; one that cannot
+    /// be read is not guessed at.
+    pub fn agent_in_front(&mut self) -> bool {
+        let Some(pid) = self.find_program_pid() else {
+            return true;
+        };
+        agent_in_front_of(
+            &self.launch.args,
+            crate::platform::process_args(pid).as_deref(),
+            &crate::platform::child_pids(pid),
+        )
+    }
+}
+
+/// [`Tab::agent_in_front`] from what the kernel says of the tab's program:
+/// its arguments (`None` when it cannot be read) and its children.
+pub fn agent_in_front_of(
+    launch_args: &[String],
+    args: Option<&[String]>,
+    children: &[i32],
+) -> bool {
+    match args.and_then(|args| args.get(1..)) {
+        Some(rest) if rest == launch_args => !children.is_empty(),
+        _ => true,
+    }
+}
+
+/// Whether the prompt holds words not sent after `bytes` were typed into
+/// it, `pending` whether it did before. A Return or line feed sends them;
+/// Esc, Ctrl-C and Ctrl-U clear the line. A paste is words; an escape
+/// sequence (an arrow, a function key) moves without adding any, and a
+/// control byte (a backspace, a tab) changes the line without ending it,
+/// so both leave the answer as it was.
+pub fn draft_after(bytes: &[u8], pending: bool) -> bool {
+    match bytes {
+        [] => pending,
+        [0x1b] | [0x03] | [0x15] => false,
+        _ if bytes.starts_with(b"\x1b[200~") => true,
+        [0x1b, ..] => pending,
+        [.., b'\r' | b'\n'] => false,
+        _ if bytes.iter().all(|b| *b < 0x20 || *b == 0x7f) => pending,
+        _ => true,
     }
 }
 
@@ -2778,6 +2832,7 @@ mod tests {
             remote: None,
             told_focus: false,
             last_typed: None,
+            draft_pending: false,
             last_probe: None,
             probe_owed: false,
             retry: None,
@@ -2786,6 +2841,42 @@ mod tests {
             notified: false,
             seen: None,
         }
+    }
+
+    #[test]
+    fn a_draft_is_words_typed_and_not_sent() {
+        // Typing leaves a draft; Return sends it, Esc or Ctrl-C clears it.
+        assert!(draft_after(b"c", false));
+        assert!(draft_after(b"ontinue", true));
+        assert!(!draft_after(b"\r", true));
+        assert!(!draft_after(b"yes\n", true));
+        assert!(!draft_after(b"\x1b", true));
+        assert!(!draft_after(b"\x03", true));
+        assert!(!draft_after(b"\x15", true));
+        // Keys that move or edit do not say whether anything is left.
+        for bytes in [&b"\x1b[A"[..], b"\x1bOB", b"\x7f", b"\t", b"\x1b[I", b""] {
+            assert!(draft_after(bytes, true), "{bytes:?}");
+            assert!(!draft_after(bytes, false), "{bytes:?}");
+        }
+        // A paste is words, even one with a line break in it.
+        assert!(draft_after(b"\x1b[200~fix it\r\x1b[201~", false));
+        assert!(draft_after(b"\x1b[200~fix it\x1b[201~", false));
+    }
+
+    #[test]
+    fn the_agent_has_left_when_the_shell_runs_nothing() {
+        let shell: Vec<String> = vec!["-l".into()];
+        let still_shell: Vec<String> = vec!["/bin/zsh".into(), "-l".into()];
+        // The shell crc started, with claude in front of it, then alone.
+        assert!(agent_in_front_of(&shell, Some(&still_shell), &[412]));
+        assert!(!agent_in_front_of(&shell, Some(&still_shell), &[]));
+        // A `-c claude` tab: the shell exec'd into the agent, which has
+        // no children while it waits.
+        let claude_tab: Vec<String> = ["-l", "-i", "-c", "claude"].map(String::from).to_vec();
+        let claude: Vec<String> = vec!["claude".into()];
+        assert!(agent_in_front_of(&claude_tab, Some(&claude), &[]));
+        // Nothing read of the program: not guessed at.
+        assert!(agent_in_front_of(&shell, None, &[]));
     }
 
     #[test]

@@ -328,14 +328,20 @@ pub fn sentences(message: &str) -> Vec<String> {
 }
 
 /// Words that make a sentence something other than a claim that a check
-/// passed: a failure, a negation, a plan, a condition.
+/// passed: a failure, a negation, a plan, a condition. Any word ending in
+/// "n't" (didn't, weren't, shouldn't) is a negation too; see
+/// [`not_a_claim`].
 const NOT_A_CLAIM: &[&str] = &[
-    "not", "no", "never", "without", "didn't", "haven't", "hasn't", "couldn't", "can't", "cannot",
-    "wasn't", "isn't", "aren't", "won't", "don't", "doesn't", "unable", "skip", "skipped", "fail",
-    "fails", "failing", "failed", "failure", "failures", "broken", "error", "errors", "should",
-    "would", "could", "will", "might", "may", "once", "until", "if", "unless", "before", "need",
-    "needs", "try", "please", "let", "run", "rerun",
+    "not", "no", "never", "without", "cannot", "unable", "skip", "skipped", "fail", "fails",
+    "failing", "failed", "failure", "failures", "broken", "error", "errors", "should", "would",
+    "could", "will", "might", "may", "once", "until", "if", "unless", "before", "need", "needs",
+    "try", "please", "let", "run", "rerun",
 ];
+
+/// Whether `word`, lowercased, keeps the clause it is in from being a claim.
+fn not_a_claim(word: &str) -> bool {
+    NOT_A_CLAIM.contains(&word) || word.ends_with("n't")
+}
 
 /// Ways to say nothing failed, which would otherwise read as a failure.
 const NOTHING_FAILED: &[&str] = &[
@@ -416,7 +422,7 @@ pub fn claimed(sentences: &[String]) -> Vec<(Kind, String)> {
                 .split(|c: char| !(c.is_alphanumeric() || c == '\''))
                 .filter(|w| !w.is_empty())
                 .collect();
-            if words.iter().any(|w| NOT_A_CLAIM.contains(w)) {
+            if words.iter().any(|w| not_a_claim(w)) {
                 continue;
             }
             let passed = words.iter().any(|w| PASSED.contains(w));
@@ -644,6 +650,11 @@ mod tests {
             "Two tests fail.",
             "I didn't run the tests.",
             "I couldn't build it: the SDK is missing.",
+            "The tests weren't passing.",
+            "The build shouldn't fail now.",
+            "Clippy hadn't passed before this change.",
+            "It mustn't pass CI until the fixture is in.",
+            "The tests needn't pass for this.",
             "The tests should pass now.",
             "Run cargo test to check it passes.",
             "Once CI is green, merge it.",

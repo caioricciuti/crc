@@ -207,10 +207,17 @@ pub fn hook(kind: &str, input: &str, dir: &Path) -> Result<Option<Event>, String
                     .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
                     .filter(|s| !s.is_empty())
             };
+            // Without details, what the agent last said stands in only
+            // when it is the error itself ("API Error: ..."): its own
+            // prose about a lost connection in the code it was working
+            // on is not a reason to try again.
             Event::ApiError {
                 error: text("error").unwrap_or_else(|| "unknown".into()),
                 details: text("error_details")
-                    .or_else(|| text("last_assistant_message"))
+                    .or_else(|| {
+                        text("last_assistant_message")
+                            .filter(|s| s.to_lowercase().starts_with("api error"))
+                    })
                     .unwrap_or_default(),
             }
         }
@@ -909,7 +916,9 @@ pub fn claude_settings_arg(review: bool) -> Option<String> {
     let text = claude_settings(&exe, review);
     if std::fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
         std::fs::create_dir_all(path.parent()?).ok()?;
-        std::fs::write(&path, text).ok()?;
+        // Whole or not at all: a second instance starting a session at the
+        // same moment reads the old file or the new, never half of one.
+        crate::platform::write_atomically(&path, text.as_bytes()).ok()?;
     }
     Some(shell_quote(&path.to_string_lossy()))
 }
@@ -1477,10 +1486,17 @@ mod tests {
             details: r#"API Error: 500 {"type":"api_error"}"#.into(),
         };
         assert_eq!(event, Some(said.clone()));
-        // No details: the last message says it. No error named: unknown.
+        // No details: the last message says it when it is the error, not
+        // when it is the agent's own words. No error named: unknown.
         hook(
             "stop-failure",
-            r#"{"last_assistant_message":"Connection dropped"}"#,
+            r#"{"last_assistant_message":"API Error: Connection dropped"}"#,
+            &dir,
+        )
+        .expect("hook");
+        hook(
+            "stop-failure",
+            r#"{"error":"unknown","last_assistant_message":"The socket test lost its connection."}"#,
             &dir,
         )
         .expect("hook");
@@ -1492,7 +1508,11 @@ mod tests {
                 said,
                 Event::ApiError {
                     error: "unknown".into(),
-                    details: "Connection dropped".into(),
+                    details: "API Error: Connection dropped".into(),
+                },
+                Event::ApiError {
+                    error: "unknown".into(),
+                    details: String::new(),
                 },
                 Event::ApiError {
                     error: "rate_limit".into(),

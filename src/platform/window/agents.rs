@@ -1489,20 +1489,23 @@ impl EditorView {
         };
         // A host's are checked and removed there, over ssh.
         let runner = crate::platform::agents::runner(parent.host.as_deref());
-        // Dirty worktrees are skipped before anything closes.
+        // Dirty worktrees, and ones holding files Git ignores (which
+        // remove_on refuses too), are skipped before anything closes.
         let mut skipped = 0;
         let mut clean = Vec::new();
         for item in found {
-            match crate::project::worktree::is_dirty_on(&runner, &item.1.path) {
-                Ok(false) => clean.push(item),
-                Ok(true) | Err(_) => skipped += 1,
+            let dirty = crate::project::worktree::is_dirty_on(&runner, &item.1.path);
+            let kept = || crate::project::worktree::ignored_files_on(&runner, &item.1.path);
+            match dirty {
+                Ok(false) if kept().is_ok_and(|kept| kept.is_empty()) => clean.push(item),
+                _ => skipped += 1,
             }
         }
         if clean.is_empty() {
             state.say(
                 layout::Feedback::Failure,
                 format!(
-                    "Nothing cleaned up: {} uncommitted changes",
+                    "Nothing cleaned up: {} uncommitted changes or files Git ignores",
                     if skipped == 1 {
                         "1 merged worktree has".to_owned()
                     } else {
@@ -1556,7 +1559,9 @@ impl EditorView {
                     .collect();
                 let mut said = format!("Cleaned up {}", worktrees(count - failed.len()));
                 if skipped > 0 {
-                    said.push_str(&format!("; skipped {skipped} with uncommitted changes"));
+                    said.push_str(&format!(
+                        "; skipped {skipped} with uncommitted changes or files Git ignores"
+                    ));
                 }
                 if failed.is_empty() {
                     Ok(Done {
@@ -1692,27 +1697,29 @@ impl EditorView {
             return;
         };
         let runner = crate::platform::agents::runner(host.as_deref());
-        // Dirty worktrees are refused before anything closes.
-        match crate::project::worktree::is_dirty_on(&runner, &task.path) {
-            Ok(false) => {}
-            Ok(true) => {
-                state.say(
-                    layout::Feedback::Failure,
-                    format!(
-                        "{} has uncommitted changes; commit or discard them first",
-                        task.name()
-                    ),
-                );
-                drop(state);
-                self.request_redraw();
-                return;
-            }
-            Err(e) => {
-                state.say(layout::Feedback::Failure, e);
-                drop(state);
-                self.request_redraw();
-                return;
-            }
+        // Dirty worktrees, and ones holding files Git ignores, are refused
+        // before anything closes, as remove_on refuses them.
+        let refused = match crate::project::worktree::is_dirty_on(&runner, &task.path) {
+            Ok(false) => match crate::project::worktree::ignored_files_on(&runner, &task.path) {
+                Ok(kept) if kept.is_empty() => None,
+                Ok(kept) => Some(format!(
+                    "{} holds files Git ignores ({}); move or delete them first",
+                    task.name(),
+                    kept[..kept.len().min(3)].join(", ")
+                )),
+                Err(e) => Some(e),
+            },
+            Ok(true) => Some(format!(
+                "{} has uncommitted changes; commit or discard them first",
+                task.name()
+            )),
+            Err(e) => Some(e),
+        };
+        if let Some(said) = refused {
+            state.say(layout::Feedback::Failure, said);
+            drop(state);
+            self.request_redraw();
+            return;
         }
         for index in sessions.into_iter().rev() {
             state.terminal.close_tab(index);

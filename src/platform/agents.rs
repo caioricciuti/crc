@@ -206,6 +206,68 @@ fn order_file() -> Option<PathBuf> {
     Some(crate::platform::app_support()?.join("agents/order"))
 }
 
+/// The arrangement writes handed to workers; see
+/// [`Panel::save_arrangement`]. Each state handed out gets a number, and
+/// only the worker holding the newest writes.
+#[derive(Default)]
+struct ArrangementWrites {
+    /// The newest state handed out, and the newest whose worker has run.
+    counts: std::sync::Mutex<(u64, u64)>,
+    /// Told each time a worker has run, for [`ArrangementWrites::flush`].
+    ran: std::sync::Condvar,
+}
+
+impl ArrangementWrites {
+    fn lock(&self) -> std::sync::MutexGuard<'_, (u64, u64)> {
+        self.counts.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A state handed to a worker: its number.
+    fn hand_out(&self) -> u64 {
+        let mut counts = self.lock();
+        counts.0 += 1;
+        counts.0
+    }
+
+    /// Writes `text`, the arrangement as of write `generation`, to `file`,
+    /// unless a newer one was handed out since: the worker for that one
+    /// writes instead. The counts are held through the write, so two
+    /// workers never race for the file.
+    fn write(&self, generation: u64, file: &Path, text: &str) -> std::io::Result<()> {
+        let mut counts = self.lock();
+        let result = if counts.0 == generation {
+            if let Some(dir) = file.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            crate::platform::write_atomically(file, text.as_bytes())
+        } else {
+            Ok(())
+        };
+        counts.1 = counts.1.max(generation);
+        drop(counts);
+        self.ran.notify_all();
+        result
+    }
+
+    /// Waits until the newest state handed out has been written, or
+    /// `timeout` passes: whether it was.
+    fn flush(&self, timeout: std::time::Duration) -> bool {
+        let started = std::time::Instant::now();
+        let mut counts = self.lock();
+        while counts.1 < counts.0 {
+            let Some(left) = timeout.checked_sub(started.elapsed()) else {
+                return false;
+            };
+            counts = self
+                .ran
+                .wait_timeout(counts, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        true
+    }
+}
+
 /// The per-project files kept before the list was one for the app, with
 /// `extension` (`workspaces` or `order`), by name. Read once, to carry
 /// them over; left in place.
@@ -1290,6 +1352,9 @@ pub struct Panel {
     pub sessions_ticking: bool,
     /// Your order, pins and names, kept for the project.
     pub arrangement: Arrangement,
+    /// How many times the arrangement was handed to a worker to write;
+    /// see [`Panel::save_arrangement`].
+    arrangement_writes: std::sync::Arc<ArrangementWrites>,
     /// A row being dragged.
     pub drag: Option<RowDrag>,
     /// The selected workspace its folded merged group was last opened for,
@@ -2609,14 +2674,30 @@ impl Panel {
         Some(new_id)
     }
 
+    /// Writes the arrangement on a worker: the write ends in an fsync,
+    /// which a click that folds a card need not wait for. A burst of
+    /// clicks hands each state to a worker of its own; only the newest
+    /// is written, so the file never goes back to an older one.
     fn save_arrangement(&self) {
         let Some(file) = order_file().filter(|_| self.loaded) else {
             return;
         };
-        if let Some(dir) = file.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let _ = crate::platform::write_atomically(&file, self.arrangement.text().as_bytes());
+        let text = self.arrangement.text();
+        let writes = std::sync::Arc::clone(&self.arrangement_writes);
+        let generation = writes.hand_out();
+        std::thread::spawn(move || {
+            if let Err(e) = writes.write(generation, &file, &text) {
+                eprintln!("crc: cannot write {}: {e}", file.display());
+            }
+        });
+    }
+
+    /// Waits, a second at most, for the newest arrangement handed to a
+    /// worker to be on disk: for the quit path, which would otherwise
+    /// leave with a fold or a drag of the last moment unwritten.
+    pub fn flush_arrangement(&self) {
+        self.arrangement_writes
+            .flush(std::time::Duration::from_secs(1));
     }
 
     /// The workspace the row `id`, dragged, lands before, by the cards
@@ -4252,6 +4333,53 @@ mod tests {
             host: None,
             github: None,
         }
+    }
+
+    #[test]
+    fn the_arrangement_worker_writes_the_newest_state_only() {
+        let dir = std::env::temp_dir().join(format!("crc-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("agents/order");
+        let writes = std::sync::Arc::new(ArrangementWrites::default());
+        let hand_out = |text: &str| (writes.hand_out(), text.to_owned());
+        // Nothing handed out: nothing to wait for.
+        assert!(writes.flush(std::time::Duration::from_millis(10)));
+        // One write lands, folder and all.
+        let (generation, text) = hand_out("activity folded\n");
+        // Handed out and not written yet: a flush gives up after its wait.
+        assert!(!writes.flush(std::time::Duration::from_millis(10)));
+        writes.write(generation, &file, &text).expect("write");
+        assert!(writes.flush(std::time::Duration::from_millis(10)));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "activity folded\n");
+        // A burst of toggles: three states handed out before any worker
+        // ran. Whatever order the workers run in, the file ends on the
+        // last state and never goes back to an earlier one, and a flush
+        // after the burst finds it there.
+        let burst: Vec<(u64, String)> = ["a\n", "b\n", "c\n"].into_iter().map(hand_out).collect();
+        let workers: Vec<_> = burst
+            .iter()
+            .rev()
+            .map(|(generation, text)| {
+                let (writes, file, text) = (writes.clone(), file.clone(), text.clone());
+                let generation = *generation;
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    writes.write(generation, &file, &text)
+                })
+            })
+            .collect();
+        assert!(
+            writes.flush(std::time::Duration::from_secs(5)),
+            "the burst landed"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "c\n");
+        for worker in workers {
+            worker.join().expect("worker").expect("write");
+        }
+        // A stale worker running late changes nothing.
+        writes.write(1, &file, "activity folded\n").expect("write");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "c\n");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

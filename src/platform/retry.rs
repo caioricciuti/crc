@@ -29,16 +29,32 @@ pub const WORD: &str = "continue";
 pub const ENTER_GAP: Duration = Duration::from_millis(200);
 
 /// Words in an `unknown` error's text that say the connection failed, not
-/// the request: worth another try.
-const NETWORK: [&str; 7] = [
+/// the request: worth another try. Each is matched as whole words, so
+/// "reconnect" is not a connection error.
+const NETWORK: [&str; 8] = [
     "unable to connect",
     "connection dropped",
     "connection lost",
     "connection closed",
-    "econn",
-    "timed out",
+    "econnreset",
+    "econnrefused",
+    "econnaborted",
     "socket hang up",
 ];
+
+/// What says "timed out" is about a request and not something the agent
+/// said of its own work ("the tests timed out"): the text names the API,
+/// a request or a connection.
+const REQUEST: [&str; 5] = ["api error", "request", "fetch failed", "connect", "socket"];
+
+/// Whether `text` holds `words` with nothing of a longer word around them.
+fn has_words(text: &str, words: &str) -> bool {
+    let not_word = |c: char| !c.is_alphanumeric();
+    text.match_indices(words).any(|(at, _)| {
+        text[..at].chars().next_back().is_none_or(not_word)
+            && text[at + words.len()..].chars().next().is_none_or(not_word)
+    })
+}
 
 /// Whether an API error that ended a turn is temporary: `error` as Claude
 /// Code's `StopFailure` hook names it, `text` what it said of it.
@@ -47,7 +63,8 @@ pub fn temporary(error: &str, text: &str) -> bool {
         "overloaded" | "server_error" => true,
         "unknown" => {
             let text = text.to_lowercase();
-            NETWORK.iter().any(|word| text.contains(word))
+            NETWORK.iter().any(|words| has_words(&text, words))
+                || (has_words(&text, "timed out") && REQUEST.iter().any(|w| text.contains(w)))
         }
         // rate_limit covers usage limits and "high load, use /model" too:
         // waiting a minute does not lift either.
@@ -117,12 +134,22 @@ impl Retry {
     }
 
     /// Whether to send now, checked right before sending: due, nothing
-    /// typed into the session since the error, and, when it is the one
-    /// showing, nothing typed into it for [`TYPING_QUIET`].
-    pub fn due(&self, now: Instant, last_typed: Option<Instant>, showing: bool) -> bool {
+    /// typed into the session since the error, no words left in its
+    /// prompt (`draft`, which the word would go after), and, when it is
+    /// the one showing, nothing typed into it for [`TYPING_QUIET`].
+    pub fn due(
+        &self,
+        now: Instant,
+        last_typed: Option<Instant>,
+        showing: bool,
+        draft: bool,
+    ) -> bool {
         let typing = showing
             && last_typed.is_some_and(|at| now.saturating_duration_since(at) < TYPING_QUIET);
-        self.next_at.is_some_and(|at| now >= at) && !self.typed_since(last_typed) && !typing
+        self.next_at.is_some_and(|at| now >= at)
+            && !self.typed_since(last_typed)
+            && !typing
+            && !draft
     }
 
     /// The word was typed at `now`: counted, its Return due after
@@ -154,11 +181,21 @@ mod tests {
             "Request timed out.",
             "socket hang up",
             "connect ECONNREFUSED 127.0.0.1:443",
+            "API Error: fetch failed (ECONNABORTED)",
         ] {
             assert!(temporary("unknown", text), "{text}");
         }
         assert!(!temporary("unknown", ""));
         assert!(!temporary("unknown", "something went wrong"));
+        // Words that only look like a connection error: "econn" inside
+        // "reconnect", "timed out" said of a test and not of a request.
+        for text in [
+            "Failed to reconnect to server",
+            "The tests timed out after 60s",
+            "Reconnecting: ECONNRESETTING is not a word",
+        ] {
+            assert!(!temporary("unknown", text), "{text}");
+        }
         for error in [
             "rate_limit",
             "authentication_failed",
@@ -190,8 +227,8 @@ mod tests {
         let mut retry = Retry::after_error(None, start, first);
         assert_eq!(retry.next_at, Some(start + Duration::from_secs(20)));
         assert!(retry.pending());
-        assert!(!retry.due(start + Duration::from_secs(19), None, false));
-        assert!(retry.due(start + Duration::from_secs(20), None, false));
+        assert!(!retry.due(start + Duration::from_secs(19), None, false, false));
+        assert!(retry.due(start + Duration::from_secs(20), None, false, false));
         let at = start + Duration::from_secs(20);
         retry.sent(at);
         assert!(!retry.pending());
@@ -217,7 +254,7 @@ mod tests {
         let retry = Retry::after_error(Some(&retry), last, first);
         assert!(!retry.pending());
         assert_eq!(retry.next_look(), None);
-        assert!(!retry.due(last + Duration::from_secs(1000), None, false));
+        assert!(!retry.due(last + Duration::from_secs(1000), None, false, false));
     }
 
     #[test]
@@ -239,11 +276,11 @@ mod tests {
         let retry = Retry::after_error(None, start, FIRST_DELAY);
         let due = start + FIRST_DELAY;
         assert!(!retry.typed_since(Some(start - Duration::from_secs(1))));
-        assert!(retry.due(due, Some(start - Duration::from_secs(60)), true));
+        assert!(retry.due(due, Some(start - Duration::from_secs(60)), true, false));
         let typed = Some(start + Duration::from_secs(5));
         assert!(retry.typed_since(typed));
-        assert!(!retry.due(due, typed, false));
-        assert!(!retry.due(due + Duration::from_secs(600), typed, false));
+        assert!(!retry.due(due, typed, false, false));
+        assert!(!retry.due(due + Duration::from_secs(600), typed, false, false));
     }
 
     #[test]
@@ -253,8 +290,22 @@ mod tests {
         let retry = Retry::after_error(None, start, Duration::from_millis(500));
         let typed = Some(start - Duration::from_millis(100));
         let due = start + Duration::from_secs(1);
-        assert!(!retry.due(due, typed, true), "being typed into");
-        assert!(retry.due(due, typed, false), "not the one showing");
-        assert!(retry.due(start + TYPING_QUIET, typed, true));
+        assert!(!retry.due(due, typed, true, false), "being typed into");
+        assert!(retry.due(due, typed, false, false), "not the one showing");
+        assert!(retry.due(start + TYPING_QUIET, typed, true, false));
+    }
+
+    #[test]
+    fn words_left_in_the_prompt_hold_it_back() {
+        let start = Instant::now();
+        let retry = Retry::after_error(None, start, FIRST_DELAY);
+        let due = start + FIRST_DELAY;
+        // Nothing typed since the error, not the one showing: it would go,
+        // but for the draft typed into it before the error, which
+        // "continue" would be sent after.
+        assert!(retry.due(due, None, false, false));
+        assert!(!retry.due(due, None, false, true));
+        assert!(!retry.due(due, Some(start - Duration::from_secs(60)), false, true));
+        assert!(!retry.due(due + Duration::from_secs(600), None, true, true));
     }
 }

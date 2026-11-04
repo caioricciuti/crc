@@ -206,6 +206,7 @@ fn tab(title: &str, workspace: &Workspace, cols: usize, rows: usize) -> Tab {
         remote: None,
         told_focus: false,
         last_typed: None,
+        draft_pending: false,
         last_probe: None,
         probe_owed: false,
         seen: None,
