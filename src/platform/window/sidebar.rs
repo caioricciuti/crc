@@ -69,11 +69,10 @@ impl EditorView {
             return;
         };
         let target = destination.join(name);
-        // Canonical identity before the move, for the same reason rename
-        // captures it: afterwards the old path cannot be canonicalised.
-        let source_key = crate::platform::canonical(&drag.path);
         // Unsaved work under the item would be stranded at a path that no
-        // longer exists, the same guard Move to Trash uses.
+        // longer exists, the same guard Move to Trash uses. Tabs are keyed
+        // by canonical paths.
+        let source_key = crate::platform::canonical(&drag.path);
         if self
             .ivars()
             .state
@@ -91,34 +90,16 @@ impl EditorView {
             self.pump();
             return;
         }
-        match move_without_replace(&drag.path, &target) {
-            Ok(()) => {
-                {
-                    let Some(mut state) = self.state_mut() else {
-                        return;
-                    };
-                    for docs in all_docs_mut(&mut state) {
-                        docs.rename_path(&source_key, &target);
-                    }
-                    state.message = Some((
-                        format!(
-                            "moved {} to {}",
-                            name.to_string_lossy(),
-                            destination.display()
-                        ),
-                        Instant::now(),
-                    ));
-                }
-                self.refresh_project_after_disk_change();
-                self.sync_title();
-                self.reparse();
-            }
-            Err(error) => {
-                if let Some(mut state) = self.state_mut() {
-                    state.message = Some((format!("move failed: {error}"), Instant::now()));
-                }
-            }
-        }
+        self.move_item(
+            &drag.path,
+            &target,
+            format!(
+                "moved {} to {}",
+                name.to_string_lossy(),
+                destination.display()
+            ),
+            "move failed",
+        );
         self.request_redraw();
         self.pump();
     }

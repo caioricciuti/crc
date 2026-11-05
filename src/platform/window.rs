@@ -4260,11 +4260,9 @@ define_class!(
                 return;
             }
 
-            let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
-            let result = NSFileManager::defaultManager()
-                .trashItemAtURL_resultingItemURL_error(&url, None);
-            match result {
-                Ok(()) => {
+            match project::trash_item(&path) {
+                // Where it is in the Trash is what an undo will need.
+                Ok(_landed) => {
                     {
                         let Some(mut state) = self.state_mut() else {
                             return;
@@ -4282,7 +4280,7 @@ define_class!(
                 Err(error) => {
                     if let Some(mut state) = self.state_mut() {
                     state.message = Some((
-                        format!("could not move to Trash: {}", error.localizedDescription()),
+                        format!("could not move to Trash: {error}"),
                         Instant::now(),
                     ));
                     }
@@ -10896,10 +10894,14 @@ mod tests {
 /// on itself, or anywhere inside itself, asks the filesystem to make a path
 /// its own descendant. Dropping something back where it already lives is a
 /// no-op worth refusing so the drop target never lights up for it.
+///
+/// Judged by where the file system says the two are, not by how the paths
+/// are written: a folder reached through a symbolic link is still the
+/// folder, and dropping it there would nest it all the same.
 fn valid_drop(source: &Path, destination: &Path) -> bool {
-    destination != source
-        && !destination.starts_with(source)
-        && source.parent() != Some(destination)
+    use crate::project::fileops;
+    !fileops::is_inside(destination, source)
+        && fileops::located(source).parent() != Some(fileops::resolved(destination).as_path())
 }
 
 #[cfg(test)]
@@ -10946,5 +10948,37 @@ mod drop_tests {
             Path::new("/p/src"),
             Path::new("/p/src-generated")
         ));
+    }
+
+    /// The same folder under another name: as written, `alias/render` is
+    /// nowhere near `src`, and a rename into it would still be a folder
+    /// moved inside itself.
+    #[test]
+    fn a_symbolic_link_does_not_hide_the_folder_behind_it() {
+        use std::os::unix::fs::symlink;
+        let tree = crate::project::TempTree::new(
+            "drop-through-link",
+            &[("src/render/font.rs", "f"), ("docs/", "")],
+        );
+        let root = tree.0.as_path();
+        let src = root.join("src");
+        let alias = root.join("alias");
+        symlink(&src, &alias).unwrap();
+
+        assert!(!valid_drop(&src, &alias), "onto itself");
+        assert!(!valid_drop(&src, &alias.join("render")), "into a child");
+        assert!(
+            !valid_drop(&src.join("render"), &alias),
+            "where it already is"
+        );
+        assert!(
+            !valid_drop(&alias.join("render/font.rs"), &src.join("render")),
+            "where it already is, the item through the link"
+        );
+        // The link is an item of its own: it can go into the folder it
+        // points at, and other things can be dropped through it.
+        assert!(valid_drop(&alias, &src.join("render")));
+        assert!(valid_drop(&root.join("docs"), &alias));
+        assert!(!valid_drop(&alias, root), "the link is already there");
     }
 }

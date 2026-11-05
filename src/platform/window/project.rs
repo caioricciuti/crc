@@ -356,7 +356,12 @@ impl EditorView {
             }
             SidebarEditKind::Rename(path) => {
                 if path.file_name().is_some_and(|current| current != name) {
-                    self.rename_item(&path, &target);
+                    self.move_item(
+                        &path,
+                        &target,
+                        format!("renamed to {}", target.display()),
+                        "rename failed",
+                    );
                 }
             }
         }
@@ -391,42 +396,35 @@ impl EditorView {
         self.lsp_sync_open();
     }
 
-    /// Moves `path` to `destination`, re-keying open tabs.
-    pub(super) fn rename_item(&self, path: &Path, destination: &Path) {
-        // Open buffers use canonical identities. Capture the source key
-        // before the rename makes it impossible to canonicalise.
-        let source_key = crate::platform::canonical(path);
-        match move_without_replace(path, destination) {
-            Ok(()) => {
-                {
-                    let Some(mut state) = self.state_mut() else {
-                        return;
-                    };
-                    for docs in all_docs_mut(&mut state) {
-                        docs.rename_path(&source_key, destination);
-                    }
-                    // Local history follows the file, or every file in the
-                    // folder.
-                    let moved = crate::platform::canonical(destination);
-                    if moved.is_dir() {
-                        state.history.rename_folder(&source_key, &moved);
-                    } else {
-                        state.history.rename(&source_key, &moved);
-                    }
-                    state.message = Some((
-                        format!("renamed to {}", destination.display()),
-                        Instant::now(),
-                    ));
-                }
-                self.refresh_project_after_disk_change();
-                self.sync_title();
-                self.reparse();
-            }
-            Err(error) => {
-                if let Some(mut state) = self.state_mut() {
-                    state.message = Some((format!("rename failed: {error}"), Instant::now()));
-                }
-            }
+    /// Moves the project item at `path` to `destination`, by a rename in
+    /// the Explorer or a drag, with its tabs and its local history. Says
+    /// `done` when it has moved, or `failed` and why.
+    pub(super) fn move_item(&self, path: &Path, destination: &Path, done: String, failed: &str) {
+        let moved = {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            let State {
+                docs,
+                panes,
+                history,
+                ..
+            } = &mut *state;
+            let open = std::iter::once(docs).chain(panes.iter_mut().map(|p| &mut p.docs));
+            let moved = move_project_item(open, history, path, destination);
+            state.message = Some((
+                match &moved {
+                    Ok(()) => done,
+                    Err(error) => format!("{failed}: {error}"),
+                },
+                Instant::now(),
+            ));
+            moved.is_ok()
+        };
+        if moved {
+            self.refresh_project_after_disk_change();
+            self.sync_title();
+            self.reparse();
         }
     }
 
@@ -468,5 +466,146 @@ impl EditorView {
 
         self.open_created_file(&path);
         true
+    }
+}
+
+/// An item moves from `source` to `destination` inside the project, and
+/// what is kept by its path goes with it: the tabs open on it or under it
+/// are re-keyed, and local history follows the file, or every file in the
+/// folder. Nothing at `destination` is replaced, and a symbolic link moves
+/// as the link.
+fn move_project_item<'a>(
+    open: impl Iterator<Item = &'a mut Documents>,
+    history: &mut crate::history::recorder::Recorder,
+    source: &Path,
+    destination: &Path,
+) -> std::io::Result<()> {
+    // Open buffers use canonical identities. Capture the source key
+    // before the move makes it impossible to canonicalise.
+    let source_key = crate::platform::canonical(source);
+    move_without_replace(source, destination)?;
+    for docs in open {
+        docs.rename_path(&source_key, destination);
+    }
+    let moved = crate::platform::canonical(destination);
+    if moved.is_dir() {
+        history.rename_folder(&source_key, &moved);
+    } else {
+        history.rename(&source_key, &moved);
+    }
+    Ok(())
+}
+
+/// Moves the item at `path` to the Trash, a symbolic link as the link, and
+/// answers where it is there, for putting it back: the Trash renames what
+/// would clash. `None` when the system does not say.
+pub(super) fn trash_item(path: &Path) -> Result<Option<std::path::PathBuf>, String> {
+    // Said outright: asked to find out, the URL follows a link to a folder.
+    let folder = std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir());
+    let url =
+        NSURL::fileURLWithPath_isDirectory(&NSString::from_str(&path.to_string_lossy()), folder);
+    let mut landed = None;
+    NSFileManager::defaultManager()
+        .trashItemAtURL_resultingItemURL_error(&url, Some(&mut landed))
+        .map_err(|error| error.localizedDescription().to_string())?;
+    Ok(landed
+        .and_then(|url| url.path())
+        .map(|path| std::path::PathBuf::from(path.to_string())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::move_project_item;
+    use crate::history::recorder::{Recorder, Timing};
+    use crate::history::store::{Reason, Store};
+    use crate::project::TempTree;
+    use crate::text::buffer::Buffer;
+    use crate::text::documents::Documents;
+    use crate::text::rope::Rope;
+    use std::path::Path;
+    use std::time::Duration;
+
+    /// The texts kept for `path`, oldest first.
+    fn kept(db: &Path, path: &Path) -> Vec<(Reason, String)> {
+        let store = Store::open(db).unwrap();
+        let mut list: Vec<(Reason, String)> = store
+            .list(path)
+            .unwrap()
+            .iter()
+            .map(|entry| (entry.reason, store.read(entry.id).unwrap().unwrap()))
+            .collect();
+        list.reverse();
+        list
+    }
+
+    /// A drag in the Explorer used to move the file and its tab and leave
+    /// its local history under the old path, where nothing finds it again.
+    #[test]
+    fn a_moved_item_takes_its_tabs_and_its_local_history() {
+        let tree = TempTree::new(
+            "move-item-history",
+            &[
+                ("project/notes.txt", "two\n"),
+                ("project/docs/guide.md", "new\n"),
+                ("project/docs-old/keep.md", "k\n"),
+                ("project/archive/", ""),
+            ],
+        );
+        let db = tree.0.join("history.db");
+        let root = crate::platform::canonical(&tree.0.join("project"));
+        let wait = Duration::from_secs(10);
+        let mut history = Recorder::new(Some(db.clone()), true, "", Timing::default());
+
+        // A file, open in a tab, with a version kept.
+        let file = root.join("notes.txt");
+        let target = root.join("archive/notes.txt");
+        history.edited_on_disk(&file, &Rope::from_text("one\n"));
+        let mut docs = Documents::new(Buffer::open(file.clone()).unwrap());
+        move_project_item(std::iter::once(&mut docs), &mut history, &file, &target).unwrap();
+        history.finish(std::iter::empty(), wait);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "two\n");
+        assert!(!file.exists());
+        assert_eq!(docs.active().path.as_deref(), Some(target.as_path()));
+        assert_eq!(kept(&db, &file), []);
+        assert_eq!(
+            kept(&db, &target),
+            [(Reason::EditedOnDisk, "one\n".to_string())]
+        );
+
+        // A folder: every file in it, and not its neighbour's.
+        let folder = root.join("docs");
+        let inside = folder.join("guide.md");
+        let neighbour = root.join("docs-old/keep.md");
+        history.edited_on_disk(&inside, &Rope::from_text("old\n"));
+        history.edited_on_disk(&neighbour, &Rope::from_text("j\n"));
+        let mut docs = Documents::new(Buffer::open(inside.clone()).unwrap());
+        let moved = root.join("archive/docs");
+        move_project_item(std::iter::once(&mut docs), &mut history, &folder, &moved).unwrap();
+        history.finish(std::iter::empty(), wait);
+        assert_eq!(
+            docs.active().path.as_deref(),
+            Some(moved.join("guide.md").as_path())
+        );
+        assert_eq!(kept(&db, &inside), []);
+        assert_eq!(
+            kept(&db, &moved.join("guide.md")),
+            [(Reason::EditedOnDisk, "old\n".to_string())]
+        );
+        assert_eq!(
+            kept(&db, &neighbour),
+            [(Reason::EditedOnDisk, "j\n".to_string())]
+        );
+
+        // Nothing is replaced, and nothing follows a move that did not
+        // happen.
+        let taken = root.join("archive/taken.md");
+        std::fs::write(&taken, "mine\n").unwrap();
+        let error = move_project_item(std::iter::once(&mut docs), &mut history, &neighbour, &taken)
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        history.finish(std::iter::empty(), wait);
+        assert_eq!(std::fs::read_to_string(&taken).unwrap(), "mine\n");
+        assert_eq!(kept(&db, &taken), []);
+        assert_eq!(kept(&db, &neighbour).len(), 1);
     }
 }

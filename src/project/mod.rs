@@ -2,6 +2,7 @@
 
 pub mod conflict;
 pub mod duckdb;
+pub mod fileops;
 pub mod finder;
 pub mod git;
 pub mod history;
