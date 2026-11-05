@@ -732,8 +732,30 @@ pub fn push_ui_text_scaled(
     }
 }
 
-/// A count on an icon: a small accent pill at its top right, cut out of
-/// the icon by a ring in `ground`, the surface it sits on.
+/// Height of a count badge's pill; a single digit makes it a circle.
+pub const BADGE_HEIGHT: f32 = 15.0;
+/// Width of the ring that cuts a badge out of what it sits on.
+pub const BADGE_RING: f32 = 2.0;
+/// How far inside the icon's square the ring stops, at the right and at the
+/// bottom: a hairline along the square's edge keeps two points of ground.
+pub const BADGE_INSET: f32 = 3.0;
+/// Room either side of a badge's label.
+const BADGE_PAD: f32 = 3.0;
+/// A badge's label, as a share of the UI size.
+const BADGE_TEXT: f32 = 0.78;
+/// The same two for the capped label, `99+`: set tighter and smaller, so
+/// three characters hide little more of the icon than two digits do.
+const BADGE_PAD_CAPPED: f32 = 2.0;
+const BADGE_TEXT_CAPPED: f32 = 0.65;
+
+/// A count on an icon: a small accent pill in the bottom right corner of
+/// the icon's square, cut out of the icon by a ring in `ground`, the
+/// surface it sits on.
+///
+/// The pill hangs from that corner and grows to the left, and no wider
+/// than the square allows: a long label is drawn smaller instead, so the
+/// pill and its ring never leave the square whatever the count or the
+/// size of the UI face.
 pub fn push_badge(
     out: &mut Vec<GlyphInstance>,
     atlas: &mut Atlas,
@@ -745,38 +767,53 @@ pub fn push_badge(
     if count == 0 {
         return;
     }
-    let label = if count > 99 {
-        "99+".to_owned()
+    let (label, size, pad) = if count > 99 {
+        ("99+".to_owned(), BADGE_TEXT_CAPPED, BADGE_PAD_CAPPED)
     } else {
-        count.to_string()
+        (count.to_string(), BADGE_TEXT, BADGE_PAD)
     };
-    const SCALE: f32 = 0.78;
-    const H: f32 = 15.0;
-    let w = (ui_text_width(atlas, &label) * SCALE + 8.0).max(H);
+    let edge = BADGE_INSET + BADGE_RING;
+    let text = ui_text_width(atlas, &label);
+    let widest = (icon.width - edge * 2.0).max(BADGE_HEIGHT);
+    // One digit is always a circle.
+    let width = if count < 10 {
+        BADGE_HEIGHT
+    } else {
+        (text * size + pad * 2.0).ceil().clamp(BADGE_HEIGHT, widest)
+    };
     let pill = Viewport {
-        x: (icon.x + icon.width * 0.5 + 2.0).round(),
-        y: (icon.y + icon.height * 0.5 - 15.0).round(),
-        width: w.round(),
-        height: H,
+        x: (icon.x + icon.width - edge).round() - width,
+        y: (icon.y + icon.height - edge).round() - BADGE_HEIGHT,
+        width,
+        height: BADGE_HEIGHT,
     };
     push_rounded_rect(
         out,
         Viewport {
-            x: pill.x - 2.0,
-            y: pill.y - 2.0,
-            width: pill.width + 4.0,
-            height: pill.height + 4.0,
+            x: pill.x - BADGE_RING,
+            y: pill.y - BADGE_RING,
+            width: pill.width + BADGE_RING * 2.0,
+            height: pill.height + BADGE_RING * 2.0,
         },
-        (H + 4.0) * 0.5,
+        BADGE_HEIGHT * 0.5 + BADGE_RING,
         ground,
     );
-    push_rounded_rect(out, pill, H * 0.5, theme.accent);
+    push_rounded_rect(out, pill, BADGE_HEIGHT * 0.5, theme.accent);
     let ink = if theme.is_dark() {
         [0.063, 0.086, 0.078, 1.0]
     } else {
         [1.0, 1.0, 1.0, 1.0]
     };
-    push_ui_text_scaled(out, atlas, pill, &label, ink, SCALE);
+    // As large as the pill's padding leaves room for, and no larger than
+    // a badge's label is.
+    let scale = ((pill.width - pad * 2.0) / text.max(1.0)).min(size);
+    let glyphs = out.len();
+    push_ui_text_scaled(out, atlas, pill, &label, ink, scale);
+    // A glyph's quad is as wide as its cell, which follows the code size
+    // and can be wider than the pill; the pill is where it ends.
+    for quad in &mut out[glyphs..] {
+        clip_horizontal(quad, pill.x, pill.x + pill.width);
+    }
 }
 
 /// A placeholder for a list row that is on its way: an icon square and
@@ -1779,5 +1816,97 @@ mod tests {
         assert_eq!(hotspot_at(&spots, 150.0, 50.0), None);
         begin_frame();
         assert!(hotspots().is_empty());
+    }
+
+    #[test]
+    fn a_badge_stays_in_the_bottom_right_of_its_square() {
+        // The usual faces, a larger UI face, whose labels are wider, and a
+        // zoomed code face, whose cells and so whose glyph quads are.
+        let atlases = [
+            (Atlas::build("SF Mono", 13.0, 2.0), true),
+            (Atlas::build_with_ui("SF Mono", 13.0, 20.0, 2.0), false),
+            (Atlas::build_with_ui("SF Mono", 28.0, 13.0, 2.0), true),
+        ];
+        // An icon's square in the activity strip, which draws a hairline
+        // one point wide along its right edge.
+        let square = Viewport {
+            x: 0.0,
+            y: 94.0,
+            width: 44.0,
+            height: 44.0,
+        };
+        let (right, bottom) = (square.x + square.width, square.y + square.height);
+        let middle = square.y + square.height * 0.5;
+        let ground = [0.2, 0.4, 0.6, 1.0];
+        for (mut atlas, usual_ui) in atlases {
+            for theme in [Theme::dark(), Theme::light()] {
+                let mut out = Vec::new();
+                push_badge(&mut out, &mut atlas, square, 0, ground, &theme);
+                assert!(out.is_empty(), "nothing to count, nothing drawn");
+                let mut two_digits = 0.0;
+                for count in [1, 9, 25, 99, 150] {
+                    out.clear();
+                    push_badge(&mut out, &mut atlas, square, count, ground, &theme);
+                    for quad in &out {
+                        let (x0, x1) = (quad.pos[0], quad.pos[0] + quad.size[0]);
+                        assert!(x0 >= square.x, "{count}: starts at {x0}");
+                        assert!(x1 <= right - 2.0, "{count}: ends at {x1}");
+                    }
+                    let ring = out.iter().find(|q| q.color == ground).expect("a ring");
+                    let pill = out
+                        .iter()
+                        .find(|q| q.color == theme.accent)
+                        .expect("a pill");
+                    // Hung from the bottom right corner, the ring two
+                    // points short of the hairline.
+                    assert_eq!(ring.pos[0] + ring.size[0], right - BADGE_INSET);
+                    assert_eq!(ring.pos[1] + ring.size[1], bottom - BADGE_INSET);
+                    assert!(ring.pos[0] + ring.size[0] <= right - 1.0 - 2.0);
+                    assert_eq!(ring.pos[0], pill.pos[0] - BADGE_RING);
+                    assert_eq!(ring.size[0], pill.size[0] + BADGE_RING * 2.0);
+                    // Never on the upper half of the glyph.
+                    assert!(pill.pos[1] >= middle, "{count}: top {}", pill.pos[1]);
+                    assert!(ring.pos[1] >= middle, "{count}: top {}", ring.pos[1]);
+                    assert_eq!(pill.size[1], BADGE_HEIGHT);
+                    if count < 10 {
+                        assert_eq!(pill.size[0], pill.size[1], "{count}: round");
+                    } else {
+                        assert!(pill.size[0] > pill.size[1], "{count}: a pill");
+                    }
+                    if count == 99 {
+                        two_digits = pill.size[0];
+                    }
+                    // The capped label is set smaller: at the usual UI size
+                    // its pill is about 20 points, a little wider than two
+                    // digits, so it hides about as much of the icon.
+                    if count > 99 && usual_ui {
+                        let width = pill.size[0];
+                        assert!(width > two_digits, "99+ is {width} wide");
+                        assert!(width <= two_digits + 3.0, "99+ is {width} wide");
+                        assert!(width <= 20.0, "99+ is {width} wide");
+                    }
+                    // The label stays on the pill.
+                    let labels = out
+                        .iter()
+                        .filter(|q| q.color != ground && q.pos != pill.pos);
+                    for glyph in labels {
+                        assert!(glyph.pos[0] >= pill.pos[0]);
+                        assert!(glyph.pos[0] + glyph.size[0] <= pill.pos[0] + pill.size[0]);
+                    }
+                }
+                // Past 99 the count stops growing the pill.
+                let capped = out
+                    .iter()
+                    .find(|q| q.color == theme.accent)
+                    .map(|q| q.size[0]);
+                out.clear();
+                push_badge(&mut out, &mut atlas, square, 12_345, ground, &theme);
+                let huge = out
+                    .iter()
+                    .find(|q| q.color == theme.accent)
+                    .map(|q| q.size[0]);
+                assert_eq!(capped, huge);
+            }
+        }
     }
 }
