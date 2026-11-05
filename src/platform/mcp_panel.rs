@@ -228,7 +228,7 @@ impl Panel {
         }
         let top = column.y + layout::SIDEBAR_HEADER_HEIGHT;
         let say = |out: &mut Vec<GlyphInstance>, atlas: &mut Atlas, y: f32, text: &str| {
-            layout::push_ui_text(
+            layout::push_ui_text_elided(
                 out,
                 atlas,
                 Viewport {
@@ -302,7 +302,7 @@ impl Panel {
                         4.0,
                         dot,
                     );
-                    layout::push_ui_text(
+                    layout::push_ui_text_elided(
                         out,
                         atlas,
                         Viewport {
@@ -348,7 +348,7 @@ impl Panel {
                     ));
                 }
                 Line::Note(text) => {
-                    layout::push_ui_text(
+                    layout::push_ui_text_elided(
                         out,
                         atlas,
                         Viewport {
@@ -362,7 +362,7 @@ impl Panel {
                     );
                 }
                 Line::Heading(text) => {
-                    layout::push_ui_text(
+                    layout::push_ui_text_elided(
                         out,
                         atlas,
                         Viewport {
@@ -389,7 +389,7 @@ impl Panel {
                         theme.status_text,
                     );
                     let name_w = (layout::ui_text_width(atlas, name) + 4.0).min(width * 0.65);
-                    layout::push_ui_text(
+                    layout::push_ui_text_elided(
                         out,
                         atlas,
                         Viewport {
@@ -401,7 +401,7 @@ impl Panel {
                         name,
                         theme.text,
                     );
-                    layout::push_ui_text(
+                    layout::push_ui_text_elided(
                         out,
                         atlas,
                         Viewport {
@@ -507,5 +507,48 @@ impl Panel {
             self.note.as_deref().unwrap_or("-"),
             self.page_hits.len()
         )
+    }
+}
+
+#[cfg(test)]
+mod narrow_tests {
+    use super::*;
+
+    #[test]
+    fn the_panel_cuts_no_label_at_the_narrowest_sidebar() {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let theme = Theme::default();
+        let mut unread = Panel::default();
+        let mut failed = Panel {
+            loaded: true,
+            error: Some("mcp.json could not be read: expected a value at line 4".into()),
+            ..Panel::default()
+        };
+        let mut empty = Panel {
+            loaded: true,
+            ..Panel::default()
+        };
+        for width in [140.0, 240.0] {
+            for (what, panel) in [
+                ("unread", &mut unread),
+                ("failed", &mut failed),
+                ("empty", &mut empty),
+            ] {
+                let column = Viewport {
+                    x: 48.0,
+                    y: 48.0,
+                    width,
+                    height: 700.0,
+                };
+                let mut out = Vec::new();
+                layout::take_cut_labels();
+                panel.draw(&mut atlas, column, &theme, &mut out);
+                assert_eq!(
+                    layout::frame_faults(&out, column),
+                    Vec::<String>::new(),
+                    "MCP, {what}, at {width}"
+                );
+            }
+        }
     }
 }

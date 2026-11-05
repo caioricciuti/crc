@@ -737,7 +737,7 @@ pub(crate) fn text(
     s: &str,
     color: [f32; 4],
 ) {
-    layout::push_ui_text(
+    layout::push_ui_text_elided(
         out,
         atlas,
         Viewport {

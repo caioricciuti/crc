@@ -3446,10 +3446,22 @@ impl Panel {
             };
             match line {
                 Line::Note(text) => {
-                    layout::push_ui_text(out, atlas, text_rect(2.0, 0.0), text, theme.gutter_text);
+                    layout::push_ui_text_elided(
+                        out,
+                        atlas,
+                        text_rect(2.0, 0.0),
+                        text,
+                        theme.gutter_text,
+                    );
                 }
                 Line::Heading(text) => {
-                    layout::push_ui_text(out, atlas, text_rect(2.0, 0.0), text, theme.status_text);
+                    layout::push_ui_text_elided(
+                        out,
+                        atlas,
+                        text_rect(2.0, 0.0),
+                        text,
+                        theme.status_text,
+                    );
                 }
                 Line::Task(index) => {
                     self.draw_card(*index, tabs, y, column, selected, None, atlas, theme, out);
@@ -3509,7 +3521,7 @@ impl Panel {
                         activity.label()
                     };
                     let state_w = layout::ui_text_width(atlas, state) + 4.0;
-                    layout::push_ui_text(
+                    layout::push_ui_text_elided(
                         out,
                         atlas,
                         Viewport {
@@ -3612,7 +3624,7 @@ impl Panel {
                     } else {
                         layout::ui_text_width(atlas, &who) + 4.0
                     };
-                    layout::push_ui_text(
+                    layout::push_ui_text_elided(
                         out,
                         atlas,
                         Viewport {
@@ -3657,7 +3669,7 @@ impl Panel {
                 theme.sidebar_background,
             );
             let w = layout::push_spinner(out, bottom.x + 8.0, bottom, theme.accent);
-            layout::push_ui_text(
+            layout::push_ui_text_elided(
                 out,
                 atlas,
                 Viewport {
@@ -3825,7 +3837,7 @@ impl Panel {
             },
             if over { theme.text } else { theme.gutter_text },
         );
-        layout::push_ui_text(
+        layout::push_ui_text_elided(
             out,
             atlas,
             Viewport {
@@ -3998,8 +4010,7 @@ impl Panel {
             layout::hotspot(chevron, layout::Cursor::Pointing, Some(&tip));
             self.hits.push((chevron, Action::Fold(index)));
             if folded {
-                let label = children.to_string();
-                let w = (layout::ui_text_width(atlas, &label) + 10.0).max(18.0);
+                let w = layout::count_width(atlas, children);
                 let x = line2.x + line2.width - w;
                 layout::push_count(out, atlas, x, line2, children, theme);
                 line2_end = x - 6.0;
@@ -4038,6 +4049,8 @@ impl Panel {
             );
         }
         // The strip, right to left: the pull request, then the waiting count.
+        // Neither reaches left of where the name starts.
+        let strip_name_x = left + 22.0;
         let right = card.x + card.width - 8.0;
         let mut strip_x = right;
         if over {
@@ -4062,40 +4075,48 @@ impl Panel {
             if let Some(pr) = pr {
                 let label = format!("#{}", pr.number);
                 let w = layout::ui_text_width(atlas, &label) + 2.0;
-                strip_x -= w;
-                layout::push_ui_text(
-                    out,
-                    atlas,
-                    Viewport {
-                        x: strip_x,
-                        width: w,
-                        ..line1
-                    },
-                    &label,
-                    pr_colour(pr, theme),
-                );
-                strip_x -= 6.0;
+                // The number whole or not at all: half a number is a
+                // different pull request.
+                if strip_x - w >= strip_name_x {
+                    strip_x -= w;
+                    layout::push_ui_text(
+                        out,
+                        atlas,
+                        Viewport {
+                            x: strip_x,
+                            width: w,
+                            ..line1
+                        },
+                        &label,
+                        pr_colour(pr, theme),
+                    );
+                    strip_x -= layout::UI_GAP;
+                }
             }
             if !waiting.is_empty() {
-                let label = waiting.len().to_string();
-                let w = (layout::ui_text_width(atlas, &label) + 10.0).max(18.0);
-                let pill = Viewport {
-                    x: strip_x - w,
-                    y: line1.y + 2.0,
-                    width: w,
-                    height: 16.0,
+                // Between the name's start and what the strip has so far:
+                // a card too narrow for the pill there goes without it.
+                let room = Viewport {
+                    x: strip_name_x,
+                    width: (strip_x - strip_name_x).max(0.0),
+                    ..line1
                 };
-                layout::push_rounded_rect(out, pill, 8.0, theme.diff_modified);
-                let ink = if theme.is_dark() {
-                    [0.063, 0.086, 0.078, 1.0]
-                } else {
-                    [1.0, 1.0, 1.0, 1.0]
-                };
-                layout::push_ui_text_centered(out, atlas, pill, &label, ink);
-                strip_x = pill.x - 6.0;
+                let w = layout::count_width(atlas, waiting.len());
+                let drawn = layout::push_count_solid(
+                    out,
+                    atlas,
+                    strip_x - w,
+                    room,
+                    waiting.len(),
+                    theme.diff_modified,
+                    theme,
+                );
+                if drawn > 0.0 {
+                    strip_x -= drawn + layout::UI_GAP;
+                }
             }
         }
-        let name_x = left + 22.0;
+        let name_x = strip_name_x;
         let name = self.title(&task);
         let editing = self
             .inline
@@ -4113,7 +4134,7 @@ impl Panel {
             layout::push_rounded_rect(out, field, layout::UI_RADIUS_SM, theme.find_background);
             let prefix: String = text.chars().take(caret).collect();
             let caret_x = name_x + layout::ui_text_width(atlas, &prefix);
-            layout::push_ui_text(
+            layout::push_ui_field_text(
                 out,
                 atlas,
                 Viewport {
@@ -4132,7 +4153,7 @@ impl Panel {
                 theme.cursor,
             );
         } else {
-            layout::push_ui_text(
+            layout::push_ui_text_elided(
                 out,
                 atlas,
                 Viewport {
@@ -4703,6 +4724,51 @@ mod tests {
         panel.repos.insert("folder:notes".into(), Vec::new());
         panel.rebuild();
         panel
+    }
+
+    /// Workspaces and worktrees with long names and a pull request of
+    /// six digits, in a narrow column and in a usual one: every label is
+    /// whole or ends in an ellipsis, and nothing leaves the column.
+    #[test]
+    fn the_sidebar_cuts_no_label_in_a_narrow_column() {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let theme = Theme::default();
+        let mut panel = nested();
+        for (n, w) in panel.tasks.iter_mut().enumerate() {
+            w.name = format!("balcony-garden-planner-and-harvest-log-{n}");
+            w.branch = Some(format!(
+                "feature/raised-beds-and-a-longer-watering-plan-{n}"
+            ));
+        }
+        for id in panel.tasks.iter().map(Workspace::id).collect::<Vec<_>>() {
+            panel.info.insert(
+                id,
+                Info {
+                    ahead: 12,
+                    pull_request: Some(PullRequest {
+                        number: 123_456,
+                        state: "OPEN".into(),
+                        ..Default::default()
+                    }),
+                },
+            );
+        }
+        for width in [140.0, 260.0] {
+            let column = Viewport {
+                x: 0.0,
+                y: 48.0,
+                width,
+                height: 900.0,
+            };
+            let mut out = Vec::new();
+            layout::take_cut_labels();
+            panel.draw(&[], None, &mut atlas, column, &theme, &mut out);
+            assert_eq!(
+                layout::frame_faults(&out, column),
+                Vec::<String>::new(),
+                "the Agents sidebar at {width}"
+            );
+        }
     }
 
     fn rows(panel: &Panel) -> Vec<String> {

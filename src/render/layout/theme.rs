@@ -145,6 +145,16 @@ impl Theme {
         self.background[0] < 0.5
     }
 
+    /// The ink of a label on a solid accent or signal fill: near black on
+    /// the dark table's bright fills, white on the light table's deep ones.
+    pub fn ink_on_solid(&self) -> [f32; 4] {
+        if self.is_dark() {
+            [0.063, 0.086, 0.078, 1.0]
+        } else {
+            [1.0, 1.0, 1.0, 1.0]
+        }
+    }
+
     /// Graphite in daylight: the same surfaces one step apart, the same
     /// mint accent darkened until it reads on white, and the syntax hues
     /// brought down to the contrast the dark ones have on graphite.

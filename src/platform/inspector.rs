@@ -103,6 +103,8 @@ impl Action {
 const ISSUES_SHOWN: usize = 10;
 /// The least an issue's title keeps beside its labels: they go first.
 const TITLE_ROOM: f32 = 140.0;
+/// The widest an issue's label is drawn; a longer one is cut.
+const LABEL_MAX: f32 = 72.0;
 
 /// What the issue lists are drawn from: what was read per repository,
 /// whether `gh` is asked at all (a list not read yet is on its way), the
@@ -1257,13 +1259,6 @@ impl Inspector {
         // Number and state, then the title over as many lines as it takes
         // (two at most), then the branches.
         let number = format!("#{}", pr.number);
-        let nw = layout::ui_text_width(atlas, &number) + 12.0;
-        let pill = Viewport {
-            x,
-            y: y + 2.0,
-            width: nw,
-            height: 20.0,
-        };
         let state = if pr.draft {
             ("Draft", theme.gutter_text)
         } else {
@@ -1273,15 +1268,17 @@ impl Inspector {
                 _ => ("Open", theme.diff_added),
             }
         };
-        layout::push_rounded_rect(
-            out,
-            pill,
-            layout::UI_RADIUS_SM,
-            layout::faded(state.1, 0.18),
-        );
-        layout::push_ui_text_centered(out, atlas, pill, &number, state.1);
-        let sw = layout::ui_text_width(atlas, state.0);
-        text(out, atlas, x + width - sw, y, sw + 2.0, state.0, state.1);
+        // The state word is whole at the row's end; the number's tag has
+        // what is left of the row and is cut before it reaches the word.
+        let sw = layout::ui_text_width(atlas, state.0).min(width);
+        text(out, atlas, x + width - sw, y, sw, state.0, state.1);
+        let number_row = Viewport {
+            x,
+            y,
+            width: (width - sw - layout::UI_GAP).max(0.0),
+            height: 20.0,
+        };
+        layout::push_tag(out, atlas, x, number_row, &number, state.1);
         y += 28.0;
         for line in wrap(atlas, &pr.title, width).into_iter().take(2) {
             text(out, atlas, x, y, width, &line, theme.text);
@@ -1434,9 +1431,15 @@ impl Inspector {
             width,
             height: 20.0,
         };
-        text(out, atlas, x, y, width, "WORKTREES", theme.status_text);
-        let hw = layout::ui_text_width(atlas, "WORKTREES");
-        layout::push_count(out, atlas, x + hw + 8.0, heading, worktrees.len(), theme);
+        layout::push_counted_heading(
+            out,
+            atlas,
+            heading,
+            "WORKTREES",
+            Some(worktrees.len()),
+            theme.status_text,
+            theme,
+        );
         y += ROW;
         let height = worktrees.len() as f32 * STRIP;
         layout::push_card(
@@ -1965,11 +1968,8 @@ impl Inspector {
                 .labels
                 .iter()
                 .take(2)
-                .map(|l| {
-                    let l = fit(atlas, l, 72.0);
-                    let w = layout::ui_text_width(atlas, &l) + 12.0;
-                    (l, w)
-                })
+                .map(|l| layout::tag_fit(atlas, l, LABEL_MAX))
+                .filter(|(_, w)| *w > 0.0)
                 .collect();
             while end - pills.iter().map(|(_, w)| w + 4.0).sum::<f32>() - title_x < TITLE_ROOM {
                 if pills.pop().is_none() {
@@ -1977,20 +1977,14 @@ impl Inspector {
                 }
             }
             for (label, w) in pills.iter().rev() {
-                let pill = Viewport {
+                let tag_row = Viewport {
                     x: end - w,
-                    y: top + 4.0,
+                    y: top,
                     width: *w,
-                    height: 18.0,
+                    height: ROW,
                 };
-                layout::push_rounded_rect(
-                    out,
-                    pill,
-                    layout::UI_RADIUS_SM,
-                    layout::faded(theme.status_text, 0.16),
-                );
-                layout::push_ui_text_centered(out, atlas, pill, label, theme.status_text);
-                end = pill.x - 4.0;
+                layout::push_tag(out, atlas, tag_row.x, tag_row, label, theme.status_text);
+                end = tag_row.x - 4.0;
             }
             let room = (end - 4.0 - title_x).max(0.0);
             let title = fit(atlas, &issue.title, room);
@@ -2342,7 +2336,7 @@ fn text(
     s: &str,
     colour: [f32; 4],
 ) {
-    layout::push_ui_text(
+    layout::push_ui_text_elided(
         out,
         atlas,
         Viewport {
@@ -2398,115 +2392,8 @@ fn plural(n: usize, word: &str) -> String {
     }
 }
 
-/// `s`, cut with an ellipsis to fit `width`. Half a point of slack: a
-/// value right-aligned into exactly its own width comes back a rounding
-/// error short of it.
-pub(crate) fn fit(atlas: &mut Atlas, s: &str, width: f32) -> String {
-    let width = width + 0.5;
-    if layout::ui_text_width(atlas, s) <= width {
-        return s.to_owned();
-    }
-    let chars: Vec<char> = s.chars().collect();
-    if chars.is_empty() {
-        return String::new();
-    }
-    // A UI width counts 120 characters, so a longer cut measures as the
-    // whole string did, and does not fit either.
-    let top = (chars.len() - 1).min(119);
-    let ellipsis = layout::ui_text_width(atlas, "\u{2026}");
-    let guess: Vec<f32> = match caret_xs(atlas, &chars[..=top]) {
-        Some(x) => (0..=top).rev().map(|n| x[n].0 + ellipsis).collect(),
-        None => vec![f32::NEG_INFINITY; top + 1],
-    };
-    first_fitting(atlas, width, &guess, |i| {
-        chars[..top - i].iter().collect::<String>() + "\u{2026}"
-    })
-    .unwrap_or_default()
-}
-
-/// The caret x before each of `chars` and after the last, from the string
-/// shaped once, if it can be. Inside a grapheme (an emoji sequence, a
-/// base and its marks) a cut shapes as something else, often narrower, so
-/// there it is a range: the x where the grapheme starts and where the next
-/// one does.
-///
-/// Not for right-to-left text: a UI width is the caret x at the end,
-/// which there is not the width at all, so every cut is measured.
-fn caret_xs(atlas: &mut Atlas, chars: &[char]) -> Option<Vec<(f32, f32)>> {
-    let rtl = |c: &char| {
-        matches!(*c as u32,
-            0x0590..=0x08ff | 0xfb1d..=0xfdff | 0xfe70..=0xfeff | 0x10800..=0x10fff
-            | 0x1e800..=0x1efff | 0x200f | 0x202b | 0x202e | 0x2067)
-    };
-    if chars.iter().any(rtl) {
-        return None;
-    }
-    let s: String = chars.iter().collect();
-    let line = atlas.shape_ui(&s)?;
-    let composed = objc2_foundation::NSString::from_str(&s);
-    let mut utf16 = 0;
-    let mut x = Vec::with_capacity(chars.len() + 1);
-    let mut start = 0.0;
-    for c in chars {
-        let at = line.caret_offset(utf16);
-        if composed
-            .rangeOfComposedCharacterSequenceAtIndex(utf16)
-            .location
-            == utf16
-        {
-            start = at;
-            x.push((at, at));
-        } else {
-            x.push((start, f32::NAN));
-        }
-        utf16 += c.len_utf16();
-    }
-    let mut next = line.caret_offset(utf16);
-    x.push((next, next));
-    for edge in x.iter_mut().rev() {
-        if edge.1.is_nan() {
-            edge.1 = next;
-        } else {
-            next = edge.1;
-        }
-    }
-    Some(x)
-}
-
-/// The first of the cuts `cut(0)`, `cut(1)`, ... that measures no wider
-/// than `width`, as measuring each in turn finds it, measuring few: the
-/// search starts at the first whose `guess`, its width from the whole
-/// string's glyph advances, fits, and steps from there while measured
-/// widths disagree. The guess is off only by kerning and shaping across
-/// the cut, well under `SLACK`; a guess of minus infinity measures every
-/// cut in turn.
-fn first_fitting(
-    atlas: &mut Atlas,
-    width: f32,
-    guess: &[f32],
-    cut: impl Fn(usize) -> String,
-) -> Option<String> {
-    const SLACK: f32 = 2.0;
-    let fits = |atlas: &mut Atlas, i: usize| {
-        let c = cut(i);
-        (layout::ui_text_width(atlas, &c) <= width).then_some(c)
-    };
-    let mut i = guess
-        .iter()
-        .position(|&w| w <= width)
-        .unwrap_or(guess.len().checked_sub(1)?);
-    match fits(atlas, i) {
-        Some(mut found) => {
-            while i > 0 && guess[i - 1] <= width + SLACK {
-                let Some(c) = fits(atlas, i - 1) else { break };
-                found = c;
-                i -= 1;
-            }
-            Some(found)
-        }
-        None => (i + 1..guess.len()).find_map(|j| fits(atlas, j)),
-    }
-}
+/// The shared end ellipsis, under the name this panel's callers know.
+pub(crate) use crate::render::layout::elide_end as fit;
 
 /// `s` in lines no wider than `width`, broken between words; a word wider
 /// than the line is cut.
@@ -2645,6 +2532,110 @@ mod tests {
             &mut out,
         );
         out
+    }
+
+    /// A pull request of six digits with a long title, issues with long
+    /// labels and a dirty branch with a long name, in a narrow panel and
+    /// at the usual width: every label is whole or ends in an ellipsis,
+    /// no pill leaves the panel, and the number's tag stops short of the
+    /// state word.
+    #[test]
+    fn the_panel_cuts_no_label_and_no_pill_when_narrow() {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let workspace = Workspace {
+            name: "balcony-garden-planner-and-harvest-log".into(),
+            path: PathBuf::from("/r"),
+            branch: Some("feature/raised-beds-and-a-longer-watering-plan".into()),
+            main: false,
+            folder: false,
+            key: String::new(),
+            repo: None,
+            base: Some("main".into()),
+            commit: None,
+            merged: false,
+            host: None,
+            github: None,
+        };
+        let pr = PullRequest {
+            number: 123_456,
+            state: "OPEN".into(),
+            draft: true,
+            title: "Water the raised beds on a schedule that follows the long dry weeks".into(),
+            author: "a-gardener-with-a-long-login".into(),
+            base: "main".into(),
+            head: "feature/raised-beds-and-a-longer-watering-plan".into(),
+            commits: 1234,
+            additions: 123_456,
+            deletions: 98_765,
+            ..Default::default()
+        };
+        let mut labelled = issue(1234);
+        labelled.labels = vec![
+            "needs-a-second-look-before-planting".into(),
+            "greenhouse".into(),
+        ];
+        let key: RepoKey = (None, PathBuf::from("/r"));
+        let read = HashMap::from([(key.clone(), set(vec![labelled, issue(7)], None))]);
+        let loaded = HashSet::from([key]);
+        for width in [160.0, 220.0, WIDTH] {
+            let mut inspector = Inspector {
+                status: vec![(
+                    PathBuf::from("/r"),
+                    Ok(Status {
+                        branch: workspace.branch.clone(),
+                        base: Some("main".into()),
+                        ahead: 12,
+                        behind: 3,
+                        files: 240,
+                        added: 12_345,
+                        removed: 6_789,
+                        dirty: 14,
+                        ..Default::default()
+                    }),
+                )],
+                read_for: vec![PathBuf::from("/r")],
+                ..Inspector::default()
+            };
+            let rect = Viewport {
+                x: 0.0,
+                y: 0.0,
+                width,
+                height: 4000.0,
+            };
+            let mut out = Vec::new();
+            layout::take_cut_labels();
+            inspector.draw(
+                Some(&workspace),
+                Some(&[PathBuf::from("/r")]),
+                &[],
+                None,
+                None,
+                Some(Some(&pr)),
+                true,
+                Issues {
+                    read: &read,
+                    asked: true,
+                    loaded: &loaded,
+                    reading: false,
+                    now: 1_790_856_000 + 12 * 86_400,
+                },
+                &HashSet::new(),
+                &mut atlas,
+                rect,
+                &Theme::dark(),
+                &mut out,
+            );
+            assert_eq!(
+                layout::frame_faults(&out, rect),
+                Vec::<String>::new(),
+                "the inspector at {width}"
+            );
+            // The pull request and the issues were drawn, not skipped.
+            let has =
+                |wanted: fn(&Action) -> bool| inspector.hits.iter().any(|(_, a, _)| wanted(a));
+            assert!(has(|a| *a == Action::OpenPullRequest), "at {width}");
+            assert!(has(|a| matches!(a, Action::OpenIssue(1234))), "at {width}");
+        }
     }
 
     fn rows(inspector: &Inspector) -> Vec<Viewport> {

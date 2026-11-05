@@ -1974,7 +1974,7 @@ impl Panel {
             } else {
                 "Message (\u{2318}\u{21a9} to commit)"
             };
-            layout::push_ui_text(out, atlas, row(0), placeholder, theme.status_text);
+            layout::push_ui_text_elided(out, atlas, row(0), placeholder, theme.status_text);
         }
         for line in shown.clone() {
             let Some(shaped) = &shaped[line - top] else {
@@ -2006,7 +2006,7 @@ impl Panel {
             // The rest of a commit type being typed, dimmed after the
             // caret; Tab takes it.
             if let Some(rest) = self.commit_type_hint() {
-                layout::push_ui_text(
+                layout::push_ui_field_text(
                     out,
                     atlas,
                     Viewport {
@@ -2277,10 +2277,16 @@ impl Panel {
                 Entry::Section { group, count } => {
                     let expanded = !self.collapsed[group.index()];
                     layout::push_row_hover(out, rect, theme);
+                    // The title and its count end short of Stage All, which
+                    // is drawn over the row's end while the pointer is on it.
+                    let action = g.section_action(rect);
                     layout::push_section_heading(
                         out,
                         atlas,
-                        rect,
+                        Viewport {
+                            width: (action.x - layout::UI_GAP - rect.x).max(0.0),
+                            ..rect
+                        },
                         group.title(),
                         Some(count),
                         expanded,
@@ -2296,7 +2302,7 @@ impl Panel {
                             Group::Staged => (icons::REMOVE, "Unstage All"),
                             _ => (icons::ADD, "Stage All"),
                         };
-                        Button::new(g.section_action(rect))
+                        Button::new(action)
                             .icon(icon)
                             .tone(Tone::Ghost)
                             .enabled(!busy)
@@ -2312,7 +2318,10 @@ impl Panel {
                     layout::push_section_heading(
                         out,
                         atlas,
-                        rect,
+                        Viewport {
+                            width: (rect.width - layout::UI_INSET).max(0.0),
+                            ..rect
+                        },
                         "Changed by agents",
                         Some(count),
                         !self.collapsed[AGENTS_FOLD],
@@ -2364,7 +2373,7 @@ impl Panel {
         // talking about a key file; the line Git itself marks as the error
         // names it. The whole of it is in the tooltip.
         let first = headline(&self.note);
-        layout::push_ui_text(
+        layout::push_ui_text_elided(
             out,
             atlas,
             Viewport {
@@ -2445,7 +2454,7 @@ impl Panel {
         } else {
             ("Git could not read this folder", self.note.as_str())
         };
-        layout::push_ui_text(
+        layout::push_ui_text_elided(
             out,
             atlas,
             Viewport {
@@ -2577,7 +2586,7 @@ impl Panel {
             theme.text
         };
         let name_width = layout::ui_text_width(atlas, &name);
-        layout::push_ui_text(out, atlas, name_rect, &name, name_colour);
+        layout::push_ui_text_elided(out, atlas, name_rect, &name, name_colour);
         if deleted {
             // Struck through, so a removal reads as one before the letter.
             layout::push_rect(
@@ -2589,7 +2598,7 @@ impl Panel {
             );
         }
         if !parent.is_empty() && name_width + 8.0 < name_rect.width {
-            layout::push_ui_text(
+            layout::push_ui_text_elided(
                 out,
                 atlas,
                 Viewport {
@@ -2728,7 +2737,7 @@ impl Panel {
             width: name_width.min(room),
             height: rect.height,
         };
-        layout::push_ui_text(out, atlas, name_rect, &name, theme.text);
+        layout::push_ui_text_elided(out, atlas, name_rect, &name, theme.text);
         let mut after_name = name_x + name_rect.width + 8.0;
         let notes = [
             age.as_ref()
@@ -2862,7 +2871,7 @@ pub fn draw_diff_lines(
     let columns = ((rect.width - DIFF_GUTTER - 12.0).max(0.0) / cell_w) as usize;
     let visible = (rect.height / DIFF_LINE).max(0.0) as usize;
     if lines.is_empty() {
-        layout::push_ui_text(
+        layout::push_ui_text_elided(
             out,
             atlas,
             Viewport {
@@ -2947,7 +2956,7 @@ pub fn draw_diff_lines(
                         [width, DIFF_LINE],
                         theme.sidebar_background,
                     );
-                    layout::push_ui_text(
+                    layout::push_ui_text_elided(
                         out,
                         atlas,
                         Viewport {
@@ -2980,7 +2989,7 @@ pub fn draw_diff_lines(
             continue;
         }
         if line.kind == git::DiffKind::Section {
-            layout::push_ui_text(
+            layout::push_ui_text_elided(
                 out,
                 atlas,
                 Viewport {
@@ -3231,6 +3240,56 @@ mod tests {
         let mut panel = Panel::idle(PathBuf::from("/tmp"), Some(snapshot));
         panel.note = String::new();
         panel
+    }
+
+    /// Long names, a long branch and a long note, at the narrowest the
+    /// sidebar is dragged to and at its width out of the box: every label
+    /// is whole or ends in an ellipsis, and nothing leaves the column.
+    #[test]
+    fn the_sidebar_cuts_no_label_at_the_narrowest_width() {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let theme = Theme::default();
+        let changes = || {
+            vec![
+                change(
+                    "beds/north/seedling-watering-schedule-for-the-long-dry-weeks.md",
+                    b' ',
+                    b'M',
+                ),
+                change("greenhouse/ventilation-and-shade-notes.txt", b'A', b' '),
+                change("compost.rs", b' ', b'D'),
+                change(
+                    "trellis/\u{82d7}\u{5e8a}\u{306e}\u{6c34}\u{306f}\u{3051}.txt",
+                    b'U',
+                    b'U',
+                ),
+            ]
+        };
+        let mut plain = panel(changes());
+        plain.note = "Could not push: the remote has commits this branch does not have".into();
+        let mut named = panel(changes());
+        named.repo = Some("balcony-garden-planner-and-harvest-log".into());
+        if let Some(snapshot) = &mut named.snapshot {
+            snapshot.branch = "feature/raised-beds-and-a-much-longer-watering-plan".into();
+        }
+        for width in [140.0, 240.0] {
+            for (what, panel) in [("plain", &plain), ("in a workspace", &named)] {
+                let column = Viewport {
+                    x: 48.0,
+                    y: 48.0,
+                    width,
+                    height: 700.0,
+                };
+                let mut out = Vec::new();
+                layout::take_cut_labels();
+                panel.draw_sidebar(&mut atlas, column, false, &theme, &mut out);
+                assert_eq!(
+                    layout::frame_faults(&out, column),
+                    Vec::<String>::new(),
+                    "Source Control, {what}, at {width}"
+                );
+            }
+        }
     }
 
     #[test]

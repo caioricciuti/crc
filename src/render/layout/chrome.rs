@@ -707,11 +707,11 @@ pub fn build_home_view(
         Some(name) => format!("Nothing is open in {}.", name.to_string_lossy()),
         None => "No project is open.".to_owned(),
     };
-    push_ui_text(out, atlas, line(y), &situation, dim);
+    push_ui_text_elided(out, atlas, line(y), &situation, dim);
     y += 20.0 + GAP;
 
     let section = |out: &mut Vec<GlyphInstance>, atlas: &mut Atlas, y: &mut f32, title: &str| {
-        push_ui_text(out, atlas, line(*y), title, dim);
+        push_ui_text_elided(out, atlas, line(*y), title, dim);
         *y += 22.0;
         push_rect(out, atlas, [x, *y - 4.0], [width, 1.0], theme.hairline);
     };
@@ -819,7 +819,7 @@ pub fn build_home_view(
             glyph,
             theme.accent,
         );
-        push_ui_text(
+        push_ui_text_elided(
             out,
             atlas,
             Viewport {
@@ -942,7 +942,7 @@ pub fn build_home_view(
                 height: UI_CONTROL_SM,
             };
             push_key_cap(out, atlas, cap, combo, theme.tab_active, theme);
-            push_ui_text(
+            push_ui_text_elided(
                 out,
                 atlas,
                 Viewport {
@@ -959,7 +959,7 @@ pub fn build_home_view(
     }
 
     if y + 20.0 <= bottom {
-        push_ui_text(
+        push_ui_text_elided(
             out,
             atlas,
             line(y),
@@ -1064,7 +1064,7 @@ fn home_row_tipped(
     );
     let label_w = home_label_width(atlas, width, label);
     let detail_w = home_detail_width(atlas, width, label);
-    push_ui_text(
+    push_ui_text_elided(
         out,
         atlas,
         Viewport {
@@ -1076,7 +1076,7 @@ fn home_row_tipped(
         label,
         theme.text,
     );
-    push_ui_text(
+    push_ui_text_elided(
         out,
         atlas,
         Viewport {
@@ -1114,7 +1114,7 @@ fn home_workspace(
     const GAP: f32 = 18.0;
     let dim = theme.status_text;
     let section = |out: &mut Vec<GlyphInstance>, atlas: &mut Atlas, y: &mut f32, title: &str| {
-        push_ui_text(
+        push_ui_text_elided(
             out,
             atlas,
             Viewport {
@@ -1177,7 +1177,7 @@ fn home_workspace(
                 break;
             }
             push_rect(out, atlas, [x + 9.0, y + 13.0], [5.0, 5.0], theme.accent);
-            push_ui_text(
+            push_ui_text_elided(
                 out,
                 atlas,
                 Viewport {
@@ -1665,51 +1665,6 @@ pub(super) fn project_name(tree: &Tree) -> String {
         .unwrap_or_else(|| "crc".into())
 }
 
-/// Keep the beginning and end of a long folder name in a bounded toolbar.
-pub(super) fn project_label(atlas: &mut Atlas, name: &str, width: f32) -> String {
-    let chars: Vec<char> = name.chars().collect();
-    if chars.len() <= 120 && ui_text_width(atlas, name) <= width {
-        return name.to_owned();
-    }
-    let mut low = 0;
-    let mut high = chars.len().min(119);
-    while low < high {
-        let keep = (low + high).div_ceil(2);
-        let head = keep.div_ceil(2);
-        let tail = keep / 2;
-        let candidate = middle_ellipsis(&chars, head, tail);
-        if ui_text_width(atlas, &candidate) <= width {
-            low = keep;
-        } else {
-            high = keep - 1;
-        }
-    }
-    middle_ellipsis(&chars, low.div_ceil(2), low / 2)
-}
-
-/// The first `head` and last `tail` characters joined by an ellipsis.
-///
-/// Neither cut lands inside a joined emoji: a zero-width joiner or a
-/// variation selector stays with what it joins.
-pub(super) fn middle_ellipsis(chars: &[char], head: usize, tail: usize) -> String {
-    let joins = |c: char| c == '\u{200d}' || ('\u{fe00}'..='\u{fe0f}').contains(&c);
-    let mut head = head.min(chars.len());
-    while head > 0 && head < chars.len() && (joins(chars[head]) || joins(chars[head - 1])) {
-        head -= 1;
-    }
-    let mut tail = tail.min(chars.len() - head);
-    let mut from = chars.len() - tail;
-    while tail > 0 && from > head && (joins(chars[from]) || joins(chars[from - 1])) {
-        tail -= 1;
-        from += 1;
-    }
-    chars[..head]
-        .iter()
-        .chain(std::iter::once(&'\u{2026}'))
-        .chain(chars[chars.len() - tail..].iter())
-        .collect()
-}
-
 /// The project title and disclosure share this rectangle for drawing, clicks
 /// and cursor shape. Its width follows the measured system-font label.
 pub fn toolbar_project(tree: &Tree, atlas: &mut Atlas, rect: Viewport) -> Viewport {
@@ -1848,7 +1803,7 @@ pub fn build_toolbar(
             theme.accent,
         );
         let label_width = (project_rect.width - PROJECT_CHROME + 8.0).max(0.0);
-        let label = project_label(atlas, &project, label_width);
+        let label = elide_middle(atlas, &project, label_width);
         push_ui_text(
             out,
             atlas,
@@ -1929,7 +1884,7 @@ pub fn build_toolbar(
             icons::SEARCH,
             theme.gutter_text,
         );
-        push_ui_text(
+        push_ui_text_elided(
             out,
             atlas,
             Viewport {
@@ -2142,7 +2097,7 @@ pub fn build_palette(
         [(viewport.width - 2.0).max(0.0), 0.5],
         theme.hairline,
     );
-    push_ui_text(
+    push_ui_text_elided(
         out,
         atlas,
         Viewport {
@@ -2173,7 +2128,7 @@ pub fn build_palette(
             );
         }
     } else if rows.is_empty() {
-        push_ui_text(
+        push_ui_text_elided(
             out,
             atlas,
             Viewport {
@@ -2253,7 +2208,7 @@ pub fn build_palette(
             ui_text_width(atlas, &item.shortcut) + 16.0
         };
         let text_width = (rect.width - text_x - 18.0 - shortcut_width).max(0.0);
-        push_ui_text(
+        push_ui_text_elided(
             out,
             atlas,
             Viewport {
@@ -2269,7 +2224,7 @@ pub fn build_palette(
                 theme.text
             },
         );
-        push_ui_text(
+        push_ui_text_elided(
             out,
             atlas,
             Viewport {
@@ -2304,7 +2259,7 @@ pub fn build_palette(
         [viewport.width - 2.0, 0.5],
         theme.hairline,
     );
-    push_ui_text(
+    push_ui_text_elided(
         out,
         atlas,
         Viewport {
@@ -2565,7 +2520,7 @@ pub fn build_tab_bar_in(
         // Middle ellipsis keeps the extension visible, which is the half
         // people actually scan for; measured in the font it is drawn in.
         let room = (x + width - TAB_PADDING_X - TAB_CLOSE_SLOT - label_x).max(0.0);
-        let shown = project_label(atlas, &title, room);
+        let shown = elide_middle(atlas, &title, room);
         push_ui_text(
             out,
             atlas,
@@ -2844,7 +2799,7 @@ pub fn push_sidebar_title(
         width: (row.width - used - UI_GAP).max(0.0),
         ..row
     };
-    push_ui_text(out, atlas, rect, title, theme.status_text);
+    push_ui_text_elided(out, atlas, rect, title, theme.status_text);
     rect
 }
 
@@ -3120,7 +3075,7 @@ pub fn build_sidebar_with_edit(
         } else {
             dim(theme.sidebar_text)
         };
-        push_ui_text(
+        push_ui_text_elided(
             out,
             atlas,
             Viewport {
@@ -3535,27 +3490,8 @@ pub fn build_response_strip(
         Verdict::ClientError | Verdict::ServerError | Verdict::Failed => theme.diff_removed,
     };
     // Row one: the status pill, then the facts.
-    let status = view.status();
-    let pill = Viewport {
-        x: strip.x + 16.0,
-        y: strip.y + 6.0,
-        width: ui_text_width(atlas, &status) + 20.0,
-        height: 28.0,
-    };
-    push_rounded_rect(out, pill, 6.0, [tone[0], tone[1], tone[2], 0.18]);
-    push_ui_text_centered(out, atlas, pill, &status, tone);
-    push_ui_text(
-        out,
-        atlas,
-        Viewport {
-            x: pill.x + pill.width + 12.0,
-            y: pill.y,
-            width: (strip.x + strip.width - pill.x - pill.width - 28.0).max(0.0),
-            height: pill.height,
-        },
-        &view.facts(),
-        theme.status_text,
-    );
+    let pill = strip_pill(out, atlas, strip, &view.status(), tone);
+    strip_facts(out, atlas, strip, pill, &view.facts(), theme);
     // Row two: the segments.
     let headers = format!("Headers {}", view.header_count());
     let labels = [
@@ -3662,7 +3598,7 @@ pub fn build_breadcrumbs(
     let crumbs = breadcrumb_segments(buffer, tree, atlas, rect);
     if crumbs.is_empty() && !home {
         let label = buffer.display_name();
-        push_ui_text(
+        push_ui_text_elided(
             out,
             atlas,
             Viewport {
@@ -3694,7 +3630,7 @@ pub fn build_breadcrumbs(
         } else {
             theme.status_text
         };
-        push_ui_text(
+        push_ui_text_elided(
             out,
             atlas,
             Viewport {
@@ -4184,5 +4120,85 @@ mod palette_loading_tests {
         let _ = built(std::slice::from_ref(&row), true);
         assert!(!take_animating());
         assert_eq!(palette_rows_shown(1, true), 1);
+    }
+}
+
+#[cfg(test)]
+mod narrow_sidebar_tests {
+    use super::*;
+
+    /// The narrowest the window lets the sidebar be dragged, and the width
+    /// it has out of the box.
+    const WIDTHS: [f32; 2] = [140.0, 240.0];
+
+    fn column(width: f32) -> Viewport {
+        Viewport {
+            x: 48.0,
+            y: 48.0,
+            width,
+            height: 600.0,
+        }
+    }
+
+    /// A project whose names are longer than any sidebar.
+    fn long_named_tree() -> Tree {
+        let root = std::env::temp_dir().join(format!("crc-explorer-narrow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let beds = root.join("greenhouse-ventilation-and-watering-notes");
+        std::fs::create_dir_all(&beds).unwrap();
+        for name in [
+            "seedling-watering-schedule-for-the-north-bed.md",
+            "\u{82d7}\u{5e8a}\u{306e}\u{6c34}\u{306f}\u{3051}\u{304c}\u{9045}\u{3059}\u{304e}\u{308b}\u{554f}\u{984c}.txt",
+            "a.rs",
+        ] {
+            std::fs::write(root.join(name), "").unwrap();
+            std::fs::write(beds.join(name), "").unwrap();
+        }
+        let mut tree = Tree::new();
+        tree.open(&root);
+        let folder = tree.rows().iter().position(|e| e.is_dir).unwrap();
+        tree.toggle(folder);
+        tree
+    }
+
+    #[test]
+    fn the_explorer_cuts_no_label_at_the_narrowest_sidebar() {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let theme = Theme::default();
+        let tree = long_named_tree();
+        assert!(tree.len() >= 7, "the folder is open: {}", tree.len());
+        for width in WIDTHS {
+            for tree in [&tree, &Tree::new()] {
+                let column = column(width);
+                let mut out = Vec::new();
+                take_cut_labels();
+                build_sidebar(tree, false, &mut atlas, column, &theme, &mut out);
+                assert_eq!(
+                    frame_faults(&out, column),
+                    Vec::<String>::new(),
+                    "the Explorer at {width}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(tree.root().unwrap());
+    }
+
+    #[test]
+    fn a_panel_title_gives_way_to_its_header_buttons() {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let theme = Theme::default();
+        for width in WIDTHS {
+            for (title, actions) in [("EXPLORER", 4), ("SOURCE CONTROL", 2), ("WORKSPACE", 2)] {
+                let column = column(width);
+                let mut out = Vec::new();
+                take_cut_labels();
+                let rect = push_sidebar_title(&mut out, &mut atlas, column, title, actions, &theme);
+                assert_eq!(
+                    frame_faults(&out, rect),
+                    Vec::<String>::new(),
+                    "{title} at {width}"
+                );
+            }
+        }
     }
 }

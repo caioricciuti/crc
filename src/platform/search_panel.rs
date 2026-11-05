@@ -592,7 +592,7 @@ impl Panel {
             if self.searching {
                 x += layout::push_spinner(out, g.note.x, g.note, theme.accent) + 6.0;
             }
-            layout::push_ui_text(
+            layout::push_ui_text_elided(
                 out,
                 atlas,
                 Viewport {
@@ -837,6 +837,44 @@ mod tests {
             hit("a.rs", 9, "plant"),
             hit("b.rs", 0, "plant"),
         ]
+    }
+
+    #[test]
+    fn the_panel_cuts_no_label_at_the_narrowest_sidebar() {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let theme = Theme::default();
+        let mut found = Panel::default();
+        found.take_results(vec![
+            hit(
+                "beds/north/seedling-watering-schedule-for-the-long-dry-weeks.md",
+                4,
+                "the plant in the north bed is watered twice a week in a long dry spell",
+            ),
+            hit("b.rs", 0, "plant"),
+        ]);
+        let filtered = Panel {
+            show_replace: true,
+            show_filters: true,
+            ..Panel::default()
+        };
+        for width in [140.0, 240.0] {
+            for (what, panel) in [("results", &found), ("filters", &filtered)] {
+                let column = Viewport {
+                    x: 48.0,
+                    y: 48.0,
+                    width,
+                    height: 700.0,
+                };
+                let mut out = Vec::new();
+                layout::take_cut_labels();
+                panel.draw(&mut atlas, column, None, None, &theme, &mut out);
+                assert_eq!(
+                    layout::frame_faults(&out, column),
+                    Vec::<String>::new(),
+                    "Search, {what}, at {width}"
+                );
+            }
+        }
     }
 
     #[test]

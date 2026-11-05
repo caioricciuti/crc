@@ -728,7 +728,7 @@ pub fn draw_side(
             [column.width, SIDE_HEADER - 1.0],
             wash(colour, 0.10),
         );
-        layout::push_ui_text(
+        layout::push_ui_text_elided(
             out,
             atlas,
             Viewport {
@@ -753,7 +753,7 @@ pub fn draw_side(
         theme.hairline,
     );
     if view.conflicts.is_empty() {
-        layout::push_ui_text(
+        layout::push_ui_text_elided(
             out,
             atlas,
             Viewport {

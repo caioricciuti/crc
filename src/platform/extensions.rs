@@ -215,7 +215,7 @@ fn text(
     s: &str,
     color: [f32; 4],
 ) {
-    layout::push_ui_text(
+    layout::push_ui_text_elided(
         out,
         atlas,
         Viewport {
@@ -759,13 +759,7 @@ pub fn draw_list(
             width,
             height: 24.0,
         };
-        let upper = title.to_uppercase();
-        layout::push_ui_text(out, atlas, row, &upper, dim);
-        let w = layout::ui_text_width(atlas, &upper);
-        if let Some(count) = count {
-            layout::push_count(out, atlas, x + w + 8.0, row, count, theme);
-        }
-        w
+        layout::push_counted_heading(out, atlas, row, title, count, dim, theme)
     };
 
     let mut rows: Vec<(&'static str, String, String, String, char)> = Vec::new();
@@ -1012,5 +1006,38 @@ mod tests {
         assert!(newer("0.10.0", "0.9.0"));
         assert!(!newer("0.1.0", "0.1.0"));
         assert!(!newer("0.1.0", "0.2.0"));
+    }
+}
+
+#[cfg(test)]
+mod narrow_tests {
+    use super::*;
+
+    #[test]
+    fn the_list_cuts_no_label_at_the_narrowest_sidebar() {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let theme = Theme::default();
+        let mut loading = Page::new(Vec::new());
+        let mut noted = Page::new(Vec::new());
+        noted.note = Some("Could not reach the registry: the request timed out".into());
+        noted.busy = Some("Installing Sort Lines and Markdown Preview\u{2026}".into());
+        for width in [140.0, 240.0] {
+            for (what, page) in [("loading", &mut loading), ("noted", &mut noted)] {
+                let column = Viewport {
+                    x: 48.0,
+                    y: 48.0,
+                    width,
+                    height: 700.0,
+                };
+                let mut out = Vec::new();
+                layout::take_cut_labels();
+                draw_list(page, &mut atlas, column, &theme, &mut out);
+                assert_eq!(
+                    layout::frame_faults(&out, column),
+                    Vec::<String>::new(),
+                    "Extensions, {what}, at {width}"
+                );
+            }
+        }
     }
 }

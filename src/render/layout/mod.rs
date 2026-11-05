@@ -333,7 +333,7 @@ mod tests {
     #[test]
     fn long_project_title_keeps_both_ends_inside_its_button() {
         let mut atlas = atlas();
-        let label = project_label(
+        let label = elide_middle(
             &mut atlas,
             "caio-personal-long-workspace-name.F12TR6",
             170.0,

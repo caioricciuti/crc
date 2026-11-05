@@ -350,12 +350,7 @@ impl<'a> Button<'a> {
                 } else {
                     theme.accent
                 };
-                let ink = if theme.is_dark() {
-                    [0.063, 0.086, 0.078, 1.0]
-                } else {
-                    [1.0, 1.0, 1.0, 1.0]
-                };
-                (fill, ink)
+                (fill, theme.ink_on_solid())
             }
             Tone::Secondary => {
                 let fill = if down {
@@ -401,8 +396,16 @@ impl<'a> Button<'a> {
             push_rounded_rect(out, rect, self.radius, fill);
         }
         let pad = if self.leading { 8.0 } else { 0.0 };
+        let icon_w = self.icon.map_or(0.0, |glyph| icon_width(atlas, glyph));
+        // A menu button too narrow for its icon and the chevron both keeps
+        // the icon: the chevron would be drawn over it.
         let chevron = if self.menu {
-            icon_width(atlas, icons::CHEVRON_DOWN)
+            let w = icon_width(atlas, icons::CHEVRON_DOWN);
+            if rect.width >= pad * 2.0 + icon_w + 2.0 + w {
+                w
+            } else {
+                0.0
+            }
         } else {
             0.0
         };
@@ -417,12 +420,30 @@ impl<'a> Button<'a> {
             ..self
         }
         .content_width(atlas, 0.0);
-        let mut x = if self.leading {
+        // A centred label too long for the button keeps a gap from both
+        // edges and ends in an ellipsis, rather than starting on the edge
+        // and being cut by the other.
+        let tight = !self.leading && !self.label.is_empty() && content > inner.width;
+        let edge = if tight {
+            UI_GAP.min(inner.width * 0.5)
+        } else {
+            0.0
+        };
+        // Less room than this after its icon, and a label is an ellipsis
+        // and little more: the icon stands alone, in the button's middle.
+        const LABEL_MIN: f32 = 16.0;
+        let lone = icon_w > 0.0
+            && !self.label.is_empty()
+            && inner.width - edge * 2.0 - icon_w - UI_ICON_GAP
+                < LABEL_MIN.min(ui_text_width(atlas, self.label));
+        let mut x = if lone {
+            rect.x + ((rect.width - icon_w) * 0.5).max(0.0)
+        } else if self.leading {
             inner.x
         } else {
-            inner.x + ((inner.width - content) * 0.5).max(0.0)
+            inner.x + ((inner.width - content) * 0.5).max(edge)
         };
-        let right = inner.x + inner.width;
+        let right = inner.x + inner.width - edge;
         if let Some(glyph) = self.icon {
             let w = icon_width(atlas, glyph);
             push_icon_centered(
@@ -442,16 +463,17 @@ impl<'a> Button<'a> {
                 UI_ICON_GAP
             };
         }
-        if !self.label.is_empty() {
+        if !self.label.is_empty() && !lone {
             let hint_w = self
                 .hint
                 .map_or(0.0, |h| ui_text_width(atlas, h) + UI_ICON_GAP);
-            push_ui_text(
+            // The hint keeps its room; the label gives way to it.
+            let drawn = push_ui_text_elided(
                 out,
                 atlas,
                 Viewport {
                     x,
-                    width: (right - x - if self.leading { hint_w } else { 0.0 }).max(0.0),
+                    width: (right - x - hint_w).max(0.0),
                     ..rect
                 },
                 self.label,
@@ -462,7 +484,7 @@ impl<'a> Button<'a> {
                 let at = if self.leading {
                     right - w
                 } else {
-                    x + ui_text_width(atlas, self.label) + UI_ICON_GAP
+                    x + drawn + UI_ICON_GAP
                 };
                 push_ui_text(
                     out,
@@ -477,7 +499,7 @@ impl<'a> Button<'a> {
                 );
             }
         }
-        if self.menu {
+        if chevron > 0.0 {
             push_icon_centered(
                 out,
                 atlas,
@@ -623,7 +645,8 @@ pub fn push_segmented(
 }
 
 /// A small rounded count beside a heading: `Changes (3)` without the
-/// brackets.
+/// brackets. Drawn at `x`, or as far left of it as keeps the pill inside
+/// `row`; the width it took.
 pub fn push_count(
     out: &mut Vec<GlyphInstance>,
     atlas: &mut Atlas,
@@ -632,21 +655,72 @@ pub fn push_count(
     count: usize,
     theme: &Theme,
 ) -> f32 {
-    let label = if count > 999 {
-        "999+".to_owned()
-    } else {
-        count.to_string()
-    };
-    let w = (ui_text_width(atlas, &label) + 10.0).max(18.0);
-    let pill = Viewport {
+    count_pill(
+        out,
+        atlas,
         x,
+        row,
+        count,
+        (theme.tab_hover, theme.status_text),
+    )
+}
+
+/// [`push_count`] filled with `fill`, for a count that asks for a look:
+/// the same pill, cap and clamp, in ink that reads on a solid colour.
+pub fn push_count_solid(
+    out: &mut Vec<GlyphInstance>,
+    atlas: &mut Atlas,
+    x: f32,
+    row: Viewport,
+    count: usize,
+    fill: [f32; 4],
+    theme: &Theme,
+) -> f32 {
+    count_pill(out, atlas, x, row, count, (fill, theme.ink_on_solid()))
+}
+
+/// The count pill in `fill` and `ink`.
+fn count_pill(
+    out: &mut Vec<GlyphInstance>,
+    atlas: &mut Atlas,
+    x: f32,
+    row: Viewport,
+    count: usize,
+    (fill, ink): ([f32; 4], [f32; 4]),
+) -> f32 {
+    let label = count_label(count);
+    let w = count_width(atlas, count);
+    let right = row.x + row.width;
+    // A row too narrow for the pill goes without it.
+    if w > row.width {
+        return 0.0;
+    }
+    let pill = Viewport {
+        x: x.min(right - w).max(row.x),
         y: row.y + ((row.height - 16.0) * 0.5).round(),
         width: w,
         height: 16.0,
     };
-    push_rounded_rect(out, pill, 8.0, theme.tab_hover);
-    push_ui_text_centered(out, atlas, pill, &label, theme.status_text);
+    push_rounded_rect(out, pill, 8.0, fill);
+    push_ui_text_centered(out, atlas, pill, &label, ink);
     w
+}
+
+/// The space between a heading and its count.
+pub const COUNT_GAP: f32 = 8.0;
+
+/// What a count pill says: the number, and `999+` past that.
+fn count_label(count: usize) -> String {
+    if count > 999 {
+        "999+".to_owned()
+    } else {
+        count.to_string()
+    }
+}
+
+/// How wide [`push_count`] draws `count`: for what is laid out beside it.
+pub fn count_width(atlas: &mut Atlas, count: usize) -> f32 {
+    (ui_text_width(atlas, &count_label(count)) + 10.0).max(18.0)
 }
 
 /// A section heading in a sidebar list: chevron, small-caps-like title and
@@ -680,9 +754,7 @@ pub fn push_section_heading(
         theme.gutter_text,
     );
     let x = row.x + 8.0 + cw + 2.0;
-    let upper = title.to_uppercase();
-    let w = ui_text_width(atlas, &upper);
-    push_ui_text(
+    push_counted_heading(
         out,
         atlas,
         Viewport {
@@ -690,12 +762,42 @@ pub fn push_section_heading(
             width: (row.x + row.width - x).max(0.0),
             ..row
         },
+        title,
+        count,
+        colour,
+        theme,
+    );
+}
+
+/// A heading in capitals from `row`'s left edge and, right after it, its
+/// count. The count keeps its room at the end of the row; the title is
+/// what gives way, with an ellipsis, so neither leaves the row. The
+/// width the title drew at.
+pub fn push_counted_heading(
+    out: &mut Vec<GlyphInstance>,
+    atlas: &mut Atlas,
+    row: Viewport,
+    title: &str,
+    count: Option<usize>,
+    colour: [f32; 4],
+    theme: &Theme,
+) -> f32 {
+    let upper = title.to_uppercase();
+    let count_room = count.map_or(0.0, |count| count_width(atlas, count) + COUNT_GAP);
+    let w = push_ui_text_elided(
+        out,
+        atlas,
+        Viewport {
+            width: (row.width - count_room).max(0.0),
+            ..row
+        },
         &upper,
         colour,
     );
     if let Some(count) = count {
-        push_count(out, atlas, x + w + 8.0, row, count, theme);
+        push_count(out, atlas, row.x + w + COUNT_GAP, row, count, theme);
     }
+    w
 }
 
 /// A UI label at `scale` times the UI size, centred in `rect`: badges and
@@ -715,6 +817,8 @@ pub fn push_ui_text_scaled(
     let m = atlas.metrics;
     let (cw, ch) = atlas.cell_size();
     let width = ui_text_width(atlas, text) * scale;
+    #[cfg(test)]
+    note_cut(text, width, rect.width);
     let x0 = rect.x + (rect.width - width) * 0.5;
     let y0 = m.snap(rect.y + (rect.height - ch * scale) * 0.5);
     for glyph in &line.glyphs {
@@ -799,11 +903,7 @@ pub fn push_badge(
         ground,
     );
     push_rounded_rect(out, pill, BADGE_HEIGHT * 0.5, theme.accent);
-    let ink = if theme.is_dark() {
-        [0.063, 0.086, 0.078, 1.0]
-    } else {
-        [1.0, 1.0, 1.0, 1.0]
-    };
+    let ink = theme.ink_on_solid();
     // As large as the pill's padding leaves room for, and no larger than
     // a badge's label is.
     let scale = ((pill.width - pad * 2.0) / text.max(1.0)).min(size);
@@ -1016,14 +1116,34 @@ pub fn push_meter(
 /// The scale of a [`push_tag`]'s label.
 const TAG_SCALE: f32 = 0.78;
 
-/// How wide [`push_tag`] draws `label`.
+/// The room either side of a [`push_tag`]'s label, together.
+const TAG_PAD: f32 = 10.0;
+
+/// How wide [`push_tag`] draws `label`, given the room.
 pub fn tag_width(atlas: &mut Atlas, label: &str) -> f32 {
-    (ui_text_width(atlas, label) * TAG_SCALE + 10.0).round()
+    (ui_text_width(atlas, label) * TAG_SCALE + TAG_PAD).round()
+}
+
+/// `label` as a [`push_tag`] no wider than `room` shows it, and that
+/// width: the whole word where it fits, cut with an ellipsis where it does
+/// not, and nothing where not even that fits.
+pub fn tag_fit(atlas: &mut Atlas, label: &str, room: f32) -> (String, f32) {
+    let whole = tag_width(atlas, label);
+    if whole <= room {
+        return (label.to_owned(), whole);
+    }
+    let cut = elide_end(atlas, label, (room - TAG_PAD - 1.0).max(0.0) / TAG_SCALE);
+    if cut.is_empty() {
+        return (cut, 0.0);
+    }
+    let width = tag_width(atlas, &cut).min(room);
+    (cut, width)
 }
 
 /// A word that flags a value, such as a state that needs a look: a small
 /// pill tinted with `colour` and the word in it, at `x` on `row`'s centre.
-/// Its width.
+/// The pill ends where `row` does: a word too long for the room left is
+/// cut with an ellipsis. Its width.
 pub fn push_tag(
     out: &mut Vec<GlyphInstance>,
     atlas: &mut Atlas,
@@ -1033,14 +1153,23 @@ pub fn push_tag(
     colour: [f32; 4],
 ) -> f32 {
     const H: f32 = 16.0;
+    let (label, width) = tag_fit(atlas, label, row.x + row.width - x);
+    if width <= 0.0 {
+        return 0.0;
+    }
     let pill = Viewport {
         x,
         y: row.y + ((row.height - H) * 0.5).round(),
-        width: tag_width(atlas, label),
+        width,
         height: H,
     };
     push_rounded_rect(out, pill, UI_RADIUS_SM, faded(colour, 0.18));
-    push_ui_text_scaled(out, atlas, pill, label, colour, TAG_SCALE);
+    let glyphs = out.len();
+    push_ui_text_scaled(out, atlas, pill, &label, colour, TAG_SCALE);
+    // A glyph's quad is as wide as its cell; the pill is where it ends.
+    for quad in &mut out[glyphs..] {
+        clip_horizontal(quad, pill.x, pill.x + pill.width);
+    }
     pill.width
 }
 
@@ -1908,5 +2037,229 @@ mod tests {
                 assert_eq!(capped, huge);
             }
         }
+    }
+
+    // ---- labels that outgrow their control --------------------------------
+
+    fn row(width: f32) -> Viewport {
+        Viewport {
+            x: 30.0,
+            y: 100.0,
+            width,
+            height: 24.0,
+        }
+    }
+
+    #[test]
+    fn a_button_label_too_long_for_it_ends_in_an_ellipsis() {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let theme = Theme::dark();
+        for width in [22.0, 40.0, 64.0, 96.0, 400.0] {
+            let rect = Viewport {
+                height: UI_CONTROL,
+                ..row(width)
+            };
+            let buttons = [
+                Button::new(rect).label("Create Pull Request"),
+                Button::new(rect).label("Merge\u{2026}").menu(),
+                Button::new(rect).label("Commit").icon(icons::CHECK),
+                Button::new(rect)
+                    .label("balcony-garden-planner")
+                    .icon(icons::FOLDER_OUTLINE)
+                    .menu(),
+                Button::new(rect).label("Rename").hint("F2").leading(),
+            ];
+            for (n, button) in buttons.into_iter().enumerate() {
+                let label = button.label;
+                let mut out = Vec::new();
+                take_cut_labels();
+                begin_frame();
+                button.draw(&mut out, &mut atlas, &theme);
+                assert_eq!(
+                    frame_faults(&out, rect),
+                    Vec::<String>::new(),
+                    "button {n} at {width}"
+                );
+                // A centred label that does not fit keeps a gap from the
+                // button's edges instead of starting on one.
+                // Too narrow for an icon and a chevron: the icon alone.
+                if n == 3 && width < 40.0 {
+                    assert_eq!(out.len(), 2, "a fill and one icon at {width}");
+                }
+                if n == 0 && (40.0..100.0).contains(&width) {
+                    let ink = out
+                        .iter()
+                        .skip(1)
+                        .map(|q| q.pos[0])
+                        .fold(f32::INFINITY, f32::min);
+                    assert!(ink >= rect.x + UI_GAP - 1.0, "{label} starts at {ink}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_heading_gives_way_to_its_count() {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let theme = Theme::dark();
+        let colour = theme.status_text;
+        for width in [60.0, 100.0, 116.0, 216.0] {
+            let row = row(width);
+            let mut out = Vec::new();
+            take_cut_labels();
+            push_section_heading(
+                &mut out,
+                &mut atlas,
+                row,
+                "Changed by agents",
+                Some(1234),
+                true,
+                colour,
+                &theme,
+            );
+            assert_eq!(
+                frame_faults(&out, row),
+                Vec::<String>::new(),
+                "the heading at {width}"
+            );
+            // A row with no room for the count after the chevron goes
+            // without it; any wider one has it, inside the row.
+            let Some(pill) = out.iter().find(|q| q.color == theme.tab_hover) else {
+                assert!(width < 100.0, "no count at {width}");
+                continue;
+            };
+            assert!(pill.pos[0] + pill.size[0] <= row.x + row.width + 0.01);
+            // The title's glyphs end before the pill starts.
+            for glyph in out.iter().filter(|q| q.color == colour) {
+                let end = glyph.pos[0] + glyph.size[0];
+                assert!(
+                    end <= pill.pos[0] || glyph.pos[0] >= pill.pos[0],
+                    "the title runs under the count at {width}"
+                );
+            }
+        }
+        // Wide enough for all of it: the count follows the whole title.
+        let row = row(400.0);
+        let mut out = Vec::new();
+        let title = push_counted_heading(
+            &mut out,
+            &mut atlas,
+            row,
+            "Changes",
+            Some(3),
+            colour,
+            &theme,
+        );
+        assert_eq!(title, ui_text_width(&mut atlas, "CHANGES"));
+        let pill = out.iter().find(|q| q.color == theme.tab_hover).unwrap();
+        assert_eq!(pill.pos[0], row.x + title + COUNT_GAP);
+    }
+
+    #[test]
+    fn a_count_is_capped_and_stays_in_its_row() {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let theme = Theme::dark();
+        let row = row(80.0);
+        let right = row.x + row.width;
+        assert_eq!(
+            count_width(&mut atlas, 1000),
+            count_width(&mut atlas, 98_765)
+        );
+        assert!(count_width(&mut atlas, 999) <= count_width(&mut atlas, 1000));
+        for x in [row.x - 20.0, row.x, right - 10.0, right + 40.0] {
+            let mut out = Vec::new();
+            take_cut_labels();
+            let w = push_count(&mut out, &mut atlas, x, row, 98_765, &theme);
+            assert_eq!(w, count_width(&mut atlas, 98_765));
+            assert_eq!(frame_faults(&out, row), Vec::<String>::new(), "at {x}");
+            assert_eq!(out[0].size[0], w);
+        }
+        // Where it fits, it is where it was asked to be.
+        let mut out = Vec::new();
+        push_count(&mut out, &mut atlas, row.x + 8.0, row, 7, &theme);
+        assert_eq!(out[0].pos[0], row.x + 8.0);
+        // A row narrower than the pill goes without it.
+        out.clear();
+        let narrow = Viewport { width: 12.0, ..row };
+        assert_eq!(
+            push_count(&mut out, &mut atlas, row.x, narrow, 7, &theme),
+            0.0
+        );
+        assert!(out.is_empty());
+    }
+
+    // ---- pills -----------------------------------------------------------
+
+    #[test]
+    fn a_solid_count_is_the_count_pill_in_another_colour() {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        for theme in [Theme::dark(), Theme::light()] {
+            let row = row(80.0);
+            let (mut plain, mut solid) = (Vec::new(), Vec::new());
+            let w = push_count(&mut plain, &mut atlas, row.x + 90.0, row, 4321, &theme);
+            let fill = theme.diff_modified;
+            let v = push_count_solid(
+                &mut solid,
+                &mut atlas,
+                row.x + 90.0,
+                row,
+                4321,
+                fill,
+                &theme,
+            );
+            assert_eq!(w, v);
+            assert_eq!(plain.len(), solid.len());
+            for (a, b) in plain.iter().zip(&solid) {
+                assert_eq!((a.pos, a.size), (b.pos, b.size));
+            }
+            assert_eq!(solid[0].color, fill);
+            assert_eq!(solid[1].color, theme.ink_on_solid());
+            assert!(solid[0].pos[0] + solid[0].size[0] <= row.x + row.width);
+        }
+    }
+
+    #[test]
+    fn a_tag_ends_where_its_row_does() {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let colour = Theme::dark().diff_added;
+        let label = "needs-a-second-look-before-planting";
+        let whole = tag_width(&mut atlas, label);
+        // Room for all of it: the whole word, as wide as it measures.
+        let mut out = Vec::new();
+        take_cut_labels();
+        assert_eq!(
+            push_tag(&mut out, &mut atlas, 30.0, row(400.0), label, colour),
+            whole
+        );
+        assert_eq!(frame_faults(&out, row(400.0)), Vec::<String>::new());
+        // Less room: a shorter pill with a cut word in it, inside the row.
+        for width in [120.0, 72.0, 40.0] {
+            let row = row(width);
+            out.clear();
+            let w = push_tag(&mut out, &mut atlas, row.x, row, label, colour);
+            assert!(w > 0.0 && w <= width, "{w} in {width}");
+            assert_eq!(frame_faults(&out, row), Vec::<String>::new(), "at {width}");
+            let (cut, fit) = tag_fit(&mut atlas, label, width);
+            assert_eq!(fit, w);
+            assert!(cut.ends_with('\u{2026}'), "{cut}");
+        }
+        // No room for even the mark: nothing.
+        out.clear();
+        assert_eq!(
+            push_tag(&mut out, &mut atlas, 30.0, row(12.0), label, colour),
+            0.0
+        );
+        assert!(out.is_empty());
+        // A neighbour that takes the end of the row is not drawn over: the
+        // tag is given the row up to it.
+        let state = ui_text_width(&mut atlas, "Draft");
+        let row = row(110.0);
+        let left = Viewport {
+            width: row.width - state - UI_GAP,
+            ..row
+        };
+        out.clear();
+        let w = push_tag(&mut out, &mut atlas, left.x, left, "#123456789012", colour);
+        assert!(left.x + w <= row.x + row.width - state - UI_GAP + 0.01);
     }
 }

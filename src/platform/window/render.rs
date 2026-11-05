@@ -136,7 +136,7 @@ impl EditorView {
             home_view,
             recent_projects,
             home: home_summary,
-            status_detail_x,
+            status_branch,
             unshaped_on_screen,
             completion_chips,
             conflict_scans,
@@ -662,7 +662,7 @@ impl EditorView {
                 [breadcrumb_rect.width, breadcrumb_rect.height],
                 theme.tab_active,
             );
-            layout::push_ui_text(
+            layout::push_ui_text_elided(
                 glyphs,
                 &mut renderer.atlas,
                 Viewport {
@@ -1121,26 +1121,33 @@ impl EditorView {
             // This Mac's branch says nothing about the server's.
             let branch = branch.filter(|_| remote.is_none());
             let claude = if claude.as_ref().is_some_and(|c| c.is_connected()) {
-                "\u{273b} Claude     "
+                STATUS_CLAUDE
             } else {
                 ""
             };
             (
                 left,
-                format!(
-                    "{claude}{}",
-                    branch.map(|b| format!("{b}     ")).unwrap_or_default()
-                ),
+                StatusDetail {
+                    lead: claude.to_owned(),
+                    branch: branch.unwrap_or_default(),
+                    ..StatusDetail::default()
+                },
             )
         } else {
             (status, detail)
         };
         let detail = if std::env::var_os("CRC_SHOW_LATENCY").is_some() {
-            format!("{}  {:?}", latency.summary(), worst)
+            StatusDetail {
+                place: format!("{}  {:?}", latency.summary(), worst),
+                ..StatusDetail::default()
+            }
         } else {
             detail
         };
-        let right = status_detail_rect(status_rect);
+        // The right side first: it takes what it needs of the room it may
+        // have, and the note has what is left of the line.
+        let fit = detail.fit(&mut renderer.atlas, status_rect);
+        let (note_rect, detail_x) = status_split(status_rect, &fit);
         // Work that outlasts a message: Git talking to a remote, a
         // language server starting. A spinner and what it is, until done.
         let shown_note = message.as_ref().map(|(text, _)| text.as_str());
@@ -1154,11 +1161,7 @@ impl EditorView {
                 .filter(|server| !server.is_ready())
                 .map(|server| format!("{} starting\u{2026}", server.name))
         };
-        let mut left = Viewport {
-            x: status_rect.x + layout::UI_INSET,
-            width: (right.x - status_rect.x - layout::UI_INSET * 2.0).max(0.0),
-            ..status_rect
-        };
+        let mut left = note_rect;
         let lead = |left: &mut Viewport, w: f32| {
             left.x += w;
             left.width = (left.width - w).max(0.0);
@@ -1228,7 +1231,7 @@ impl EditorView {
                 button = Some(layout::Button::new(rect).label(label));
             }
         }
-        layout::push_ui_text(
+        layout::push_ui_text_elided(
             glyphs,
             &mut renderer.atlas,
             text_rect,
@@ -1247,16 +1250,21 @@ impl EditorView {
             *status_action = Some(button.rect);
         }
         // Right-aligned, so the readout ends at the window's edge however
-        // long the branch name is, instead of leaving a ragged gap.
-        let detail_w = layout::ui_text_width(&mut renderer.atlas, &detail).min(right.width);
-        *status_detail_x = Some(right.x + right.width - detail_w);
-        layout::push_ui_text_right(
+        // long the branch name is, instead of leaving a ragged gap. Three
+        // runs side by side, the branch the middle one: where it is drawn
+        // is where it is clicked.
+        push_status_detail(
             glyphs,
             &mut renderer.atlas,
-            right,
-            &detail,
+            status_rect,
+            &fit,
             theme.status_text,
         );
+        *status_branch = fit.branch_span().map(|(offset, width)| Viewport {
+            x: detail_x + offset,
+            width,
+            ..status_rect
+        });
         // Go-to-line takes over the status line: it is a line number, and
         // that is where line numbers already live.
         let prompt = goto
@@ -1651,10 +1659,196 @@ struct StatusParts<'a> {
     table_cell: Option<(usize, usize)>,
 }
 
-/// The status line's left and right text. The left is a note, else the
-/// diagnostic under the caret, else the file's name and save state; the
-/// right is Claude, the branch, the diagnostic counts and the position.
-fn status_texts(parts: &StatusParts<'_>) -> (String, String) {
+/// Claude's mark in the status line, while Claude Code is connected.
+const STATUS_CLAUDE: &str = "\u{273b} Claude";
+/// What stands between the parts of the status line's right side.
+const STATUS_GAP: &str = "     ";
+/// The least room the branch is drawn in: under it a cut name says
+/// nothing, and the branch goes instead.
+const STATUS_BRANCH_MIN: f32 = 48.0;
+
+/// The right side of the status line, in the parts that give way
+/// differently when the window is narrow.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct StatusDetail {
+    /// Claude's mark and the language server.
+    lead: String,
+    branch: String,
+    /// The document's errors and warnings, counted.
+    counts: String,
+    /// The caret's line and column, or the grid's cell. Never cut.
+    place: String,
+    /// The encoding and the line ending.
+    format: String,
+}
+
+/// A [`StatusDetail`] as some width shows it: three runs of text side by
+/// side, the middle one the branch, and how wide each is drawn.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct StatusFit {
+    before: String,
+    branch: String,
+    after: String,
+    widths: [f32; 3],
+}
+
+impl StatusFit {
+    fn width(&self) -> f32 {
+        self.widths.iter().sum()
+    }
+
+    /// The runs, left to right, each with its width.
+    fn runs(&self) -> [(&str, f32); 3] {
+        [
+            (self.before.as_str(), self.widths[0]),
+            (self.branch.as_str(), self.widths[1]),
+            (self.after.as_str(), self.widths[2]),
+        ]
+    }
+
+    /// The branch's run: its offset from the start, and its width.
+    fn branch_span(&self) -> Option<(f32, f32)> {
+        (!self.branch.is_empty()).then_some((self.widths[0], self.widths[1]))
+    }
+
+    /// All three runs as one line.
+    #[cfg(test)]
+    fn text(&self) -> String {
+        format!("{}{}{}", self.before, self.branch, self.after)
+    }
+}
+
+impl StatusDetail {
+    /// All of it on one line, as a window with room shows it.
+    #[cfg(test)]
+    fn whole(&self) -> String {
+        join_status(&[
+            &self.lead,
+            &self.branch,
+            &self.counts,
+            &self.place,
+            &self.format,
+        ])
+    }
+
+    /// What of it is drawn in the status line `status`, whose right side
+    /// may take the share `status_detail_rect` gives it. All of it where
+    /// it fits. Short of that the branch is cut in its middle, down to
+    /// [`STATUS_BRANCH_MIN`]; then Claude's mark and the language server
+    /// go, then the branch, the encoding, and the counts. The position is
+    /// whole whatever the width: it takes the room it needs even past
+    /// that share, up to the whole line between its insets.
+    fn fit(&self, atlas: &mut Atlas, status: Viewport) -> StatusFit {
+        let place = layout::ui_text_width(atlas, &self.place);
+        let line = (status.width - layout::UI_INSET * 2.0).max(0.0);
+        let room = status_detail_rect(status).width.max(place).min(line);
+        let (lead, branch) = (self.lead.as_str(), self.branch.as_str());
+        let (counts, place, format) = (
+            self.counts.as_str(),
+            self.place.as_str(),
+            self.format.as_str(),
+        );
+        let steps: [(&str, &str, &[&str]); 5] = [
+            (lead, branch, &[counts, place, format]),
+            ("", branch, &[counts, place, format]),
+            ("", "", &[counts, place, format]),
+            ("", "", &[counts, place]),
+            ("", "", &[place]),
+        ];
+        let mut fit = StatusFit::default();
+        for (lead, branch, tail) in steps {
+            let tail = join_status(tail);
+            // A gap after the lead when anything follows it, and one
+            // before the tail when the branch is ahead of it.
+            let follows = !(branch.is_empty() && tail.is_empty());
+            let before = match (lead.is_empty(), follows) {
+                (true, _) => String::new(),
+                (false, true) => format!("{lead}{STATUS_GAP}"),
+                (false, false) => lead.to_owned(),
+            };
+            let after = if branch.is_empty() || tail.is_empty() {
+                tail
+            } else {
+                format!("{STATUS_GAP}{tail}")
+            };
+            let widths = [
+                layout::ui_text_width(atlas, &before),
+                layout::ui_text_width(atlas, branch),
+                layout::ui_text_width(atlas, &after),
+            ];
+            let left = room - widths[0] - widths[2];
+            let cut = if widths[1] <= left {
+                Some((branch.to_owned(), widths[1]))
+            } else if left >= STATUS_BRANCH_MIN {
+                let cut = layout::elide_middle(atlas, branch, left);
+                let width = layout::ui_text_width(atlas, &cut);
+                (!cut.is_empty()).then_some((cut, width))
+            } else {
+                None
+            };
+            // The last step is drawn whatever it measures: in a window
+            // narrower than the position, what fits of it.
+            fit = StatusFit {
+                before,
+                branch: String::new(),
+                after,
+                widths: [widths[0], 0.0, widths[2].min(room)],
+            };
+            if let Some((branch, width)) = cut {
+                fit.branch = branch;
+                fit.widths[1] = width;
+                break;
+            }
+        }
+        fit
+    }
+}
+
+/// Where the status line's note goes and where its right side starts,
+/// for a right side drawn as `fit`: the note has the line from its left
+/// inset to an inset short of the right side, so a long note is what
+/// gives way.
+fn status_split(status: Viewport, fit: &StatusFit) -> (Viewport, f32) {
+    let detail_x = status.x + status.width - layout::UI_INSET - fit.width();
+    let note = Viewport {
+        x: status.x + layout::UI_INSET,
+        width: (detail_x - status.x - layout::UI_INSET * 2.0).max(0.0),
+        ..status
+    };
+    (note, detail_x)
+}
+
+/// Draws the status line's right side as `fit`, ending at the line's
+/// right inset.
+fn push_status_detail(
+    out: &mut Vec<GlyphInstance>,
+    atlas: &mut Atlas,
+    status: Viewport,
+    fit: &StatusFit,
+    colour: [f32; 4],
+) {
+    let (_, mut x) = status_split(status, fit);
+    for (run, width) in fit.runs() {
+        layout::push_ui_text_elided(out, atlas, Viewport { x, width, ..status }, run, colour);
+        x += width;
+    }
+}
+
+/// The parts that say something, with [`STATUS_GAP`] between them.
+fn join_status(parts: &[&str]) -> String {
+    parts
+        .iter()
+        .filter(|part| !part.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join(STATUS_GAP)
+}
+
+/// The status line's left text and its right side. The left is a note,
+/// else the diagnostic under the caret, else the file's name and save
+/// state; the right is Claude, the branch, the diagnostic counts and the
+/// position.
+fn status_texts(parts: &StatusParts<'_>) -> (String, StatusDetail) {
     let buffer = parts.buffer;
     let (line, column) = buffer.cursor_position();
     let (here, counts) = match parts.diagnostics {
@@ -1668,7 +1862,7 @@ fn status_texts(parts: &StatusParts<'_>) -> (String, String) {
                 .filter(|d| d.severity == crate::lsp::Severity::Error)
                 .count();
             let warnings = list.len() - errors;
-            (here, format!("✕ {errors}  ⚠ {warnings}     "))
+            (here, format!("✕ {errors}  ⚠ {warnings}"))
         }
         _ => (None, String::new()),
     };
@@ -1709,36 +1903,41 @@ fn status_texts(parts: &StatusParts<'_>) -> (String, String) {
         Some((row, column)) => format!("Row {}, Col {}", row + 1, column + 1),
         None => format!("Ln {}, Col {}", line + 1, column + 1),
     };
-    let position = if buffer.is_view_only() {
-        String::new()
+    // A view-only document has no caret to place and nothing to encode.
+    let (place, format) = if buffer.is_view_only() {
+        (String::new(), String::new())
     } else {
-        format!(
-            "{place}     {}     {}",
-            buffer.disk_format().label(),
-            buffer.disk_format().line_ending_label()
+        (
+            place,
+            join_status(&[
+                buffer.disk_format().label(),
+                buffer.disk_format().line_ending_label(),
+            ]),
         )
     };
-    let right = format!(
-        "{}{}{}{counts}{position}",
-        if parts.claude { "✻ Claude     " } else { "" },
-        parts
-            .lsp
-            .as_deref()
-            .map(|lsp| format!("● {lsp}     "))
-            .unwrap_or_default(),
-        if parts.branch.is_empty() {
-            String::new()
-        } else {
-            format!("{}     ", parts.branch)
-        },
-    );
+    let lsp = parts.lsp.as_deref().map(|lsp| format!("● {lsp}"));
+    let right = StatusDetail {
+        lead: join_status(&[
+            if parts.claude { STATUS_CLAUDE } else { "" },
+            lsp.as_deref().unwrap_or(""),
+        ]),
+        branch: parts.branch.clone(),
+        counts,
+        place,
+        format,
+    };
     (left, right)
 }
 
 #[cfg(test)]
 mod status_tests {
-    use super::{StatusParts, status_texts};
+    use super::{
+        STATUS_BRANCH_MIN, StatusDetail, StatusParts, push_status_detail, status_detail_rect,
+        status_split, status_texts,
+    };
     use crate::lsp::{Diagnostic, Position, Severity};
+    use crate::render::font::Atlas;
+    use crate::render::layout::{self, Theme, Viewport};
     use crate::text::buffer::Buffer;
 
     fn parts(buffer: &Buffer) -> StatusParts<'_> {
@@ -1762,7 +1961,7 @@ mod status_tests {
             table_cell: Some((2, 1)),
             ..parts(&buffer)
         };
-        let (_, right) = status_texts(&grid);
+        let right = status_texts(&grid).1.whole();
         assert!(right.starts_with("Row 3, Col 2     "), "{right}");
         assert!(!right.contains("Ln "), "{right}");
     }
@@ -1771,15 +1970,16 @@ mod status_tests {
     fn the_language_server_shows_at_the_right_once_it_answers() {
         let buffer = Buffer::new();
         let mut p = parts(&buffer);
-        assert!(!status_texts(&p).1.contains('\u{25cf}'));
+        assert!(!status_texts(&p).1.whole().contains('\u{25cf}'));
         p.lsp = Some("rust-analyzer".into());
         assert!(
             status_texts(&p)
                 .1
+                .whole()
                 .starts_with("\u{25cf} rust-analyzer     ")
         );
         p.lsp = Some("rust-analyzer stopped".into());
-        assert!(status_texts(&p).1.contains("rust-analyzer stopped"));
+        assert!(status_texts(&p).1.whole().contains("rust-analyzer stopped"));
     }
 
     fn diagnostic(line: u32, severity: Severity, message: &str) -> Diagnostic {
@@ -1797,6 +1997,7 @@ mod status_tests {
     fn the_left_side_is_the_note_then_the_diagnostic_here_then_the_file() {
         let buffer = Buffer::new();
         let (left, right) = status_texts(&parts(&buffer));
+        let right = right.whole();
         assert_eq!(left, "Untitled   All changes saved");
         assert!(right.starts_with("Ln 1, Col 1"), "{right}");
 
@@ -1810,11 +2011,12 @@ mod status_tests {
             ..parts(&buffer)
         };
         let (left, right) = status_texts(&with_list);
+        let right = right.whole();
         assert_eq!(
             left, "expected `;`",
             "the first line of the one under the caret"
         );
-        assert!(right.starts_with("✕ 1  ⚠ 1"), "{right}");
+        assert!(right.starts_with("✕ 1  ⚠ 1     Ln 1"), "{right}");
 
         let noted = StatusParts {
             note: Some("Saved".into()),
@@ -1834,15 +2036,156 @@ mod status_tests {
             ..parts(&buffer)
         };
         let (left, right) = status_texts(&all);
+        let right = right.whole();
         assert_eq!(
             left,
             "Untitled   All changes saved   Long lines drawn without shaping   ·   Ada, 2 days ago"
         );
         assert!(right.starts_with("✻ Claude     main     Ln 1"), "{right}");
+        assert!(
+            right.ends_with("LF"),
+            "nothing trails the last part: {right:?}"
+        );
         let empty_blame = StatusParts {
             blame: Some(""),
             ..parts(&buffer)
         };
         assert_eq!(status_texts(&empty_blame).0, "Untitled   All changes saved");
+    }
+
+    /// Everything the right side can say at once, with a branch far
+    /// longer than any window gives it room for.
+    fn crowded() -> StatusDetail {
+        StatusDetail {
+            lead: "\u{273b} Claude     \u{25cf} rust-analyzer".into(),
+            branch: "feature/raised-beds-and-a-much-longer-watering-plan \u{2191}2 \u{2193}1"
+                .into(),
+            counts: "\u{2715} 12  \u{26a0} 3".into(),
+            place: "Ln 1234, Col 56".into(),
+            format: "UTF-8     LF".into(),
+        }
+    }
+
+    fn line(width: f32) -> Viewport {
+        Viewport {
+            x: 0.0,
+            y: 700.0,
+            width,
+            height: 24.0,
+        }
+    }
+
+    #[test]
+    fn a_narrow_window_cuts_the_note_then_the_branch_and_never_the_position() {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let theme = Theme::dark();
+        let detail = crowded();
+        let note = "Could not push to origin: the remote has commits this branch does not have, \
+                    pull them first and try again";
+        let note_colour = theme.text;
+        let place = layout::ui_text_width(&mut atlas, &detail.place);
+        let mut seen = Vec::new();
+        for width in [1600.0, 1100.0, 900.0, 600.0, 420.0, 320.0, 240.0, 180.0] {
+            let status = line(width);
+            let fit = detail.fit(&mut atlas, status);
+            assert!(
+                fit.width() <= status_detail_rect(status).width.max(place) + 0.5,
+                "at {width}: {}",
+                fit.width()
+            );
+            let text = fit.text();
+            // The position is whole at every width.
+            assert!(text.contains("Ln 1234, Col 56"), "at {width}: {text:?}");
+            let (note_rect, detail_x) = status_split(status, &fit);
+            let mut out = Vec::new();
+            layout::take_cut_labels();
+            layout::push_ui_text_elided(&mut out, &mut atlas, note_rect, note, note_colour);
+            let note_quads = out.len();
+            push_status_detail(&mut out, &mut atlas, status, &fit, theme.status_text);
+            // Nothing is sliced, nothing leaves the line, and the note
+            // ends before the right side starts.
+            assert_eq!(
+                layout::frame_faults(&out, status),
+                Vec::<String>::new(),
+                "at {width}"
+            );
+            for quad in &out[..note_quads] {
+                assert!(quad.pos[0] + quad.size[0] <= detail_x, "at {width}");
+            }
+            let end = out.last().map(|q| q.pos[0] + q.size[0]).unwrap();
+            assert!(end <= width - layout::UI_INSET + 0.51, "at {width}: {end}");
+            // The branch's run is the branch as drawn, and as wide.
+            match fit.branch_span() {
+                Some((offset, span)) => {
+                    assert_eq!(offset, fit.widths[0]);
+                    assert_eq!(span, layout::ui_text_width(&mut atlas, &fit.branch));
+                    assert!(span >= STATUS_BRANCH_MIN.min(span), "at {width}");
+                    if fit.branch != detail.branch {
+                        let (head, tail) = fit.branch.split_once('\u{2026}').expect("a cut branch");
+                        assert!(detail.branch.starts_with(head) && detail.branch.ends_with(tail));
+                        assert!(tail.ends_with("\u{2193}1"), "the counts stay: {tail:?}");
+                    }
+                }
+                None => assert!(fit.branch.is_empty()),
+            }
+            seen.push((width, text));
+        }
+        let at = |w: f32| {
+            seen.iter()
+                .find(|(width, _)| *width == w)
+                .unwrap()
+                .1
+                .clone()
+        };
+        // Room for all of it: all of it.
+        assert_eq!(at(1600.0), detail.whole());
+        // Less: the branch is cut while Claude and the server still show.
+        let cut = at(900.0);
+        assert!(
+            cut.contains('\u{2026}') && cut.contains("rust-analyzer"),
+            "{cut:?}"
+        );
+        assert!(cut.ends_with("UTF-8     LF"), "{cut:?}");
+        // Less again: the lead goes before the branch does.
+        let tight = at(600.0);
+        assert!(
+            !tight.contains("Claude") && tight.contains('\u{2026}'),
+            "{tight:?}"
+        );
+        // Then the branch, with the counts and the encoding still there.
+        let bare = at(420.0);
+        assert!(
+            !bare.contains('\u{2026}') && bare.ends_with("LF"),
+            "{bare:?}"
+        );
+        // The narrowest: the position, and little else.
+        let least = at(180.0);
+        assert!(!least.contains('\u{2026}'), "{least:?}");
+        assert!(least.contains("Ln 1234, Col 56"), "{least:?}");
+    }
+
+    #[test]
+    fn a_short_branch_and_a_wide_window_change_nothing() {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let detail = StatusDetail {
+            branch: "main".into(),
+            place: "Ln 1, Col 1".into(),
+            format: "UTF-8     LF".into(),
+            ..StatusDetail::default()
+        };
+        let status = line(1440.0);
+        let fit = detail.fit(&mut atlas, status);
+        assert_eq!(fit.text(), "main     Ln 1, Col 1     UTF-8     LF");
+        assert_eq!(fit.branch, "main");
+        let (note, detail_x) = status_split(status, &fit);
+        // The right side ends at the line's inset, the note at one before it.
+        assert_eq!(detail_x + fit.width(), 1440.0 - layout::UI_INSET);
+        assert_eq!(note.x + note.width, detail_x - layout::UI_INSET);
+        // No branch: no run for a click to land on.
+        let bare = StatusDetail {
+            branch: String::new(),
+            ..detail
+        };
+        assert_eq!(bare.fit(&mut atlas, status).branch_span(), None);
     }
 }

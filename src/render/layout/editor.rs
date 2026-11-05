@@ -1428,7 +1428,7 @@ pub fn build_change_peek(
         ..close
     };
     let title_x = header.x + 22.0;
-    push_ui_text(
+    push_ui_text_elided(
         out,
         atlas,
         Viewport {
@@ -1470,7 +1470,7 @@ pub fn build_change_peek(
         height: body_rows as f32 * lh,
     };
     if peek.head.is_empty() {
-        push_ui_text(
+        push_ui_text_elided(
             out,
             atlas,
             Viewport {
@@ -1520,7 +1520,7 @@ pub fn build_change_peek(
             );
         }
         if more > 0 {
-            push_ui_text(
+            push_ui_text_elided(
                 out,
                 atlas,
                 Viewport {
@@ -1685,7 +1685,7 @@ pub fn push_ghost(
         clip_horizontal(quad, code_x, text.x + text.width);
     }
     if ghost.more > 0 {
-        push_ui_text(
+        push_ui_text_elided(
             &mut quads,
             atlas,
             Viewport {
@@ -2104,7 +2104,7 @@ pub fn build_completion_ribbon(
             [panel.width - 16.0, 1.0],
             theme.palette_border,
         );
-        push_ui_text(
+        push_ui_text_elided(
             out,
             atlas,
             Viewport {

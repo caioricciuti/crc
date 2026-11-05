@@ -792,9 +792,10 @@ struct State {
     /// rectangles and tooltips, and the one under the pointer.
     hotspots: Vec<layout::Hotspot>,
     hot: Option<usize>,
-    /// Where the status line's right-hand readout starts, as last drawn:
-    /// it is right-aligned, so where the branch is depends on its length.
-    status_detail_x: Option<f32>,
+    /// Where the status line drew the branch in the last frame: the run
+    /// it is in, cut or whole. `None` while there is no branch, or no
+    /// room for it.
+    status_branch: Option<Viewport>,
     /// Where the status line last drew the button of a message that
     /// asks for something, for hit-testing clicks.
     status_action: Option<Viewport>,
@@ -8049,35 +8050,31 @@ fn say_no_preview(state: &mut State) {
     );
 }
 
-/// The right half of the status line, where the branch, counts and the
-/// caret's position are written.
+/// The most of the status line its right side may take, where the
+/// branch, counts and the caret's position are written: the larger share,
+/// from the line's right inset. The note on the left has the rest, and
+/// all the right side does not use.
 fn status_detail_rect(status: Viewport) -> Viewport {
-    let right_width = 320.0f32.min(status.width * 0.55);
+    const SHARE: f32 = 0.7;
+    let inner = (status.width - layout::UI_INSET * 2.0).max(0.0);
+    let width = (inner * SHARE).floor();
     Viewport {
-        x: status.x + status.width - right_width,
-        width: (right_width - 12.0).max(0.0),
+        x: status.x + status.width - layout::UI_INSET - width,
+        width,
         ..status
     }
 }
 
-/// Where the status line writes the branch, as `status_texts` lays it out:
-/// first in the right half, after Claude's mark when it is there.
+/// Where the status line wrote the branch in the last frame: the run it
+/// was drawn in, cut or whole, so a click lands on what is shown.
 fn status_branch_rect(state: &mut State, status: Viewport) -> Option<Viewport> {
-    let branch = state.git.branch_status();
-    if branch.is_empty() {
+    if state.git.branch_status().is_empty() {
         return None;
     }
-    let detail = status_detail_rect(status);
-    let start = state.status_detail_x.unwrap_or(detail.x);
-    let claude = if state.claude.as_ref().is_some_and(|c| c.is_connected()) {
-        layout::ui_text_width(&mut state.renderer.atlas, "✻ Claude     ")
-    } else {
-        0.0
-    };
-    let width = layout::ui_text_width(&mut state.renderer.atlas, &branch);
+    let drawn = state.status_branch?;
     Some(Viewport {
-        x: start + claude,
-        width: width.min((detail.x + detail.width - start - claude).max(0.0)),
+        x: drawn.x,
+        width: drawn.width,
         ..status
     })
 }
@@ -10421,7 +10418,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         pointer_targets: Vec::new(),
         hotspots: Vec::new(),
         hot: None,
-        status_detail_x: None,
+        status_branch: None,
         status_action: None,
         font: font.to_owned(),
         font_size: size_pt,

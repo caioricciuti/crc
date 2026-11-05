@@ -977,7 +977,7 @@ pub fn draw_strip(
             width: (strip.x + strip.width - pill.x - pill.width - 28.0).max(0.0),
             height: pill.height,
         };
-        layout::push_ui_text(out, atlas, row, &error_facts(error), theme.diff_removed);
+        layout::push_ui_text_elided(out, atlas, row, &error_facts(error), theme.diff_removed);
     } else {
         layout::strip_facts(out, atlas, strip, pill, &shape_facts(view, file), theme);
     }

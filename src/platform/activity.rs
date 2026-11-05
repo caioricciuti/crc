@@ -498,7 +498,26 @@ impl Monitor {
             }
             return title;
         };
-        layout::push_ui_text(out, atlas, cpu, "CPU", theme.status_text);
+        // A line's label has the room its figures leave, and is cut with an
+        // ellipsis where that is short; the figures are never drawn over it.
+        let label = |out: &mut Vec<GlyphInstance>,
+                     atlas: &mut Atlas,
+                     row: Viewport,
+                     label: &str,
+                     figures: f32| {
+            layout::push_ui_text_elided(
+                out,
+                atlas,
+                Viewport {
+                    width: (row.width - figures - layout::UI_GAP).max(0.0),
+                    ..row
+                },
+                label,
+                theme.status_text,
+            );
+        };
+        let cpu_w = layout::ui_text_width(atlas, &sample.cpu);
+        label(out, atlas, cpu, "CPU", cpu_w);
         let cpu_colour = if sample.cpu_hot {
             theme.diff_removed
         } else {
@@ -520,15 +539,18 @@ impl Monitor {
             Pressure::Warn => theme.diff_modified,
             Pressure::Critical => theme.diff_removed,
         };
-        layout::push_ui_text(out, atlas, mem, "Memory", theme.status_text);
+        let mut mem_w = layout::ui_text_width(atlas, &sample.memory);
         layout::push_ui_text_right(out, atlas, mem, &sample.memory, theme.text);
         if let Some(word) = sample.pressure.label() {
-            let tag_x = mem.x + mem.width
-                - layout::ui_text_width(atlas, &sample.memory)
-                - layout::UI_GAP
-                - layout::tag_width(atlas, word);
-            layout::push_tag(out, atlas, tag_x, mem, word, pressed);
+            let tag_w = layout::tag_width(atlas, word);
+            let tag_x = mem.x + mem.width - mem_w - layout::UI_GAP - tag_w;
+            // The word beside the figure, where the line has room for both.
+            if tag_x >= mem.x {
+                layout::push_tag(out, atlas, tag_x, mem, word, pressed);
+                mem_w += layout::UI_GAP + tag_w;
+            }
         }
+        label(out, atlas, mem, "Memory", mem_w);
         layout::push_meter(out, meter, sample.memory_used, pressed, theme);
         // In and out in two columns as wide as a busy rate, figures to
         // their right edge so both lines' units stand one above the other;
@@ -538,19 +560,25 @@ impl Monitor {
             .into_iter()
             .map(|widest| layout::ui_text_width(atlas, widest))
             .fold(0.0, f32::max);
-        for (row, label, [down, up]) in
-            [(disk, "Disk", &sample.disk), (net, "Network", &sample.net)]
+        for (row, name, [down, up]) in [(disk, "Disk", &sample.disk), (net, "Network", &sample.net)]
         {
-            layout::push_ui_text(out, atlas, row, label, theme.status_text);
             let right = row.x + row.width;
-            for (n, (arrow, value)) in [("\u{2193}", down), ("\u{2191}", up)]
+            // From the line's end leftwards: out, then in. A rate the line
+            // has no room for is left out whole, since a cut figure reads
+            // as another figure.
+            let mut figures = 0.0;
+            for (n, (arrow, value)) in [("\u{2191}", up), ("\u{2193}", down)]
                 .into_iter()
                 .enumerate()
             {
-                let end = right - (1 - n) as f32 * (column + PAD_X + arrow_w + 3.0);
+                let end = right - n as f32 * (column + PAD_X + arrow_w + 3.0);
                 let value_w = layout::ui_text_width(atlas, value);
+                let start = end - value_w - 3.0 - arrow_w;
+                if start < row.x {
+                    continue;
+                }
                 let arrow_at = Viewport {
-                    x: end - value_w - 3.0 - arrow_w,
+                    x: start,
                     width: arrow_w,
                     ..row
                 };
@@ -559,13 +587,16 @@ impl Monitor {
                     out,
                     atlas,
                     Viewport {
-                        width: end - row.x,
+                        x: start + arrow_w,
+                        width: end - start - arrow_w,
                         ..row
                     },
                     value,
                     theme.text,
                 );
+                figures = right - start;
             }
+            label(out, atlas, row, name, figures);
         }
         // Name, then CPU and memory in columns as wide as their widest
         // plausible figure, so they hold still from one read to the next.
@@ -1121,6 +1152,67 @@ mod tests {
         // these run on, but neither read may fail loudly.
         let _ = disk_bytes();
         let _ = link_bytes();
+    }
+
+    /// A busy read with long figures and a pressure word, in the narrowest
+    /// sidebar and in a usual one: no label is sliced, no figure is drawn
+    /// over a label, and nothing leaves the panel.
+    #[test]
+    fn the_panel_cuts_no_label_in_the_narrowest_sidebar() {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let theme = Theme::default();
+        let monitor = Monitor {
+            sample: Some(Sample {
+                cpu: "100%".into(),
+                cpu_hot: true,
+                history: vec![0.2, 0.9, 0.4],
+                memory: "46.2 / 48 GB".into(),
+                memory_used: 0.96,
+                pressure: Pressure::Critical,
+                disk: ["99.9 MB/s".into(), "810 KB/s".into()],
+                net: ["1023 B/s".into(), "0 B/s".into()],
+                top: vec![Busy {
+                    name: "seedling-watering-schedule-planner".into(),
+                    cpu: "212%".into(),
+                    memory: "1023 MB".into(),
+                }],
+            }),
+            ..Monitor::default()
+        };
+        for width in [140.0, 240.0] {
+            let rect = Viewport {
+                x: 0.0,
+                y: 400.0,
+                width,
+                height: Monitor::height(false),
+            };
+            let mut out = Vec::new();
+            layout::take_cut_labels();
+            monitor.draw(false, &mut atlas, rect, &theme, &mut out);
+            assert_eq!(
+                layout::frame_faults(&out, rect),
+                Vec::<String>::new(),
+                "Activity at {width}"
+            );
+            // Each line's label ends before its figures start.
+            let labels: Vec<_> = out
+                .iter()
+                .filter(|q| q.color == theme.status_text && q.size[0] > 0.0)
+                .collect();
+            let figures: Vec<_> = out
+                .iter()
+                .filter(|q| q.color == theme.text || q.color == theme.diff_removed)
+                .collect();
+            for label in &labels {
+                for figure in figures.iter().filter(|f| f.pos[1] == label.pos[1]) {
+                    assert!(
+                        label.pos[0] + label.size[0] <= figure.pos[0] + 0.5
+                            || figure.pos[0] + figure.size[0] <= label.pos[0] + 0.5,
+                        "a label under a figure at {width}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
