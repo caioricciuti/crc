@@ -25,6 +25,7 @@ mod chrome;
 mod draw;
 mod editor;
 mod markdown;
+pub mod split;
 mod theme;
 mod ui;
 pub use chrome::*;
