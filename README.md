@@ -247,7 +247,11 @@ the size and write it back.
   Focus Pane Left, Right, Up and Down to move the keyboard, and
   `Cmd-Option-W` closes the pane with the keyboard and keeps its session
   as a tab. A tab that is in no pane shows in the pane with the keyboard
-  when clicked. Each pane scrolls and selects on its own, each workspace
+  when clicked. Drag a tab down out of the strip onto a pane to arrange
+  them: let go near an edge and the tab gets that half of the pane, in
+  the middle and it shows in the pane's place, and a tab that is a pane
+  already moves there (Escape gives the drag up). Each pane scrolls and
+  selects on its own, each workspace
   keeps its own panes, and a program is told its new size once a drag is
   let go, not on every step. Panes are not kept across a relaunch. A
   session's state comes from the
@@ -402,7 +406,17 @@ the size and write it back.
   `-copy`, then `-copy-2`. A cut item is dimmed until it is pasted,
   something else is copied or Escape calls it off, and its open tabs and
   local history move with it. A large copy runs in the background, and
-  Escape in the tree stops it.
+  Escape in the tree stops it. Dragging moves: a drag that starts on a
+  selected item takes the whole selection, on any other item that item
+  alone, and what is carried shows beside the pointer. Picking an item
+  up opens nothing: a file opens, and a folder opens or closes, when the
+  press is let go where it went down. The folder it
+  would go into lights up: a folder's row is that folder, a file's row
+  the folder it is in, and the empty part of the list the project root.
+  Hold Option to copy instead of move. Resting on a closed folder opens
+  it, the tree scrolls near its top and bottom edges, and Escape calls
+  the drag off. A folder cannot go into itself, and an item whose name
+  is taken where it is dropped stays where it was while the rest go.
 - **Search view** (`Cmd-Shift-F`) in the sidebar: the project searched as
   you type, listed by file and line with each match marked, folding
   files, files to include and exclude, and Replace All; `Cmd-P` fuzzy
@@ -569,6 +583,9 @@ the size and write it back.
 | `Cmd-Delete` in the Explorer | move the selection to the Trash, after asking |
 | `Cmd-C` / `Cmd-X` / `Cmd-V` in the Explorer | copy or cut the selected files and folders, paste into the cursor's folder; also to and from the Finder |
 | Escape in the Explorer | stop a copy that is running, or call off a cut |
+| drag in the Explorer | move the selection, or the item pressed, into the folder under the pointer |
+| Option-drag in the Explorer | copy there instead; a name that is taken gets `-copy` |
+| Escape while dragging in the Explorer | call the drag off |
 | `Cmd-1..9`, `Cmd-[`, `Cmd-]` | switch tabs |
 | `Cmd-Shift-[`, `Cmd-Shift-]` | move the tab left or right: the terminal's while it has the keyboard, else the document's |
 | drag a tab, or right-click it | reorder or manage tabs |

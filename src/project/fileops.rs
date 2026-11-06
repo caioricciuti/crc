@@ -529,6 +529,9 @@ pub enum Refusal {
     Missing,
     /// A folder, headed into itself or into a folder inside it.
     IntoItself,
+    /// Dragged to a folder where something already has its name: a move
+    /// by drag replaces nothing and renames nothing.
+    Taken,
 }
 
 impl Refusal {
@@ -538,6 +541,7 @@ impl Refusal {
         match self {
             Refusal::Missing => "is no longer there",
             Refusal::IntoItself => "cannot be pasted into itself",
+            Refusal::Taken => "would replace an item of the same name",
         }
     }
 }
@@ -633,6 +637,174 @@ fn free_destination(
     });
     chosen.insert(key(&name));
     dir.join(name)
+}
+
+// ---- dragging -----------------------------------------------------------------
+// A drag in the Explorer asks whether it may be dropped on every move of
+// the pointer. Where the file system says the items and the folder are is
+// read once each, and the answer is then a comparison of paths.
+
+/// An item being dragged, with where the file system says it is: read
+/// once, when the drag starts.
+#[derive(Clone, Debug)]
+struct Dragged {
+    path: PathBuf,
+    /// As [`located`] answers: a symbolic link is the link.
+    at: PathBuf,
+    /// A folder that could hold the place it is dropped, not a link to one.
+    folder: bool,
+}
+
+impl Dragged {
+    fn new(path: PathBuf) -> Dragged {
+        let folder = fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir());
+        let at = located(&path);
+        Dragged { path, at, folder }
+    }
+}
+
+/// The folder a drag is over, with where the file system says it is: read
+/// once, when the drag comes to it.
+#[derive(Clone, Debug)]
+struct DropFolder {
+    dir: PathBuf,
+    /// As [`resolved`] answers.
+    real: PathBuf,
+}
+
+/// What dropping one item on a folder comes to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Landing {
+    /// It is moved there, or copied.
+    Goes,
+    /// Dropped on itself, or moved to the folder it is in: nothing to do.
+    Stays,
+    /// A folder, dropped somewhere inside itself.
+    IntoItself,
+}
+
+/// What dropping `item` on `onto` comes to, moved or with `copy` copied.
+/// Reads nothing: both were looked up when they were made.
+///
+/// Judged by where the file system says the two are, not by how the paths
+/// are written: a folder reached through a symbolic link is still the
+/// folder, and dropping it there would nest it all the same. A link is an
+/// item of its own, and can go into the folder it points at.
+fn landing(item: &Dragged, onto: &DropFolder, copy: bool) -> Landing {
+    if onto.real == item.at || onto.dir == item.path {
+        Landing::Stays
+    } else if item.folder && onto.real.starts_with(&item.at) {
+        Landing::IntoItself
+    } else if !copy && item.at.parent() == Some(onto.real.as_path()) {
+        Landing::Stays
+    } else {
+        Landing::Goes
+    }
+}
+
+/// What a drag in the Explorer carries, and the folder it is over.
+#[derive(Clone, Debug)]
+pub struct DropCheck {
+    items: Vec<Dragged>,
+    onto: Option<DropFolder>,
+}
+
+impl DropCheck {
+    /// A drag of the items at `paths` starts: each is looked up, once.
+    pub fn new(paths: Vec<PathBuf>) -> DropCheck {
+        DropCheck {
+            items: paths.into_iter().map(Dragged::new).collect(),
+            onto: None,
+        }
+    }
+
+    /// How many items are carried.
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// The items carried, as they were pressed.
+    pub fn paths(&self) -> impl Iterator<Item = &Path> {
+        self.items.iter().map(|item| item.path.as_path())
+    }
+
+    /// The folder the drag is over, if it is over one.
+    pub fn dir(&self) -> Option<&Path> {
+        self.onto.as_ref().map(|onto| onto.dir.as_path())
+    }
+
+    /// The drag is over the folder `dir` now, or over none. The folder is
+    /// looked up only when it is another one than the last: a pointer that
+    /// moves about inside one folder's rows reads nothing.
+    pub fn aim(&mut self, dir: Option<&Path>) {
+        self.aim_with(dir, resolved);
+    }
+
+    /// [`DropCheck::aim`], with the lookup given so a test can count it.
+    fn aim_with(&mut self, dir: Option<&Path>, resolve: impl FnOnce(&Path) -> PathBuf) {
+        if self.dir() == dir {
+            return;
+        }
+        self.onto = dir.map(|dir| DropFolder {
+            dir: dir.to_path_buf(),
+            real: resolve(dir),
+        });
+    }
+
+    /// Whether a drop here would move anything, or with `copy` copy it:
+    /// what the target lights up for. Reads nothing.
+    pub fn allowed(&self, copy: bool) -> bool {
+        self.onto.as_ref().is_some_and(|onto| {
+            self.items
+                .iter()
+                .any(|item| landing(item, onto, copy) == Landing::Goes)
+        })
+    }
+
+    /// What a drop here will do with each item, in order, without touching
+    /// anything. A copy takes its own name when that is free and the next
+    /// free `-copy` name otherwise, as a paste does. A move never takes
+    /// another name: where the item's name is in use it is refused as
+    /// [`Refusal::Taken`], and so is the second of two items of one name.
+    /// The rest still go.
+    pub fn plan(&self, copy: bool) -> Vec<Planned> {
+        let Some(onto) = &self.onto else {
+            return Vec::new();
+        };
+        let mut chosen = HashSet::new();
+        self.items
+            .iter()
+            .map(|item| {
+                let refused = |why| Planned::Refused {
+                    from: item.path.clone(),
+                    why,
+                };
+                match landing(item, onto, copy) {
+                    Landing::Stays => return Planned::Stays(item.path.clone()),
+                    Landing::IntoItself => return refused(Refusal::IntoItself),
+                    Landing::Goes => {}
+                }
+                let Some(name) = item.path.file_name().filter(|_| taken(&item.path)) else {
+                    return refused(Refusal::Missing);
+                };
+                let from = item.path.clone();
+                if copy {
+                    let folder = shown_as_folder(&from);
+                    let to = free_destination(&onto.dir, name, folder, &mut chosen);
+                    return Planned::Copy { from, to };
+                }
+                let to = onto.dir.join(name);
+                if taken(&to) || !chosen.insert(to.to_string_lossy().to_lowercase()) {
+                    return refused(Refusal::Taken);
+                }
+                Planned::Move { from, to }
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -1624,5 +1796,231 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+    }
+
+    /// A dragged item as the paths alone say it is, for rules that read
+    /// nothing.
+    fn dragged(path: &str, folder: bool) -> Dragged {
+        Dragged {
+            path: PathBuf::from(path),
+            at: PathBuf::from(path),
+            folder,
+        }
+    }
+
+    fn onto(dir: &str) -> DropFolder {
+        DropFolder {
+            dir: PathBuf::from(dir),
+            real: PathBuf::from(dir),
+        }
+    }
+
+    #[test]
+    fn a_drop_on_itself_or_where_it_is_stays_and_into_itself_is_refused() {
+        let src = dragged("/p/src", true);
+        let file = dragged("/p/src/main.rs", false);
+        for copy in [false, true] {
+            // Onto itself: nothing to do, moved or copied.
+            assert_eq!(landing(&src, &onto("/p/src"), copy), Landing::Stays);
+            // Into a folder inside itself, however deep.
+            for inside in ["/p/src/render", "/p/src/render/font"] {
+                assert_eq!(
+                    landing(&src, &onto(inside), copy),
+                    Landing::IntoItself,
+                    "{inside} (copy: {copy})"
+                );
+            }
+            // Somewhere else is a move, or a copy.
+            assert_eq!(landing(&file, &onto("/p/docs"), copy), Landing::Goes);
+            assert_eq!(landing(&src, &onto("/p/docs"), copy), Landing::Goes);
+            // A sibling whose name starts with the folder's is not inside
+            // it: paths compare whole components.
+            assert_eq!(
+                landing(&src, &onto("/p/src-generated"), copy),
+                Landing::Goes
+            );
+        }
+        // The folder it is in already: a move has nothing to do, and a
+        // copy is made beside the original.
+        assert_eq!(landing(&file, &onto("/p/src"), false), Landing::Stays);
+        assert_eq!(landing(&src, &onto("/p"), false), Landing::Stays);
+        assert_eq!(landing(&file, &onto("/p/src"), true), Landing::Goes);
+        assert_eq!(landing(&src, &onto("/p"), true), Landing::Goes);
+    }
+
+    /// The same folder under another name: as written, `alias/render` is
+    /// nowhere near `src`, and a move into it would still be a folder
+    /// moved inside itself.
+    #[test]
+    fn a_drop_is_judged_through_symbolic_links() {
+        let tree = TempTree::new(
+            "fileops-drop-link",
+            &[("src/render/font.rs", "f"), ("docs/", "")],
+        );
+        let root = tree.0.as_path();
+        let src = root.join("src");
+        let alias = root.join("alias");
+        symlink(&src, &alias).unwrap();
+        let allowed = |item: &Path, dir: &Path| {
+            let mut check = DropCheck::new(vec![item.to_path_buf()]);
+            check.aim(Some(dir));
+            check.allowed(false)
+        };
+
+        assert!(!allowed(&src, &alias), "onto itself");
+        assert!(!allowed(&src, &alias.join("render")), "into a child");
+        assert!(!allowed(&src.join("render"), &alias), "where it already is");
+        assert!(
+            !allowed(&alias.join("render/font.rs"), &src.join("render")),
+            "where it already is, the item through the link"
+        );
+        // The link is an item of its own: it can go into the folder it
+        // points at, other things can be dropped through it, and on its
+        // own row it stays.
+        assert!(allowed(&alias, &src.join("render")));
+        assert!(allowed(&root.join("docs"), &alias));
+        assert!(!allowed(&alias, root), "the link is already there");
+        assert!(!allowed(&alias, &alias), "the link on its own row");
+        // Over nothing, nothing is allowed.
+        let mut nowhere = DropCheck::new(vec![src.clone()]);
+        nowhere.aim(None);
+        assert!(!nowhere.allowed(false));
+        assert_eq!(nowhere.plan(false), []);
+    }
+
+    /// A drag asks on every move of the pointer. The folder under it is
+    /// looked up when it changes, and never again while it is the same.
+    #[test]
+    fn a_drop_folder_is_looked_up_once_for_as_long_as_the_drag_is_over_it() {
+        let looked_up = std::cell::Cell::new(0);
+        let resolve = |dir: &Path| {
+            looked_up.set(looked_up.get() + 1);
+            dir.to_path_buf()
+        };
+        let mut check = DropCheck {
+            items: vec![dragged("/p/garden.txt", false), dragged("/p/trips", true)],
+            onto: None,
+        };
+        assert!(!check.allowed(false), "over nothing yet");
+        for _ in 0..50 {
+            check.aim_with(Some(Path::new("/p/recipes")), resolve);
+            assert!(check.allowed(false));
+            assert!(check.allowed(true));
+        }
+        assert_eq!(looked_up.get(), 1);
+        // Another folder, then off the tree, then back: once each time it
+        // comes to a folder.
+        for _ in 0..50 {
+            check.aim_with(Some(Path::new("/p")), resolve);
+            assert!(!check.allowed(false), "both are in it already");
+            assert!(check.allowed(true), "a copy beside the originals");
+        }
+        assert_eq!(looked_up.get(), 2);
+        check.aim_with(None, resolve);
+        check.aim_with(None, resolve);
+        assert_eq!(looked_up.get(), 2);
+        assert_eq!(check.dir(), None);
+        check.aim_with(Some(Path::new("/p/trips/lisbon")), resolve);
+        assert_eq!(looked_up.get(), 3);
+        // One item can go and one cannot: the drop is allowed for the one.
+        assert!(check.allowed(false));
+        assert_eq!(check.len(), 2);
+    }
+
+    #[test]
+    fn a_drop_plan_moves_what_can_go_and_skips_a_taken_name() {
+        let tree = TempTree::new(
+            "fileops-plan-drop",
+            &[
+                ("recipes/bread.md", "flour"),
+                ("recipes/soup.md", "leeks"),
+                ("trips/lisbon.md", "tram 28"),
+                ("trips/soup.md", "a bowl in alfama"),
+                ("old/bread.md", "stale"),
+                ("garden.txt", "tomatoes"),
+                ("archive/", ""),
+            ],
+        );
+        let dir = tree.0.as_path();
+        let (recipes, trips) = (dir.join("recipes"), dir.join("trips"));
+        let (bread, soup) = (recipes.join("bread.md"), recipes.join("soup.md"));
+        let garden = dir.join("garden.txt");
+        let plan = |paths: &[&Path], onto: &Path, copy: bool| {
+            let mut check = DropCheck::new(paths.iter().map(|p| p.to_path_buf()).collect());
+            check.aim(Some(onto));
+            check.plan(copy)
+        };
+
+        // Several items go together; the one whose name is in use there is
+        // skipped, and the rest still go.
+        assert_eq!(
+            plan(&[&bread, &soup, &garden], &trips, false),
+            [
+                move_to(&bread, &trips.join("bread.md")),
+                refused(&soup, Refusal::Taken),
+                move_to(&garden, &trips.join("garden.txt")),
+            ]
+        );
+        // Two items of one name from two folders: the first goes, and the
+        // second would replace it.
+        let stale = dir.join("old/bread.md");
+        assert_eq!(
+            plan(&[&stale, &bread], &dir.join("archive"), false),
+            [
+                move_to(&stale, &dir.join("archive/bread.md")),
+                refused(&bread, Refusal::Taken),
+            ]
+        );
+        // A dangling link has the name as much as a file has.
+        symlink("nowhere", dir.join("archive/garden.txt")).unwrap();
+        assert_eq!(
+            plan(&[&garden], &dir.join("archive"), false),
+            [refused(&garden, Refusal::Taken)]
+        );
+        // Copied, nothing is skipped: a name in use gives way to `-copy`,
+        // and a copy into the folder it is in lands beside the original.
+        assert_eq!(
+            plan(&[&bread, &soup], &trips, true),
+            [
+                copy_to(&bread, &trips.join("bread.md")),
+                copy_to(&soup, &trips.join("soup-copy.md")),
+            ]
+        );
+        assert_eq!(
+            plan(&[&bread, &recipes], &recipes, true),
+            [
+                copy_to(&bread, &recipes.join("bread-copy.md")),
+                Planned::Stays(recipes.clone()),
+            ]
+        );
+        // Where it is, on itself, into itself, and gone meanwhile.
+        assert_eq!(
+            plan(&[&bread, &recipes, &trips], dir, false),
+            [
+                move_to(&bread, &dir.join("bread.md")),
+                Planned::Stays(recipes.clone()),
+                Planned::Stays(trips.clone()),
+            ]
+        );
+        fs::create_dir(recipes.join("baking")).unwrap();
+        assert_eq!(
+            plan(&[&recipes, &garden], &recipes.join("baking"), false),
+            [
+                refused(&recipes, Refusal::IntoItself),
+                move_to(&garden, &recipes.join("baking/garden.txt")),
+            ]
+        );
+        let mut gone = DropCheck::new(vec![garden.clone()]);
+        gone.aim(Some(&trips));
+        fs::remove_file(&garden).unwrap();
+        assert_eq!(gone.plan(false), [refused(&garden, Refusal::Missing)]);
+        assert_eq!(
+            Refusal::Taken.said(),
+            "would replace an item of the same name"
+        );
+
+        // A plan touches nothing.
+        assert_eq!(names(&trips), ["lisbon.md", "soup.md"]);
+        assert_eq!(names(&recipes), ["baking", "bread.md", "soup.md"]);
     }
 }

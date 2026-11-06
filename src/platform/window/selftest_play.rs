@@ -477,6 +477,9 @@ impl EditorView {
                     // and the terminal find bar's.
                     self.poll_terminal_search();
                     self.poll_terminal_find();
+                    // And rows of the Explorer held: the tree scrolls and
+                    // the folder they rest on opens by the frame.
+                    self.tree_drag_tick(Some(slice));
                 }
                 self.check_open_files();
                 self.poll_tree_children();
@@ -981,9 +984,10 @@ impl EditorView {
                     // With the terminal's tabs in their strip's order, on
                     // a line of its own, and then its panes: each one's
                     // grid, how often its program was told a size, and
-                    // where it is, with the divider held if one is.
+                    // where it is, with the pane and zone a held tab
+                    // would land on and the divider held if one is.
                     format_args!(
-                        "{}\nterminal_tabs: {}\nterminal_panes: {} held={}",
+                        "{}\nterminal_tabs: {}\nterminal_panes: {} drop={} held={}",
                         state.agents.report(
                             &state.terminal.tabs,
                             state.terminal.active,
@@ -994,6 +998,7 @@ impl EditorView {
                             let (_, screen) = crate::platform::terminal::split(rect);
                             state.terminal.panes_report(screen)
                         }),
+                        state.terminal.drop_report(),
                         state
                             .terminal
                             .divider_drag

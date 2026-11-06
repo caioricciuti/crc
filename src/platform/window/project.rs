@@ -401,8 +401,8 @@ impl EditorView {
     }
 
     /// Renames or moves a project item as `op` says, by a rename in the
-    /// Explorer or a drag, with its tabs and its local history. Says
-    /// `done` when it has moved, or `failed` and why.
+    /// Explorer, with its tabs and its local history. Says `done` when it
+    /// has moved, or `failed` and why.
     pub(super) fn move_item(&self, op: Op<'_>, done: String, failed: &str) {
         let moved = self.relocate(op, false);
         if let Some(mut state) = self.state_mut() {

@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use crate::project::icons;
 use crate::render::font::Atlas;
-use crate::render::layout::split::{Dir, Divider, Edge, Node};
+use crate::render::layout::split::{Dir, Divider, Edge, Node, Zone, zone_at, zone_rect};
 use crate::render::layout::{self, Button, Theme, Tone, Viewport};
 use crate::render::metal::GlyphInstance;
 use crate::term::pty::Session;
@@ -569,7 +569,7 @@ pub struct Panel {
     /// notifications are still to be taken back.
     pub withdrawn: Vec<String>,
     /// A tab pressed in the header, dragged along the strip once the
-    /// pointer has moved far enough.
+    /// pointer has moved far enough, or off it onto a pane.
     pub tab_drag: Option<TabDrag>,
     /// The tab a right-click's menu is about, by [`Tab::id`]: tabs can
     /// close and move while the menu is open, and its items act on that
@@ -587,7 +587,8 @@ pub struct Panel {
 }
 
 /// A tab pressed in the header: a drag to another place among the tabs
-/// listed once the pointer has left where it was pressed.
+/// listed once the pointer has left where it was pressed, and to a pane
+/// once it has been taken under the strip.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TabDrag {
     pub tab: usize,
@@ -597,10 +598,34 @@ pub struct TabDrag {
     pub y: f32,
     /// Moved far enough to be a drag, not a click.
     pub active: bool,
+    /// The session the press took the screen or a pane from, showing the
+    /// tab in its place as a click does. A drop beside a pane gives it
+    /// that place back first: the tab is added to what was showing.
+    pub before: Option<PaneId>,
+    /// Taken under the strip, on its way to a pane; level with the strip
+    /// again it is on its way along it.
+    pub pane: bool,
+    /// Where it lands if let go where the pointer is, as the last move
+    /// worked it out: the frame only draws it.
+    pub drop: Option<PaneDrop>,
+}
+
+/// Where a tab dragged over the panes lands.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PaneDrop {
+    /// The session whose pane the pointer is over.
+    pub pane: PaneId,
+    /// Beside it, cutting its pane in two at that edge, or in its place.
+    pub zone: Zone,
+    /// What lights up: the room the tab gets of that pane.
+    pub rect: Viewport,
 }
 
 /// How far the pointer moves from a press on a tab before it is a drag.
 pub const TAB_DRAG_AFTER: f32 = 4.0;
+/// How far under the strip a held tab is taken before it is on its way to
+/// a pane.
+pub const PANE_DROP_AFTER: f32 = 8.0;
 
 /// Where the tab at `index` is once the one at `from` has moved to `to`,
 /// the tabs between them each a place along. Every index kept across a
@@ -979,11 +1004,221 @@ impl Panel {
             .into_iter()
             .find(|(tab, _)| *tab == self.active)
             .map_or(screen, |(_, rect)| rect);
-        let (dir, extent) = match edge {
-            Edge::Left | Edge::Right => (Dir::Horizontal, pane.width),
-            Edge::Top | Edge::Bottom => (Dir::Vertical, pane.height),
+        can_cut(atlas, pane, edge)
+    }
+
+    /// A press on `tab` in the strip at a point: it shows, as a click
+    /// does, and is held, to be dragged along the strip or onto a pane.
+    /// The session it took the screen or a pane from is kept, for a drop
+    /// that adds the tab to what was showing.
+    pub fn press_tab(&mut self, tab: usize, x: f32, y: f32) {
+        let Some(pressed) = self.tabs.get(tab) else {
+            return;
         };
-        extent >= pane_min(atlas, dir) * 2.0 + PANE_GAP
+        let id = pressed.view.id;
+        let before = self
+            .active_tab()
+            .filter(|was| {
+                self.showing()
+                    && was.view.id != id
+                    && was.view.group == pressed.view.group
+                    && self.layout_of(id).is_none()
+            })
+            .map(|was| was.view.id);
+        self.show(tab);
+        self.tab_drag = Some(TabDrag {
+            tab,
+            start_x: x,
+            x,
+            y,
+            active: false,
+            before,
+            pane: false,
+            drop: None,
+        });
+    }
+
+    /// The pointer moved with a tab held, the strip in `header` and the
+    /// panes in `screen`. Along the strip the tab is on its way to another
+    /// place among the tabs once it has left where it was pressed. Taken
+    /// [`PANE_DROP_AFTER`] under the strip, where `panes` are to be had,
+    /// it is on its way to a pane, until it is level with the strip again.
+    /// Where it would land is worked out here, once a move, for the frame
+    /// to draw. Returns whether it is being dragged.
+    pub fn drag_tab(
+        &mut self,
+        atlas: &Atlas,
+        header: Viewport,
+        screen: Viewport,
+        panes: bool,
+        x: f32,
+        y: f32,
+    ) -> bool {
+        let Some(drag) = &mut self.tab_drag else {
+            return false;
+        };
+        drag.x = x;
+        drag.y = y;
+        let under = y - (header.y + header.height);
+        if !panes || under < 0.0 {
+            drag.pane = false;
+        } else if under > PANE_DROP_AFTER {
+            drag.pane = true;
+            drag.active = true;
+        }
+        drag.active |= (x - drag.start_x).abs() > TAB_DRAG_AFTER;
+        let active = drag.active;
+        let drop = self.drop_at(atlas, screen, x, y);
+        if let Some(drag) = &mut self.tab_drag {
+            drag.drop = drop;
+        }
+        active
+    }
+
+    /// Where the tab held over the panes in `screen` lands if let go at a
+    /// point: the pane under it, the gaps and the padding belonging to
+    /// the pane beside them, and the zone of that pane. None off the
+    /// panel, where the drop would change nothing (a tab on its own pane,
+    /// or put where it already is), and where a pane cut in two there
+    /// would leave a half smaller than a pane gets.
+    pub fn drop_at(&self, atlas: &Atlas, screen: Viewport, x: f32, y: f32) -> Option<PaneDrop> {
+        let drag = self.tab_drag.filter(|drag| drag.active && drag.pane)?;
+        let body = Viewport {
+            x: screen.x - PAD,
+            y: screen.y - PAD * 0.5,
+            width: screen.width + PAD * 2.0,
+            height: screen.height + PAD,
+        };
+        if !self.showing() || !body.contains(x, y) {
+            return None;
+        }
+        let over = self.pane_at(screen, x, y);
+        let (_, rect) = self
+            .screens(screen)
+            .into_iter()
+            .find(|(tab, _)| *tab == over)?;
+        // Just inside it, from a gap or the padding beside it.
+        let inside =
+            |at: f32, from: f32, extent: f32| at.clamp(from, (from + extent - 0.01).max(from));
+        let zone = zone_at(
+            rect,
+            inside(x, rect.x, rect.width),
+            inside(y, rect.y, rect.height),
+        )?;
+        let pane = self.tabs.get(over)?.view.id;
+        self.dropped(&drag, pane, zone)?;
+        if let Zone::Edge(edge) = zone
+            && !can_cut(atlas, rect, edge)
+        {
+            return None;
+        }
+        Some(PaneDrop {
+            pane,
+            zone,
+            rect: zone_rect(rect, PANE_GAP, zone),
+        })
+    }
+
+    /// The panes as they are with the tab of `drag` let go in `zone` of
+    /// the pane showing `over`, one pane alone being no layout. A tab the
+    /// press showed in place of another comes from the strip: the other
+    /// has its place back, and the tab is beside the pane it was let go
+    /// on, or in its place. A tab that was a pane already moves there,
+    /// what was beside it getting its room. None where nothing changes or
+    /// the layout takes no more.
+    fn dropped(&self, drag: &TabDrag, over: PaneId, zone: Zone) -> Option<Node<PaneId>> {
+        let tab = self.tabs.get(drag.tab)?;
+        let id = tab.view.id;
+        let now = match self.panes() {
+            Some(panes) => panes.tree.clone(),
+            None => Node::Leaf(self.active_tab()?.view.id),
+        };
+        if !now.contains(&id) || !now.contains(&over) {
+            return None;
+        }
+        let before = drag.before.filter(|before| {
+            self.layout_of(*before).is_none()
+                && self
+                    .tabs
+                    .iter()
+                    .any(|was| was.view.id == *before && was.view.group == tab.view.group)
+        });
+        let mut tree = now.clone();
+        let done = match (before, zone) {
+            (Some(before), Zone::Edge(edge)) => {
+                let target = if over == id { before } else { over };
+                tree.replace(&id, before) && tree.split(&target, edge, id)
+            }
+            // In its own place it is there already.
+            (Some(before), Zone::Center) => {
+                over != id && tree.replace(&id, before) && tree.replace(&over, id)
+            }
+            (None, Zone::Edge(edge)) => tree.move_leaf(&id, &over, edge),
+            (None, Zone::Center) => {
+                let mut rest = Some(tree);
+                let taken = over != id && Node::remove(&mut rest, &id);
+                tree = rest?;
+                taken && tree.replace(&over, id)
+            }
+        };
+        (done && !tree.alike(&now)).then_some(tree)
+    }
+
+    /// The button went up at a point with a tab held over the panes in
+    /// `screen`: the tab lands where [`Panel::drop_at`] has it, with the
+    /// keyboard, and nowhere when that is nowhere. The drag is over
+    /// either way. Returns whether the panes changed.
+    pub fn drop_pane(&mut self, atlas: &Atlas, screen: Viewport, x: f32, y: f32) -> bool {
+        let landed = self.drop_at(atlas, screen, x, y).and_then(|drop| {
+            let drag = self.tab_drag?;
+            Some((drag.tab, self.dropped(&drag, drop.pane, drop.zone)?))
+        });
+        self.tab_drag = None;
+        let Some((tab, tree)) = landed else {
+            return false;
+        };
+        let (id, group) = (self.tabs[tab].view.id, self.tabs[tab].view.group.clone());
+        let at = self.layouts.iter().position(|panes| panes.group == group);
+        if let Some(at) = at {
+            self.layouts.remove(at);
+        }
+        if tree.leaf_count() > 1 {
+            self.layouts.insert(
+                at.unwrap_or(self.layouts.len()),
+                Panes {
+                    group,
+                    tree,
+                    focus: id,
+                },
+            );
+        }
+        // Another shape: a divider held is not the one it was.
+        self.divider_drag = None;
+        self.active = tab;
+        true
+    }
+
+    /// For the self-test: the pane a held tab would land on, by its
+    /// session's title, and the zone of it, as `title:zone`; `-` while
+    /// there is none.
+    pub fn drop_report(&self) -> String {
+        self.tab_drag
+            .filter(|drag| drag.active && drag.pane)
+            .and_then(|drag| drag.drop)
+            .map_or("-".to_owned(), |drop| {
+                let pane = self
+                    .index_of(drop.pane)
+                    .and_then(|index| self.tabs.get(index))
+                    .map_or("?".to_owned(), Tab::base_name);
+                let zone = match drop.zone {
+                    Zone::Center => "center",
+                    Zone::Edge(Edge::Left) => "left",
+                    Zone::Edge(Edge::Right) => "right",
+                    Zone::Edge(Edge::Top) => "top",
+                    Zone::Edge(Edge::Bottom) => "bottom",
+                };
+                format!("{pane}:{zone}")
+            })
     }
 
     /// Keeps every session's grid the size of where it is drawn in the
@@ -995,8 +1230,11 @@ impl Panel {
     /// touches once. Nothing while a divider is dragged: a program that
     /// draws its whole screen on every change would draw it for each
     /// step, so the panes are cut or padded until the divider is let go.
+    /// Nothing while a tab is held either: the press shows it where the
+    /// drop may not leave it, so each session hears where it ended up,
+    /// once, when the button goes up.
     pub fn fit(&self, atlas: &Atlas, screen: Viewport) {
-        if self.divider_drag.is_some() {
+        if self.divider_drag.is_some() || self.tab_drag.is_some() {
             return;
         }
         let whole = grid_size(atlas, screen);
@@ -2535,6 +2773,14 @@ pub fn split(rect: Viewport) -> (Viewport, Viewport) {
 
 /// Between two panes: the padding of each and the line between them.
 pub const PANE_GAP: f32 = PAD * 2.0 + 1.0;
+/// How far into the padding round a pane what lights up for a drop
+/// reaches: short of the strip above it and of the line beside it.
+const DROP_GROW: f32 = PAD * 0.5 - 1.0;
+/// How thick the focus line is, the rule over the pane with the keyboard.
+/// It lies against the pane's first row, clear of the strip, and is half
+/// the weight of the active tab's rule: under that tab the two were one
+/// long line, and this one is the pane's.
+const FOCUS_LINE: f32 = 1.0;
 /// How far past the gap, into the pane on each side, a press still grabs
 /// the divider.
 const DIVIDER_SLOP: f32 = 2.0;
@@ -2549,6 +2795,16 @@ pub fn pane_min(atlas: &Atlas, dir: Dir) -> f32 {
         Dir::Horizontal => PANE_MIN_COLS as f32 * atlas.metrics.advance,
         Dir::Vertical => PANE_MIN_ROWS as f32 * row_height(atlas),
     }
+}
+
+/// Whether `pane` has room to be cut in two at `edge` with each half still
+/// the smallest a pane is dragged to.
+fn can_cut(atlas: &Atlas, pane: Viewport, edge: Edge) -> bool {
+    let (dir, extent) = match edge {
+        Edge::Left | Edge::Right => (Dir::Horizontal, pane.width),
+        Edge::Top | Edge::Bottom => (Dir::Vertical, pane.height),
+    };
+    extent >= pane_min(atlas, dir) * 2.0 + PANE_GAP
 }
 
 /// The height of one terminal row.
@@ -2978,8 +3234,11 @@ pub fn draw(
 
     let strip = strip(panel, atlas, header);
     let listed = panel.listed();
-    // A tab on its way to another place along the strip.
+    // A tab on its way to another place along the strip, or off it onto
+    // a pane: its name then goes with the pointer, as the strip has it.
     let drag = panel.tab_drag.filter(|drag| drag.active);
+    let lifted = drag.filter(|drag| drag.pane);
+    let mut lifted_name = None;
     let first = out.len();
     for (place, index) in listed.iter().enumerate() {
         let (index, tab) = (*index, &panel.tabs[*index]);
@@ -3075,6 +3334,9 @@ pub fn draw(
             &text,
             faint(colour),
         );
+        if lifted.is_some_and(|drag| drag.tab == index) {
+            lifted_name = Some(text);
+        }
         // The close cross on the tab that is showing and the one under the
         // pointer, the way editor tabs do it; not on one half out of sight.
         if (active || hovered) && drag.is_none() && close.width > 0.0 {
@@ -3145,13 +3407,14 @@ pub fn draw(
             };
             layout::push_rect(out, atlas, pos, size, colour);
         }
-        // The pane with the keyboard: a line over its screen.
+        // The pane with the keyboard: a thin line over its screen,
+        // against its first row.
         if let Some((_, focused)) = screens.iter().find(|(tab, _)| *tab == panel.active) {
             layout::push_rect(
                 out,
                 atlas,
-                [focused.x, focused.y - PAD * 0.5],
-                [focused.width, 2.0],
+                [focused.x, focused.y - FOCUS_LINE],
+                [focused.width, FOCUS_LINE],
                 if panel.focus {
                     theme.accent
                 } else {
@@ -3169,6 +3432,32 @@ pub fn draw(
     for (index, screen) in screens {
         let find = find.filter(|_| index == panel.active);
         draw_screen(panel, find, index, screen, atlas, theme, background, out);
+    }
+    // A tab taken off the strip: the room it would get lit up over the
+    // screens, a little into the padding round it, and its name by the
+    // pointer over that.
+    if let Some(drag) = lifted {
+        if let Some(drop) = drag.drop {
+            let lit = Viewport {
+                x: drop.rect.x - DROP_GROW,
+                y: drop.rect.y - DROP_GROW,
+                width: drop.rect.width + DROP_GROW * 2.0,
+                height: drop.rect.height + DROP_GROW * 2.0,
+            };
+            layout::push_drop_zone(out, atlas, lit, theme);
+        }
+        let name = lifted_name.or_else(|| {
+            let tab = panel.tabs.get(drag.tab)?;
+            Some(fitted_label(atlas, tab, TAB_MAX - TAB_CHROME))
+        });
+        if let Some(name) = name {
+            let body = Viewport {
+                y: header.y + header.height,
+                height: (rect.height - header.height).max(0.0),
+                ..rect
+            };
+            layout::push_drag_chip(out, atlas, (drag.x, drag.y), body, &name, theme);
+        }
     }
 }
 
@@ -4462,6 +4751,9 @@ mod tests {
                             x: 9.0,
                             y: 0.0,
                             active: true,
+                            before: None,
+                            pane: false,
+                            drop: None,
                         });
                         panel.closed_active = Some((None, PathBuf::new(), other));
                         let name = |panel: &Panel, i: usize| panel.tabs[i].title.clone();
@@ -4619,6 +4911,9 @@ mod tests {
             x: 0.0,
             y: 0.0,
             active: true,
+            before: None,
+            pane: false,
+            drop: None,
         });
         panel.close_tab(0);
         assert_eq!(panel.tab_drag, None);
@@ -4918,6 +5213,9 @@ mod tests {
                     x: header.x + header.width - 60.0,
                     y: header.y + 10.0,
                     active: true,
+                    before: None,
+                    pane: false,
+                    drop: None,
                 });
                 let mut dragging = Vec::new();
                 draw(&panel, None, &mut atlas, rect, &theme, &mut dragging);
@@ -5938,25 +6236,634 @@ mod tests {
         );
         assert_eq!(level.0[0] + level.1[0], rect.x + rect.width);
         // The focus line over the pane with the keyboard, in the accent
-        // while the terminal has it.
-        let over = |panel: &Panel, atlas: &mut Atlas| {
-            rules(panel, atlas)
+        // while the terminal has it: a thin rule against the pane's first
+        // row, as wide as the pane, and the only one there.
+        let over = |panel: &Panel, atlas: &mut Atlas, pane: Viewport| {
+            let found: Vec<_> = rules(panel, atlas)
                 .into_iter()
-                .find(|(_, size, _)| size[1] == 2.0)
-                .expect("a focus line")
+                .filter(|(pos, size, _)| size[1] == 1.0 && pos[1] == pane.y - 1.0)
+                .collect();
+            assert_eq!(found.len(), 1, "one focus line: {found:?}");
+            found[0]
         };
-        let (pos, size, colour) = over(&panel, &mut atlas);
         let focused = panes[2].1;
-        assert_eq!(pos, [focused.x, focused.y - PAD * 0.5]);
-        assert_eq!(size, [focused.width, 2.0]);
+        let (pos, size, colour) = over(&panel, &mut atlas, focused);
+        assert_eq!(pos, [focused.x, focused.y - 1.0]);
+        assert_eq!(size, [focused.width, 1.0]);
         assert_eq!(colour, theme.accent);
+        // No other pane has one.
+        for (_, pane) in &panes[..2] {
+            assert!(
+                !rules(&panel, &mut atlas)
+                    .iter()
+                    .any(|(pos, _, _)| pos[1] == pane.y - 1.0)
+            );
+        }
+        // Over a pane that touches the strip it is clear of the strip,
+        // where the active tab's own rule is, and half that rule's weight.
         panel.show(0);
-        let (pos, size, _) = over(&panel, &mut atlas);
-        assert_eq!(
-            (pos, size[0]),
-            ([panes[0].1.x, screen.y - PAD * 0.5], panes[0].1.width)
-        );
+        let (pos, size, _) = over(&panel, &mut atlas, panes[0].1);
+        assert_eq!((pos[0], size[0]), (panes[0].1.x, panes[0].1.width));
+        assert_eq!(pos[1] - (rect.y + HEADER), 3.0);
+        let mut out = Vec::new();
+        draw(&panel, None, &mut atlas, rect, &theme, &mut out);
+        let tab_rule = out
+            .iter()
+            .find(|q| q.color == theme.accent && q.pos[1] == rect.y + HEADER - 2.0)
+            .expect("the active tab's rule");
+        assert_eq!(tab_rule.size[1], 2.0);
         panel.focus = false;
-        assert_eq!(over(&panel, &mut atlas).2, theme.hairline);
+        assert_eq!(over(&panel, &mut atlas, panes[0].1).2, theme.hairline);
+    }
+
+    // ---- a tab dragged onto a pane -------------------------------------------
+
+    const CENTER: Zone = Zone::Center;
+    const LEFT: Zone = Zone::Edge(Edge::Left);
+    const RIGHT: Zone = Zone::Edge(Edge::Right);
+    const TOP: Zone = Zone::Edge(Edge::Top);
+    const BOTTOM: Zone = Zone::Edge(Edge::Bottom);
+
+    /// The panel the drags below are in: its strip over [`wide_screen`].
+    fn drag_rect() -> Viewport {
+        Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: 1016.0,
+            height: 638.0,
+        }
+    }
+
+    /// A point in `zone` of the pane showing the session titled `over`.
+    fn zone_point(panel: &Panel, over: &str, zone: Zone) -> (f32, f32) {
+        let over = at(panel, over);
+        let (_, pane) = panel
+            .screens(wide_screen())
+            .into_iter()
+            .find(|(tab, _)| *tab == over)
+            .expect("a pane showing it");
+        let (fx, fy) = match zone {
+            Zone::Center => (0.5, 0.5),
+            Zone::Edge(Edge::Left) => (0.1, 0.5),
+            Zone::Edge(Edge::Right) => (0.9, 0.5),
+            Zone::Edge(Edge::Top) => (0.5, 0.1),
+            Zone::Edge(Edge::Bottom) => (0.5, 0.9),
+        };
+        (pane.x + pane.width * fx, pane.y + pane.height * fy)
+    }
+
+    /// A press on the tab titled `tab`, as the window sends it, then the
+    /// pointer taken to `zone` of the pane showing `over`. Where it is,
+    /// and where the tab would land.
+    fn lift(
+        panel: &mut Panel,
+        atlas: &Atlas,
+        tab: &str,
+        over: &str,
+        zone: Zone,
+    ) -> ((f32, f32), Option<PaneDrop>) {
+        let (header, screen) = split(drag_rect());
+        panel.press_tab(at(panel, tab), 60.0, 15.0);
+        let (x, y) = zone_point(panel, over, zone);
+        assert!(panel.drag_tab(atlas, header, screen, true, x, y));
+        let drag = panel.tab_drag.expect("a tab held");
+        assert!(drag.active && drag.pane);
+        ((x, y), drag.drop)
+    }
+
+    /// [`lift`], then the button up there. Whether the panes changed.
+    fn drop_on(panel: &mut Panel, atlas: &Atlas, tab: &str, over: &str, zone: Zone) -> bool {
+        let ((x, y), drop) = lift(panel, atlas, tab, over, zone);
+        let landed = panel.drop_pane(atlas, wide_screen(), x, y);
+        assert_eq!(landed, drop.is_some(), "what lit up is what happened");
+        assert_eq!(panel.tab_drag, None, "the drag is over");
+        check_panes(panel, "after a drop");
+        landed
+    }
+
+    #[test]
+    fn a_held_tab_is_for_the_strip_until_it_is_taken_under_it() {
+        let atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let (header, screen) = split(drag_rect());
+        let mut panel = two_workspaces();
+        panel.press_tab(at(&panel, "g1"), 60.0, 15.0);
+        assert_eq!(front(&panel), "g1", "the press shows it");
+        let state = |panel: &Panel| {
+            let drag = panel.tab_drag.expect("a tab held");
+            (drag.active, drag.pane)
+        };
+        assert_eq!(state(&panel), (false, false));
+        // A point or two is a click still; past that it is on its way
+        // along the strip.
+        assert!(!panel.drag_tab(&atlas, header, screen, true, 62.0, 16.0));
+        assert!(panel.drag_tab(&atlas, header, screen, true, 80.0, 16.0));
+        assert_eq!(state(&panel), (true, false));
+        assert_eq!(
+            panel.report(),
+            "g0,(s0),*g1,g2,(s1),g3 panes=- scrolled=no drag=g1"
+        );
+        // Just under the strip is still the strip's.
+        let under = HEADER + PANE_DROP_AFTER;
+        assert!(panel.drag_tab(&atlas, header, screen, true, 80.0, under));
+        assert_eq!(state(&panel), (true, false));
+        assert_eq!(panel.drop_report(), "-");
+        // Further down it is on its way to a pane, and stays so until it
+        // is level with the strip again.
+        assert!(panel.drag_tab(&atlas, header, screen, true, 900.0, under + 1.0));
+        assert_eq!(state(&panel), (true, true));
+        assert!(panel.drag_tab(&atlas, header, screen, true, 900.0, HEADER + 2.0));
+        assert_eq!(state(&panel), (true, true));
+        assert_eq!(panel.drop_report(), "g1:top");
+        assert!(panel.drag_tab(&atlas, header, screen, true, 900.0, HEADER - 1.0));
+        assert_eq!(state(&panel), (true, false));
+        assert_eq!(panel.drop_report(), "-", "nothing lit from the strip");
+        assert_eq!(panel.tab_drag.and_then(|drag| drag.drop), None);
+        // Let go on the strip it is a move along it, as before.
+        let listed = panel.listed();
+        assert!(panel.drop_tab(&listed, at(&panel, "g1"), 0));
+        assert_eq!(titles(&panel), ["g1", "g0", "s0", "g2", "s1", "g3"]);
+        assert_eq!(panes_of(&panel), "-");
+
+        // Straight down from the press, never sideways: a drag all the
+        // same.
+        let mut panel = two_workspaces();
+        panel.press_tab(at(&panel, "g1"), 60.0, 15.0);
+        assert!(panel.drag_tab(&atlas, header, screen, true, 60.0, 300.0));
+        assert_eq!(state(&panel), (true, true));
+        // Where there are no panes to be had it never leaves the strip.
+        let mut panel = two_workspaces();
+        panel.press_tab(at(&panel, "g1"), 60.0, 15.0);
+        assert!(!panel.drag_tab(&atlas, header, screen, false, 60.0, 300.0));
+        assert_eq!(state(&panel), (false, false));
+        assert!(panel.drag_tab(&atlas, header, screen, false, 900.0, 300.0));
+        assert_eq!(state(&panel), (true, false));
+        assert_eq!(panel.drop_at(&atlas, screen, 900.0, 300.0), None);
+        assert!(!panel.drop_pane(&atlas, screen, 900.0, 300.0));
+        assert_eq!(panes_of(&panel), "-");
+    }
+
+    #[test]
+    fn a_tab_dropped_on_one_session_makes_two_panes_of_it() {
+        let atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        // g0 shows alone. g1's tab is pressed, which shows it, and let go
+        // at an edge of the screen: g0 is back, and g1 beside it there
+        // with the keyboard.
+        for (edge, panes) in [
+            (Edge::Right, "h(0.5,g0,*g1)"),
+            (Edge::Left, "h(0.5,*g1,g0)"),
+            (Edge::Bottom, "v(0.5,g0,*g1)"),
+            (Edge::Top, "v(0.5,*g1,g0)"),
+        ] {
+            let mut panel = two_workspaces();
+            let (_, drop) = lift(&mut panel, &atlas, "g1", "g1", Zone::Edge(edge));
+            let drop = drop.unwrap_or_else(|| panic!("{edge:?}: nowhere to land"));
+            assert_eq!(drop.zone, Zone::Edge(edge));
+            assert_eq!(
+                drop.rect,
+                zone_rect(wide_screen(), PANE_GAP, Zone::Edge(edge)),
+                "{edge:?}: half the screen lights up"
+            );
+            assert_eq!(panes_of(&panel), "-", "{edge:?}: nothing moves while held");
+            let mut panel = two_workspaces();
+            assert!(drop_on(&mut panel, &atlas, "g1", "g1", Zone::Edge(edge)));
+            assert_eq!(panes_of(&panel), panes, "{edge:?}");
+            assert_eq!(front(&panel), "g1", "{edge:?}: it has the keyboard");
+            assert_eq!(titles(&panel), ["g0", "s0", "g1", "g2", "s1", "g3"]);
+        }
+        // In the middle it shows there, which the press already did.
+        let mut panel = two_workspaces();
+        assert!(!drop_on(&mut panel, &atlas, "g1", "g1", CENTER));
+        assert_eq!((panes_of(&panel).as_str(), front(&panel)), ("-", "g1"));
+        // The session showing, dragged over its own screen: nothing.
+        for zone in [CENTER, RIGHT, TOP] {
+            let mut panel = two_workspaces();
+            assert!(!drop_on(&mut panel, &atlas, "g0", "g0", zone));
+            assert_eq!((panes_of(&panel).as_str(), front(&panel)), ("-", "g0"));
+        }
+        // Another workspace's panes are no part of it.
+        let mut panel = two_workspaces();
+        assert!(drop_on(&mut panel, &atlas, "g1", "g1", RIGHT));
+        list(&mut panel, "sheds");
+        panel.show(at(&panel, "s0"));
+        assert!(drop_on(&mut panel, &atlas, "s1", "s1", BOTTOM));
+        assert_eq!(panes_of(&panel), "v(0.5,s0,*s1)");
+        list(&mut panel, "garden");
+        panel.show(at(&panel, "g0"));
+        assert_eq!(panes_of(&panel), "h(0.5,*g0,g1)");
+    }
+
+    #[test]
+    fn a_tab_of_the_strip_dropped_on_a_pane_is_beside_it_or_in_its_place() {
+        let atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let three = || {
+            let mut panel = two_workspaces();
+            assert!(panel.split(Edge::Right, at(&panel, "g1")));
+            assert!(panel.split(Edge::Bottom, at(&panel, "g2")));
+            assert_eq!(panes_of(&panel), "h(0.5,g0,v(0.5,g1,*g2))");
+            panel
+        };
+        // g3 is in no pane. Its press shows it where g2 was; the drop
+        // puts g2 back and g3 beside the pane it was let go on.
+        let mut panel = three();
+        assert!(drop_on(&mut panel, &atlas, "g3", "g0", BOTTOM));
+        assert_eq!(panes_of(&panel), "h(0.5,v(0.5,g0,*g3),v(0.5,g1,g2))");
+        assert_eq!(front(&panel), "g3");
+        let mut panel = three();
+        assert!(drop_on(&mut panel, &atlas, "g3", "g1", LEFT));
+        assert_eq!(panes_of(&panel), "h(0.5,g0,v(0.5,h(0.5,*g3,g1),g2))");
+        // On the pane the press showed it in, that is beside g2.
+        let mut panel = three();
+        assert!(drop_on(&mut panel, &atlas, "g3", "g3", RIGHT));
+        assert_eq!(panes_of(&panel), "h(0.5,g0,v(0.5,g1,h(0.5,g2,*g3)))");
+        let mut panel = three();
+        assert!(drop_on(&mut panel, &atlas, "g3", "g3", TOP));
+        assert_eq!(panes_of(&panel), "h(0.5,g0,v(0.5,g1,v(0.5,*g3,g2)))");
+        // In the middle of another pane it shows in that one's place:
+        // g2 has its pane back and g0 is a tab of the strip alone.
+        let mut panel = three();
+        assert!(drop_on(&mut panel, &atlas, "g3", "g0", CENTER));
+        assert_eq!(panes_of(&panel), "h(0.5,*g3,v(0.5,g1,g2))");
+        assert_eq!(panel.visible(true), [5, 2, 3]);
+        // In the middle of the one it shows in: as the press left it.
+        let mut panel = three();
+        assert!(!drop_on(&mut panel, &atlas, "g3", "g3", CENTER));
+        assert_eq!(panes_of(&panel), "h(0.5,g0,v(0.5,g1,*g3))");
+        // The dividers keep their places round what was not cut.
+        let mut panel = three();
+        let bar = panel.dividers(wide_screen())[0];
+        panel.grab_divider(&bar, bar.rect.x + 8.0, bar.rect.y + 8.0);
+        assert!(panel.drag_divider(&atlas, wide_screen(), 300.0, 0.0));
+        panel.divider_drag = None;
+        let ratio = panes_of(&panel);
+        let ratio = ratio[2..].split(',').next().expect("a ratio").to_owned();
+        assert_ne!(ratio, "0.5");
+        assert!(drop_on(&mut panel, &atlas, "g3", "g1", RIGHT));
+        assert_eq!(
+            panes_of(&panel),
+            format!("h({ratio},g0,v(0.5,h(0.5,g1,*g3),g2))")
+        );
+    }
+
+    #[test]
+    fn a_pane_dragged_by_its_tab_moves_and_stays_put_on_itself() {
+        let atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let three = || {
+            let mut panel = two_workspaces();
+            assert!(panel.split(Edge::Right, at(&panel, "g1")));
+            assert!(panel.split(Edge::Bottom, at(&panel, "g2")));
+            panel
+        };
+        // g2 to the left of g0: g1 has all of the right side.
+        let mut panel = three();
+        assert!(drop_on(&mut panel, &atlas, "g2", "g0", LEFT));
+        assert_eq!(panes_of(&panel), "h(0.5,h(0.5,*g2,g0),g1)");
+        assert_eq!(front(&panel), "g2");
+        // g0, which did not have the keyboard, under g2: it has it there.
+        let mut panel = three();
+        assert!(drop_on(&mut panel, &atlas, "g0", "g2", BOTTOM));
+        assert_eq!(panes_of(&panel), "v(0.5,g1,v(0.5,g2,*g0))");
+        assert_eq!(front(&panel), "g0");
+        // To the other side of the pane beside it: the two trade places.
+        let mut panel = three();
+        assert!(drop_on(&mut panel, &atlas, "g1", "g2", BOTTOM));
+        assert_eq!(panes_of(&panel), "h(0.5,g0,v(0.5,g2,*g1))");
+        // In the middle of another pane: it shows there, the pane it
+        // left closes, and the session it replaced is a tab alone.
+        let mut panel = three();
+        assert!(drop_on(&mut panel, &atlas, "g2", "g0", CENTER));
+        assert_eq!(panes_of(&panel), "h(0.5,*g2,g1)");
+        let mut panel = two_workspaces();
+        assert!(panel.split(Edge::Right, at(&panel, "g1")));
+        assert!(drop_on(&mut panel, &atlas, "g0", "g1", CENTER));
+        assert_eq!((panes_of(&panel).as_str(), front(&panel)), ("-", "g0"));
+        assert!(panel.layouts.is_empty(), "one pane is no layout");
+
+        // On its own pane, wherever: nothing, and nothing lights up.
+        // The press alone gives it the keyboard, as a click does.
+        for zone in [CENTER, LEFT, RIGHT, TOP, BOTTOM] {
+            let mut panel = three();
+            let before = panel.layouts[0].tree.clone();
+            assert!(!drop_on(&mut panel, &atlas, "g1", "g1", zone), "{zone:?}");
+            assert_eq!(panel.layouts[0].tree, before, "{zone:?}");
+            assert_eq!(front(&panel), "g1");
+        }
+        // To where it already is, over g2 or beside g0: nothing, and the
+        // dividers stay where they were put.
+        let mut panel = three();
+        let bar = panel.dividers(wide_screen())[1];
+        panel.grab_divider(&bar, bar.rect.x + 8.0, bar.rect.y + 8.0);
+        assert!(panel.drag_divider(&atlas, wide_screen(), 0.0, 200.0));
+        panel.divider_drag = None;
+        let before = panel.layouts[0].tree.clone();
+        assert!(!drop_on(&mut panel, &atlas, "g1", "g2", TOP));
+        assert!(!drop_on(&mut panel, &atlas, "g2", "g1", BOTTOM));
+        assert_eq!(panel.layouts[0].tree, before);
+        let mut panel = two_workspaces();
+        assert!(panel.split(Edge::Right, at(&panel, "g1")));
+        assert!(!drop_on(&mut panel, &atlas, "g0", "g1", LEFT));
+        assert!(!drop_on(&mut panel, &atlas, "g1", "g0", RIGHT));
+        assert_eq!(panes_of(&panel), "h(0.5,g0,*g1)");
+    }
+
+    #[test]
+    fn a_drop_is_refused_where_a_pane_would_be_too_small_or_off_the_panel() {
+        let atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let (header, _) = split(drag_rect());
+        let advance = atlas.metrics.advance;
+        let row = row_height(&atlas);
+        // Room for three panes across and not four, for two rows of them
+        // and not three.
+        let screen = Viewport {
+            width: PANE_MIN_COLS as f32 * advance * 3.5,
+            height: PANE_MIN_ROWS as f32 * row * 2.5,
+            ..wide_screen()
+        };
+        let mut panel = two_workspaces();
+        assert!(panel.split(Edge::Right, at(&panel, "g1")));
+        let pane = |panel: &Panel, title: &str| {
+            let tab = at(panel, title);
+            let (_, pane) = panel
+                .screens(screen)
+                .into_iter()
+                .find(|(index, _)| *index == tab)
+                .expect("a pane");
+            pane
+        };
+        let hold = |panel: &mut Panel, x: f32, y: f32| {
+            assert!(panel.drag_tab(&atlas, header, screen, true, x, y));
+            panel.tab_drag.and_then(|drag| drag.drop)
+        };
+        // g2 from the strip, shown where g1 was by its press. Beside
+        // either pane there is no room for it; stacked there is; and in
+        // the middle of g0 it takes that pane as it is.
+        panel.press_tab(at(&panel, "g2"), 60.0, 15.0);
+        let left = pane(&panel, "g0");
+        let mid = left.y + left.height * 0.5;
+        assert_eq!(hold(&mut panel, left.x + 4.0, mid), None, "too narrow");
+        assert_eq!(panel.drop_report(), "-");
+        let low = hold(
+            &mut panel,
+            left.x + left.width * 0.5,
+            left.y + left.height - 4.0,
+        );
+        assert_eq!(low.map(|drop| drop.zone), Some(BOTTOM));
+        let middle = hold(&mut panel, left.x + left.width * 0.5, mid);
+        assert_eq!(
+            middle.map(|drop| (drop.zone, drop.rect)),
+            Some((CENTER, left))
+        );
+        // Let go where it is refused: the panes are as the press left
+        // them, and the drag is over.
+        let before = panel.layouts.clone();
+        assert!(!panel.drop_pane(&atlas, screen, left.x + 4.0, mid));
+        assert_eq!(panel.layouts, before);
+        assert_eq!(panel.tab_drag, None);
+        check_panes(&panel, "refused");
+
+        // The gaps and the padding are the pane's beside them; past the
+        // panel's edges, and on the strip, there is nowhere to land.
+        let screen = wide_screen();
+        let mut panel = two_workspaces();
+        assert!(panel.split(Edge::Right, at(&panel, "g1")));
+        panel.press_tab(at(&panel, "g2"), 60.0, 15.0);
+        let hold = |panel: &mut Panel, x: f32, y: f32| {
+            assert!(panel.drag_tab(&atlas, header, screen, true, x, y));
+            panel.tab_drag.and_then(|drag| drag.drop)
+        };
+        let in_gap = hold(&mut panel, 503.0, 300.0).expect("g0's side of the gap");
+        assert_eq!(panel.index_of(in_gap.pane), Some(at(&panel, "g0")));
+        assert_eq!(in_gap.zone, RIGHT);
+        let in_pad = hold(&mut panel, 2.0, 636.0).expect("the padding by g0");
+        assert_eq!(panel.index_of(in_pad.pane), Some(at(&panel, "g0")));
+        assert_eq!(hold(&mut panel, 1017.0, 300.0), None, "past the right edge");
+        assert_eq!(hold(&mut panel, 500.0, 639.0), None, "under the panel");
+        assert_eq!(hold(&mut panel, -1.0, 300.0), None);
+        let before = (panel.layouts.clone(), panel.active);
+        assert!(
+            !panel.drop_pane(&atlas, screen, 500.0, 639.0),
+            "let go outside"
+        );
+        assert_eq!((panel.layouts.clone(), panel.active), before);
+        assert_eq!(panel.tab_drag, None);
+
+        // Given up with Escape, which is the drag forgotten: as a click.
+        let mut panel = two_workspaces();
+        assert!(panel.split(Edge::Right, at(&panel, "g1")));
+        let (_, drop) = lift(&mut panel, &atlas, "g2", "g0", BOTTOM);
+        assert!(drop.is_some());
+        panel.tab_drag = None;
+        assert_eq!(panes_of(&panel), "h(0.5,g0,*g2)");
+        assert_eq!(panel.drop_report(), "-");
+        check_panes(&panel, "given up");
+
+        // The session the press took the pane from closes while the tab
+        // is held: the drag ends with it, as any does.
+        let mut panel = two_workspaces();
+        assert!(panel.split(Edge::Right, at(&panel, "g1")));
+        lift(&mut panel, &atlas, "g2", "g0", BOTTOM);
+        panel.close_tab(at(&panel, "g1"));
+        assert_eq!(panel.tab_drag, None);
+        check_panes(&panel, "closed while held");
+    }
+
+    #[test]
+    fn a_tab_held_tells_no_session_a_size_until_it_is_let_go() {
+        let atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let (header, screen) = split(drag_rect());
+        let whole = grid_size(&atlas, screen);
+        let mut panel = panel_of(&["g0", "g1", "g2", "g3", "s0"]);
+        regroup(&mut panel);
+        panel.fit(&atlas, screen);
+        assert_eq!(resizes(&panel), [1, 1, 1, 1, 1]);
+        let frames = |panel: &Panel| {
+            for _ in 0..3 {
+                panel.fit(&atlas, screen);
+            }
+            resizes(panel)
+        };
+
+        // g1 onto the right of g0's screen: nobody hears while it is
+        // held, over the strip or the screen; let go, the two panes do.
+        panel.press_tab(1, 60.0, 15.0);
+        assert_eq!(frames(&panel), [1, 1, 1, 1, 1], "pressed");
+        for step in 0..30 {
+            let (x, y) = (60.0 + step as f32 * 28.0, 15.0 + step as f32 * 10.0);
+            assert_eq!(panel.drag_tab(&atlas, header, screen, true, x, y), step > 0);
+            assert_eq!(frames(&panel), [1, 1, 1, 1, 1], "step {step}");
+        }
+        assert_eq!(panel.drop_report(), "g1:right");
+        assert!(panel.drop_pane(&atlas, screen, 872.0, 305.0));
+        assert_eq!(panes_of(&panel), "h(0.5,g0,*g1)");
+        assert_eq!(frames(&panel), [2, 2, 1, 1, 1]);
+        let panes = panel.screens(screen);
+        assert_eq!(grids(&panel)[0], grid_size(&atlas, panes[0].1));
+        assert_eq!(grids(&panel)[1], grid_size(&atlas, panes[1].1));
+
+        // g2 from the strip to under g1. Its press shows it in g1's
+        // pane, which neither is told; let go, g1 is back there at the
+        // height it has now, g2 under it, and g0 hears nothing.
+        let ((x, y), drop) = lift(&mut panel, &atlas, "g2", "g2", BOTTOM);
+        assert!(drop.is_some());
+        assert_eq!(panes_of(&panel), "h(0.5,g0,*g2)");
+        assert_eq!(frames(&panel), [2, 2, 1, 1, 1], "held");
+        assert!(panel.drop_pane(&atlas, screen, x, y));
+        assert_eq!(panes_of(&panel), "h(0.5,g0,v(0.5,g1,*g2))");
+        assert_eq!(frames(&panel), [2, 3, 2, 1, 1]);
+
+        // g2 moved to the left of g0: every pane's room changed.
+        assert!(drop_on(&mut panel, &atlas, "g2", "g0", LEFT));
+        assert_eq!(panes_of(&panel), "h(0.5,h(0.5,*g2,g0),g1)");
+        assert_eq!(frames(&panel), [3, 4, 3, 1, 1]);
+
+        // A drop that changes nothing tells nobody anything, and neither
+        // does a drag given up where its press changed nothing.
+        assert!(!drop_on(&mut panel, &atlas, "g1", "g1", CENTER));
+        assert_eq!(frames(&panel), [3, 4, 3, 1, 1]);
+        lift(&mut panel, &atlas, "g0", "g1", TOP);
+        panel.tab_drag = None;
+        assert_eq!(frames(&panel), [3, 4, 3, 1, 1]);
+
+        // A click on g3's tab, no drag: it shows where g0 was, and the
+        // two that changed places hear once the button is up.
+        panel.press_tab(3, 60.0, 15.0);
+        assert_eq!(panes_of(&panel), "h(0.5,h(0.5,g2,*g3),g1)");
+        assert_eq!(frames(&panel), [3, 4, 3, 1, 1], "pressed");
+        panel.tab_drag = None;
+        assert_eq!(frames(&panel), [4, 4, 3, 2, 1]);
+        assert_eq!(grids(&panel)[0], whole);
+    }
+
+    #[test]
+    fn a_tab_over_a_pane_lights_its_zone_and_goes_with_the_pointer() {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let theme = Theme::default();
+        let rect = drag_rect();
+        let (header, screen) = split(rect);
+        let solid = atlas.solid_uv();
+        let wash = layout::faded(theme.accent, 0.14);
+        let mut panel = two_workspaces();
+        panel.focus = true;
+        for tab in &panel.tabs {
+            tab.session.feed(b"beans and peas");
+        }
+        assert!(panel.split(Edge::Right, at(&panel, "g1")));
+        let frame = |panel: &Panel, atlas: &mut Atlas| {
+            layout::take_cut_labels();
+            let mut out = Vec::new();
+            draw(panel, None, atlas, rect, &theme, &mut out);
+            let faults = layout::frame_faults(&out, rect);
+            assert!(faults.is_empty(), "{faults:?}");
+            out
+        };
+        let washes = |out: &[GlyphInstance]| -> Vec<Viewport> {
+            out.iter()
+                .filter(|q| q.uv == solid && q.color == wash)
+                .map(|q| Viewport {
+                    x: q.pos[0],
+                    y: q.pos[1],
+                    width: q.size[0],
+                    height: q.size[1],
+                })
+                .collect()
+        };
+        // The floating panel a name is on: the only rounded quad in the
+        // palette's border colour.
+        let chips = |out: &[GlyphInstance]| -> Vec<Viewport> {
+            out.iter()
+                .filter(|q| q.flags == crate::render::metal::ROUNDED)
+                .filter(|q| q.color == theme.palette_border)
+                .map(|q| Viewport {
+                    x: q.pos[0],
+                    y: q.pos[1],
+                    width: q.size[0],
+                    height: q.size[1],
+                })
+                .collect()
+        };
+        let plain = frame(&panel, &mut atlas);
+        assert!(washes(&plain).is_empty() && chips(&plain).is_empty());
+
+        // Held over the strip: the line between two tabs, and nothing
+        // over the screens.
+        panel.press_tab(at(&panel, "g2"), 60.0, 15.0);
+        assert!(panel.drag_tab(&atlas, header, screen, true, 200.0, 15.0));
+        let along = frame(&panel, &mut atlas);
+        assert!(washes(&along).is_empty() && chips(&along).is_empty());
+        assert!(
+            along
+                .iter()
+                .any(|q| q.size == [2.0, HEADER - 8.0] && q.color == theme.accent)
+        );
+
+        // Under g0: its lower half lit, a little into the padding and
+        // short of the strip and the line between the panes, with its
+        // outline; and the tab's name by the pointer, over the wash.
+        let (x, y) = zone_point(&panel, "g0", BOTTOM);
+        assert!(panel.drag_tab(&atlas, header, screen, true, x, y));
+        let drop = panel.tab_drag.and_then(|drag| drag.drop).expect("a drop");
+        let over = frame(&panel, &mut atlas);
+        let lit = washes(&over);
+        assert_eq!(lit.len(), 1);
+        assert_eq!(
+            lit[0],
+            Viewport {
+                x: drop.rect.x - 3.0,
+                y: drop.rect.y - 3.0,
+                width: drop.rect.width + 6.0,
+                height: drop.rect.height + 6.0,
+            }
+        );
+        let bar = panel.dividers(screen)[0].rect;
+        assert!(lit[0].x + lit[0].width < bar.x + bar.width * 0.5);
+        assert!(lit[0].y + lit[0].height <= rect.y + rect.height);
+        let outline = layout::faded(theme.accent, 0.75);
+        let edges = over
+            .iter()
+            .filter(|q| q.uv == solid && q.color == outline)
+            .count();
+        assert_eq!(edges, 4);
+        assert!(
+            !over
+                .iter()
+                .any(|q| q.size == [2.0, HEADER - 8.0] && q.color == theme.accent),
+            "no line in the strip"
+        );
+        let chip = chips(&over);
+        assert_eq!(chip.len(), 1);
+        assert!(chip[0].x > x && chip[0].y > y, "under and right of {x},{y}");
+        assert!(chip[0].width < 80.0, "as wide as a short name: {chip:?}");
+        let wash_at = over.iter().position(|q| q.color == wash).expect("the wash");
+        let chip_at = over
+            .iter()
+            .position(|q| q.color == theme.palette_border)
+            .expect("the chip");
+        assert!(wash_at < chip_at, "the name is over what lights up");
+        let cells = over
+            .iter()
+            .position(|q| q.uv != solid && q.pos[1] >= screen.y)
+            .unwrap_or(0);
+        assert!(cells < wash_at, "and that over the screens");
+        // Held there, and moved about the zone: the frames that follow
+        // shape no label again.
+        let shaped = atlas.ui_shapes();
+        for step in 0..5 {
+            let x = x + step as f32 * 7.0;
+            assert!(panel.drag_tab(&atlas, header, screen, true, x, y));
+            assert_eq!(washes(&frame(&panel, &mut atlas)), lit, "step {step}");
+        }
+        assert_eq!(atlas.ui_shapes(), shaped, "a held tab shapes nothing");
+
+        // In the corner of the panel the name stays inside it.
+        assert!(panel.drag_tab(&atlas, header, screen, true, 1012.0, 634.0));
+        let corner = chips(&frame(&panel, &mut atlas));
+        assert_eq!(corner.len(), 1);
+        assert!(corner[0].x + corner[0].width <= rect.x + rect.width);
+        assert!(corner[0].y + corner[0].height <= rect.y + rect.height);
+        // Where it cannot land, its name alone.
+        let (x, y) = zone_point(&panel, "g2", CENTER);
+        assert!(panel.drag_tab(&atlas, header, screen, true, x, y));
+        let own = frame(&panel, &mut atlas);
+        assert!(washes(&own).is_empty());
+        assert_eq!(chips(&own).len(), 1);
     }
 }

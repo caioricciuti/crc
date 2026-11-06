@@ -809,21 +809,31 @@ impl EditorView {
         Some(crate::platform::terminal::split(rect).0)
     }
 
+    /// A press on a terminal tab: it shows, as a click does, and is held,
+    /// to be dragged along the strip or onto a pane.
+    pub(super) fn terminal_tab_pressed(&self, index: usize, x: f32, y: f32) {
+        if let Some(mut state) = self.state_mut() {
+            // Each tab's workspace as it is now: a drop keeps to one.
+            group_terminals(&mut state);
+            state.terminal.press_tab(index, x, y);
+        }
+        self.request_redraw();
+        self.pump();
+    }
+
     /// The pointer moved with a press on a terminal tab held: once it has
     /// left where it was pressed the tab is on its way to another place
-    /// along the strip, and the frame shows where. Returns whether a tab
-    /// is held.
+    /// along the strip, or taken under the strip to a pane, and the frame
+    /// shows where. Returns whether a tab is held.
     pub(super) fn terminal_tab_dragged(&self, x: f32, y: f32) -> bool {
+        let rect = self.chrome().terminal;
         let Some(mut state) = self.state_mut() else {
             return false;
         };
-        let Some(drag) = &mut state.terminal.tab_drag else {
+        if state.terminal.tab_drag.is_none() {
             return false;
-        };
-        drag.x = x;
-        drag.y = y;
-        drag.active |= (x - drag.start_x).abs() > crate::platform::terminal::TAB_DRAG_AFTER;
-        let active = drag.active;
+        }
+        let active = follow_tab(&mut state, rect, x, y);
         drop(state);
         if active {
             self.request_redraw();
@@ -834,33 +844,61 @@ impl EditorView {
 
     /// The button went up with a terminal tab held. Dragged, and let go
     /// over the strip, it lands in the gap nearest the pointer, among its
-    /// workspace's tabs as the frame has them; let go anywhere else it
-    /// stays where it was.
+    /// workspace's tabs as the frame has them. Let go over a pane it
+    /// lands there with the keyboard, and the frame that follows tells
+    /// each session it touched its size. Let go anywhere else it stays
+    /// where it was.
     pub(super) fn terminal_tab_released(&self, x: f32, y: f32) {
+        let rect = self.chrome().terminal;
         let header = self.terminal_header();
-        let Some(mut state) = self.state_mut() else {
-            return;
+        let landed = {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            if state.terminal.tab_drag.is_none() {
+                return;
+            }
+            // Where it was let go, should no move have said so.
+            follow_tab(&mut state, rect, x, y);
+            let state = &mut *state;
+            let held = state.terminal.tab_drag.filter(|drag| drag.active);
+            let landed = held.is_some_and(|drag| drag.pane)
+                && rect.is_some_and(|rect| {
+                    let (_, screen) = crate::platform::terminal::split(rect);
+                    state
+                        .terminal
+                        .drop_pane(&state.renderer.atlas, screen, x, y)
+                });
+            state.terminal.tab_drag = None;
+            let Some(drag) = held else {
+                return;
+            };
+            // In view again, wherever the drag left the strip.
+            state.terminal.strip_free = false;
+            if drag.pane {
+                landed
+            } else {
+                if let Some(header) = header.filter(|header| header.contains(x, y)) {
+                    let strip = crate::platform::terminal::strip(
+                        &state.terminal,
+                        &mut state.renderer.atlas,
+                        header,
+                    );
+                    let listed = state.terminal.listed();
+                    let slot = crate::platform::terminal::drop_slot(&strip, &listed, x);
+                    state.terminal.drop_tab(&listed, drag.tab, slot);
+                }
+                false
+            }
         };
-        let Some(drag) = state.terminal.tab_drag.take().filter(|drag| drag.active) else {
-            return;
-        };
-        let state = &mut *state;
-        if let Some(header) = header.filter(|header| header.contains(x, y)) {
-            let strip = crate::platform::terminal::strip(
-                &state.terminal,
-                &mut state.renderer.atlas,
-                header,
-            );
-            let listed = state.terminal.listed();
-            let slot = crate::platform::terminal::drop_slot(&strip, &listed, x);
-            state.terminal.drop_tab(&listed, drag.tab, slot);
+        if landed {
+            self.after_pane_focus();
         }
-        // In view again, wherever the drag left the strip.
-        state.terminal.strip_free = false;
     }
 
-    /// Escape with a terminal tab on its way along the strip: it stays
-    /// where it was. Returns whether there was one, which spends the key.
+    /// Escape with a terminal tab on its way along the strip or to a
+    /// pane: it stays where it was. Returns whether there was one, which
+    /// spends the key.
     pub(super) fn cancel_terminal_tab_drag(&self) -> bool {
         let Some(mut state) = self.state_mut() else {
             return false;
@@ -3030,6 +3068,21 @@ pub(super) fn group_terminals(state: &mut State) {
     let tasks = &agents.tasks;
     terminal
         .regroup(|tab| crate::platform::agents::task_of(tasks, tab).map(|task| tasks[task].id()));
+}
+
+/// A held terminal tab follows the pointer to a point of the panel in
+/// `rect`: see [`crate::platform::terminal::Panel::drag_tab`]. Onto a pane
+/// in Agents mode only, with the selected workspace's sessions showing.
+/// Returns whether it is being dragged.
+fn follow_tab(state: &mut State, rect: Option<Viewport>, x: f32, y: f32) -> bool {
+    let Some(rect) = rect else {
+        return false;
+    };
+    let (header, screen) = crate::platform::terminal::split(rect);
+    let panes = state.agents.on && !super::agents::active_hidden(state);
+    state
+        .terminal
+        .drag_tab(&state.renderer.atlas, header, screen, panes, x, y)
 }
 
 /// Whether the terminal shows panes a command can act on: in Agents mode,

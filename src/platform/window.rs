@@ -87,6 +87,7 @@ mod state;
 mod table;
 mod tabs;
 mod terminal;
+mod tree_drag;
 use extensions::{ext_details, preview_command, preview_displaced};
 use mcp::{mcp_details, mcp_url_rows};
 use state::{
@@ -94,6 +95,7 @@ use state::{
     Said, Watch, message_lasts_of,
 };
 use table::{active_table, sync_tables, table_grid};
+use tree_drag::TreeDrag;
 
 struct ProjectIndexResult {
     root: std::path::PathBuf,
@@ -1398,26 +1400,6 @@ struct SignatureTip {
     signature: crate::lsp::Signature,
 }
 
-/// Dragging a file or folder onto another folder to move it.
-///
-/// Held from the mouse going down on a row, but not acted on until the
-/// pointer has travelled far enough to mean it: a drag that starts on every
-/// click would make selecting a file impossible.
-struct TreeDrag {
-    path: std::path::PathBuf,
-    origin: (f32, f32),
-    /// Past the threshold, so this is a move rather than a click.
-    active: bool,
-    /// The row it would drop onto, or `None` for the project root.
-    over: Option<usize>,
-    /// Whether the pointer is somewhere a drop is allowed at all.
-    valid: bool,
-    /// The press was on one of several selected rows, and the click it may
-    /// turn out to be waits for the release: a drag must find the others
-    /// still selected.
-    deferred: bool,
-}
-
 /// What a held press is dragging. One at a time: `mouseDown:` clears it
 /// before deciding what the press started, `mouseUp:` clears it again.
 enum Drag {
@@ -1434,7 +1416,7 @@ enum Drag {
     Timeline,
     /// A tab across the strip, by its current index.
     Tab(usize),
-    /// A sidebar row onto a folder.
+    /// The Explorer's rows onto a folder: see `tree_drag.rs`.
     Tree(TreeDrag),
     /// Across the Source Control diff, selecting its lines.
     DiffLines,
@@ -1620,6 +1602,11 @@ define_class!(
             if let Some((x, y)) = point {
                 self.terminal_link_hover(x as f32, y as f32, event.modifierFlags());
             }
+            // Option pressed or let go with rows of the Explorer held: the
+            // drop would copy, or move again.
+            if !self.ivars().testing || event.timestamp() == 0.0 {
+                self.tree_drag_flags(event.modifierFlags());
+            }
             let _: () = unsafe { msg_send![super(self), flagsChanged: event] };
         }
 
@@ -1654,9 +1641,13 @@ define_class!(
             // Timestamp before any of our own work, so nothing we do hides
             // inside the measurement.
             let started = Instant::now();
-            // Escape gives up a terminal tab being dragged along its strip,
-            // and is spent: the shell under it hears nothing.
+            // Escape gives up a terminal tab being dragged along its strip
+            // or onto a pane, and is spent: the shell under it hears nothing.
             if event.keyCode() == 53 && self.cancel_terminal_tab_drag() {
+                return;
+            }
+            // And a drag in the Explorer: nothing moves.
+            if event.keyCode() == 53 && self.cancel_tree_drag() {
                 return;
             }
             // Mid-composition every key belongs to the input method: arrows
@@ -1992,22 +1983,9 @@ define_class!(
                     return;
                 }
                 Some(Hit::TerminalTab(index)) => {
-                    let Some(mut state) = self.state_mut() else {
-                        return;
-                    };
-                    state.terminal.show(index);
-                    // The press may become a drag to another place along
-                    // the strip.
-                    state.terminal.tab_drag = Some(crate::platform::terminal::TabDrag {
-                        tab: index,
-                        start_x: x,
-                        x,
-                        y,
-                        active: false,
-                    });
-                    drop(state);
-                    self.request_redraw();
-                    self.pump();
+                    // Shown, and held: the press may become a drag to
+                    // another place along the strip, or onto a pane.
+                    self.terminal_tab_pressed(index, x, y);
                     return;
                 }
                 Some(Hit::TerminalClose(index)) => {
@@ -2450,7 +2428,8 @@ define_class!(
             if self.terminal_mouse_drag(event, point.x as f32, point.y as f32) {
                 return;
             }
-            // A terminal tab held: along its strip, and nothing else.
+            // A terminal tab held: along its strip or onto a pane, and
+            // nothing else.
             if self.terminal_tab_dragged(point.x as f32, point.y as f32) {
                 return;
             }
@@ -2535,7 +2514,7 @@ define_class!(
             }
 
             if self.state().is_some_and(|state| matches!(state.drag, Some(Drag::Tree(_)))) {
-                self.tree_drag_moved(point.x as f32, point.y as f32);
+                self.tree_drag_moved(point.x as f32, point.y as f32, event.modifierFlags());
                 return;
             }
 
@@ -2696,6 +2675,8 @@ define_class!(
                 state.agents.arrange();
                 return;
             }
+            // Option as it is now: held, a drag in the Explorer copies.
+            self.tree_drag_flags(_event.modifierFlags());
             let drop = {
                 let Some(mut state) = self.state_mut() else {
                     return;
@@ -2704,10 +2685,9 @@ define_class!(
                 state.terminal.end_selecting();
                 state.autoscroll_carry = 0.0;
                 match state.drag.take() {
-                    // A drag dropped where it may be, or the click that a
-                    // press on one of several selected rows waited to be.
-                    Some(Drag::Tree(drag)) if drag.active && drag.valid => Some(drag),
-                    Some(Drag::Tree(drag)) if !drag.active && drag.deferred => Some(drag),
+                    // A drag in the Explorer let go, or the click that
+                    // a press on one of its rows waited to be.
+                    Some(Drag::Tree(drag)) => Some(drag),
                     _ => None,
                 }
             };
@@ -3198,6 +3178,11 @@ define_class!(
             // A pointer held still past the edge of the text sends no events,
             // so this is what keeps the view moving under it.
             if self.drag_select() || self.terminal_autoscroll() || self.terminal_strip_autoscroll() {
+                self.request_redraw();
+            }
+            // Rows of the Explorer held still: the tree scrolls under them
+            // near its edges, and the closed folder they rest on opens.
+            if self.tree_drag_tick(None) {
                 self.request_redraw();
             }
             if self.ivars().needs_redraw.get() {
@@ -11076,100 +11061,5 @@ mod tests {
             "borrow held across a block:\n{}",
             offenders.join("\n")
         );
-    }
-}
-
-/// Whether `source` may be dropped into the directory `destination`.
-///
-/// Three refusals, and each is a way to lose a directory. Dropping a folder
-/// on itself, or anywhere inside itself, asks the filesystem to make a path
-/// its own descendant. Dropping something back where it already lives is a
-/// no-op worth refusing so the drop target never lights up for it.
-///
-/// Judged by where the file system says the two are, not by how the paths
-/// are written: a folder reached through a symbolic link is still the
-/// folder, and dropping it there would nest it all the same.
-fn valid_drop(source: &Path, destination: &Path) -> bool {
-    use crate::project::fileops;
-    !fileops::is_inside(destination, source)
-        && fileops::located(source).parent() != Some(fileops::resolved(destination).as_path())
-}
-
-#[cfg(test)]
-mod drop_tests {
-    use super::valid_drop;
-    use std::path::Path;
-
-    #[test]
-    fn a_folder_cannot_be_dropped_into_itself_or_its_own_subtree() {
-        let src = Path::new("/p/src");
-        assert!(!valid_drop(src, src), "onto itself");
-        assert!(!valid_drop(src, Path::new("/p/src/render")), "into a child");
-        assert!(
-            !valid_drop(src, Path::new("/p/src/render/font")),
-            "into a grandchild"
-        );
-    }
-
-    #[test]
-    fn an_item_cannot_be_dropped_where_it_already_is() {
-        assert!(!valid_drop(
-            Path::new("/p/src/main.rs"),
-            Path::new("/p/src")
-        ));
-        assert!(!valid_drop(Path::new("/p/src"), Path::new("/p")));
-    }
-
-    #[test]
-    fn a_real_move_is_allowed() {
-        assert!(valid_drop(
-            Path::new("/p/src/main.rs"),
-            Path::new("/p/docs")
-        ));
-        assert!(valid_drop(Path::new("/p/docs"), Path::new("/p/src")));
-        assert!(valid_drop(Path::new("/p/a/deep/file.rs"), Path::new("/p")));
-    }
-
-    /// A sibling whose name merely starts with the source's is not inside it.
-    /// A prefix test on strings would refuse this; `starts_with` on a Path
-    /// compares whole components, which is why it is used here.
-    #[test]
-    fn a_similarly_named_sibling_is_not_a_subtree() {
-        assert!(valid_drop(
-            Path::new("/p/src"),
-            Path::new("/p/src-generated")
-        ));
-    }
-
-    /// The same folder under another name: as written, `alias/render` is
-    /// nowhere near `src`, and a rename into it would still be a folder
-    /// moved inside itself.
-    #[test]
-    fn a_symbolic_link_does_not_hide_the_folder_behind_it() {
-        use std::os::unix::fs::symlink;
-        let tree = crate::project::TempTree::new(
-            "drop-through-link",
-            &[("src/render/font.rs", "f"), ("docs/", "")],
-        );
-        let root = tree.0.as_path();
-        let src = root.join("src");
-        let alias = root.join("alias");
-        symlink(&src, &alias).unwrap();
-
-        assert!(!valid_drop(&src, &alias), "onto itself");
-        assert!(!valid_drop(&src, &alias.join("render")), "into a child");
-        assert!(
-            !valid_drop(&src.join("render"), &alias),
-            "where it already is"
-        );
-        assert!(
-            !valid_drop(&alias.join("render/font.rs"), &src.join("render")),
-            "where it already is, the item through the link"
-        );
-        // The link is an item of its own: it can go into the folder it
-        // points at, and other things can be dropped through it.
-        assert!(valid_drop(&alias, &src.join("render")));
-        assert!(valid_drop(&root.join("docs"), &alias));
-        assert!(!valid_drop(&alias, root), "the link is already there");
     }
 }

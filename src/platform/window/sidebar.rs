@@ -1,109 +1,11 @@
-//! The sidebar: the file tree and its drags, the Source Control view's
-//! clicks and keys, and opening a folder with its project scan.
+//! The sidebar: the file tree, the Source Control view's clicks and keys,
+//! and opening a folder with its project scan. A drag in the tree is in
+//! `tree_drag.rs`.
 
 use super::*;
 use crate::project::fileops::Op;
 
 impl EditorView {
-    /// Tracks a sidebar drag and works out whether it could be dropped here.
-    pub(super) fn tree_drag_moved(&self, x: f32, y: f32) {
-        let Some(rect) = self.chrome().sidebar else {
-            return;
-        };
-        let (changed, active) = 'drag: {
-            let Some(mut state) = self.state_mut() else {
-                return;
-            };
-            let row = layout::sidebar_row_at(&state.tree, sidebar_field(&state), rect, y);
-            // The destination directory: the folder under the pointer, the
-            // parent of a file under it, or the project root below the tree.
-            let destination = match row.and_then(|index| state.tree.rows().get(index)) {
-                Some(entry) if entry.is_dir => Some(entry.path.clone()),
-                Some(entry) => entry.path.parent().map(Path::to_path_buf),
-                None => state.tree.root().map(Path::to_path_buf),
-            };
-            let Some(Drag::Tree(drag)) = &mut state.drag else {
-                break 'drag (false, false);
-            };
-            if !drag.active {
-                let far = (x - drag.origin.0).abs() > 4.0 || (y - drag.origin.1).abs() > 4.0;
-                if !far {
-                    break 'drag (false, false);
-                }
-                drag.active = true;
-            }
-            let valid = rect.contains(x, y)
-                && destination
-                    .as_deref()
-                    .is_some_and(|dir| valid_drop(&drag.path, dir));
-            let changed = drag.over != row || drag.valid != valid;
-            drag.over = row;
-            drag.valid = valid;
-            (changed, true)
-        };
-        if active && changed {
-            self.request_redraw();
-            self.pump();
-        }
-    }
-
-    /// Moves the dragged item into the folder it was dropped on.
-    pub(super) fn drop_tree_item(&self, drag: TreeDrag) {
-        let Some(rect) = self.chrome().sidebar else {
-            return;
-        };
-        let destination = {
-            let Some(state) = self.state() else {
-                return;
-            };
-            match drag.over.and_then(|index| state.tree.rows().get(index)) {
-                Some(entry) if entry.is_dir => Some(entry.path.clone()),
-                Some(entry) => entry.path.parent().map(Path::to_path_buf),
-                None => state.tree.root().map(Path::to_path_buf),
-            }
-        };
-        let _ = rect;
-        let Some(destination) = destination else {
-            return;
-        };
-        let Some(name) = drag.path.file_name() else {
-            return;
-        };
-        let target = destination.join(name);
-        // Unsaved work under the item would be stranded at a path that no
-        // longer exists, the same guard Move to Trash uses. Tabs are keyed
-        // by canonical paths.
-        let source_key = crate::platform::canonical(&drag.path);
-        if self
-            .state()
-            .is_some_and(|state| dirty_tabs_under(&state, &source_key))
-        {
-            if let Some(mut state) = self.state_mut() {
-                state.message = Some((
-                    "save the affected tabs before moving this item".into(),
-                    Instant::now(),
-                ));
-            }
-            self.request_redraw();
-            self.pump();
-            return;
-        }
-        self.move_item(
-            Op::Move {
-                from: &drag.path,
-                to: &target,
-            },
-            format!(
-                "moved {} to {}",
-                name.to_string_lossy(),
-                destination.display()
-            ),
-            "move failed",
-        );
-        self.request_redraw();
-        self.pump();
-    }
-
     /// Closes every expanded directory in the tree.
     pub(super) fn collapse_tree(&self) {
         if let Some(mut state) = self.state_mut() {
@@ -432,11 +334,13 @@ impl EditorView {
 
     /// A press in the Explorer. The row under the pointer is selected:
     /// alone, added to the selection or taken out of it with Command, or as
-    /// the end of a range with Shift. A plain press opens a file or toggles
-    /// a folder at once, except on one of several selected rows, where it
-    /// waits for the release: a drag from there has to find them all still
-    /// selected. The tree takes the keyboard, unless the press opened a
-    /// file, which has it then.
+    /// the end of a range with Shift. A plain press does no more than
+    /// that: the file is opened, or the folder opened or closed, when the
+    /// press is let go without having become a drag, so that picking an
+    /// item up to drag it opens nothing. On one of several selected rows
+    /// it does not even select, since a drag from there has to find them
+    /// all still selected. The tree takes the keyboard, until a file is
+    /// opened, which has it then.
     pub(super) fn tree_press(&self, event: &NSEvent, x: f32, y: f32, rect: Viewport) {
         // No folder: the panel is its empty state, whose one button opens one.
         let on_open = {
@@ -462,7 +366,7 @@ impl EditorView {
         let flags = event.modifierFlags();
         let command = flags.contains(NSEventModifierFlags::Command);
         let shift = flags.contains(NSEventModifierFlags::Shift);
-        let act = {
+        {
             let Some(mut state) = self.state_mut() else {
                 return;
             };
@@ -479,56 +383,38 @@ impl EditorView {
                     if state.sidebar_edit.is_none() {
                         state.tree.clear_selection();
                     }
-                    None
                 }
-                Some(index) if shift => {
-                    state.tree.select_to(index);
-                    None
-                }
-                Some(index) if command => {
-                    state.tree.toggle_selected(index);
-                    None
-                }
+                Some(index) if shift => state.tree.select_to(index),
+                Some(index) if command => state.tree.toggle_selected(index),
                 Some(index) => {
-                    // Remember what is under the pointer in case this turns
-                    // into a drag.
-                    let deferred = state.tree.selection_len() > 1 && state.tree.is_selected(index);
-                    state.drag = state.tree.rows().get(index).map(|entry| {
-                        Drag::Tree(TreeDrag {
-                            path: entry.path.clone(),
-                            origin: (x, y),
-                            active: false,
-                            over: None,
-                            valid: false,
-                            deferred,
-                        })
-                    });
-                    (!deferred).then_some(index)
+                    // Remember what is under the pointer, and what a drag
+                    // from here would carry, in case this turns into one.
+                    let among = state.tree.selection_len() > 1 && state.tree.is_selected(index);
+                    state.drag = TreeDrag::new(&state.tree, index, (x, y)).map(Drag::Tree);
+                    // Selected now; opened, if it comes to that, when the
+                    // press is let go.
+                    if !among {
+                        state.tree.select(index);
+                    }
                 }
-            }
-        };
-        match act {
-            // A file opened by a click has the keyboard: what is typed next
-            // is for it, and Cmd-Delete edits its line.
-            Some(index) => self.activate_tree_row(index, true),
-            None => {
-                self.request_redraw();
-                self.pump();
             }
         }
+        self.request_redraw();
+        self.pump();
     }
 
-    /// The release of a press in the tree that came to something: a drag
-    /// dropped where it may be, or the click a press on one of several
-    /// selected rows was waiting to be.
+    /// The release of a plain press in the tree: a drag let go, or the
+    /// click the press was waiting to be. A file opened by a click has
+    /// the keyboard: what is typed next is for it, and Cmd-Delete edits
+    /// its line.
     pub(super) fn tree_release(&self, drag: TreeDrag) {
-        if drag.active {
-            self.drop_tree_item(drag);
+        let Some(pressed) = drag.click() else {
+            self.drop_tree_items(drag);
             return;
-        }
+        };
         let index = self
             .state()
-            .and_then(|state| state.tree.rows().iter().position(|e| e.path == drag.path));
+            .and_then(|state| state.tree.rows().iter().position(|e| e.path == pressed));
         if let Some(index) = index {
             self.activate_tree_row(index, true);
         }
@@ -1175,7 +1061,7 @@ pub(super) fn dirty_tabs_under(state: &State, path: &Path) -> bool {
 /// Opens the folder at tree row `index` (`Some(true)`), closes it
 /// (`Some(false)`), or whichever it is not (`None`, a click). Closing is at
 /// once; the children of one that opens are read on a worker.
-fn set_tree_folder(state: &mut State, index: usize, open: Option<bool>) {
+pub(super) fn set_tree_folder(state: &mut State, index: usize, open: Option<bool>) {
     let Some(entry) = state.tree.rows().get(index) else {
         return;
     };
@@ -1226,7 +1112,8 @@ fn trash_question(paths: &[std::path::PathBuf]) -> String {
 /// by their path in the project (a folder with a slash, a row cut and not
 /// yet pasted after a `~`, a selected row starred, the cursor's after a
 /// `>`), what a command on the selection would act on, the first row
-/// shown, and the file work: see [`explorer::report`].
+/// shown, the drag in progress (see [`TreeDrag::report`]), and the file
+/// work: see [`explorer::report`].
 pub(super) fn tree_report(state: &State) -> String {
     let tree = &state.tree;
     let shown = |path: &Path| {
@@ -1260,8 +1147,12 @@ pub(super) fn tree_report(state: &State) -> String {
         .iter()
         .map(|path| shown(path))
         .collect();
+    let drag = match &state.drag {
+        Some(Drag::Tree(drag)) => drag.report(tree.root()),
+        _ => "none".to_string(),
+    };
     format!(
-        "tree_keys: {}\ntree_rows: {}\ntree_acts_on: {}\ntree_scroll: {}\n{}",
+        "tree_keys: {}\ntree_rows: {}\ntree_acts_on: {}\ntree_scroll: {}\ntree_drag: {drag}\n{}",
         tree_has_keys(state),
         rows.join("|"),
         acts_on.join("|"),

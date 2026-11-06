@@ -3134,6 +3134,41 @@ pub fn build_sidebar_with_edit(
     drawn
 }
 
+/// What lights up while a drag over the tree would drop on `on`: the rows
+/// of that folder with what shows inside it, as far as they are in sight,
+/// or everything under the header for the project root. `None` with the
+/// folder scrolled out of sight.
+pub fn sidebar_drop_band(
+    tree: &Tree,
+    on: crate::project::tree::DropOn,
+    viewport: Viewport,
+) -> Option<Viewport> {
+    let band = |y: f32, height: f32| Viewport {
+        x: viewport.x + 4.0,
+        y,
+        width: (viewport.width - 8.0).max(0.0),
+        height,
+    };
+    match on {
+        crate::project::tree::DropOn::Root => {
+            let top = viewport.y + SIDEBAR_HEADER_HEIGHT;
+            let height = viewport.y + viewport.height - top - 4.0;
+            (height > 0.0).then(|| band(top, height))
+        }
+        crate::project::tree::DropOn::Folder(index) => {
+            let first = tree.scroll.min(tree.len().saturating_sub(1));
+            let from = index.max(first);
+            let to = tree.end_of(index).min(first + sidebar_rows(viewport));
+            (to > from).then(|| {
+                band(
+                    sidebar_row_rect(viewport, from - first).y,
+                    (to - from) as f32 * SIDEBAR_ROW_HEIGHT,
+                )
+            })
+        }
+    }
+}
+
 /// The name field in the tree, drawn where the item will appear: the same
 /// indent, an icon that follows the extension as it is typed, and a caret.
 pub(super) fn push_sidebar_edit_row(
@@ -4222,6 +4257,72 @@ mod narrow_sidebar_tests {
             }
         }
         let _ = std::fs::remove_dir_all(tree.root().unwrap());
+    }
+
+    /// The folder a drag would drop into lights up with the rows that show
+    /// inside it; the project root, as the whole list.
+    #[test]
+    fn the_drop_band_covers_the_folder_and_what_shows_inside_it() {
+        use crate::project::tree::DropOn;
+        const ROW: f32 = SIDEBAR_ROW_HEIGHT;
+        let files = crate::project::TempTree::new(
+            "explorer-drop-band",
+            &[
+                ("recipes/bread.md", ""),
+                ("recipes/soup.md", ""),
+                ("trips/lisbon.md", ""),
+                ("garden.txt", ""),
+                ("journal.md", ""),
+            ],
+        );
+        let mut tree = Tree::new();
+        tree.open(&files.0);
+        tree.toggle(0);
+        // recipes/, bread.md, soup.md, trips/, garden.txt, journal.md
+        let column = Viewport {
+            x: 44.0,
+            y: 48.0,
+            width: 240.0,
+            height: 400.0,
+        };
+        let top = column.y + SIDEBAR_HEADER_HEIGHT;
+        let band = |tree: &Tree, on, column| {
+            sidebar_drop_band(tree, on, column).map(|band| (band.y, band.height))
+        };
+        // An open folder with the two rows inside it, a closed one alone.
+        assert_eq!(
+            band(&tree, DropOn::Folder(0), column),
+            Some((top, 3.0 * ROW))
+        );
+        assert_eq!(
+            band(&tree, DropOn::Folder(3), column),
+            Some((top + 3.0 * ROW, ROW))
+        );
+        // The root: everything under the header, inset like the rows.
+        let root = sidebar_drop_band(&tree, DropOn::Root, column).unwrap();
+        assert_eq!((root.x, root.width), (48.0, 232.0));
+        assert_eq!(
+            (root.y, root.height),
+            (top, 400.0 - SIDEBAR_HEADER_HEIGHT - 4.0)
+        );
+        // Scrolled part of the way past the folder, then all of the way.
+        tree.scroll = 1;
+        assert_eq!(
+            band(&tree, DropOn::Folder(0), column),
+            Some((top, 2.0 * ROW))
+        );
+        tree.scroll = 3;
+        assert_eq!(band(&tree, DropOn::Folder(0), column), None);
+        // A column with room for two rows shows two of the three.
+        tree.scroll = 0;
+        let short = Viewport {
+            height: SIDEBAR_HEADER_HEIGHT + 2.0 * ROW + 5.0,
+            ..column
+        };
+        assert_eq!(
+            band(&tree, DropOn::Folder(0), short),
+            Some((top, 2.0 * ROW))
+        );
     }
 
     #[test]

@@ -355,3 +355,230 @@ panes_mark h 3 "$T/panes-end.out" two
 panes_words=$(cut -d' ' -f1,2 "$T/panes/marks" 2>/dev/null | tr '\n' ',' || true)
 [ "$panes_words" = "4 c,3 b,1 a,3 d,1 e,4 f,3 g,3 h," ] \
     || failed "panes: the marks are [$panes_words], expected [4 c,3 b,1 a,3 d,1 e,4 f,3 g,3 h,]"
+
+# ---- a tab dragged from the strip onto the panes ----------------------------
+# One workspace, plots, with the shells one to four, numbered as they were
+# started. A tab pressed in the strip shows, as a click does; taken under
+# the strip it is on its way to a pane, and the dump says which pane and
+# which zone of it would take it. Two let go at the right of one's screen
+# makes two panes; three at the bottom of two's a third; four in the middle
+# of one's shows there in one's place; four's own tab then takes its pane
+# to the right of three's. Held over its own pane a tab has nowhere to
+# land. Taken back to the strip it lands among the tabs. Escape, or letting
+# go off the panel, leaves things as the press left them. No program is
+# told a size while a tab is held, each one whose room changed is told
+# once after, and what is typed after a drop goes to the tab dropped.
+mkdir -p "$T/home/panedrop" "$T/panedrop"
+printf 'one\ntwo\nthree\nfour\n' > "$T/panedrop/titles"
+cat > "$T/panedrop.script" <<SCRIPT
+resize 1280 800
+wait 500
+key 0 cmd,shift A
+wait 900
+key 17 cmd t
+wait 700
+key 17 cmd t
+wait 700
+key 17 cmd t
+wait 700
+clickat @terminal.tab.0 0.3 0.5
+wait 500
+dump $T/drop-start.out
+downat @terminal.tab.1 0.3 0.5
+wait 100
+dragat @terminal.pane.1 0.9 0.5
+wait 300
+dump $T/drop-right-held.out
+upat @terminal.pane.1 0.9 0.5
+wait 500
+dump $T/drop-right.out
+text mark a
+key 36
+wait 300
+downat @terminal.tab.2 0.3 0.5
+wait 100
+dragat @terminal.pane.2 0.5 0.9
+wait 300
+dump $T/drop-bottom-held.out
+upat @terminal.pane.2 0.5 0.9
+wait 500
+dump $T/drop-bottom.out
+text mark b
+key 36
+wait 300
+downat @terminal.tab.3 0.3 0.5
+wait 100
+dragat @terminal.pane.1 0.5 0.5
+wait 300
+dump $T/drop-centre-held.out
+upat @terminal.pane.1 0.5 0.5
+wait 500
+dump $T/drop-centre.out
+text mark c
+key 36
+wait 300
+downat @terminal.tab.3 0.3 0.5
+wait 100
+dragat @terminal.pane.1 0.5 0.5
+wait 300
+dump $T/drop-own-held.out
+dragat @terminal.pane.3 0.9 0.5
+wait 300
+dump $T/drop-move-held.out
+upat @terminal.pane.3 0.9 0.5
+wait 500
+dump $T/drop-moved.out
+text mark d
+key 36
+wait 300
+downat @terminal.tab.3 0.3 0.5
+wait 100
+dragat @terminal.pane.1 0.5 0.5
+wait 300
+dump $T/drop-strip-out.out
+dragat @terminal.tab.0 0.1 0.5
+wait 300
+dump $T/drop-strip-held.out
+upat @terminal.tab.0 0.1 0.5
+wait 500
+dump $T/drop-strip.out
+downat @terminal.tab.1 0.3 0.5
+wait 100
+dragat @terminal.pane.1 0.5 0.1
+wait 300
+dump $T/drop-escape-held.out
+key 53
+wait 300
+dump $T/drop-escaped.out
+upat @terminal.pane.1 0.5 0.1
+wait 500
+dump $T/drop-escape.out
+text mark e
+key 36
+wait 300
+downat @terminal.tab.0 0.3 0.5
+wait 100
+dragat @terminal.pane.1 0.5 0.9
+wait 300
+dump $T/drop-off-held.out
+dragby -3000 400
+wait 300
+dump $T/drop-off-out.out
+upby -3000 400
+wait 500
+dump $T/drop-off.out
+quit
+SCRIPT
+HOME="$T/home/panedrop" PATH="$T/panesbin:$PATH" PANES_DIR="$T/panedrop" CRC_TERMINAL_SHELL="$T/panes-shell.sh" \
+    CRC_SELFTEST="$T/panedrop.script" "$BIN" "$P" 2> "$T/panedrop.err"
+
+# drop_is <dump> <pane:zone>: where the dump has a held tab landing, `-`
+# for nowhere.
+drop_is() {
+    local got
+    got=$(grep -m1 '^terminal_panes: ' "$T/$1" 2>/dev/null | sed 's/.* drop=\([^ ]*\) held=.*/\1/' || true)
+    [ "$got" = "$2" ] || failed "$1: a held tab would land on [$got], expected [$2]"
+}
+# drop_mark <word> <shell> <dump> <title>: the shell with that number, and
+# no other, ran `mark word`, on a terminal the size the dump has for it.
+drop_mark() {
+    local got want
+    got=$(grep " $1 " "$T/panedrop/marks" 2>/dev/null || true)
+    want="$2 $1 $(panes_of "$T/$3" "$4" rows) $(panes_of "$T/$3" "$4" cols)"
+    [ "$got" = "$want" ] || failed "panedrop: mark $1 was written as [$got], expected [$want]"
+}
+# drop_told <before> <after> <more> <title>...: each of those sessions'
+# programs was told a size that many times between the two dumps.
+drop_told() {
+    local was=$1 now=$2 more=$3 drop_pane
+    shift 3
+    for drop_pane in "$@"; do
+        panes_told "$T/$was" "$T/$now" "$drop_pane" "$more"
+    done
+}
+drop_whole=$(panes_of "$T/drop-start.out" one cols)
+
+expect "$T/drop-start.out" terminal_tabs "*one,two,three,four panes=- scrolled=no drag=-"
+drop_is drop-start.out -
+# Two pressed, which shows it, and held at the right of the screen: the
+# right half would take it. Its program has not heard of a pane.
+expect "$T/drop-right-held.out" terminal_tabs "one,*two,three,four panes=- scrolled=no drag=two"
+drop_is drop-right-held.out two:right
+[ -n "$drop_whole" ] && [ "$(panes_of "$T/drop-right-held.out" two cols)" = "$drop_whole" ] \
+    || failed "drop-right-held.out: two was sized while held: $(grep '^terminal_panes:' "$T/drop-right-held.out")"
+# Let go: one is back, two beside it with the keyboard, each told once.
+expect "$T/drop-right.out" terminal_tabs "one,*two,three,four panes=h(0.5,one,*two) scrolled=no drag=-"
+drop_is drop-right.out -
+drop_told drop-right-held.out drop-right.out 1 two
+drop_told drop-start.out drop-right.out 1 one
+[ "$(panes_of "$T/drop-right.out" two cols)" -lt "$drop_whole" ] \
+    && [ "$(panes_of "$T/drop-right.out" two x)" -gt "$(panes_of "$T/drop-right.out" one x)" ] \
+    || failed "drop-right.out: two is not a pane to the right of one: $(grep '^terminal_panes:' "$T/drop-right.out")"
+drop_mark a 2 drop-right.out two
+# Three pressed shows in two's pane, the one with the keyboard. Held at
+# the bottom of it, and let go: two is back there and three under it.
+expect "$T/drop-bottom-held.out" terminal_tabs "one,two,*three,four panes=h(0.5,one,*three) scrolled=no drag=three"
+drop_is drop-bottom-held.out three:bottom
+drop_told drop-right.out drop-bottom-held.out 0 one
+[ "$(panes_of "$T/drop-bottom-held.out" three cols)" = "$drop_whole" ] \
+    || failed "drop-bottom-held.out: three was sized while held: $(grep '^terminal_panes:' "$T/drop-bottom-held.out")"
+expect "$T/drop-bottom.out" terminal_tabs "one,two,*three,four panes=h(0.5,one,v(0.5,two,*three)) scrolled=no drag=-"
+drop_told drop-right.out drop-bottom.out 0 one
+drop_told drop-right.out drop-bottom.out 1 two
+drop_told drop-bottom-held.out drop-bottom.out 1 three
+[ "$(panes_of "$T/drop-bottom.out" three y)" -gt "$(panes_of "$T/drop-bottom.out" two y)" ] \
+    && [ "$(panes_of "$T/drop-bottom.out" three x)" = "$(panes_of "$T/drop-bottom.out" two x)" ] \
+    || failed "drop-bottom.out: three is not under two: $(grep '^terminal_panes:' "$T/drop-bottom.out")"
+drop_mark b 3 drop-bottom.out three
+# Four, held over the middle of one: it would show there. Let go, it does,
+# one is a tab of the strip alone, and three, which four's press had put
+# out of its pane, is back in it without having heard a thing.
+expect "$T/drop-centre-held.out" terminal_tabs "one,two,three,*four panes=h(0.5,one,v(0.5,two,*four)) scrolled=no drag=four"
+drop_is drop-centre-held.out one:center
+drop_told drop-bottom.out drop-centre-held.out 0 one two
+expect "$T/drop-centre.out" terminal_tabs "one,two,three,*four panes=h(0.5,*four,v(0.5,two,three)) scrolled=no drag=-"
+drop_told drop-bottom.out drop-centre.out 0 two three
+drop_told drop-centre-held.out drop-centre.out 1 four
+drop_mark c 4 drop-centre.out four
+# Four's tab over four's own pane: nowhere to land. Over the right of
+# three's: let go, four's pane is there, and two has the room it left.
+# Three's half of the row is the size its pane was, so it hears nothing.
+expect "$T/drop-own-held.out" terminal_tabs "one,two,three,*four panes=h(0.5,*four,v(0.5,two,three)) scrolled=no drag=four"
+drop_is drop-own-held.out -
+drop_is drop-move-held.out three:right
+drop_told drop-centre.out drop-move-held.out 0 two three four
+expect "$T/drop-moved.out" terminal_tabs "one,two,three,*four panes=v(0.5,two,h(0.5,three,*four)) scrolled=no drag=-"
+drop_told drop-move-held.out drop-moved.out 1 two four
+drop_told drop-move-held.out drop-moved.out 0 three
+[ "$(panes_of "$T/drop-moved.out" four x)" -gt "$(panes_of "$T/drop-moved.out" three x)" ] \
+    && [ "$(panes_of "$T/drop-moved.out" four y)" = "$(panes_of "$T/drop-moved.out" three y)" ] \
+    && [ "$(panes_of "$T/drop-moved.out" two w)" -gt "$(panes_of "$T/drop-centre.out" two w)" ] \
+    || failed "drop-moved.out: four is not beside three under a wider two: $(grep '^terminal_panes:' "$T/drop-moved.out")"
+drop_mark d 4 drop-moved.out four
+# Taken under the strip and back to it: nothing lit, and let go there it
+# is a move along the strip, the panes and their programs left alone.
+drop_is drop-strip-out.out two:center
+expect "$T/drop-strip-held.out" terminal_tabs "one,two,three,*four panes=v(0.5,two,h(0.5,three,*four)) scrolled=no drag=four"
+drop_is drop-strip-held.out -
+expect "$T/drop-strip.out" terminal_tabs "*four,one,two,three panes=v(0.5,two,h(0.5,three,*four)) scrolled=no drag=-"
+drop_told drop-moved.out drop-strip.out 0 two three four
+# One pressed shows where four was. Held over the top of two, then
+# Escape: it stays as the press left it, and one is told that pane's size.
+expect "$T/drop-escape-held.out" terminal_tabs "four,*one,two,three panes=v(0.5,two,h(0.5,three,*one)) scrolled=no drag=one"
+drop_is drop-escape-held.out two:top
+expect "$T/drop-escaped.out" terminal_tabs "four,*one,two,three panes=v(0.5,two,h(0.5,three,*one)) scrolled=no drag=-"
+drop_is drop-escaped.out -
+expect "$T/drop-escape.out" terminal_tabs "four,*one,two,three panes=v(0.5,two,h(0.5,three,*one)) scrolled=no drag=-"
+drop_told drop-escape-held.out drop-escape.out 1 one
+drop_told drop-strip.out drop-escape.out 0 two three
+drop_mark e 1 drop-escape.out one
+# Four again, held over the bottom of two, then taken off the panel and
+# let go there: as the press left it.
+expect "$T/drop-off-held.out" terminal_tabs "*four,one,two,three panes=v(0.5,two,h(0.5,three,*four)) scrolled=no drag=four"
+drop_is drop-off-held.out two:bottom
+drop_is drop-off-out.out -
+expect "$T/drop-off.out" terminal_tabs "*four,one,two,three panes=v(0.5,two,h(0.5,three,*four)) scrolled=no drag=-"
+drop_told drop-escape.out drop-off.out 0 two three
+drop_words=$(cut -d' ' -f1,2 "$T/panedrop/marks" 2>/dev/null | tr '\n' ',' || true)
+[ "$drop_words" = "2 a,3 b,4 c,4 d,1 e," ] \
+    || failed "panedrop: the marks are [$drop_words], expected [2 a,3 b,4 c,4 d,1 e,]"

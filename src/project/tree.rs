@@ -101,6 +101,15 @@ pub struct Tree {
     cut: Vec<PathBuf>,
 }
 
+/// Where a drag over the tree would drop what it carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DropOn {
+    /// The project root: the whole list.
+    Root,
+    /// The folder at this row, with what shows inside it.
+    Folder(usize),
+}
+
 /// Whether Git ignores a path, and where the rule applies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ignored {
@@ -437,6 +446,51 @@ impl Tree {
         roots
     }
 
+    /// What a drag that starts on the row at `index` carries: every item a
+    /// command on the selection acts on when the row is one of the
+    /// selected, and the row alone when it is not.
+    pub fn dragged_from(&self, index: usize) -> Vec<PathBuf> {
+        if self.is_selected(index) {
+            return self.selected_roots();
+        }
+        self.rows
+            .get(index)
+            .map(|entry| entry.path.clone())
+            .into_iter()
+            .collect()
+    }
+
+    /// Where a drag over the row at `row` drops, or over the empty part of
+    /// the list with `None`: a folder's row is that folder, a file's row
+    /// the folder it is in, and no row the project root. The folder, and
+    /// what to light up for it.
+    pub fn drop_folder(&self, row: Option<usize>) -> Option<(DropOn, &Path)> {
+        let Some(index) = row.filter(|&index| index < self.rows.len()) else {
+            return self.root.as_deref().map(|root| (DropOn::Root, root));
+        };
+        let folder = if self.rows[index].is_dir {
+            Some(index)
+        } else {
+            self.parent_row(index)
+        };
+        match folder {
+            Some(index) => Some((DropOn::Folder(index), &self.rows[index].path)),
+            None => self.root.as_deref().map(|root| (DropOn::Root, root)),
+        }
+    }
+
+    /// The row after the last one inside the folder at `index`: everything
+    /// deeper than it, until the next sibling.
+    pub fn end_of(&self, index: usize) -> usize {
+        let Some(entry) = self.rows.get(index) else {
+            return self.rows.len();
+        };
+        self.rows[index + 1..]
+            .iter()
+            .position(|e| e.depth <= entry.depth)
+            .map_or(self.rows.len(), |offset| index + 1 + offset)
+    }
+
     /// Selects nothing and leaves the keyboard nowhere.
     pub fn clear_selection(&mut self) {
         self.selection_changes += 1;
@@ -699,14 +753,8 @@ impl Tree {
         if !entry.is_dir || !entry.expanded {
             return;
         }
-        let depth = entry.depth;
-        // Everything deeper than this row, until the next sibling, is a
-        // descendant and goes away with it.
-        let end = self.rows[index + 1..]
-            .iter()
-            .position(|e| e.depth <= depth)
-            .map(|offset| index + 1 + offset)
-            .unwrap_or(self.rows.len());
+        // Everything inside it goes away with it.
+        let end = self.end_of(index);
         self.rows.drain(index + 1..end);
         self.rows[index].expanded = false;
         // A cursor that was inside is on the folder now.
@@ -1523,5 +1571,60 @@ mod tests {
         t.refresh();
         assert_eq!(picked(&t), ["[src]"]);
         assert_eq!(t.selected_path(), Some(f.0.join("src")));
+    }
+
+    /// A drag that starts on one of the selected rows carries all of them,
+    /// less what is inside a folder that goes too. One that starts on any
+    /// other row carries that row alone.
+    #[test]
+    fn a_drag_carries_the_selection_or_the_row_pressed() {
+        let f = Fixture::new("drag-items");
+        let mut t = Tree::new();
+        t.open(&f.0);
+        t.toggle(0);
+        // src/, src/nested/, src/main.rs, README.md
+        let path = |name: &str| f.0.join(name);
+        assert_eq!(t.dragged_from(2), [path("src/main.rs")], "none selected");
+        t.select(3);
+        assert_eq!(t.dragged_from(3), [path("README.md")]);
+        assert_eq!(t.dragged_from(2), [path("src/main.rs")], "another row");
+        // Several selected: all of them, from whichever was pressed, top
+        // to bottom. main.rs is inside src, which takes it along.
+        t.toggle_selected(2);
+        t.toggle_selected(0);
+        assert_eq!(t.dragged_from(3), [path("src"), path("README.md")]);
+        assert_eq!(t.dragged_from(2), [path("src"), path("README.md")]);
+        assert_eq!(t.dragged_from(0), [path("src"), path("README.md")]);
+        // A row that is not one of them, with them still selected.
+        assert_eq!(t.dragged_from(1), [path("src/nested")]);
+        assert_eq!(t.dragged_from(9), Vec::<PathBuf>::new());
+    }
+
+    /// A folder's row is that folder, a file's row the folder it is in,
+    /// and below the rows the project root.
+    #[test]
+    fn a_drop_goes_into_the_folder_the_row_is_or_is_in() {
+        let f = Fixture::new("drop-folder");
+        let mut t = Tree::new();
+        t.open(&f.0);
+        t.toggle(0);
+        t.toggle(1);
+        // src/, src/nested/, src/nested/deep.rs, src/main.rs, README.md
+        let path = |name: &str| f.0.join(name);
+        let at = |row| t.drop_folder(row).map(|(on, dir)| (on, dir.to_path_buf()));
+        assert_eq!(at(Some(0)), Some((DropOn::Folder(0), path("src"))));
+        assert_eq!(at(Some(1)), Some((DropOn::Folder(1), path("src/nested"))));
+        assert_eq!(at(Some(2)), Some((DropOn::Folder(1), path("src/nested"))));
+        assert_eq!(at(Some(3)), Some((DropOn::Folder(0), path("src"))));
+        assert_eq!(at(Some(4)), Some((DropOn::Root, f.0.clone())));
+        assert_eq!(at(None), Some((DropOn::Root, f.0.clone())));
+        assert_eq!(at(Some(40)), Some((DropOn::Root, f.0.clone())));
+        // What lights up with a folder: its row and the rows inside it.
+        assert_eq!(t.end_of(0), 4);
+        assert_eq!(t.end_of(1), 3);
+        assert_eq!(t.end_of(3), 4);
+        assert_eq!(t.end_of(4), 5);
+        // With no folder open there is nowhere to drop.
+        assert_eq!(Tree::new().drop_folder(None), None);
     }
 }

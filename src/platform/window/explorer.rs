@@ -6,14 +6,15 @@
 //! pasted: its rows are dimmed meanwhile. A paste that moves is done at
 //! once, with the tabs and the local history of what moved; one that
 //! copies runs on a worker, so a large folder does not hold the window,
-//! and Escape in the tree stops it. Nothing is ever replaced.
+//! and Escape in the tree stops it. Nothing is ever replaced. What a drag
+//! in the tree drops is moved or copied the same way.
 
 use std::collections::VecDeque;
 use std::io;
 use std::path::PathBuf;
 
 use super::*;
-use crate::project::fileops::{self, Env, Op, OpKind, Planned, Record};
+use crate::project::fileops::{self, Env, Op, OpKind, Planned, Record, Refusal};
 
 /// How many finished operations are kept.
 const KEPT: usize = 100;
@@ -97,7 +98,9 @@ struct Job {
     worker: Option<std::thread::JoinHandle<()>>,
     /// How many items it was given.
     total: usize,
-    duplicate: bool,
+    verb: Verb,
+    /// A drop: the folder it went to, as the outcome names it.
+    to: Option<String>,
     /// A paste: the clipboard's change count when it was asked for.
     from: Option<isize>,
     /// What the status line says while it runs.
@@ -249,9 +252,27 @@ impl EditorView {
         self.carry_out(fileops::plan_duplicate(&paths), Verb::Duplicate);
     }
 
-    /// Does what `plan` says. The moves are done here and now, through the
-    /// path a drag in the tree takes; the copies are handed to a worker.
+    /// What a drag in the tree dropped on the folder `into`: moved there as
+    /// `plan` says, or with `copy` copied. A move by drag takes no other
+    /// name than its own, so an item whose name is in use there is skipped
+    /// and the rest still go.
+    pub(super) fn drop_items(&self, plan: Vec<Planned>, copy: bool, into: &Path) {
+        let verb = if copy { Verb::DragCopy } else { Verb::Drag };
+        let mut outcome = Outcome::new(verb);
+        outcome.to = Some(sidebar::item_name(into));
+        self.carry_out_as(plan, outcome);
+    }
+
+    /// Does what `plan` says. The moves are done here and now, with the
+    /// tabs and the local history of what moves; the copies are handed to
+    /// a worker.
     fn carry_out(&self, plan: Vec<Planned>, verb: Verb) {
+        self.carry_out_as(plan, Outcome::new(verb));
+    }
+
+    /// [`EditorView::carry_out`], into an outcome already begun.
+    fn carry_out_as(&self, plan: Vec<Planned>, mut outcome: Outcome) {
+        let verb = outcome.verb;
         if self.state().is_some_and(|state| !state.explorer.idle()) {
             self.say_about_files(
                 layout::Feedback::Info,
@@ -261,20 +282,29 @@ impl EditorView {
         }
         let mut copies = Vec::new();
         let mut moves = Vec::new();
-        let mut outcome = Outcome::new(verb);
         for planned in plan {
             match planned {
                 Planned::Copy { from, to } => copies.push((from, to)),
                 Planned::Move { from, to } => moves.push((from, to)),
+                // Dropped where it is: nothing to do, and nothing to say.
+                Planned::Stays(_) if verb.dragged() => {}
                 Planned::Stays(from) => outcome.stays.push(sidebar::item_name(&from)),
-                Planned::Refused { from, why } => {
-                    outcome
-                        .refused
-                        .push(format!("{} {}", sidebar::item_name(&from), why.said()))
-                }
+                Planned::Refused {
+                    from,
+                    why: Refusal::Taken,
+                } => outcome.skipped.push(sidebar::item_name(&from)),
+                Planned::Refused { from, why } => outcome.refused.push(format!(
+                    "{} {}",
+                    sidebar::item_name(&from),
+                    verb.refusal(why)
+                )),
             }
         }
         outcome.total = copies.len() + moves.len();
+        // Dropped where everything already is: nothing was done.
+        if verb.dragged() && outcome.total == 0 && outcome.nothing_to_say() {
+            return;
+        }
         if !copies.is_empty() {
             self.start_copy(copies, outcome);
             return;
@@ -299,7 +329,12 @@ impl EditorView {
             return;
         }
         for (from, to) in &moves {
-            match self.relocate(Op::Move { from, to }, true) {
+            // A paste's move takes the next free name when its own was
+            // taken since the plan; a drag's is skipped.
+            match self.relocate(Op::Move { from, to }, !verb.dragged()) {
+                Err(error) if verb.dragged() && error.kind() == io::ErrorKind::AlreadyExists => {
+                    outcome.skipped.push(sidebar::item_name(from))
+                }
                 Ok(did) => {
                     if let Some(why) = did.original_left {
                         outcome.failed.push(format!(
@@ -316,7 +351,7 @@ impl EditorView {
         }
         let moved = !outcome.made.is_empty();
         if let Some(mut state) = self.state_mut() {
-            if moved {
+            if moved && verb == Verb::Move {
                 // The cut is over, and what is on the clipboard is gone
                 // from where it says: a second paste has nothing to move.
                 if state.explorer.cut_change == Some(clipboard::change_count()) {
@@ -344,8 +379,9 @@ impl EditorView {
         let (tx, rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let total = copies.len();
-        let duplicate = outcome.verb == Verb::Duplicate;
-        let from = (outcome.verb == Verb::Paste).then(clipboard::change_count);
+        let verb = outcome.verb;
+        let duplicate = verb == Verb::Duplicate;
+        let from = (verb == Verb::Paste).then(clipboard::change_count);
         let said = match total {
             1 => "Copying 1 item\u{2026}".to_string(),
             n => format!("Copying {n} items\u{2026}"),
@@ -393,7 +429,8 @@ impl EditorView {
                 stop,
                 worker: Some(worker),
                 total,
-                duplicate,
+                verb,
+                to: outcome.to,
                 from,
                 said,
                 made: Vec::new(),
@@ -457,17 +494,13 @@ impl EditorView {
                 let _ = worker.join();
             }
             let outcome = Outcome {
-                verb: if job.duplicate {
-                    Verb::Duplicate
-                } else {
-                    Verb::Paste
-                },
                 total: job.total,
                 cancelled: job.stop.load(Ordering::Relaxed),
                 made: job.made,
                 failed: job.failed,
                 refused: job.refused,
-                stays: Vec::new(),
+                to: job.to,
+                ..Outcome::new(job.verb)
             };
             let (kind, said) = outcome.said();
             state.explorer.made = outcome.made;
@@ -623,15 +656,37 @@ pub(super) fn report(state: &State) -> String {
     )
 }
 
-/// What a paste or a duplicate is called when it is over.
+/// What a paste, a duplicate or a drop is called when it is over.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Verb {
     Paste,
+    /// A cut, pasted.
     Move,
     Duplicate,
+    /// Dragged in the tree to another folder.
+    Drag,
+    /// Dragged there with Option held.
+    DragCopy,
 }
 
-/// How a paste or a duplicate went, for the status line.
+impl Verb {
+    /// By a drag in the tree, not from the clipboard.
+    fn dragged(self) -> bool {
+        matches!(self, Verb::Drag | Verb::DragCopy)
+    }
+
+    /// Why an item was left alone, as the rest of a sentence that starts
+    /// with its name.
+    fn refusal(self, why: Refusal) -> &'static str {
+        match (self, why) {
+            (Verb::Drag, Refusal::IntoItself) => "cannot be moved into itself",
+            (Verb::DragCopy, Refusal::IntoItself) => "cannot be copied into itself",
+            _ => why.said(),
+        }
+    }
+}
+
+/// How a paste, a duplicate or a drop went, for the status line.
 struct Outcome {
     verb: Verb,
     /// How many items were to be copied or moved.
@@ -646,6 +701,11 @@ struct Outcome {
     refused: Vec<String>,
     /// The cut items that were pasted where they already are.
     stays: Vec<String>,
+    /// The dragged items left where they were: something in the folder
+    /// they were dropped on has their name.
+    skipped: Vec<String>,
+    /// A drop: the name of the folder it went to.
+    to: Option<String>,
 }
 
 impl Outcome {
@@ -658,7 +718,14 @@ impl Outcome {
             failed: Vec::new(),
             refused: Vec::new(),
             stays: Vec::new(),
+            skipped: Vec::new(),
+            to: None,
         }
+    }
+
+    /// Nothing was refused, skipped or failed.
+    fn nothing_to_say(&self) -> bool {
+        self.failed.is_empty() && self.refused.is_empty() && self.skipped.is_empty()
     }
 
     /// The message, and what kind it is: a failure when anything was
@@ -666,8 +733,9 @@ impl Outcome {
     fn said(&self) -> (layout::Feedback, String) {
         let (done, doing) = match self.verb {
             Verb::Paste => ("pasted", "copy"),
-            Verb::Move => ("moved", "move"),
+            Verb::Move | Verb::Drag => ("moved", "move"),
             Verb::Duplicate => ("duplicated", "duplicate"),
+            Verb::DragCopy => ("copied", "copy"),
         };
         let made = self.made.len();
         let mut parts = Vec::new();
@@ -677,10 +745,14 @@ impl Outcome {
                 _ => format!("copy stopped: {made} of {} items were copied", self.total),
             });
         } else if made > 0 {
-            parts.push(match (made, self.total) {
+            let what = match (made, self.total) {
                 (1, 1) => format!("{done} {}", sidebar::item_name(&self.made[0])),
                 (made, total) if made == total => format!("{done} {made} items"),
                 (made, total) => format!("{done} {made} of {total} items"),
+            };
+            parts.push(match &self.to {
+                Some(folder) => format!("{what} to {folder}"),
+                None => what,
             });
         }
         parts.extend(
@@ -694,7 +766,17 @@ impl Outcome {
             [name] => parts.push(format!("{name} is already in this folder")),
             names => parts.push(format!("{} items are already in this folder", names.len())),
         }
-        let kind = if !self.failed.is_empty() || !self.refused.is_empty() {
+        match self.skipped.as_slice() {
+            [] => {}
+            [name] => parts.push(format!(
+                "skipped {name}: an item of that name is already there"
+            )),
+            names => parts.push(format!(
+                "skipped {} items: items of those names are already there",
+                names.len()
+            )),
+        }
+        let kind = if !self.nothing_to_say() {
             layout::Feedback::Failure
         } else if made > 0 && !self.cancelled {
             layout::Feedback::Success
@@ -794,6 +876,76 @@ mod tests {
         let mut late = outcome(Verb::Paste, 1, &["/p/a.txt"]);
         late.cancelled = true;
         assert_eq!(said(late), (Info, "pasted a.txt".to_string()));
+    }
+
+    /// A drop says where it went, and counts what it left behind because
+    /// the folder already has something of that name.
+    #[test]
+    fn a_drop_names_its_folder_and_counts_what_it_skipped() {
+        use layout::Feedback::{Failure, Success};
+        let dropped = |verb, total, made: &[&str], skipped: &[&str]| {
+            let mut outcome = outcome(verb, total, made);
+            outcome.to = Some("trips".into());
+            outcome.skipped = skipped.iter().map(|name| name.to_string()).collect();
+            outcome.said()
+        };
+        assert_eq!(
+            dropped(Verb::Drag, 1, &["/p/trips/garden.txt"], &[]),
+            (Success, "moved garden.txt to trips".to_string())
+        );
+        assert_eq!(
+            dropped(
+                Verb::Drag,
+                3,
+                &["/p/trips/a", "/p/trips/b", "/p/trips/c"],
+                &[]
+            ),
+            (Success, "moved 3 items to trips".to_string())
+        );
+        assert_eq!(
+            dropped(Verb::DragCopy, 1, &["/p/trips/garden-copy.txt"], &[]),
+            (Success, "copied garden-copy.txt to trips".to_string())
+        );
+        // One name in use there: the others went, and it is named.
+        assert_eq!(
+            dropped(Verb::Drag, 2, &["/p/trips/a", "/p/trips/b"], &["soup.md"]),
+            (
+                Failure,
+                "moved 2 items to trips; skipped soup.md: an item of that name is already there"
+                    .to_string()
+            )
+        );
+        // Several: how many.
+        assert_eq!(
+            dropped(Verb::Drag, 1, &["/p/trips/a"], &["soup.md", "bread.md"]),
+            (
+                Failure,
+                "moved a to trips; skipped 2 items: items of those names are already there"
+                    .to_string()
+            )
+        );
+        // Nothing could go.
+        assert_eq!(
+            dropped(Verb::Drag, 0, &[], &["soup.md", "bread.md", "list.txt"]),
+            (
+                Failure,
+                "skipped 3 items: items of those names are already there".to_string()
+            )
+        );
+        // A folder into itself, by its own word for each way of dropping.
+        assert_eq!(
+            Verb::Drag.refusal(Refusal::IntoItself),
+            "cannot be moved into itself"
+        );
+        assert_eq!(
+            Verb::DragCopy.refusal(Refusal::IntoItself),
+            "cannot be copied into itself"
+        );
+        assert_eq!(
+            Verb::Paste.refusal(Refusal::IntoItself),
+            "cannot be pasted into itself"
+        );
+        assert_eq!(Verb::Drag.refusal(Refusal::Missing), "is no longer there");
     }
 
     /// Cmd-C, Cmd-V, Cmd-V on a folder: the second paste finds the cursor

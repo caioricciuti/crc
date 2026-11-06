@@ -992,26 +992,13 @@ impl EditorView {
             if *git_open {
                 git.draw_sidebar(&mut renderer.atlas, rect, *git_focus, theme, glyphs);
             } else if let Some(Drag::Tree(drag)) = drag
-                && drag.active
-                && drag.valid
+                && let Some(on) = drag.drop_on()
+                && let Some(band) = layout::sidebar_drop_band(tree, on, rect)
             {
-                // Where it would land. A drag with no target drawn is a drag
-                // you have to guess at.
-                let band = match drag.over {
-                    Some(index) => Viewport {
-                        x: rect.x + 4.0,
-                        width: (rect.width - 8.0).max(0.0),
-                        ..layout::sidebar_row_rect(rect, index.saturating_sub(tree.scroll))
-                    },
-                    // The project root: the whole column below the tree.
-                    None => Viewport {
-                        x: rect.x + 4.0,
-                        y: rect.y + layout::SIDEBAR_HEADER_HEIGHT,
-                        width: (rect.width - 8.0).max(0.0),
-                        height: (rect.height - layout::SIDEBAR_HEADER_HEIGHT).max(0.0),
-                    },
-                };
-                layout::push_focus_ring(glyphs, band, 5.0, 1.5, theme);
+                // Where it would land: the folder with what shows inside
+                // it, or the whole list for the project root. A drag with
+                // no target drawn is a drag you have to guess at.
+                layout::push_drop_zone(glyphs, &renderer.atlas, band, theme);
             }
         }
 
@@ -1401,6 +1388,12 @@ impl EditorView {
                 glyphs,
             );
             layout::fade_from(glyphs, overlay_from, layout::overlay_alpha(PALETTE_OVERLAY));
+        }
+
+        // What a drag in the Explorer carries, beside the pointer wherever
+        // in the window that is.
+        if let Some(Drag::Tree(drag)) = drag {
+            drag.draw_pill(glyphs, &mut renderer.atlas, viewport, theme);
         }
 
         let background = theme.background;

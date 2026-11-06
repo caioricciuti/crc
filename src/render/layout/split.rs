@@ -532,6 +532,25 @@ impl<L: Clone + PartialEq> Node<L> {
         true
     }
 
+    /// Whether `other` is the same panes cut the same ways, wherever its
+    /// dividers are: a move that ends in the shape it started from has
+    /// moved nothing.
+    pub fn alike(&self, other: &Node<L>) -> bool {
+        match (self, other) {
+            (Node::Leaf(own), Node::Leaf(their)) => own == their,
+            (
+                Node::Split { dir, a, b, .. },
+                Node::Split {
+                    dir: their,
+                    a: p,
+                    b: q,
+                    ..
+                },
+            ) => dir == their && a.alike(p) && b.alike(q),
+            _ => false,
+        }
+    }
+
     /// The tree as text: a pane is what `leaf` gives for it, a split is
     /// `h(ratio,a,b)` or `v(ratio,a,b)`. In a pane's text the characters
     /// the form uses, spaces and control characters are written `%XX`.
@@ -1197,6 +1216,35 @@ mod tests {
         let before = tree.clone();
         assert!(!tree.move_leaf(&100, &(MAX_DEPTH as u32), Edge::Bottom));
         assert_eq!(tree, before);
+    }
+
+    #[test]
+    fn two_trees_are_alike_whatever_their_ratios() {
+        let tree = h(0.3, leaf(1), v(0.6, leaf(2), leaf(3)));
+        assert!(tree.alike(&tree));
+        assert!(tree.alike(&h(0.5, leaf(1), v(0.5, leaf(2), leaf(3)))));
+        assert!(
+            !tree.alike(&h(0.3, leaf(1), v(0.6, leaf(3), leaf(2)))),
+            "traded"
+        );
+        assert!(
+            !tree.alike(&h(0.3, leaf(1), h(0.6, leaf(2), leaf(3)))),
+            "cut the other way"
+        );
+        assert!(!tree.alike(&h(0.3, leaf(1), leaf(2))), "a pane fewer");
+        assert!(!tree.alike(&leaf(1)));
+        assert!(leaf(1).alike(&leaf(1)));
+        assert!(!leaf(1).alike(&leaf(2)));
+
+        // A pane moved to where it already is: the same shape, the
+        // divider in the middle again.
+        let mut moved = tree.clone();
+        assert!(moved.move_leaf(&2, &3, Edge::Top));
+        assert_eq!(moved, h(0.3, leaf(1), v(0.5, leaf(2), leaf(3))));
+        assert!(moved.alike(&tree));
+        // And to the other side of it: another shape.
+        assert!(moved.move_leaf(&2, &3, Edge::Bottom));
+        assert!(!moved.alike(&tree));
     }
 
     #[test]

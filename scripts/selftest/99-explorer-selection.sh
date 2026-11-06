@@ -314,9 +314,14 @@ expect "$T/guard-nested.out" focused_pane 1
 expect "$T/guard-nested.out" tree_rows "*recipes/|*recipes/bread.md|recipes/soup.md|trips/|*>garden.txt|groceries.txt|journal.md|letters.txt"
 expect "$T/guard-nested.out" tree_acts_on "recipes|garden.txt"
 expect "$T/guard-trash.out" message "would refuse: unsaved changes are open"
-expect "$T/guard-drag.out" message "save the affected tabs before moving this item"
+# The drag carries the whole selection, the folder and garden.txt, and
+# none of it goes while one of them holds unsaved work.
+expect "$T/guard-drag.out" message "save the affected tabs before moving these items"
 expect "$T/guard-drag.out" focused_pane 1
 expect "$T/guard-drag.out" tree_acts_on "recipes|garden.txt"
 if [ ! -f "$T/paneguard/recipes/bread.md" ] || [ -e "$T/paneguard/trips/recipes" ]; then
     failed "guard: a drag moved a folder with unsaved work open in another pane"
+fi
+if [ ! -f "$T/paneguard/garden.txt" ] || [ -e "$T/paneguard/trips/garden.txt" ]; then
+    failed "guard: a drag refused for unsaved work moved the other item it carried"
 fi

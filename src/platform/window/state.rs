@@ -484,6 +484,9 @@ impl State {
             && self.message.is_none()
             && !self.git.busy()
             && !matches!(self.drag, Some(Drag::Select { point: Some(_), .. }))
+            // Rows of the Explorer held: the tree scrolls under them and
+            // the folder they rest on opens, by the frame.
+            && !matches!(&self.drag, Some(Drag::Tree(drag)) if drag.active())
             && !self.terminal.selecting_dragged()
             // A tab held at an end of its strip scrolls it by the frame.
             && !self.terminal.tab_drag.is_some_and(|drag| drag.active)

@@ -547,6 +547,77 @@ pub fn push_row_hover(out: &mut Vec<GlyphInstance>, row: Viewport, theme: &Theme
     hotspot(row, Cursor::Pointing, None);
 }
 
+// ---- a drag -----------------------------------------------------------------
+// What a thing dragged shows while it is held: where it would land, and
+// what it is, by the pointer.
+
+/// Where something dragged lands if let go here: `rect` washed in the
+/// accent with a thin line of it round the edge, over whatever is there,
+/// which shows through.
+pub fn push_drop_zone(out: &mut Vec<GlyphInstance>, atlas: &Atlas, rect: Viewport, theme: &Theme) {
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
+    }
+    let Viewport {
+        x,
+        y,
+        width,
+        height,
+    } = rect;
+    let wash = faded(theme.accent, 0.14);
+    push_rect(out, atlas, [x, y], [width, height], wash);
+    let line = faded(theme.accent, 0.75);
+    let upright = (height - 2.0).max(0.0);
+    push_rect(out, atlas, [x, y], [width, 1.0], line);
+    push_rect(out, atlas, [x, y + height - 1.0], [width, 1.0], line);
+    push_rect(out, atlas, [x, y + 1.0], [1.0, upright], line);
+    push_rect(out, atlas, [x + width - 1.0, y + 1.0], [1.0, upright], line);
+}
+
+/// The widest a [`push_drag_chip`] gets: a longer name ends in an ellipsis.
+const DRAG_CHIP_MAX: f32 = 220.0;
+
+/// What is being dragged, by the pointer at `at`: its name on a small
+/// floating panel under and to the right of the pointer, kept inside
+/// `bounds`. It hangs 12 across and 16 down from the pointer, and what
+/// is drawn beside it (see [`push_copy_mark`]) counts on that.
+pub fn push_drag_chip(
+    out: &mut Vec<GlyphInstance>,
+    atlas: &mut Atlas,
+    at: (f32, f32),
+    bounds: Viewport,
+    label: &str,
+    theme: &Theme,
+) {
+    const PAD: f32 = 8.0;
+    let width = (ui_text_width(atlas, label) + PAD * 2.0)
+        .ceil()
+        .min(DRAG_CHIP_MAX)
+        .min(bounds.width);
+    let chip = Viewport {
+        x: (at.0 + 12.0)
+            .min(bounds.x + bounds.width - width)
+            .max(bounds.x),
+        y: (at.1 + 16.0)
+            .min(bounds.y + bounds.height - UI_CONTROL_SM)
+            .max(bounds.y),
+        width,
+        height: UI_CONTROL_SM,
+    };
+    push_panel(out, chip, UI_RADIUS_SM, theme);
+    push_ui_text_elided(
+        out,
+        atlas,
+        Viewport {
+            x: chip.x + PAD,
+            width: (chip.width - PAD * 2.0).max(0.0),
+            ..chip
+        },
+        label,
+        theme.tab_text,
+    );
+}
+
 // ---- the segmented control ----------------------------------------------
 // A track with the choices side by side and the chosen one lit: Grid or
 // Text over a table, Editor or Agents in the toolbar, the steps and the
@@ -1171,6 +1242,57 @@ pub fn push_tag(
         clip_horizontal(quad, pill.x, pill.x + pill.width);
     }
     pill.width
+}
+
+/// The size of a [`push_copy_mark`].
+pub const COPY_MARK: f32 = 14.0;
+
+/// The mark of a copy on something dragged: a plus on a small disc in the
+/// accent, centred on `at` and kept inside `bounds`, with a ring in
+/// `ground` that cuts it out of what it sits on. Shown beside the pointer
+/// while letting go would copy what is held instead of moving it.
+pub fn push_copy_mark(
+    out: &mut Vec<GlyphInstance>,
+    at: (f32, f32),
+    bounds: Viewport,
+    ground: [f32; 4],
+    theme: &Theme,
+) {
+    const RING: f32 = 1.5;
+    let reach = COPY_MARK * 0.5 + RING;
+    // A whole point to stand on between the two edges, or nothing.
+    if bounds.width < reach * 2.0 + 1.0 || bounds.height < reach * 2.0 + 1.0 {
+        return;
+    }
+    // On whole points, so the bars of the plus are not blurred.
+    let whole = |at: f32, from: f32, size: f32| {
+        at.round()
+            .clamp((from + reach).ceil(), (from + size - reach).floor())
+    };
+    let cx = whole(at.0, bounds.x, bounds.width);
+    let cy = whole(at.1, bounds.y, bounds.height);
+    let disc = |size: f32| Viewport {
+        x: cx - size * 0.5,
+        y: cy - size * 0.5,
+        width: size,
+        height: size,
+    };
+    push_rounded_rect(out, disc(reach * 2.0), reach, ground);
+    push_rounded_rect(out, disc(COPY_MARK), COPY_MARK * 0.5, theme.accent);
+    let (arm, bar) = (4.0, 2.0);
+    for (width, height) in [(arm * 2.0, bar), (bar, arm * 2.0)] {
+        push_rounded_rect(
+            out,
+            Viewport {
+                x: cx - width * 0.5,
+                y: cy - height * 0.5,
+                width,
+                height,
+            },
+            bar * 0.5,
+            theme.ink_on_solid(),
+        );
+    }
 }
 
 /// A heading in bold prose at `size` points, top-left at `(x, y)`; its
@@ -2261,5 +2383,57 @@ mod tests {
         out.clear();
         let w = push_tag(&mut out, &mut atlas, left.x, left, "#123456789012", colour);
         assert!(left.x + w <= row.x + row.width - state - UI_GAP + 0.01);
+    }
+
+    /// The mark of a copy stays whole at the edges of what it is drawn in.
+    #[test]
+    fn a_copy_mark_is_a_plus_on_a_disc_kept_inside_its_bounds() {
+        let theme = Theme::dark();
+        let window = Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: 600.0,
+            height: 400.0,
+        };
+        for at in [(300.4, 200.6), (0.0, 0.0), (700.0, 500.0), (-20.0, 399.0)] {
+            let mut out = Vec::new();
+            push_copy_mark(&mut out, at, window, theme.palette_background, &theme);
+            // The ring, the disc, and the two bars of the plus.
+            assert_eq!(out.len(), 4, "at {at:?}");
+            assert_eq!(frame_faults(&out, window), Vec::<String>::new());
+            for quad in &out {
+                assert!(quad.pos[1] >= 0.0 && quad.pos[1] + quad.size[1] <= 400.0);
+                // Every edge on a whole or a half point: nothing blurred
+                // on a display of two pixels to the point.
+                for edge in [quad.pos[0], quad.pos[1], quad.size[0], quad.size[1]] {
+                    assert_eq!((edge * 2.0).fract(), 0.0, "{quad:?}");
+                }
+            }
+            // The disc is the accent's, and the plus is centred on it.
+            assert_eq!(out[1].color, theme.accent);
+            assert_eq!(out[1].size, [COPY_MARK, COPY_MARK]);
+            let centre = |quad: &GlyphInstance| {
+                (
+                    quad.pos[0] + quad.size[0] * 0.5,
+                    quad.pos[1] + quad.size[1] * 0.5,
+                )
+            };
+            assert_eq!(centre(&out[2]), centre(&out[1]));
+            assert_eq!(centre(&out[3]), centre(&out[1]));
+        }
+        // No room for it: nothing, not a mark cut by the edge.
+        let mut out = Vec::new();
+        let sliver = Viewport {
+            height: 10.0,
+            ..window
+        };
+        push_copy_mark(
+            &mut out,
+            (50.0, 5.0),
+            sliver,
+            theme.palette_background,
+            &theme,
+        );
+        assert!(out.is_empty());
     }
 }
