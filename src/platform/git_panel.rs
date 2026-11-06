@@ -359,6 +359,12 @@ struct InFlight {
 /// screen to say so.
 const TOUCH_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// The next [`Panel::snapshot_stamp`]. Never 0, never reused within a run.
+fn next_stamp() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 pub struct Panel {
     directory: PathBuf,
     /// The repository's name in a workspace of several, drawn as a menu
@@ -427,6 +433,8 @@ pub struct Panel {
     /// Counts the worker's answers, so a view derived from the snapshot
     /// knows when to look again.
     generation: u64,
+    /// Names the snapshot held: see [`Panel::snapshot_stamp`].
+    snapshot_stamp: u64,
     /// When the repository last fetched from its remote, read with the
     /// snapshot: the branch row's "checked 14:02".
     fetched_at: Option<u64>,
@@ -717,6 +725,7 @@ impl Panel {
     /// A panel that has asked the repository nothing yet: no worker runs.
     fn idle(directory: PathBuf, snapshot: Option<Snapshot>) -> Self {
         Self {
+            snapshot_stamp: if snapshot.is_some() { next_stamp() } else { 0 },
             directory,
             repo: None,
             ssh_auth_sock: None,
@@ -753,6 +762,20 @@ impl Panel {
     /// How many times the worker has answered.
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Names the snapshot held: 0 before the first, and a number no other
+    /// snapshot of any panel in this run has had. Whoever builds something
+    /// from the snapshot keeps the stamp beside it and builds again only
+    /// when the two differ, whichever panel is asked.
+    pub fn snapshot_stamp(&self) -> u64 {
+        self.snapshot_stamp
+    }
+
+    /// The folder the repository is read for: the project's, or the
+    /// member of a workspace that Source Control shows.
+    pub fn directory(&self) -> &std::path::Path {
+        &self.directory
     }
 
     pub fn busy(&self) -> bool {
@@ -1723,6 +1746,7 @@ impl Panel {
                 }
                 let before = self.selected_change().map(|c| c.path.clone());
                 self.snapshot = Some(reply.snapshot);
+                self.snapshot_stamp = next_stamp();
                 self.agents = reply.agents;
                 self.fetched_at = reply.fetched_at;
                 self.selected = reply.selected;

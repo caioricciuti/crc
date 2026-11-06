@@ -7,6 +7,8 @@ pub mod finder;
 pub mod git;
 pub mod history;
 pub mod icons;
+pub mod marks;
+pub mod naming;
 pub mod receipt;
 pub mod review;
 pub mod tree;

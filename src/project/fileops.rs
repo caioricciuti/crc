@@ -1,9 +1,10 @@
 //! Copying and moving project items on disk, for the Explorer.
 //!
-//! Nothing here replaces an entry that already exists. A copy is built in a
-//! hidden folder beside its destination and moved into place with the
+//! Nothing here writes over an entry that already exists. A copy is built in
+//! a hidden folder beside its destination and moved into place with the
 //! exclusive rename; a move is that rename, or a copy and a removal when the
-//! destination is on another volume. A symbolic link is the item itself
+//! destination is on another volume. A copy told to replace an item moves
+//! that item to the Trash first. A symbolic link is the item itself
 //! throughout: it is copied, moved and removed as the link, and never
 //! followed. Every operation answers where the item ended up, so that it can
 //! be reversed.
@@ -12,9 +13,11 @@
 //! a new file or folder, a rename, a move, a copy, a duplicate, a move to
 //! the Trash. It answers a [`Record`] of what was done. What a paste or a
 //! duplicate will do to each item is worked out first, by [`plan_paste`]
-//! and [`plan_duplicate`], without touching anything.
+//! and [`plan_duplicate`], without touching anything. A record is what an
+//! undo goes by: [`Steps`] keeps them, a step for each thing a person did,
+//! and [`undo_step`] and [`redo_step`] take one back and do it again.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
@@ -158,6 +161,48 @@ pub fn copy_item_until(
     destination: &Path,
     stop: &dyn Fn() -> bool,
 ) -> io::Result<PathBuf> {
+    copy_into_place(source, destination, stop, None).map(|placed| placed.path)
+}
+
+/// What moves an item to the Trash, and answers where it is there when
+/// the system says: [`Env::trash`].
+pub type ToTrash<'a> = &'a dyn Fn(&Path) -> io::Result<Option<PathBuf>>;
+
+/// A copy put where another item was.
+#[derive(Debug)]
+pub struct Replaced {
+    /// Where the copy is.
+    pub path: PathBuf,
+    /// Something was there, and went to the Trash.
+    pub replaced: bool,
+    /// Where that is in the Trash, when the system says.
+    pub trashed: Option<PathBuf>,
+}
+
+/// Copies the item at `source` to `destination` in place of what is there,
+/// which is handed to `trash` and never written over. As [`copy_item_until`]
+/// otherwise, and a plain copy when nothing is there.
+///
+/// The copy is built whole first, so one that fails or is stopped leaves
+/// what was there where it was. Only then is that moved to the Trash and
+/// the copy given its name. An item is not put in place of itself, or of a
+/// folder it is in: the Trash would take the original along.
+pub fn replace_item_until(
+    source: &Path,
+    destination: &Path,
+    trash: ToTrash<'_>,
+    stop: &dyn Fn() -> bool,
+) -> io::Result<Replaced> {
+    copy_into_place(source, destination, stop, Some(trash))
+}
+
+/// [`copy_item_until`], or with `trash` given [`replace_item_until`].
+fn copy_into_place(
+    source: &Path,
+    destination: &Path,
+    stop: &dyn Fn() -> bool,
+    trash: Option<ToTrash<'_>>,
+) -> io::Result<Replaced> {
     let (dir, name) = folder_and_name(destination)?;
     let kind = fs::symlink_metadata(source)?.file_type();
     if !(kind.is_file() || kind.is_dir() || kind.is_symlink()) {
@@ -167,26 +212,72 @@ pub fn copy_item_until(
         ));
     }
     refuse_nesting(source, dir)?;
-    // Before the work of copying. The exclusive move below is what keeps
-    // an entry made in the meantime.
-    if taken(destination) {
-        return Err(io::ErrorKind::AlreadyExists.into());
+    if trash.is_none() {
+        // Before the work of copying. The exclusive move below is what
+        // keeps an entry made in the meantime.
+        if taken(destination) {
+            return Err(io::ErrorKind::AlreadyExists.into());
+        }
+    } else if holds(destination, source) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "an item cannot replace itself or the folder it is in",
+        ));
     }
     let staging = Staging::new(dir)?;
     let staged = staging.0.join(name);
     let mut folders = Vec::new();
     copy_tree(source, &staged, Path::new(""), &mut folders, stop)?;
-    move_without_replace(&staged, destination)?;
-    // Folders were made writable to be filled, and to be moved out of the
-    // staging folder. Deepest first, as one that loses its search bit hides
-    // the folders in it.
-    for (relative, permissions) in folders.into_iter().rev() {
-        if let Err(error) = fs::set_permissions(destination.join(relative), permissions) {
-            let _ = remove_item(destination);
-            return Err(error);
-        }
+    // The copy is whole: only now does what is there give way to it.
+    let mut replaced = false;
+    let mut trashed = None;
+    if let Some(trash) = trash
+        && taken(destination)
+    {
+        trashed = trash(destination)?;
+        replaced = true;
     }
-    Ok(destination.to_path_buf())
+    let placed = move_without_replace(&staged, destination).and_then(|()| {
+        // Folders were made writable to be filled, and to be moved out of
+        // the staging folder. Deepest first, as one that loses its search
+        // bit hides the folders in it.
+        for (relative, permissions) in folders.into_iter().rev() {
+            if let Err(error) = fs::set_permissions(destination.join(relative), permissions) {
+                let _ = remove_item(destination);
+                return Err(error);
+            }
+        }
+        Ok(())
+    });
+    match placed {
+        Ok(()) => Ok(Replaced {
+            path: destination.to_path_buf(),
+            replaced,
+            trashed,
+        }),
+        Err(error) if replaced => {
+            // What gave way comes back, when the Trash said where it is.
+            let back = trashed
+                .as_deref()
+                .is_some_and(|trashed| move_without_replace(trashed, destination).is_ok());
+            if back {
+                Err(error)
+            } else {
+                Err(io::Error::new(
+                    error.kind(),
+                    format!("{error}; the item that was there is in the Trash"),
+                ))
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether the item at `outer` is the one at `item`, or a folder that has
+/// `item` somewhere in it, by where the file system says both are. A link
+/// to a folder holds nothing: it is the link that would go to the Trash.
+fn holds(outer: &Path, item: &Path) -> bool {
+    located(item).starts_with(located(outer))
 }
 
 /// The folder a destination is in, and the name it has there.
@@ -363,6 +454,8 @@ pub enum OpKind {
     Move,
     Copy,
     Duplicate,
+    /// A copy put in place of an item, which went to the Trash.
+    Replace,
     Trash,
 }
 
@@ -381,6 +474,9 @@ pub enum Op<'a> {
     Copy { from: &'a Path, to: &'a Path },
     /// As `Copy`, asked for as a duplicate beside the original.
     Duplicate { from: &'a Path, to: &'a Path },
+    /// A copy of the item at `from`, at `to`, in place of the item that is
+    /// there: that one is moved to the Trash once the copy is whole.
+    Replace { from: &'a Path, to: &'a Path },
     /// The item at this path moved to the Trash.
     Trash(&'a Path),
 }
@@ -394,18 +490,45 @@ pub struct Record {
     /// Where the result is: the new item, the copy, the item once renamed
     /// or moved. `None` for an item moved to the Trash.
     pub result: Option<PathBuf>,
-    /// Where the item is in the Trash, when the system says.
+    /// Where the item is in the Trash, when the system says. For a copy
+    /// that replaced an item, where the item that was at `result` is.
     pub trashed: Option<PathBuf>,
     /// A move to another volume whose original could not be removed after
     /// it was copied: it is still at `source`, and this is why.
     pub original_left: Option<io::Error>,
+    /// What the item is: the one at `result`, or the one that went to the
+    /// Trash. An undo touches only what is still that kind of thing.
+    pub item: Option<ItemKind>,
+    /// What the item a copy replaced is, the one `trashed` says where.
+    pub replaced: Option<ItemKind>,
+}
+
+/// What an item is, as far as taking an operation back goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ItemKind {
+    File,
+    Folder,
+    /// A symbolic link, whatever it points at.
+    Link,
+}
+
+/// What is at `path`: a link is the link.
+fn item_kind(path: &Path) -> io::Result<ItemKind> {
+    let kind = fs::symlink_metadata(path)?.file_type();
+    Ok(if kind.is_symlink() {
+        ItemKind::Link
+    } else if kind.is_dir() {
+        ItemKind::Folder
+    } else {
+        ItemKind::File
+    })
 }
 
 /// What an operation is given besides its paths.
 pub struct Env<'a> {
     /// Moves an item to the Trash, and answers where it is there when the
     /// system says.
-    pub trash: &'a dyn Fn(&Path) -> io::Result<Option<PathBuf>>,
+    pub trash: ToTrash<'a>,
     /// Asked before each file and folder of a copy: `true` stops the copy,
     /// which then fails with `Interrupted` and leaves nothing behind.
     pub stop: &'a dyn Fn() -> bool,
@@ -415,15 +538,19 @@ pub struct Env<'a> {
 /// the project is made, renamed, moved, copied or trashed, so that every
 /// one of them leaves a record.
 ///
-/// Nothing is ever replaced: an operation whose destination is taken, a
-/// dangling link included, fails with `AlreadyExists` and changes nothing.
+/// Nothing is ever written over: an operation whose destination is taken,
+/// a dangling link included, fails with `AlreadyExists` and changes
+/// nothing. [`Op::Replace`] alone asks for the destination, and what is
+/// there goes to the Trash, where the record says it is.
 pub fn perform(op: Op<'_>, env: &Env<'_>) -> io::Result<Record> {
     let record = |kind: OpKind, source: Option<&Path>, result: Option<PathBuf>| Record {
         kind,
         source: source.map(Path::to_path_buf),
+        item: result.as_deref().and_then(|path| item_kind(path).ok()),
         result,
         trashed: None,
         original_left: None,
+        replaced: None,
     };
     match op {
         Op::NewFile(path) => {
@@ -461,10 +588,27 @@ pub fn perform(op: Op<'_>, env: &Env<'_>) -> io::Result<Record> {
             let copy = copy_item_until(from, to, env.stop)?;
             Ok(record(kind, Some(from), Some(copy)))
         }
+        Op::Replace { from, to } => {
+            let there = item_kind(to).ok();
+            let placed = replace_item_until(from, to, env.trash, env.stop)?;
+            // Nothing was there after all: a copy like any other.
+            let kind = if placed.replaced {
+                OpKind::Replace
+            } else {
+                OpKind::Copy
+            };
+            Ok(Record {
+                trashed: placed.trashed,
+                replaced: there.filter(|_| placed.replaced),
+                ..record(kind, Some(from), Some(placed.path))
+            })
+        }
         Op::Trash(path) => {
+            let item = item_kind(path).ok();
             let trashed = (env.trash)(path)?;
             Ok(Record {
                 trashed,
+                item,
                 ..record(OpKind::Trash, Some(path), None)
             })
         }
@@ -514,6 +658,9 @@ fn shown_as_folder(path: &Path) -> bool {
 pub enum Planned {
     /// Copied to `to`, a name nothing has.
     Copy { from: PathBuf, to: PathBuf },
+    /// Copied to `to` in place of the item there, which goes to the Trash:
+    /// only where a drop from outside was told to replace.
+    Replace { from: PathBuf, to: PathBuf },
     /// Moved to `to`, a name nothing has.
     Move { from: PathBuf, to: PathBuf },
     /// Cut, and pasted into the folder it is in already: it stays.
@@ -532,6 +679,9 @@ pub enum Refusal {
     /// Dragged to a folder where something already has its name: a move
     /// by drag replaces nothing and renames nothing.
     Taken,
+    /// Told to replace the item of its name, which is the folder it is in:
+    /// the Trash would take the original along.
+    InsideReplaced,
 }
 
 impl Refusal {
@@ -542,8 +692,18 @@ impl Refusal {
             Refusal::Missing => "is no longer there",
             Refusal::IntoItself => "cannot be pasted into itself",
             Refusal::Taken => "would replace an item of the same name",
+            Refusal::InsideReplaced => "is inside the item it would replace",
         }
     }
+}
+
+/// What a drop from outside does where a name it brings is in use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OnTaken {
+    /// The item there goes to the Trash and the copy takes its name.
+    Replace,
+    /// The copy takes the next free `-copy` name.
+    KeepBoth,
 }
 
 /// What pasting `sources` into the folder `dir` will do with each of them,
@@ -804,6 +964,511 @@ impl DropCheck {
                 Planned::Move { from, to }
             })
             .collect()
+    }
+
+    // A drag from outside the tree, from the Finder or another app, is
+    // always a copy, and it goes where a move would: dropped on the folder
+    // an item is in already it has nothing to do, so [`DropCheck::allowed`]
+    // is asked as for a move.
+
+    /// The items a drop from outside would bring to a name that is in use
+    /// in the folder: what the one question of such a drop is about. Looks
+    /// at the folder once for each item that would go.
+    pub fn taken_there(&self) -> Vec<&Path> {
+        let Some(onto) = &self.onto else {
+            return Vec::new();
+        };
+        self.items
+            .iter()
+            .filter(|item| landing(item, onto, false) == Landing::Goes && taken(&item.path))
+            .filter(|item| {
+                item.path
+                    .file_name()
+                    .is_some_and(|name| taken(&onto.dir.join(name)))
+            })
+            .map(|item| item.path.as_path())
+            .collect()
+    }
+
+    /// What a drop from outside will do with each item, in order, without
+    /// touching anything. Every item is copied under its own name where
+    /// that is free. Where it is in use, `on_taken` says: the item there
+    /// is replaced, or the copy takes the next free `-copy` name. An item
+    /// dropped on the folder it is in already stays, a folder is refused
+    /// inside itself, and so is an item that is no longer there.
+    ///
+    /// Only what was in the folder before the drop is replaced. The second
+    /// of two items of one name is kept beside the first, and an item is
+    /// refused that would replace a folder it is in.
+    pub fn plan_from_outside(&self, on_taken: OnTaken) -> Vec<Planned> {
+        let Some(onto) = &self.onto else {
+            return Vec::new();
+        };
+        let mut chosen = HashSet::new();
+        self.items
+            .iter()
+            .map(|item| {
+                let refused = |why| Planned::Refused {
+                    from: item.path.clone(),
+                    why,
+                };
+                match landing(item, onto, false) {
+                    Landing::Stays => return Planned::Stays(item.path.clone()),
+                    Landing::IntoItself => return refused(Refusal::IntoItself),
+                    Landing::Goes => {}
+                }
+                let Some(name) = item.path.file_name().filter(|_| taken(&item.path)) else {
+                    return refused(Refusal::Missing);
+                };
+                let from = item.path.clone();
+                let to = onto.dir.join(name);
+                let key = to.to_string_lossy().to_lowercase();
+                if on_taken == OnTaken::Replace && taken(&to) && !chosen.contains(&key) {
+                    if item.at.starts_with(located(&to)) {
+                        return refused(Refusal::InsideReplaced);
+                    }
+                    chosen.insert(key);
+                    return Planned::Replace { from, to };
+                }
+                let folder = shown_as_folder(&from);
+                let to = free_destination(&onto.dir, name, folder, &mut chosen);
+                Planned::Copy { from, to }
+            })
+            .collect()
+    }
+}
+
+// ---- taking back --------------------------------------------------------------
+// A record says enough to take its operation back, and to do it again after
+// that. Nothing is deleted on the way: what an operation made goes to the
+// Trash, and what it sent there comes back from where the Trash put it.
+// Each item is looked at first, and left alone when the files are no longer
+// as the operation left them. Nothing is ever written over.
+
+/// What taking an operation back, or doing it again, does to the files.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Reversal {
+    /// The item at `from` goes to `to`, where nothing is.
+    Move { from: PathBuf, to: PathBuf },
+    /// The item goes to the Trash.
+    Trash(PathBuf),
+    /// The item at `from`, in the Trash, comes back to `to`.
+    PutBack { from: PathBuf, to: PathBuf },
+    /// The item at `path` goes to the Trash, and the one at `from`, in the
+    /// Trash, takes its place.
+    Exchange { path: PathBuf, from: PathBuf },
+}
+
+/// Why an operation is not taken back, or not done again.
+#[derive(Debug)]
+pub enum Skip {
+    /// The item is not where the operation left it.
+    Gone,
+    /// It is not in the Trash where it was put.
+    GoneFromTrash,
+    /// Something else has its name now: a folder where a file was.
+    Changed,
+    /// The place it would go to is taken, by the item here.
+    Taken(PathBuf),
+    /// It went to the Trash, and the Trash did not say where.
+    Unplaced,
+    /// It could not be brought back from the Trash, where it still is:
+    /// where it belongs, and why it is not there.
+    StillInTrash { belongs: PathBuf, error: io::Error },
+    /// It could not be done, and the item is where it was.
+    Failed(io::Error),
+}
+
+impl Skip {
+    /// The reason, as a sentence about the item called `name`.
+    pub fn said(&self, name: &str) -> String {
+        match self {
+            Skip::Gone => format!("{name} is no longer there"),
+            Skip::GoneFromTrash => format!("{name} is no longer in the Trash"),
+            Skip::Changed => format!("{name} is no longer the same kind of item"),
+            Skip::Taken(by) => format!(
+                "{name} was left alone: an item named {} is in the way",
+                shown_name(by)
+            ),
+            Skip::Unplaced => {
+                format!("{name} is in the Trash, and the Trash did not say where")
+            }
+            Skip::StillInTrash { belongs, error } => format!(
+                "{name} is still in the Trash and belongs in {}: {error}",
+                belongs.parent().unwrap_or(belongs).display()
+            ),
+            Skip::Failed(error) => format!("{name}: {error}"),
+        }
+    }
+}
+
+/// An item's name, as a sentence says it.
+fn shown_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// Whether the item at `path` is still the `kind` of thing an operation
+/// left there. What is `in_trash` and cannot be looked at passes: the
+/// Trash may keep itself from being read, and the move out of it says so.
+fn still(path: &Path, kind: Option<ItemKind>, in_trash: bool) -> Result<(), Skip> {
+    use io::ErrorKind::{NotADirectory, NotFound};
+    match item_kind(path) {
+        Ok(found) if kind.is_none_or(|kind| kind == found) => Ok(()),
+        Ok(_) => Err(Skip::Changed),
+        Err(error) if matches!(error.kind(), NotFound | NotADirectory) => Err(if in_trash {
+            Skip::GoneFromTrash
+        } else {
+            Skip::Gone
+        }),
+        Err(_) if in_trash => Ok(()),
+        Err(error) => Err(Skip::Failed(error)),
+    }
+}
+
+/// Whether `item` can go to `to`: nothing is there, or only `item` itself
+/// under another spelling of its name, on a volume that does not tell the
+/// two apart.
+fn free_for(to: &Path, item: &Path) -> Result<(), Skip> {
+    use std::os::unix::fs::MetadataExt;
+    let itself = || match (fs::symlink_metadata(to), fs::symlink_metadata(item)) {
+        (Ok(to), Ok(item)) => to.dev() == item.dev() && to.ino() == item.ino(),
+        _ => false,
+    };
+    if !taken(to) || itself() {
+        Ok(())
+    } else {
+        Err(Skip::Taken(to.to_path_buf()))
+    }
+}
+
+/// Moves the item at `from` to `to`, where nothing may be.
+fn put(from: &Path, to: &Path) -> Result<(), io::Error> {
+    move_item(from, to).map(|_| ())
+}
+
+impl Reversal {
+    /// The item that leaves its place, moved away or to the Trash: a tab
+    /// open on it, or under it, would be left on a file that is gone.
+    pub fn leaves(&self) -> Option<&Path> {
+        match self {
+            Reversal::Move { from, .. } => Some(from),
+            Reversal::Trash(path) | Reversal::Exchange { path, .. } => Some(path),
+            Reversal::PutBack { .. } => None,
+        }
+    }
+
+    /// Where an item is once this is done; `None` when it is in the Trash.
+    pub fn lands(&self) -> Option<&Path> {
+        match self {
+            Reversal::Move { to, .. } | Reversal::PutBack { to, .. } => Some(to),
+            Reversal::Exchange { path, .. } => Some(path),
+            Reversal::Trash(_) => None,
+        }
+    }
+
+    /// Does it, and answers where `trash` put what went to the Trash, when
+    /// it says. A place taken since it was looked at is left as it is.
+    pub fn apply(&self, trash: ToTrash<'_>) -> Result<Option<PathBuf>, Skip> {
+        let taken_or = |to: &Path, error: io::Error, other: fn(io::Error) -> Skip| {
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                Skip::Taken(to.to_path_buf())
+            } else {
+                other(error)
+            }
+        };
+        match self {
+            Reversal::Move { from, to } => put(from, to)
+                .map(|()| None)
+                .map_err(|error| taken_or(to, error, Skip::Failed)),
+            Reversal::Trash(path) => trash(path).map_err(Skip::Failed),
+            Reversal::PutBack { from, to } => put(from, to).map(|()| None).map_err(|error| {
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    Skip::Taken(to.clone())
+                } else {
+                    Skip::StillInTrash {
+                        belongs: to.clone(),
+                        error,
+                    }
+                }
+            }),
+            Reversal::Exchange { path, from } => {
+                let gone = trash(path).map_err(Skip::Failed)?;
+                let Err(error) = put(from, path) else {
+                    return Ok(gone);
+                };
+                // What gave way comes back, when the Trash said where it is.
+                let back = gone.as_deref().is_some_and(|gone| put(gone, path).is_ok());
+                Err(if back {
+                    Skip::StillInTrash {
+                        belongs: path.clone(),
+                        error,
+                    }
+                } else {
+                    Skip::Failed(io::Error::new(
+                        error.kind(),
+                        format!(
+                            "{error}; it is in the Trash now, and so is the item that was to take its place"
+                        ),
+                    ))
+                })
+            }
+        }
+    }
+}
+
+impl Record {
+    /// The item, by the path a person knows it by: where the operation
+    /// left it, or where it was before it went to the Trash.
+    pub fn shown(&self) -> &Path {
+        self.result
+            .as_deref()
+            .or(self.source.as_deref())
+            .unwrap_or(Path::new(""))
+    }
+
+    /// What taking the operation back would do, looked up now and without
+    /// touching anything: a new item or a copy goes to the Trash, a
+    /// renamed or moved one back to where it was, a trashed one out of the
+    /// Trash again, and a copy that replaced an item gives the place back
+    /// to it. Refused when what the operation left is gone or has become
+    /// another kind of thing, and when the place something would go back
+    /// to is taken.
+    pub fn undo(&self) -> Result<Reversal, Skip> {
+        let at = |path: &Option<PathBuf>| path.clone().ok_or(Skip::Gone);
+        match self.kind {
+            OpKind::NewFile | OpKind::NewFolder | OpKind::Copy | OpKind::Duplicate => {
+                let made = at(&self.result)?;
+                still(&made, self.item, false)?;
+                Ok(Reversal::Trash(made))
+            }
+            OpKind::Rename | OpKind::Move => {
+                let (from, to) = (at(&self.result)?, at(&self.source)?);
+                still(&from, self.item, false)?;
+                free_for(&to, &from)?;
+                Ok(Reversal::Move { from, to })
+            }
+            OpKind::Trash => {
+                let to = at(&self.source)?;
+                let from = self.trashed.clone().ok_or(Skip::Unplaced)?;
+                still(&from, self.item, true)?;
+                free_for(&to, &from)?;
+                Ok(Reversal::PutBack { from, to })
+            }
+            OpKind::Replace => {
+                let path = at(&self.result)?;
+                let from = self.trashed.clone().ok_or(Skip::Unplaced)?;
+                still(&path, self.item, false)?;
+                still(&from, self.replaced, true)?;
+                Ok(Reversal::Exchange { path, from })
+            }
+        }
+    }
+}
+
+/// An operation taken back, with what it takes to do it again.
+#[derive(Debug)]
+pub struct Undone {
+    pub record: Record,
+    /// Where taking it back put what the operation had made, in the
+    /// Trash, when the Trash said.
+    pub aside: Option<PathBuf>,
+}
+
+impl Undone {
+    /// What doing the operation again would do, looked up now and without
+    /// touching anything, under the checks of [`Record::undo`]. What went
+    /// to the Trash when it was taken back comes out of it again, with
+    /// whatever is in it, instead of being made or copied a second time.
+    pub fn redo(&self) -> Result<Reversal, Skip> {
+        let record = &self.record;
+        let at = |path: &Option<PathBuf>| path.clone().ok_or(Skip::Gone);
+        match record.kind {
+            OpKind::NewFile | OpKind::NewFolder | OpKind::Copy | OpKind::Duplicate => {
+                let to = at(&record.result)?;
+                let from = self.aside.clone().ok_or(Skip::Unplaced)?;
+                still(&from, record.item, true)?;
+                free_for(&to, &from)?;
+                Ok(Reversal::PutBack { from, to })
+            }
+            OpKind::Rename | OpKind::Move => {
+                let (from, to) = (at(&record.source)?, at(&record.result)?);
+                still(&from, record.item, false)?;
+                free_for(&to, &from)?;
+                Ok(Reversal::Move { from, to })
+            }
+            OpKind::Trash => {
+                let path = at(&record.source)?;
+                still(&path, record.item, false)?;
+                Ok(Reversal::Trash(path))
+            }
+            OpKind::Replace => {
+                let path = at(&record.result)?;
+                let from = self.aside.clone().ok_or(Skip::Unplaced)?;
+                still(&path, record.replaced, false)?;
+                still(&from, record.item, true)?;
+                Ok(Reversal::Exchange { path, from })
+            }
+        }
+    }
+}
+
+/// An item a step left as it is, and why.
+#[derive(Debug)]
+pub struct Skipped {
+    /// The item, by the path a person knows it by.
+    pub item: PathBuf,
+    pub why: Skip,
+}
+
+/// What carries a [`Reversal`] out: [`Reversal::apply`], and whatever else
+/// has to follow an item that moves.
+pub type Apply<'a> = &'a mut dyn FnMut(&Reversal) -> Result<Option<PathBuf>, Skip>;
+
+/// Takes back the operations of one step, the last one first, each as
+/// [`Record::undo`] says and `apply` carries out. An operation that cannot
+/// be taken back is skipped, and the others still are. Answers what was
+/// taken back, in the order it was, and what was skipped.
+pub fn undo_step(records: Vec<Record>, apply: Apply<'_>) -> (Vec<Undone>, Vec<Skipped>) {
+    let mut undone = Vec::new();
+    let mut skipped = Vec::new();
+    for record in records.into_iter().rev() {
+        match record.undo().and_then(|reversal| apply(&reversal)) {
+            Ok(aside) => undone.push(Undone { record, aside }),
+            Err(why) => skipped.push(Skipped {
+                item: record.shown().to_path_buf(),
+                why,
+            }),
+        }
+    }
+    (undone, skipped)
+}
+
+/// Does the operations of a step that was taken back again, in the order
+/// they were first done, each as [`Undone::redo`] says and `apply` carries
+/// out. Answers the records of what was done again, as [`perform`] would
+/// have, and what was skipped.
+pub fn redo_step(undone: Vec<Undone>, apply: Apply<'_>) -> (Vec<Record>, Vec<Skipped>) {
+    let mut records = Vec::new();
+    let mut skipped = Vec::new();
+    for taken_back in undone.into_iter().rev() {
+        match taken_back.redo().and_then(|reversal| apply(&reversal)) {
+            Ok(trashed) => {
+                let mut record = taken_back.record;
+                // Where the Trash put the item this time.
+                if matches!(record.kind, OpKind::Trash | OpKind::Replace) {
+                    record.trashed = trashed;
+                }
+                records.push(record);
+            }
+            Err(why) => skipped.push(Skipped {
+                item: taken_back.record.shown().to_path_buf(),
+                why,
+            }),
+        }
+    }
+    (records, skipped)
+}
+
+/// How many steps are kept to be taken back.
+pub const STEPS_KEPT: usize = 100;
+
+/// What was done to the files of a project, to be taken back and done
+/// again. A step is one thing a person did, with every operation it came
+/// to: a paste of five items is one step, and one undo.
+#[derive(Debug, Default)]
+pub struct Steps {
+    /// The steps done, oldest first, each under the number it was begun
+    /// with.
+    done: VecDeque<(u64, Vec<Record>)>,
+    /// The steps taken back, the last one taken back last.
+    undone: Vec<Vec<Undone>>,
+    next: u64,
+}
+
+impl Steps {
+    /// A new step: the number its operations are kept under.
+    pub fn begin(&mut self) -> u64 {
+        self.next += 1;
+        self.next
+    }
+
+    /// Keeps `record` as one of the operations of `step`, the oldest step
+    /// making room for a new one. What was taken back can no longer be
+    /// done again: the files have moved on.
+    pub fn keep(&mut self, step: u64, record: Record) {
+        self.undone.clear();
+        if let Some((_, records)) = self.done.iter_mut().rev().find(|(id, _)| *id == step) {
+            records.push(record);
+            return;
+        }
+        self.push(step, vec![record]);
+    }
+
+    fn push(&mut self, step: u64, records: Vec<Record>) {
+        if self.done.len() == STEPS_KEPT {
+            self.done.pop_front();
+        }
+        self.done.push_back((step, records));
+    }
+
+    /// How many steps can be taken back.
+    pub fn len(&self) -> usize {
+        self.done.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.done.is_empty()
+    }
+
+    /// Every operation that can be taken back, oldest first.
+    pub fn records(&self) -> impl Iterator<Item = &Record> {
+        self.done.iter().flat_map(|(_, records)| records)
+    }
+
+    /// The step an undo would take back.
+    pub fn last(&self) -> Option<&[Record]> {
+        self.done.back().map(|(_, records)| records.as_slice())
+    }
+
+    /// The step a redo would do again.
+    pub fn last_undone(&self) -> Option<&[Undone]> {
+        self.undone.last().map(Vec::as_slice)
+    }
+
+    /// Takes the last step off, to be taken back.
+    pub fn take_last(&mut self) -> Option<Vec<Record>> {
+        self.done.pop_back().map(|(_, records)| records)
+    }
+
+    /// Takes the step last taken back off, to be done again.
+    pub fn take_undone(&mut self) -> Option<Vec<Undone>> {
+        self.undone.pop()
+    }
+
+    /// A step was taken back, and can be done again. One of which nothing
+    /// could be taken back is not kept: it would only be in the way of
+    /// the steps before it.
+    pub fn took_back(&mut self, undone: Vec<Undone>) {
+        if !undone.is_empty() {
+            self.undone.push(undone);
+        }
+    }
+
+    /// A step was done again, and can be taken back as it could the first
+    /// time. The other steps taken back stay so: nothing new was done.
+    pub fn did_again(&mut self, records: Vec<Record>) {
+        if !records.is_empty() {
+            let step = self.begin();
+            self.push(step, records);
+        }
+    }
+
+    /// Forgets every step: the project is another one.
+    pub fn clear(&mut self) {
+        self.done.clear();
+        self.undone.clear();
     }
 }
 
@@ -2022,5 +2687,984 @@ mod tests {
         // A plan touches nothing.
         assert_eq!(names(&trips), ["lisbon.md", "soup.md"]);
         assert_eq!(names(&recipes), ["baking", "bread.md", "soup.md"]);
+    }
+
+    fn replace_at(from: &Path, to: &Path) -> Planned {
+        Planned::Replace {
+            from: from.to_path_buf(),
+            to: to.to_path_buf(),
+        }
+    }
+
+    /// Files dragged in from another app, onto a folder of the project
+    /// where some of their names are in use: what the one question is
+    /// about, and what each answer to it does.
+    #[test]
+    fn a_drop_from_outside_is_planned_as_the_question_was_answered() {
+        let tree = TempTree::new(
+            "fileops-plan-outside",
+            &[
+                ("desk/soup.md", "pumpkin"),
+                ("desk/plots.txt", "beans by the wall"),
+                ("desk/lisbon.md", "a second visit"),
+                ("desk/later/soup.md", "miso"),
+                ("project/trips/lisbon.md", "tram 28"),
+                ("project/trips/soup.md", "a bowl in alfama"),
+                ("project/trips/soup-copy.md", "another bowl"),
+                ("project/garden.txt", "tomatoes"),
+            ],
+        );
+        let dir = tree.0.as_path();
+        let (desk, project) = (dir.join("desk"), dir.join("project"));
+        let trips = project.join("trips");
+        let (soup, plots) = (desk.join("soup.md"), desk.join("plots.txt"));
+        let lisbon = desk.join("lisbon.md");
+        let check = |paths: &[&Path], onto: &Path| {
+            let mut check = DropCheck::new(paths.iter().map(|p| p.to_path_buf()).collect());
+            check.aim(Some(onto));
+            check
+        };
+
+        // No name in use where it lands: nothing to ask, and either answer
+        // plans the same copy.
+        let free = check(&[&plots, &soup], &project);
+        assert!(free.allowed(false));
+        assert_eq!(free.taken_there(), [] as [&Path; 0]);
+        for answer in [OnTaken::Replace, OnTaken::KeepBoth] {
+            assert_eq!(
+                free.plan_from_outside(answer),
+                [
+                    copy_to(&plots, &project.join("plots.txt")),
+                    copy_to(&soup, &project.join("soup.md")),
+                ]
+            );
+        }
+
+        // Two of three names are in use: the question is about those two.
+        let clash = check(&[&soup, &plots, &lisbon], &trips);
+        assert_eq!(clash.taken_there(), [soup.as_path(), lisbon.as_path()]);
+        // Replace: each takes the name, in place of what has it.
+        assert_eq!(
+            clash.plan_from_outside(OnTaken::Replace),
+            [
+                replace_at(&soup, &trips.join("soup.md")),
+                copy_to(&plots, &trips.join("plots.txt")),
+                replace_at(&lisbon, &trips.join("lisbon.md")),
+            ]
+        );
+        // Keep Both: the next free `-copy` name, past one already there.
+        assert_eq!(
+            clash.plan_from_outside(OnTaken::KeepBoth),
+            [
+                copy_to(&soup, &trips.join("soup-copy-2.md")),
+                copy_to(&plots, &trips.join("plots.txt")),
+                copy_to(&lisbon, &trips.join("lisbon-copy.md")),
+            ]
+        );
+
+        // Two items of one name in one drop: only what was there before is
+        // replaced, and the second is kept beside the first.
+        let later = desk.join("later/soup.md");
+        let twice = check(&[&soup, &later], &trips);
+        assert_eq!(
+            twice.plan_from_outside(OnTaken::Replace),
+            [
+                replace_at(&soup, &trips.join("soup.md")),
+                copy_to(&later, &trips.join("soup-copy-2.md")),
+            ]
+        );
+        let twice_free = check(&[&soup, &later], &project);
+        assert_eq!(twice_free.taken_there(), [] as [&Path; 0]);
+        assert_eq!(
+            twice_free.plan_from_outside(OnTaken::Replace),
+            [
+                copy_to(&soup, &project.join("soup.md")),
+                copy_to(&later, &project.join("soup-copy.md")),
+            ]
+        );
+
+        // Onto the folder it is in already: nothing lights up, nothing is
+        // asked and nothing is planned, though its own name is in use
+        // there. Beside one that can go, it stays.
+        let garden = project.join("garden.txt");
+        let own = check(&[&garden], &project);
+        assert!(!own.allowed(false));
+        assert_eq!(own.taken_there(), [] as [&Path; 0]);
+        for answer in [OnTaken::Replace, OnTaken::KeepBoth] {
+            assert_eq!(
+                own.plan_from_outside(answer),
+                [Planned::Stays(garden.clone())]
+            );
+        }
+        let mixed = check(&[&garden, &plots], &project);
+        assert!(mixed.allowed(false));
+        assert_eq!(
+            mixed.plan_from_outside(OnTaken::KeepBoth),
+            [
+                Planned::Stays(garden.clone()),
+                copy_to(&plots, &project.join("plots.txt")),
+            ]
+        );
+
+        // A folder into itself or its own subtree: refused, and what came
+        // with it still goes.
+        let into = check(&[&project, &plots], &trips);
+        assert!(into.allowed(false));
+        assert_eq!(into.taken_there(), [] as [&Path; 0]);
+        assert_eq!(
+            into.plan_from_outside(OnTaken::Replace),
+            [
+                refused(&project, Refusal::IntoItself),
+                copy_to(&plots, &trips.join("plots.txt")),
+            ]
+        );
+        let alone = check(&[&project], &trips);
+        assert!(!alone.allowed(false));
+        assert!(!check(&[&trips], &trips).allowed(false), "onto itself");
+
+        // An item that would replace the folder it is in: the Trash would
+        // take it along. Kept beside it, it is a copy like any other.
+        fs::create_dir(trips.join("trips")).unwrap();
+        let nested = trips.join("trips");
+        let inside = check(&[&nested], &project);
+        assert_eq!(inside.taken_there(), [nested.as_path()]);
+        assert_eq!(
+            inside.plan_from_outside(OnTaken::Replace),
+            [refused(&nested, Refusal::InsideReplaced)]
+        );
+        assert_eq!(
+            inside.plan_from_outside(OnTaken::KeepBoth),
+            [copy_to(&nested, &project.join("trips-copy"))]
+        );
+        assert_eq!(
+            Refusal::InsideReplaced.said(),
+            "is inside the item it would replace"
+        );
+
+        // Gone since the drag began: not asked about, and skipped.
+        let gone = check(&[&soup, &plots], &trips);
+        fs::remove_file(&soup).unwrap();
+        assert_eq!(gone.taken_there(), [] as [&Path; 0]);
+        assert_eq!(
+            gone.plan_from_outside(OnTaken::Replace),
+            [
+                refused(&soup, Refusal::Missing),
+                copy_to(&plots, &trips.join("plots.txt")),
+            ]
+        );
+        // Over nothing, nothing is planned.
+        let mut nowhere = DropCheck::new(vec![plots.clone()]);
+        nowhere.aim(None);
+        assert_eq!(nowhere.taken_there(), [] as [&Path; 0]);
+        assert_eq!(nowhere.plan_from_outside(OnTaken::Replace), []);
+
+        // A plan touches nothing.
+        assert_eq!(
+            names(&trips),
+            ["lisbon.md", "soup-copy.md", "soup.md", "trips"]
+        );
+        assert_eq!(
+            fs::read_to_string(trips.join("soup.md")).unwrap(),
+            "a bowl in alfama"
+        );
+    }
+
+    /// Replace: the copy takes the name, and what had it is in the Trash,
+    /// where the record says. Never written over, and not trashed before
+    /// the copy is whole.
+    #[test]
+    fn a_copy_that_replaces_keeps_where_the_trash_put_what_was_there() {
+        let tree = TempTree::new(
+            "fileops-replace",
+            &[
+                ("desk/soup.md", "pumpkin"),
+                ("desk/recipes/bread.md", "rye"),
+                ("desk/recipes/baking/scones.md", "butter"),
+                ("project/soup.md", "leeks"),
+                ("project/recipes/bread.md", "white"),
+                ("project/recipes/old.md", "kept until now"),
+                ("bin/", ""),
+            ],
+        );
+        let dir = tree.0.as_path();
+        let at = |path: &str| dir.join(path);
+        let bin = at("bin");
+        let trashed = std::cell::Cell::new(0);
+        // A folder of the fixture stands in for the Trash.
+        let trash = |path: &Path| -> io::Result<Option<PathBuf>> {
+            trashed.set(trashed.get() + 1);
+            let landed = bin.join(path.file_name().unwrap());
+            fs::rename(path, &landed)?;
+            Ok(Some(landed))
+        };
+        let env = Env {
+            trash: &trash,
+            stop: &|| false,
+        };
+
+        // A file: the new text under the name, the old one in the Trash.
+        let (from, to) = (at("desk/soup.md"), at("project/soup.md"));
+        let record = perform(
+            Op::Replace {
+                from: &from,
+                to: &to,
+            },
+            &env,
+        )
+        .unwrap();
+        assert_eq!(record.kind, OpKind::Replace);
+        assert_eq!(record.source, Some(from.clone()));
+        assert_eq!(record.result, Some(to.clone()));
+        assert_eq!(record.trashed, Some(at("bin/soup.md")));
+        assert_eq!(fs::read_to_string(&to).unwrap(), "pumpkin");
+        assert_eq!(fs::read_to_string(at("bin/soup.md")).unwrap(), "leeks");
+        assert_eq!(fs::read_to_string(&from).unwrap(), "pumpkin", "a copy");
+
+        // A folder: the whole of the old one goes, nothing is merged.
+        let (from, to) = (at("desk/recipes"), at("project/recipes"));
+        let record = perform_free(
+            Op::Replace {
+                from: &from,
+                to: &to,
+            },
+            &env,
+        )
+        .unwrap();
+        assert_eq!(record.kind, OpKind::Replace);
+        assert_eq!(record.trashed, Some(at("bin/recipes")));
+        assert_eq!(names(&to), ["baking", "bread.md"]);
+        assert_eq!(fs::read_to_string(to.join("bread.md")).unwrap(), "rye");
+        assert_eq!(names(&at("bin/recipes")), ["bread.md", "old.md"]);
+        assert_eq!(names(&at("project")), ["recipes", "soup.md"]);
+
+        // Nothing there any more: a copy like any other, and nothing trashed.
+        let before = trashed.get();
+        let (from, to) = (at("desk/soup.md"), at("project/stew.md"));
+        let record = perform(
+            Op::Replace {
+                from: &from,
+                to: &to,
+            },
+            &env,
+        )
+        .unwrap();
+        assert_eq!(record.kind, OpKind::Copy);
+        assert_eq!(record.trashed, None);
+        assert_eq!(trashed.get(), before);
+
+        // Stopped while the copy is built: what was there has not moved.
+        let stopped = Env {
+            trash: &trash,
+            stop: &|| true,
+        };
+        let (from, to) = (at("desk/recipes"), at("project/recipes"));
+        let error = perform(
+            Op::Replace {
+                from: &from,
+                to: &to,
+            },
+            &stopped,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(trashed.get(), before);
+        assert_eq!(names(&to), ["baking", "bread.md"]);
+        assert_eq!(names(&at("project")), ["recipes", "soup.md", "stew.md"]);
+
+        // The Trash refuses: the copy is given up, and what was there stays.
+        let refusing = Env {
+            trash: &|_| Err(io::ErrorKind::PermissionDenied.into()),
+            stop: &|| false,
+        };
+        let (from, to) = (at("desk/soup.md"), at("project/soup.md"));
+        let error = perform(
+            Op::Replace {
+                from: &from,
+                to: &to,
+            },
+            &refusing,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(fs::read_to_string(&to).unwrap(), "pumpkin");
+        assert_eq!(names(&at("project")), ["recipes", "soup.md", "stew.md"]);
+
+        // An item in place of itself, or of a folder it is in: refused
+        // before anything is copied or trashed.
+        for (from, to) in [
+            (at("project/soup.md"), at("project/soup.md")),
+            (at("project/recipes/baking"), at("project/recipes")),
+        ] {
+            let error = perform(
+                Op::Replace {
+                    from: &from,
+                    to: &to,
+                },
+                &env,
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{from:?}");
+        }
+        assert_eq!(trashed.get(), before);
+        assert!(at("project/recipes/baking/scones.md").exists());
+
+        // The name is taken again between the Trash and the copy landing:
+        // nothing is written over, and the failure says where the old
+        // item is when it could not be put back.
+        let raced = Env {
+            trash: &|path| {
+                let landed = bin.join("raced.md");
+                fs::rename(path, &landed)?;
+                fs::write(path, "someone else's")?;
+                Ok(Some(landed))
+            },
+            stop: &|| false,
+        };
+        let error = perform(
+            Op::Replace {
+                from: &at("desk/soup.md"),
+                to: &at("project/stew.md"),
+            },
+            &raced,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(error.to_string().contains("is in the Trash"), "{error}");
+        assert_eq!(
+            fs::read_to_string(at("project/stew.md")).unwrap(),
+            "someone else's"
+        );
+        assert_eq!(fs::read_to_string(at("bin/raced.md")).unwrap(), "pumpkin");
+        // No staging folder is left by any of it.
+        assert_eq!(names(&at("project")), ["recipes", "soup.md", "stew.md"]);
+    }
+
+    /// A Trash for a test: the folder `bin` of the fixture, where an item
+    /// takes the next free name, as the Trash renames what would clash.
+    fn trash_into(bin: &Path) -> impl Fn(&Path) -> io::Result<Option<PathBuf>> + '_ {
+        move |path: &Path| {
+            let folder = fs::symlink_metadata(path)?.is_dir();
+            let landed = bin.join(free_name(bin, path.file_name().unwrap(), folder));
+            fs::rename(path, &landed)?;
+            Ok(Some(landed))
+        }
+    }
+
+    /// Takes `record` back through `trash`, as a step of one.
+    fn take_back(record: Record, trash: ToTrash<'_>) -> Result<Undone, Skip> {
+        let (mut undone, mut skipped) = undo_step(vec![record], &mut |one| one.apply(trash));
+        match skipped.pop() {
+            Some(skipped) => Err(skipped.why),
+            None => Ok(undone.pop().unwrap()),
+        }
+    }
+
+    /// Does `undone` again through `trash`, as a step of one.
+    fn do_again(undone: Undone, trash: ToTrash<'_>) -> Result<Record, Skip> {
+        let (mut records, mut skipped) = redo_step(vec![undone], &mut |one| one.apply(trash));
+        match skipped.pop() {
+            Some(skipped) => Err(skipped.why),
+            None => Ok(records.pop().unwrap()),
+        }
+    }
+
+    /// Every operation has its inverse, and the inverse its own: taken
+    /// back and done again the files are as the operation left them, and
+    /// nothing was deleted or written over on the way. What an undo sends
+    /// to the Trash comes back out of it with whatever was put in it.
+    #[test]
+    fn every_operation_is_taken_back_and_done_again() {
+        let tree = TempTree::new(
+            "fileops-undo",
+            &[
+                ("project/soup.md", "leeks"),
+                ("project/bread.md", "flour"),
+                ("project/recipes/", ""),
+                ("desk/soup.md", "pumpkin"),
+                ("bin/", ""),
+            ],
+        );
+        let dir = tree.0.as_path();
+        let at = |path: &str| dir.join(path);
+        let bin = at("bin");
+        let trash = trash_into(&bin);
+        let env = Env {
+            trash: &trash,
+            stop: &|| false,
+        };
+        let read = |path: &str| fs::read_to_string(at(path)).unwrap();
+
+        // A new file: to the Trash, never deleted, and back with what was
+        // written in it meanwhile.
+        let made = perform(Op::NewFile(&at("project/plots.md")), &env).unwrap();
+        assert_eq!(made.item, Some(ItemKind::File));
+        fs::write(at("project/plots.md"), "beans").unwrap();
+        let undone = take_back(made, &trash).unwrap();
+        assert_eq!(undone.aside, Some(at("bin/plots.md")));
+        assert!(!at("project/plots.md").exists());
+        assert_eq!(read("bin/plots.md"), "beans");
+        let made = do_again(undone, &trash).unwrap();
+        assert_eq!(made.kind, OpKind::NewFile);
+        assert_eq!(read("project/plots.md"), "beans");
+        assert_eq!(names(&bin), [] as [&str; 0]);
+
+        // A new folder, with what was put in it since.
+        let made = perform(Op::NewFolder(&at("project/trips")), &env).unwrap();
+        assert_eq!(made.item, Some(ItemKind::Folder));
+        fs::write(at("project/trips/lisbon.md"), "tram 28").unwrap();
+        let undone = take_back(made, &trash).unwrap();
+        assert!(!at("project/trips").exists());
+        assert_eq!(read("bin/trips/lisbon.md"), "tram 28");
+        do_again(undone, &trash).unwrap();
+        assert_eq!(read("project/trips/lisbon.md"), "tram 28");
+        assert_eq!(names(&bin), [] as [&str; 0]);
+
+        // A rename and a move: back to where the item was, and there again.
+        for (kind, from, to) in [
+            (OpKind::Rename, "project/soup.md", "project/stew.md"),
+            (OpKind::Move, "project/stew.md", "project/recipes/stew.md"),
+        ] {
+            let (source, result) = (at(from), at(to));
+            let op = match kind {
+                OpKind::Rename => Op::Rename {
+                    from: &source,
+                    to: &result,
+                },
+                _ => Op::Move {
+                    from: &source,
+                    to: &result,
+                },
+            };
+            let moved = perform(op, &env).unwrap();
+            let undone = take_back(moved, &trash).unwrap();
+            assert_eq!(undone.aside, None);
+            assert_eq!(read(from), "leeks");
+            assert!(!result.exists(), "{to}");
+            let moved = do_again(undone, &trash).unwrap();
+            assert_eq!(moved.kind, kind);
+            assert_eq!(read(to), "leeks");
+            assert!(!source.exists(), "{from}");
+        }
+
+        // A copy and a duplicate: the copy goes to the Trash, the original
+        // is never touched, and the same copy comes back.
+        for (kind, from, to) in [
+            (OpKind::Copy, "desk/soup.md", "project/soup.md"),
+            (
+                OpKind::Duplicate,
+                "project/bread.md",
+                "project/bread-copy.md",
+            ),
+        ] {
+            let (source, result) = (at(from), at(to));
+            let op = match kind {
+                OpKind::Copy => Op::Copy {
+                    from: &source,
+                    to: &result,
+                },
+                _ => Op::Duplicate {
+                    from: &source,
+                    to: &result,
+                },
+            };
+            let original = read(from);
+            let copied = perform(op, &env).unwrap();
+            fs::write(&result, "edited since").unwrap();
+            let undone = take_back(copied, &trash).unwrap();
+            assert!(!result.exists(), "{to}");
+            assert_eq!(read(from), original);
+            let copied = do_again(undone, &trash).unwrap();
+            assert_eq!(copied.kind, kind);
+            assert_eq!(read(to), "edited since");
+            assert_eq!(read(from), original);
+            assert_eq!(names(&bin), [] as [&str; 0]);
+        }
+
+        // Moved to the Trash: put back from where the Trash put it, and
+        // moved there again, wherever the Trash puts it this time.
+        let trashed = perform(Op::Trash(&at("project/bread.md")), &env).unwrap();
+        assert_eq!(trashed.item, Some(ItemKind::File));
+        assert_eq!(trashed.trashed, Some(at("bin/bread.md")));
+        let undone = take_back(trashed, &trash).unwrap();
+        assert_eq!(read("project/bread.md"), "flour");
+        assert_eq!(names(&bin), [] as [&str; 0]);
+        fs::write(at("bin/bread.md"), "someone else's").unwrap();
+        let trashed = do_again(undone, &trash).unwrap();
+        assert_eq!(trashed.trashed, Some(at("bin/bread-copy.md")));
+        assert!(!at("project/bread.md").exists());
+        assert_eq!(read("bin/bread-copy.md"), "flour");
+        take_back(trashed, &trash).unwrap();
+        assert_eq!(read("project/bread.md"), "flour");
+        fs::remove_file(at("bin/bread.md")).unwrap();
+
+        // A copy that replaced an item: the copy goes to the Trash and
+        // the item comes back from it, then the other way round again.
+        fs::write(at("project/soup.md"), "leeks").unwrap();
+        let (from, to) = (at("desk/soup.md"), at("project/soup.md"));
+        let replaced = perform(
+            Op::Replace {
+                from: &from,
+                to: &to,
+            },
+            &env,
+        )
+        .unwrap();
+        assert_eq!(replaced.kind, OpKind::Replace);
+        assert_eq!(replaced.replaced, Some(ItemKind::File));
+        assert_eq!(read("project/soup.md"), "pumpkin");
+        assert_eq!(read("bin/soup.md"), "leeks");
+        let undone = take_back(replaced, &trash).unwrap();
+        assert_eq!(read("project/soup.md"), "leeks");
+        let aside = undone.aside.clone().unwrap();
+        assert_eq!(fs::read_to_string(&aside).unwrap(), "pumpkin");
+        assert_eq!(names(&bin).len(), 1);
+        let replaced = do_again(undone, &trash).unwrap();
+        assert_eq!(read("project/soup.md"), "pumpkin");
+        let old = replaced.trashed.clone().unwrap();
+        assert_eq!(fs::read_to_string(&old).unwrap(), "leeks");
+        assert_eq!(names(&bin).len(), 1);
+        // And taken back once more, from where the Trash put it this time.
+        take_back(replaced, &trash).unwrap();
+        assert_eq!(read("project/soup.md"), "leeks");
+        assert_eq!(read("desk/soup.md"), "pumpkin", "the original of the copy");
+    }
+
+    /// An undo looks before it acts: what the operation left must still
+    /// be there and be the same kind of thing, and the place an item goes
+    /// back to must be free. Otherwise nothing is touched, and the reason
+    /// says which it was.
+    #[test]
+    fn what_no_longer_matches_is_left_alone_and_nothing_is_written_over() {
+        let tree = TempTree::new(
+            "fileops-undo-refused",
+            &[
+                ("soup.md", "leeks"),
+                ("bread.md", "flour"),
+                ("plots.md", "beans"),
+                ("old.md", "last year"),
+                ("recipes/", ""),
+                ("bin/", ""),
+            ],
+        );
+        let dir = tree.0.as_path();
+        let at = |path: &str| dir.join(path);
+        let bin = at("bin");
+        let trash = trash_into(&bin);
+        let env = Env {
+            trash: &trash,
+            stop: &|| false,
+        };
+        let read = |path: &str| fs::read_to_string(at(path)).unwrap();
+        let rename = |from: &str, to: &str| {
+            perform(
+                Op::Rename {
+                    from: &at(from),
+                    to: &at(to),
+                },
+                &env,
+            )
+            .unwrap()
+        };
+
+        // The place is taken: neither file is touched.
+        let renamed = rename("soup.md", "stew.md");
+        fs::write(at("soup.md"), "another soup").unwrap();
+        let why = renamed.undo().unwrap_err();
+        assert!(
+            matches!(&why, Skip::Taken(by) if *by == at("soup.md")),
+            "{why:?}"
+        );
+        assert_eq!(
+            why.said("stew.md"),
+            "stew.md was left alone: an item named soup.md is in the way"
+        );
+        assert!(matches!(take_back(renamed, &trash), Err(Skip::Taken(_))));
+        assert_eq!(read("soup.md"), "another soup");
+        assert_eq!(read("stew.md"), "leeks");
+        // By a dangling link as well.
+        let renamed = rename("bread.md", "rye.md");
+        symlink("missing-target", at("bread.md")).unwrap();
+        assert!(matches!(renamed.undo(), Err(Skip::Taken(_))));
+        fs::remove_file(at("bread.md")).unwrap();
+        // Taken between the look and the move: the move itself refuses.
+        let back = renamed.undo().unwrap();
+        fs::write(at("bread.md"), "late").unwrap();
+        assert!(matches!(back.apply(&trash), Err(Skip::Taken(_))));
+        assert_eq!(read("bread.md"), "late");
+        assert_eq!(read("rye.md"), "flour");
+        fs::remove_file(at("bread.md")).unwrap();
+
+        // The item is gone.
+        fs::remove_file(at("rye.md")).unwrap();
+        let why = renamed.undo().unwrap_err();
+        assert!(matches!(why, Skip::Gone), "{why:?}");
+        assert_eq!(why.said("rye.md"), "rye.md is no longer there");
+        // Or has become another kind of thing: a folder where the file was.
+        fs::create_dir(at("rye.md")).unwrap();
+        let why = renamed.undo().unwrap_err();
+        assert!(matches!(why, Skip::Changed), "{why:?}");
+        assert_eq!(
+            why.said("rye.md"),
+            "rye.md is no longer the same kind of item"
+        );
+        assert!(matches!(take_back(renamed, &trash), Err(Skip::Changed)));
+        assert!(at("rye.md").is_dir());
+        // A link where a file was made is not that file either.
+        let made = perform(Op::NewFile(&at("notes.md")), &env).unwrap();
+        fs::remove_file(at("notes.md")).unwrap();
+        symlink("plots.md", at("notes.md")).unwrap();
+        assert!(matches!(made.undo(), Err(Skip::Changed)));
+        fs::remove_file(at("notes.md")).unwrap();
+        assert!(matches!(take_back(made, &trash), Err(Skip::Gone)));
+        assert_eq!(names(&bin), [] as [&str; 0], "nothing went to the Trash");
+
+        // Out of the Trash: gone from it, another kind of thing there, the
+        // place taken, and a Trash that never said where the item went.
+        let trashed = perform(Op::Trash(&at("plots.md")), &env).unwrap();
+        fs::write(at("plots.md"), "peas").unwrap();
+        assert!(matches!(trashed.undo(), Err(Skip::Taken(_))));
+        fs::remove_file(at("plots.md")).unwrap();
+        fs::rename(at("bin/plots.md"), at("bin/elsewhere.md")).unwrap();
+        let why = trashed.undo().unwrap_err();
+        assert!(matches!(why, Skip::GoneFromTrash), "{why:?}");
+        assert_eq!(why.said("plots.md"), "plots.md is no longer in the Trash");
+        fs::create_dir(at("bin/plots.md")).unwrap();
+        assert!(matches!(trashed.undo(), Err(Skip::Changed)));
+        assert!(!at("plots.md").exists());
+        let silent = Env {
+            trash: &|path| fs::remove_file(path).map(|()| None),
+            stop: &|| false,
+        };
+        let trashed = perform(Op::Trash(&at("old.md")), &silent).unwrap();
+        let why = trashed.undo().unwrap_err();
+        assert!(matches!(why, Skip::Unplaced), "{why:?}");
+        assert_eq!(
+            why.said("old.md"),
+            "old.md is in the Trash, and the Trash did not say where"
+        );
+
+        // Doing again is checked the same way: the place the item would
+        // go to has been taken since it was taken back.
+        let renamed = rename("stew.md", "broth.md");
+        let undone = take_back(renamed, &trash).unwrap();
+        fs::write(at("broth.md"), "bones").unwrap();
+        assert!(matches!(undone.redo(), Err(Skip::Taken(_))));
+        fs::remove_file(at("broth.md")).unwrap();
+        fs::remove_file(at("stew.md")).unwrap();
+        assert!(matches!(do_again(undone, &trash), Err(Skip::Gone)));
+        // A copy taken back and then emptied out of the Trash cannot come
+        // back, and is not copied a second time behind anyone's back.
+        let copied = perform(
+            Op::Copy {
+                from: &at("soup.md"),
+                to: &at("recipes/soup.md"),
+            },
+            &env,
+        )
+        .unwrap();
+        let undone = take_back(copied, &trash).unwrap();
+        fs::remove_file(undone.aside.as_deref().unwrap()).unwrap();
+        assert!(matches!(undone.redo(), Err(Skip::GoneFromTrash)));
+        assert!(!at("recipes/soup.md").exists());
+    }
+
+    /// The Trash can refuse to give an item back. Then it is still in the
+    /// Trash, and the reason says so and where it belongs: nothing is
+    /// called done that was not. A copy that replaced an item stays where
+    /// it is when the item cannot come back to take its place.
+    #[test]
+    fn an_item_the_trash_does_not_give_back_is_said_to_be_still_there() {
+        let tree = TempTree::new(
+            "fileops-undo-stuck",
+            &[
+                ("recipes/soup.md", "pumpkin"),
+                ("locked/soup.md", "leeks"),
+                ("locked/old.md", "last year"),
+                ("bin/", ""),
+            ],
+        );
+        let dir = tree.0.as_path();
+        let at = |path: &str| dir.join(path);
+        let bin = at("bin");
+        let trash = trash_into(&bin);
+        // As the operations left them: old.md was moved to a Trash that
+        // lets nothing out, and soup.md replaced an item now in it.
+        let record = |kind, source: &str, result: Option<&str>, trashed: &str| Record {
+            kind,
+            source: Some(at(source)),
+            result: result.map(at),
+            trashed: Some(at(trashed)),
+            original_left: None,
+            item: Some(ItemKind::File),
+            replaced: Some(ItemKind::File),
+        };
+        let trashed = record(OpKind::Trash, "recipes/old.md", None, "locked/old.md");
+        let replaced = record(
+            OpKind::Replace,
+            "desk/soup.md",
+            Some("recipes/soup.md"),
+            "locked/soup.md",
+        );
+        chmod(&at("locked"), 0o555);
+        let put_back = take_back(trashed, &trash);
+        let exchanged = take_back(replaced, &trash);
+        // Writable again before anything is asserted, so the folder can be
+        // removed whatever happens.
+        chmod(&at("locked"), 0o755);
+
+        let why = put_back.unwrap_err();
+        assert!(
+            matches!(&why, Skip::StillInTrash { belongs, .. } if *belongs == at("recipes/old.md")),
+            "{why:?}"
+        );
+        let said = why.said("old.md");
+        assert!(
+            said.starts_with(&format!(
+                "old.md is still in the Trash and belongs in {}: ",
+                at("recipes").display()
+            )),
+            "{said}"
+        );
+        assert_eq!(
+            fs::read_to_string(at("locked/old.md")).unwrap(),
+            "last year"
+        );
+        assert!(!at("recipes/old.md").exists());
+
+        let why = exchanged.unwrap_err();
+        assert!(
+            matches!(&why, Skip::StillInTrash { belongs, .. } if *belongs == at("recipes/soup.md")),
+            "{why:?}"
+        );
+        // The copy is back where it was, and nothing of it is left in the
+        // Trash it went to for a moment.
+        assert_eq!(
+            fs::read_to_string(at("recipes/soup.md")).unwrap(),
+            "pumpkin"
+        );
+        assert_eq!(fs::read_to_string(at("locked/soup.md")).unwrap(), "leeks");
+        assert_eq!(names(&bin), [] as [&str; 0]);
+
+        // A Trash that refuses to take an item: it stays where it is.
+        let made = perform(Op::NewFile(&at("recipes/notes.md")), &plain()).unwrap();
+        let why = take_back(made, &|_| Err(io::ErrorKind::PermissionDenied.into())).unwrap_err();
+        assert!(matches!(why, Skip::Failed(_)), "{why:?}");
+        assert!(at("recipes/notes.md").exists());
+    }
+
+    /// The operations of one step are taken back last first, so that what
+    /// a later one did to the result of an earlier one is undone before
+    /// it. One that cannot be is skipped with its reason, and the others
+    /// still go. Done again they go first to last.
+    #[test]
+    fn a_step_is_taken_back_last_first_and_skips_what_it_cannot() {
+        let tree = TempTree::new(
+            "fileops-undo-step",
+            &[
+                ("bread.md", "flour"),
+                ("soup.md", "leeks"),
+                ("plots.md", "beans"),
+                ("bin/", ""),
+            ],
+        );
+        let dir = tree.0.as_path();
+        let at = |path: &str| dir.join(path);
+        let bin = at("bin");
+        let trash = trash_into(&bin);
+        let env = Env {
+            trash: &trash,
+            stop: &|| false,
+        };
+        // A folder made, and three files moved into it: the folder can
+        // only go once they are out of it again.
+        let mut records = vec![perform(Op::NewFolder(&at("recipes")), &env).unwrap()];
+        for name in ["bread.md", "soup.md", "plots.md"] {
+            let moved = perform(
+                Op::Move {
+                    from: &at(name),
+                    to: &at("recipes").join(name),
+                },
+                &env,
+            )
+            .unwrap();
+            records.push(moved);
+        }
+        // Something else has taken soup.md's place meanwhile.
+        fs::write(at("soup.md"), "another soup").unwrap();
+
+        let mut order = Vec::new();
+        let (undone, skipped) = undo_step(records, &mut |reversal| {
+            order.push(reversal.clone());
+            reversal.apply(&trash)
+        });
+        assert_eq!(
+            order,
+            [
+                Reversal::Move {
+                    from: at("recipes/plots.md"),
+                    to: at("plots.md"),
+                },
+                Reversal::Move {
+                    from: at("recipes/bread.md"),
+                    to: at("bread.md"),
+                },
+                Reversal::Trash(at("recipes")),
+            ]
+        );
+        let kinds: Vec<OpKind> = undone.iter().map(|undone| undone.record.kind).collect();
+        assert_eq!(kinds, [OpKind::Move, OpKind::Move, OpKind::NewFolder]);
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].item, at("recipes/soup.md"));
+        assert!(matches!(skipped[0].why, Skip::Taken(_)));
+        assert_eq!(names(dir), ["bin", "bread.md", "plots.md", "soup.md"]);
+        assert_eq!(fs::read_to_string(at("soup.md")).unwrap(), "another soup");
+        // The file that could not go back went to the Trash inside its
+        // folder, and was not deleted.
+        assert_eq!(
+            fs::read_to_string(at("bin/recipes/soup.md")).unwrap(),
+            "leeks"
+        );
+
+        // Done again in the order they were done: the folder first, then
+        // the files into it.
+        let mut order = Vec::new();
+        let (records, skipped) = redo_step(undone, &mut |reversal| {
+            order.push(reversal.lands().map(Path::to_path_buf));
+            reversal.apply(&trash)
+        });
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(
+            order,
+            [
+                Some(at("recipes")),
+                Some(at("recipes/bread.md")),
+                Some(at("recipes/plots.md")),
+            ]
+        );
+        let kinds: Vec<OpKind> = records.iter().map(|record| record.kind).collect();
+        assert_eq!(kinds, [OpKind::NewFolder, OpKind::Move, OpKind::Move]);
+        assert_eq!(names(&at("recipes")), ["bread.md", "plots.md", "soup.md"]);
+        assert_eq!(names(dir), ["bin", "recipes", "soup.md"]);
+    }
+
+    /// A rename that only changes the case of a name is taken back too:
+    /// on a volume that does not tell the two spellings apart, the old
+    /// name is not taken by anything but the item itself.
+    #[test]
+    fn a_change_of_case_is_taken_back() {
+        let tree = TempTree::new("fileops-undo-case", &[("bread.md", "flour")]);
+        let dir = tree.0.as_path();
+        let (from, to) = (dir.join("bread.md"), dir.join("Bread.md"));
+        let env = plain();
+        let renamed = perform(
+            Op::Rename {
+                from: &from,
+                to: &to,
+            },
+            &env,
+        )
+        .unwrap();
+        assert_eq!(names(dir), ["Bread.md"]);
+        let undone = take_back(renamed, env.trash).unwrap();
+        assert_eq!(names(dir), ["bread.md"]);
+        do_again(undone, env.trash).unwrap();
+        assert_eq!(names(dir), ["Bread.md"]);
+    }
+
+    /// The steps kept: one for each thing done, whatever it came to, the
+    /// oldest making room. Taking one back and doing it again are not
+    /// steps themselves, and anything new that is done ends what could be
+    /// done again.
+    #[test]
+    fn steps_are_kept_taken_back_and_done_again_until_something_new_is_done() {
+        let record = |name: &str| Record {
+            kind: OpKind::NewFile,
+            source: None,
+            result: Some(PathBuf::from(name)),
+            trashed: None,
+            original_left: None,
+            item: Some(ItemKind::File),
+            replaced: None,
+        };
+        let shown = |records: &[Record]| -> Vec<String> {
+            records
+                .iter()
+                .map(|record| record.shown().display().to_string())
+                .collect()
+        };
+        let mut steps = Steps::default();
+        assert!(steps.is_empty());
+        assert!(steps.last().is_none() && steps.last_undone().is_none());
+
+        // Three operations of one step, kept as they end, with a step of
+        // one operation done in between: still two steps.
+        let (paste, rename) = (steps.begin(), steps.begin());
+        steps.keep(paste, record("a"));
+        steps.keep(paste, record("b"));
+        steps.keep(rename, record("r"));
+        steps.keep(paste, record("c"));
+        assert_eq!(steps.len(), 2);
+        assert_eq!(shown(steps.last().unwrap()), ["r"]);
+        let all: Vec<&Record> = steps.records().collect();
+        assert_eq!(all.len(), 4);
+
+        // Taken back: off what was done, onto what can be done again.
+        let taken = steps.take_last().unwrap();
+        assert_eq!(shown(&taken), ["r"]);
+        let undone = |records: Vec<Record>| -> Vec<Undone> {
+            records
+                .into_iter()
+                .map(|record| Undone {
+                    record,
+                    aside: None,
+                })
+                .collect()
+        };
+        steps.took_back(undone(taken));
+        assert_eq!(steps.len(), 1);
+        assert_eq!(shown(steps.last().unwrap()), ["a", "b", "c"]);
+        assert_eq!(steps.last_undone().map(<[Undone]>::len), Some(1));
+        let taken = steps.take_last().unwrap();
+        steps.took_back(undone(taken));
+        assert!(steps.is_empty());
+
+        // Done again, the last one taken back first, and the other one
+        // can still be done again after it.
+        let again = steps.take_undone().unwrap();
+        assert_eq!(again.len(), 3);
+        steps.did_again(again.into_iter().map(|undone| undone.record).collect());
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps.last_undone().map(<[Undone]>::len), Some(1));
+
+        // Something new is done: nothing can be done again any more.
+        let step = steps.begin();
+        steps.keep(step, record("n"));
+        assert!(steps.last_undone().is_none());
+        assert!(steps.take_undone().is_none());
+        assert_eq!(steps.len(), 2);
+
+        // A step of which nothing was taken back is not kept to be done
+        // again, and it is gone from what can be taken back.
+        let _ = steps.take_last().unwrap();
+        steps.took_back(Vec::new());
+        assert!(steps.last_undone().is_none());
+        assert_eq!(steps.len(), 1);
+
+        // No more than a hundred steps: the oldest go.
+        for n in 0..STEPS_KEPT + 5 {
+            let step = steps.begin();
+            steps.keep(step, record(&format!("f{n}")));
+        }
+        assert_eq!(steps.len(), STEPS_KEPT);
+        assert_eq!(
+            steps
+                .records()
+                .next()
+                .map(|record| record.shown().to_path_buf()),
+            Some(PathBuf::from("f5"))
+        );
+
+        steps.clear();
+        assert!(steps.is_empty() && steps.last_undone().is_none());
     }
 }

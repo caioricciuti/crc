@@ -392,7 +392,17 @@ the size and write it back.
   version again, and Git > Clear History for This File or Clear All
   Local History deletes what was kept, after asking.
 - **Split panes** (`Cmd-\`), up to four, each with its own tabs.
-- **Explorer** in the sidebar: the project's files as a tree. Several
+- **Explorer** in the sidebar: the project's files as a tree. A changed
+  file's name takes the colour of its Git status, with a letter at the
+  row's right edge: `M` modified, `A` added, `U` untracked, `D` deleted,
+  `R` renamed, `C` in conflict. A folder with changes inside has a dot,
+  in the conflict's colour when it holds one, and ignored files are
+  dimmed. In a folder of several repositories the marks are for the one
+  Source Control shows. The name field of New File, New Folder and
+  Rename checks the name as you type and says what is wrong right under
+  itself: a name that is taken or empty, `.` and `..`, a `/` in a
+  rename. Return does nothing until the name is put right; spaces at
+  either end are allowed, with a warning. Several
   items can be selected (`Cmd`-click, Shift-click) and moved to the Trash
   or have their paths copied together, with one question for all of them.
   A click on a file opens it and the keyboard stays in the document; a
@@ -417,6 +427,28 @@ the size and write it back.
   it, the tree scrolls near its top and bottom edges, and Escape calls
   the drag off. A folder cannot go into itself, and an item whose name
   is taken where it is dropped stays where it was while the rest go.
+  A drag can leave the tree as well. Over the terminal the pane under
+  the pointer lights up, and letting go types the paths there, quoted
+  for the shell, moving nothing; over the editor the files open, in the
+  pane under the pointer. Out of the window the drag goes on to the
+  Finder and other apps, which can copy what it carries and never move
+  it out of the project; brought back, it drops as if it had never left.
+  Files and folders dragged in from the Finder, or from any app that
+  drags files, are copied into the folder they are dropped on in the
+  tree, never moved; dropped on the editor they open, as before. Where
+  names they bring are taken, the drop asks once for all of them:
+  Replace moves what is there to the Trash first, Keep Both copies
+  under `-copy`, and Cancel copies nothing. What was done to the files
+  can be taken back: with the keyboard in the tree, `Cmd-Z` undoes the
+  last file operation (a new file or folder, a rename, a move, a copy, a
+  duplicate, a move to the Trash, a drop that replaced an item), every
+  item of it at once, and `Cmd-Shift-Z` does it again; Edit > Undo and
+  Redo say which. Nothing is deleted or written over on the way: what
+  an undo takes away goes to the Trash, and what went to the Trash
+  comes back from it. An item that is no longer as the operation left
+  it, or whose old place is taken, is skipped and said so, and nothing
+  moves while a tab on it holds unsaved work or a copy is running. With
+  the keyboard in a document, `Cmd-Z` is the document's.
 - **Search view** (`Cmd-Shift-F`) in the sidebar: the project searched as
   you type, listed by file and line with each match marked, folding
   files, files to include and exclude, and Replace All; `Cmd-P` fuzzy
@@ -582,6 +614,7 @@ the size and write it back.
 | type in the Explorer | jump to the next name that starts with it |
 | `Cmd-Delete` in the Explorer | move the selection to the Trash, after asking |
 | `Cmd-C` / `Cmd-X` / `Cmd-V` in the Explorer | copy or cut the selected files and folders, paste into the cursor's folder; also to and from the Finder |
+| `Cmd-Z` / `Cmd-Shift-Z` in the Explorer | undo the last file operation, every item of it, and redo it |
 | Escape in the Explorer | stop a copy that is running, or call off a cut |
 | drag in the Explorer | move the selection, or the item pressed, into the folder under the pointer |
 | Option-drag in the Explorer | copy there instead; a name that is taken gets `-copy` |

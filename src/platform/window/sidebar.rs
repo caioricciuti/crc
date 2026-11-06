@@ -695,7 +695,13 @@ impl EditorView {
         let question = trash_question(&paths);
         // A test instance shows no alert, which would wait for a person,
         // and moves nothing to the real Trash: it says what it would do.
-        if self.ivars().testing {
+        // Unless its script answers for the person (`CRC_TRASH_ANSWER` is
+        // `move`): then the items go to the folder that is a test
+        // instance's Trash, or nowhere when it has none.
+        let scripted = self.ivars().testing
+            && !dirty
+            && std::env::var("CRC_TRASH_ANSWER").is_ok_and(|answer| answer == "move");
+        if self.ivars().testing && !scripted {
             if let Some(mut state) = self.state_mut() {
                 let said = if dirty {
                     "would refuse: unsaved changes are open".to_string()
@@ -721,26 +727,32 @@ impl EditorView {
             );
             return;
         }
-        let answer = ask(
-            MainThreadMarker::from(self),
-            &question,
-            if one {
-                "The item can be recovered from the Trash."
-            } else {
-                "The items can be recovered from the Trash."
-            },
-            &["Move to Trash", "Cancel"],
-        );
+        let answer = if scripted {
+            0
+        } else {
+            ask(
+                MainThreadMarker::from(self),
+                &question,
+                if one {
+                    "The item can be recovered from the Trash."
+                } else {
+                    "The items can be recovered from the Trash."
+                },
+                &["Move to Trash", "Cancel"],
+            )
+        };
         if answer != 0 {
             return;
         }
 
+        // One step, however many items go: one undo brings them all back.
+        let step = self.begin_file_step();
         let mut moved = 0;
         let mut failed = None;
         for (path, key) in paths.iter().zip(&keys) {
-            match self.file_op(Op::Trash(path)) {
+            match self.file_op_in(step, Op::Trash(path)) {
                 // Where it is in the Trash is kept with what was done: an
-                // undo will need it.
+                // undo needs it.
                 Ok(_) => {
                     moved += 1;
                     if let Some(mut state) = self.state_mut() {
@@ -1112,8 +1124,9 @@ fn trash_question(paths: &[std::path::PathBuf]) -> String {
 /// by their path in the project (a folder with a slash, a row cut and not
 /// yet pasted after a `~`, a selected row starred, the cursor's after a
 /// `>`), what a command on the selection would act on, the first row
-/// shown, the drag in progress (see [`TreeDrag::report`]), and the file
-/// work: see [`explorer::report`].
+/// shown, the drag in progress (see [`TreeDrag::report`]), the one handed
+/// to the system when it left the window, and the file work: see
+/// [`explorer::report`].
 pub(super) fn tree_report(state: &State) -> String {
     let tree = &state.tree;
     let shown = |path: &Path| {
@@ -1151,14 +1164,63 @@ pub(super) fn tree_report(state: &State) -> String {
         Some(Drag::Tree(drag)) => drag.report(tree.root()),
         _ => "none".to_string(),
     };
+    let out = super::tree_drag::out_report(state);
+    let marks = tree_marks_report(state);
     format!(
-        "tree_keys: {}\ntree_rows: {}\ntree_acts_on: {}\ntree_scroll: {}\ntree_drag: {drag}\n{}",
+        "tree_keys: {}\ntree_rows: {}\ntree_acts_on: {}\ntree_scroll: {}\ntree_drag: {drag}\ntree_drag_out: {out}\n{marks}{}",
         tree_has_keys(state),
         rows.join("|"),
         acts_on.join("|"),
         tree.scroll,
         explorer::report(state),
     )
+}
+
+/// Two more lines of the tree's report. `tree_marks:` has the rows that
+/// say something about Git, by their path in the project, each with what
+/// its right edge shows after an `=`: the letter of a changed file, `.`
+/// for the dot of a folder with changes inside, `!` for one with a
+/// conflict inside, and `i` for a row dimmed as ignored, which has no
+/// mark. `tree_name_note:` is what the name field says under itself, with
+/// `error: ` or `warning: ` in front; empty with nothing said.
+fn tree_marks_report(state: &State) -> String {
+    use crate::project::marks::Mark;
+    use crate::project::tree::Ignored;
+    let tree = &state.tree;
+    let marks: Vec<String> = tree
+        .rows()
+        .iter()
+        .filter_map(|entry| {
+            let mark = match tree.git_mark(&entry.path) {
+                Some(Mark::ContainsConflict) => "!",
+                Some(Mark::Contains) => ".",
+                Some(mark) => mark.letter().unwrap_or("?"),
+                None if matches!(tree.ignored(&entry.path), Ignored::Here | Ignored::Inside) => "i",
+                None => return None,
+            };
+            let path = tree
+                .root()
+                .and_then(|root| entry.path.strip_prefix(root).ok())
+                .unwrap_or(&entry.path);
+            Some(format!(
+                "{}{}={mark}",
+                path.to_string_lossy(),
+                if entry.is_dir { "/" } else { "" },
+            ))
+        })
+        .collect();
+    let note = state
+        .sidebar_edit
+        .as_ref()
+        .and_then(|edit| edit.problem())
+        .map_or_else(String::new, |problem| {
+            format!(
+                "{}: {}",
+                if problem.blocks() { "error" } else { "warning" },
+                problem.said()
+            )
+        });
+    format!("tree_marks: {}\ntree_name_note: {note}\n", marks.join("|"))
 }
 
 #[cfg(test)]

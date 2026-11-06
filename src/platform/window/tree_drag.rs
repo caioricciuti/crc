@@ -15,10 +15,24 @@
 //!
 //! Where the items and the folder under the pointer really are is looked
 //! up once each (see [`DropCheck`]); a move of the pointer compares paths.
+//!
+//! Files dragged in from the Finder or another app are the same drag with
+//! no press of ours behind it: the same folder lights up, opens and
+//! scrolls under them. The system draws what is carried, and letting go
+//! always copies: see `explorer.rs` for the drop.
+//!
+//! A drag of ours may leave the tree as well: onto the terminal, onto the
+//! editor, and out of the window to another app. See `tree_drag/out.rs`.
+
+use objc2_app_kit::NSPasteboard;
 
 use super::*;
-use crate::project::fileops::{DropCheck, Planned};
+use crate::project::fileops::DropCheck;
 use crate::project::tree::DropOn;
+
+mod out;
+use out::Beyond;
+pub(super) use out::{Out, out_report, source_mask};
 
 /// How far the pointer travels from the press before it is a drag: one that
 /// started on every click would make selecting a file impossible.
@@ -83,8 +97,23 @@ struct Live {
     at: (f32, f32),
     /// Option is held: letting go copies.
     copy: bool,
+    /// Brought in from another app, not pressed here. It is always
+    /// copied, and `copy` stays off: it goes where a move would, since
+    /// dropped on the folder an item is in already it has nothing to do.
+    outside: bool,
+    /// Ours, taken out of the window and brought back by the system. It
+    /// is carried as what comes from `outside` is, and so is that too,
+    /// but let go it does what a press of ours does: it moves, or copies
+    /// with Option.
+    returned: bool,
+    /// Something carried is a file, which the editor can open: looked up
+    /// when the drag starts, once.
+    files: bool,
     /// The pointer is over the Explorer, where letting go is a drop.
     inside: bool,
+    /// Off the Explorer, over the terminal or the editor, where letting
+    /// go does something else: see `out.rs`.
+    beyond: Option<Beyond>,
     /// Where the drop would go, while anything would: what lights up.
     on: Option<DropOn>,
     hover: Option<Hover>,
@@ -224,17 +253,64 @@ impl TreeDrag {
         }
         let (label, label_width) = label(&carried_label(&self.items));
         self.live = Some(Live {
+            files: out::any_file(&self.items),
             check: DropCheck::new(std::mem::take(&mut self.items)),
             label,
             label_width,
             at,
             copy: false,
+            outside: false,
+            returned: false,
             inside: false,
+            beyond: None,
             on: None,
             hover: None,
             carry: 0.0,
         });
         true
+    }
+
+    /// Files dragged in from another app, the pointer at `at`: a drag
+    /// from the first, with no row pressed and nothing for a release to
+    /// click. Each of `paths` is looked up, once.
+    fn from_outside(paths: Vec<std::path::PathBuf>, at: (f32, f32)) -> TreeDrag {
+        let label = carried_label(&paths);
+        TreeDrag {
+            path: std::path::PathBuf::new(),
+            items: Vec::new(),
+            origin: at,
+            live: Some(Live {
+                check: DropCheck::new(paths),
+                // Said in a `dump` only: the system draws what is carried.
+                label,
+                label_width: 0.0,
+                at,
+                copy: false,
+                outside: true,
+                returned: false,
+                files: false,
+                inside: false,
+                beyond: None,
+                on: None,
+                hover: None,
+                carry: 0.0,
+            }),
+        }
+    }
+
+    /// Carried by the system, from another app or back from outside the
+    /// window: no press, no pill, and no release of ours ends it.
+    pub(super) fn outside(&self) -> bool {
+        self.live.as_ref().is_some_and(|live| live.outside)
+    }
+
+    /// The pane of the terminal or of the editor that lights up: where
+    /// letting go types the paths carried, or opens the files.
+    pub(super) fn lit(&self) -> Option<Viewport> {
+        self.live
+            .as_ref()
+            .and_then(|live| live.beyond)
+            .map(|beyond| beyond.lit())
     }
 
     /// What the tree lights up: where letting go now would drop.
@@ -250,7 +326,7 @@ impl TreeDrag {
         bounds: Viewport,
         theme: &Theme,
     ) {
-        let Some(live) = &self.live else {
+        let Some(live) = self.live.as_ref().filter(|live| !live.outside) else {
             return;
         };
         let at = (live.at.0 + CHIP_SHIFT.0, live.at.1 + CHIP_SHIFT.1);
@@ -264,13 +340,17 @@ impl TreeDrag {
     /// The drag as a `dump` says it: `none` for a press that is not one,
     /// otherwise what the pill says, `copy` while Option is held, and the
     /// folder it would drop into by its path in the project (`.` for the
-    /// root, `nowhere` where nothing would go).
+    /// root, `nowhere` where nothing would go). Files brought in from
+    /// another app are said to be `from outside:`, and ours brought back
+    /// into the window `returned:`. Off the tree it is `onto terminal` or
+    /// `onto editor` where letting go does something there.
     pub(super) fn report(&self, root: Option<&Path>) -> String {
         let Some(live) = &self.live else {
             return "none".into();
         };
-        let onto = match (live.on, live.check.dir()) {
-            (Some(_), Some(dir)) => match root.and_then(|root| dir.strip_prefix(root).ok()) {
+        let onto = match (live.beyond, live.on, live.check.dir()) {
+            (Some(beyond), ..) => beyond.name().to_string(),
+            (None, Some(_), Some(dir)) => match root.and_then(|root| dir.strip_prefix(root).ok()) {
                 Some(rest) if rest.as_os_str().is_empty() => ".".to_string(),
                 Some(rest) => rest.to_string_lossy().into_owned(),
                 None => dir.to_string_lossy().into_owned(),
@@ -278,7 +358,12 @@ impl TreeDrag {
             _ => "nowhere".to_string(),
         };
         format!(
-            "{}{} onto {onto}",
+            "{}{}{} onto {onto}",
+            match (live.returned, live.outside) {
+                (true, _) => "returned: ",
+                (false, true) => "from outside: ",
+                (false, false) => "",
+            },
             live.label,
             if live.copy { " copy" } else { "" }
         )
@@ -294,9 +379,20 @@ impl TreeDrag {
 /// reads the file system only when the folder under the pointer is another
 /// one than last time.
 fn aim(state: &mut State, now: Instant, delay: Duration) -> bool {
-    let rect = chrome_of(state)
+    let chrome = chrome_of(state);
+    let rect = chrome
         .sidebar
         .filter(|_| super::sidebar::explorer_showing(state));
+    // Off the tree: what comes from another app is dropped by its own
+    // rules there, and nothing of it is held here.
+    let beyond = match &state.drag {
+        Some(Drag::Tree(TreeDrag {
+            live: Some(live), ..
+        })) if live.returned || !live.outside => {
+            out::beyond_at(state, &chrome, live.at, live.files)
+        }
+        _ => None,
+    };
     let field = sidebar_field(state);
     let State { drag, tree, .. } = &mut *state;
     let Some(Drag::Tree(TreeDrag {
@@ -321,9 +417,11 @@ fn aim(state: &mut State, now: Instant, delay: Duration) -> bool {
     let open = hover_step(&mut live.hover, closed, now, delay)
         .then_some(closed)
         .flatten();
-    let changed = live.on != on || live.inside != rect.is_some();
+    let beyond = beyond.filter(|_| rect.is_none());
+    let changed = live.on != on || live.inside != rect.is_some() || live.beyond != beyond;
     live.on = on;
     live.inside = rect.is_some();
+    live.beyond = beyond;
     if let Some(row) = open {
         super::sidebar::set_tree_folder(state, row, Some(true));
     }
@@ -344,6 +442,10 @@ impl EditorView {
             let Some(Drag::Tree(drag)) = &mut state.drag else {
                 return;
             };
+            // Not a press of ours: the system says where it is.
+            if drag.outside() {
+                return;
+            }
             let atlas = &mut state.renderer.atlas;
             let began = drag.begin((x, y), |label| {
                 let label = layout::elide_middle(atlas, label, LABEL_WIDTH);
@@ -376,7 +478,7 @@ impl EditorView {
             match &mut state.drag {
                 Some(Drag::Tree(TreeDrag {
                     live: Some(live), ..
-                })) if live.copy != copy => live.copy = copy,
+                })) if live.copy != copy && (live.returned || !live.outside) => live.copy = copy,
                 _ => return,
             }
             // A copy may go where a move has nothing to do.
@@ -445,7 +547,17 @@ impl EditorView {
 
     /// Escape while a drag is held: it is called off, and nothing moves.
     /// Whether there was one.
+    ///
+    /// One the system carries it calls off itself, and no key comes here.
+    /// A test instance has no system drag: its own stands in, and Escape
+    /// ends it as the system would.
     pub(super) fn cancel_tree_drag(&self) -> bool {
+        let out =
+            self.ivars().testing && self.state().is_some_and(|state| state.tree_out.is_some());
+        if out {
+            self.tree_drag_out_ended();
+            return true;
+        }
         {
             let Some(mut state) = self.state_mut() else {
                 return false;
@@ -462,27 +574,148 @@ impl EditorView {
 
     /// A drag let go: over the Explorer, what it carries goes into the
     /// folder under the pointer, moved or with Option held copied, each
-    /// with its tabs and its local history. Anywhere else nothing happens.
+    /// with its tabs and its local history. Over the terminal its paths
+    /// are typed there, and over the editor its files open. Anywhere else
+    /// nothing happens.
     pub(super) fn drop_tree_items(&self, drag: TreeDrag) {
-        let Some(live) = drag.live else {
+        // What came from another app is never moved: its drop is its own.
+        let Some(live) = drag.live.filter(|live| !live.outside) else {
             return;
         };
+        self.drop_live(live);
+    }
+
+    /// What letting go of a drag of ours does, where it is. Whether that
+    /// was anything.
+    fn drop_live(&self, live: Live) -> bool {
+        if live.beyond.is_some() {
+            return self.drop_beyond(&live);
+        }
         let Some(into) = live.check.dir().filter(|_| live.inside) else {
-            return;
+            return false;
         };
         let plan = live.check.plan(live.copy);
         // The tree has the keyboard after a drop that does anything: what
         // landed is selected there, and Escape stops a copy that runs.
-        let acts = plan
-            .iter()
-            .any(|planned| matches!(planned, Planned::Copy { .. } | Planned::Move { .. }));
+        let acts = super::explorer::acts(&plan);
         if acts && let Some(mut state) = self.state_mut() {
             super::sidebar::take_tree_keys(&mut state);
         }
         self.drop_items(plan, live.copy, into);
         self.request_redraw();
         self.pump();
+        acts
     }
+
+    /// A drag from another app is at `(x, y)`. Over the Explorer's tree
+    /// its files are what the tree's own drag would be: the folder under
+    /// the pointer lights up where a drop would copy anything, a closed
+    /// one rested on opens, and the tree scrolls near its edges, all by
+    /// the frame as for a press held here. Whether a drop there would do
+    /// anything, or `None` when the pointer is not over the tree, where
+    /// the drop is someone else's.
+    ///
+    /// The pasteboard is read when the drag first comes over the tree,
+    /// and its files are looked up then, once. A drag that carries no
+    /// files does nothing here.
+    pub(super) fn outside_drag_over(
+        &self,
+        pasteboard: &NSPasteboard,
+        x: f32,
+        y: f32,
+    ) -> Option<bool> {
+        let (would, changed) = {
+            let mut state = self.state_mut()?;
+            let state = &mut *state;
+            let over = over_tree(state, x, y);
+            let held = matches!(&state.drag, Some(Drag::Tree(drag)) if drag.outside());
+            if !held {
+                // Not over the tree yet, or a press of ours is held.
+                if !over || state.drag.is_some() {
+                    return None;
+                }
+                let paths = clipboard::file_urls(pasteboard);
+                if paths.is_empty() {
+                    return Some(false);
+                }
+                state.drag = Some(Drag::Tree(TreeDrag::from_outside(paths, (x, y))));
+            }
+            if let Some(Drag::Tree(TreeDrag {
+                live: Some(live), ..
+            })) = &mut state.drag
+            {
+                live.at = (x, y);
+            }
+            let changed = aim(state, Instant::now(), hover_expand(self.ivars().testing));
+            let would = matches!(&state.drag, Some(Drag::Tree(drag)) if drag.drop_on().is_some());
+            (over.then_some(would), changed || !held)
+        };
+        if changed {
+            self.request_redraw();
+        }
+        // Held still it sends nothing: the frame opens the folder it
+        // rests on and scrolls the tree under it.
+        self.resume_display_link();
+        self.pump();
+        would
+    }
+
+    /// The drag from another app left the window, or ended without a drop
+    /// here: nothing is lit any more.
+    pub(super) fn outside_drag_left(&self) {
+        {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            if !matches!(&state.drag, Some(Drag::Tree(drag)) if drag.outside()) {
+                return;
+            }
+            state.drag = None;
+        }
+        self.request_redraw();
+        self.pump();
+    }
+
+    /// The drag from another app was let go at `(x, y)`. Over the
+    /// Explorer's tree its files are copied into the folder under the
+    /// pointer: whether that drop was taken, or `None` when the pointer is
+    /// not over the tree and the drop is someone else's.
+    pub(super) fn outside_drag_dropped(
+        &self,
+        pasteboard: &NSPasteboard,
+        x: f32,
+        y: f32,
+    ) -> Option<bool> {
+        // Aimed once more, where it was let go.
+        let over = self.outside_drag_over(pasteboard, x, y);
+        let drag = {
+            let mut state = self.state_mut()?;
+            match state.drag.take() {
+                Some(Drag::Tree(drag)) if drag.outside() => Some(drag),
+                other => {
+                    state.drag = other;
+                    None
+                }
+            }
+        };
+        self.request_redraw();
+        over?;
+        // Over the tree with no files to bring: the drop is ignored.
+        let Some(live) = drag.and_then(|drag| drag.live) else {
+            return Some(false);
+        };
+        Some(self.drop_from_outside(live.check))
+    }
+}
+
+/// Whether `(x, y)` is over the Explorer's tree with a project in it:
+/// where files dragged in from another app are copied into a folder.
+fn over_tree(state: &State, x: f32, y: f32) -> bool {
+    state.tree.root().is_some()
+        && super::sidebar::explorer_showing(state)
+        && chrome_of(state)
+            .sidebar
+            .is_some_and(|rect| rect.contains(x, y))
 }
 
 #[cfg(test)]
@@ -662,6 +895,72 @@ mod tests {
         assert_eq!((x, y), (900.0 - 76.0, 600.0 - layout::UI_CONTROL_SM));
         let (x, y) = corner((-100.0, -100.0));
         assert_eq!((x, y), (0.0, 0.0));
+    }
+
+    /// Files brought in from another app are a drag from the first, with
+    /// no row of ours behind them: nothing for a release to click, no
+    /// pill, and never a copy by Option, since they are always copied.
+    #[test]
+    fn files_from_outside_are_a_drag_with_no_press_behind_it() {
+        let files = crate::project::TempTree::new(
+            "tree-drag-outside",
+            &[
+                ("desk/plots.txt", "beans"),
+                ("desk/soup.md", "pumpkin"),
+                ("project/recipes/soup.md", "leeks"),
+                ("project/garden.txt", "tomatoes"),
+            ],
+        );
+        let (desk, project) = (files.0.join("desk"), files.0.join("project"));
+        let one = TreeDrag::from_outside(vec![desk.join("plots.txt")], (40.0, 200.0));
+        assert!(one.active());
+        assert!(one.outside());
+        assert_eq!(one.click(), None);
+        assert_eq!(one.drop_on(), None);
+        assert_eq!(
+            one.report(Some(&project)),
+            "from outside: plots.txt onto nowhere"
+        );
+        let two = TreeDrag::from_outside(
+            vec![desk.join("plots.txt"), desk.join("soup.md")],
+            (40.0, 200.0),
+        );
+        assert_eq!(
+            two.report(Some(&project)),
+            "from outside: 2 items onto nowhere"
+        );
+        // A press of ours is not one, before it is a drag or after.
+        let mut tree = Tree::new();
+        tree.open(&project);
+        let mut press = TreeDrag::new(&tree, 1, (100.0, 120.0)).unwrap();
+        assert!(!press.outside());
+        assert!(press.begin((100.0, 160.0), |label| (label.to_string(), 60.0)));
+        assert!(!press.outside());
+
+        // Where it would go is the tree's own rule: a folder's row is
+        // that folder, a file's row the folder it is in, and under the
+        // rows the project root. It lights up where anything would be
+        // copied: not on the folder an item is in already, though a copy
+        // by Option would land there.
+        let Some(live) = two.live else {
+            panic!("a drag from outside is live");
+        };
+        let mut check = live.check;
+        assert!(!live.copy);
+        // recipes/, garden.txt
+        let aimed = |check: &mut DropCheck, row: Option<usize>| {
+            let aimed = tree.drop_folder(row);
+            check.aim(aimed.map(|(_, dir)| dir));
+            aimed.map(|(on, _)| on).filter(|_| check.allowed(live.copy))
+        };
+        assert_eq!(aimed(&mut check, Some(0)), Some(DropOn::Folder(0)));
+        assert_eq!(check.dir(), Some(project.join("recipes").as_path()));
+        assert_eq!(aimed(&mut check, Some(1)), Some(DropOn::Root));
+        assert_eq!(aimed(&mut check, None), Some(DropOn::Root));
+        assert_eq!(check.dir(), Some(project.as_path()));
+        let mut own = DropCheck::new(vec![project.join("garden.txt")]);
+        assert_eq!(aimed(&mut own, None), None);
+        assert_eq!(aimed(&mut own, Some(0)), Some(DropOn::Folder(0)));
     }
 
     #[test]

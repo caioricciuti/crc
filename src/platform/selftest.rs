@@ -49,6 +49,14 @@
 //! write <file> <text>         overwrite a file, as another program would
 //! pasteboard <file>[|<file>]  put files on the clipboard as a copy in
 //!                             another app does: their URLs and nothing else
+//! dragfiles <file>[|<file>]   the files a drag from another app carries,
+//!                             for the `dragover` and `dropat` after it
+//! dragtext <text>             text carried by such a drag instead
+//! dragover|dropat @<region> <fx> <fy>
+//!                             that drag over a point, or let go there,
+//!                             placed as for `clickat`; the next dump's
+//!                             `file_drag:` says what the window answered
+//! dragout                     that drag leaves the window
 //! dump <file>                 write the state of the active document
 //! action <selector>           a menu item's action sent to the view, as
 //!                             choosing the item does: for the items of a
@@ -142,6 +150,13 @@ pub enum Step {
     Write(String, String),
     /// Files put on the clipboard as another app's copy leaves them.
     Pasteboard(Vec<String>),
+    /// The files a drag from another app carries: what [`Mouse::Over`] and
+    /// [`Mouse::Drop`] play, on a pasteboard of the instance's own.
+    DragFiles(Vec<String>),
+    /// Text carried by such a drag instead of files.
+    DragText(String),
+    /// That drag leaves the window without a drop.
+    DragOut,
     /// A mouse-wheel delta in notches, as `scrollingDeltaY` reports them.
     /// Only the palette is driven this way.
     Wheel(f64),
@@ -206,6 +221,10 @@ pub enum Mouse {
     Up,
     /// The right button: the context menu is made, not shown.
     Menu,
+    /// No button of ours: a drag from another app is over the point.
+    Over,
+    /// That drag let go at the point.
+    Drop,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -365,12 +384,16 @@ pub fn parse(script: &str) -> Result<Vec<Step>, String> {
                 dx: args.num().ok_or_else(bad)?,
                 dy: args.num().ok_or_else(bad)?,
             }),
-            "clickat" | "downat" | "dragat" | "upat" | "menuat" if rest.starts_with('@') => {
+            "clickat" | "downat" | "dragat" | "upat" | "menuat" | "dragover" | "dropat"
+                if rest.starts_with('@') =>
+            {
                 let mouse = match command {
                     "clickat" => Mouse::Click,
                     "downat" => Mouse::Down,
                     "dragat" => Mouse::Drag,
                     "menuat" => Mouse::Menu,
+                    "dragover" => Mouse::Over,
+                    "dropat" => Mouse::Drop,
                     _ => Mouse::Up,
                 };
                 let name = args.word().ok_or_else(bad)?.to_string();
@@ -444,6 +467,11 @@ pub fn parse(script: &str) -> Result<Vec<Step>, String> {
             "pasteboard" if !rest.is_empty() => steps.push(Step::Pasteboard(
                 rest.split('|').map(str::to_string).collect(),
             )),
+            "dragfiles" if !rest.is_empty() => steps.push(Step::DragFiles(
+                rest.split('|').map(str::to_string).collect(),
+            )),
+            "dragtext" if !rest.is_empty() => steps.push(Step::DragText(rest.to_string())),
+            "dragout" if rest.is_empty() => steps.push(Step::DragOut),
             "dump" if !rest.is_empty() => steps.push(Step::Dump(rest.to_string())),
             "frame" if !rest.is_empty() => steps.push(Step::Frame(rest.to_string())),
             "fade" => steps.push(Step::Fade(rest.parse().map_err(|_| bad())?)),
@@ -574,6 +602,40 @@ mod tests {
             ])]
         );
         assert!(parse("pasteboard\n").is_err());
+        assert_eq!(
+            parse(
+                "dragfiles /d/plots.txt|/d/old recipes\ndragtext a line of text\n\
+                 dragover @sidebar.row.1 0.5 0.5\ndropat @sidebar 0.5 0.9\ndragout\n"
+            )
+            .unwrap(),
+            [
+                Step::DragFiles(vec!["/d/plots.txt".into(), "/d/old recipes".into()]),
+                Step::DragText("a line of text".into()),
+                Step::At {
+                    mouse: Mouse::Over,
+                    name: "sidebar.row.1".into(),
+                    fx: 0.5,
+                    fy: 0.5,
+                    mods: Mods::default(),
+                },
+                Step::At {
+                    mouse: Mouse::Drop,
+                    name: "sidebar".into(),
+                    fx: 0.5,
+                    fy: 0.9,
+                    mods: Mods::default(),
+                },
+                Step::DragOut,
+            ]
+        );
+        for junk in [
+            "dragfiles",
+            "dragtext",
+            "dragout now",
+            "dropat sidebar 0.5 0.5",
+        ] {
+            assert!(parse(junk).is_err(), "{junk} should be refused");
+        }
         assert!(parse("action\n").is_err());
         assert!(parse("action closeOtherTerminalTabs\n").is_err());
         assert!(parse("menubar\n").is_err());

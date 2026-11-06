@@ -18,12 +18,12 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSAlert, NSAlertStyle, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
-    NSApplicationTerminateReply, NSBackingStoreType, NSCursor, NSDragOperation,
-    NSDraggingDestination, NSDraggingInfo, NSEvent, NSEventModifierFlags, NSEventType, NSMenu,
-    NSMenuDelegate, NSMenuItem, NSOpenPanel, NSPasteboardTypeFileURL, NSPasteboardTypePNG,
-    NSPasteboardTypeTIFF, NSRequestUserAttentionType, NSSavePanel, NSScreen, NSTextInputClient,
-    NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindow, NSWindowCollectionBehavior,
-    NSWindowDelegate, NSWindowStyleMask, NSWindowTitleVisibility,
+    NSApplicationTerminateReply, NSBackingStoreType, NSCursor, NSDragOperation, NSDraggingContext,
+    NSDraggingDestination, NSDraggingInfo, NSDraggingSource, NSEvent, NSEventModifierFlags,
+    NSEventType, NSMenu, NSMenuDelegate, NSMenuItem, NSOpenPanel, NSPasteboardTypeFileURL,
+    NSPasteboardTypePNG, NSPasteboardTypeTIFF, NSRequestUserAttentionType, NSSavePanel, NSScreen,
+    NSTextInputClient, NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindow,
+    NSWindowCollectionBehavior, NSWindowDelegate, NSWindowStyleMask, NSWindowTitleVisibility,
 };
 use objc2_foundation::{
     NSArray, NSAttributedString, NSAttributedStringKey, NSFileManager, NSNotFound, NSNotification,
@@ -152,6 +152,10 @@ fn spawn_project_scan(
 /// Makes `dir` the project: the sidebar, Source Control and the finder
 /// start over there, read on workers.
 fn set_project_root(state: &mut State, dir: &Path) {
+    // What was done to another folder's files is not this one's to undo.
+    if state.tree.root() != Some(dir) {
+        state.explorer.forget_steps();
+    }
     state.tree.set_root(dir);
     state.workspace = crate::project::workspace::Workspace::open(dir);
     state.git = git_panel_for(&state.workspace);
@@ -604,6 +608,8 @@ struct SidebarEdit {
     row: usize,
     depth: usize,
     field: Buffer,
+    /// What is wrong with the name as typed, kept in step with the text.
+    check: project::NameCheck,
 }
 
 impl SidebarEdit {
@@ -899,6 +905,9 @@ struct State {
     sidebar_width: f32,
     /// What the held press is dragging, if anything.
     drag: Option<Drag>,
+    /// Rows of the Explorer the system is carrying, from when their drag
+    /// left the window until the system's is over: see `tree_drag/out.rs`.
+    tree_out: Option<tree_drag::Out>,
     /// Lines of autoscroll owed but not yet amounting to a whole one.
     autoscroll_carry: f32,
     /// Text an input method is still composing: the accent waiting for its
@@ -2515,6 +2524,8 @@ define_class!(
 
             if self.state().is_some_and(|state| matches!(state.drag, Some(Drag::Tree(_)))) {
                 self.tree_drag_moved(point.x as f32, point.y as f32, event.modifierFlags());
+                // Out of the window it is the system's to carry on.
+                self.tree_drag_leaves(event, point.x as f32, point.y as f32);
                 return;
             }
 
@@ -4740,6 +4751,10 @@ define_class!(
 
         #[unsafe(method(undo:))]
         fn action_undo(&self, _sender: Option<&AnyObject>) {
+            // In the Explorer, the last thing done to the files.
+            if self.turn_file_step(false) {
+                return;
+            }
             let (changed, focus) = self.edit_focused(|b, _| b.undo());
             if changed {
                 self.after_focused_edit(focus);
@@ -4748,6 +4763,10 @@ define_class!(
 
         #[unsafe(method(redo:))]
         fn action_redo(&self, _sender: Option<&AnyObject>) {
+            // In the Explorer, the last thing an undo took back.
+            if self.turn_file_step(true) {
+                return;
+            }
             let (changed, focus) = self.edit_focused(|b, _| b.redo());
             if changed {
                 self.after_focused_edit(focus);
@@ -4882,18 +4901,30 @@ define_class!(
                 return Bool::NO;
             };
             let terminal = state.terminal.has_keys() && !field_has_keys(&state);
+            // Undo and Redo are named after the file operation they would
+            // take back or do again while the Explorer's tree has the
+            // keys, and plainly everywhere else.
+            let redo = action == sel!(redo:);
+            let in_tree = (redo || action == sel!(undo:))
+                .then(|| explorer::edit_item(&state, redo));
+            if let Some(in_tree) = &in_tree {
+                let title = match in_tree {
+                    Some((title, _)) => title.as_str(),
+                    None if redo => "Redo",
+                    None => "Undo",
+                };
+                item.setTitle(&NSString::from_str(title));
+            }
             let enabled = if action == sel!(copyAsOneLine:) {
                 terminal && state.terminal.selection().is_some()
             } else if terminal && action == sel!(copy:) {
                 state.terminal.selection().is_some()
             } else if terminal && (action == sel!(cut:) || action == sel!(undo:) || action == sel!(redo:)) {
                 false
-            } else if sidebar::tree_has_keys(&state)
-                && (action == sel!(undo:) || action == sel!(redo:))
-            {
-                // The Explorer's tree has the keyboard: these would edit
-                // the document behind it, where nobody is looking.
-                false
+            } else if let Some(Some((_, enabled))) = in_tree {
+                // The Explorer's tree has the keyboard: these are for what
+                // was done to its files, not the document behind it.
+                enabled
             } else if sidebar::tree_has_keys(&state)
                 && (action == sel!(copy:) || action == sel!(cut:))
             {
@@ -5109,6 +5140,13 @@ define_class!(
             };
             Bool::new(enabled)
         }
+
+        /// The question of a drop on the Explorer that found names in use,
+        /// asked once the drag that brought it is over: see `explorer.rs`.
+        #[unsafe(method(askAboutDrop:))]
+        fn ask_about_drop_action(&self, _sender: Option<&AnyObject>) {
+            self.ask_about_drop();
+        }
     }
 
     unsafe impl NSObjectProtocol for EditorView {}
@@ -5117,12 +5155,27 @@ define_class!(
     unsafe impl NSDraggingDestination for EditorView {
         #[unsafe(method(draggingEntered:))]
         fn dragging_entered(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> NSDragOperation {
-            self.drag_operation(&sender.draggingPasteboard())
+            // Another drag: what one before it held over the tree is over.
+            self.outside_drag_left();
+            let point = self.convertPoint_fromView(sender.draggingLocation(), None);
+            self.drag_operation(&sender.draggingPasteboard(), point.x as f32, point.y as f32)
         }
 
         #[unsafe(method(draggingUpdated:))]
         fn dragging_updated(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> NSDragOperation {
-            self.drag_operation(&sender.draggingPasteboard())
+            let point = self.convertPoint_fromView(sender.draggingLocation(), None);
+            self.drag_operation(&sender.draggingPasteboard(), point.x as f32, point.y as f32)
+        }
+
+        #[unsafe(method(draggingExited:))]
+        fn dragging_exited(&self, _sender: Option<&ProtocolObject<dyn NSDraggingInfo>>) {
+            self.outside_drag_left();
+        }
+
+        // Let go where nothing would be done: no drop comes, only this.
+        #[unsafe(method(draggingEnded:))]
+        fn dragging_ended(&self, _sender: &ProtocolObject<dyn NSDraggingInfo>) {
+            self.outside_drag_left();
         }
 
         #[unsafe(method(prepareForDragOperation:))]
@@ -5134,6 +5187,22 @@ define_class!(
         fn perform_drag_operation(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> bool {
             let point = self.convertPoint_fromView(sender.draggingLocation(), None);
             self.drop_pasteboard(&sender.draggingPasteboard(), point.x as f32, point.y as f32)
+        }
+    }
+
+    // Rows of the Explorer dragged out of the window, which the system
+    // carries from there: see `tree_drag/out.rs`. The session is taken as
+    // any object: nothing is asked of it here.
+    unsafe impl NSDraggingSource for EditorView {
+        #[unsafe(method(draggingSession:sourceOperationMaskForDraggingContext:))]
+        fn dragging_source_mask(&self, _session: &AnyObject, context: NSDraggingContext) -> NSDragOperation {
+            tree_drag::source_mask(context)
+        }
+
+        // Let go anywhere, taken or not, or called off.
+        #[unsafe(method(draggingSession:endedAtPoint:operation:))]
+        fn dragging_session_ended(&self, _session: &AnyObject, _point: NSPoint, _operation: NSDragOperation) {
+            self.tree_drag_out_ended();
         }
     }
 
@@ -10501,6 +10570,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         sidebar,
         sidebar_width: session.sidebar_width,
         drag: None,
+        tree_out: None,
         autoscroll_carry: 0.0,
         marked: None,
         marked_caret: 0,

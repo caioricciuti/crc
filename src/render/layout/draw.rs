@@ -285,7 +285,7 @@ pub fn push_ui_field_text(
 }
 
 /// The quads of a shaped UI line in `rect`, cut to it.
-fn push_shaped(
+pub(super) fn push_shaped(
     out: &mut Vec<GlyphInstance>,
     atlas: &mut Atlas,
     rect: Viewport,

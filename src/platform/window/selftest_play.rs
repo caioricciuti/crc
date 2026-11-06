@@ -288,6 +288,40 @@ impl EditorView {
                                 Some((format!("menu: {}", enabled.join("|")), Instant::now()));
                         }
                     }
+                    // A drag from another app, through what
+                    // `draggingEntered:` and `draggingUpdated:` call, and
+                    // what the window answered them.
+                    Mouse::Over => {
+                        let carried = clipboard::scripted_drag();
+                        let answered = self.drag_operation(&carried, x as f32, y as f32);
+                        self.scripted_drag_answered(if answered == NSDragOperation::Copy {
+                            "copy"
+                        } else if answered == NSDragOperation::Move {
+                            // Rows of the Explorer, back from outside.
+                            "move"
+                        } else {
+                            "none"
+                        });
+                    }
+                    // Let go there, as AppKit lets a drag go: the drop
+                    // comes only where the last answer was not none, and
+                    // otherwise the drag just ends.
+                    Mouse::Drop => {
+                        let carried = clipboard::scripted_drag();
+                        let answered = self.drag_operation(&carried, x as f32, y as f32);
+                        let came = if answered == NSDragOperation::None {
+                            self.outside_drag_left();
+                            "none: no drop"
+                        } else if self.drop_pasteboard(&carried, x as f32, y as f32) {
+                            "dropped"
+                        } else {
+                            "drop refused"
+                        };
+                        self.scripted_drag_answered(came);
+                        // Let go, the system's drag is over: of rows the
+                        // Explorer handed it, the source is told.
+                        self.tree_drag_out_ended();
+                    }
                 }
             }
             Step::Down { x, y, count } => {
@@ -327,6 +361,25 @@ impl EditorView {
                 let paths: Vec<std::path::PathBuf> =
                     paths.iter().map(std::path::PathBuf::from).collect();
                 clipboard::write_file_urls(&paths);
+            }
+            // What a drag from another app carries, as that app leaves
+            // it: on a pasteboard of this instance's own. Another drag
+            // than the one before it, which is over as `draggingEntered:`
+            // has it.
+            Step::DragFiles(paths) => {
+                let paths: Vec<std::path::PathBuf> =
+                    paths.iter().map(std::path::PathBuf::from).collect();
+                self.outside_drag_left();
+                clipboard::write_file_urls_on(&clipboard::scripted_drag(), &paths);
+            }
+            Step::DragText(text) => {
+                self.outside_drag_left();
+                clipboard::write_text_on(&clipboard::scripted_drag(), text);
+            }
+            // What `draggingExited:` calls.
+            Step::DragOut => {
+                self.outside_drag_left();
+                self.scripted_drag_answered("left");
             }
             Step::Wheel(dy) => {
                 if self.state().is_some_and(|state| state.palette.is_some()) {
@@ -1205,6 +1258,9 @@ impl EditorView {
                     state.agents.inspector.report_receipt(),
                     state.agents.activity.report(state.agents.arrangement.activity_folded),
                 );
+                // First, what Edit > Undo and Redo say: named after the
+                // Explorer's file operations while its tree has the keys.
+                let report = format!("{}{report}", self.edit_menu_report());
                 if let Err(e) = std::fs::write(path, report) {
                     eprintln!("crc: selftest could not write {path}: {e}");
                 }
@@ -1400,6 +1456,8 @@ fn region_named(state: &mut State, name: &str) -> Option<Viewport> {
             }
         }
         _ if name.starts_with("inspector.") => state.agents.inspector.named(name),
+        // The whole sidebar, the room under its rows included.
+        _ if name == "sidebar" => chrome_of(state).sidebar,
         // The Open Folder button of the Explorer with no folder.
         _ if name == "sidebar.open" => {
             let sidebar = chrome_of(state).sidebar?;

@@ -34,9 +34,22 @@ fn general() -> Retained<NSPasteboard> {
     NSPasteboard::generalPasteboard()
 }
 
+/// The pasteboard a scripted drag from another app carries its files on,
+/// under the self-test: one of the instance's own, never the system's drag
+/// pasteboard, which belongs to whatever the person is dragging.
+pub fn scripted_drag() -> Retained<NSPasteboard> {
+    NSPasteboard::pasteboardWithName(&NSString::from_str(&format!(
+        "crc-selftest-drag-{}",
+        std::process::id()
+    )))
+}
+
 /// Replaces the clipboard contents with `text`.
 pub fn write_text(text: &str) {
-    let pasteboard = general();
+    write_text_on(&general(), text);
+}
+
+pub fn write_text_on(pasteboard: &NSPasteboard, text: &str) {
     // Required before writing: the pasteboard is versioned, and setString
     // silently fails against a stale change count.
     unsafe {
@@ -141,14 +154,22 @@ pub fn write_file_urls(paths: &[PathBuf]) {
     write_file_urls_on(&general(), paths);
 }
 
-fn write_file_urls_on(pasteboard: &NSPasteboard, paths: &[PathBuf]) {
-    let urls: Vec<Retained<ProtocolObject<dyn NSPasteboardWriting>>> = paths
+pub fn write_file_urls_on(pasteboard: &NSPasteboard, paths: &[PathBuf]) {
+    pasteboard.clearContents();
+    pasteboard.writeObjects(&NSArray::from_retained_slice(&file_url_writers(paths)));
+}
+
+/// The files at `paths` as what a pasteboard is given, one file URL to an
+/// item: what a copy writes, and what each item of a drag out of the
+/// Explorer carries.
+pub fn file_url_writers(
+    paths: &[PathBuf],
+) -> Vec<Retained<ProtocolObject<dyn NSPasteboardWriting>>> {
+    paths
         .iter()
         .filter_map(|path| NSURL::URLWithString(&NSString::from_str(&file_url(path))))
         .map(ProtocolObject::from_retained)
-        .collect();
-    pasteboard.clearContents();
-    pasteboard.writeObjects(&NSArray::from_retained_slice(&urls));
+        .collect()
 }
 
 /// The `file:` URL of `path`, a folder's ending in a slash. Written out
@@ -339,5 +360,67 @@ mod tests {
             });
         assert_eq!(read_files_on(&private.0), Files::default());
         assert_ne!(private.0.changeCount(), before);
+    }
+
+    /// What a drag out of the Explorer carries, one item and several: a
+    /// URL to each, byte for byte the name on disk, with a space and an
+    /// accent escaped as they are written there and a folder's ending in
+    /// a slash.
+    #[test]
+    fn files_dragged_out_are_one_url_each_byte_for_byte() {
+        let private = Private::new();
+        let (fixture, paths) = sample("dragged-out");
+        let root = file_url(&fixture.0);
+        let carried = |paths: &[PathBuf]| -> Vec<String> {
+            private.0.clearContents();
+            private
+                .0
+                .writeObjects(&NSArray::from_retained_slice(&file_url_writers(paths)));
+            let items = private.0.pasteboardItems().unwrap();
+            items
+                .iter()
+                .filter_map(|item| item.stringForType(unsafe { NSPasteboardTypeFileURL }))
+                .map(|url| url.to_string())
+                .collect()
+        };
+        assert_eq!(carried(&paths[1..2]), [format!("{root}caf%C3%A9.md")]);
+        assert_eq!(file_urls(&private.0), paths[1..2]);
+        assert_eq!(
+            carried(&paths),
+            [
+                format!("{root}packing%20list.txt"),
+                format!("{root}caf%C3%A9.md"),
+                format!("{root}trips/"),
+            ]
+        );
+        assert_eq!(file_urls(&private.0), paths);
+        // Nothing beside the URLs: no text for another app to take.
+        assert_eq!(private.text(), None);
+    }
+
+    /// What a drag carries is read the same way. Text and an image are
+    /// not files, a path written out as text included: dropped on the
+    /// Explorer's tree, which takes files only, they are nothing.
+    #[test]
+    fn a_drag_of_text_or_of_an_image_carries_no_files() {
+        let private = Private::new();
+        let (_fixture, paths) = sample("drag");
+        write_file_urls_on(&private.0, &paths);
+        assert_eq!(file_urls(&private.0), paths);
+
+        write_text_on(&private.0, &paths[0].to_string_lossy());
+        assert_eq!(file_urls(&private.0), [] as [PathBuf; 0]);
+        assert_eq!(
+            private.text(),
+            Some(paths[0].to_string_lossy().into_owned())
+        );
+
+        private.0.clearContents();
+        let image = objc2_foundation::NSData::with_bytes(b"not really a png");
+        private
+            .0
+            .setData_forType(Some(&image), unsafe { NSPasteboardTypePNG });
+        assert!(has_image_on(&private.0));
+        assert_eq!(file_urls(&private.0), [] as [PathBuf; 0]);
     }
 }

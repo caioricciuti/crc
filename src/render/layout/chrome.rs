@@ -2852,6 +2852,32 @@ pub struct SidebarEdit<'a> {
     pub text: &'a str,
     pub cursor: usize,
     pub selection: Option<std::ops::Range<usize>>,
+    /// What is wrong with the name as typed, or odd about it: said under
+    /// the field, which is outlined in the note's colour.
+    pub note: Option<FieldNote<'a>>,
+}
+
+/// The colour of a row's Git mark and of its name: the ones the letters
+/// in Source Control's list have. A rename is in the colour of a new
+/// file, the accent being the selection's here.
+pub fn git_mark_colour(mark: crate::project::marks::Mark, theme: &Theme) -> [f32; 4] {
+    use crate::project::marks::Mark;
+    match mark {
+        Mark::Modified | Mark::Contains => theme.diff_modified,
+        Mark::Added | Mark::Untracked | Mark::Renamed => theme.diff_added,
+        Mark::Deleted | Mark::Conflicted | Mark::ContainsConflict => theme.diff_removed,
+    }
+}
+
+/// Where a row's Git mark goes in the Explorer `viewport`, on the row at
+/// `y`: at the right edge, inside the row's pill.
+pub fn sidebar_mark_slot(viewport: Viewport, y: f32) -> Viewport {
+    Viewport {
+        x: viewport.x + viewport.width - UI_INSET - ROW_MARK,
+        y,
+        width: ROW_MARK,
+        height: SIDEBAR_ROW_HEIGHT,
+    }
 }
 
 /// What the Explorer says with no folder open.
@@ -2981,11 +3007,14 @@ pub fn build_sidebar_with_edit(
     let first = tree.scroll.min(total.saturating_sub(1));
     let last = (first + rows).min(total);
     let mut drawn = 0;
+    // The name field's box, once its row is drawn: what it says about the
+    // name goes over the rows next to it, after them.
+    let mut field = None;
 
     for visible in first..last {
         let y = sidebar_row_rect(viewport, visible - first).y;
         if let Some(edit) = edit.as_ref().filter(|e| e.row == visible) {
-            push_sidebar_edit_row(edit, atlas, viewport, y, theme, out);
+            field = Some(push_sidebar_edit_row(edit, atlas, viewport, y, theme, out));
             drawn += 1;
             continue;
         }
@@ -3105,30 +3134,54 @@ pub fn build_sidebar_with_edit(
         );
         column += icon_w;
 
+        // Git's word on the row: its letter at the right edge, or a dot
+        // for a folder with changes inside, and the name in its colour.
+        // One lookup, and none outside a repository or in a clean one.
+        let mark = tree.git_mark(&entry.path);
         let color = if selected {
             picked
         } else if ignored == crate::project::tree::Ignored::Preview {
             // Would be ignored once the .gitignore being typed is saved.
             let [r, g, b, _] = theme.accent;
             [r, g, b, 0.8]
+        } else if let Some(mark) = mark {
+            dim(git_mark_colour(mark, theme))
         } else if entry.is_dir {
             dim(theme.sidebar_directory)
         } else {
             dim(theme.sidebar_text)
         };
+        let name_x = viewport.x + column;
+        let mut name_end = viewport.x + viewport.width - 14.0;
+        // The mark has its own room and the name ends short of it. A row
+        // with no room for it past the icon goes without, rather than
+        // show a part of one. It keeps its colour on a selected row, where
+        // the name is the selection's.
+        if let Some(mark) = mark {
+            let slot = sidebar_mark_slot(viewport, y);
+            if slot.x >= name_x {
+                let colour = dim(git_mark_colour(mark, theme));
+                push_row_mark(out, atlas, slot, mark.letter(), colour);
+                name_end = slot.x - UI_GAP;
+            }
+        }
         push_ui_text_elided(
             out,
             atlas,
             Viewport {
-                x: viewport.x + column,
+                x: name_x,
                 y,
-                width: (viewport.width - column - 14.0).max(0.0),
+                width: (name_end - name_x).max(0.0),
                 height: SIDEBAR_ROW_HEIGHT,
             },
             &entry.name,
             color,
         );
         drawn += 1;
+    }
+
+    if let Some((field, note)) = field.zip(edit.as_ref().and_then(|e| e.note)) {
+        push_field_note(out, atlas, field, viewport, note, theme);
     }
 
     drawn
@@ -3171,6 +3224,8 @@ pub fn sidebar_drop_band(
 
 /// The name field in the tree, drawn where the item will appear: the same
 /// indent, an icon that follows the extension as it is typed, and a caret.
+/// Outlined in the accent, or in the colour of what it has to say about
+/// the name. The field's box.
 pub(super) fn push_sidebar_edit_row(
     edit: &SidebarEdit<'_>,
     atlas: &mut Atlas,
@@ -3178,7 +3233,7 @@ pub(super) fn push_sidebar_edit_row(
     y: f32,
     theme: &Theme,
     out: &mut Vec<GlyphInstance>,
-) {
+) -> Viewport {
     let m = atlas.metrics;
     let (cell_w, cell_h) = atlas.cell_size();
     let glyph_dy = m.glyph_dy(SIDEBAR_ROW_HEIGHT);
@@ -3204,7 +3259,10 @@ pub(super) fn push_sidebar_edit_row(
         width: (viewport.width - indent - 22.0 - 12.0).max(0.0),
         height: SIDEBAR_ROW_HEIGHT - 4.0,
     };
-    push_rounded_rect(out, field, 4.0, theme.accent);
+    let outline = edit
+        .note
+        .map_or(theme.accent, |note| note.tone.colour(theme));
+    push_rounded_rect(out, field, 4.0, outline);
     push_rounded_rect(
         out,
         Viewport {
@@ -3236,6 +3294,7 @@ pub(super) fn push_sidebar_edit_row(
         },
         theme,
     );
+    field
 }
 
 /// Something the pointer can land on, named so input handling, cursor
@@ -4342,5 +4401,526 @@ mod narrow_sidebar_tests {
                 );
             }
         }
+    }
+}
+
+/// The Explorer's Git marks and the note under its name field, as drawn.
+#[cfg(test)]
+mod explorer_git_tests {
+    use super::*;
+    use crate::project::git::{Change, Snapshot};
+    use crate::project::marks::Mark;
+
+    const WIDTHS: [f32; 2] = [140.0, 240.0];
+
+    fn column(width: f32) -> Viewport {
+        Viewport {
+            x: 48.0,
+            y: 48.0,
+            width,
+            height: 600.0,
+        }
+    }
+
+    fn change(path: &str, index: u8, worktree: u8) -> Change {
+        Change {
+            path: path.into(),
+            original: None,
+            index,
+            worktree,
+        }
+    }
+
+    /// A kitchen notebook with every kind of row: changed files, a name
+    /// longer than any sidebar, a folder with changes inside, one with a
+    /// conflict inside, a row four folders down, and files Git has
+    /// nothing to say about. `recipes` and the folders down to
+    /// `deep.md` are open.
+    fn notebook(name: &str) -> (crate::project::TempTree, Tree) {
+        let files = crate::project::TempTree::new(
+            name,
+            &[
+                ("plots/tomatoes.md", ""),
+                ("recipes/a-very-long-recipe-name-for-sunday-lunch.md", ""),
+                ("recipes/bread.md", ""),
+                ("recipes/pancakes.md", ""),
+                ("recipes/soup.md", ""),
+                ("trips/lisbon.md", ""),
+                ("years/2026/may/week/deep.md", ""),
+                ("garden.txt", ""),
+                ("groceries.txt", ""),
+                ("journal.md", ""),
+                ("letters.txt", ""),
+                ("scratch.log", ""),
+            ],
+        );
+        let mut tree = Tree::new();
+        tree.open(&files.0);
+        tree.clear_selection();
+        for folder in ["recipes", "years", "2026", "may", "week"] {
+            let row = tree
+                .rows()
+                .iter()
+                .position(|e| e.is_dir && e.name == folder)
+                .unwrap_or_else(|| panic!("no folder {folder}"));
+            tree.toggle(row);
+        }
+        let snapshot = Snapshot {
+            root: files.0.clone(),
+            branch: "main".into(),
+            changes: vec![
+                change("plots/tomatoes.md", b'U', b'U'),
+                change(
+                    "recipes/a-very-long-recipe-name-for-sunday-lunch.md",
+                    b' ',
+                    b'M',
+                ),
+                change("recipes/bread.md", b' ', b'M'),
+                change("recipes/pancakes.md", b'?', b'?'),
+                change("years/2026/may/week/deep.md", b' ', b'M'),
+                change("garden.txt", b'A', b' '),
+                change("groceries.txt", b'R', b' '),
+                change("journal.md", b' ', b'M'),
+            ],
+            in_progress: None,
+            head_message: None,
+            head_pushed: false,
+        };
+        assert!(tree.sync_git(1, Some(&snapshot), &files.0));
+        tree.set_ignored(std::sync::Arc::new(
+            [files.0.join("scratch.log")].into_iter().collect(),
+        ));
+        (files, tree)
+    }
+
+    fn row_of(tree: &Tree, name: &str) -> usize {
+        tree.rows()
+            .iter()
+            .position(|e| e.name == name)
+            .unwrap_or_else(|| panic!("no row {name}"))
+    }
+
+    /// The quads on the row of `name` in `colour`, left of the mark's
+    /// room and in it.
+    fn row_quads(
+        out: &[GlyphInstance],
+        tree: &Tree,
+        column: Viewport,
+        name: &str,
+        colour: [f32; 4],
+    ) -> (Vec<GlyphInstance>, Vec<GlyphInstance>) {
+        let y = sidebar_row_rect(column, row_of(tree, name) - tree.scroll).y;
+        let slot = sidebar_mark_slot(column, y);
+        out.iter()
+            .filter(|q| q.color == colour && q.pos[1] >= y && q.pos[1] < y + SIDEBAR_ROW_HEIGHT)
+            .partition(|q| q.pos[0] < slot.x)
+    }
+
+    /// The mark is whole at the narrowest sidebar and at the usual one,
+    /// in both themes: the whole of the letter is inside the room kept
+    /// for it, and the name ends short of that room. Nothing is cut at an
+    /// edge and nothing leaves the column.
+    #[test]
+    fn a_mark_is_never_cut_and_the_name_ends_before_it() {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let (_files, tree) = notebook("explorer-marks-whole");
+        for theme in [Theme::dark(), Theme::light()] {
+            for width in WIDTHS {
+                let column = column(width);
+                let mut out = Vec::new();
+                take_cut_labels();
+                build_sidebar(&tree, false, &mut atlas, column, &theme, &mut out);
+                assert_eq!(
+                    frame_faults(&out, column),
+                    Vec::<String>::new(),
+                    "the Explorer at {width}"
+                );
+                for (name, mark) in [
+                    (
+                        "a-very-long-recipe-name-for-sunday-lunch.md",
+                        Mark::Modified,
+                    ),
+                    ("bread.md", Mark::Modified),
+                    ("pancakes.md", Mark::Untracked),
+                    ("garden.txt", Mark::Added),
+                    ("groceries.txt", Mark::Renamed),
+                    ("journal.md", Mark::Modified),
+                ] {
+                    let colour = git_mark_colour(mark, &theme);
+                    let (label, letter) = row_quads(&out, &tree, column, name, colour);
+                    let y = sidebar_row_rect(column, row_of(&tree, name)).y;
+                    let slot = sidebar_mark_slot(column, y);
+                    // A glyph's quad is as wide as its cell and ends where
+                    // the room does; the letter is whole when its advance
+                    // is inside both.
+                    let advance = ui_text_width(&mut atlas, mark.letter().expect("a letter"));
+                    let starts = slot.x + (slot.width - advance) * 0.5;
+                    assert_eq!(letter.len(), 1, "{name} has one letter at {width}");
+                    let drawn = letter[0];
+                    assert!(
+                        drawn.pos[0] >= slot.x
+                            && drawn.pos[0] + drawn.size[0] <= slot.x + slot.width + 0.51,
+                        "{name}'s letter leaves its room at {width}: {drawn:?} in {slot:?}"
+                    );
+                    assert!(
+                        drawn.pos[0] <= starts + 0.51
+                            && drawn.pos[0] + drawn.size[0] >= starts + advance - 0.51,
+                        "{name}'s letter is cut at {width}: {drawn:?}, {advance} from {starts}"
+                    );
+                    assert!(
+                        !label.is_empty(),
+                        "{name} keeps some of its name at {width}"
+                    );
+                    for quad in &label {
+                        assert!(
+                            quad.pos[0] + quad.size[0] <= slot.x - UI_GAP + 0.51,
+                            "{name} runs into its mark at {width}: {quad:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every letter fits the room kept for it.
+    #[test]
+    fn every_letter_fits_the_room_of_a_mark() {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        for mark in [
+            Mark::Modified,
+            Mark::Added,
+            Mark::Untracked,
+            Mark::Deleted,
+            Mark::Renamed,
+            Mark::Conflicted,
+        ] {
+            let letter = mark.letter().expect("a letter");
+            let width = ui_text_width(&mut atlas, letter);
+            assert!(width <= ROW_MARK, "{letter} is {width} wide");
+        }
+    }
+
+    /// A folder says what it holds with a dot, in the colour of a change
+    /// or of a conflict; a row with no room for a mark past its icon goes
+    /// without one rather than show a part of it.
+    #[test]
+    fn a_folder_has_a_dot_and_a_row_with_no_room_has_no_mark() {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let theme = Theme::default();
+        let (_files, tree) = notebook("explorer-marks-dots");
+        let dots = |out: &[GlyphInstance], name: &str, colour: [f32; 4], column: Viewport| {
+            let (_, mark) = row_quads(out, &tree, column, name, colour);
+            mark.iter()
+                .filter(|q| q.flags & crate::render::metal::ROUNDED != 0)
+                .map(|q| q.size)
+                .collect::<Vec<_>>()
+        };
+        for width in WIDTHS {
+            let column = column(width);
+            let mut out = Vec::new();
+            build_sidebar(&tree, false, &mut atlas, column, &theme, &mut out);
+            assert_eq!(
+                dots(&out, "recipes", theme.diff_modified, column),
+                [[6.0, 6.0]],
+                "at {width}"
+            );
+            assert_eq!(
+                dots(&out, "plots", theme.diff_removed, column),
+                [[6.0, 6.0]],
+                "a conflict inside, at {width}"
+            );
+            assert_eq!(
+                dots(&out, "years", theme.diff_modified, column),
+                [[6.0, 6.0]]
+            );
+            // A folder with nothing changed in it, and a file Git has
+            // nothing to say about, have no mark.
+            for (name, colour) in [
+                ("trips", theme.sidebar_directory),
+                ("letters.txt", theme.sidebar_text),
+            ] {
+                let (label, mark) = row_quads(&out, &tree, column, name, colour);
+                assert!(!label.is_empty() && mark.is_empty(), "{name} at {width}");
+            }
+            for colour in [theme.diff_modified, theme.diff_added, theme.diff_removed] {
+                let (label, mark) = row_quads(&out, &tree, column, "letters.txt", colour);
+                assert!(label.is_empty() && mark.is_empty());
+            }
+        }
+        // The glyph of the letter M, by where it is in the atlas.
+        let mut m = Vec::new();
+        let anywhere = sidebar_mark_slot(column(240.0), 0.0);
+        push_row_mark(&mut m, &mut atlas, anywhere, Some("M"), theme.diff_modified);
+        let is_m = |q: &GlyphInstance| q.uv[..2] == m[0].uv[..2];
+        // With room, a row four folders down has its letter.
+        let wide = column(240.0);
+        let mut out = Vec::new();
+        build_sidebar(&tree, false, &mut atlas, wide, &theme, &mut out);
+        let (_, letter) = row_quads(&out, &tree, wide, "deep.md", theme.diff_modified);
+        assert_eq!(letter.len(), 1);
+        assert!(is_m(&letter[0]));
+        // At the narrowest width its icon reaches the mark's room: no
+        // letter, whole or cut, and the name ends as it always did.
+        let narrow = column(140.0);
+        let mut out = Vec::new();
+        take_cut_labels();
+        build_sidebar(&tree, false, &mut atlas, narrow, &theme, &mut out);
+        let (name, rest) = row_quads(&out, &tree, narrow, "deep.md", theme.diff_modified);
+        assert!(!name.iter().chain(&rest).any(is_m), "{name:?} {rest:?}");
+        assert_eq!(frame_faults(&out, narrow), Vec::<String>::new());
+    }
+
+    /// A selected row's name is the selection's and its letter keeps the
+    /// mark's colour; a cut row and an ignored one are dimmed, mark and
+    /// all. In both themes every one of them stands off the sidebar.
+    #[test]
+    fn selected_cut_and_ignored_rows_stay_readable() {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let luminance = |c: [f32; 4]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+        for theme in [Theme::dark(), Theme::light()] {
+            let (files, mut tree) = notebook("explorer-marks-states");
+            let column = column(240.0);
+            tree.focused = true;
+            tree.select(row_of(&tree, "journal.md"));
+            tree.set_cut(vec![files.0.join("recipes/bread.md")]);
+            let mut out = Vec::new();
+            build_sidebar(&tree, false, &mut atlas, column, &theme, &mut out);
+            let amber = theme.diff_modified;
+            // Selected: the name in the accent, the letter in amber.
+            let (name, letter) = row_quads(&out, &tree, column, "journal.md", theme.accent);
+            assert!(!name.is_empty() && letter.is_empty());
+            let (name, letter) = row_quads(&out, &tree, column, "journal.md", amber);
+            assert!(name.is_empty());
+            assert_eq!(letter.len(), 1);
+            // Cut: name and letter at the strength a cut row has.
+            let dimmed = faded(amber, 0.45);
+            let (name, letter) = row_quads(&out, &tree, column, "bread.md", dimmed);
+            assert!(!name.is_empty());
+            assert_eq!(letter.len(), 1);
+            // Ignored: dimmed as before, and no mark.
+            let (name, letter) = row_quads(
+                &out,
+                &tree,
+                column,
+                "scratch.log",
+                faded(theme.sidebar_text, 0.45),
+            );
+            assert!(!name.is_empty() && letter.is_empty());
+            // Each colour a mark can have is far enough from the
+            // sidebar's to read, on its own and under the selection's
+            // wash.
+            let ground = luminance(theme.sidebar_background);
+            let wash = mixed(
+                theme.sidebar_background,
+                theme.sidebar_selected,
+                theme.sidebar_selected[3],
+            );
+            for colour in [theme.diff_modified, theme.diff_added, theme.diff_removed] {
+                assert!((luminance(colour) - ground).abs() > 0.25, "{colour:?}");
+                assert!(
+                    (luminance(colour) - luminance(wash)).abs() > 0.25,
+                    "{colour:?}"
+                );
+            }
+        }
+    }
+
+    /// Outside a repository, and in a clean one, the Explorer draws what
+    /// it drew before there were marks: the same quads, one for one.
+    #[test]
+    fn a_tree_with_no_marks_draws_as_it_did() {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let theme = Theme::default();
+        let (files, marked) = notebook("explorer-marks-none");
+        let mut plain = Tree::new();
+        plain.open(&files.0);
+        plain.clear_selection();
+        let mut clean = plain.clone();
+        let nothing = Snapshot {
+            root: files.0.clone(),
+            branch: "main".into(),
+            changes: Vec::new(),
+            in_progress: None,
+            head_message: None,
+            head_pushed: false,
+        };
+        assert!(clean.sync_git(9, Some(&nothing), &files.0));
+        let column = column(240.0);
+        let draw = |tree: &Tree, atlas: &mut Atlas| {
+            let mut out = Vec::new();
+            build_sidebar(tree, false, atlas, column, &theme, &mut out);
+            out.iter()
+                .map(|q| (q.pos, q.size, q.uv, q.color, q.flags))
+                .collect::<Vec<_>>()
+        };
+        let before = draw(&plain, &mut atlas);
+        assert_eq!(draw(&clean, &mut atlas), before);
+        // And with marks there is more to draw.
+        let mut collapsed = marked.clone();
+        for folder in ["week", "may", "2026", "years", "recipes"] {
+            collapsed.toggle(row_of(&collapsed, folder));
+        }
+        assert!(draw(&collapsed, &mut atlas).len() > before.len());
+    }
+
+    fn edit<'a>(row: usize, text: &'a str, note: Option<FieldNote<'a>>) -> SidebarEdit<'a> {
+        SidebarEdit {
+            row,
+            depth: 0,
+            replaces: false,
+            is_dir: false,
+            text,
+            cursor: text.len(),
+            selection: None,
+            note,
+        }
+    }
+
+    /// What is wrong with the name is said right under the field, as wide
+    /// as it, over the row below and after it; the field is outlined in
+    /// the note's colour. At the narrowest sidebar the line ends in an
+    /// ellipsis, and nothing is cut or leaves the column.
+    #[test]
+    fn the_name_field_says_what_is_wrong_under_itself() {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let (_files, tree) = notebook("explorer-field-note");
+        for theme in [Theme::dark(), Theme::light()] {
+            for width in WIDTHS {
+                let column = column(width);
+                let y = sidebar_row_rect(column, 2).y;
+                let mut plain = Vec::new();
+                build_sidebar_with_edit(
+                    &tree,
+                    false,
+                    Some(edit(2, "soup.md", None)),
+                    &mut atlas,
+                    column,
+                    &theme,
+                    &mut plain,
+                );
+                let outline_of = |out: &[GlyphInstance]| {
+                    out.iter()
+                        .find(|q| q.pos[1] == y + 2.0 && q.size[1] == SIDEBAR_ROW_HEIGHT - 4.0)
+                        .map(|q| {
+                            (
+                                q.color,
+                                Viewport {
+                                    x: q.pos[0],
+                                    y: q.pos[1],
+                                    width: q.size[0],
+                                    height: q.size[1],
+                                },
+                            )
+                        })
+                        .expect("the field's outline")
+                };
+                assert_eq!(outline_of(&plain).0, theme.accent);
+                for (tone, colour) in [
+                    (NoteTone::Error, theme.diff_removed),
+                    (NoteTone::Warning, theme.diff_modified),
+                ] {
+                    let note = FieldNote {
+                        text: "This name is already taken",
+                        tone,
+                    };
+                    let mut out = Vec::new();
+                    take_cut_labels();
+                    build_sidebar_with_edit(
+                        &tree,
+                        false,
+                        Some(edit(2, "soup.md", Some(note))),
+                        &mut atlas,
+                        column,
+                        &theme,
+                        &mut out,
+                    );
+                    assert_eq!(
+                        frame_faults(&out, column),
+                        Vec::<String>::new(),
+                        "at {width}"
+                    );
+                    let (outline, field) = outline_of(&out);
+                    assert_eq!(outline, colour, "the field's outline at {width}");
+                    // The note's own quads come after everything else.
+                    let added = &out[plain.len()..];
+                    let panel = added.first().expect("the note");
+                    assert_eq!(panel.color, colour);
+                    assert_eq!(panel.pos[1], field.y + field.height + 2.0);
+                    assert_eq!(panel.size[1], FIELD_NOTE);
+                    // It ends where the field ends. With room for its line
+                    // it is as wide as the field; without, it grows to the
+                    // left and stays inside the column.
+                    assert_eq!(
+                        panel.pos[0] + panel.size[0],
+                        field.x + field.width,
+                        "at {width}"
+                    );
+                    if width == 240.0 {
+                        assert_eq!(panel.pos[0], field.x);
+                    } else {
+                        assert!(panel.pos[0] < field.x, "wider than the field at {width}");
+                        assert_eq!(panel.pos[0], column.x + UI_GAP);
+                    }
+                    let text: Vec<_> = added
+                        .iter()
+                        .filter(|q| q.flags & crate::render::metal::ROUNDED == 0)
+                        .collect();
+                    assert!(!text.is_empty(), "the note says something at {width}");
+                    for quad in text {
+                        assert_eq!(quad.color, colour);
+                        assert!(
+                            quad.pos[0] >= panel.pos[0]
+                                && quad.pos[0] + quad.size[0]
+                                    <= panel.pos[0] + panel.size[0] + 0.51,
+                            "the note's text leaves it at {width}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// On the last row the column shows there is no room under the
+    /// field: the note goes right above it.
+    #[test]
+    fn the_note_goes_above_a_field_on_the_last_row() {
+        let field = Viewport {
+            x: 90.0,
+            y: 300.0,
+            width: 120.0,
+            height: 22.0,
+        };
+        let roomy = Viewport {
+            x: 48.0,
+            y: 48.0,
+            width: 240.0,
+            height: 600.0,
+        };
+        assert_eq!(field_note_rect(field, roomy, 0.0).y, 324.0);
+        // Exactly enough room is enough.
+        let exact = Viewport {
+            height: 324.0 + FIELD_NOTE - 48.0,
+            ..roomy
+        };
+        assert_eq!(field_note_rect(field, exact, 0.0).y, 324.0);
+        let tight = Viewport {
+            height: exact.height - 1.0,
+            ..roomy
+        };
+        let above = field_note_rect(field, tight, 100.0);
+        assert_eq!(above.y, 300.0 - 2.0 - FIELD_NOTE);
+        assert_eq!(
+            (above.x, above.width, above.height),
+            (90.0, 120.0, FIELD_NOTE)
+        );
+        // A line wider than the field has the note grow to the left, as
+        // far as the bounds go, and end where the field ends.
+        let wider = field_note_rect(field, roomy, 150.0);
+        assert_eq!((wider.x, wider.width), (60.0, 150.0));
+        let widest = field_note_rect(field, roomy, 400.0);
+        assert_eq!(
+            (widest.x, widest.width),
+            (48.0 + UI_GAP, 210.0 - 48.0 - UI_GAP)
+        );
     }
 }

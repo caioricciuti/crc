@@ -4,6 +4,79 @@
 use super::explorer::Did;
 use super::*;
 use crate::project::fileops::Op;
+use crate::project::naming::{self, Problem};
+
+/// What the tree's name field knows about the name in it.
+#[derive(Default)]
+pub(super) struct NameCheck {
+    /// The text the verdict is for; `None` before the first, and to have
+    /// the next one asked whatever the text.
+    text: Option<String>,
+    problem: Option<Problem>,
+    /// Whether the verdict is said under the field: once the text has
+    /// been edited, or Return refused. A field just opened says nothing
+    /// about the name it starts with.
+    said: bool,
+}
+
+impl SidebarEdit {
+    /// Brings the verdict up to date with the field's text, and answers
+    /// the text. The folder is looked at once for each text the field
+    /// comes to hold, however many frames draw it: the same text again
+    /// asks nothing.
+    pub(super) fn check_name(&mut self) -> &str {
+        let text = self.field.rope.to_string();
+        if self.check.text.as_deref() != Some(text.as_str()) {
+            let ask = naming::Ask {
+                parent: &self.parent,
+                nested: !self.replaces(),
+                renaming: match &self.kind {
+                    SidebarEditKind::Rename(path) => Some(path),
+                    _ => None,
+                },
+            };
+            self.check.problem = naming::check(&text, &ask);
+            self.check.said |= self.check.text.is_some();
+            self.check.text = Some(text);
+        }
+        self.name()
+    }
+
+    /// The text the verdict is for: the field's, as of the last
+    /// [`SidebarEdit::check_name`].
+    pub(super) fn name(&self) -> &str {
+        self.check.text.as_deref().unwrap_or_default()
+    }
+
+    /// Whether the name would be refused, asked of the folder as it is
+    /// now rather than as it was when the text last changed: for Return
+    /// and for a click elsewhere, not for a frame.
+    fn refuses_now(&mut self) -> bool {
+        let said = self.check.said;
+        self.check.text = None;
+        self.check_name();
+        self.check.said = said;
+        self.check.problem.is_some_and(Problem::blocks)
+    }
+
+    /// What is wrong with the name, or odd about it, once that is said.
+    pub(super) fn problem(&self) -> Option<Problem> {
+        self.check.problem.filter(|_| self.check.said)
+    }
+
+    /// The problem as the field shows it under itself.
+    pub(super) fn note(&self) -> Option<layout::FieldNote<'static>> {
+        let problem = self.problem()?;
+        Some(layout::FieldNote {
+            text: problem.said(),
+            tone: if problem.blocks() {
+                layout::NoteTone::Error
+            } else {
+                layout::NoteTone::Warning
+            },
+        })
+    }
+}
 
 impl EditorView {
     /// Starts, or restarts, the FSEvents watcher on the current root.
@@ -114,9 +187,12 @@ impl EditorView {
         }
         start_project_refresh(&mut state);
         start_home_summary(&mut state);
-        if state.git_open {
-            state.git.refresh();
-        }
+        // The status is on show with Source Control closed too: the marks
+        // on the Explorer's rows and the count on the activity bar. A file
+        // another program changed gets its letter once the watcher has
+        // settled, not when the panel is next opened: one status on a
+        // worker for each settled batch, and one waiting at most.
+        state.git.refresh();
         drop(state);
         self.check_open_files();
         self.resume_display_link();
@@ -210,13 +286,18 @@ impl EditorView {
                 state.tree.scroll = row + 1 - rows;
             }
         }
-        state.sidebar_edit = Some(SidebarEdit {
+        let mut edit = SidebarEdit {
             kind,
             parent,
             row,
             depth,
             field,
-        });
+            check: NameCheck::default(),
+        };
+        // The name the field starts with is where its edits are counted
+        // from: nothing is said about it until it changes.
+        edit.check_name();
+        state.sidebar_edit = Some(edit);
         drop(state);
         self.request_redraw();
         self.pump();
@@ -242,7 +323,7 @@ impl EditorView {
         };
         match code {
             ESCAPE => self.finish_sidebar_edit(false),
-            key::RETURN => self.finish_sidebar_edit(true),
+            key::RETURN => self.submit_sidebar_edit(),
             key::TAB => return true,
             key::DELETE => {
                 let Some(mut state) = self.state_mut() else {
@@ -277,37 +358,50 @@ impl EditorView {
         true
     }
 
-    /// Ends the inline field: creates, renames, or does nothing.
+    /// Return in the name field: the name is taken, unless something is
+    /// wrong with it. Then the field stays open and says what, and Return
+    /// has done nothing.
+    pub(super) fn submit_sidebar_edit(&self) {
+        let refused = {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            let Some(edit) = state.sidebar_edit.as_mut() else {
+                return;
+            };
+            let refused = edit.refuses_now();
+            // Said from here on, even about a name not yet edited: an
+            // empty field just opened.
+            edit.check.said |= refused;
+            refused
+        };
+        if refused {
+            self.request_redraw();
+            self.pump();
+        } else {
+            self.finish_sidebar_edit(true);
+        }
+    }
+
+    /// Ends the inline field: creates, renames, or does nothing. A name
+    /// that will not do is dropped without a word: this is also where a
+    /// click elsewhere ends up, and that is no time to fail.
     pub(super) fn finish_sidebar_edit(&self, commit: bool) {
-        let Some(edit) = self
+        let Some(mut edit) = self
             .state_mut()
             .and_then(|mut state| state.sidebar_edit.take())
         else {
             return;
         };
-        let name = edit.field.rope.to_string();
-        let name = name.trim();
-        if !commit || name.is_empty() {
+        if !commit || edit.refuses_now() {
             self.request_redraw();
             return;
         }
+        // As typed: spaces at either end are the name's, and the field
+        // has said so.
+        let name = edit.check_name().to_owned();
+        let name = name.as_str();
         let relative = Path::new(name);
-        let single = relative.file_name().is_some_and(|part| part == name);
-        let nested_ok = !name.starts_with('/')
-            && relative.components().all(
-                |c| matches!(c, std::path::Component::Normal(part) if part != "." && part != ".."),
-            );
-        let valid = match edit.kind {
-            SidebarEditKind::NewFile | SidebarEditKind::NewFolder => nested_ok,
-            SidebarEditKind::Rename(_) => single,
-        };
-        if !valid {
-            if let Some(mut state) = self.state_mut() {
-                state.message = Some((format!("not a valid name: {name}"), Instant::now()));
-            }
-            self.request_redraw();
-            return;
-        }
         let target = edit.parent.join(relative);
         match edit.kind {
             SidebarEditKind::NewFile => {
@@ -404,7 +498,8 @@ impl EditorView {
     /// Explorer, with its tabs and its local history. Says `done` when it
     /// has moved, or `failed` and why.
     pub(super) fn move_item(&self, op: Op<'_>, done: String, failed: &str) {
-        let moved = self.relocate(op, false);
+        let step = self.begin_file_step();
+        let moved = self.relocate(op, false, step);
         if let Some(mut state) = self.state_mut() {
             state.message = Some((
                 match &moved {
@@ -430,8 +525,9 @@ impl EditorView {
     /// pane, its local history and the Explorer's selection. Neither says
     /// anything nor reads the tree again: the caller does both, once.
     /// With `free`, a destination taken since it was chosen gives way to
-    /// the next free name. Answers where the item is now.
-    pub(super) fn relocate(&self, op: Op<'_>, free: bool) -> std::io::Result<Did> {
+    /// the next free name. What was done is kept as one of the operations
+    /// of `step`. Answers where the item is now.
+    pub(super) fn relocate(&self, op: Op<'_>, free: bool, step: u64) -> std::io::Result<Did> {
         let Some(mut state) = self.state_mut() else {
             return Err(std::io::Error::other("the window is busy"));
         };
@@ -444,7 +540,7 @@ impl EditorView {
             ..
         } = &mut *state;
         let open = std::iter::once(docs).chain(panes.iter_mut().map(|p| &mut p.docs));
-        let did = move_project_item(open, history, explorer, op, free)?;
+        let did = move_project_item(open, history, explorer, step, op, free)?;
         if let (Op::Rename { from, .. } | Op::Move { from, .. }, Some(to)) = (op, &did.path) {
             // The Explorer's selection stays on the item.
             tree.follow_move(from, to);
@@ -505,12 +601,14 @@ impl EditorView {
 /// what is kept by its path goes with it: the tabs open on it or under it
 /// are re-keyed, and local history follows the file, or every file in the
 /// folder. Nothing at the destination is replaced, and a symbolic link
-/// moves as the link. What was done is kept in `files`; with `free`, a
-/// destination taken since it was chosen gives way to the next free name.
+/// moves as the link. What was done is kept in `files`, as one of the
+/// operations of `step`; with `free`, a destination taken since it was
+/// chosen gives way to the next free name.
 fn move_project_item<'a>(
     open: impl Iterator<Item = &'a mut Documents>,
     history: &mut crate::history::recorder::Recorder,
     files: &mut explorer::Files,
+    step: u64,
     op: Op<'_>,
     free: bool,
 ) -> std::io::Result<Did> {
@@ -520,20 +618,33 @@ fn move_project_item<'a>(
     // Open buffers use canonical identities. Capture the source key
     // before the move makes it impossible to canonicalise.
     let source_key = crate::platform::canonical(source);
-    let did = explorer::file_op(files, op, free)?;
+    let did = explorer::file_op(files, step, op, free)?;
     let Some(destination) = did.path.as_deref() else {
         return Ok(did);
     };
+    follow_moved(open, history, &source_key, destination);
+    Ok(did)
+}
+
+/// What is kept by an item's path goes with the item that has moved to
+/// `destination` from `source_key`, its canonical path while it was still
+/// there: the tabs open on it or under it, and its local history. An undo
+/// that moves an item back comes here too.
+pub(super) fn follow_moved<'a>(
+    open: impl Iterator<Item = &'a mut Documents>,
+    history: &mut crate::history::recorder::Recorder,
+    source_key: &Path,
+    destination: &Path,
+) {
     for docs in open {
-        docs.rename_path(&source_key, destination);
+        docs.rename_path(source_key, destination);
     }
     let moved = crate::platform::canonical(destination);
     if moved.is_dir() {
-        history.rename_folder(&source_key, &moved);
+        history.rename_folder(source_key, &moved);
     } else {
-        history.rename(&source_key, &moved);
+        history.rename(source_key, &moved);
     }
-    Ok(did)
 }
 
 /// Moves the item at `path` to the Trash, a symbolic link as the link, and
@@ -542,15 +653,43 @@ fn move_project_item<'a>(
 pub(super) fn trash_item(path: &Path) -> Result<Option<std::path::PathBuf>, String> {
     // Said outright: asked to find out, the URL follows a link to a folder.
     let folder = std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir());
-    let url =
-        NSURL::fileURLWithPath_isDirectory(&NSString::from_str(&path.to_string_lossy()), folder);
-    let mut landed = None;
-    NSFileManager::defaultManager()
-        .trashItemAtURL_resultingItemURL_error(&url, Some(&mut landed))
-        .map_err(|error| error.localizedDescription().to_string())?;
-    Ok(landed
-        .and_then(|url| url.path())
-        .map(|path| std::path::PathBuf::from(path.to_string())))
+    if std::env::var_os("CRC_SELFTEST").is_some() {
+        return scripted_trash(path, folder);
+    }
+    // In a pool of its own: a copy that replaces an item asks from its
+    // worker, which has none.
+    objc2::rc::autoreleasepool(|_| {
+        let url = NSURL::fileURLWithPath_isDirectory(
+            &NSString::from_str(&path.to_string_lossy()),
+            folder,
+        );
+        let mut landed = None;
+        NSFileManager::defaultManager()
+            .trashItemAtURL_resultingItemURL_error(&url, Some(&mut landed))
+            .map_err(|error| error.localizedDescription().to_string())?;
+        Ok(landed
+            .and_then(|url| url.path())
+            .map(|path| std::path::PathBuf::from(path.to_string())))
+    })
+}
+
+/// A test instance's Trash: the folder `CRC_SELFTEST_TRASH` names, where
+/// the item takes the next free name as the Trash renames what would
+/// clash. With no such folder nothing is moved: no test instance reaches
+/// the real Trash.
+fn scripted_trash(path: &Path, folder: bool) -> Result<Option<std::path::PathBuf>, String> {
+    use crate::project::fileops;
+    let (Some(trash), Some(name)) = (
+        std::env::var_os("CRC_SELFTEST_TRASH").map(std::path::PathBuf::from),
+        path.file_name(),
+    ) else {
+        return Err("a test instance has no Trash".into());
+    };
+    std::fs::create_dir_all(&trash).map_err(|error| error.to_string())?;
+    let landed = trash.join(fileops::free_name(&trash, name, folder));
+    fileops::move_item(path, &landed)
+        .map(|moved| Some(moved.path))
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -598,6 +737,7 @@ mod tests {
         let wait = Duration::from_secs(10);
         let mut history = Recorder::new(Some(db.clone()), true, "", Timing::default());
         let mut files = Files::default();
+        let step = files.begin();
 
         // A file, open in a tab, with a version kept.
         let file = root.join("notes.txt");
@@ -608,6 +748,7 @@ mod tests {
             std::iter::once(&mut docs),
             &mut history,
             &mut files,
+            step,
             Op::Move {
                 from: &file,
                 to: &target,
@@ -637,6 +778,7 @@ mod tests {
             std::iter::once(&mut docs),
             &mut history,
             &mut files,
+            step,
             Op::Rename {
                 from: &folder,
                 to: &moved,
@@ -671,6 +813,7 @@ mod tests {
             std::iter::once(&mut docs),
             &mut history,
             &mut files,
+            step,
             clash,
             false,
         )
@@ -686,6 +829,7 @@ mod tests {
             std::iter::once(&mut docs),
             &mut history,
             &mut files,
+            step,
             clash,
             true,
         )
@@ -699,5 +843,169 @@ mod tests {
         assert_eq!(kept(&db, &taken), []);
         assert_eq!(kept(&db, &neighbour), []);
         assert_eq!(kept(&db, &landed).len(), 1);
+    }
+}
+
+/// The name field's verdict, as Return and the frame ask for it.
+#[cfg(test)]
+mod name_field_tests {
+    use super::*;
+    use crate::project::TempTree;
+
+    fn notebook(name: &str) -> TempTree {
+        TempTree::new(
+            name,
+            &[
+                ("bread.md", "flour\n"),
+                ("soup.md", "leeks\n"),
+                ("plots/", ""),
+            ],
+        )
+    }
+
+    /// The field as `start_sidebar_edit` opens it, on `text`.
+    fn field(kind: SidebarEditKind, parent: &Path, text: &str) -> SidebarEdit {
+        let mut edit = SidebarEdit {
+            kind,
+            parent: parent.to_path_buf(),
+            row: 0,
+            depth: 0,
+            field: Buffer::from_text(text),
+            check: NameCheck::default(),
+        };
+        edit.check_name();
+        edit
+    }
+
+    /// The text typed over, and a frame drawn.
+    fn retype(edit: &mut SidebarEdit, text: &str) {
+        edit.field = Buffer::from_text(text);
+        edit.check_name();
+    }
+
+    #[test]
+    fn return_is_refused_while_the_name_will_not_do() {
+        let files = notebook("name-field-refused");
+        let bread = files.0.join("bread.md");
+        let mut edit = field(SidebarEditKind::Rename(bread), &files.0, "bread.md");
+        // The name it has: nothing to say, and Return closes the field.
+        assert_eq!(edit.note(), None);
+        assert!(!edit.refuses_now());
+
+        retype(&mut edit, "soup.md");
+        assert_eq!(edit.problem(), Some(Problem::Taken));
+        assert_eq!(
+            edit.note(),
+            Some(layout::FieldNote {
+                text: "This name is already taken",
+                tone: layout::NoteTone::Error,
+            })
+        );
+        // Asked again, as often as Return is pressed, the answer holds
+        // and the field keeps its text.
+        for _ in 0..3 {
+            assert!(edit.refuses_now());
+        }
+        assert_eq!(edit.name(), "soup.md");
+        assert_eq!(edit.problem(), Some(Problem::Taken));
+
+        // Put right, Return goes through.
+        retype(&mut edit, "stew.md");
+        assert_eq!(edit.note(), None);
+        assert!(!edit.refuses_now());
+
+        // A slash is a path for a new item and no name for a rename.
+        retype(&mut edit, "plots/stew.md");
+        assert_eq!(edit.problem(), Some(Problem::Slash));
+        assert!(edit.refuses_now());
+
+        // Spaces at an end are said, in the other colour, and allowed.
+        retype(&mut edit, " stew.md");
+        assert_eq!(
+            edit.note().map(|note| note.tone),
+            Some(layout::NoteTone::Warning)
+        );
+        assert!(!edit.refuses_now());
+        assert_eq!(edit.name(), " stew.md", "the name is taken as typed");
+    }
+
+    #[test]
+    fn a_change_of_case_alone_is_not_in_its_own_way() {
+        let files = notebook("name-field-case");
+        let bread = files.0.join("bread.md");
+        let mut edit = field(SidebarEditKind::Rename(bread), &files.0, "bread.md");
+        retype(&mut edit, "Bread.md");
+        assert_eq!(edit.problem(), None);
+        assert!(!edit.refuses_now());
+        retype(&mut edit, "BREAD.MD");
+        assert_eq!(edit.problem(), None);
+        assert!(!edit.refuses_now());
+    }
+
+    /// An empty field just opened says nothing: Return is refused all the
+    /// same, and from then on the field says why.
+    #[test]
+    fn a_new_name_is_required_but_not_said_until_asked_for() {
+        let files = notebook("name-field-empty");
+        for kind in [SidebarEditKind::NewFile, SidebarEditKind::NewFolder] {
+            let mut edit = field(kind, &files.0, "");
+            assert_eq!(edit.note(), None, "nothing typed yet, nothing said");
+            let refused = edit.refuses_now();
+            assert!(refused);
+            assert_eq!(edit.note(), None, "asking does not say it");
+            // What `submit_sidebar_edit` does with a refusal.
+            edit.check.said |= refused;
+            assert_eq!(edit.problem(), Some(Problem::Empty));
+
+            // Typed and deleted again, it is said without Return.
+            let mut edit = field(SidebarEditKind::NewFile, &files.0, "");
+            retype(&mut edit, "s");
+            assert_eq!(edit.note(), None);
+            retype(&mut edit, "");
+            assert_eq!(edit.problem(), Some(Problem::Empty));
+            // A new item takes a path, and each part is checked.
+            retype(&mut edit, "plots/2027/beds.md");
+            assert_eq!(edit.problem(), None);
+            assert!(!edit.refuses_now());
+            retype(&mut edit, "plots/../beds.md");
+            assert_eq!(edit.problem(), Some(Problem::Reserved));
+            retype(&mut edit, "soup.md/beds.md");
+            assert_eq!(edit.problem(), Some(Problem::Blocked));
+            // A colon is the name's to have; a path that ends in a slash
+            // names nothing.
+            retype(&mut edit, "notes:today.md");
+            assert_eq!(edit.note(), None);
+            assert!(!edit.refuses_now());
+            retype(&mut edit, "plots/");
+            assert_eq!(edit.problem(), Some(Problem::EmptyPart));
+            assert!(edit.refuses_now());
+        }
+    }
+
+    /// The verdict is for the text: frames drawn with the same text ask
+    /// the folder nothing, so what changes on disk meanwhile is seen at
+    /// the next edit, or when Return asks.
+    #[test]
+    fn the_folder_is_asked_when_the_text_changes_not_every_frame() {
+        let files = notebook("name-field-once");
+        let mut edit = field(SidebarEditKind::NewFile, &files.0, "");
+        retype(&mut edit, "stew.md");
+        assert_eq!(edit.problem(), None);
+        // Something else makes the file.
+        std::fs::write(files.0.join("stew.md"), "").unwrap();
+        for _ in 0..5 {
+            edit.check_name();
+        }
+        assert_eq!(edit.problem(), None, "the same text asked nothing");
+        // Return asks the folder as it is now.
+        assert!(edit.refuses_now());
+        assert_eq!(edit.problem(), Some(Problem::Taken));
+        // And so does the next edit.
+        std::fs::remove_file(files.0.join("stew.md")).unwrap();
+        edit.check_name();
+        assert_eq!(edit.problem(), Some(Problem::Taken), "still the same text");
+        retype(&mut edit, "stew.m");
+        retype(&mut edit, "stew.md");
+        assert_eq!(edit.problem(), None);
     }
 }

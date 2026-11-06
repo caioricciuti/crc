@@ -2776,6 +2776,18 @@ pub const PANE_GAP: f32 = PAD * 2.0 + 1.0;
 /// How far into the padding round a pane what lights up for a drop
 /// reaches: short of the strip above it and of the line beside it.
 const DROP_GROW: f32 = PAD * 0.5 - 1.0;
+
+/// What lights up for a drop on the screen `rect` of a pane, or on the
+/// part of one a tab would get: that, and a little of the padding round
+/// it.
+pub fn lit_pane(rect: Viewport) -> Viewport {
+    Viewport {
+        x: rect.x - DROP_GROW,
+        y: rect.y - DROP_GROW,
+        width: rect.width + DROP_GROW * 2.0,
+        height: rect.height + DROP_GROW * 2.0,
+    }
+}
 /// How thick the focus line is, the rule over the pane with the keyboard.
 /// It lies against the pane's first row, clear of the strip, and is half
 /// the weight of the active tab's rule: under that tab the two were one
@@ -3438,13 +3450,7 @@ pub fn draw(
     // pointer over that.
     if let Some(drag) = lifted {
         if let Some(drop) = drag.drop {
-            let lit = Viewport {
-                x: drop.rect.x - DROP_GROW,
-                y: drop.rect.y - DROP_GROW,
-                width: drop.rect.width + DROP_GROW * 2.0,
-                height: drop.rect.height + DROP_GROW * 2.0,
-            };
-            layout::push_drop_zone(out, atlas, lit, theme);
+            layout::push_drop_zone(out, atlas, lit_pane(drop.rect), theme);
         }
         let name = lifted_name.or_else(|| {
             let tab = panel.tabs.get(drag.tab)?;

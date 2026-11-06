@@ -965,21 +965,26 @@ impl EditorView {
                 glyphs,
             );
         } else if let Some(rect) = sidebar_rect {
-            let edit_text = sidebar_edit.as_ref().map(|e| e.field.rope.to_string());
-            let edit = sidebar_edit
-                .as_ref()
-                .zip(edit_text.as_deref())
-                .map(|(e, text)| layout::SidebarEdit {
-                    row: e.row,
-                    depth: e.depth,
-                    replaces: e.replaces(),
-                    is_dir: matches!(e.kind, SidebarEditKind::NewFolder)
-                        || matches!(&e.kind, SidebarEditKind::Rename(path) if path.is_dir()),
-                    text,
-                    cursor: e.field.cursor(),
-                    selection: e.field.selection(),
-                });
+            // The name being typed is checked when its text has changed,
+            // not once a frame; the text drawn is the one checked.
+            if let Some(edit) = sidebar_edit.as_mut() {
+                edit.check_name();
+            }
+            let edit = sidebar_edit.as_ref().map(|e| layout::SidebarEdit {
+                row: e.row,
+                depth: e.depth,
+                replaces: e.replaces(),
+                is_dir: matches!(e.kind, SidebarEditKind::NewFolder)
+                    || matches!(&e.kind, SidebarEditKind::Rename(path) if path.is_dir()),
+                text: e.name(),
+                cursor: e.field.cursor(),
+                selection: e.field.selection(),
+                note: e.note(),
+            });
             tree.set_preview(ignore_preview(docs.active(), completion.as_ref(), tree));
+            // The rows' Git marks, from the status Source Control has:
+            // built again when that status is a new one, else one compare.
+            tree.sync_git(git.snapshot_stamp(), git.snapshot.as_ref(), git.directory());
             layout::build_sidebar_with_edit(
                 tree,
                 *git_open,
@@ -1035,6 +1040,13 @@ impl EditorView {
                     glyphs,
                 );
             }
+        }
+        // Rows of the Explorer held over the terminal or the editor: the
+        // pane that would be typed their paths, or open them.
+        if let Some(Drag::Tree(drag)) = drag
+            && let Some(lit) = drag.lit()
+        {
+            layout::push_drop_zone(glyphs, &renderer.atlas, lit, theme);
         }
 
         // Status line along the bottom, spanning the full width.

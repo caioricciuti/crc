@@ -997,7 +997,17 @@ mod tests {
         let first = claim(&dir).expect("a free folder is claimed");
         assert!(claim(&dir).is_none(), "held by the first");
         drop(first);
-        assert!(claim(&dir).is_some(), "free again once the first lets go");
+        // A child that another test forked holds a copy of the lock until
+        // it execs, so the folder can stay claimed for a moment longer.
+        let mut free = false;
+        for _ in 0..200 {
+            if claim(&dir).is_some() {
+                free = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(free, "free again once the first lets go");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

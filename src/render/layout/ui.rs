@@ -1184,6 +1184,151 @@ pub fn push_meter(
     }
 }
 
+// ---- a field's note and a row's mark ----------------------------------------
+// What a one-line field says about the text in it, and the small mark a
+// list row carries at its trailing edge.
+
+/// How a field's note reads: something that stops the field, or something
+/// worth a second look.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoteTone {
+    Error,
+    Warning,
+}
+
+impl NoteTone {
+    /// The tone's colour: a failure's red, or the amber of a change.
+    pub fn colour(self, theme: &Theme) -> [f32; 4] {
+        match self {
+            NoteTone::Error => theme.diff_removed,
+            NoteTone::Warning => theme.diff_modified,
+        }
+    }
+}
+
+/// What a field says about the text in it, in one line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FieldNote<'a> {
+    pub text: &'a str,
+    pub tone: NoteTone,
+}
+
+/// The height of a [`push_field_note`].
+pub const FIELD_NOTE: f32 = UI_CONTROL_SM;
+
+/// Where the note of `field` goes: right under it and as wide, or right
+/// above it where `bounds` has no room left under it. A note that wants
+/// more than the field's width (`wants`, its line with the padding) grows
+/// to the left for it, as far as `bounds` goes, and still ends where the
+/// field ends.
+pub fn field_note_rect(field: Viewport, bounds: Viewport, wants: f32) -> Viewport {
+    const GAP: f32 = 2.0;
+    let under = field.y + field.height + GAP;
+    let y = if under + FIELD_NOTE <= bounds.y + bounds.height {
+        under
+    } else {
+        field.y - GAP - FIELD_NOTE
+    };
+    let right = field.x + field.width;
+    let x = (right - wants.max(field.width))
+        .max(bounds.x + UI_GAP)
+        .min(field.x);
+    Viewport {
+        x,
+        y,
+        width: right - x,
+        height: FIELD_NOTE,
+    }
+}
+
+/// The note of `field`, over whatever is next to it: one line in the
+/// tone's colour on a small panel outlined in it, cut with an ellipsis
+/// where even `bounds` is too narrow for it, and said whole to a pointer
+/// resting on it. Draw it after what it covers. The rectangle it took.
+pub fn push_field_note(
+    out: &mut Vec<GlyphInstance>,
+    atlas: &mut Atlas,
+    field: Viewport,
+    bounds: Viewport,
+    note: FieldNote<'_>,
+    theme: &Theme,
+) -> Viewport {
+    let wants = (ui_text_width(atlas, note.text) + UI_GAP * 2.0).ceil();
+    let rect = field_note_rect(field, bounds, wants);
+    if rect.width <= 0.0 {
+        return rect;
+    }
+    let colour = note.tone.colour(theme);
+    push_rounded_rect(out, rect, UI_RADIUS_SM, colour);
+    let inner = Viewport {
+        x: rect.x + 1.0,
+        y: rect.y + 1.0,
+        width: (rect.width - 2.0).max(0.0),
+        height: rect.height - 2.0,
+    };
+    // Opaque first: the rows under it must not show through the wash.
+    push_rounded_rect(out, inner, UI_RADIUS_SM - 1.0, theme.palette_background);
+    push_rounded_rect(out, inner, UI_RADIUS_SM - 1.0, faded(colour, 0.12));
+    push_ui_text_elided(
+        out,
+        atlas,
+        Viewport {
+            x: rect.x + UI_GAP,
+            width: (rect.width - UI_GAP * 2.0).max(0.0),
+            ..rect
+        },
+        note.text,
+        colour,
+    );
+    hotspot(rect, Cursor::Arrow, Some(note.text));
+    rect
+}
+
+/// The room a [`push_row_mark`] takes at a row's trailing edge.
+pub const ROW_MARK: f32 = 14.0;
+
+/// A row's mark in `slot`, [`ROW_MARK`] wide: one letter, centred, or a
+/// small dot where there is none. The letter is a constant and its shaping
+/// is cached, so a mark costs a frame no allocation.
+pub fn push_row_mark(
+    out: &mut Vec<GlyphInstance>,
+    atlas: &mut Atlas,
+    slot: Viewport,
+    letter: Option<&'static str>,
+    colour: [f32; 4],
+) {
+    const DOT: f32 = 6.0;
+    let Some(letter) = letter else {
+        push_rounded_rect(
+            out,
+            Viewport {
+                x: slot.x + ((slot.width - DOT) * 0.5).round(),
+                y: slot.y + ((slot.height - DOT) * 0.5).round(),
+                width: DOT,
+                height: DOT,
+            },
+            DOT * 0.5,
+            colour,
+        );
+        return;
+    };
+    let Some(line) = atlas.shape_ui(letter) else {
+        return;
+    };
+    let inset = ((slot.width - line.caret_offset(usize::MAX)) * 0.5).max(0.0);
+    push_shaped(
+        out,
+        atlas,
+        Viewport {
+            x: slot.x + inset,
+            width: (slot.width - inset).max(0.0),
+            ..slot
+        },
+        &line,
+        colour,
+    );
+}
+
 /// The scale of a [`push_tag`]'s label.
 const TAG_SCALE: f32 = 0.78;
 

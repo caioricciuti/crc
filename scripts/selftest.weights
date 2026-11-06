@@ -96,3 +96,7 @@ terminal-panes 45.6
 explorer-selection 16.5
 explorer-clipboard 23.7
 explorer-drag 20.9
+explorer-drop 17.9
+explorer-rename-git 31.1
+explorer-undo 37.4
+explorer-drag-out 29.3

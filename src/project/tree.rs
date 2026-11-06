@@ -99,6 +99,9 @@ pub struct Tree {
     /// The items cut and not yet pasted: drawn dimmed, with what is in
     /// them. Nothing has happened to them on disk.
     cut: Vec<PathBuf>,
+    /// Git's status of the rows, from the status Source Control last
+    /// read; see [`Tree::sync_git`]. Shared, as `ignored` is.
+    git: std::sync::Arc<crate::project::marks::Marks>,
 }
 
 /// Where a drag over the tree would drop what it carries.
@@ -162,6 +165,7 @@ impl Tree {
         self.ignored = Default::default();
         self.preview.clear();
         self.cut.clear();
+        self.git = Default::default();
     }
 
     /// The items cut and waiting for a paste; none takes the dimming off.
@@ -190,6 +194,39 @@ impl Tree {
 
     pub fn set_preview(&mut self, preview: std::collections::HashSet<PathBuf>) {
         self.preview = preview;
+    }
+
+    /// Brings the rows' Git marks up to date with Source Control's status:
+    /// `stamp` names the one it has now, `snapshot` is that status and
+    /// `directory` the folder it was read for. Asked before every frame,
+    /// and one compare while the status is the one already marked; the
+    /// marks are built again only for a new one. Whether they were.
+    pub fn sync_git(
+        &mut self,
+        stamp: u64,
+        snapshot: Option<&crate::project::git::Snapshot>,
+        directory: &Path,
+    ) -> bool {
+        if self.git.stamp() == stamp {
+            return false;
+        }
+        let top = self.root.as_deref().unwrap_or(directory);
+        let snapshot = snapshot.filter(|_| self.root.is_some());
+        self.git = std::sync::Arc::new(crate::project::marks::Marks::build(
+            stamp, snapshot, directory, top,
+        ));
+        true
+    }
+
+    /// Git's mark for the row at `path`, if it has one: one lookup, and
+    /// none at all outside a repository or in a clean one.
+    pub fn git_mark(&self, path: &Path) -> Option<crate::project::marks::Mark> {
+        self.git.get(path)
+    }
+
+    /// The marks as built, shared with every copy of the tree.
+    pub fn git_marks(&self) -> &std::sync::Arc<crate::project::marks::Marks> {
+        &self.git
     }
 
     /// Whether Git ignores `path`: one lookup for the path, then one per
