@@ -45,9 +45,9 @@ quit
 SCRIPT
 HOME="$T/home/ts-home" CRC_TERMINAL_SHELL=/bin/sh \
     CRC_SELFTEST="$T/tsa.script" "$BIN" "$W" 2> "$T/tsa.err"
-expect "$T/tsa-second.out" agents "on tasks=tsproj,tsproj 2 selected=tsproj 2 sessions=tsproj,*tsproj 2 claude=0 pair=- op=-"
+expect "$T/tsa-second.out" agents "on tasks=tsproj,tsproj 2 selected=tsproj 2 sessions=tsproj,*tsproj 2 claude=0 panes=- op=-"
 expect "$T/tsa-open.out" palette_query "zebralime"
 expect "$T/tsa-open.out" palette_rows "zebralime1 (tsproj / sh  ·  line 2)|zebralime2 (tsproj 2 / sh  ·  line 2)"
 expect "$T/tsa-picked.out" palette_query ""
-expect "$T/tsa-picked.out" agents "on tasks=tsproj,tsproj 2 selected=tsproj sessions=*tsproj,tsproj 2 claude=0 pair=- op=-"
+expect "$T/tsa-picked.out" agents "on tasks=tsproj,tsproj 2 selected=tsproj sessions=*tsproj,tsproj 2 claude=0 panes=- op=-"
 expect_terminal "$T/tsa-picked.out" 'find=zebralime 1 of 1 target=terminal keys=true'

@@ -1,7 +1,9 @@
 //! The project in the window: watching it for changes, and the sidebar's
 //! new file, new folder and rename fields.
 
+use super::explorer::Did;
 use super::*;
+use crate::project::fileops::Op;
 
 impl EditorView {
     /// Starts, or restarts, the FSEvents watcher on the current root.
@@ -100,7 +102,9 @@ impl EditorView {
         let Some(at) = state.watch.tree_changed_at else {
             return;
         };
-        if at.elapsed() < SETTLE || state.watch.index_rx.is_some() {
+        // A copy that is running lands its items one by one: the tree is
+        // read again once, when it is over.
+        if at.elapsed() < SETTLE || state.watch.index_rx.is_some() || !state.explorer.idle() {
             return;
         }
         state.watch.tree_changed_at = None;
@@ -312,14 +316,10 @@ impl EditorView {
                         state.message = Some((format!("{name} already exists"), Instant::now()));
                     }
                 } else {
-                    let created = target
-                        .parent()
-                        .map_or(Ok(()), std::fs::create_dir_all)
-                        // Never truncates: a file that appeared since the
-                        // check above is an error, not an empty file.
-                        .and_then(|()| std::fs::File::create_new(&target).map(drop));
-                    match created {
-                        Ok(()) => self.open_created_file(&target),
+                    // Never truncates: a file that appeared since the
+                    // check above is an error, not an empty file.
+                    match self.file_op(Op::NewFile(&target)) {
+                        Ok(_) => self.open_created_file(&target),
                         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                             if let Some(mut state) = self.state_mut() {
                                 state.message =
@@ -336,15 +336,14 @@ impl EditorView {
                 }
             }
             SidebarEditKind::NewFolder => {
-                let result = if target.exists() {
-                    Err(std::io::Error::other("already exists"))
-                } else {
-                    std::fs::create_dir_all(&target)
-                };
+                let result = self.file_op(Op::NewFolder(&target));
                 if let Some(mut state) = self.state_mut() {
                     state.message = Some((
                         match &result {
-                            Ok(()) => format!("created folder {name}"),
+                            Ok(_) => format!("created folder {name}"),
+                            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                                "could not create folder: already exists".to_string()
+                            }
                             Err(error) => format!("could not create folder: {error}"),
                         },
                         Instant::now(),
@@ -357,8 +356,10 @@ impl EditorView {
             SidebarEditKind::Rename(path) => {
                 if path.file_name().is_some_and(|current| current != name) {
                     self.move_item(
-                        &path,
-                        &target,
+                        Op::Rename {
+                            from: &path,
+                            to: &target,
+                        },
                         format!("renamed to {}", target.display()),
                         "rename failed",
                     );
@@ -399,40 +400,56 @@ impl EditorView {
         self.lsp_sync_open();
     }
 
-    /// Moves the project item at `path` to `destination`, by a rename in
-    /// the Explorer or a drag, with its tabs and its local history. Says
+    /// Renames or moves a project item as `op` says, by a rename in the
+    /// Explorer or a drag, with its tabs and its local history. Says
     /// `done` when it has moved, or `failed` and why.
-    pub(super) fn move_item(&self, path: &Path, destination: &Path, done: String, failed: &str) {
-        let moved = {
-            let Some(mut state) = self.state_mut() else {
-                return;
-            };
-            let State {
-                docs,
-                panes,
-                history,
-                ..
-            } = &mut *state;
-            let open = std::iter::once(docs).chain(panes.iter_mut().map(|p| &mut p.docs));
-            let moved = move_project_item(open, history, path, destination);
-            if moved.is_ok() {
-                // The Explorer's selection stays on the item.
-                state.tree.follow_move(path, destination);
-            }
+    pub(super) fn move_item(&self, op: Op<'_>, done: String, failed: &str) {
+        let moved = self.relocate(op, false);
+        if let Some(mut state) = self.state_mut() {
             state.message = Some((
                 match &moved {
-                    Ok(()) => done,
+                    Ok(Did {
+                        original_left: Some(why),
+                        ..
+                    }) => format!("{done}; the original could not be removed: {why}"),
+                    Ok(_) => done,
                     Err(error) => format!("{failed}: {error}"),
                 },
                 Instant::now(),
             ));
-            moved.is_ok()
-        };
-        if moved {
+        }
+        if moved.is_ok() {
             self.refresh_project_after_disk_change();
             self.sync_title();
             self.reparse();
         }
+    }
+
+    /// The one path for an item that moves inside the project, `op` a
+    /// rename or a move: the item on disk, the tabs open on it in every
+    /// pane, its local history and the Explorer's selection. Neither says
+    /// anything nor reads the tree again: the caller does both, once.
+    /// With `free`, a destination taken since it was chosen gives way to
+    /// the next free name. Answers where the item is now.
+    pub(super) fn relocate(&self, op: Op<'_>, free: bool) -> std::io::Result<Did> {
+        let Some(mut state) = self.state_mut() else {
+            return Err(std::io::Error::other("the window is busy"));
+        };
+        let State {
+            docs,
+            panes,
+            history,
+            explorer,
+            tree,
+            ..
+        } = &mut *state;
+        let open = std::iter::once(docs).chain(panes.iter_mut().map(|p| &mut p.docs));
+        let did = move_project_item(open, history, explorer, op, free)?;
+        if let (Op::Rename { from, .. } | Op::Move { from, .. }, Some(to)) = (op, &did.path) {
+            // The Explorer's selection stays on the item.
+            tree.follow_move(from, to);
+        }
+        Ok(did)
     }
 
     pub(super) fn new_file_with_panel(&self) -> bool {
@@ -464,7 +481,15 @@ impl EditorView {
         };
         let path = std::path::PathBuf::from(path.to_string());
 
-        if let Err(e) = std::fs::write(&path, "") {
+        let created = match self.file_op(Op::NewFile(&path)) {
+            Ok(_) => Ok(()),
+            // The panel asked, and the answer was to replace it.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                std::fs::write(&path, "")
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(e) = created {
             if let Some(mut state) = self.state_mut() {
                 state.message = Some((format!("could not create: {e}"), Instant::now()));
             }
@@ -476,21 +501,29 @@ impl EditorView {
     }
 }
 
-/// An item moves from `source` to `destination` inside the project, and
+/// An item is renamed or moved inside the project, as `op` says, and
 /// what is kept by its path goes with it: the tabs open on it or under it
 /// are re-keyed, and local history follows the file, or every file in the
-/// folder. Nothing at `destination` is replaced, and a symbolic link moves
-/// as the link.
+/// folder. Nothing at the destination is replaced, and a symbolic link
+/// moves as the link. What was done is kept in `files`; with `free`, a
+/// destination taken since it was chosen gives way to the next free name.
 fn move_project_item<'a>(
     open: impl Iterator<Item = &'a mut Documents>,
     history: &mut crate::history::recorder::Recorder,
-    source: &Path,
-    destination: &Path,
-) -> std::io::Result<()> {
+    files: &mut explorer::Files,
+    op: Op<'_>,
+    free: bool,
+) -> std::io::Result<Did> {
+    let (Op::Rename { from: source, .. } | Op::Move { from: source, .. }) = op else {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    };
     // Open buffers use canonical identities. Capture the source key
     // before the move makes it impossible to canonicalise.
     let source_key = crate::platform::canonical(source);
-    move_without_replace(source, destination)?;
+    let did = explorer::file_op(files, op, free)?;
+    let Some(destination) = did.path.as_deref() else {
+        return Ok(did);
+    };
     for docs in open {
         docs.rename_path(&source_key, destination);
     }
@@ -500,7 +533,7 @@ fn move_project_item<'a>(
     } else {
         history.rename(&source_key, &moved);
     }
-    Ok(())
+    Ok(did)
 }
 
 /// Moves the item at `path` to the Trash, a symbolic link as the link, and
@@ -525,7 +558,9 @@ mod tests {
     use super::move_project_item;
     use crate::history::recorder::{Recorder, Timing};
     use crate::history::store::{Reason, Store};
+    use crate::platform::window::explorer::Files;
     use crate::project::TempTree;
+    use crate::project::fileops::Op;
     use crate::text::buffer::Buffer;
     use crate::text::documents::Documents;
     use crate::text::rope::Rope;
@@ -562,13 +597,24 @@ mod tests {
         let root = crate::platform::canonical(&tree.0.join("project"));
         let wait = Duration::from_secs(10);
         let mut history = Recorder::new(Some(db.clone()), true, "", Timing::default());
+        let mut files = Files::default();
 
         // A file, open in a tab, with a version kept.
         let file = root.join("notes.txt");
         let target = root.join("archive/notes.txt");
         history.edited_on_disk(&file, &Rope::from_text("one\n"));
         let mut docs = Documents::new(Buffer::open(file.clone()).unwrap());
-        move_project_item(std::iter::once(&mut docs), &mut history, &file, &target).unwrap();
+        move_project_item(
+            std::iter::once(&mut docs),
+            &mut history,
+            &mut files,
+            Op::Move {
+                from: &file,
+                to: &target,
+            },
+            false,
+        )
+        .unwrap();
         history.finish(std::iter::empty(), wait);
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "two\n");
         assert!(!file.exists());
@@ -587,7 +633,17 @@ mod tests {
         history.edited_on_disk(&neighbour, &Rope::from_text("j\n"));
         let mut docs = Documents::new(Buffer::open(inside.clone()).unwrap());
         let moved = root.join("archive/docs");
-        move_project_item(std::iter::once(&mut docs), &mut history, &folder, &moved).unwrap();
+        move_project_item(
+            std::iter::once(&mut docs),
+            &mut history,
+            &mut files,
+            Op::Rename {
+                from: &folder,
+                to: &moved,
+            },
+            false,
+        )
+        .unwrap();
         history.finish(std::iter::empty(), wait);
         assert_eq!(
             docs.active().path.as_deref(),
@@ -607,12 +663,41 @@ mod tests {
         // happen.
         let taken = root.join("archive/taken.md");
         std::fs::write(&taken, "mine\n").unwrap();
-        let error = move_project_item(std::iter::once(&mut docs), &mut history, &neighbour, &taken)
-            .unwrap_err();
+        let clash = Op::Move {
+            from: &neighbour,
+            to: &taken,
+        };
+        let error = move_project_item(
+            std::iter::once(&mut docs),
+            &mut history,
+            &mut files,
+            clash,
+            false,
+        )
+        .err()
+        .expect("the name is taken");
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(&taken).unwrap(), "mine\n");
+
+        // A paste's move takes the next free name instead, and the tab
+        // and the history follow the item to where it really went.
+        let mut docs = Documents::new(Buffer::open(neighbour.clone()).unwrap());
+        let did = move_project_item(
+            std::iter::once(&mut docs),
+            &mut history,
+            &mut files,
+            clash,
+            true,
+        )
+        .unwrap();
+        let landed = root.join("archive/taken-copy.md");
+        assert_eq!(did.path.as_deref(), Some(landed.as_path()));
         history.finish(std::iter::empty(), wait);
         assert_eq!(std::fs::read_to_string(&taken).unwrap(), "mine\n");
+        assert_eq!(std::fs::read_to_string(&landed).unwrap(), "k\n");
+        assert_eq!(docs.active().path.as_deref(), Some(landed.as_path()));
         assert_eq!(kept(&db, &taken), []);
-        assert_eq!(kept(&db, &neighbour).len(), 1);
+        assert_eq!(kept(&db, &neighbour), []);
+        assert_eq!(kept(&db, &landed).len(), 1);
     }
 }

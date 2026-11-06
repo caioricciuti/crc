@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::platform::terminal::When;
+use crate::render::layout::split::{Dir, Edge};
 
 impl EditorView {
     /// Whether keys go to the terminal: it is open with the keyboard, and
@@ -242,8 +243,8 @@ impl EditorView {
             } else {
                 (!state.terminal.tabs.is_empty()).then_some(state.terminal.active)
             };
-            if let Some(index) = found {
-                state.terminal.active = index;
+            if let Some(index) = found.filter(|index| *index != state.terminal.active) {
+                state.terminal.show(index);
             }
             found
         };
@@ -406,23 +407,32 @@ impl EditorView {
         cwd: Option<&Path>,
         into: Option<String>,
     ) {
-        self.spawn_terminal_on(claude, cwd, into, None, None);
+        self.spawn_terminal_on(claude, cwd, into, None, None, None);
     }
 
     /// A shell over ssh in `dir` on `host`, in the workspace `id`: a
     /// worktree just made there, before the list has its row.
     pub(super) fn spawn_remote_terminal(&self, host: &str, dir: &Path, id: String) {
-        self.spawn_terminal_on(false, Some(dir), Some(id), Some(host.to_owned()), None);
+        self.spawn_terminal_on(
+            false,
+            Some(dir),
+            Some(id),
+            Some(host.to_owned()),
+            None,
+            None,
+        );
     }
 
     /// Claude in `dir` on this Mac, in the workspace `id`, first told
     /// `prompt`: an issue's task, whose row the list may not have yet.
     pub(super) fn spawn_claude_told(&self, dir: &Path, id: String, prompt: &str) {
-        self.spawn_terminal_on(true, Some(dir), Some(id), None, Some(prompt));
+        self.spawn_terminal_on(true, Some(dir), Some(id), None, Some(prompt), None);
     }
 
     /// As [`Self::spawn_terminal_into`]; on `host`, in `cwd` there, when
     /// the workspace's row does not say so yet; Claude first told `prompt`.
+    /// With `beside`, in a new pane at that edge of the one with the
+    /// keyboard; otherwise where any tab shown from the strip goes.
     fn spawn_terminal_on(
         &self,
         claude: bool,
@@ -430,6 +440,7 @@ impl EditorView {
         into: Option<String>,
         host: Option<String>,
         prompt: Option<&str>,
+        beside: Option<Edge>,
     ) {
         // Every new terminal says it: one opened later fails the same way.
         self.say_if_replaced(true);
@@ -587,10 +598,16 @@ impl EditorView {
                     launch,
                     held,
                     status: None,
+                    view: crate::platform::terminal::View::new(),
                 };
                 self.add_terminal_tab(&mut state, tab);
-                state.terminal.active = state.terminal.tabs.len() - 1;
-                state.terminal.back = 0;
+                let new = state.terminal.tabs.len() - 1;
+                // Its workspace first: that workspace's panes are where
+                // it shows.
+                group_terminals(&mut state);
+                if !beside.is_some_and(|edge| state.terminal.split(edge, new)) {
+                    state.terminal.show(new);
+                }
                 if let Some(said) = said {
                     state.say(layout::Feedback::Failure, said);
                 }
@@ -758,6 +775,7 @@ impl EditorView {
                     seen: None,
                     launch,
                     held: Some(id),
+                    view: crate::platform::terminal::View::new(),
                 },
                 left.active,
             ));
@@ -780,7 +798,6 @@ impl EditorView {
         }
         state.terminal.active = active.unwrap_or(state.terminal.tabs.len() - 1);
         state.terminal.open = true;
-        state.terminal.back = 0;
         super::review::refresh_review(&mut state);
         drop(state);
         self.after_terminal_layout();
@@ -1243,20 +1260,20 @@ impl EditorView {
         else {
             return;
         };
-        let Some(tab) = terminal.active_tab() else {
+        let Some(tab) = terminal.active_tab_mut() else {
             return;
         };
         let term = tab.session.term.lock().unwrap_or_else(|e| e.into_inner());
         let back = crate::platform::terminal::back_showing(
             line,
             term.view_line(0, 0),
-            terminal.back,
+            tab.view.back,
             term.rows(),
             covered,
             term.scrollback_len(),
         );
         drop(term);
-        terminal.back = back;
+        tab.view.back = back;
     }
 
     /// Enter, Cmd-G and the bar's arrows over the terminal: the next or
@@ -1431,7 +1448,11 @@ impl EditorView {
         self.terminal_find_sync(false);
     }
 
-    /// Keeps every session's grid the size of the panel.
+    /// Keeps every session's grid the size of where it is drawn: a
+    /// pane's of its pane, any other tab's of the panel. Once for a
+    /// change, as a size a session has is not set again, and not at all
+    /// while a divider is dragged (see
+    /// [`crate::platform::terminal::Panel::fit`]).
     pub(super) fn terminal_after_frame(&self) {
         self.terminal_find_after_frame();
         let Some(state) = self.state() else {
@@ -1444,68 +1465,240 @@ impl EditorView {
             return;
         };
         let (_, screen) = crate::platform::terminal::split(rect);
-        let atlas = &state.renderer.atlas;
-        let (cols, rows) = crate::platform::terminal::grid_size(atlas, screen);
-        let pair = state.terminal.shown_pair();
-        let (half, _) = crate::platform::terminal::halves(screen);
-        let (half_cols, half_rows) = crate::platform::terminal::grid_size(atlas, half);
-        for (index, tab) in state.terminal.tabs.iter().enumerate() {
-            if pair.is_some_and(|(l, r)| index == l || index == r) {
-                tab.session.resize(half_cols, half_rows);
-            } else {
-                tab.session.resize(cols, rows);
-            }
-        }
+        state.terminal.fit(&state.renderer.atlas, screen);
     }
 
-    /// Agents mode's Cmd-\: the session showing and another of its task
-    /// side by side, a new shell in its folder when it has no other.
-    pub(super) fn split_terminal(&self) {
+    /// The screen the terminal's panes share, as the window is now.
+    fn panes_screen(&self) -> Option<Viewport> {
+        let rect = self.chrome().terminal?;
+        Some(crate::platform::terminal::split(rect).1)
+    }
+
+    /// Agents mode's Split Right (Cmd-\) and Split Down: the pane with
+    /// the keyboard is cut in two, and the new pane at `edge` shows
+    /// another session of its workspace that is in no pane yet, or a new
+    /// shell in the workspace's folder when there is none. From a tab's
+    /// own menu (`of_menu`) the new pane shows that tab; one that is a
+    /// pane already gets the keyboard and is the one cut.
+    pub(super) fn split_terminal(&self, edge: Edge, of_menu: bool) {
+        let screen = self.panes_screen();
         let start_in = {
             let Some(mut state) = self.state_mut() else {
                 return;
             };
-            if state.terminal.shown_pair().is_some() {
+            let state = &mut *state;
+            group_terminals(state);
+            if super::agents::active_hidden(state) {
                 return;
+            }
+            let mut with = None;
+            if of_menu {
+                let Some(tab) = state.terminal.menu_tab.take().and_then(|id| {
+                    let tab = state.terminal.tab_by_id(&id)?;
+                    super::agents::listed_terminals(state)
+                        .contains(&tab)
+                        .then_some(tab)
+                }) else {
+                    return;
+                };
+                if state.terminal.visible(true).contains(&tab) {
+                    if tab != state.terminal.active {
+                        state.terminal.show(tab);
+                    }
+                } else {
+                    with = Some(tab);
+                }
             }
             let active = state.terminal.active;
             let Some(folder) = state.terminal.active_tab().map(|t| t.folder.clone()) else {
                 return;
             };
-            let tasks = state.agents.tasks.clone();
-            let task = crate::platform::agents::task_of(&tasks, &state.terminal.tabs[active]);
-            let other = (0..state.terminal.tabs.len()).find(|i| {
-                *i != active
-                    && crate::platform::agents::task_of(&tasks, &state.terminal.tabs[*i]) == task
-            });
-            match other {
-                Some(other) => {
-                    state.terminal.pair = Some((active, other));
-                    state.terminal.show(other);
-                    None
+            if screen.is_some_and(|screen| {
+                !state
+                    .terminal
+                    .can_split(&state.renderer.atlas, screen, edge)
+            }) {
+                state.say(layout::Feedback::Info, "No room here for another pane");
+                None
+            } else {
+                let tasks = state.agents.tasks.clone();
+                let task = crate::platform::agents::task_of(&tasks, &state.terminal.tabs[active]);
+                let on_screen = state.terminal.visible(true);
+                let other = with.or_else(|| {
+                    (0..state.terminal.tabs.len()).find(|i| {
+                        !on_screen.contains(i)
+                            && crate::platform::agents::task_of(&tasks, &state.terminal.tabs[*i])
+                                == task
+                    })
+                });
+                match other {
+                    Some(other) => {
+                        state.terminal.split(edge, other);
+                        None
+                    }
+                    None => Some((
+                        task.map(|t| tasks[t].id()),
+                        task.map_or(folder, |t| tasks[t].dir()),
+                    )),
                 }
-                None => Some((active, task.map_or(folder, |t| tasks[t].path.clone()))),
             }
         };
-        if let Some((left, dir)) = start_in {
-            self.spawn_terminal_in(false, Some(&dir));
-            if let Some(mut state) = self.state_mut() {
-                let right = state.terminal.active;
-                if right != left {
-                    state.terminal.pair = Some((left, right));
-                }
-            }
+        if let Some((workspace, dir)) = start_in {
+            self.spawn_terminal_on(false, Some(&dir), workspace, None, None, Some(edge));
+        }
+        self.after_pane_focus();
+    }
+
+    /// Agents mode's Close Pane: the pane with the keyboard goes, what
+    /// was beside it gets its room and the keyboard, and its session
+    /// keeps running in its tab.
+    pub(super) fn close_terminal_pane(&self) {
+        if let Some(mut state) = self.state_mut()
+            && !super::agents::active_hidden(&state)
+        {
+            state.terminal.close_pane();
+        }
+        self.after_pane_focus();
+    }
+
+    /// Focus Next Pane and Focus Previous Pane: the keyboard to the pane
+    /// `step` along, in the order they read.
+    pub(super) fn step_terminal_pane(&self, step: isize) {
+        if let Some(mut state) = self.state_mut()
+            && !super::agents::active_hidden(&state)
+        {
+            state.terminal.focus_step(step);
+        }
+        self.after_pane_focus();
+    }
+
+    /// Focus Pane Left, Right, Up and Down: the keyboard to the pane
+    /// beside the one that has it, that way.
+    pub(super) fn focus_terminal_pane(&self, toward: Edge) {
+        let Some(screen) = self.panes_screen() else {
+            return;
+        };
+        if let Some(mut state) = self.state_mut()
+            && !super::agents::active_hidden(&state)
+        {
+            state.terminal.focus_toward(screen, toward);
+        }
+        self.after_pane_focus();
+    }
+
+    /// Another pane has the keyboard, or the panes changed: the switcher
+    /// remembers the session at the front, and the frame is drawn.
+    fn after_pane_focus(&self) {
+        if let Some(mut state) = self.state_mut() {
+            state.terminal.focus = true;
+            state.sidebar_keys = false;
+            note_focus(&mut state);
         }
         self.after_terminal_layout();
     }
 
-    /// Agents mode's Close Pane: the pair goes, the session with the
-    /// keyboard stays, and the other keeps running in its tab.
-    pub(super) fn unsplit_terminal(&self) {
+    /// A press on a divider between two panes: it is held, to follow the
+    /// pointer; a double click puts it back in the middle. Not where a
+    /// prompt's mark or a find tick is under the pointer, in the gap
+    /// beside its pane: that is pressed instead. Returns whether the
+    /// press was the divider's.
+    fn terminal_divider_press(&self, event: &NSEvent, x: f32, y: f32) -> bool {
+        let Some(screen) = self.panes_screen() else {
+            return false;
+        };
+        let divider = self.state_mut().and_then(|mut state| {
+            // One left held by a release that never came.
+            state.terminal.divider_drag = None;
+            if super::agents::active_hidden(&state) {
+                return None;
+            }
+            state.terminal.divider_at(screen, x, y)
+        });
+        let Some(divider) = divider else {
+            return false;
+        };
+        if self.terminal_tick_under(screen, x, y) {
+            return false;
+        }
         if let Some(mut state) = self.state_mut() {
-            state.terminal.pair = None;
+            let state = &mut *state;
+            if event.clickCount() >= 2 {
+                state
+                    .terminal
+                    .center_divider(&state.renderer.atlas, screen, divider.id);
+            } else {
+                state.terminal.grab_divider(&divider, x, y);
+            }
         }
         self.after_terminal_layout();
+        true
+    }
+
+    /// Whether a point is on a prompt's mark or a find tick beside one of
+    /// the panes showing.
+    fn terminal_tick_under(&self, screen: Viewport, x: f32, y: f32) -> bool {
+        let Some(state) = self.state() else {
+            return false;
+        };
+        let panel = &state.terminal;
+        let find = state.find.as_ref().and_then(|bar| bar.terminal.as_ref());
+        panel.screens(screen).into_iter().any(|(index, pane)| {
+            let track = crate::platform::terminal::mark_track(pane);
+            let Some(tab) = panel.tabs.get(index).filter(|_| track.contains(x, y)) else {
+                return false;
+            };
+            let term = tab.session.term.lock().unwrap_or_else(|e| e.into_inner());
+            if term.is_alternate() {
+                return false;
+            }
+            let first = term.first_line();
+            let total = term.scrollback_len() + term.rows();
+            drop(term);
+            let lines = tab.marks.iter().map(|m| m.line);
+            crate::platform::terminal::mark_at(track, y, lines, first, total).is_some()
+                || find.filter(|_| index == panel.active).is_some_and(|find| {
+                    crate::platform::terminal::find_tick_at(track, y, &find.matches, first, total)
+                        .is_some()
+                })
+        })
+    }
+
+    /// The pointer moved with a divider between two panes held: the panes
+    /// follow it, each cut or padded to its new room, and no session is
+    /// told a size until the divider is let go. Returns whether one is
+    /// held.
+    pub(super) fn terminal_divider_dragged(&self, x: f32, y: f32) -> bool {
+        if self
+            .state()
+            .is_none_or(|state| state.terminal.divider_drag.is_none())
+        {
+            return false;
+        }
+        let Some(screen) = self.panes_screen() else {
+            return true;
+        };
+        let moved = self.state_mut().is_some_and(|mut state| {
+            let state = &mut *state;
+            state
+                .terminal
+                .drag_divider(&state.renderer.atlas, screen, x, y)
+        });
+        if moved {
+            self.request_redraw();
+            self.pump();
+        }
+        true
+    }
+
+    /// The button went up with a divider held: the panes stay where it
+    /// was let go, and the frame after tells each session its size, once.
+    pub(super) fn terminal_divider_released(&self) {
+        let held = self
+            .state_mut()
+            .is_some_and(|mut state| state.terminal.divider_drag.take().is_some());
+        if held {
+            self.after_terminal_layout();
+        }
     }
 
     /// Cmd-K: the active session's history and screen go, its cursor's
@@ -1519,11 +1712,8 @@ impl EditorView {
         if super::agents::active_hidden(&state) {
             return;
         }
-        let panel = &mut state.terminal;
-        panel.back = 0;
-        panel.selection = None;
-        panel.selecting = false;
-        if let Some(tab) = panel.active_tab_mut() {
+        if let Some(tab) = state.terminal.active_tab_mut() {
+            tab.view.reset();
             let mut term = tab.session.term.lock().unwrap_or_else(|e| e.into_inner());
             term.clear_all();
             // Its prompt marks go with the history.
@@ -1555,11 +1745,10 @@ impl EditorView {
         } else {
             0
         };
-        let panel = &mut state.terminal;
-        let back = panel.back;
-        let Some(tab) = panel.active_tab_mut() else {
+        let Some(tab) = state.terminal.active_tab_mut() else {
             return;
         };
+        let back = tab.view.back;
         let term = tab.session.term.lock().unwrap_or_else(|e| e.into_inner());
         if term.is_alternate() {
             return;
@@ -1581,7 +1770,7 @@ impl EditorView {
             None => return,
         };
         drop(term);
-        panel.back = back;
+        tab.view.back = back;
         drop(state);
         self.request_redraw();
         self.pump();
@@ -1679,8 +1868,10 @@ impl EditorView {
                 covered,
             )
         };
-        state.terminal.back = back;
-        state.terminal.selection = None;
+        if let Some(tab) = state.terminal.active_tab_mut() {
+            tab.view.back = back;
+            tab.view.selection = None;
+        }
         drop(state);
         self.request_redraw();
         self.pump();
@@ -1696,10 +1887,10 @@ impl EditorView {
         if super::agents::active_hidden(&state) {
             return;
         }
-        state.terminal.back = 0;
-        state.terminal.selection = None;
         let mut answered = false;
         if let Some(tab) = state.terminal.active_tab_mut() {
+            tab.view.back = 0;
+            tab.view.selection = None;
             answered = tab.type_in(bytes);
         }
         if answered {
@@ -2040,19 +2231,23 @@ impl EditorView {
     /// or path on a double click and the line on a triple, and with Command
     /// opens the file reference under the pointer.
     pub(super) fn terminal_press(&self, event: &NSEvent, x: f32, y: f32) {
-        // A press in the other pane of a pair gives it the keyboard first.
-        // Where its program asked for the mouse that is all it does, as in
-        // other terminals: the program does not hear the press that only
-        // chose its pane.
+        if self.terminal_divider_press(event, x, y) {
+            return;
+        }
+        // A press in another pane gives it the keyboard first. Where its
+        // program asked for the mouse that is all it does, as in other
+        // terminals: the program does not hear the press that only chose
+        // its pane.
         let mut switched = false;
-        if let Some(rect) = self.chrome().terminal
+        if let Some(screen) = self.panes_screen()
             && let Some(mut state) = self.state_mut()
-            && state.terminal.shown_pair().is_some()
+            && state.terminal.panes().is_some()
+            && !super::agents::active_hidden(&state)
         {
-            let (_, screen) = crate::platform::terminal::split(rect);
-            let tab = state.terminal.screen_at(screen, x);
+            let tab = state.terminal.pane_at(screen, x, y);
             if tab != state.terminal.active {
                 state.terminal.show(tab);
+                note_focus(&mut state);
                 switched = true;
             }
             state.terminal.focus = true;
@@ -2083,12 +2278,11 @@ impl EditorView {
             };
             let (row, boundary, cell) =
                 crate::platform::terminal::point(&state.renderer.atlas, screen, x, y, cols, rows);
-            let back = state.terminal.back;
-            let Some(tab) = state.terminal.active_tab() else {
+            let Some(tab) = state.terminal.active_tab_mut() else {
                 return;
             };
             let term = tab.session.term.lock().unwrap_or_else(|e| e.into_inner());
-            let line = term.view_line(row, back);
+            let line = term.view_line(row, tab.view.back);
             if command {
                 if let Some(link) = term.link_at(line, cell) {
                     drop(term);
@@ -2110,8 +2304,8 @@ impl EditorView {
                     _ => Some(((line, boundary), (line, boundary))),
                 };
                 drop(term);
-                state.terminal.selection = selection;
-                state.terminal.selecting = clicks < 2;
+                tab.view.selection = selection;
+                tab.view.selecting = clicks < 2;
                 None
             }
         };
@@ -2189,12 +2383,7 @@ impl EditorView {
             term.cols(),
             term.rows(),
         );
-        let back = if tab == state.terminal.active {
-            state.terminal.back
-        } else {
-            0
-        };
-        let link = term.link_at(term.view_line(row, back), col)?;
+        let link = term.link_at(term.view_line(row, session.view.back), col)?;
         Some((tab, link))
     }
 
@@ -2239,7 +2428,7 @@ impl EditorView {
             .screens(screen)
             .into_iter()
             .find(|(_, s)| s.contains(x, y))?;
-        if tab == state.terminal.active && state.terminal.back > 0 {
+        if state.terminal.tabs.get(tab)?.view.back > 0 {
             return None;
         }
         let term = state.terminal.tabs.get(tab)?.session.term.lock();
@@ -2303,7 +2492,7 @@ impl EditorView {
         let Some((tab, screen, cols, rows)) = self.mouse_pane(x, y) else {
             return false;
         };
-        // A press in the other pane of a pair only gives it the keyboard.
+        // A press in a pane without the keyboard only gives it that.
         if self
             .state()
             .is_none_or(|state| tab != state.terminal.active)
@@ -2319,8 +2508,10 @@ impl EditorView {
             };
             state.terminal.focus = true;
             state.sidebar_keys = false;
-            state.terminal.selection = None;
-            state.terminal.selecting = false;
+            if let Some(pressed) = state.terminal.tabs.get_mut(tab) {
+                pressed.view.selection = None;
+                pressed.view.selecting = false;
+            }
             state.terminal.mouse_press = Some((tab, button, cell));
             // The program hears it has the keyboard before the press.
             let key = self.key_window();
@@ -2487,18 +2678,28 @@ impl EditorView {
                 return;
             }
         }
+        // The history of the pane under the pointer, whichever has the
+        // keyboard; off every pane, of the one that has it.
+        let over = self.panes_screen().and_then(|screen| {
+            let state = self.state()?;
+            (state.terminal.panes().is_some() && !super::agents::active_hidden(&state))
+                .then(|| state.terminal.pane_at(screen, x, y))
+        });
         let Some(mut state) = self.state_mut() else {
             return;
         };
-        let history = state.terminal.active_tab().map_or(0, |tab| {
-            tab.session
-                .term
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .scrollback_len()
-        });
-        let back = state.terminal.back as isize;
-        state.terminal.back = (back - lines).clamp(0, history as isize) as usize;
+        let over = over.unwrap_or(state.terminal.active);
+        let Some(tab) = state.terminal.tabs.get_mut(over) else {
+            return;
+        };
+        let history = tab
+            .session
+            .term
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .scrollback_len();
+        let back = tab.view.back as isize;
+        tab.view.back = (back - lines).clamp(0, history as isize) as usize;
         drop(state);
         self.request_redraw();
         self.pump();
@@ -2525,29 +2726,46 @@ impl EditorView {
         self.ivars().testing || self.window().is_some_and(|window| window.isKeyWindow())
     }
 
+    /// The session whose selection a held press is dragging, its screen
+    /// and its grid size: the pane the press was in, wherever the pointer
+    /// and the keyboard have gone since.
+    fn selecting_pane(&self) -> Option<(usize, Viewport, usize, usize)> {
+        let tab = self.state()?.terminal.selecting()?;
+        let (screen, cols, rows) = self.pane_grid(tab)?;
+        Some((tab, screen, cols, rows))
+    }
+
     pub(super) fn terminal_drag(&self, x: f32, y: f32) {
-        let Some((screen, cols, rows)) = self.terminal_screen() else {
+        let Some((index, screen, cols, rows)) = self.selecting_pane() else {
             return;
         };
         {
             let Some(mut state) = self.state_mut() else {
                 return;
             };
-            state.terminal.drag_point = Some((x, y));
+            let state = &mut *state;
             // Pulled inside the screen first: above it selects up to the
             // top row, not a row computed from a negative distance.
-            let y = y.clamp(screen.y, screen.y + (screen.height - 1.0).max(0.0));
-            let (row, boundary, _) =
-                crate::platform::terminal::point(&state.renderer.atlas, screen, x, y, cols, rows);
-            let back = state.terminal.back;
-            let line = state.terminal.active_tab().map(|tab| {
-                tab.session
-                    .term
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .view_line(row, back)
-            });
-            if let (Some(line), Some((_, head))) = (line, state.terminal.selection.as_mut()) {
+            let inside = y.clamp(screen.y, screen.y + (screen.height - 1.0).max(0.0));
+            let (row, boundary, _) = crate::platform::terminal::point(
+                &state.renderer.atlas,
+                screen,
+                x,
+                inside,
+                cols,
+                rows,
+            );
+            let Some(tab) = state.terminal.tabs.get_mut(index) else {
+                return;
+            };
+            tab.view.drag_point = Some((x, y));
+            let line = tab
+                .session
+                .term
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .view_line(row, tab.view.back);
+            if let Some((_, head)) = tab.view.selection.as_mut() {
                 *head = (line, boundary);
             }
         }
@@ -2559,17 +2777,20 @@ impl EditorView {
     /// history under it, by the frame, and the selection follows. Returns
     /// whether it scrolled, which is to say whether to ask again next frame.
     pub(super) fn terminal_autoscroll(&self) -> bool {
-        let Some((screen, _, _)) = self.terminal_screen() else {
+        let Some((index, screen, _, _)) = self.selecting_pane() else {
             return false;
         };
         let moved = {
             let Some(mut state) = self.state_mut() else {
                 return false;
             };
-            if !state.terminal.selecting {
-                return false;
-            }
-            let Some((x, y)) = state.terminal.drag_point else {
+            let state = &mut *state;
+            let Some((x, y)) = state
+                .terminal
+                .tabs
+                .get(index)
+                .and_then(|tab| tab.view.drag_point)
+            else {
                 return false;
             };
             let past = if y < screen.y {
@@ -2587,16 +2808,18 @@ impl EditorView {
             state.autoscroll_carry += speed * state.frame_interval.as_secs_f32();
             let lines = state.autoscroll_carry.trunc();
             state.autoscroll_carry -= lines;
-            let history = state.terminal.active_tab().map_or(0, |tab| {
-                tab.session
-                    .term
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .scrollback_len()
-            });
+            let Some(tab) = state.terminal.tabs.get_mut(index) else {
+                return false;
+            };
+            let history = tab
+                .session
+                .term
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .scrollback_len();
             // Up is into history: a negative distance raises `back`.
-            let back = state.terminal.back as isize - lines as isize;
-            state.terminal.back = back.clamp(0, history as isize) as usize;
+            let back = tab.view.back as isize - lines as isize;
+            tab.view.back = back.clamp(0, history as isize) as usize;
             (x, y)
         };
         self.terminal_drag(moved.0, moved.1);
@@ -2608,7 +2831,7 @@ impl EditorView {
         let Some(mut state) = self.state_mut() else {
             return;
         };
-        let Some(tab) = state.terminal.active_tab() else {
+        let Some(tab) = state.terminal.active_tab_mut() else {
             return;
         };
         let term = tab.session.term.lock().unwrap_or_else(|e| e.into_inner());
@@ -2616,8 +2839,8 @@ impl EditorView {
         let last = term.view_line(term.rows().saturating_sub(1), 0);
         let cols = term.cols();
         drop(term);
-        state.terminal.selection = Some(((first, 0), (last, cols)));
-        state.terminal.selecting = false;
+        tab.view.selection = Some(((first, 0), (last, cols)));
+        tab.view.selecting = false;
         drop(state);
         self.request_redraw();
         self.pump();
@@ -2627,7 +2850,7 @@ impl EditorView {
     /// for Copy as One Line.
     pub(super) fn terminal_selected_text(&self, one_line: bool) -> Option<String> {
         let state = self.state()?;
-        let (a, b) = state.terminal.selection?;
+        let (a, b) = state.terminal.selection()?;
         let tab = state.terminal.active_tab()?;
         let term = tab.session.term.lock().unwrap_or_else(|e| e.into_inner());
         let text = if one_line {
@@ -2754,8 +2977,8 @@ fn mouse_event(
 
 /// Tells each program that asked for focus reports (mode 1004) when its
 /// session gains or loses the keyboard, `CSI I` and `CSI O`, on a change
-/// only: a click away from the terminal, another pane of a pair, another
-/// tab, another window or app.
+/// only: a click away from the terminal, another pane, another tab,
+/// another window or app.
 pub(super) fn report_focus(state: &mut State, key_window: bool) {
     let keys = key_window
         && state.terminal.has_keys()
@@ -2795,6 +3018,56 @@ pub(super) fn can_step_terminal_tab(state: &State, of_menu: bool, step: isize) -
     tab.and_then(|tab| listed.iter().position(|i| *i == tab))
         .and_then(|place| place.checked_add_signed(step))
         .is_some_and(|to| to < listed.len())
+}
+
+/// Says which workspace each terminal is in, and has the panes put right
+/// with it: a layout holds the sessions of one workspace, and a session
+/// that left for another is no pane of it.
+pub(super) fn group_terminals(state: &mut State) {
+    let State {
+        terminal, agents, ..
+    } = state;
+    let tasks = &agents.tasks;
+    terminal
+        .regroup(|tab| crate::platform::agents::task_of(tasks, tab).map(|task| tasks[task].id()));
+}
+
+/// Whether the terminal shows panes a command can act on: in Agents mode,
+/// with the selected workspace's sessions on screen.
+pub(super) fn has_panes(state: &State) -> bool {
+    state.agents.on && state.terminal.panes().is_some() && !super::agents::active_hidden(state)
+}
+
+/// Whether a split has a pane to cut: Agents mode shows a session of the
+/// selected workspace, or for a tab's own menu (`of_menu`) that tab is
+/// one of its strip's.
+pub(super) fn can_split_terminal(state: &State, of_menu: bool) -> bool {
+    state.agents.on
+        && !super::agents::active_hidden(state)
+        && state.terminal.active_tab().is_some()
+        && (!of_menu
+            || state
+                .terminal
+                .menu_tab_index()
+                .is_some_and(|tab| super::agents::listed_terminals(state).contains(&tab)))
+}
+
+/// Where a press grabs each divider between the terminal's panes, and
+/// whether it is dragged sideways, for the resize cursor over it.
+pub(super) fn pane_dividers(state: &State, chrome: &Chrome) -> Vec<(Viewport, bool)> {
+    let Some(rect) = chrome.terminal else {
+        return Vec::new();
+    };
+    if !state.terminal.showing() || super::agents::active_hidden(state) {
+        return Vec::new();
+    }
+    let (_, screen) = crate::platform::terminal::split(rect);
+    state
+        .terminal
+        .dividers(screen)
+        .into_iter()
+        .map(|divider| (divider.hit, divider.dir == Dir::Horizontal))
+        .collect()
 }
 
 pub(super) fn find_rect(state: &State, chrome: &Chrome) -> Option<Viewport> {

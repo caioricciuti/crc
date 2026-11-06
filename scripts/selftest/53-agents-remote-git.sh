@@ -104,13 +104,13 @@ quit
 SCRIPT
 HOME="$RGH" CRC_TERMINAL_SHELL=/bin/sh CRC_SSH_COMMAND="$T/rgit-ssh.sh" \
     CRC_SELFTEST="$T/rgit.script" "$BIN" "$T/rgitproj" 2> "$T/rgit.err"
-expect "$T/rgit-on.out" agents "on tasks=app,fix,old,rgitproj selected=rgitproj sessions=*rgitproj claude=0 pair=- op=-"
+expect "$T/rgit-on.out" agents "on tasks=app,fix,old,rgitproj selected=rgitproj sessions=*rgitproj claude=0 panes=- op=-"
 expect "$T/rgit-on.out" agents_tree "app,>fix,~merged(+1),rgitproj"
 expect "$T/rgit-on.out" agents_activity "fix=commit,old=commit"
 # The host stops answering: the rows it had stay.
 expect "$T/rgit-down.out" agents_tree "app(unreachable),>fix,~merged(+1),rgitproj"
 # The worktree's terminal is ssh to its folder on the host.
-expect "$T/rgit-term.out" agents "on tasks=app,fix,old,rgitproj selected=fix sessions=rgitproj,*fix claude=0 pair=- op=-"
+expect "$T/rgit-term.out" agents "on tasks=app,fix,old,rgitproj selected=fix sessions=rgitproj,*fix claude=0 panes=- op=-"
 expect "$T/rgit-term.out" inspector "remote=myhost:$fix_path error=host unreachable buttons="
 expect_terminal "$T/rgit-term.out" "remote stub up"
 q="'\"'\"'"

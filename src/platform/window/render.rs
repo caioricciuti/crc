@@ -56,6 +56,8 @@ impl EditorView {
         // The Explorer's selection is drawn at full strength, its cursor
         // outlined, while the tree has the keyboard in the key window.
         state.tree.focused = key && super::sidebar::tree_has_keys(&state);
+        // And its cut rows dimmed until something else is copied.
+        super::explorer::sync_cut(&mut state);
         let column = column_of(&state);
         let chrome = chrome_of(&state);
         let terminal_find_rect = super::terminal::find_rect(&state, &chrome);
@@ -824,6 +826,14 @@ impl EditorView {
                 })
                 .collect()
         });
+        // Its panes hold one workspace's sessions each: put right with
+        // where the sessions are now, while there are any.
+        if !terminal_panel.layouts.is_empty() {
+            let tasks = &agents.tasks;
+            terminal_panel.regroup(|tab| {
+                crate::platform::agents::task_of(tasks, tab).map(|task| tasks[task].id())
+            });
+        }
         // Set again by the list when it draws the Activity panel open.
         agents.activity.shown = false;
         if let Some(rect) = sidebar_rect

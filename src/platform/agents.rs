@@ -3100,11 +3100,12 @@ impl Panel {
     }
 
     /// For the self-test: the mode, the tasks by name, the selected one,
-    /// and each session's task (`-` for none), the active one starred.
-    pub fn report(&self, tabs: &[Tab], active: usize, pair: Option<(usize, usize)>) -> String {
+    /// each session's task (`-` for none), the active one starred, and
+    /// the terminal's `panes` as it says them, by each session's place.
+    pub fn report(&self, tabs: &[Tab], active: usize, panes: &str) -> String {
         let name = |i: Option<usize>| i.map_or("-".to_owned(), |i| self.title(&self.tasks[i]));
         format!(
-            "{} tasks={} selected={} sessions={} claude={} pair={} op={}",
+            "{} tasks={} selected={} sessions={} claude={} panes={} op={}",
             if self.on { "on" } else { "off" },
             self.tasks
                 .iter()
@@ -3125,7 +3126,7 @@ impl Panel {
                 .collect::<Vec<_>>()
                 .join(","),
             tabs.iter().filter(|t| t.claude).count(),
-            pair.map_or("-".to_owned(), |(l, r)| format!("{l}+{r}")),
+            panes,
             self.op.as_ref().map_or("-", |(said, _)| said.as_str()),
         )
     }

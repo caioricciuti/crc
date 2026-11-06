@@ -372,6 +372,35 @@ impl<L: Clone + PartialEq> Node<L> {
         y: f32,
         min: f32,
     ) -> bool {
+        self.place_divider(id, area, gap, min, false, |dir, start, gap, _| {
+            (dir.along(x, y) - start - gap * 0.5).round()
+        })
+    }
+
+    /// Puts divider `id` back in the middle of its split, as far as
+    /// leaving every pane on both sides `min` allows: an even split where
+    /// there is room for one. Returns whether the split changed, as
+    /// [`Node::drag_divider`] does.
+    pub fn center_divider(&mut self, id: usize, area: Viewport, gap: f32, min: f32) -> bool {
+        self.place_divider(id, area, gap, min, true, |_, _, _, free| {
+            (free * 0.5).floor()
+        })
+    }
+
+    /// Gives the first side of the split with divider `id` the size
+    /// `wanted` works out from the split's direction, where its area
+    /// starts, its gap and the room its two sides share, held to what
+    /// `min` allows. With `even`, a size that is half the room is kept as
+    /// the ratio a new split has.
+    fn place_divider(
+        &mut self,
+        id: usize,
+        area: Viewport,
+        gap: f32,
+        min: f32,
+        even: bool,
+        wanted: impl Fn(Dir, f32, f32, f32) -> f32,
+    ) -> bool {
         let mut left = id;
         let Some((Node::Split { dir, ratio, a, b }, area)) = self.nth_split(area, gap, &mut left)
         else {
@@ -384,13 +413,18 @@ impl<L: Clone + PartialEq> Node<L> {
         let min = min.max(0.0);
         let lo = a.need(*dir, min, gap).ceil();
         let hi = (free - b.need(*dir, min, gap)).floor();
-        let first = (dir.along(x, y) - start - gap * 0.5).round();
+        let first = wanted(*dir, start, gap, free);
         if !first.is_finite() || free <= 0.0 || lo > hi {
             return false;
         }
+        let first = first.clamp(lo, hi);
         // Half a point past the whole size, so that flooring the product
         // in the layout gives that size back.
-        let next = ((first.clamp(lo, hi) + 0.5) / free).min(1.0);
+        let next = if even && first == (free * 0.5).floor() {
+            0.5
+        } else {
+            ((first + 0.5) / free).min(1.0)
+        };
         let changed = next != *ratio;
         *ratio = next;
         changed
@@ -419,6 +453,39 @@ impl<L: Clone + PartialEq> Node<L> {
             b,
         };
         true
+    }
+
+    /// Shows `new` where the pane `leaf` is, the tree otherwise as it was.
+    /// Returns false, leaving the tree alone, when `leaf` is not here or
+    /// `new` already is.
+    pub fn replace(&mut self, leaf: &L, new: L) -> bool {
+        if self.contains(&new) {
+            return false;
+        }
+        match self.find_mut(leaf) {
+            Some(node) => {
+                *node = Node::Leaf(new);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The pane that gets the room of the pane `leaf` when it goes: the
+    /// nearest one of what is beside it, the first of a side after it or
+    /// the last of a side before it. None for the only pane, or one not
+    /// here.
+    pub fn heir(&self, leaf: &L) -> Option<&L> {
+        let Node::Split { a, b, .. } = self else {
+            return None;
+        };
+        if matches!(&**a, Node::Leaf(own) if own == leaf) {
+            b.leaves().first().copied()
+        } else if matches!(&**b, Node::Leaf(own) if own == leaf) {
+            a.leaves().last().copied()
+        } else {
+            a.heir(leaf).or_else(|| b.heir(leaf))
+        }
     }
 
     /// Takes `leaf` out of the layout in `tree`; what was beside it gets
@@ -631,9 +698,8 @@ pub fn drop_zone(pane: Viewport, gap: f32, x: f32, y: f32) -> Option<(Zone, View
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::terminal::halves;
 
-    /// What the terminal leaves between the two screens of a pair.
+    /// What the terminal leaves between two panes.
     const GAP: f32 = 17.0;
 
     fn leaf(id: u32) -> Node<u32> {
@@ -694,27 +760,134 @@ mod tests {
     }
 
     #[test]
-    fn an_even_split_is_the_pair_the_terminal_draws() {
+    fn an_even_split_gives_each_side_half_on_whole_points() {
         let tree = h(0.5, leaf(1), leaf(2));
-        assert_eq!(
-            tree.rects(rect(8.0, 30.0, 1000.0, 400.0), GAP),
-            vec![
-                (&1, rect(8.0, 30.0, 491.0, 400.0)),
-                (&2, rect(516.0, 30.0, 492.0, 400.0)),
-            ]
-        );
-        for screen in [
-            rect(8.0, 30.0, 1000.0, 400.0),
-            rect(0.0, 0.0, 1183.0, 700.0),
-            rect(248.0, 52.0, 1183.5, 611.0),
-            rect(3.0, 4.0, 18.0, 9.0),
-            rect(3.0, 4.0, GAP, 9.0),
+        // The first side is half of what the gap leaves, rounded down; the
+        // second starts after the gap and takes the rest.
+        for (screen, left, right) in [
+            (
+                rect(8.0, 30.0, 1000.0, 400.0),
+                rect(8.0, 30.0, 491.0, 400.0),
+                rect(516.0, 30.0, 492.0, 400.0),
+            ),
+            (
+                rect(0.0, 0.0, 1183.0, 700.0),
+                rect(0.0, 0.0, 583.0, 700.0),
+                rect(600.0, 0.0, 583.0, 700.0),
+            ),
+            (
+                rect(248.0, 52.0, 1183.5, 611.0),
+                rect(248.0, 52.0, 583.0, 611.0),
+                rect(848.0, 52.0, 583.5, 611.0),
+            ),
+            (
+                rect(3.0, 4.0, 18.0, 9.0),
+                rect(3.0, 4.0, 0.0, 9.0),
+                rect(20.0, 4.0, 1.0, 9.0),
+            ),
+            (
+                rect(3.0, 4.0, GAP, 9.0),
+                rect(3.0, 4.0, 0.0, 9.0),
+                rect(20.0, 4.0, 0.0, 9.0),
+            ),
         ] {
-            let (left, right) = halves(screen);
             assert_eq!(
                 tree.rects(screen, GAP),
                 vec![(&1, left), (&2, right)],
                 "{screen:?}"
+            );
+        }
+        // Stacked, the same along the other direction.
+        assert_eq!(
+            v(0.5, leaf(1), leaf(2)).rects(rect(8.0, 30.0, 1000.0, 400.0), GAP),
+            vec![
+                (&1, rect(8.0, 30.0, 1000.0, 191.0)),
+                (&2, rect(8.0, 238.0, 1000.0, 192.0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_divider_goes_back_to_the_middle_as_far_as_the_minimum_allows() {
+        let area = rect(100.0, 0.0, 317.0, 200.0);
+        let mut tree = h(0.5, leaf(1), leaf(2));
+        assert!(!tree.center_divider(0, area, GAP, 80.0), "already even");
+        assert!(tree.drag_divider(0, area, GAP, 5000.0, 0.0, 80.0));
+        assert!(tree.center_divider(0, area, GAP, 80.0));
+        assert_eq!(tree, h(0.5, leaf(1), leaf(2)), "the ratio a new split has");
+        // From the other side too, and it lays out as a new split does.
+        assert!(tree.drag_divider(0, area, GAP, -5000.0, 0.0, 80.0));
+        assert!(tree.center_divider(0, area, GAP, 80.0));
+        assert_eq!(tree, h(0.5, leaf(1), leaf(2)));
+        assert_eq!(
+            tree.rects(area, GAP),
+            vec![
+                (&1, rect(100.0, 0.0, 150.0, 200.0)),
+                (&2, rect(267.0, 0.0, 150.0, 200.0)),
+            ]
+        );
+
+        // Two panes on the right need more than half: the divider stops
+        // where each of them still has the minimum.
+        let mut tree = h(0.2, leaf(1), h(0.5, leaf(2), leaf(3)));
+        let area = rect(0.0, 0.0, 317.0, 200.0);
+        assert!(tree.center_divider(0, area, GAP, 80.0));
+        let panes = tree.rects(area, GAP);
+        assert_eq!(panes[0].1.width, 300.0 - (80.0 + GAP + 80.0));
+        assert!(panes.iter().all(|(_, pane)| pane.width >= 80.0));
+        // The nested one, in its own area.
+        assert!(tree.drag_divider(1, area, GAP, 5000.0, 0.0, 0.0));
+        assert!(tree.center_divider(1, area, GAP, 0.0));
+        let panes = tree.rects(area, GAP);
+        assert_eq!(panes[1].1.width, 80.0);
+        assert_eq!(panes[2].1.width, 80.0);
+
+        let before = tree.clone();
+        assert!(!tree.center_divider(2, area, GAP, 80.0), "no such divider");
+        assert!(!tree.center_divider(0, rect(0.0, 0.0, 100.0, 100.0), GAP, 80.0));
+        assert!(!leaf(1).center_divider(0, area, GAP, 80.0));
+        assert_eq!(tree, before);
+    }
+
+    #[test]
+    fn a_pane_is_replaced_where_it_is_and_its_room_goes_to_the_nearest() {
+        let mut tree = h(0.3, leaf(1), v(0.6, leaf(2), h(0.7, leaf(3), leaf(4))));
+        assert!(tree.replace(&3, 9));
+        assert_eq!(
+            tree,
+            h(0.3, leaf(1), v(0.6, leaf(2), h(0.7, leaf(9), leaf(4))))
+        );
+        let before = tree.clone();
+        assert!(!tree.replace(&3, 5), "no such pane");
+        assert!(!tree.replace(&1, 4), "4 is already here");
+        assert!(!tree.replace(&1, 1), "onto itself");
+        assert_eq!(tree, before);
+        let mut one = leaf(1);
+        assert!(one.replace(&1, 2));
+        assert_eq!(one, leaf(2));
+
+        // Whoever is beside a pane gets its room: the first pane of a side
+        // after it, the last of a side before it.
+        let heir = |from: u32| tree.heir(&from).copied();
+        assert_eq!(heir(1), Some(2));
+        assert_eq!(heir(2), Some(9));
+        assert_eq!(heir(9), Some(4));
+        assert_eq!(heir(4), Some(9));
+        assert_eq!(heir(7), None, "no such pane");
+        assert_eq!(leaf(1).heir(&1), None, "the only pane");
+        let wide = h(0.5, v(0.5, leaf(1), leaf(2)), leaf(3));
+        assert_eq!(wide.heir(&3), Some(&2), "the last of the side before");
+        // And it is the pane that has the room once the other is gone.
+        for id in [1, 2, 9, 4] {
+            let next = heir(id).unwrap();
+            let area = rect(0.0, 0.0, 817.0, 617.0);
+            let was = tree.rect_of(area, GAP, &id).unwrap();
+            let mut slot = Some(tree.clone());
+            assert!(Node::remove(&mut slot, &id));
+            let grown = slot.unwrap().rect_of(area, GAP, &next).unwrap();
+            assert!(
+                grown.width * grown.height > was.width * was.height || grown.contains(was.x, was.y),
+                "{id} to {next}: {grown:?}"
             );
         }
     }

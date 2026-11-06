@@ -92,4 +92,6 @@ agent-changes 6.0
 table-query 10.7
 data-preview 26.3
 terminal-reorder 40.1
+terminal-panes 26.2
 explorer-selection 16.5
+explorer-clipboard 23.7

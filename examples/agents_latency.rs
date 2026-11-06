@@ -22,7 +22,9 @@
 //! `--workspaces N`, `--hidden-streaming N` for that many background
 //! terminals printing between samples, every tenth line retitling its tab
 //! as an agent's spinner does; the redraws they ask for are counted under
-//! the window's rule, [`terminal::Pace::decide`]).
+//! the window's rule, [`terminal::Pace::decide`]; `--panes N` for that
+//! many of the selected workspace's terminals on screen at once, the
+//! first beside the rest stacked).
 
 use crc::platform::agents::{self, IssueSet, Panel, RepoKey, Workspace};
 use crc::platform::inspector::{self, Issues};
@@ -56,6 +58,7 @@ struct Options {
     issues: bool,
     workspaces: usize,
     hidden_streaming: usize,
+    panes: usize,
 }
 
 impl Options {
@@ -75,6 +78,7 @@ impl Options {
             issues: !args.iter().any(|a| a == "--no-issues"),
             workspaces: number("--workspaces", 12).max(1),
             hidden_streaming: number("--hidden-streaming", 0),
+            panes: number("--panes", 1).clamp(1, 6),
         }
     }
 }
@@ -214,6 +218,7 @@ fn tab(title: &str, workspace: &Workspace, cols: usize, rows: usize) -> Tab {
         last_return: None,
         marks: Default::default(),
         notified: false,
+        view: terminal::View::new(),
     }
 }
 
@@ -268,6 +273,12 @@ impl Scene {
                 .filter(|i| agents::task_of(tasks, &self.terminal.tabs[*i]) == selected)
                 .collect(),
         );
+        // As the window does while there are panes: each session's
+        // workspace, and the layouts put right with it.
+        if !self.terminal.layouts.is_empty() {
+            self.terminal
+                .regroup(|tab| agents::task_of(tasks, tab).map(|task| tasks[task].id()));
+        }
         let active = self.terminal.active_tab().map(|_| self.terminal.active);
         self.agents.draw(
             &self.terminal.tabs,
@@ -462,22 +473,40 @@ fn main() {
 
     // The selected workspace's two terminals, the first showing; the rest
     // spread over the others, and as many more as stream.
-    let hidden = (TABS - SHOWN_TABS).max(options.hidden_streaming);
-    let mut tabs: Vec<Tab> = (0..SHOWN_TABS)
+    let shown = SHOWN_TABS.max(options.panes);
+    let hidden = (TABS.max(shown) - shown).max(options.hidden_streaming);
+    let mut tabs: Vec<Tab> = (0..shown)
         .map(|n| tab(&format!("shell-{}", n + 1), &home, cols, rows))
         .collect();
     for n in 0..hidden {
         let owner = &folders[(n + 1) % folders.len()];
         tabs.push(tab(&format!("agent-{}", n + 1), owner, cols, rows));
     }
-    let streaming: Vec<usize> = (SHOWN_TABS..SHOWN_TABS + options.hidden_streaming).collect();
-    let terminal = terminal::Panel {
+    let streaming: Vec<usize> = (shown..shown + options.hidden_streaming).collect();
+    let mut terminal = terminal::Panel {
         open: true,
         focus: true,
         tabs,
         active: 0,
         ..terminal::Panel::default()
     };
+    // The panes asked for: the second beside the first, the rest under
+    // the second, each session the size of its pane, and the keyboard
+    // back in the first, which is the one typed into.
+    {
+        let tasks = &panel.tasks;
+        terminal.regroup(|tab| agents::task_of(tasks, tab).map(|task| tasks[task].id()));
+    }
+    for n in 1..options.panes {
+        let edge = if n == 1 {
+            layout::split::Edge::Right
+        } else {
+            layout::split::Edge::Bottom
+        };
+        assert!(terminal.split(edge, n), "pane {n}");
+    }
+    terminal.show(0);
+    terminal.fit(&renderer.atlas, terminal::split(screen).1);
     let mut scene = Scene {
         agents: panel,
         terminal,
@@ -497,7 +526,10 @@ fn main() {
         options.repos,
         if options.issues { 15 } else { 0 },
     );
-    println!("terminal    {cols}x{rows} cells\n");
+    println!(
+        "terminal    {cols}x{rows} cells, {} on screen\n",
+        options.panes
+    );
 
     let size = (logical_w, logical_h);
     let px = (px_w, px_h);

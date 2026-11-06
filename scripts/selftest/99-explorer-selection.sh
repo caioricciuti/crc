@@ -110,10 +110,10 @@ expect "$T/pick-released.out" tabs "garden.txt | journal.md"
 expect "$T/pick-released.out" tree_rows "$(pick_rows '*>' journal.md)"
 expect "$T/pick-released.out" tree_keys false
 expect "$T/pick-menu-many.out" tree_rows "$(pick_rows '*' groceries.txt '*>' journal.md)"
-expect "$T/pick-menu-many.out" message "menu: New File…|New Folder…|Copy Path|Copy Relative Path|Reveal in Finder|Move to Trash"
+expect "$T/pick-menu-many.out" message "menu: New File…|New Folder…|Cut|Copy|Paste|Duplicate|Copy Path|Copy Relative Path|Reveal in Finder|Move to Trash"
 expect "$T/pick-menu-many.out" tree_keys true
 expect "$T/pick-menu-one.out" tree_rows "$(pick_rows '*>' letters.txt)"
-expect "$T/pick-menu-one.out" message "menu: New File…|New Folder…|Copy Path|Copy Relative Path|Reveal in Finder|Rename…|Move to Trash"
+expect "$T/pick-menu-one.out" message "menu: New File…|New Folder…|Cut|Copy|Paste|Duplicate|Copy Path|Copy Relative Path|Reveal in Finder|Rename…|Move to Trash"
 # Taken out again with Command, the cursor goes back to what is selected.
 expect "$T/pick-cmd-off.out" tree_rows "$(pick_rows '*>' letters.txt)"
 expect "$T/pick-blank.out" tree_rows "$(pick_rows)"

@@ -11,10 +11,15 @@
 
 use std::path::{Path, PathBuf};
 
-/// Directories never worth indexing: the ones the sidebar hides, and
-/// vendored sources, which the sidebar shows but nobody opens by name.
+/// Directories never worth indexing: the ones the sidebar hides, vendored
+/// sources, which the sidebar shows but nobody opens by name, and the
+/// folders a copy is built in, which are not the project's. The project
+/// search and the index list their files through this walk, so they leave
+/// the same folders out.
 fn skip_dir(name: &str) -> bool {
-    super::SKIP_DIRS.contains(&name) || name == "third_party"
+    super::SKIP_DIRS.contains(&name)
+        || name == "third_party"
+        || name.starts_with(super::fileops::STAGING_PREFIX)
 }
 
 /// How deep to walk. A guard against a pathological tree rather than a real
@@ -415,6 +420,24 @@ mod tests {
             !names.iter().any(|n| n.contains(".git")),
             "Git internals should not be indexed"
         );
+    }
+
+    /// What is in the hidden folder a copy is built in is not the
+    /// project's: Go to File, the project search and the index, which all
+    /// list files through this walk, never see a half-made copy.
+    #[test]
+    fn the_folder_a_copy_is_built_in_is_not_indexed() {
+        let f = Fixture::new("staging");
+        let staging = format!("{}7-0", crate::project::fileops::STAGING_PREFIX);
+        for dir in [f.0.clone(), f.0.join("src/render")] {
+            std::fs::create_dir_all(dir.join(&staging).join("site")).unwrap();
+            std::fs::write(dir.join(&staging).join("site/half.rs"), "x").unwrap();
+        }
+        let before = finder(&Fixture::new("staging-none")).len();
+        let finder = finder(&f);
+        let names: Vec<&str> = finder.entries.iter().map(|e| e.relative.as_str()).collect();
+        assert!(!names.iter().any(|n| n.contains("half.rs")), "{names:?}");
+        assert_eq!(finder.len(), before);
     }
 
     #[test]

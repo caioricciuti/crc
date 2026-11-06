@@ -49,10 +49,17 @@ impl EditorView {
                 if active_hidden(&state) {
                     let tasks = &state.agents.tasks;
                     let selected = state.agents.selected_index();
-                    if let Some(last) = (0..state.terminal.tabs.len())
-                        .rev()
-                        .find(|i| task_of(tasks, &state.terminal.tabs[*i]) == selected)
-                    {
+                    // The one its panes had the keyboard in, when it has
+                    // panes.
+                    let focused = state
+                        .terminal
+                        .focused_in(state.agents.selected.as_deref())
+                        .filter(|i| task_of(tasks, &state.terminal.tabs[*i]) == selected);
+                    if let Some(last) = focused.or_else(|| {
+                        (0..state.terminal.tabs.len())
+                            .rev()
+                            .find(|i| task_of(tasks, &state.terminal.tabs[*i]) == selected)
+                    }) {
                         state.terminal.show(last);
                     }
                 }
@@ -617,16 +624,24 @@ impl EditorView {
                 .filter(|i| task_of(&tasks, &state.terminal.tabs[*i]) == Some(index))
                 .collect();
             let tabs = &state.terminal.tabs;
-            let pick = switcher::latest(&state.agents.focus, &mine, |i| {
-                switcher::session_key(&tabs[i].id())
-            })
-            .or_else(|| {
-                super::menubar::best_tab(
-                    &mine,
-                    |i| tabs[i].activity() == Activity::Waiting,
-                    state.terminal.active,
-                )
-            });
+            // Its panes come back as they were left, the keyboard in the
+            // one that had it.
+            let pick = state
+                .terminal
+                .focused_in(Some(&tasks[index].id()))
+                .filter(|tab| mine.contains(tab))
+                .or_else(|| {
+                    switcher::latest(&state.agents.focus, &mine, |i| {
+                        switcher::session_key(&tabs[i].id())
+                    })
+                })
+                .or_else(|| {
+                    super::menubar::best_tab(
+                        &mine,
+                        |i| tabs[i].activity() == Activity::Waiting,
+                        state.terminal.active,
+                    )
+                });
             (pick, path)
         };
         match found {

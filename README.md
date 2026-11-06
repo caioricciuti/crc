@@ -236,8 +236,21 @@ the size and write it back.
   the editor, merging its branch into the main checkout, removing it
   (refused while it has uncommitted changes), and renaming or forgetting
   a folder workspace; on a session the menu offers another session
-  beside it, or closes it. Releases stay outside crc. `Cmd-\` shows two of a
-  workspace's sessions side by side. A session's state comes from the
+  beside it, or closes it. Releases stay outside crc. A workspace's
+  sessions show in panes, as many as you split: `Cmd-\` cuts the pane
+  with the keyboard in two side by side, `Cmd-Shift-\` stacks a new one
+  under it, and a tab's menu has Split Right and Split Down to put that
+  session in a pane of its own. The new pane shows another session of
+  the workspace, or a new shell in its folder. Drag the line between two
+  panes to resize them (a pane keeps at least twenty columns by five
+  rows; a double click evens the split), click a pane or use View >
+  Focus Pane Left, Right, Up and Down to move the keyboard, and
+  `Cmd-Option-W` closes the pane with the keyboard and keeps its session
+  as a tab. A tab that is in no pane shows in the pane with the keyboard
+  when clicked. Each pane scrolls and selects on its own, each workspace
+  keeps its own panes, and a program is told its new size once a drag is
+  let go, not on every step. Panes are not kept across a relaunch. A
+  session's state comes from the
   agent itself when it reports it (Claude Code 2.1.295 and later speak
   the Program Status Protocol, OSC 7501): working, waiting on a
   permission, a question or a login, finished, or failed, with its
@@ -380,7 +393,16 @@ the size and write it back.
   or have their paths copied together, with one question for all of them.
   A click on a file opens it and the keyboard stays in the document; a
   click on a folder, or View > Focus Explorer, puts it in the tree, where
-  the arrows move, Return renames and typing jumps to a name.
+  the arrows move, Return renames and typing jumps to a name. There,
+  `Cmd-C`, `Cmd-X` and `Cmd-V` copy, cut and paste the selected files
+  and folders, and Duplicate (the context menu, or File > Duplicate) puts
+  a copy beside each. They go through the system clipboard, so a copy
+  pastes in the Finder and files copied in the Finder paste into the
+  cursor's folder. Nothing is ever replaced: a name that is taken gets
+  `-copy`, then `-copy-2`. A cut item is dimmed until it is pasted,
+  something else is copied or Escape calls it off, and its open tabs and
+  local history move with it. A large copy runs in the background, and
+  Escape in the tree stops it.
 - **Search view** (`Cmd-Shift-F`) in the sidebar: the project searched as
   you type, listed by file and line with each match marked, folding
   files, files to include and exclude, and Replace All; `Cmd-P` fuzzy
@@ -509,6 +531,8 @@ the size and write it back.
 | `Cmd-\` | split the editor to the right |
 | `Cmd-Option-[` / `Cmd-Option-]` | focus the previous / next pane |
 | `Cmd-Option-W` | close the pane |
+| `Cmd-\` / `Cmd-Shift-\` (Agents mode) | split the terminal pane with the keyboard to the right / down |
+| drag the line between two terminal panes, or double-click it | resize them / even the split |
 | `F12`, Cmd-click | go to definition |
 | `F1` | hover information for the symbol at the caret |
 | `Ctrl-Space` | completion; Tab takes the suggestion, Up/Down pick another (then Return takes it too), Option-1 to 9 take one directly, Escape closes |
@@ -543,6 +567,8 @@ the size and write it back.
 | Space / `Cmd-Down` in the Explorer | open and stay in the tree / open and move to the document |
 | type in the Explorer | jump to the next name that starts with it |
 | `Cmd-Delete` in the Explorer | move the selection to the Trash, after asking |
+| `Cmd-C` / `Cmd-X` / `Cmd-V` in the Explorer | copy or cut the selected files and folders, paste into the cursor's folder; also to and from the Finder |
+| Escape in the Explorer | stop a copy that is running, or call off a cut |
 | `Cmd-1..9`, `Cmd-[`, `Cmd-]` | switch tabs |
 | `Cmd-Shift-[`, `Cmd-Shift-]` | move the tab left or right: the terminal's while it has the keyboard, else the document's |
 | drag a tab, or right-click it | reorder or manage tabs |

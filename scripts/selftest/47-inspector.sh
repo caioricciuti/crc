@@ -69,7 +69,7 @@ SCRIPT
 # The list is one for the app, kept under HOME: this scenario has its own.
 mkdir -p "$T/home/inspector"
 HOME="$T/home/inspector" CRC_TERMINAL_SHELL=/bin/sh CRC_SELFTEST="$T/inspector.script" "$BIN" "$P" 2> "$T/inspector.err"
-expect "$T/inspector-feat.out" agents "on tasks=inspectproj,feat selected=feat sessions=inspectproj,*feat claude=0 pair=- op=-"
+expect "$T/inspector-feat.out" agents "on tasks=inspectproj,feat selected=feat sessions=inspectproj,*feat claude=0 panes=- op=-"
 expect_prefix() {
     local got
     got=$(grep -m1 "^$2: " "$1" 2>/dev/null | sed "s/^$2: //" || true)
@@ -146,8 +146,8 @@ expect_prefix "$T/inspector-behind.out" inspector "branch=feat base=main ahead=3
 expect_prefix "$T/inspector-pulled.out" inspector "branch=feat base=main ahead=4 behind=0 upstream=origin/feat push=0 pull=0"
 [ -f "$F/t.txt" ] || failed "inspector: Pull did not bring t.txt"
 # Waiting on you moves nothing: the list keeps your order.
-expect "$T/inspector-zz.out" agents "on tasks=inspectproj,feat,zz selected=zz sessions=inspectproj,feat,*zz claude=0 pair=- op=-"
-expect "$T/inspector-sorted.out" agents "on tasks=inspectproj,feat,zz selected=zz sessions=inspectproj,feat,*zz claude=0 pair=- op=-"
+expect "$T/inspector-zz.out" agents "on tasks=inspectproj,feat,zz selected=zz sessions=inspectproj,feat,*zz claude=0 panes=- op=-"
+expect "$T/inspector-sorted.out" agents "on tasks=inspectproj,feat,zz selected=zz sessions=inspectproj,feat,*zz claude=0 panes=- op=-"
 testgit "$P" worktree remove --force "$F" 2>/dev/null || true
 testgit "$P" worktree remove --force "$T/inspect-wt/zz" 2>/dev/null || true
 
@@ -188,7 +188,7 @@ SCRIPT
 mkdir -p "$T/home/inspector-many"
 HOME="$T/home/inspector-many" CRC_TERMINAL_SHELL=/bin/sh CRC_SELFTEST="$T/inspector-many.script" \
     "$BIN" "$M" 2> "$T/inspector-many.err"
-expect "$T/inspector-many.out" agents "on tasks=inspect-many selected=inspect-many sessions=*inspect-many claude=0 pair=- op=-"
+expect "$T/inspector-many.out" agents "on tasks=inspect-many selected=inspect-many sessions=*inspect-many claude=0 panes=- op=-"
 expect "$T/inspector-many.out" inspector "alpha: branch=main base=- ahead=0 behind=0 upstream=- push=0 pull=0 dirty=0 changes=+0-0 tag=- buttons=push | beta: branch=main base=- ahead=0 behind=0 upstream=- push=0 pull=0 dirty=1 changes=+0-0 tag=- buttons=commit,push"
 [ "$(testgit "$M/beta" log -1 --format=%s)" = wip ] \
     || failed "inspector: Commit All in beta did not commit there: $(testgit "$M/beta" log -1 --format=%s)"

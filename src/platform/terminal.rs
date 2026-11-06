@@ -7,10 +7,12 @@
 //! lines, so box drawing joins up: `claude` draws its input in a box.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::project::icons;
 use crate::render::font::Atlas;
+use crate::render::layout::split::{Dir, Divider, Edge, Node};
 use crate::render::layout::{self, Button, Theme, Tone, Viewport};
 use crate::render::metal::GlyphInstance;
 use crate::term::pty::Session;
@@ -136,6 +138,102 @@ pub struct Tab {
     /// it starts waiting, cleared when it stops (see `notify::edge` in the
     /// window).
     pub notified: bool,
+    /// What is shown of it where it is on screen, and what names it in a
+    /// layout of panes.
+    pub view: View,
+}
+
+/// What names a tab in a layout of panes, for as long as it lives and
+/// wherever it goes among the tabs: a number no other tab ever has, so a
+/// pane can never come to mean another session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PaneId(u64);
+
+impl PaneId {
+    /// One no tab has had.
+    fn next() -> PaneId {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        PaneId(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+/// Selected text of a session, from the press to the pointer: line
+/// numbers (see [`crate::term::Term::view_line`]) and column boundaries.
+pub type Selection = ((u64, usize), (u64, usize));
+
+/// What is shown of a session where it is on screen. Each tab has its
+/// own, so scrolling or selecting in one pane never moves or clears
+/// another.
+#[derive(Clone, Debug, PartialEq)]
+pub struct View {
+    /// What names its tab in a layout of panes.
+    pub id: PaneId,
+    /// The workspace its tab is in, by the window's name for it, as the
+    /// window last said ([`Panel::regroup`]): a layout holds the tabs of
+    /// one workspace.
+    pub group: Option<String>,
+    /// Lines scrolled back into history; 0 follows the output.
+    pub back: usize,
+    pub selection: Option<Selection>,
+    /// A press in its screen is being dragged.
+    pub selecting: bool,
+    /// Where the drag last was, for scrolling the history under a pointer
+    /// held past the screen's edge.
+    pub drag_point: Option<(f32, f32)>,
+}
+
+impl View {
+    /// A new tab's: following the output, nothing selected.
+    pub fn new() -> View {
+        View {
+            id: PaneId::next(),
+            group: None,
+            back: 0,
+            selection: None,
+            selecting: false,
+            drag_point: None,
+        }
+    }
+
+    /// As it is when its tab comes on screen from the strip: at the
+    /// output, nothing selected.
+    pub fn reset(&mut self) {
+        self.back = 0;
+        self.selection = None;
+        self.selecting = false;
+        self.drag_point = None;
+    }
+}
+
+impl Default for View {
+    fn default() -> Self {
+        View::new()
+    }
+}
+
+/// A workspace's panes: its sessions on screen together, side by side or
+/// stacked, and the one with the keyboard. Kept only while there are two
+/// or more: a workspace with one session showing has none.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Panes {
+    /// The workspace whose tabs these are, as [`View::group`] names it.
+    pub group: Option<String>,
+    pub tree: Node<PaneId>,
+    /// The pane that has the keyboard while these show, and gets it back
+    /// when they show again.
+    pub focus: PaneId,
+}
+
+/// A divider between two panes, held and dragged.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DividerDrag {
+    /// Whose panes it is among.
+    pub group: Option<String>,
+    /// Which divider, by its place in the tree (see [`Divider::id`]): good
+    /// while the tree keeps its shape, and the drag ends when it does not.
+    pub id: usize,
+    /// How far from the middle of its gap it was pressed.
+    pub grab: (f32, f32),
 }
 
 /// What a session is doing, as the Agents sidebar shows it.
@@ -332,6 +430,11 @@ impl Tab {
         title_of(self)
     }
 
+    /// [`Tab::base_name`] for a caller that holds its terminal locked.
+    fn base_name_of(&self, term: &term::Term) -> String {
+        titled(self, term)
+    }
+
     /// Whether a bell rung at `now` asks for attention. One right after a
     /// keystroke is the program answering the key (a shell given a key it
     /// has nothing bound to, a completion with nothing to offer, a
@@ -434,24 +537,19 @@ pub struct Panel {
     pub focus: bool,
     pub height: f32,
     pub tabs: Vec<Tab>,
+    /// The session with the keyboard: the one showing, or of several
+    /// panes the focused one.
     pub active: usize,
-    /// Lines scrolled back into history; 0 follows the output.
-    pub back: usize,
-    /// Selected text of the active tab, from the press to the pointer:
-    /// line numbers (see [`crate::term::Term::view_line`]) and column
-    /// boundaries.
-    pub selection: Option<((u64, usize), (u64, usize))>,
-    /// A press in the screen is being dragged.
-    pub selecting: bool,
-    /// Where the drag last was, for scrolling the history under a pointer
-    /// held past the screen's edge.
-    pub drag_point: Option<(f32, f32)>,
     /// The tabs the header lists, when not all: in Agents mode, the
     /// selected task's.
     pub shown: Option<Vec<usize>>,
-    /// Two sessions side by side, left and right, in Agents mode. The
-    /// active one is the pane with the keyboard.
-    pub pair: Option<(usize, usize)>,
+    /// The panes of each workspace that shows more than one session, one
+    /// layout a workspace at most and no tab in two. The one showing is
+    /// the one the active tab is in.
+    pub layouts: Vec<Panes>,
+    /// A divider between two panes, while it is dragged: the sessions
+    /// keep their sizes until it is let go.
+    pub divider_drag: Option<DividerDrag>,
     /// Redraws asked for by tabs not on screen, paced.
     pub pace: Pace,
     /// A press reported to a program that asked for the mouse: its tab,
@@ -529,12 +627,9 @@ impl Default for Panel {
             height: DEFAULT_HEIGHT,
             tabs: Vec::new(),
             active: 0,
-            back: 0,
-            selection: None,
-            selecting: false,
-            drag_point: None,
             shown: None,
-            pair: None,
+            layouts: Vec::new(),
+            divider_drag: None,
             pace: Pace::default(),
             mouse_press: None,
             mouse_cell: None,
@@ -579,74 +674,503 @@ impl Panel {
             .is_none_or(|shown| shown.contains(&self.active))
     }
 
-    /// The pair, while both its tabs exist and one of them is active.
-    pub fn shown_pair(&self) -> Option<(usize, usize)> {
-        self.pair.filter(|(l, r)| {
-            l != r
-                && *l < self.tabs.len()
-                && *r < self.tabs.len()
-                && (self.active == *l || self.active == *r)
-        })
+    /// Where the tab a layout calls `id` is among the tabs now.
+    pub fn index_of(&self, id: PaneId) -> Option<usize> {
+        self.tabs.iter().position(|tab| tab.view.id == id)
     }
 
-    /// Each session on screen and where its screen is: the active one, or
-    /// both of a pair.
+    /// The layout the tab `id` is a pane of, by its place among them.
+    fn layout_of(&self, id: PaneId) -> Option<usize> {
+        self.layouts
+            .iter()
+            .position(|panes| panes.tree.contains(&id))
+    }
+
+    /// The panes showing: the layout the active tab is in. None while one
+    /// session shows alone.
+    pub fn panes(&self) -> Option<&Panes> {
+        let id = self.active_tab()?.view.id;
+        self.layouts.iter().find(|panes| panes.tree.contains(&id))
+    }
+
+    /// Each session on screen and where its screen is, left before right
+    /// and top before bottom: the active one, or every pane of its layout.
     pub fn screens(&self, screen: Viewport) -> Vec<(usize, Viewport)> {
-        match self.shown_pair() {
-            Some((left, right)) => {
-                let (a, b) = halves(screen);
-                vec![(left, a), (right, b)]
-            }
+        match self.panes() {
+            Some(panes) => panes
+                .tree
+                .rects(screen, PANE_GAP)
+                .into_iter()
+                .filter_map(|(id, rect)| Some((self.index_of(*id)?, rect)))
+                .collect(),
             None => vec![(self.active, screen)],
         }
     }
 
-    /// Shows `tab` with the keyboard: in a pair, the pane it is in, or in
-    /// place of the session in the pane that has the keyboard.
-    pub fn show(&mut self, tab: usize) {
-        if tab >= self.tabs.len() {
+    /// Gives `tab` the keyboard where its workspace's panes have it: the
+    /// pane it is in, or in place of the session in the pane that had the
+    /// keyboard, which goes back to being a tab of the strip alone.
+    fn place(&mut self, tab: usize) {
+        let Some(shown) = self.tabs.get(tab) else {
             return;
-        }
-        if let Some((left, right)) = self.shown_pair()
-            && tab != left
-            && tab != right
-        {
-            self.pair = Some(if self.active == left {
-                (tab, right)
-            } else {
-                (left, tab)
-            });
+        };
+        let id = shown.view.id;
+        let at = self.layout_of(id).or_else(|| {
+            let at = self
+                .layouts
+                .iter()
+                .position(|panes| panes.group == shown.view.group)?;
+            let focus = self.layouts[at].focus;
+            self.layouts[at].tree.replace(&focus, id).then_some(at)
+        });
+        if let Some(at) = at {
+            self.layouts[at].focus = id;
         }
         self.active = tab;
-        self.back = 0;
-        self.selection = None;
+    }
+
+    /// Shows `tab` with the keyboard. Among its workspace's panes it is
+    /// the pane it is in, as it was left, or it takes the place of the
+    /// session in the pane that had the keyboard. A tab that was in no
+    /// pane starts at its output with nothing selected.
+    pub fn show(&mut self, tab: usize) {
+        let Some(shown) = self.tabs.get(tab) else {
+            return;
+        };
+        let kept = self.layout_of(shown.view.id).is_some();
+        self.place(tab);
+        if !kept {
+            self.tabs[tab].view.reset();
+        }
+    }
+
+    /// Cuts the pane with the keyboard in two, with `new` at its `edge`
+    /// and the keyboard in it. Returns false, changing nothing, when
+    /// `new` is the session showing, is another workspace's, is in a pane
+    /// already, or the layout takes no more panes.
+    pub fn split(&mut self, edge: Edge, new: usize) -> bool {
+        let (Some(from), Some(to)) = (self.tabs.get(self.active), self.tabs.get(new)) else {
+            return false;
+        };
+        let (from_id, to_id) = (from.view.id, to.view.id);
+        let group = from.view.group.clone();
+        if new == self.active || to.view.group != group || self.layout_of(to_id).is_some() {
+            return false;
+        }
+        // A session showing alone while its workspace has panes takes its
+        // place among them first.
+        self.place(self.active);
+        let (at, made) = match self.layout_of(from_id) {
+            Some(at) => (at, false),
+            None if self.layouts.iter().any(|panes| panes.group == group) => return false,
+            None => {
+                self.layouts.push(Panes {
+                    group,
+                    tree: Node::Leaf(from_id),
+                    focus: from_id,
+                });
+                (self.layouts.len() - 1, true)
+            }
+        };
+        if !self.layouts[at].tree.split(&from_id, edge, to_id) {
+            if made {
+                self.layouts.remove(at);
+            }
+            return false;
+        }
+        self.layouts[at].focus = to_id;
+        // Another shape: a divider held is not the one it was.
+        self.divider_drag = None;
+        self.active = new;
+        self.tabs[new].view.reset();
+        true
+    }
+
+    /// Takes the tab `id` out of the layout it is a pane of: what was
+    /// beside it gets its room, and the keyboard when it had it there. A
+    /// layout left with one pane is no layout. Returns the pane that got
+    /// the room.
+    fn take_leaf(&mut self, id: PaneId) -> Option<PaneId> {
+        let at = self.layout_of(id)?;
+        let Panes { group, tree, focus } = self.layouts.remove(at);
+        let heir = tree.heir(&id).copied();
+        let mut rest = Some(tree);
+        Node::remove(&mut rest, &id);
+        self.divider_drag = None;
+        if let (Some(tree), Some(heir)) = (rest, heir)
+            && tree.leaf_count() > 1
+        {
+            self.layouts.insert(
+                at,
+                Panes {
+                    group,
+                    focus: if focus == id { heir } else { focus },
+                    tree,
+                },
+            );
+        }
+        heir
+    }
+
+    /// Close Pane: the pane with the keyboard goes and its session stays
+    /// a tab of the strip; what was beside it gets its room and the
+    /// keyboard. Returns whether there was a pane to close.
+    pub fn close_pane(&mut self) -> bool {
+        let Some(id) = self.active_tab().map(|tab| tab.view.id) else {
+            return false;
+        };
+        match self.take_leaf(id).and_then(|heir| self.index_of(heir)) {
+            Some(next) => {
+                self.active = next;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The keyboard to the pane `step` along from the one that has it, in
+    /// the order they read, round from the last to the first. Returns
+    /// whether it moved.
+    pub fn focus_step(&mut self, step: isize) -> bool {
+        let Some(panes) = self.panes() else {
+            return false;
+        };
+        let leaves: Vec<PaneId> = panes.tree.leaves().into_iter().copied().collect();
+        let Some(place) = leaves
+            .iter()
+            .position(|id| self.index_of(*id) == Some(self.active))
+        else {
+            return false;
+        };
+        let to = (place as isize + step).rem_euclid(leaves.len() as isize) as usize;
+        match self
+            .index_of(leaves[to])
+            .filter(|next| *next != self.active)
+        {
+            Some(next) => {
+                self.place(next);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The keyboard to the pane beside the one that has it, toward an
+    /// edge of the panel's `screen`. Returns whether there is one.
+    pub fn focus_toward(&mut self, screen: Viewport, toward: Edge) -> bool {
+        let next = self.panes().and_then(|panes| {
+            let id = self.active_tab()?.view.id;
+            let next = panes.tree.neighbour(screen, PANE_GAP, &id, toward)?;
+            self.index_of(*next)
+        });
+        match next {
+            Some(next) => {
+                self.place(next);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The session whose pane a point of the panel's `screen` is in, or
+    /// nearest to: the gaps and the padding belong to the pane beside
+    /// them.
+    pub fn pane_at(&self, screen: Viewport, x: f32, y: f32) -> usize {
+        let away = |rect: &Viewport| {
+            let dx = (rect.x - x).max(x - (rect.x + rect.width)).max(0.0);
+            let dy = (rect.y - y).max(y - (rect.y + rect.height)).max(0.0);
+            dx.max(dy)
+        };
+        self.screens(screen)
+            .into_iter()
+            .min_by(|(_, p), (_, q)| away(p).total_cmp(&away(q)))
+            .map_or(self.active, |(tab, _)| tab)
+    }
+
+    /// The dividers between the panes showing, in the panel's `screen`.
+    pub fn dividers(&self, screen: Viewport) -> Vec<Divider> {
+        self.panes().map_or(Vec::new(), |panes| {
+            panes.tree.dividers(screen, PANE_GAP, DIVIDER_SLOP)
+        })
+    }
+
+    /// The divider a press at a point grabs.
+    pub fn divider_at(&self, screen: Viewport, x: f32, y: f32) -> Option<Divider> {
+        self.panes()?
+            .tree
+            .divider_at(screen, PANE_GAP, DIVIDER_SLOP, x, y)
+    }
+
+    /// A press on `divider` at a point: it is held, and follows the
+    /// pointer from where it was taken.
+    pub fn grab_divider(&mut self, divider: &Divider, x: f32, y: f32) {
+        let Some(panes) = self.panes() else {
+            return;
+        };
+        let gap = divider.rect;
+        self.divider_drag = Some(DividerDrag {
+            group: panes.group.clone(),
+            id: divider.id,
+            grab: (
+                x - (gap.x + gap.width * 0.5),
+                y - (gap.y + gap.height * 0.5),
+            ),
+        });
+    }
+
+    /// The layout a held divider is in and which way it splits, while it
+    /// is still the one showing; otherwise the drag is over.
+    fn held_divider(&mut self, screen: Viewport) -> Option<(usize, usize, Dir)> {
+        let drag = self.divider_drag.as_ref()?;
+        let id = self.active_tab().map(|tab| tab.view.id);
+        let found = id
+            .and_then(|id| self.layout_of(id))
+            .filter(|at| self.layouts[*at].group == drag.group)
+            .and_then(|at| {
+                let bars = self.layouts[at].tree.dividers(screen, PANE_GAP, 0.0);
+                Some((at, drag.id, bars.get(drag.id)?.dir))
+            });
+        if found.is_none() {
+            self.divider_drag = None;
+        }
+        found
+    }
+
+    /// The pointer moved with a divider held: the divider goes with it,
+    /// as far as leaving every pane [`PANE_MIN_COLS`] by
+    /// [`PANE_MIN_ROWS`] allows. The sessions are not told: see
+    /// [`Panel::fit`]. Returns whether the panes changed.
+    pub fn drag_divider(&mut self, atlas: &Atlas, screen: Viewport, x: f32, y: f32) -> bool {
+        let Some((at, id, dir)) = self.held_divider(screen) else {
+            return false;
+        };
+        let (dx, dy) = self.divider_drag.as_ref().map_or((0.0, 0.0), |d| d.grab);
+        let min = pane_min(atlas, dir);
+        self.layouts[at]
+            .tree
+            .drag_divider(id, screen, PANE_GAP, x - dx, y - dy, min)
+    }
+
+    /// A double click on divider `id`: its two sides get half each, as
+    /// far as the smallest pane allows. Returns whether the panes changed.
+    pub fn center_divider(&mut self, atlas: &Atlas, screen: Viewport, id: usize) -> bool {
+        self.divider_drag = None;
+        let Some(at) = self
+            .active_tab()
+            .and_then(|tab| self.layout_of(tab.view.id))
+        else {
+            return false;
+        };
+        let bars = self.layouts[at].tree.dividers(screen, PANE_GAP, 0.0);
+        let Some(dir) = bars.get(id).map(|bar| bar.dir) else {
+            return false;
+        };
+        let min = pane_min(atlas, dir);
+        self.layouts[at]
+            .tree
+            .center_divider(id, screen, PANE_GAP, min)
+    }
+
+    /// Whether the pane with the keyboard has room to be cut in two at
+    /// `edge` with each half still the smallest a pane is dragged to.
+    pub fn can_split(&self, atlas: &Atlas, screen: Viewport, edge: Edge) -> bool {
+        let pane = self
+            .screens(screen)
+            .into_iter()
+            .find(|(tab, _)| *tab == self.active)
+            .map_or(screen, |(_, rect)| rect);
+        let (dir, extent) = match edge {
+            Edge::Left | Edge::Right => (Dir::Horizontal, pane.width),
+            Edge::Top | Edge::Bottom => (Dir::Vertical, pane.height),
+        };
+        extent >= pane_min(atlas, dir) * 2.0 + PANE_GAP
+    }
+
+    /// Keeps every session's grid the size of where it is drawn in the
+    /// panel's `screen`: a pane's the size of its pane, whether its
+    /// workspace's panes show now or not, so coming back to them tells no
+    /// program anything; every other tab's the size of the whole screen.
+    /// A size a session already has is not set again (see
+    /// [`Session::resize`]), so a change of layout tells each program it
+    /// touches once. Nothing while a divider is dragged: a program that
+    /// draws its whole screen on every change would draw it for each
+    /// step, so the panes are cut or padded until the divider is let go.
+    pub fn fit(&self, atlas: &Atlas, screen: Viewport) {
+        if self.divider_drag.is_some() {
+            return;
+        }
+        let whole = grid_size(atlas, screen);
+        let mut sizes = vec![whole; self.tabs.len()];
+        for panes in &self.layouts {
+            for (id, rect) in panes.tree.rects(screen, PANE_GAP) {
+                if let Some(index) = self.index_of(*id) {
+                    sizes[index] = grid_size(atlas, rect);
+                }
+            }
+        }
+        for (tab, (cols, rows)) in self.tabs.iter().zip(sizes) {
+            tab.session.resize(cols, rows);
+        }
+    }
+
+    /// The window says which workspace each tab is in, and the layouts
+    /// are put right with it.
+    pub fn regroup(&mut self, group: impl Fn(&Tab) -> Option<String>) {
+        for tab in &mut self.tabs {
+            let now = group(tab);
+            if tab.view.group != now {
+                tab.view.group = now;
+            }
+        }
+        self.settle();
+    }
+
+    /// Puts the layouts right with the tabs as they are: a pane whose tab
+    /// has gone, or has left for another workspace, gives its room to the
+    /// one beside it; no workspace has two layouts; each layout's
+    /// keyboard is in one of its panes; and the tab showing, when its
+    /// workspace has panes, is one of them.
+    pub fn settle(&mut self) {
+        let stray: Vec<PaneId> = self
+            .layouts
+            .iter()
+            .flat_map(|panes| {
+                panes.tree.leaves().into_iter().copied().filter(|id| {
+                    !self
+                        .tabs
+                        .iter()
+                        .any(|tab| tab.view.id == *id && tab.view.group == panes.group)
+                })
+            })
+            .collect();
+        for id in stray {
+            self.take_leaf(id);
+        }
+        let mut at = 0;
+        while at < self.layouts.len() {
+            let group = &self.layouts[at].group;
+            if self.layouts[..at].iter().any(|panes| panes.group == *group) {
+                self.layouts.remove(at);
+                continue;
+            }
+            let panes = &mut self.layouts[at];
+            if !panes.tree.contains(&panes.focus)
+                && let Some(first) = panes.tree.leaves().first()
+            {
+                panes.focus = **first;
+            }
+            at += 1;
+        }
+        if self.showing() && self.active < self.tabs.len() {
+            self.place(self.active);
+        }
+    }
+
+    /// The session that has the keyboard among the panes of workspace
+    /// `group`, for showing them again as they were left.
+    pub fn focused_in(&self, group: Option<&str>) -> Option<usize> {
+        let panes = self
+            .layouts
+            .iter()
+            .find(|panes| panes.group.as_deref() == group)?;
+        self.index_of(panes.focus)
     }
 
     /// The tabs whose screens are drawn: none while the panel is not
-    /// `on_screen`, else the active one, or both of a pair.
+    /// `on_screen`, else the active one, or every pane of its layout.
     pub fn visible(&self, on_screen: bool) -> Vec<usize> {
         if !on_screen || self.tabs.is_empty() {
             return Vec::new();
         }
-        match self.shown_pair() {
-            Some((left, right)) => vec![left, right],
+        match self.panes() {
+            Some(panes) => panes
+                .tree
+                .leaves()
+                .into_iter()
+                .filter_map(|id| self.index_of(*id))
+                .collect(),
             None => vec![self.active],
         }
     }
 
-    /// The other pane of the pair gets the keyboard.
-    pub fn focus_other(&mut self) {
-        if let Some((left, right)) = self.shown_pair() {
-            self.show(if self.active == left { right } else { left });
+    /// How far back the session with the keyboard is scrolled.
+    pub fn back(&self) -> usize {
+        self.active_tab().map_or(0, |tab| tab.view.back)
+    }
+
+    /// What is selected in the session with the keyboard.
+    pub fn selection(&self) -> Option<Selection> {
+        self.active_tab()?.view.selection
+    }
+
+    /// The tab whose selection a held press is dragging.
+    pub fn selecting(&self) -> Option<usize> {
+        self.tabs.iter().position(|tab| tab.view.selecting)
+    }
+
+    /// Whether a selection is being dragged, the pointer having moved.
+    pub fn selecting_dragged(&self) -> bool {
+        self.tabs
+            .iter()
+            .any(|tab| tab.view.selecting && tab.view.drag_point.is_some())
+    }
+
+    /// The button went up: a drag selects no further, and a press that
+    /// never moved selected nothing.
+    pub fn end_selecting(&mut self) {
+        for tab in &mut self.tabs {
+            let view = &mut tab.view;
+            if std::mem::take(&mut view.selecting) && view.selection.is_some_and(|(a, b)| a == b) {
+                view.selection = None;
+            }
+            view.drag_point = None;
         }
     }
 
-    /// The session whose screen is under the point, in a pair.
-    pub fn screen_at(&self, screen: Viewport, x: f32) -> usize {
-        self.screens(screen)
+    /// The panes showing as text (see [`Node::encode`]), each pane what
+    /// `name` gives for its tab's place, the one with the keyboard
+    /// starred; `-` while one session shows alone.
+    pub fn panes_text(&self, name: impl Fn(usize) -> String) -> String {
+        self.panes().map_or("-".to_owned(), |panes| {
+            panes.tree.encode(|id| {
+                let pane = self.index_of(*id).map_or("?".to_owned(), &name);
+                if *id == panes.focus {
+                    format!("*{pane}")
+                } else {
+                    pane
+                }
+            })
+        })
+    }
+
+    /// For the self-test: each pane showing in the order they read, as
+    /// `title:columnsxrows:rN:bN:sN@x,y,width,height`: its session's
+    /// grid, how many times its program was told another size, how far
+    /// back it is scrolled, whether anything is selected in it (1 or 0),
+    /// and where it is.
+    pub fn panes_report(&self, screen: Viewport) -> String {
+        let panes: Vec<String> = self
+            .screens(screen)
             .into_iter()
-            .find(|(_, s)| x < s.x + s.width + PAIR_GAP * 0.5)
-            .map_or(self.active, |(tab, _)| tab)
+            .filter_map(|(index, rect)| {
+                let tab = self.tabs.get(index)?;
+                let term = tab.session.term.lock().unwrap_or_else(|e| e.into_inner());
+                Some(format!(
+                    "{}:{}x{}:r{}:b{}:s{}@{},{},{},{}",
+                    tab.base_name_of(&term),
+                    term.cols(),
+                    term.rows(),
+                    tab.session.resizes(),
+                    tab.view.back,
+                    u8::from(tab.view.selection.is_some()),
+                    rect.x,
+                    rect.y,
+                    rect.width,
+                    rect.height
+                ))
+            })
+            .collect();
+        panes.join(" ")
     }
 
     /// What names the tab at `index` wherever it goes and for as long as
@@ -687,9 +1211,10 @@ impl Panel {
 
     /// Moves the tab at `from` to `to`, the tabs between them each a place
     /// along, and everything that names a tab by its place with them: the
-    /// session with the keyboard, both of a pair, the tabs listed, a press
-    /// a program is being told of, the cell and the link under the
-    /// pointer, a drag. Returns whether it moved.
+    /// session with the keyboard, the tabs listed, a press a program is
+    /// being told of, the cell and the link under the pointer, a drag.
+    /// The panes name their tabs by [`PaneId`], and each tab's view goes
+    /// with it. Returns whether it moved.
     pub fn move_tab(&mut self, from: usize, to: usize) -> bool {
         let len = self.tabs.len();
         if from == to || from >= len || to >= len {
@@ -699,10 +1224,6 @@ impl Panel {
         self.tabs.insert(to, tab);
         let at = |index: &mut usize| *index = moved(*index, from, to);
         at(&mut self.active);
-        if let Some((left, right)) = &mut self.pair {
-            at(left);
-            at(right);
-        }
         if let Some(shown) = &mut self.shown {
             shown.iter_mut().for_each(at);
             shown.sort_unstable();
@@ -788,13 +1309,13 @@ impl Panel {
 
     /// For the self-test: the tabs by title in the strip's order, the one
     /// showing starred and those the header does not list in brackets,
-    /// the pair by title, whether the strip is scrolled, and the tab being
-    /// dragged along it.
+    /// the panes by title (see [`Panel::panes_text`]), whether the strip
+    /// is scrolled, and the tab being dragged along it.
     pub fn report(&self) -> String {
         let listed = self.listed();
         let title = |index: usize| self.tabs.get(index).map_or("?".to_owned(), Tab::base_name);
         format!(
-            "{} pair={} scrolled={} drag={}",
+            "{} panes={} scrolled={} drag={}",
             (0..self.tabs.len())
                 .map(|i| match (i == self.active, listed.contains(&i)) {
                     (true, true) => format!("*{}", title(i)),
@@ -804,11 +1325,7 @@ impl Panel {
                 })
                 .collect::<Vec<_>>()
                 .join(","),
-            self.shown_pair().map_or("-".to_owned(), |(l, r)| format!(
-                "{}+{}",
-                title(l),
-                title(r)
-            )),
+            self.panes_text(title),
             if self.strip_scroll > 0.5 { "yes" } else { "no" },
             self.tab_drag
                 .filter(|drag| drag.active)
@@ -816,13 +1333,24 @@ impl Panel {
         )
     }
 
+    /// Closes the tab at `index`. A pane it was in gives its room to the
+    /// one beside it, which has the keyboard next when the closed one had
+    /// it; closed from no pane, the tab that slid into its place is at
+    /// the front, for the window to choose its workspace's next.
     pub fn close_tab(&mut self, index: usize) {
-        // Indices after it move down; a pair is not worth renumbering.
-        self.pair = None;
         self.mouse_press = None;
         self.mouse_cell = None;
         self.tab_drag = None;
+        // What is on screen now: a tab that comes to the front from the
+        // strip starts at its output, a pane that stays is left alone.
+        let seen: Vec<PaneId> = self
+            .visible(true)
+            .into_iter()
+            .filter_map(|tab| Some(self.tabs.get(tab)?.view.id))
+            .collect();
         if index < self.tabs.len() {
+            // Its pane goes first, while its tab still says which it is.
+            let heir = self.take_leaf(self.tabs[index].view.id);
             // Dropping the session hangs up on its program.
             let tab = self.tabs.remove(index);
             if tab.notified {
@@ -834,11 +1362,17 @@ impl Panel {
             if !tab.review.as_os_str().is_empty() {
                 crate::project::review::remove(&tab.review);
             }
-            if index == self.active {
+            let beside = heir.and_then(|heir| self.index_of(heir));
+            if index != self.active {
+                // The one showing stays the one, a place down when the
+                // closed one was before it.
+                if index < self.active {
+                    self.active -= 1;
+                }
+            } else if let Some(beside) = beside {
+                self.active = beside;
+            } else {
                 self.closed_active = Some((tab.workspace.clone(), tab.folder.clone(), index));
-            } else if index < self.active {
-                // The one showing slid down a place: it stays the one.
-                self.active -= 1;
             }
             // The tabs listed, renumbered as they are.
             if let Some(shown) = &mut self.shown {
@@ -855,8 +1389,11 @@ impl Panel {
             self.open = false;
             self.focus = false;
         }
-        self.back = 0;
-        self.selection = None;
+        if let Some(tab) = self.tabs.get_mut(self.active)
+            && !seen.contains(&tab.view.id)
+        {
+            tab.view.reset();
+        }
     }
 }
 
@@ -1996,23 +2533,22 @@ pub fn split(rect: Viewport) -> (Viewport, Viewport) {
     (header, screen)
 }
 
-/// Between the two screens of a pair.
-const PAIR_GAP: f32 = PAD * 2.0 + 1.0;
+/// Between two panes: the padding of each and the line between them.
+pub const PANE_GAP: f32 = PAD * 2.0 + 1.0;
+/// How far past the gap, into the pane on each side, a press still grabs
+/// the divider.
+const DIVIDER_SLOP: f32 = 2.0;
+/// The smallest a pane is dragged to, in columns and rows.
+pub const PANE_MIN_COLS: usize = 20;
+pub const PANE_MIN_ROWS: usize = 5;
 
-/// A screen cut in two, side by side, each on a whole point.
-pub fn halves(screen: Viewport) -> (Viewport, Viewport) {
-    let half = ((screen.width - PAIR_GAP) / 2.0).floor().max(0.0);
-    (
-        Viewport {
-            width: half,
-            ..screen
-        },
-        Viewport {
-            x: screen.x + half + PAIR_GAP,
-            width: (screen.width - half - PAIR_GAP).max(0.0),
-            ..screen
-        },
-    )
+/// The least room a pane keeps along `dir` when a divider moves: the
+/// columns of a split side by side, the rows of a stacked one.
+pub fn pane_min(atlas: &Atlas, dir: Dir) -> f32 {
+    match dir {
+        Dir::Horizontal => PANE_MIN_COLS as f32 * atlas.metrics.advance,
+        Dir::Vertical => PANE_MIN_ROWS as f32 * row_height(atlas),
+    }
 }
 
 /// The height of one terminal row.
@@ -2339,6 +2875,10 @@ fn fitted_label(atlas: &mut Atlas, tab: &Tab, room: f32) -> String {
 
 fn title_of(tab: &Tab) -> String {
     let term = tab.session.term.lock().unwrap_or_else(|e| e.into_inner());
+    titled(tab, &term)
+}
+
+fn titled(tab: &Tab, term: &term::Term) -> String {
     let title = term.title.trim();
     if title.is_empty() {
         tab.title.clone()
@@ -2578,32 +3118,47 @@ pub fn draw(
         .draw(out, atlas, theme);
 
     let screens = panel.screens(screen);
-    if let [(_, left), (_, right)] = screens.as_slice() {
-        let x = ((left.x + left.width + right.x) * 0.5).floor();
-        layout::push_rect(
-            out,
-            atlas,
-            [x, screen.y - PAD * 0.5],
-            [1.0, screen.height + PAD],
-            theme.hairline,
-        );
+    if screens.len() > 1 {
+        // A line down the middle of each gap, run on into the padding or
+        // the gap at its ends so that it meets the line it stops at. The
+        // one held is in the accent.
+        let (left, right) = (screen.x - PAD, screen.x + screen.width + PAD);
+        let (top, bottom) = (screen.y - PAD * 0.5, screen.y + screen.height + PAD * 0.5);
+        for divider in panel.dividers(screen) {
+            let held = panel
+                .divider_drag
+                .as_ref()
+                .is_some_and(|drag| drag.id == divider.id);
+            let colour = if held { theme.accent } else { theme.hairline };
+            let gap = divider.rect;
+            let (pos, size) = match divider.dir {
+                Dir::Horizontal => {
+                    let from = (gap.y - PAD).max(top);
+                    let to = (gap.y + gap.height + PAD).min(bottom);
+                    ([(gap.x + gap.width * 0.5).floor(), from], [1.0, to - from])
+                }
+                Dir::Vertical => {
+                    let from = (gap.x - PAD).max(left);
+                    let to = (gap.x + gap.width + PAD).min(right);
+                    ([from, (gap.y + gap.height * 0.5).floor()], [to - from, 1.0])
+                }
+            };
+            layout::push_rect(out, atlas, pos, size, colour);
+        }
         // The pane with the keyboard: a line over its screen.
-        let focused = if panel.active == screens[0].0 {
-            left
-        } else {
-            right
-        };
-        layout::push_rect(
-            out,
-            atlas,
-            [focused.x, screen.y - PAD * 0.5],
-            [focused.width, 2.0],
-            if panel.focus {
-                theme.accent
-            } else {
-                theme.hairline
-            },
-        );
+        if let Some((_, focused)) = screens.iter().find(|(tab, _)| *tab == panel.active) {
+            layout::push_rect(
+                out,
+                atlas,
+                [focused.x, focused.y - PAD * 0.5],
+                [focused.width, 2.0],
+                if panel.focus {
+                    theme.accent
+                } else {
+                    theme.hairline
+                },
+            );
+        }
     }
     // The workspace listed has no terminal left: the one at the front is
     // another's, and is not shown in its place.
@@ -2617,8 +3172,12 @@ pub fn draw(
     }
 }
 
-/// One session's screen: its cells, the selection and the cursor when it
-/// is the active one, and how far back it is scrolled.
+/// One session's screen: its cells, its selection, its cursor, and how
+/// far back it is scrolled. Only what fits in `screen` is drawn: a grid
+/// larger than its pane (a divider is being dragged, or the session has
+/// not been told its new size yet) is cut to whole cells, the rows kept
+/// being those down to the cursor's, and a smaller one leaves the rest of
+/// the pane empty.
 #[allow(clippy::too_many_arguments)]
 fn draw_screen(
     panel: &Panel,
@@ -2643,7 +3202,8 @@ fn draw_screen(
     // What is on screen, copied out under the lock and drawn after it is
     // let go: the reader thread takes the same lock for every burst of
     // output, and a frame's glyph work would hold it up.
-    let (rows, cols, back, visible, cursor, cursor_visible, kept) = {
+    let fit_cols = (screen.width / advance).floor().max(0.0) as usize;
+    let (rows, cols, back, visible, cursor, cursor_visible, kept, top) = {
         let mut term = tab.session.term.lock().unwrap_or_else(|e| e.into_inner());
         let byte = |v: f64| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
         let rgb = |c: [f32; 4]| [byte(c[0] as f64), byte(c[1] as f64), byte(c[2] as f64)];
@@ -2656,12 +3216,15 @@ fn draw_screen(
             ],
         );
         let rows = term.rows().min((screen.height / row_h).floor() as usize);
-        let back = if active {
-            panel.back.min(term.scrollback_len())
+        let back = tab.view.back.min(term.scrollback_len());
+        // The first row drawn: past the top when the grid is taller than
+        // the pane, far enough that the cursor's row is the last.
+        let top = if back == 0 {
+            (term.cursor().0 + 1).min(term.rows()).saturating_sub(rows)
         } else {
             0
         };
-        let visible: Vec<(Vec<crate::term::Cell>, u64)> = (0..rows)
+        let visible: Vec<(Vec<crate::term::Cell>, u64)> = (top..top + rows)
             .map(|row| {
                 (
                     term.visible_row(row, back).to_vec(),
@@ -2671,7 +3234,7 @@ fn draw_screen(
             .collect();
         (
             rows,
-            term.cols(),
+            term.cols().min(fit_cols),
             back,
             visible,
             term.cursor(),
@@ -2682,9 +3245,10 @@ fn draw_screen(
                 (
                     term.first_line(),
                     term.scrollback_len() + term.rows(),
-                    term.view_line(0, back),
+                    term.view_line(top, back),
                 )
             }),
+            top,
         )
     };
     // Find's matches on the rows showing, the current one marked.
@@ -2703,6 +3267,7 @@ fn draw_screen(
         }
     }
     let mut run = String::new();
+    let cells_from = out.len();
     for (row, (cells, line)) in visible.iter().enumerate() {
         let line = *line;
         let y = screen.y + row as f32 * row_h;
@@ -2743,11 +3308,11 @@ fn draw_screen(
             layout::push_rect(out, atlas, [x, y], [width, row_h], colour);
         }
         // The selection, over the backgrounds and under the text.
-        if let Some((a, b)) = panel.selection.filter(|_| active) {
+        if let Some((a, b)) = tab.view.selection {
             let (start, end) = if a <= b { (a, b) } else { (b, a) };
             if (start.0..=end.0).contains(&line) {
                 let from = if line == start.0 { start.1 } else { 0 };
-                let to = if line == end.0 { end.1 } else { cols };
+                let to = if line == end.0 { end.1.min(cols) } else { cols };
                 if to > from {
                     layout::push_rect(
                         out,
@@ -2835,11 +3400,22 @@ fn draw_screen(
             );
         }
     }
+    // A glyph wider than its cell, in the last column a narrow pane has
+    // room for, stops short of the pane beside it.
+    let edge = PAD * 0.5;
+    for quad in &mut out[cells_from..] {
+        layout::clip_horizontal(quad, screen.x - edge, screen.x + screen.width + edge);
+    }
     // The cursor, where the program left it, when it is showing.
     let (row, col) = cursor;
-    if back == 0 && cursor_visible && row < rows && !tab.session.has_exited() {
+    if back == 0
+        && cursor_visible
+        && (top..top + rows).contains(&row)
+        && col <= cols
+        && !tab.session.has_exited()
+    {
         let x = screen.x + col as f32 * advance;
-        let y = screen.y + row as f32 * row_h;
+        let y = screen.y + (row - top) as f32 * row_h;
         if panel.focus && active {
             layout::push_rect(out, atlas, [x, y], [2.0, row_h], theme.cursor);
         } else {
@@ -3322,6 +3898,7 @@ mod tests {
             marks: Default::default(),
             notified: false,
             seen: None,
+            view: View::new(),
         }
     }
 
@@ -3476,8 +4053,14 @@ mod tests {
         };
         assert_eq!(panel.visible(false), Vec::<usize>::new());
         assert_eq!(panel.visible(true), vec![1]);
-        panel.pair = Some((0, 1));
+        // Every pane is on screen, whichever has the keyboard.
+        assert!(panel.split(Edge::Left, 0));
         assert_eq!(panel.visible(true), vec![0, 1]);
+        assert!(panel.split(Edge::Bottom, 2));
+        assert_eq!(panel.visible(true), vec![0, 2, 1]);
+        panel.show(1);
+        assert_eq!(panel.visible(true), vec![0, 2, 1]);
+        assert_eq!(panel.visible(false), Vec::<usize>::new());
     }
 
     #[test]
@@ -3859,8 +4442,14 @@ mod tests {
                     for at in 0..len {
                         let other = (at + 1) % len;
                         let mut panel = panel_of(&names);
+                        // Two panes where there are two tabs, the keyboard
+                        // in `at`, and every tab scrolled its own way.
+                        panel.active = other;
+                        assert_eq!(panel.split(Edge::Right, at), len > 1);
                         panel.active = at;
-                        panel.pair = Some((at, other));
+                        for (i, tab) in panel.tabs.iter_mut().enumerate() {
+                            tab.view.back = i + 1;
+                        }
                         // Every other tab from `at` on, as a workspace's
                         // tabs lie among the others'.
                         panel.shown = Some((0..len).filter(|i| i % 2 == at % 2).collect());
@@ -3876,6 +4465,15 @@ mod tests {
                         });
                         panel.closed_active = Some((None, PathBuf::new(), other));
                         let name = |panel: &Panel, i: usize| panel.tabs[i].title.clone();
+                        let panes = |panel: &Panel| {
+                            let mut scrolled: Vec<(String, usize)> = panel
+                                .tabs
+                                .iter()
+                                .map(|tab| (tab.title.clone(), tab.view.back))
+                                .collect();
+                            scrolled.sort();
+                            (panel.panes_text(|i| name(panel, i)), scrolled)
+                        };
                         let shown = |panel: &Panel| -> Vec<String> {
                             let mut shown: Vec<String> = panel
                                 .shown
@@ -3888,7 +4486,7 @@ mod tests {
                         };
                         let before = (
                             name(&panel, panel.active),
-                            panel.pair.map(|(l, r)| (name(&panel, l), name(&panel, r))),
+                            panes(&panel),
                             shown(&panel),
                             name(&panel, panel.mouse_press.unwrap().0),
                             name(&panel, panel.mouse_cell.unwrap().0),
@@ -3902,7 +4500,7 @@ mod tests {
                         assert_eq!(panel.move_tab(from, to), from != to);
                         let after = (
                             name(&panel, panel.active),
-                            panel.pair.map(|(l, r)| (name(&panel, l), name(&panel, r))),
+                            panes(&panel),
                             shown(&panel),
                             name(&panel, panel.mouse_press.unwrap().0),
                             name(&panel, panel.mouse_cell.unwrap().0),
@@ -3913,6 +4511,12 @@ mod tests {
                         let what = format!("{len} tabs, {from} to {to}, holders on {at}");
                         assert_eq!(titles(&panel), order, "{what}");
                         assert_eq!(before, after, "{what}");
+                        if len > 1 {
+                            let (text, _) = panes(&panel);
+                            let wanted = format!("h(0.5,t{other},*t{at})");
+                            assert_eq!(text, wanted, "{what}");
+                        }
+                        check_panes(&panel, &what);
                         // What else a press carries is untouched.
                         assert_eq!(panel.mouse_press.unwrap().2, (1, 2), "{what}");
                         assert_eq!(panel.mouse_cell.unwrap().1, (3, 4), "{what}");
@@ -4381,13 +4985,978 @@ mod tests {
         panel.active = 2;
         assert_eq!(
             panel.report(),
-            "one,two,*three,(other) pair=- scrolled=no drag=-"
+            "one,two,*three,(other) panes=- scrolled=no drag=-"
         );
-        panel.pair = Some((2, 0));
+        // The panes by title, the one with the keyboard starred: the
+        // same two sessions after a move, by other places.
+        assert!(panel.split(Edge::Right, 0));
+        assert_eq!(panel.panes_text(|tab| tab.to_string()), "h(0.5,2,*0)");
         panel.move_tab(2, 0);
         assert_eq!(
             panel.report(),
-            "*three,one,two,(other) pair=three+one scrolled=no drag=-"
+            "three,*one,two,(other) panes=h(0.5,three,*one) scrolled=no drag=-"
         );
+        assert_eq!(panel.panes_text(|tab| tab.to_string()), "h(0.5,0,*1)");
+        assert!(panel.split(Edge::Bottom, 2));
+        assert_eq!(
+            panel.report(),
+            "three,one,*two,(other) panes=h(0.5,three,v(0.5,one,*two)) scrolled=no drag=-"
+        );
+    }
+
+    // ---- panes ---------------------------------------------------------------
+
+    /// What must hold of the layouts whatever was done: a layout has two
+    /// panes or more, each a live tab of the layout's workspace and in no
+    /// other layout; no workspace has two layouts; a layout's keyboard is
+    /// in one of its panes; and of the panes showing, the one with the
+    /// keyboard is the active tab.
+    fn check_panes(panel: &Panel, what: &str) {
+        let mut seen: Vec<PaneId> = Vec::new();
+        for (at, panes) in panel.layouts.iter().enumerate() {
+            let leaves = panes.tree.leaves();
+            assert!(leaves.len() > 1, "{what}: a layout of one pane");
+            for id in leaves {
+                let tab = panel
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.view.id == *id)
+                    .unwrap_or_else(|| panic!("{what}: a pane for a tab that has gone"));
+                assert_eq!(
+                    tab.view.group, panes.group,
+                    "{what}: {} is in another workspace's layout",
+                    tab.title
+                );
+                assert!(!seen.contains(id), "{what}: {} is in two panes", tab.title);
+                seen.push(*id);
+            }
+            assert!(
+                panes.tree.contains(&panes.focus),
+                "{what}: the keyboard is in no pane"
+            );
+            assert!(
+                !panel.layouts[..at].iter().any(|p| p.group == panes.group),
+                "{what}: two layouts for {:?}",
+                panes.group
+            );
+        }
+        if let Some(panes) = panel.panes() {
+            assert_eq!(
+                panel.index_of(panes.focus),
+                Some(panel.active),
+                "{what}: the pane with the keyboard is not the active tab"
+            );
+        }
+        if !panel.tabs.is_empty() {
+            assert!(panel.visible(true).contains(&panel.active), "{what}");
+        }
+    }
+
+    /// Garden's g0 to g3 with sheds' s0 and s1 among them, as two
+    /// workspaces' terminals lie in the order they were started, each
+    /// told its workspace and garden's listed.
+    fn two_workspaces() -> Panel {
+        let mut panel = panel_of(&["g0", "s0", "g1", "g2", "s1", "g3"]);
+        regroup(&mut panel);
+        list(&mut panel, "garden");
+        panel
+    }
+
+    /// As the window says it: a tab's workspace by the first letter of
+    /// its title.
+    fn regroup(panel: &mut Panel) {
+        panel.regroup(|tab| {
+            Some(match tab.title.chars().next() {
+                Some('g') => "garden".to_owned(),
+                Some('s') => "sheds".to_owned(),
+                _ => "elsewhere".to_owned(),
+            })
+        });
+    }
+
+    /// The header lists the tabs of workspace `group`, as a frame leaves it.
+    fn list(panel: &mut Panel, group: &str) {
+        panel.shown = Some(
+            (0..panel.tabs.len())
+                .filter(|i| panel.tabs[*i].view.group.as_deref() == Some(group))
+                .collect(),
+        );
+    }
+
+    fn at(panel: &Panel, title: &str) -> usize {
+        panel
+            .tabs
+            .iter()
+            .position(|tab| tab.title == title)
+            .unwrap_or_else(|| panic!("no tab {title}"))
+    }
+
+    fn panes_of(panel: &Panel) -> String {
+        panel.panes_text(|i| panel.tabs[i].title.clone())
+    }
+
+    fn front(panel: &Panel) -> &str {
+        &panel.tabs[panel.active].title
+    }
+
+    #[test]
+    fn a_split_cuts_the_pane_with_the_keyboard_and_refuses_what_it_cannot_show() {
+        let mut panel = two_workspaces();
+        assert_eq!(panes_of(&panel), "-");
+        assert!(panel.split(Edge::Right, at(&panel, "g1")));
+        assert_eq!(panes_of(&panel), "h(0.5,g0,*g1)");
+        assert_eq!(front(&panel), "g1", "the new pane has the keyboard");
+        check_panes(&panel, "split right");
+        assert!(panel.split(Edge::Bottom, at(&panel, "g2")));
+        assert_eq!(panes_of(&panel), "h(0.5,g0,v(0.5,g1,*g2))");
+        check_panes(&panel, "split down");
+
+        let before = (panel.layouts.clone(), panel.active);
+        let (g1, g2, s0) = (at(&panel, "g1"), at(&panel, "g2"), at(&panel, "s0"));
+        assert!(!panel.split(Edge::Right, g2), "the session showing");
+        assert!(!panel.split(Edge::Right, g1), "in a pane already");
+        assert!(!panel.split(Edge::Right, s0), "another workspace's");
+        assert!(!panel.split(Edge::Right, 99), "no such tab");
+        assert_eq!((panel.layouts.clone(), panel.active), before);
+
+        // Left and top put the new pane first.
+        let mut panel = two_workspaces();
+        assert!(panel.split(Edge::Left, at(&panel, "g1")));
+        assert!(panel.split(Edge::Top, at(&panel, "g2")));
+        assert_eq!(panes_of(&panel), "h(0.5,v(0.5,*g2,g1),g0)");
+        check_panes(&panel, "left and top");
+
+        // A workspace that could not be split leaves no layout behind.
+        let mut one = panel_of(&["only"]);
+        assert!(!one.split(Edge::Right, 0));
+        assert!(one.layouts.is_empty());
+    }
+
+    #[test]
+    fn a_tab_of_the_strip_shows_in_the_pane_with_the_keyboard() {
+        let mut panel = two_workspaces();
+        assert!(panel.split(Edge::Right, at(&panel, "g1")));
+        assert!(panel.split(Edge::Bottom, at(&panel, "g2")));
+        // g3 is in no pane: it takes the place of g2, which goes back to
+        // being a tab of the strip alone.
+        panel.show(at(&panel, "g3"));
+        assert_eq!(panes_of(&panel), "h(0.5,g0,v(0.5,g1,*g3))");
+        assert_eq!(panel.visible(true), [0, 2, 5]);
+        check_panes(&panel, "g3 shown");
+        // A tab that is a pane gets the keyboard where it is.
+        panel.show(at(&panel, "g0"));
+        assert_eq!(panes_of(&panel), "h(0.5,*g0,v(0.5,g1,g3))");
+        check_panes(&panel, "g0 focused");
+        // And the one it replaced comes back the same way.
+        panel.show(at(&panel, "g2"));
+        assert_eq!(panes_of(&panel), "h(0.5,*g2,v(0.5,g1,g3))");
+        check_panes(&panel, "g2 shown");
+        panel.show(99);
+        assert_eq!(front(&panel), "g2", "no such tab: nothing moves");
+    }
+
+    #[test]
+    fn the_keyboard_goes_round_the_panes_and_to_the_one_beside() {
+        let mut panel = two_workspaces();
+        assert!(!panel.focus_step(1), "one session: nowhere to go");
+        assert!(panel.split(Edge::Right, at(&panel, "g1")));
+        assert!(panel.split(Edge::Bottom, at(&panel, "g2")));
+        // g0 | g1 over g2, the keyboard in g2.
+        let mut order = Vec::new();
+        for _ in 0..4 {
+            assert!(panel.focus_step(1));
+            order.push(front(&panel).to_owned());
+            check_panes(&panel, "next");
+        }
+        assert_eq!(order, ["g0", "g1", "g2", "g0"]);
+        assert!(panel.focus_step(-1));
+        assert_eq!(front(&panel), "g2", "back round the end");
+        assert!(panel.focus_step(-1));
+        assert_eq!(front(&panel), "g1");
+
+        let screen = Viewport {
+            x: 8.0,
+            y: 34.0,
+            width: 1017.0,
+            height: 617.0,
+        };
+        let mut go = |toward: Edge| {
+            let moved = panel.focus_toward(screen, toward);
+            check_panes(&panel, "toward");
+            (moved, front(&panel).to_owned())
+        };
+        assert_eq!(go(Edge::Bottom), (true, "g2".to_owned()));
+        assert_eq!(go(Edge::Bottom), (false, "g2".to_owned()), "the last row");
+        assert_eq!(go(Edge::Left), (true, "g0".to_owned()));
+        assert_eq!(go(Edge::Left), (false, "g0".to_owned()));
+        assert_eq!(go(Edge::Top), (false, "g0".to_owned()));
+        assert_eq!(go(Edge::Right), (true, "g1".to_owned()), "the top one");
+        assert_eq!(go(Edge::Top), (false, "g1".to_owned()));
+        assert_eq!(panes_of(&panel), "h(0.5,g0,v(0.5,*g1,g2))");
+    }
+
+    #[test]
+    fn closing_a_pane_keeps_its_tab_and_closing_its_tab_frees_the_pane() {
+        let mut panel = two_workspaces();
+        assert!(!panel.close_pane(), "one session showing is no pane");
+        assert!(panel.split(Edge::Right, at(&panel, "g1")));
+        assert!(panel.split(Edge::Bottom, at(&panel, "g2")));
+        // Close Pane on g2: g1 beside it has its room and the keyboard,
+        // and g2 is still a tab.
+        assert!(panel.close_pane());
+        assert_eq!(panes_of(&panel), "h(0.5,g0,*g1)");
+        assert_eq!(titles(&panel), ["g0", "s0", "g1", "g2", "s1", "g3"]);
+        check_panes(&panel, "pane closed");
+        // The last split closed leaves one session and no layout.
+        assert!(panel.close_pane());
+        assert_eq!((panes_of(&panel).as_str(), front(&panel)), ("-", "g0"));
+        assert!(panel.layouts.is_empty());
+        check_panes(&panel, "unsplit");
+
+        // The tab of the pane with the keyboard closes (Cmd-W, or its
+        // program ended): the pane beside it has the keyboard, not
+        // whichever tab slid into its place.
+        let mut panel = two_workspaces();
+        assert!(panel.split(Edge::Right, at(&panel, "g3")));
+        assert!(panel.split(Edge::Bottom, at(&panel, "g1")));
+        assert_eq!(panes_of(&panel), "h(0.5,g0,v(0.5,g3,*g1))");
+        panel.close_tab(at(&panel, "g1"));
+        assert_eq!(titles(&panel), ["g0", "s0", "g2", "s1", "g3"]);
+        assert_eq!(front(&panel), "g3", "not g2, which slid into its place");
+        assert_eq!(panes_of(&panel), "h(0.5,g0,*g3)");
+        assert_eq!(panel.closed_active, None, "its workspace still shows");
+        check_panes(&panel, "focused tab closed");
+        // A pane without the keyboard closes: the keyboard stays.
+        panel.close_tab(at(&panel, "g0"));
+        assert_eq!((panes_of(&panel).as_str(), front(&panel)), ("-", "g3"));
+        assert_eq!(panel.closed_active, None);
+        check_panes(&panel, "other pane closed");
+        // With no pane left it closes as a tab always did: the window is
+        // told, to show that workspace's next.
+        let closed = at(&panel, "g3");
+        panel.close_tab(closed);
+        assert!(matches!(&panel.closed_active, Some((_, _, place)) if *place == closed));
+        check_panes(&panel, "last closed");
+
+        // A tab of the strip closes beside the panes: nothing of them moves.
+        let mut panel = two_workspaces();
+        assert!(panel.split(Edge::Right, at(&panel, "g1")));
+        for title in ["s0", "g3", "g2", "s1"] {
+            panel.close_tab(at(&panel, title));
+            assert_eq!(panes_of(&panel), "h(0.5,g0,*g1)", "{title} closed");
+            assert_eq!(front(&panel), "g1", "{title} closed");
+            check_panes(&panel, title);
+        }
+        // Every tab closed, one by one, from every pane.
+        while !panel.tabs.is_empty() {
+            panel.close_tab(panel.active);
+            check_panes(&panel, "closing all");
+        }
+        assert!(panel.layouts.is_empty() && !panel.open);
+    }
+
+    #[test]
+    fn each_workspace_keeps_its_own_panes_and_the_keyboard_where_it_was() {
+        let mut panel = two_workspaces();
+        assert!(panel.split(Edge::Right, at(&panel, "g1")));
+        assert!(panel.split(Edge::Bottom, at(&panel, "g2")));
+        panel.show(at(&panel, "g0"));
+        let garden = panes_of(&panel);
+        assert_eq!(garden, "h(0.5,*g0,v(0.5,g1,g2))");
+
+        // To sheds: its one session alone, garden's panes as they were.
+        list(&mut panel, "sheds");
+        panel.show(at(&panel, "s0"));
+        assert_eq!(panes_of(&panel), "-");
+        assert_eq!(panel.visible(true), [at(&panel, "s0")]);
+        assert_eq!(panel.layouts.len(), 1);
+        check_panes(&panel, "in sheds");
+        // Sheds splits too: two layouts, a workspace each.
+        assert!(panel.split(Edge::Bottom, at(&panel, "s1")));
+        assert_eq!(panes_of(&panel), "v(0.5,s0,*s1)");
+        assert!(
+            !panel.split(Edge::Right, at(&panel, "g3")),
+            "garden's tab is not for sheds' panes"
+        );
+        check_panes(&panel, "sheds split");
+
+        // Back to garden, by the pane that had the keyboard.
+        list(&mut panel, "garden");
+        let focused = panel.focused_in(Some("garden")).expect("garden's panes");
+        assert_eq!(panel.tabs[focused].title, "g0");
+        panel.show(focused);
+        assert_eq!(panes_of(&panel), garden);
+        check_panes(&panel, "back in garden");
+        // A tab of garden's strip shown from sheds takes garden's pane
+        // with the keyboard, and none of sheds'.
+        list(&mut panel, "sheds");
+        panel.show(at(&panel, "s0"));
+        list(&mut panel, "garden");
+        panel.show(at(&panel, "g3"));
+        assert_eq!(panes_of(&panel), "h(0.5,*g3,v(0.5,g1,g2))");
+        assert_eq!(panel.focused_in(Some("sheds")), Some(at(&panel, "s0")));
+        assert_eq!(panel.focused_in(Some("nowhere")), None);
+        check_panes(&panel, "g3 from sheds");
+    }
+
+    #[test]
+    fn a_session_that_leaves_its_workspace_leaves_its_pane() {
+        let mut panel = two_workspaces();
+        assert!(panel.split(Edge::Right, at(&panel, "g1")));
+        assert!(panel.split(Edge::Bottom, at(&panel, "g2")));
+        // g2's shell went to a folder of its own: the window says so.
+        let moved = at(&panel, "g2");
+        panel.tabs[moved].title = "e0".into();
+        regroup(&mut panel);
+        list(&mut panel, "elsewhere");
+        assert_eq!(front(&panel), "e0", "it is still the one typed into");
+        assert_eq!(panes_of(&panel), "-", "alone in its new workspace");
+        assert_eq!(panel.layouts.len(), 1);
+        assert_eq!(
+            panel.focused_in(Some("garden")),
+            Some(at(&panel, "g1")),
+            "the pane beside it has garden's keyboard"
+        );
+        check_panes(&panel, "left");
+        // Back in garden, it shows where garden's keyboard is.
+        panel.tabs[moved].title = "g2".into();
+        regroup(&mut panel);
+        list(&mut panel, "garden");
+        panel.settle();
+        assert_eq!(panes_of(&panel), "h(0.5,g0,*g2)");
+        check_panes(&panel, "back");
+        // Both of a layout's panes gone to other workspaces: no layout.
+        for title in ["g0", "g2"] {
+            let tab = at(&panel, title);
+            panel.tabs[tab].title = format!("x{title}");
+        }
+        regroup(&mut panel);
+        assert!(panel.layouts.is_empty());
+        check_panes(&panel, "emptied");
+    }
+
+    /// Everything a window does to the panes, over and over in an order
+    /// made up from a seed: after each, the layouts hold together.
+    #[test]
+    fn the_layouts_hold_together_through_any_run_of_changes() {
+        let mut seed = 0x9e37_79b9_u32;
+        let mut next = move |below: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as usize % below.max(1)
+        };
+        let edges = [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom];
+        let screen = Viewport {
+            x: 8.0,
+            y: 34.0,
+            width: 1017.0,
+            height: 617.0,
+        };
+        let mut made = 0;
+        let mut panel = two_workspaces();
+        for step in 0..4000 {
+            let len = panel.tabs.len();
+            let what = match next(9) {
+                _ if len < 3 => {
+                    made += 1;
+                    let group = ["g", "s"][next(2)];
+                    panel.tabs.push(Tab {
+                        title: format!("{group}n{made}"),
+                        ..tab()
+                    });
+                    regroup(&mut panel);
+                    panel.show(panel.tabs.len() - 1);
+                    "open"
+                }
+                0 => {
+                    panel.split(edges[next(4)], next(len));
+                    "split"
+                }
+                1 => {
+                    panel.show(next(len));
+                    "show"
+                }
+                2 => {
+                    panel.close_pane();
+                    "close pane"
+                }
+                3 => {
+                    panel.close_tab(next(len));
+                    "close tab"
+                }
+                4 => {
+                    panel.move_tab(next(len), next(len));
+                    "move"
+                }
+                5 => {
+                    panel.focus_step(if next(2) == 0 { 1 } else { -1 });
+                    "step"
+                }
+                6 => {
+                    panel.focus_toward(screen, edges[next(4)]);
+                    "toward"
+                }
+                7 => {
+                    // A shell cds into the other workspace's folder.
+                    let tab = next(len);
+                    let title = panel.tabs[tab].title.clone();
+                    let other = if title.starts_with('g') { "s" } else { "g" };
+                    panel.tabs[tab].title = format!("{other}{}", &title[1..]);
+                    regroup(&mut panel);
+                    "regroup"
+                }
+                _ => {
+                    made += 1;
+                    panel.tabs.push(Tab {
+                        title: format!("gm{made}"),
+                        ..tab()
+                    });
+                    regroup(&mut panel);
+                    panel.show(panel.tabs.len() - 1);
+                    "open"
+                }
+            };
+            // A frame: the tabs of the workspace showing are listed.
+            if let Some(group) = panel.active_tab().and_then(|tab| tab.view.group.clone()) {
+                list(&mut panel, &group);
+            }
+            panel.settle();
+            check_panes(&panel, &format!("step {step}, {what}"));
+            // Whatever is typed goes to the pane drawn with the keyboard.
+            if let Some(panes) = panel.panes() {
+                let focused = panel.index_of(panes.focus);
+                assert_eq!(focused, Some(panel.active), "step {step}, {what}");
+                assert!(
+                    panel
+                        .screens(screen)
+                        .iter()
+                        .any(|(tab, _)| *tab == panel.active),
+                    "step {step}, {what}: the active tab has no screen"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn each_pane_scrolls_and_selects_on_its_own() {
+        let mut panel = two_workspaces();
+        assert!(panel.split(Edge::Right, at(&panel, "g1")));
+        let (g0, g1, g2) = (at(&panel, "g0"), at(&panel, "g1"), at(&panel, "g2"));
+        let picked = Some(((4, 1), (6, 9)));
+        panel.tabs[g1].view.back = 12;
+        panel.tabs[g1].view.selection = picked;
+        assert_eq!((panel.back(), panel.selection()), (12, picked));
+        // The keyboard to the other pane: this one stays as it was, and
+        // the other has its own.
+        panel.show(g0);
+        assert_eq!((panel.back(), panel.selection()), (0, None));
+        assert_eq!(panel.tabs[g1].view.back, 12);
+        assert_eq!(panel.tabs[g1].view.selection, picked);
+        panel.tabs[g0].view.back = 3;
+        panel.tabs[g0].view.selection = Some(((1, 0), (1, 5)));
+        panel.focus_step(1);
+        assert_eq!(
+            (panel.active, panel.back(), panel.selection()),
+            (g1, 12, picked)
+        );
+        assert_eq!(panel.tabs[g0].view.back, 3);
+        // A drag in one pane is that pane's: letting go ends it there and
+        // touches nothing of the other.
+        panel.tabs[g0].view.selecting = true;
+        panel.tabs[g0].view.drag_point = Some((40.0, 9.0));
+        assert_eq!(panel.selecting(), Some(g0));
+        assert!(panel.selecting_dragged());
+        panel.end_selecting();
+        assert_eq!(panel.selecting(), None);
+        assert!(!panel.selecting_dragged());
+        assert_eq!(panel.tabs[g0].view.selection, Some(((1, 0), (1, 5))));
+        assert_eq!(panel.tabs[g1].view.selection, picked);
+        // A press that never moved selected nothing, in its pane only.
+        panel.tabs[g0].view.selection = Some(((2, 7), (2, 7)));
+        panel.tabs[g0].view.selecting = true;
+        panel.end_selecting();
+        assert_eq!(panel.tabs[g0].view.selection, None);
+        assert_eq!(panel.tabs[g1].view.selection, picked);
+        // A tab shown from the strip starts at its output; the pane it
+        // did not take is as it was.
+        panel.tabs[g2].view.back = 40;
+        panel.show(g2);
+        assert_eq!(panes_of(&panel), "h(0.5,g0,*g2)");
+        assert_eq!((panel.back(), panel.selection()), (0, None));
+        assert_eq!(panel.tabs[g0].view.back, 3);
+        // The one that left keeps nothing to come back to stale: shown
+        // again it starts at its output too.
+        panel.show(g1);
+        assert_eq!((panel.back(), panel.selection()), (0, None));
+        // Closing a pane's tab leaves the other pane's view alone.
+        panel.tabs[g0].view.back = 5;
+        panel.close_tab(panel.active);
+        assert_eq!((front(&panel), panel.back()), ("g0", 5));
+        // No two tabs are ever called the same.
+        let mut ids: Vec<PaneId> = panel.tabs.iter().map(|tab| tab.view.id).collect();
+        ids.dedup();
+        assert_eq!(ids.len(), panel.tabs.len());
+    }
+
+    /// The panel's screen in the tests of sizes: 1000 by 600 inside its
+    /// padding.
+    fn wide_screen() -> Viewport {
+        Viewport {
+            x: 8.0,
+            y: 34.0,
+            width: 1000.0,
+            height: 600.0,
+        }
+    }
+
+    fn resizes(panel: &Panel) -> Vec<usize> {
+        panel.tabs.iter().map(|tab| tab.session.resizes()).collect()
+    }
+
+    fn grids(panel: &Panel) -> Vec<(usize, usize)> {
+        panel
+            .tabs
+            .iter()
+            .map(|tab| {
+                let term = tab.session.term.lock().unwrap();
+                (term.cols(), term.rows())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_change_of_layout_tells_each_session_it_touches_its_size_once() {
+        let atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let screen = wide_screen();
+        let whole = grid_size(&atlas, screen);
+        let mut panel = panel_of(&["g0", "g1", "g2", "s0"]);
+        regroup(&mut panel);
+        // The first frame: every session the size of the panel.
+        panel.fit(&atlas, screen);
+        assert_eq!(resizes(&panel), [1, 1, 1, 1]);
+        assert_eq!(grids(&panel), [whole; 4]);
+        for _ in 0..3 {
+            panel.fit(&atlas, screen);
+        }
+        assert_eq!(resizes(&panel), [1, 1, 1, 1], "frames alone tell nothing");
+
+        // Split right: the two panes hear their size, once, and the tabs
+        // in no pane hear nothing.
+        assert!(panel.split(Edge::Right, 1));
+        for _ in 0..3 {
+            panel.fit(&atlas, screen);
+        }
+        assert_eq!(resizes(&panel), [2, 2, 1, 1]);
+        let panes = panel.screens(screen);
+        assert_eq!(grids(&panel)[0], grid_size(&atlas, panes[0].1));
+        assert_eq!(grids(&panel)[1], grid_size(&atlas, panes[1].1));
+        assert!(grids(&panel)[0].0 < whole.0 / 2 + 1);
+        assert_eq!(grids(&panel)[2], whole);
+
+        // Split down in the right pane: the one cut and the new one. The
+        // left pane is as it was and hears nothing.
+        assert!(panel.split(Edge::Bottom, 2));
+        for _ in 0..3 {
+            panel.fit(&atlas, screen);
+        }
+        assert_eq!(resizes(&panel), [2, 3, 2, 1]);
+
+        // To the other workspace and back: its panes keep their sizes
+        // while they do not show, so nobody is told anything.
+        panel.show(3);
+        panel.fit(&atlas, screen);
+        assert_eq!(panel.visible(true), [3]);
+        panel.show(0);
+        panel.fit(&atlas, screen);
+        assert_eq!(resizes(&panel), [2, 3, 2, 1]);
+
+        // Close Pane: the pane beside it grows, once; the session that
+        // left its pane is the size of the panel again, once.
+        panel.show(2);
+        assert!(panel.close_pane());
+        for _ in 0..3 {
+            panel.fit(&atlas, screen);
+        }
+        assert_eq!(resizes(&panel), [2, 4, 3, 1]);
+        assert_eq!(grids(&panel)[2], whole);
+    }
+
+    #[test]
+    fn a_divider_dragged_tells_no_session_a_size_until_it_is_let_go() {
+        let atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let screen = wide_screen();
+        let mut panel = panel_of(&["g0", "g1", "g2"]);
+        regroup(&mut panel);
+        assert!(panel.split(Edge::Right, 1));
+        assert!(panel.split(Edge::Bottom, 2));
+        panel.fit(&atlas, screen);
+        let told = resizes(&panel);
+        let sized = grids(&panel);
+        let was = panel.screens(screen);
+
+        // The divider between g0 and the rest, pressed a little off its
+        // middle and dragged left in steps, a frame after each.
+        let bar = panel.dividers(screen)[0];
+        let (x, y) = (bar.rect.x + 3.0, bar.rect.y + 200.0);
+        assert_eq!(panel.divider_at(screen, x, y).map(|d| d.id), Some(0));
+        panel.grab_divider(&bar, x, y);
+        let mut moved = 0;
+        for step in 1..=40 {
+            if panel.drag_divider(&atlas, screen, x - step as f32 * 5.0, y) {
+                moved += 1;
+            }
+            panel.fit(&atlas, screen);
+            assert_eq!(resizes(&panel), told, "step {step}");
+            assert_eq!(grids(&panel), sized, "step {step}");
+        }
+        assert_eq!(moved, 40, "the panes followed every step");
+        let now = panel.screens(screen);
+        assert_eq!(now[0].1.width, was[0].1.width - 200.0);
+        assert_eq!(now[1].1.width, was[1].1.width + 200.0);
+        check_panes(&panel, "dragged");
+
+        // Let go: each pane whose room changed hears its size, once.
+        panel.divider_drag = None;
+        for _ in 0..3 {
+            panel.fit(&atlas, screen);
+        }
+        assert_eq!(
+            resizes(&panel),
+            told.iter().map(|n| n + 1).collect::<Vec<_>>()
+        );
+        for (tab, pane) in panel.screens(screen) {
+            assert_eq!(grids(&panel)[tab], grid_size(&atlas, pane));
+        }
+
+        // The stacked one moves up and down, and only its two panes hear.
+        let told = resizes(&panel);
+        let bar = panel.dividers(screen)[1];
+        assert_eq!(bar.dir, Dir::Vertical);
+        let (x, y) = (bar.rect.x + 50.0, bar.rect.y + 8.5);
+        panel.grab_divider(&bar, x, y);
+        assert!(panel.drag_divider(&atlas, screen, x + 300.0, y + 90.0));
+        panel.fit(&atlas, screen);
+        assert_eq!(resizes(&panel), told);
+        panel.divider_drag = None;
+        panel.fit(&atlas, screen);
+        assert_eq!(resizes(&panel), [told[0], told[1] + 1, told[2] + 1]);
+        let now = panel.screens(screen);
+        assert_eq!(now[0].1, panel.screens(screen)[0].1);
+        assert_eq!(now[1].1.height + now[2].1.height, 600.0 - PANE_GAP);
+    }
+
+    #[test]
+    fn a_divider_stops_where_a_pane_would_be_too_small_and_a_double_click_evens_it() {
+        let atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let screen = wide_screen();
+        let advance = atlas.metrics.advance;
+        let row = row_height(&atlas);
+        let mut panel = panel_of(&["g0", "g1", "g2"]);
+        regroup(&mut panel);
+        assert!(panel.split(Edge::Right, 1));
+        assert!(panel.split(Edge::Bottom, 2));
+        let bar = panel.dividers(screen)[0];
+        let middle = (bar.rect.x + bar.rect.width * 0.5, bar.rect.y + 9.0);
+        panel.grab_divider(&bar, middle.0, middle.1);
+        // Far past the left edge: the left pane keeps twenty columns.
+        assert!(panel.drag_divider(&atlas, screen, -4000.0, 0.0));
+        let panes = panel.screens(screen);
+        assert_eq!(grid_size(&atlas, panes[0].1).0, PANE_MIN_COLS);
+        assert!(panes[0].1.width >= PANE_MIN_COLS as f32 * advance);
+        assert!(panes[0].1.width < (PANE_MIN_COLS + 1) as f32 * advance);
+        assert!(
+            !panel.drag_divider(&atlas, screen, -9000.0, 0.0),
+            "held there"
+        );
+        // Far past the right edge: the two on the right keep theirs.
+        assert!(panel.drag_divider(&atlas, screen, 9000.0, 0.0));
+        for (tab, pane) in panel.screens(screen).into_iter().skip(1) {
+            assert_eq!(grid_size(&atlas, pane).0, PANE_MIN_COLS, "tab {tab}");
+        }
+        // The stacked one keeps five rows on either side.
+        let bar = panel.dividers(screen)[1];
+        panel.grab_divider(&bar, bar.rect.x + 9.0, bar.rect.y + 8.5);
+        assert!(panel.drag_divider(&atlas, screen, 0.0, -4000.0));
+        let panes = panel.screens(screen);
+        assert_eq!(grid_size(&atlas, panes[1].1).1, PANE_MIN_ROWS);
+        assert!(panes[1].1.height < (PANE_MIN_ROWS + 1) as f32 * row);
+        assert!(panel.drag_divider(&atlas, screen, 0.0, 4000.0));
+        let panes = panel.screens(screen);
+        assert_eq!(grid_size(&atlas, panes[2].1).1, PANE_MIN_ROWS);
+        check_panes(&panel, "clamped");
+
+        // A double click on each puts it back in the middle, and lets go
+        // of a divider held.
+        assert!(panel.center_divider(&atlas, screen, 1));
+        assert!(panel.center_divider(&atlas, screen, 0));
+        assert_eq!(panel.divider_drag, None);
+        assert_eq!(panes_of(&panel), "h(0.5,g0,v(0.5,g1,*g2))");
+        assert!(!panel.center_divider(&atlas, screen, 0), "already even");
+        assert!(!panel.center_divider(&atlas, screen, 7), "no such divider");
+
+        // A pane too small to cut in two is not split.
+        assert!(panel.can_split(&atlas, screen, Edge::Right));
+        let narrow = Viewport {
+            width: PANE_MIN_COLS as f32 * advance * 4.0,
+            height: PANE_MIN_ROWS as f32 * row * 3.0,
+            ..screen
+        };
+        assert!(!panel.can_split(&atlas, narrow, Edge::Right));
+        assert!(!panel.can_split(&atlas, narrow, Edge::Bottom));
+        panel.show(0);
+        assert!(panel.can_split(&atlas, narrow, Edge::Bottom));
+        assert!(!panel.can_split(&atlas, narrow, Edge::Left));
+    }
+
+    #[test]
+    fn a_drag_ends_when_the_panes_change_shape_or_another_workspace_shows() {
+        let atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let screen = wide_screen();
+        let hold = |panel: &mut Panel| {
+            let bar = panel.dividers(screen)[0];
+            panel.grab_divider(&bar, bar.rect.x + 8.0, bar.rect.y + 8.0);
+            assert!(panel.divider_drag.is_some());
+        };
+        let mut panel = two_workspaces();
+        assert!(panel.split(Edge::Right, at(&panel, "g1")));
+        hold(&mut panel);
+        assert!(panel.split(Edge::Bottom, at(&panel, "g2")));
+        assert_eq!(panel.divider_drag, None, "a split");
+        hold(&mut panel);
+        panel.close_tab(at(&panel, "g0"));
+        assert_eq!(panel.divider_drag, None, "a pane's program ended");
+        hold(&mut panel);
+        assert!(panel.close_pane());
+        assert_eq!(panel.divider_drag, None, "a pane closed");
+
+        // Held while another workspace comes to the front: its panes are
+        // not the ones the divider is among, and nothing of theirs moves.
+        let mut panel = two_workspaces();
+        assert!(panel.split(Edge::Right, at(&panel, "g1")));
+        hold(&mut panel);
+        list(&mut panel, "sheds");
+        panel.show(at(&panel, "s0"));
+        assert!(panel.split(Edge::Right, at(&panel, "s1")));
+        hold(&mut panel);
+        let sheds = panel.screens(screen);
+        list(&mut panel, "garden");
+        panel.show(at(&panel, "g0"));
+        let garden = panel.screens(screen);
+        assert!(!panel.drag_divider(&atlas, screen, 100.0, 100.0));
+        assert_eq!(panel.divider_drag, None);
+        assert_eq!(panel.screens(screen), garden);
+        panel.show(at(&panel, "s0"));
+        assert_eq!(panel.screens(screen), sheds);
+    }
+
+    #[test]
+    fn a_point_is_in_the_pane_under_it_or_the_nearest_and_a_gap_is_its_divider() {
+        let screen = wide_screen();
+        let mut panel = panel_of(&["g0", "g1", "g2"]);
+        regroup(&mut panel);
+        assert_eq!(panel.pane_at(screen, 500.0, 300.0), 0, "one session");
+        assert!(panel.dividers(screen).is_empty());
+        assert_eq!(panel.divider_at(screen, 500.0, 300.0), None);
+        assert!(panel.split(Edge::Right, 1));
+        assert!(panel.split(Edge::Bottom, 2));
+        // g0 is 491 wide from 8; g1 and g2 start at 516, g2 under g1.
+        let panes = panel.screens(screen);
+        assert_eq!(panes[0].1.x + panes[0].1.width, 499.0);
+        assert_eq!(panes[1].1.x, 516.0);
+        assert_eq!(panel.pane_at(screen, 100.0, 300.0), 0);
+        assert_eq!(panel.pane_at(screen, 700.0, 100.0), 1);
+        assert_eq!(panel.pane_at(screen, 700.0, 500.0), 2);
+        // In the gap: the nearer pane. Off the screen, in the padding:
+        // the pane beside it.
+        assert_eq!(panel.pane_at(screen, 503.0, 100.0), 0);
+        assert_eq!(panel.pane_at(screen, 512.0, 100.0), 1);
+        assert_eq!(panel.pane_at(screen, 512.0, 500.0), 2);
+        assert_eq!(panel.pane_at(screen, 2.0, 640.0), 0);
+        assert_eq!(panel.pane_at(screen, 1012.0, 30.0), 1);
+
+        // A press anywhere in a gap, or two points into the panes beside
+        // it, grabs its divider; further into a pane it is the pane's.
+        let at = |x: f32, y: f32| panel.divider_at(screen, x, y).map(|d| d.id);
+        assert_eq!(at(499.0, 300.0), Some(0));
+        assert_eq!(at(515.9, 300.0), Some(0));
+        assert_eq!(at(497.0, 300.0), Some(0), "in the slop");
+        assert_eq!(at(517.9, 100.0), Some(0), "in the slop");
+        assert_eq!(at(496.9, 300.0), None);
+        assert_eq!(at(518.0, 100.0), None);
+        let stacked = panel.dividers(screen)[1];
+        assert_eq!(stacked.dir, Dir::Vertical);
+        assert_eq!(at(700.0, stacked.rect.y + 8.0), Some(1));
+        assert_eq!(at(700.0, stacked.rect.y - 2.0), Some(1));
+        assert_eq!(at(700.0, stacked.rect.y - 2.1), None);
+        assert_eq!(at(300.0, stacked.rect.y + 8.0), None, "g0 runs past it");
+    }
+
+    #[test]
+    fn a_grid_larger_or_smaller_than_its_pane_is_drawn_inside_it() {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let theme = Theme::default();
+        let rect = Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: 1016.0,
+            height: 638.0,
+        };
+        let (_, screen) = split(rect);
+        let solid = atlas.solid_uv();
+        // Three sessions, each a full screen of letters at the size of
+        // the whole panel, then one much smaller: none knows of its pane.
+        let whole = grid_size(&atlas, screen);
+        let mut panel = panel_of(&["g0", "g1", "g2"]);
+        panel.focus = true;
+        regroup(&mut panel);
+        for (n, tab) in panel.tabs.iter().enumerate() {
+            let (cols, rows) = if n == 2 { (12, 3) } else { whole };
+            tab.session.resize(cols, rows);
+            let line = "W".repeat(cols);
+            for _ in 0..rows {
+                tab.session.feed(format!("\r\n{line}").as_bytes());
+            }
+        }
+        assert!(panel.split(Edge::Right, 1));
+        assert!(panel.split(Edge::Bottom, 2));
+        // A divider on its way, far from where the sessions were sized.
+        let bar = panel.dividers(screen)[0];
+        panel.grab_divider(&bar, bar.rect.x + 8.0, bar.rect.y + 8.0);
+        assert!(panel.drag_divider(&atlas, screen, 700.0, 0.0));
+        let mut out = Vec::new();
+        draw(&panel, None, &mut atlas, rect, &theme, &mut out);
+        let panes = panel.screens(screen);
+        let (header, _) = split(rect);
+        let mut letters = [0usize; 3];
+        for quad in out.iter().filter(|q| q.uv != solid) {
+            // The header's own labels are above the screens.
+            if quad.pos[1] + quad.size[1] <= header.y + header.height {
+                continue;
+            }
+            let (x0, x1) = (quad.pos[0], quad.pos[0] + quad.size[0]);
+            let (y0, y1) = (quad.pos[1], quad.pos[1] + quad.size[1]);
+            let home = panes.iter().position(|(_, pane)| {
+                x0 >= pane.x - PAD * 0.5
+                    && x1 <= pane.x + pane.width + PAD * 0.5
+                    && y0 >= pane.y - 1.0
+                    && y1 <= pane.y + pane.height + 1.0
+            });
+            match home {
+                Some(pane) => letters[pane] += 1,
+                None => panic!("a glyph outside every pane: {quad:?} in {panes:?}"),
+            }
+        }
+        let advance = atlas.metrics.advance;
+        let row = row_height(&atlas);
+        // The large grids are cut to the cells their panes have room for.
+        for pane in 0..2 {
+            let (_, at) = panes[pane];
+            let fits = (at.width / advance).floor() as usize * (at.height / row).floor() as usize;
+            assert_eq!(letters[pane], fits, "pane {pane}");
+        }
+        // The small one is all there, with the rest of its pane empty.
+        assert_eq!(letters[2], 12 * 3);
+        // The divider held is drawn in the accent, the others not.
+        let lines: Vec<_> = out
+            .iter()
+            .filter(|q| q.uv == solid && (q.size[0] == 1.0 || q.size[1] == 1.0))
+            .filter(|q| q.pos[1] >= screen.y - PAD)
+            .collect();
+        assert!(
+            lines
+                .iter()
+                .any(|q| q.color == theme.accent && q.size[0] == 1.0)
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|q| q.color == theme.hairline && q.size[1] == 1.0)
+        );
+    }
+
+    #[test]
+    fn the_lines_between_panes_meet_and_the_focus_line_is_over_its_pane() {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let theme = Theme::default();
+        let rect = Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: 1016.0,
+            height: 638.0,
+        };
+        let (_, screen) = split(rect);
+        let mut panel = panel_of(&["g0", "g1", "g2"]);
+        panel.focus = true;
+        regroup(&mut panel);
+        let solid = atlas.solid_uv();
+        let row = row_height(&atlas);
+        let rules = |panel: &Panel, atlas: &mut Atlas| -> Vec<([f32; 2], [f32; 2], [f32; 4])> {
+            let mut out = Vec::new();
+            draw(panel, None, atlas, rect, &theme, &mut out);
+            out.iter()
+                .filter(|q| q.uv == solid && q.pos[1] > rect.y + HEADER - 1.0)
+                .filter(|q| q.color == theme.hairline || q.color == theme.accent)
+                .filter(|q| q.size[0] <= 2.0 || q.size[1] <= 2.0)
+                // Not a cursor, which is a row tall.
+                .filter(|q| q.size[1] != row)
+                .map(|q| (q.pos, q.size, q.color))
+                .collect()
+        };
+        // One session: no line, no focus line.
+        assert!(
+            rules(&panel, &mut atlas)
+                .iter()
+                .all(|(_, size, _)| size[0] > 2.0)
+        );
+        assert!(panel.split(Edge::Right, 1));
+        assert!(panel.split(Edge::Bottom, 2));
+        let drawn = rules(&panel, &mut atlas);
+        let panes = panel.screens(screen);
+        let bars = panel.dividers(screen);
+        // The upright line down the middle of its gap, the whole height
+        // of the panel under its header.
+        let upright = drawn
+            .iter()
+            .find(|(_, size, _)| size[0] == 1.0)
+            .expect("the line between g0 and the rest");
+        assert_eq!(upright.0[0], bars[0].rect.x + 8.0);
+        assert_eq!(upright.0[1], screen.y - PAD * 0.5);
+        assert_eq!(upright.1[1], screen.height + PAD);
+        // The level one from that line to the panel's right edge.
+        let level = drawn
+            .iter()
+            .find(|(_, size, colour)| {
+                size[1] == 1.0 && *colour == theme.hairline && size[0] < 600.0
+            })
+            .expect("the line between g1 and g2");
+        assert_eq!(level.0[1], bars[1].rect.y + 8.0);
+        assert_eq!(
+            level.0[0],
+            upright.0[0] + 1.0,
+            "it starts at the upright one"
+        );
+        assert_eq!(level.0[0] + level.1[0], rect.x + rect.width);
+        // The focus line over the pane with the keyboard, in the accent
+        // while the terminal has it.
+        let over = |panel: &Panel, atlas: &mut Atlas| {
+            rules(panel, atlas)
+                .into_iter()
+                .find(|(_, size, _)| size[1] == 2.0)
+                .expect("a focus line")
+        };
+        let (pos, size, colour) = over(&panel, &mut atlas);
+        let focused = panes[2].1;
+        assert_eq!(pos, [focused.x, focused.y - PAD * 0.5]);
+        assert_eq!(size, [focused.width, 2.0]);
+        assert_eq!(colour, theme.accent);
+        panel.show(0);
+        let (pos, size, _) = over(&panel, &mut atlas);
+        assert_eq!(
+            (pos, size[0]),
+            ([panes[0].1.x, screen.y - PAD * 0.5], panes[0].1.width)
+        );
+        panel.focus = false;
+        assert_eq!(over(&panel, &mut atlas).2, theme.hairline);
     }
 }

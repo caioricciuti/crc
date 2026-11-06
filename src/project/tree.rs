@@ -82,6 +82,12 @@ pub struct Tree {
     /// The letters typed to jump to a name, lower-cased, and when the last
     /// one was typed.
     typed: Option<(String, Instant)>,
+    /// Counts every time the selection or the cursor is put somewhere: by
+    /// a click, a key, a menu, or a command that selects what it made. It
+    /// does not move when the rows are only read again. Whoever remembers
+    /// its value can tell later whether the selection is still the one
+    /// they left.
+    selection_changes: u64,
     /// First visible row.
     pub scroll: usize,
     /// What Git ignores under the root, from [`crate::project::git::ignored`].
@@ -90,6 +96,9 @@ pub struct Tree {
     /// What the `.gitignore` line being typed would ignore, before it is
     /// saved: the Explorer shows it while you type.
     preview: std::collections::HashSet<PathBuf>,
+    /// The items cut and not yet pasted: drawn dimmed, with what is in
+    /// them. Nothing has happened to them on disk.
+    cut: Vec<PathBuf>,
 }
 
 /// Whether Git ignores a path, and where the rule applies.
@@ -131,6 +140,7 @@ impl Tree {
         self.rows = read_dir(&root, 0);
         self.root = Some(root);
         self.clear_selection();
+        self.cut.clear();
         self.scroll = 0;
     }
 
@@ -142,6 +152,23 @@ impl Tree {
         self.scroll = 0;
         self.ignored = Default::default();
         self.preview.clear();
+        self.cut.clear();
+    }
+
+    /// The items cut and waiting for a paste; none takes the dimming off.
+    pub fn set_cut(&mut self, cut: Vec<PathBuf>) {
+        self.cut = cut;
+    }
+
+    /// The items cut and waiting for a paste.
+    pub fn cut(&self) -> &[PathBuf] {
+        &self.cut
+    }
+
+    /// Whether `path` is one of the items cut, or inside one. Asked for
+    /// every row drawn; with nothing cut it compares nothing.
+    pub fn is_cut(&self, path: &Path) -> bool {
+        self.cut.iter().any(|cut| path.starts_with(cut))
     }
 
     pub fn set_ignored(&mut self, ignored: std::sync::Arc<std::collections::HashSet<PathBuf>>) {
@@ -362,6 +389,12 @@ impl Tree {
         }
     }
 
+    /// How many times the selection or the cursor has been put somewhere.
+    /// Equal to a value read earlier, nothing has touched them since.
+    pub fn selection_changes(&self) -> u64 {
+        self.selection_changes
+    }
+
     /// How many items are selected.
     pub fn selection_len(&self) -> usize {
         self.selection.len()
@@ -406,6 +439,7 @@ impl Tree {
 
     /// Selects nothing and leaves the keyboard nowhere.
     pub fn clear_selection(&mut self) {
+        self.selection_changes += 1;
         self.selection.clear();
         self.anchor = None;
         self.cursor = None;
@@ -420,6 +454,7 @@ impl Tree {
             return;
         };
         let path = entry.path.clone();
+        self.selection_changes += 1;
         self.anchor = Some(path.clone());
         if self.selection.remove(&path) {
             // The cursor stays among what is selected: the next selected
@@ -450,6 +485,7 @@ impl Tree {
     /// only the cursor moves there; any other row is selected alone.
     pub fn select_for_menu(&mut self, index: usize) {
         if self.is_selected(index) {
+            self.selection_changes += 1;
             self.cursor = Some(self.rows[index].path.clone());
             self.cursor_row = Some(index);
         } else {
@@ -469,6 +505,7 @@ impl Tree {
             .and_then(|anchor| self.row_of(anchor))
             .or(self.cursor_row)
             .unwrap_or(index);
+        self.selection_changes += 1;
         self.selection.clear();
         for entry in &self.rows[anchor.min(index)..=anchor.max(index)] {
             self.selection.insert(entry.path.clone());
@@ -483,6 +520,7 @@ impl Tree {
         if self.rows.is_empty() {
             return;
         }
+        self.selection_changes += 1;
         self.selection = self.rows.iter().map(|e| e.path.clone()).collect();
         let row = self.cursor_row.unwrap_or(0);
         self.cursor = Some(self.rows[row].path.clone());
@@ -620,7 +658,38 @@ impl Tree {
         self.typed = live.typed.clone();
         self.focused = live.focused;
         self.scroll = live.scroll;
+        self.cut = live.cut.clone();
+        self.selection_changes = live.selection_changes;
         self.settle(true);
+    }
+
+    /// Selects the items at `paths` that there are, opening the folders
+    /// above them, and nothing else: what a paste or a duplicate just
+    /// made. The cursor and the anchor go to the first of them as the rows
+    /// list them. With none of them there the selection stays as it is.
+    pub fn select_items(&mut self, paths: &[PathBuf]) {
+        let found: HashSet<PathBuf> = paths
+            .iter()
+            .filter(|path| {
+                self.reveal(path);
+                self.row_of(path).is_some()
+            })
+            .cloned()
+            .collect();
+        // A folder opened for a later item moves the rows, never the items.
+        let Some(first) = self
+            .rows
+            .iter()
+            .position(|entry| found.contains(&entry.path))
+        else {
+            return;
+        };
+        self.selection_changes += 1;
+        self.selection = found;
+        self.cursor = Some(self.rows[first].path.clone());
+        self.cursor_row = Some(first);
+        self.anchor = self.cursor.clone();
+        self.typed = None;
     }
 
     fn collapse(&mut self, index: usize) {
@@ -659,6 +728,7 @@ impl Tree {
     /// anchor are there too.
     pub fn select(&mut self, index: usize) -> Option<&Entry> {
         let path = self.rows.get(index)?.path.clone();
+        self.selection_changes += 1;
         self.selection.clear();
         self.selection.insert(path.clone());
         self.anchor = Some(path.clone());
@@ -732,6 +802,10 @@ fn read_dir(path: &Path, depth: usize) -> Vec<Entry> {
     let mut out: Vec<Entry> = entries
         .flatten()
         .filter_map(|entry| {
+            // Where a copy is being built: not an item of the project.
+            if super::fileops::is_staging(&entry.file_name()) {
+                return None;
+            }
             let name = entry.file_name().to_string_lossy().into_owned();
             // Through a symlink, what it points at: a linked folder is a
             // folder to expand, not a file to open as text.
@@ -844,6 +918,23 @@ mod tests {
         assert!(children.iter().any(|e| e.name == ".env" && !e.is_dir));
     }
 
+    /// The hidden folder a copy is built in is never a row, in the root or
+    /// in a folder, whatever is in it; a refresh does not bring it in.
+    #[test]
+    fn the_folder_a_copy_is_built_in_is_never_a_row() {
+        let f = Fixture::new("staging");
+        let staging = format!("{}7-0", crate::project::fileops::STAGING_PREFIX);
+        std::fs::create_dir_all(f.0.join(&staging).join("site")).unwrap();
+        std::fs::write(f.0.join(&staging).join("site/index.html"), "x").unwrap();
+        std::fs::create_dir(f.0.join("src").join(&staging)).unwrap();
+        let mut t = Tree::new();
+        t.open(&f.0);
+        t.toggle(0); // src
+        t.refresh();
+        let names: Vec<&str> = t.rows().iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["src", "nested", "main.rs", "README.md"]);
+    }
+
     #[test]
     fn expanding_splices_children_in_below() {
         let f = Fixture::new("expand");
@@ -899,6 +990,100 @@ mod tests {
             .expect("selected");
         assert_eq!(selected.name, "deep.rs");
         assert!(t.rows().iter().any(|e| e.name == "nested" && e.expanded));
+    }
+
+    /// What a paste made is selected, in folders that were closed too, and
+    /// nothing that was selected before; what is not there is left out.
+    #[test]
+    fn new_items_are_selected_with_their_folders_opened() {
+        let f = Fixture::new("select-items");
+        let mut t = Tree::new();
+        t.open(&f.0);
+        t.select(1); // README.md
+        let made = [
+            f.0.join("src/nested/deep.rs"),
+            f.0.join("gone.txt"),
+            f.0.join("src/main.rs"),
+        ];
+        t.select_items(&made);
+        let names: Vec<&str> = t.rows().iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["src", "nested", "deep.rs", "main.rs", "README.md"]);
+        assert_eq!(t.selected_paths(), [made[0].clone(), made[2].clone()]);
+        assert_eq!(t.cursor_row(), Some(2), "the first of them");
+
+        // None of them there: the selection is left alone.
+        t.select_items(&[f.0.join("gone.txt")]);
+        assert_eq!(t.selected_paths(), [made[0].clone(), made[2].clone()]);
+    }
+
+    /// The count moves whenever the selection or the cursor is put
+    /// somewhere, and not when the rows are only read again: a paste goes
+    /// by it to tell whether the cursor is still where it left it.
+    #[test]
+    fn the_selection_count_moves_with_the_selection_and_not_with_a_refresh() {
+        let f = Fixture::new("selection-count");
+        let mut t = Tree::new();
+        t.open(&f.0);
+        let mut last = t.selection_changes();
+        let mut moved = |t: &Tree, what: &str| {
+            assert_ne!(t.selection_changes(), last, "{what}");
+            last = t.selection_changes();
+        };
+        t.select(0);
+        moved(&t, "a click");
+        t.step_cursor(1, false);
+        moved(&t, "an arrow");
+        t.select_to(0);
+        moved(&t, "a Shift-click");
+        t.toggle_selected(1);
+        moved(&t, "a Command-click");
+        t.select_for_menu(0);
+        moved(&t, "a right-click on a selected row");
+        t.select_all();
+        moved(&t, "Select All");
+        t.reduce_selection();
+        moved(&t, "Escape");
+        t.type_ahead('r', Instant::now());
+        moved(&t, "a typed letter");
+        t.select_items(&[f.0.join("src/main.rs")]);
+        moved(&t, "what a paste made");
+        t.clear_selection();
+        moved(&t, "a click under the rows");
+
+        // Read again, on a worker and here: nothing was put anywhere.
+        t.select(0);
+        let before = t.selection_changes();
+        let mut read = t.clone();
+        read.select(1);
+        read.refresh();
+        read.adopt_selection(&t);
+        assert_eq!(read.selection_changes(), before);
+        t.refresh();
+        t.toggle(0);
+        t.scroll_to_selection(3);
+        assert_eq!(t.selection_changes(), before);
+    }
+
+    /// A cut item is dimmed with everything in it, and a neighbour whose
+    /// name only starts the same is not.
+    #[test]
+    fn cut_items_are_the_ones_cut_and_what_is_in_them() {
+        let f = Fixture::new("cut");
+        let mut t = Tree::new();
+        t.open(&f.0);
+        assert!(!t.is_cut(&f.0.join("src")));
+        t.set_cut(vec![f.0.join("src")]);
+        assert!(t.is_cut(&f.0.join("src")));
+        assert!(t.is_cut(&f.0.join("src/nested/deep.rs")));
+        assert!(!t.is_cut(&f.0.join("src-old")));
+        assert!(!t.is_cut(&f.0.join("README.md")));
+        // A tree read on a worker keeps it; a new project does not.
+        let mut read = t.clone();
+        read.set_cut(Vec::new());
+        read.adopt_selection(&t);
+        assert_eq!(read.cut(), [f.0.join("src")]);
+        t.set_root(f.0.join("src"));
+        assert!(t.cut().is_empty());
     }
 
     #[test]

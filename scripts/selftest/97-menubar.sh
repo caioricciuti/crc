@@ -46,12 +46,12 @@ quit
 SCRIPT
 HOME="$T/home/mb-home" PATH="$T/mbbin:$PATH" CRC_TERMINAL_SHELL=/bin/sh \
     CRC_SELFTEST="$T/mb.script" "$BIN" "$W" 2> "$T/mb.err"
-expect "$T/mb-rows.out" agents "on tasks=mbproj,mbproj 2 selected=mbproj sessions=*mbproj,mbproj 2 claude=0 pair=- op=-"
+expect "$T/mb-rows.out" agents "on tasks=mbproj,mbproj 2 selected=mbproj sessions=*mbproj,mbproj 2 claude=0 panes=- op=-"
 # Waiting first though it is second in the list and not the one showing.
 expect "$T/mb-rows.out" menubar "1 mbproj 2 · waiting|mbproj · idle"
-expect "$T/mb-editor.out" agents "off tasks=mbproj,mbproj 2 selected=mbproj sessions=*mbproj,mbproj 2 claude=0 pair=- op=-"
+expect "$T/mb-editor.out" agents "off tasks=mbproj,mbproj 2 selected=mbproj sessions=*mbproj,mbproj 2 claude=0 panes=- op=-"
 # The row chosen: Agents mode, that workspace, its waiting session.
-expect "$T/mb-pick.out" agents "on tasks=mbproj,mbproj 2 selected=mbproj 2 sessions=mbproj,*mbproj 2 claude=0 pair=- op=-"
+expect "$T/mb-pick.out" agents "on tasks=mbproj,mbproj 2 selected=mbproj 2 sessions=mbproj,*mbproj 2 claude=0 panes=- op=-"
 expect "$T/mb-pick.out" menubar "1 mbproj 2 · waiting|mbproj · idle"
 if grep -q 'no menu bar row' "$T/mb.err"; then
     failed "menubar: $(cat "$T/mb.err")"

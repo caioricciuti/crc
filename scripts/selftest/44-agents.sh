@@ -116,10 +116,10 @@ mkdir -p "$T/home/agents" "$T/home/agents-plain" "$T/elsewhere" "$T/notes"
 HOME="$T/home/agents" PATH="$T/agentsbin:$PATH" CRC_TERMINAL_SHELL=/bin/sh \
     CRC_CLAUDE_COMMAND="$T/agents-agent.sh" CRC_WORKTREES="$T/worktrees" \
     CRC_SELFTEST="$T/agents.script" "$BIN" "$T/agentsproj" 2> "$T/agents.err"
-expect "$T/agents-on.out" agents "on tasks=agentsproj selected=agentsproj sessions=*agentsproj claude=0 pair=- op=-"
+expect "$T/agents-on.out" agents "on tasks=agentsproj selected=agentsproj sessions=*agentsproj claude=0 panes=- op=-"
 expect "$T/agents-on.out" terminals "waiting: finished"
 expect "$T/agents-on.out" teams "0: [x] Write tests (tester); [ ] Fix login (fixer) idle=tester"
-expect "$T/agents-task.out" agents "on tasks=agentsproj,try-it selected=try-it sessions=agentsproj,*try-it claude=0 pair=- op=-"
+expect "$T/agents-task.out" agents "on tasks=agentsproj,try-it selected=try-it sessions=agentsproj,*try-it claude=0 panes=- op=-"
 ls -d "$T"/worktrees/agentsproj-*/try-it >/dev/null 2>&1 \
     || failed "agents: no worktree for try-it under $T/worktrees"
 testgit "$T/agentsproj" rev-parse -q --verify refs/heads/try-it >/dev/null \
@@ -128,38 +128,41 @@ expect_terminal "$T/agents-task.out" "agent ready in try-it"
 # The worktree's row sits under the workspace holding its repository.
 expect "$T/agents-task.out" agents_tree "agentsproj,>try-it"
 # A task's row shows its waiting session, with the keyboard.
-expect "$T/agents-main.out" agents "on tasks=agentsproj,try-it selected=agentsproj sessions=*agentsproj,try-it claude=0 pair=- op=-"
-expect "$T/agents-jump.out" agents "on tasks=agentsproj,try-it selected=try-it sessions=agentsproj,*try-it claude=0 pair=- op=-"
-# Cmd-\ puts a new shell in the task beside its agent; Cmd-Option-]
-# moves the keyboard across; Cmd-Option-W goes back to one, and the shell
-# keeps its tab.
-expect "$T/agents-split.out" agents "on tasks=agentsproj,try-it selected=try-it sessions=agentsproj,try-it,*try-it claude=0 pair=1+2 op=-"
-expect "$T/agents-other.out" agents "on tasks=agentsproj,try-it selected=try-it sessions=agentsproj,*try-it,try-it claude=0 pair=1+2 op=-"
-expect "$T/agents-unsplit.out" agents "on tasks=agentsproj,try-it selected=try-it sessions=agentsproj,*try-it,try-it claude=0 pair=- op=-"
+expect "$T/agents-main.out" agents "on tasks=agentsproj,try-it selected=agentsproj sessions=*agentsproj,try-it claude=0 panes=- op=-"
+expect "$T/agents-jump.out" agents "on tasks=agentsproj,try-it selected=try-it sessions=agentsproj,*try-it claude=0 panes=- op=-"
+# Cmd-\ puts a new shell in the task in a pane beside its agent, with the
+# keyboard; Cmd-Option-] moves the keyboard across to the agent;
+# Cmd-Option-W closes the pane that has it: the shell beside it has the
+# room and the keyboard, and the agent keeps its tab.
+expect "$T/agents-split.out" agents "on tasks=agentsproj,try-it selected=try-it sessions=agentsproj,try-it,*try-it claude=0 panes=h(0.5,1,*2) op=-"
+expect "$T/agents-other.out" agents "on tasks=agentsproj,try-it selected=try-it sessions=agentsproj,*try-it,try-it claude=0 panes=h(0.5,*1,2) op=-"
+expect "$T/agents-unsplit.out" agents "on tasks=agentsproj,try-it selected=try-it sessions=agentsproj,try-it,*try-it claude=0 panes=- op=-"
+grep -q '^terminals: waiting: finished|waiting: finished|' "$T/agents-unsplit.out" \
+    || failed "agents-unsplit.out: the agent lost its tab: $(grep '^terminals:' "$T/agents-unsplit.out")"
 # The shell beside the agent cds out of the worktree to a folder nothing
 # holds: a workspace is made there and has it. Back in the worktree, it is
 # try-it's again, and the workspace it left empty goes.
-expect "$T/agents-left.out" agents "on tasks=agentsproj,try-it,elsewhere selected=elsewhere sessions=agentsproj,try-it,*elsewhere claude=0 pair=- op=-"
-expect "$T/agents-back.out" agents "on tasks=agentsproj,try-it selected=try-it sessions=agentsproj,try-it,*try-it claude=0 pair=- op=-"
+expect "$T/agents-left.out" agents "on tasks=agentsproj,try-it,elsewhere selected=elsewhere sessions=agentsproj,try-it,*elsewhere claude=0 panes=- op=-"
+expect "$T/agents-back.out" agents "on tasks=agentsproj,try-it selected=try-it sessions=agentsproj,try-it,*try-it claude=0 panes=- op=-"
 grep -q '^inspector: branch=try-it ' "$T/agents-back.out" \
     || failed "agents-back.out: $(grep '^inspector:' "$T/agents-back.out")"
 # A folder workspace on a folder beside try-it's repository, never on the
 # repository itself, with a shell in it; Cmd-T adds a shell to it. It is
 # kept.
 expect "$T/agents-folder.out" agents_tree "agentsproj,>try-it,notes"
-expect "$T/agents-folder.out" agents "on tasks=agentsproj,try-it,notes selected=notes sessions=agentsproj,try-it,try-it,*notes claude=0 pair=- op=-"
+expect "$T/agents-folder.out" agents "on tasks=agentsproj,try-it,notes selected=notes sessions=agentsproj,try-it,try-it,*notes claude=0 panes=- op=-"
 expect_terminal "$T/agents-folder.out" "agent ready in notes"
-expect "$T/agents-cmdt.out" agents "on tasks=agentsproj,try-it,notes selected=notes sessions=agentsproj,try-it,try-it,notes,*notes claude=0 pair=- op=-"
+expect "$T/agents-cmdt.out" agents "on tasks=agentsproj,try-it,notes selected=notes sessions=agentsproj,try-it,try-it,notes,*notes claude=0 panes=- op=-"
 grep -q "^notes	" "$T"/home/agents/Library/Application\ Support/crc/agents/workspaces 2>/dev/null \
     || failed "agents: the notes workspace was not kept under Application Support/crc/agents"
 # One click under the list does nothing; a double-click makes a second
 # workspace on the selected one's folder (notes), named after it, with a
 # shell: a folder holds any number of workspaces.
-expect "$T/agents-single.out" agents "on tasks=agentsproj,try-it,notes selected=notes sessions=agentsproj,try-it,try-it,notes,*notes claude=0 pair=- op=-"
-expect "$T/agents-blank.out" agents "on tasks=agentsproj,try-it,notes,notes 2 selected=notes 2 sessions=agentsproj,try-it,try-it,notes,notes,*notes 2 claude=0 pair=- op=-"
+expect "$T/agents-single.out" agents "on tasks=agentsproj,try-it,notes selected=notes sessions=agentsproj,try-it,try-it,notes,*notes claude=0 panes=- op=-"
+expect "$T/agents-blank.out" agents "on tasks=agentsproj,try-it,notes,notes 2 selected=notes 2 sessions=agentsproj,try-it,try-it,notes,notes,*notes 2 claude=0 panes=- op=-"
 expect "$T/agents-blank.out" agents_folders "agentsproj=$T/agentsproj,notes=$T/notes,notes 2=$T/notes"
 # Back in the editor, the sessions keep running.
-expect "$T/agents-off.out" agents "off tasks=agentsproj,try-it,notes,notes 2 selected=notes 2 sessions=agentsproj,try-it,try-it,notes,notes,*notes 2 claude=0 pair=- op=-"
+expect "$T/agents-off.out" agents "off tasks=agentsproj,try-it,notes,notes 2 selected=notes 2 sessions=agentsproj,try-it,try-it,notes,notes,*notes 2 claude=0 panes=- op=-"
 grep -q '^terminals: waiting: finished|waiting: finished|' "$T/agents-off.out" \
     || failed "agents-off.out: $(grep '^terminals:' "$T/agents-off.out")"
 testgit "$T/agentsproj" worktree remove --force "$(ls -d "$T"/worktrees/agentsproj-*/try-it)" 2>/dev/null || true
@@ -236,11 +239,11 @@ quit
 SCRIPT
 HOME="$T/home/agents-plain" CRC_TERMINAL_SHELL=/bin/sh CRC_SELFTEST="$T/agents-plain.script" "$BIN" "$T/plainproj" \
     2> "$T/agents-plain.err"
-expect "$T/agents-plain.out" agents "on tasks=plainproj selected=plainproj sessions=*plainproj claude=0 pair=- op=-"
-expect "$T/agents-plain-cmdt.out" agents "on tasks=plainproj selected=plainproj sessions=plainproj,*plainproj claude=0 pair=- op=-"
+expect "$T/agents-plain.out" agents "on tasks=plainproj selected=plainproj sessions=*plainproj claude=0 panes=- op=-"
+expect "$T/agents-plain-cmdt.out" agents "on tasks=plainproj selected=plainproj sessions=plainproj,*plainproj claude=0 panes=- op=-"
 # After `cd ../movedrepo` in the second shell, the workspace (named by crc
 # after its folder) is that folder now, and the inspector reads its Git.
-expect "$T/agents-moved.out" agents "on tasks=movedrepo selected=movedrepo sessions=movedrepo,*movedrepo claude=0 pair=- op=-"
+expect "$T/agents-moved.out" agents "on tasks=movedrepo selected=movedrepo sessions=movedrepo,*movedrepo claude=0 panes=- op=-"
 grep -q '^inspector: branch=main base=- ahead=0 behind=0 upstream=-' "$T/agents-moved.out" \
     || failed "agents-moved.out: $(grep '^inspector:' "$T/agents-moved.out")"
 # A second workspace, then back to the first: Command-1 and 2 pick its
@@ -248,13 +251,13 @@ grep -q '^inspector: branch=main base=- ahead=0 behind=0 upstream=-' "$T/agents-
 # workspace's other terminal, not the second workspace's that slid into
 # its place. The last one exits: its workspace stays, selected and empty,
 # and the second's terminal is not shown in its place.
-expect "$T/agents-other-made.out" agents "on tasks=movedrepo,other selected=other sessions=movedrepo,movedrepo,*other claude=0 pair=- op=-"
+expect "$T/agents-other-made.out" agents "on tasks=movedrepo,other selected=other sessions=movedrepo,movedrepo,*other claude=0 panes=- op=-"
 # The first terminal never left plainproj: showing it, the workspace is there.
-expect "$T/agents-cmd1.out" agents "on tasks=plainproj,other selected=plainproj sessions=*plainproj,plainproj,other claude=0 pair=- op=-"
-expect "$T/agents-cmd2.out" agents "on tasks=movedrepo,other selected=movedrepo sessions=movedrepo,*movedrepo,other claude=0 pair=- op=-"
+expect "$T/agents-cmd1.out" agents "on tasks=plainproj,other selected=plainproj sessions=*plainproj,plainproj,other claude=0 panes=- op=-"
+expect "$T/agents-cmd2.out" agents "on tasks=movedrepo,other selected=movedrepo sessions=movedrepo,*movedrepo,other claude=0 panes=- op=-"
 # The one left is the plainproj shell: the workspace follows it there.
-expect "$T/agents-one-left.out" agents "on tasks=plainproj,other selected=plainproj sessions=*plainproj,other claude=0 pair=- op=-"
-expect "$T/agents-closed.out" agents "on tasks=plainproj,other selected=plainproj sessions=*other claude=0 pair=- op=-"
+expect "$T/agents-one-left.out" agents "on tasks=plainproj,other selected=plainproj sessions=*plainproj,other claude=0 panes=- op=-"
+expect "$T/agents-closed.out" agents "on tasks=plainproj,other selected=plainproj sessions=*other claude=0 panes=- op=-"
 # Agents leads: back in the editor, the project is the selected
 # workspace's folder (plainproj, no repository in it), not that of the
 # other workspace, whose terminal is the one left.

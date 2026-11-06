@@ -78,8 +78,8 @@ HOME="$RH" CRC_TERMINAL_SHELL=/bin/sh CRC_SSH_COMMAND="$T/remote-ssh.sh" \
     CRC_SELFTEST="$T/remote.script" "$BIN" "$RP" 2> "$T/remote.err"
 wait "$remote_writer" 2>/dev/null || true
 # The local shell gets a workspace of its own; the remote one takes none.
-expect "$T/remote-on.out" agents "on tasks=app,remoteproj selected=remoteproj sessions=*remoteproj claude=0 pair=- op=-"
-expect "$T/remote-term.out" agents "on tasks=app,remoteproj selected=app sessions=remoteproj,*app claude=0 pair=- op=-"
+expect "$T/remote-on.out" agents "on tasks=app,remoteproj selected=remoteproj sessions=*remoteproj claude=0 panes=- op=-"
+expect "$T/remote-term.out" agents "on tasks=app,remoteproj selected=app sessions=remoteproj,*app claude=0 panes=- op=-"
 expect "$T/remote-term.out" agents_tree "app,remoteproj"
 # Read on the host: no repository in its folder there, said as one here is.
 expect "$T/remote-term.out" inspector "remote=myhost:/srv/app none"
@@ -87,11 +87,11 @@ expect_terminal "$T/remote-term.out" "remote stub up"
 # A file written here while the remote terminal prints is not its to
 # review: the local one, also working, takes it.
 expect "$T/remote-review.out" terminals "idle review=1|idle"
-expect "$T/remote-new.out" agents "on tasks=app,remoteproj,work selected=work sessions=remoteproj,app,*work claude=0 pair=- op=-"
+expect "$T/remote-new.out" agents "on tasks=app,remoteproj,work selected=work sessions=remoteproj,app,*work claude=0 panes=- op=-"
 expect "$T/remote-new.out" inspector "remote=box:/home/me/work none"
 # A host ssh cannot resolve: its terminal stays, with ssh's error and what
 # to check, and its folder is unreachable instead of being read forever.
-expect "$T/remote-down.out" agents "on tasks=app,remoteproj,work,x selected=x sessions=remoteproj,app,work,*x claude=0 pair=- op=-"
+expect "$T/remote-down.out" agents "on tasks=app,remoteproj,work,x selected=x sessions=remoteproj,app,work,*x claude=0 panes=- op=-"
 expect_terminal "$T/remote-down.out" "Could not resolve hostname nohost"
 expect_terminal "$T/remote-down.out" "crc: could not connect to nohost. Check the host name"
 expect_terminal "$T/remote-down.out" "hosts are: shots"

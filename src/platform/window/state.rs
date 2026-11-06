@@ -480,10 +480,11 @@ impl State {
             && self.lsp.idle()
             && self.ext.idle()
             && self.watch.idle()
+            && self.explorer.idle()
             && self.message.is_none()
             && !self.git.busy()
             && !matches!(self.drag, Some(Drag::Select { point: Some(_), .. }))
-            && !(self.terminal.selecting && self.terminal.drag_point.is_some())
+            && !self.terminal.selecting_dragged()
             // A tab held at an end of its strip scrolls it by the frame.
             && !self.terminal.tab_drag.is_some_and(|drag| drag.active)
             && self.project_search.rx.is_none()

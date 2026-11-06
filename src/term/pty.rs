@@ -283,6 +283,8 @@ struct Status {
     code: std::sync::atomic::AtomicI32,
     /// A wake-up is queued and not yet taken by [`Session::drain_wake`].
     woken: AtomicBool,
+    /// How many times the terminal was given another size.
+    resizes: AtomicUsize,
 }
 
 impl Status {
@@ -483,11 +485,18 @@ impl Session {
         let mut term = self.term.lock().unwrap_or_else(|e| e.into_inner());
         if (term.cols(), term.rows()) != (cols.max(2), rows.max(1)) {
             term.resize(cols, rows);
+            self.status.resizes.fetch_add(1, Ordering::Relaxed);
             match &self.control {
                 Control::Pty { master, .. } => set_size(master.as_raw_fd(), cols, rows),
                 Control::Held { .. } => self.out.send(Frame::Resize(cols, rows)),
             }
         }
+    }
+
+    /// How many times [`Session::resize`] gave the terminal another size,
+    /// and so told its program: a size it already has does not count.
+    pub fn resizes(&self) -> usize {
+        self.status.resizes.load(Ordering::Relaxed)
     }
 
     /// Whether a helper holds the program, so it can outlive the window.

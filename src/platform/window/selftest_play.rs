@@ -323,6 +323,11 @@ impl EditorView {
                     eprintln!("crc: selftest could not write {path}: {error}");
                 }
             }
+            Step::Pasteboard(paths) => {
+                let paths: Vec<std::path::PathBuf> =
+                    paths.iter().map(std::path::PathBuf::from).collect();
+                clipboard::write_file_urls(&paths);
+            }
             Step::Wheel(dy) => {
                 if self.state().is_some_and(|state| state.palette.is_some()) {
                     self.palette_wheel_by(*dy, false);
@@ -475,6 +480,9 @@ impl EditorView {
                 }
                 self.check_open_files();
                 self.poll_tree_children();
+                // A copy's outcome before the tree it asks to be read
+                // again, so one wait can take both.
+                self.poll_file_job();
                 self.poll_project_index();
                 self.poll_project_search();
                 self.poll_http();
@@ -708,7 +716,7 @@ impl EditorView {
                             .map(|t| t.title.as_str())
                             .collect::<Vec<_>>()
                             .join("|"),
-                        state.terminal.selection.and_then(|(a, b)| {
+                        state.terminal.selection().and_then(|(a, b)| {
                             state.terminal.active_tab().map(|tab| {
                                 tab.session
                                     .term
@@ -733,7 +741,7 @@ impl EditorView {
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .scrollback_len()),
-                        state.terminal.back,
+                        state.terminal.back(),
                         state.find.as_ref().map_or("none".to_string(), |bar| {
                             let query = bar.query.rope.to_string();
                             match &bar.terminal {
@@ -766,7 +774,7 @@ impl EditorView {
                         // scrolled it.
                         state.terminal.active_tab().map_or(String::new(), |t| {
                             let term = t.session.term.lock().unwrap_or_else(|e| e.into_inner());
-                            let line = term.view_line(0, state.terminal.back);
+                            let line = term.view_line(0, state.terminal.back());
                             term.text_between((line, 0), (line, term.cols()))
                         }),
                     ),
@@ -858,7 +866,7 @@ impl EditorView {
                                     tab.session.term.lock().unwrap_or_else(|e| e.into_inner());
                                 let covered =
                                     crate::platform::terminal::find_bar_rows(&state.renderer.atlas);
-                                let top = term.view_line(0, state.terminal.back);
+                                let top = term.view_line(0, state.terminal.back());
                                 hit.start.0 >= top + covered as u64
                                     && hit.start.0 < top + term.rows() as u64
                             })
@@ -971,15 +979,26 @@ impl EditorView {
                         .collect::<Vec<_>>()
                         .join("|"),
                     // With the terminal's tabs in their strip's order, on
-                    // a line of its own.
+                    // a line of its own, and then its panes: each one's
+                    // grid, how often its program was told a size, and
+                    // where it is, with the divider held if one is.
                     format_args!(
-                        "{}\nterminal_tabs: {}",
+                        "{}\nterminal_tabs: {}\nterminal_panes: {} held={}",
                         state.agents.report(
                             &state.terminal.tabs,
                             state.terminal.active,
-                            state.terminal.shown_pair(),
+                            &state.terminal.panes_text(|tab| tab.to_string()),
                         ),
-                        state.terminal.report()
+                        state.terminal.report(),
+                        chrome_of(&state).terminal.map_or(String::new(), |rect| {
+                            let (_, screen) = crate::platform::terminal::split(rect);
+                            state.terminal.panes_report(screen)
+                        }),
+                        state
+                            .terminal
+                            .divider_drag
+                            .as_ref()
+                            .map_or("-".to_owned(), |drag| drag.id.to_string()),
                     ),
                     state.agents.inspector.report(
                         state
@@ -1191,6 +1210,8 @@ impl EditorView {
                 panic!("selftest: forced panic");
             }
             Step::Quit => {
+                // As a real quit does: a copy still running stops whole.
+                self.finish_file_job();
                 self.claude_shutdown();
                 self.history_finish();
                 std::process::exit(0)
@@ -1357,6 +1378,21 @@ fn region_named(state: &mut State, name: &str) -> Option<Viewport> {
                 width: track.width,
                 height: crate::platform::terminal::TICK_HEIGHT,
             })
+        }
+        // A pane of the terminal, in the order they read, and the gap of
+        // a divider between two, a parent's before its sides':
+        // `terminal.pane.2`, `terminal.split.1`.
+        _ if name.starts_with("terminal.pane.") || name.starts_with("terminal.split.") => {
+            let (_, screen) = crate::platform::terminal::split(chrome_of(state).terminal?);
+            let (kind, number) = name["terminal.".len()..].split_once('.')?;
+            let index = number.parse::<usize>().ok()?.checked_sub(1)?;
+            if kind == "pane" {
+                let panes = state.terminal.screens(screen);
+                panes.get(index).map(|(_, rect)| *rect)
+            } else {
+                let dividers = state.terminal.dividers(screen);
+                dividers.get(index).map(|divider| divider.rect)
+            }
         }
         _ if name.starts_with("inspector.") => state.agents.inspector.named(name),
         // The Open Folder button of the Explorer with no folder.

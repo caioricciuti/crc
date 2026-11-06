@@ -8,7 +8,7 @@
 # shell of its own. Each is selected apart, keeps its terminals, and a
 # rename in its row keeps them apart. Then each gets a second terminal, so
 # their tabs interleave (deskproj, notes, deskproj, notes): a terminal that
-# exits, in the background or at the front, or one closed in a pair, gives
+# exits, in the background or at the front, or one closed in a pane, gives
 # way to its own workspace's next, never another's; when a workspace's last
 # one exits, that workspace stays selected, empty: nothing typed or Cmd-W
 # reaches the other workspace's terminal behind it. A workspace left on
@@ -132,45 +132,45 @@ HOME="$T/home/ws-home" CRC_TERMINAL_SHELL=/bin/sh CRC_CLAUDE_COMMAND="$T/ws-agen
 [ -z "${SELFTEST_FRAMES:-}" ] || cp -f "$T/ws-empty.bmp" "$T/ws-bare.bmp" "$SELFTEST_FRAMES/"
 ws_kept="$T/home/ws-home/Library/Application Support/crc/agents/workspaces"
 # Two workspaces on deskproj, each with its own shell and row.
-expect "$T/ws-two.out" agents "on tasks=deskproj,deskproj 2 selected=deskproj 2 sessions=deskproj,*deskproj 2 claude=0 pair=- op=-"
+expect "$T/ws-two.out" agents "on tasks=deskproj,deskproj 2 selected=deskproj 2 sessions=deskproj,*deskproj 2 claude=0 panes=- op=-"
 expect "$T/ws-two.out" agents_folders "deskproj=$W,deskproj 2=$W"
-expect "$T/ws-first.out" agents "on tasks=deskproj,deskproj 2 selected=deskproj sessions=*deskproj,deskproj 2 claude=0 pair=- op=-"
-expect "$T/ws-second.out" agents "on tasks=deskproj,deskproj 2 selected=deskproj 2 sessions=deskproj,*deskproj 2 claude=0 pair=- op=-"
+expect "$T/ws-first.out" agents "on tasks=deskproj,deskproj 2 selected=deskproj sessions=*deskproj,deskproj 2 claude=0 panes=- op=-"
+expect "$T/ws-second.out" agents "on tasks=deskproj,deskproj 2 selected=deskproj 2 sessions=deskproj,*deskproj 2 claude=0 panes=- op=-"
 # Renamed, it keeps its terminal and its own key in the file.
-expect "$T/ws-renamed.out" agents "on tasks=deskproj,notes selected=notes sessions=deskproj,*notes claude=0 pair=- op=-"
+expect "$T/ws-renamed.out" agents "on tasks=deskproj,notes selected=notes sessions=deskproj,*notes claude=0 panes=- op=-"
 [ "$(awk -F'\t' '$2 ~ /\/deskproj$/ { print $3 }' "$ws_kept" 2>/dev/null | sort -u | wc -l | tr -d ' ')" = 2 ] \
     || failed "workspaces: two on one folder were not kept apart: $(cat "$ws_kept" 2>/dev/null)"
 # Interleaved: deskproj's at 0 and 2, notes' at 1 and 3.
-expect "$T/ws-four.out" agents "on tasks=deskproj,notes selected=notes sessions=deskproj,notes,deskproj,*notes claude=0 pair=- op=-"
+expect "$T/ws-four.out" agents "on tasks=deskproj,notes selected=notes sessions=deskproj,notes,deskproj,*notes claude=0 panes=- op=-"
 # deskproj left on its first tab: back on it, not its newest (BUG-061).
-expect "$T/ws-left.out" agents "on tasks=deskproj,notes selected=notes sessions=deskproj,notes,deskproj,*notes claude=0 pair=- op=-"
-expect "$T/ws-back.out" agents "on tasks=deskproj,notes selected=deskproj sessions=*deskproj,notes,deskproj,notes claude=0 pair=- op=-"
-expect "$T/ws-before-exit.out" agents "on tasks=deskproj,notes selected=deskproj sessions=deskproj,notes,*deskproj,notes claude=0 pair=- op=-"
+expect "$T/ws-left.out" agents "on tasks=deskproj,notes selected=notes sessions=deskproj,notes,deskproj,*notes claude=0 panes=- op=-"
+expect "$T/ws-back.out" agents "on tasks=deskproj,notes selected=deskproj sessions=*deskproj,notes,deskproj,notes claude=0 panes=- op=-"
+expect "$T/ws-before-exit.out" agents "on tasks=deskproj,notes selected=deskproj sessions=deskproj,notes,*deskproj,notes claude=0 panes=- op=-"
 # notes' first exits behind deskproj's: deskproj's stays at the front.
-expect "$T/ws-background.out" agents "on tasks=deskproj,notes selected=deskproj sessions=deskproj,*deskproj,notes claude=0 pair=- op=-"
+expect "$T/ws-background.out" agents "on tasks=deskproj,notes selected=deskproj sessions=deskproj,*deskproj,notes claude=0 panes=- op=-"
 # deskproj's at the front exits: its other one, before it, not notes'.
-expect "$T/ws-front.out" agents "on tasks=deskproj,notes selected=deskproj sessions=*deskproj,notes claude=0 pair=- op=-"
+expect "$T/ws-front.out" agents "on tasks=deskproj,notes selected=deskproj sessions=*deskproj,notes claude=0 panes=- op=-"
 # Its last exits: deskproj stays selected, empty; notes' is not taken.
-expect "$T/ws-empty.out" agents "on tasks=deskproj,notes selected=deskproj sessions=*notes claude=0 pair=- op=-"
+expect "$T/ws-empty.out" agents "on tasks=deskproj,notes selected=deskproj sessions=*notes claude=0 panes=- op=-"
 # Cmd-W and typing there reach nothing.
-expect "$T/ws-guarded.out" agents "on tasks=deskproj,notes selected=deskproj sessions=*notes claude=0 pair=- op=-"
-expect "$T/ws-notes.out" agents "on tasks=deskproj,notes selected=notes sessions=*notes claude=0 pair=- op=-"
+expect "$T/ws-guarded.out" agents "on tasks=deskproj,notes selected=deskproj sessions=*notes claude=0 panes=- op=-"
+expect "$T/ws-notes.out" agents "on tasks=deskproj,notes selected=notes sessions=*notes claude=0 panes=- op=-"
 if grep -q 'leaked-from-deskproj' "$T/ws-notes.out"; then
     failed "workspaces: typing in an empty workspace reached another's terminal"
 fi
-# A pair in notes; the pane at the front exits: notes' other shows.
-expect "$T/ws-pair.out" agents "on tasks=deskproj,notes selected=notes sessions=notes,*notes claude=0 pair=0+1 op=-"
-expect "$T/ws-pair-exit.out" agents "on tasks=deskproj,notes selected=notes sessions=*notes claude=0 pair=- op=-"
+# Two panes in notes; the one with the keyboard exits: notes' other shows.
+expect "$T/ws-pair.out" agents "on tasks=deskproj,notes selected=notes sessions=notes,*notes claude=0 panes=h(0.5,0,*1) op=-"
+expect "$T/ws-pair-exit.out" agents "on tasks=deskproj,notes selected=notes sessions=*notes claude=0 panes=- op=-"
 # A workspace with no folder: no folder line, no repositories, and its
 # shell and Claude start in the home folder.
-expect "$T/ws-bare.out" agents "on tasks=deskproj,notes,scratch selected=scratch sessions=notes,*scratch claude=0 pair=- op=-"
+expect "$T/ws-bare.out" agents "on tasks=deskproj,notes,scratch selected=scratch sessions=notes,*scratch claude=0 panes=- op=-"
 expect "$T/ws-bare.out" agents_folders "deskproj=$W,notes=$W,scratch=-"
 expect "$T/ws-bare.out" inspector "none"
 case "$(cat "$T/ws-pwd.txt" 2>/dev/null)" in
 */home/ws-home) ;;
 *) failed "workspaces: the shell without a folder started in [$(cat "$T/ws-pwd.txt" 2>/dev/null)]" ;;
 esac
-expect "$T/ws-bare-claude.out" agents "on tasks=deskproj,notes,scratch selected=scratch sessions=notes,scratch,*scratch claude=1 pair=- op=-"
+expect "$T/ws-bare-claude.out" agents "on tasks=deskproj,notes,scratch selected=scratch sessions=notes,scratch,*scratch claude=1 panes=- op=-"
 expect_terminal "$T/ws-bare-claude.out" "claude in ws-home"
 grep -q "^scratch		ws:" "$ws_kept" 2>/dev/null \
     || failed "workspaces: the one without a folder was not kept: $(cat "$ws_kept" 2>/dev/null)"

@@ -15,7 +15,7 @@ impl EditorView {
     /// What a drag over the window may do: copy, for files and images;
     /// nothing for anything else, so the pointer says so.
     pub(super) fn drag_operation(&self, pasteboard: &NSPasteboard) -> NSDragOperation {
-        if !file_urls(pasteboard).is_empty() || clipboard::has_image_on(pasteboard) {
+        if !clipboard::file_urls(pasteboard).is_empty() || clipboard::has_image_on(pasteboard) {
             NSDragOperation::Copy
         } else {
             NSDragOperation::None
@@ -25,7 +25,7 @@ impl EditorView {
     /// Takes a drop at `(x, y)` in view coordinates; `true` when something
     /// was done with it.
     pub(super) fn drop_pasteboard(&self, pasteboard: &NSPasteboard, x: f32, y: f32) -> bool {
-        let mut paths = file_urls(pasteboard);
+        let mut paths = clipboard::file_urls(pasteboard);
         if paths.is_empty()
             && let Some(png) = clipboard::read_image_png_on(pasteboard)
             && let Some(saved) = save_image(&png)
@@ -118,22 +118,6 @@ impl EditorView {
         self.request_redraw();
         self.pump();
     }
-}
-
-/// The files on the pasteboard, as paths.
-fn file_urls(pasteboard: &NSPasteboard) -> Vec<PathBuf> {
-    let Some(items) = pasteboard.pasteboardItems() else {
-        return Vec::new();
-    };
-    items
-        .iter()
-        .filter_map(|item| {
-            let text = item.stringForType(unsafe { NSPasteboardTypeFileURL })?;
-            let url = NSURL::URLWithString(&text)?;
-            let path = url.path()?;
-            Some(PathBuf::from(path.to_string()))
-        })
-        .collect()
 }
 
 /// Where dropped and pasted images go: `drops/` under Application Support,

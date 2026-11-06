@@ -59,11 +59,11 @@ SCRIPT
 mkdir -p "$T/home/sidebar"
 HOME="$T/home/sidebar" PATH="$T/sidebin:$PATH" CRC_TERMINAL_SHELL=/bin/sh CRC_CLAUDE_COMMAND="$T/side-agent.sh" \
     CRC_SELFTEST="$T/side.script" "$BIN" "$S" 2> "$T/side.err"
-expect "$T/side-made.out" agents "on tasks=sideproj,beta,gamma selected=gamma sessions=sideproj,beta,*gamma claude=0 pair=- op=-"
+expect "$T/side-made.out" agents "on tasks=sideproj,beta,gamma selected=gamma sessions=sideproj,beta,*gamma claude=0 panes=- op=-"
 expect "$T/side-made.out" agents_folders "sideproj=$S,beta=$T/beta,gamma=$T/gamma"
 [ -z "${SELFTEST_FRAMES:-}" ] || cp -f "$T/side-made.bmp" "$SELFTEST_FRAMES/"
 # gamma dragged above beta stays there.
-expect "$T/side-dragged.out" agents "on tasks=sideproj,gamma,beta selected=gamma sessions=sideproj,beta,*gamma claude=0 pair=- op=-"
+expect "$T/side-dragged.out" agents "on tasks=sideproj,gamma,beta selected=gamma sessions=sideproj,beta,*gamma claude=0 panes=- op=-"
 # The order file keeps ids: gamma's is its key in the workspaces file.
 side_kept="$T/home/sidebar/Library/Application Support/crc/agents"
 gamma_key=$(awk -F'\t' '$1 == "gamma" { print $3 }' "$side_kept/workspaces" 2>/dev/null)
@@ -71,7 +71,7 @@ gamma_key=$(awk -F'\t' '$1 == "gamma" { print $3 }' "$side_kept/workspaces" 2>/d
     || failed "sidebar: the dragged order was not kept"
 # beta, now third, renamed in its row (a folder workspace takes the name).
 # (The script's double-click is one event, so it does not select first.)
-expect "$T/side-renamed.out" agents "on tasks=sideproj,gamma,notes selected=gamma sessions=sideproj,notes,*gamma claude=0 pair=- op=-"
+expect "$T/side-renamed.out" agents "on tasks=sideproj,gamma,notes selected=gamma sessions=sideproj,notes,*gamma claude=0 panes=- op=-"
 
 # The reboot: the helpers end without a word (the self-test's quit writes
 # nothing either, as a crash would not); each session's record kept its
@@ -220,7 +220,7 @@ HOME="$T/home/garden" CRC_TERMINAL_SHELL=/bin/sh CRC_SELFTEST="$T/garden.script"
     "$T/garden-merged.bmp" "$T/garden-merged-open.bmp" "$SELFTEST_FRAMES/"
 expect "$T/garden.out" agents_tree "garden,>fix/seed-dates,>feat/compost-log"
 expect "$T/garden.out" inspector "branch=main base=- ahead=0 behind=0 upstream=- push=0 pull=0 dirty=0 changes=+0-0 tag=- buttons=push worktrees=fix/seed-dates:ahead=1:+3-0:files=1,feat/compost-log:ahead=0:+0-0:files=0"
-expect "$T/garden-terminal.out" agents "on tasks=garden,fix/seed-dates,feat/compost-log selected=feat/compost-log sessions=garden,*feat/compost-log claude=0 pair=- op=-"
+expect "$T/garden-terminal.out" agents "on tasks=garden,fix/seed-dates,feat/compost-log selected=feat/compost-log sessions=garden,*feat/compost-log claude=0 panes=- op=-"
 # Nothing written yet: each says its branch's last commit.
 expect "$T/garden.out" agents_activity "fix/seed-dates=commit,feat/compost-log=commit"
 # A file written in a worktree from a shell elsewhere (as a background
@@ -232,9 +232,9 @@ expect "$T/garden-folded.out" agents_tree "garden(+2)"
 grep -q "^fold[,	]" "$T/home/garden/Library/Application Support/crc/agents/order" 2>/dev/null \
     || failed "garden: the fold was not kept: $(cat "$T/home/garden/Library/Application Support/crc/agents/order" 2>/dev/null)"
 # Folded, there is no second row for Control-2 to pick.
-expect "$T/garden-ctrl2.out" agents "on tasks=garden,fix/seed-dates,feat/compost-log selected=garden sessions=*garden,feat/compost-log claude=0 pair=- op=-"
+expect "$T/garden-ctrl2.out" agents "on tasks=garden,fix/seed-dates,feat/compost-log selected=garden sessions=*garden,feat/compost-log claude=0 panes=- op=-"
 expect "$T/garden-ctrl3.out" agents_tree "garden,>fix/seed-dates,>feat/compost-log"
-expect "$T/garden-ctrl3.out" agents "on tasks=garden,fix/seed-dates,feat/compost-log selected=feat/compost-log sessions=garden,*feat/compost-log claude=0 pair=- op=-"
+expect "$T/garden-ctrl3.out" agents "on tasks=garden,fix/seed-dates,feat/compost-log selected=feat/compost-log sessions=garden,*feat/compost-log claude=0 panes=- op=-"
 case "$(grep '^agents:' "$T/garden-open.out")" in
 *" selected=fix/seed-dates "*) ;;
 *) failed "garden: Open did not select the worktree: $(grep '^agents:' "$T/garden-open.out")" ;;

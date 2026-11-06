@@ -43,7 +43,7 @@ use crate::platform::session::Session;
 use crate::platform::switcher;
 use crate::platform::symbols;
 use crate::project::finder::Finder;
-use crate::project::tree::{Entry as TreeEntry, Tree, move_without_replace};
+use crate::project::tree::{Entry as TreeEntry, Tree};
 use crate::render::font::Atlas;
 use crate::render::layout::{self, Button, Chrome, Frame, Hit, Theme, Tone, Viewport};
 use crate::render::metal::{DRAWABLE_FORMAT, FrameTiming, GlyphInstance, Renderer};
@@ -58,6 +58,7 @@ mod claude;
 mod completion;
 mod conflicts;
 mod dropped;
+mod explorer;
 mod extensions;
 mod files;
 mod find;
@@ -988,6 +989,9 @@ struct State {
     /// selection; the selection itself outlives focus, and used to be enough,
     /// so Cmd-Delete while typing moved a file to the Trash.
     sidebar_keys: bool,
+    /// The Explorer's file work: a copy running, a cut waiting for its
+    /// paste, and the operations done.
+    explorer: explorer::Files,
     /// Terminal sessions under the editor, Claude Code among them.
     terminal: crate::platform::terminal::Panel,
     /// Agents mode and its task list.
@@ -2450,6 +2454,10 @@ define_class!(
             if self.terminal_tab_dragged(point.x as f32, point.y as f32) {
                 return;
             }
+            // A divider between two terminal panes held: it follows.
+            if self.terminal_divider_dragged(point.x as f32, point.y as f32) {
+                return;
+            }
 
             if let Some(mut state) = self.state_mut()
                 && let Some(drag) = &mut state.agents.drag
@@ -2531,7 +2539,7 @@ define_class!(
                 return;
             }
 
-            if self.state().is_some_and(|state| state.terminal.selecting) {
+            if self.state().is_some_and(|state| state.terminal.selecting().is_some()) {
                 self.terminal_drag(point.x as f32, point.y as f32);
                 return;
             }
@@ -2673,6 +2681,7 @@ define_class!(
             let point = self.convertPoint_fromView(_event.locationInWindow(), None);
             self.terminal_mouse_release(_event, point.x as f32, point.y as f32);
             self.terminal_tab_released(point.x as f32, point.y as f32);
+            self.terminal_divider_released();
             if let Some(mut state) = self.state_mut()
                 && let Some(drag) = state.agents.drag.take()
                 && drag.active
@@ -2692,12 +2701,7 @@ define_class!(
                     return;
                 };
                 // A press that never moved selects nothing.
-                if std::mem::take(&mut state.terminal.selecting)
-                    && state.terminal.selection.is_some_and(|(a, b)| a == b)
-                {
-                    state.terminal.selection = None;
-                }
-                state.terminal.drag_point = None;
+                state.terminal.end_selecting();
                 state.autoscroll_carry = 0.0;
                 match state.drag.take() {
                     // A drag dropped where it may be, or the click that a
@@ -2823,6 +2827,11 @@ define_class!(
                 let band = Viewport { y: rect.y - DIVIDER_GRAB, height: DIVIDER_GRAB * 2.0, ..rect };
                 let cursor = if NSCursor::class().class_method(objc2::sel!(rowResizeCursor)).is_some() { NSCursor::rowResizeCursor() } else { #[allow(deprecated)] NSCursor::resizeUpDownCursor() };
                 add(band, &cursor);
+                // The dividers between its panes, each the way it is dragged.
+                let sideways = if NSCursor::class().class_method(objc2::sel!(columnResizeCursor)).is_some() { NSCursor::columnResizeCursor() } else { #[allow(deprecated)] NSCursor::resizeLeftRightCursor() };
+                for (grab, across) in terminal::pane_dividers(&state, &chrome) {
+                    add(grab, if across { &sideways } else { &cursor });
+                }
             }
             // The shared controls last: they are the most specific, and
             // each is exactly the rectangle that was drawn.
@@ -3074,6 +3083,8 @@ define_class!(
             crate::platform::jank::lap("git.poll");
             self.poll_project_index();
             crate::platform::jank::lap("poll_project_index");
+            self.poll_file_job();
+            crate::platform::jank::lap("poll_file_job");
             self.poll_project_search();
             crate::platform::jank::lap("poll_project_search");
             self.poll_terminal_search();
@@ -4278,6 +4289,11 @@ define_class!(
             self.trash_selection();
         }
 
+        #[unsafe(method(duplicateProjectItem:))]
+        fn action_duplicate_project_item(&self, _sender: Option<&AnyObject>) {
+            self.duplicate_tree_items();
+        }
+
         #[unsafe(method(sendRequest:))]
         fn action_send_request(&self, _sender: Option<&AnyObject>) {
             self.send_request();
@@ -4286,10 +4302,48 @@ define_class!(
         #[unsafe(method(splitEditor:))]
         fn action_split_editor(&self, _sender: Option<&AnyObject>) {
             if self.state().is_some_and(|state| state.agents.on) {
-                self.split_terminal();
+                self.split_terminal(layout::split::Edge::Right, false);
             } else {
                 self.split_pane();
             }
+        }
+
+        /// Split Down: the terminal's pane with the keyboard, in Agents
+        /// mode, cut in two with the new pane under it.
+        #[unsafe(method(splitTerminalDown:))]
+        fn action_split_terminal_down(&self, _sender: Option<&AnyObject>) {
+            self.split_terminal(layout::split::Edge::Bottom, false);
+        }
+
+        /// A terminal tab's own menu, Split Right and Split Down.
+        #[unsafe(method(splitTerminalTabRight:))]
+        fn action_split_terminal_tab_right(&self, _sender: Option<&AnyObject>) {
+            self.split_terminal(layout::split::Edge::Right, true);
+        }
+
+        #[unsafe(method(splitTerminalTabDown:))]
+        fn action_split_terminal_tab_down(&self, _sender: Option<&AnyObject>) {
+            self.split_terminal(layout::split::Edge::Bottom, true);
+        }
+
+        #[unsafe(method(focusPaneLeft:))]
+        fn action_focus_pane_left(&self, _sender: Option<&AnyObject>) {
+            self.focus_terminal_pane(layout::split::Edge::Left);
+        }
+
+        #[unsafe(method(focusPaneRight:))]
+        fn action_focus_pane_right(&self, _sender: Option<&AnyObject>) {
+            self.focus_terminal_pane(layout::split::Edge::Right);
+        }
+
+        #[unsafe(method(focusPaneUp:))]
+        fn action_focus_pane_up(&self, _sender: Option<&AnyObject>) {
+            self.focus_terminal_pane(layout::split::Edge::Top);
+        }
+
+        #[unsafe(method(focusPaneDown:))]
+        fn action_focus_pane_down(&self, _sender: Option<&AnyObject>) {
+            self.focus_terminal_pane(layout::split::Edge::Bottom);
         }
 
         #[unsafe(method(goToDefinition:))]
@@ -4315,7 +4369,7 @@ define_class!(
         #[unsafe(method(closePane:))]
         fn action_close_pane(&self, _sender: Option<&AnyObject>) {
             if self.state().is_some_and(|state| state.agents.on) {
-                self.unsplit_terminal();
+                self.close_terminal_pane();
                 return;
             }
             let Some(focused) = self.state().map(|state| state.focused_pane) else {
@@ -4327,10 +4381,7 @@ define_class!(
         #[unsafe(method(focusNextPane:))]
         fn action_focus_next_pane(&self, _sender: Option<&AnyObject>) {
             if self.state().is_some_and(|state| state.agents.on) {
-                if let Some(mut state) = self.state_mut() {
-                    state.terminal.focus_other();
-                }
-                self.after_terminal_layout();
+                self.step_terminal_pane(1);
                 return;
             }
             self.cycle_pane(1);
@@ -4339,10 +4390,7 @@ define_class!(
         #[unsafe(method(focusPreviousPane:))]
         fn action_focus_previous_pane(&self, _sender: Option<&AnyObject>) {
             if self.state().is_some_and(|state| state.agents.on) {
-                if let Some(mut state) = self.state_mut() {
-                    state.terminal.focus_other();
-                }
-                self.after_terminal_layout();
+                self.step_terminal_pane(-1);
                 return;
             }
             self.cycle_pane(-1);
@@ -4757,6 +4805,10 @@ define_class!(
                 }
                 return;
             }
+            // In the Explorer, the selected items themselves, as files.
+            if self.copy_tree_items(false) {
+                return;
+            }
             let (text, _) = self.edit_focused(|b, _| b.copied_text());
             if let Some(text) = text {
                 clipboard::write_text(&text);
@@ -4777,6 +4829,10 @@ define_class!(
 
         #[unsafe(method(cut:))]
         fn action_cut(&self, _sender: Option<&AnyObject>) {
+            // In the Explorer, the selected items: moved by the paste.
+            if self.copy_tree_items(true) {
+                return;
+            }
             let (text, focus) = self.edit_focused(|b, _| b.cut());
             if let Some(text) = text {
                 clipboard::write_text(&text);
@@ -4786,6 +4842,11 @@ define_class!(
 
         #[unsafe(method(paste:))]
         fn action_paste(&self, _sender: Option<&AnyObject>) {
+            // In the Explorer, the clipboard's files, into the cursor's
+            // folder; they may have no text beside them.
+            if self.paste_tree_items() {
+                return;
+            }
             let Some(text) = clipboard::read_text() else {
                 // An image and no text: into a terminal it goes as a
                 // file (or straight to a Claude tab), as in iTerm.
@@ -4837,20 +4898,26 @@ define_class!(
             };
             let terminal = state.terminal.has_keys() && !field_has_keys(&state);
             let enabled = if action == sel!(copyAsOneLine:) {
-                terminal && state.terminal.selection.is_some()
+                terminal && state.terminal.selection().is_some()
             } else if terminal && action == sel!(copy:) {
-                state.terminal.selection.is_some()
+                state.terminal.selection().is_some()
             } else if terminal && (action == sel!(cut:) || action == sel!(undo:) || action == sel!(redo:)) {
                 false
             } else if sidebar::tree_has_keys(&state)
-                && (action == sel!(cut:)
-                    || action == sel!(paste:)
-                    || action == sel!(undo:)
-                    || action == sel!(redo:))
+                && (action == sel!(undo:) || action == sel!(redo:))
             {
                 // The Explorer's tree has the keyboard: these would edit
                 // the document behind it, where nobody is looking.
                 false
+            } else if sidebar::tree_has_keys(&state)
+                && (action == sel!(copy:) || action == sel!(cut:))
+            {
+                // The selected items, as files.
+                state.tree.selection_len() > 0
+            } else if sidebar::tree_has_keys(&state) && action == sel!(paste:) {
+                // Into the cursor's folder. With no files on the clipboard
+                // the paste says so, which a greyed item could not.
+                true
             } else if action == sel!(copy:) || action == sel!(cut:) {
                 focused_buffer(&state).has_selection()
             } else if action == sel!(undo:) {
@@ -4931,7 +4998,7 @@ define_class!(
             } else if action == sel!(focusExplorer:) {
                 // The tree of an open folder; Agents has its own sidebar.
                 state.tree.root().is_some() && !state.agents.on
-            } else if action == sel!(trashProjectItem:) {
+            } else if action == sel!(trashProjectItem:) || action == sel!(duplicateProjectItem:) {
                 // Only while the tree has the keyboard, and never while a
                 // field does: Cmd-Delete anywhere else edits text, and must
                 // not reach the tree's selection.
@@ -4955,10 +5022,23 @@ define_class!(
                 || action == sel!(focusPreviousPane:)
             {
                 if state.agents.on {
-                    state.terminal.shown_pair().is_some()
+                    terminal::has_panes(&state)
                 } else {
                     pane_count(&state) > 1
                 }
+            } else if action == sel!(focusPaneLeft:)
+                || action == sel!(focusPaneRight:)
+                || action == sel!(focusPaneUp:)
+                || action == sel!(focusPaneDown:)
+            {
+                // The terminal's panes: the editor's are stepped through.
+                terminal::has_panes(&state)
+            } else if action == sel!(splitTerminalDown:) {
+                terminal::can_split_terminal(&state, false)
+            } else if action == sel!(splitTerminalTabRight:)
+                || action == sel!(splitTerminalTabDown:)
+            {
+                terminal::can_split_terminal(&state, true)
             } else if action == sel!(nextConflict:)
                 || action == sel!(previousConflict:)
                 || action == sel!(acceptCurrent:)
@@ -6557,6 +6637,8 @@ define_class!(
                     server.finish_shutdown(until);
                 }
             }
+            // A copy still running stops here: nothing half copied is left.
+            view.finish_file_job();
             view.claude_shutdown();
             view.history_finish();
             NSApplicationTerminateReply::TerminateNow
@@ -9419,6 +9501,10 @@ fn terminal_tab_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
         "}",
         cmd,
     ));
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
+    // This tab in a pane of its own beside the one with the keyboard.
+    menu.addItem(&menu_item(mtm, "Split Right", sel!(splitTerminalTabRight:)));
+    menu.addItem(&menu_item(mtm, "Split Down", sel!(splitTerminalTabDown:)));
     menu
 }
 
@@ -9572,6 +9658,13 @@ fn sidebar_item_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
         NSEventModifierFlags::Command,
     ));
     menu.addItem(&menu_item(mtm, "New Folder\u{2026}", sel!(newFolder:)));
+    line();
+    // The items themselves, as files: to another folder, or the Finder.
+    let cmd = NSEventModifierFlags::Command;
+    menu.addItem(&hinted_menu_item(mtm, "Cut", sel!(cut:), "x", cmd));
+    menu.addItem(&hinted_menu_item(mtm, "Copy", sel!(copy:), "c", cmd));
+    menu.addItem(&hinted_menu_item(mtm, "Paste", sel!(paste:), "v", cmd));
+    menu.addItem(&menu_item(mtm, "Duplicate", sel!(duplicateProjectItem:)));
     line();
     menu.addItem(&menu_item(mtm, "Copy Path", sel!(copyProjectItemPath:)));
     menu.addItem(&menu_item(
@@ -9804,6 +9897,9 @@ fn install_menu(mtm: MainThreadMarker, app: &NSApplication) {
     // already existed with its unsaved-tab guard, but only in the context
     // menu, so there was no way to reach it from the keyboard.
     // `validateMenuItem` greys it out when nothing in the tree is selected.
+    // A copy beside each item selected in the Explorer. No key: Cmd-D is
+    // the document's.
+    file_menu.addItem(&item("Duplicate", sel!(duplicateProjectItem:), "", false));
     file_menu.addItem(&item(
         "Move to Trash",
         sel!(trashProjectItem:),
@@ -9924,6 +10020,8 @@ fn install_menu(mtm: MainThreadMarker, app: &NSApplication) {
     view_menu.addItem(&item("Actual Size", sel!(zoomActual:), "0", false));
     view_menu.addItem(&NSMenuItem::separatorItem(mtm));
     view_menu.addItem(&item("Split Editor Right", sel!(splitEditor:), "\\", false));
+    // The terminal's panes, in Agents mode: the bar typed with Shift.
+    view_menu.addItem(&item("Split Down", sel!(splitTerminalDown:), "|", false));
     let close_pane = item("Close Pane", sel!(closePane:), "w", false);
     close_pane
         .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
@@ -9936,6 +10034,11 @@ fn install_menu(mtm: MainThreadMarker, app: &NSApplication) {
     previous_pane
         .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
     view_menu.addItem(&previous_pane);
+    // No keys: Command-Option with the arrows folds and unfolds.
+    view_menu.addItem(&item("Focus Pane Left", sel!(focusPaneLeft:), "", false));
+    view_menu.addItem(&item("Focus Pane Right", sel!(focusPaneRight:), "", false));
+    view_menu.addItem(&item("Focus Pane Up", sel!(focusPaneUp:), "", false));
+    view_menu.addItem(&item("Focus Pane Down", sel!(focusPaneDown:), "", false));
     view_menu.addItem(&NSMenuItem::separatorItem(mtm));
     view_menu.addItem(&item("Agents", sel!(toggleAgents:), "a", true));
     view_menu.addItem(&item("New Workspace\u{2026}", sel!(newTask:), "n", true));
@@ -10463,6 +10566,7 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         claude: None,
         claude_tried: None,
         sidebar_keys: false,
+        explorer: explorer::Files::default(),
         terminal: crate::platform::terminal::Panel::default(),
         agents: crate::platform::agents::Panel::default(),
         sidebar_edit: None,

@@ -3071,8 +3071,11 @@ pub fn build_sidebar_with_edit(
         // Ignored by Git: icon and name at half strength, so what the
         // repository does not track reads as a step back from what it does.
         let ignored = tree.ignored(&entry.path);
+        // Cut and not yet pasted: dimmed the same way, selected or not, as
+        // an item on its way out of here.
+        let cut = tree.is_cut(&entry.path);
         let dim = |[r, g, b, a]: [f32; 4]| {
-            if ignored == crate::project::tree::Ignored::No {
+            if ignored == crate::project::tree::Ignored::No && !cut {
                 [r, g, b, a]
             } else {
                 [r, g, b, a * 0.45]
@@ -3090,6 +3093,7 @@ pub fn build_sidebar_with_edit(
                 SIDEBAR_UNFOCUSED_TEXT,
             )
         };
+        let picked = if cut { faded(picked, 0.45) } else { picked };
         draw_icon(
             icon.glyph,
             if selected {

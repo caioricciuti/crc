@@ -47,6 +47,8 @@
 //! resize <width> <height>     resize the native window in points
 //! touch <file>                create a file without notifying the project UI
 //! write <file> <text>         overwrite a file, as another program would
+//! pasteboard <file>[|<file>]  put files on the clipboard as a copy in
+//!                             another app does: their URLs and nothing else
 //! dump <file>                 write the state of the active document
 //! action <selector>           a menu item's action sent to the view, as
 //!                             choosing the item does: for the items of a
@@ -138,6 +140,8 @@ pub enum Step {
     },
     Touch(String),
     Write(String, String),
+    /// Files put on the clipboard as another app's copy leaves them.
+    Pasteboard(Vec<String>),
     /// A mouse-wheel delta in notches, as `scrollingDeltaY` reports them.
     /// Only the palette is driven this way.
     Wheel(f64),
@@ -437,6 +441,9 @@ pub fn parse(script: &str) -> Result<Vec<Step>, String> {
                 let (file, text) = rest.split_once(' ').unwrap_or((rest, ""));
                 steps.push(Step::Write(file.to_string(), text.to_string()));
             }
+            "pasteboard" if !rest.is_empty() => steps.push(Step::Pasteboard(
+                rest.split('|').map(str::to_string).collect(),
+            )),
             "dump" if !rest.is_empty() => steps.push(Step::Dump(rest.to_string())),
             "frame" if !rest.is_empty() => steps.push(Step::Frame(rest.to_string())),
             "fade" => steps.push(Step::Fade(rest.parse().map_err(|_| bad())?)),
@@ -559,6 +566,14 @@ mod tests {
             parse("action closeOtherTerminalTabs:\n").unwrap(),
             [Step::Action("closeOtherTerminalTabs:".into())]
         );
+        assert_eq!(
+            parse("pasteboard /p/packing list.txt|/p/trips\n").unwrap(),
+            [Step::Pasteboard(vec![
+                "/p/packing list.txt".into(),
+                "/p/trips".into()
+            ])]
+        );
+        assert!(parse("pasteboard\n").is_err());
         assert!(parse("action\n").is_err());
         assert!(parse("action closeOtherTerminalTabs\n").is_err());
         assert!(parse("menubar\n").is_err());

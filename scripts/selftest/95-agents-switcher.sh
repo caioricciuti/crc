@@ -45,10 +45,10 @@ quit
 SCRIPT
 HOME="$T/home/sw-home" CRC_TERMINAL_SHELL=/bin/sh \
     CRC_SELFTEST="$T/sw.script" "$BIN" "$W" 2> "$T/sw.err"
-expect "$T/sw-second.out" agents "on tasks=swproj,swproj 2 selected=swproj 2 sessions=swproj,*swproj 2 claude=0 pair=- op=-"
+expect "$T/sw-second.out" agents "on tasks=swproj,swproj 2 selected=swproj 2 sessions=swproj,*swproj 2 claude=0 panes=- op=-"
 # The one shown before the current is first; the current comes second.
 expect "$T/sw-open.out" palette_first "swproj / sh"
-expect "$T/sw-back.out" agents "on tasks=swproj,swproj 2 selected=swproj sessions=*swproj,swproj 2 claude=0 pair=- op=-"
+expect "$T/sw-back.out" agents "on tasks=swproj,swproj 2 selected=swproj sessions=*swproj,swproj 2 claude=0 panes=- op=-"
 expect "$T/sw-back.out" palette_query ""
 # `>` is the commands, never a session.
 expect "$T/sw-commands.out" palette_query ">"

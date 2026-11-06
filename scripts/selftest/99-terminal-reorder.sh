@@ -11,8 +11,8 @@
 # as the braces they type) move the terminal showing, Cmd-[ and Cmd-] show
 # the next one round the strip, Cmd-1 to 9 count the tabs as the strip has
 # them, and a tab's own menu moves it or closes the others. None of it
-# touches the other workspace's tabs, and a pair open through a move still
-# shows the same two sessions. The order is there again after a quit: a
+# touches the other workspace's tabs, and two panes open through a move
+# still show the same two sessions. The order is there again after a quit: a
 # real one (Cmd-Q), as the script's own quit writes nothing down.
 R="$T/garden"
 mkdir -p "$R" "$T/sheds" "$T/home/reorder"
@@ -138,41 +138,42 @@ reorder_run() {
         CRC_SELFTEST="$1" "$BIN" "$R" 2> "$2"
 }
 reorder_run "$T/reorder.script" "$T/reorder.err"
-expect "$T/reorder-start.out" agents "on tasks=garden,sheds selected=garden sessions=garden,sheds,garden,*garden,sheds claude=0 pair=- op=-"
-expect "$T/reorder-start.out" terminal_tabs "tab1,(tab2),tab3,*tab4,(tab5) pair=- scrolled=no drag=-"
+expect "$T/reorder-start.out" agents "on tasks=garden,sheds selected=garden sessions=garden,sheds,garden,*garden,sheds claude=0 panes=- op=-"
+expect "$T/reorder-start.out" terminal_tabs "tab1,(tab2),tab3,*tab4,(tab5) panes=- scrolled=no drag=-"
 # A press that barely moves shows the tab, and moves nothing.
-expect "$T/reorder-click.out" terminal_tabs "tab1,(tab2),*tab3,tab4,(tab5) pair=- scrolled=no drag=-"
+expect "$T/reorder-click.out" terminal_tabs "tab1,(tab2),*tab3,tab4,(tab5) panes=- scrolled=no drag=-"
 # The third of garden's, held over the first: it is on its way, and shows.
-expect "$T/reorder-held.out" terminal_tabs "tab1,(tab2),tab3,*tab4,(tab5) pair=- scrolled=no drag=tab4"
+expect "$T/reorder-held.out" terminal_tabs "tab1,(tab2),tab3,*tab4,(tab5) panes=- scrolled=no drag=tab4"
 # Let go there, it is the first; sheds' two are where they were.
-expect "$T/reorder-dragged.out" terminal_tabs "*tab4,tab1,(tab2),tab3,(tab5) pair=- scrolled=no drag=-"
-expect "$T/reorder-dragged.out" agents "on tasks=garden,sheds selected=garden sessions=*garden,garden,sheds,garden,sheds claude=0 pair=- op=-"
+expect "$T/reorder-dragged.out" terminal_tabs "*tab4,tab1,(tab2),tab3,(tab5) panes=- scrolled=no drag=-"
+expect "$T/reorder-dragged.out" agents "on tasks=garden,sheds selected=garden sessions=*garden,garden,sheds,garden,sheds claude=0 panes=- op=-"
 # Escape gives a drag up, and so does letting go off the strip.
-expect "$T/reorder-escape.out" terminal_tabs "*tab4,tab1,(tab2),tab3,(tab5) pair=- scrolled=no drag=-"
-expect "$T/reorder-off.out" terminal_tabs "*tab4,tab1,(tab2),tab3,(tab5) pair=- scrolled=no drag=-"
+expect "$T/reorder-escape.out" terminal_tabs "*tab4,tab1,(tab2),tab3,(tab5) panes=- scrolled=no drag=-"
+expect "$T/reorder-off.out" terminal_tabs "*tab4,tab1,(tab2),tab3,(tab5) panes=- scrolled=no drag=-"
 # Move Tab Right, once and then to the end, where it stays; and back one.
-expect "$T/reorder-right.out" terminal_tabs "tab1,*tab4,(tab2),tab3,(tab5) pair=- scrolled=no drag=-"
-expect "$T/reorder-end.out" terminal_tabs "tab1,(tab2),tab3,*tab4,(tab5) pair=- scrolled=no drag=-"
-expect "$T/reorder-left.out" terminal_tabs "tab1,(tab2),*tab4,tab3,(tab5) pair=- scrolled=no drag=-"
+expect "$T/reorder-right.out" terminal_tabs "tab1,*tab4,(tab2),tab3,(tab5) panes=- scrolled=no drag=-"
+expect "$T/reorder-end.out" terminal_tabs "tab1,(tab2),tab3,*tab4,(tab5) panes=- scrolled=no drag=-"
+expect "$T/reorder-left.out" terminal_tabs "tab1,(tab2),*tab4,tab3,(tab5) panes=- scrolled=no drag=-"
 # Show Next Tab goes along garden's and round to its first; Previous back.
-expect "$T/reorder-next.out" terminal_tabs "tab1,(tab2),tab4,*tab3,(tab5) pair=- scrolled=no drag=-"
-expect "$T/reorder-round.out" terminal_tabs "*tab1,(tab2),tab4,tab3,(tab5) pair=- scrolled=no drag=-"
-expect "$T/reorder-previous.out" terminal_tabs "tab1,(tab2),tab4,*tab3,(tab5) pair=- scrolled=no drag=-"
+expect "$T/reorder-next.out" terminal_tabs "tab1,(tab2),tab4,*tab3,(tab5) panes=- scrolled=no drag=-"
+expect "$T/reorder-round.out" terminal_tabs "*tab1,(tab2),tab4,tab3,(tab5) panes=- scrolled=no drag=-"
+expect "$T/reorder-previous.out" terminal_tabs "tab1,(tab2),tab4,*tab3,(tab5) panes=- scrolled=no drag=-"
 # Cmd-1 and Cmd-9 count the strip as it is now.
-expect "$T/reorder-one.out" terminal_tabs "*tab1,(tab2),tab4,tab3,(tab5) pair=- scrolled=no drag=-"
-expect "$T/reorder-nine.out" terminal_tabs "tab1,(tab2),tab4,*tab3,(tab5) pair=- scrolled=no drag=-"
-# Cmd-2 shows tab4 and Cmd-\ puts tab1 beside it. Moved a place along
-# with the pair open, the same two sessions are the pair, by other numbers.
-expect "$T/reorder-pair.out" terminal_tabs "*tab1,(tab2),tab4,tab3,(tab5) pair=tab4+tab1 scrolled=no drag=-"
-expect "$T/reorder-pair.out" agents "on tasks=garden,sheds selected=garden sessions=*garden,sheds,garden,garden,sheds claude=0 pair=2+0 op=-"
-expect "$T/reorder-pair-moved.out" terminal_tabs "(tab2),tab4,*tab1,tab3,(tab5) pair=tab4+tab1 scrolled=no drag=-"
-expect "$T/reorder-pair-moved.out" agents "on tasks=garden,sheds selected=garden sessions=sheds,garden,*garden,garden,sheds claude=0 pair=1+2 op=-"
+expect "$T/reorder-one.out" terminal_tabs "*tab1,(tab2),tab4,tab3,(tab5) panes=- scrolled=no drag=-"
+expect "$T/reorder-nine.out" terminal_tabs "tab1,(tab2),tab4,*tab3,(tab5) panes=- scrolled=no drag=-"
+# Cmd-2 shows tab4 and Cmd-\ puts tab1 in a pane beside it. Moved a place
+# along with the panes open, the same two sessions are the panes, by other
+# numbers. Cmd-Option-W then closes tab1's pane, and tab4 has the keyboard.
+expect "$T/reorder-pair.out" terminal_tabs "*tab1,(tab2),tab4,tab3,(tab5) panes=h(0.5,tab4,*tab1) scrolled=no drag=-"
+expect "$T/reorder-pair.out" agents "on tasks=garden,sheds selected=garden sessions=*garden,sheds,garden,garden,sheds claude=0 panes=h(0.5,2,*0) op=-"
+expect "$T/reorder-pair-moved.out" terminal_tabs "(tab2),tab4,*tab1,tab3,(tab5) panes=h(0.5,tab4,*tab1) scrolled=no drag=-"
+expect "$T/reorder-pair-moved.out" agents "on tasks=garden,sheds selected=garden sessions=sheds,garden,*garden,garden,sheds claude=0 panes=h(0.5,1,*2) op=-"
 # A tab's own menu: the first cannot go left; the last can, and does.
-expect "$T/reorder-menu-first.out" message "menu: Close Terminal|Close Other Terminals|Move Tab Right"
-expect "$T/reorder-menu.out" message "menu: Close Terminal|Close Other Terminals|Move Tab Left"
-expect "$T/reorder-menu-moved.out" terminal_tabs "(tab2),tab4,tab3,*tab1,(tab5) pair=- scrolled=no drag=-"
+expect "$T/reorder-menu-first.out" message "menu: Close Terminal|Close Other Terminals|Move Tab Right|Split Right|Split Down"
+expect "$T/reorder-menu.out" message "menu: Close Terminal|Close Other Terminals|Move Tab Left|Split Right|Split Down"
+expect "$T/reorder-menu-moved.out" terminal_tabs "(tab2),*tab4,tab3,tab1,(tab5) panes=- scrolled=no drag=-"
 # The other workspace's strip, untouched by all of it.
-expect "$T/reorder-sheds.out" terminal_tabs "tab2,(tab4),(tab3),(tab1),*tab5 pair=- scrolled=no drag=-"
+expect "$T/reorder-sheds.out" terminal_tabs "tab2,(tab4),(tab3),(tab1),*tab5 panes=- scrolled=no drag=-"
 
 # The next window has the tabs in the order they were left in, not the
 # order they were started in. A tab's menu is about that tab whatever
@@ -210,12 +211,12 @@ dump $T/reorder-closed.out
 quit
 SCRIPT
 reorder_run "$T/reorder-2.script" "$T/reorder-2.err"
-reorder_back=$(grep -m1 '^terminal_tabs: ' "$T/reorder-back.out" 2>/dev/null | sed 's/^terminal_tabs: //; s/ pair=.*//' | tr -d '()*' || true)
+reorder_back=$(grep -m1 '^terminal_tabs: ' "$T/reorder-back.out" 2>/dev/null | sed 's/^terminal_tabs: //; s/ panes=.*//' | tr -d '()*' || true)
 [ "$reorder_back" = "tab2,tab4,tab3,tab1,tab5" ] \
     || failed "reorder-back.out: the tabs came back as [$reorder_back], expected [tab2,tab4,tab3,tab1,tab5]"
-expect "$T/reorder-stale.out" terminal_tabs "(tab2),tab1,(tab5),*tab6 pair=- scrolled=no drag=-"
-expect "$T/reorder-others.out" terminal_tabs "(tab2),*tab1,(tab5) pair=- scrolled=no drag=-"
-expect "$T/reorder-closed.out" terminal_tabs "*tab2,(tab1) pair=- scrolled=no drag=-"
+expect "$T/reorder-stale.out" terminal_tabs "(tab2),tab1,(tab5),*tab6 panes=- scrolled=no drag=-"
+expect "$T/reorder-others.out" terminal_tabs "(tab2),*tab1,(tab5) panes=- scrolled=no drag=-"
+expect "$T/reorder-closed.out" terminal_tabs "*tab2,(tab1) panes=- scrolled=no drag=-"
 
 # Twelve terminals with long titles in one workspace: the tabs shrink to
 # their least width and the strip scrolls, the last one (the one showing)
@@ -280,27 +281,27 @@ reorder_tabs() {
 }
 reorder_long=$(reorder_tabs "$T/reorder-long.out")
 case "$reorder_long" in
-    "bed 1: "*",*bed 12: "*" pair=- scrolled=yes drag=-") ;;
+    "bed 1: "*",*bed 12: "*" panes=- scrolled=yes drag=-") ;;
     *) failed "reorder-long.out: terminal_tabs is [$reorder_long], expected twelve, the last showing, scrolled" ;;
 esac
 reorder_long=$(reorder_tabs "$T/reorder-long-wheel.out")
 case "$reorder_long" in
-    "bed 1: "*" pair=- scrolled=no drag=-") ;;
+    "bed 1: "*" panes=- scrolled=no drag=-") ;;
     *) failed "reorder-long-wheel.out: terminal_tabs is [$reorder_long], expected the strip back at its start" ;;
 esac
 reorder_long=$(reorder_tabs "$T/reorder-long-dragged.out")
 case "$reorder_long" in
-    "*bed 2: "*",bed 1: "*",bed 3: "*" pair=- scrolled=no drag=-") ;;
+    "*bed 2: "*",bed 1: "*",bed 3: "*" panes=- scrolled=no drag=-") ;;
     *) failed "reorder-long-dragged.out: terminal_tabs is [$reorder_long], expected the second tab first" ;;
 esac
 reorder_long=$(reorder_tabs "$T/reorder-long-last.out")
 case "$reorder_long" in
-    *",*bed 12: "*" pair=- scrolled=yes drag=-") ;;
+    *",*bed 12: "*" panes=- scrolled=yes drag=-") ;;
     *) failed "reorder-long-last.out: terminal_tabs is [$reorder_long], expected the last tab showing, in view" ;;
 esac
 # The new-terminal button was in reach at the end of the scrolled strip.
 reorder_long=$(reorder_tabs "$T/reorder-long-new.out")
 case "$reorder_long" in
-    *",*tab13 pair=- scrolled=yes drag=-") ;;
+    *",*tab13 panes=- scrolled=yes drag=-") ;;
     *) failed "reorder-long-new.out: terminal_tabs is [$reorder_long], expected a thirteenth, showing" ;;
 esac

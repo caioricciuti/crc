@@ -7,7 +7,14 @@
 //! throughout: it is copied, moved and removed as the link, and never
 //! followed. Every operation answers where the item ended up, so that it can
 //! be reversed.
+//!
+//! Every change the Explorer makes to the files goes through [`perform`]:
+//! a new file or folder, a rename, a move, a copy, a duplicate, a move to
+//! the Trash. It answers a [`Record`] of what was done. What a paste or a
+//! duplicate will do to each item is worked out first, by [`plan_paste`]
+//! and [`plan_duplicate`], without touching anything.
 
+use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
@@ -21,6 +28,13 @@ use super::tree::move_without_replace;
 /// What the hidden folder a copy is built in is named after, beside the
 /// copy's destination. One left behind means a copy was cut short.
 pub const STAGING_PREFIX: &str = ".crc-copy-";
+
+/// Whether `name` is a staging folder's: never an item of the project, so
+/// the tree, the finder, the search, the index and the watcher all leave
+/// it out.
+pub fn is_staging(name: &OsStr) -> bool {
+    name.as_bytes().starts_with(STAGING_PREFIX.as_bytes())
+}
 
 /// The name a copy of `name` takes in the folder `dir`: `name` itself when
 /// nothing there has it, otherwise the first free of `stem-copy.ext`,
@@ -132,6 +146,18 @@ pub fn is_inside(dir: &Path, item: &Path) -> bool {
 /// copied into itself or anything below it. Sockets, pipes and devices
 /// inside a folder are left out: there is nothing in them to copy.
 pub fn copy_item(source: &Path, destination: &Path) -> io::Result<PathBuf> {
+    copy_item_until(source, destination, &|| false)
+}
+
+/// [`copy_item`], which can be stopped: `stop` is asked before each file
+/// and folder is copied, and once it answers `true` the copy ends with
+/// `Interrupted` and nothing of it is left. A copy already moved into
+/// place is whole, and stays.
+pub fn copy_item_until(
+    source: &Path,
+    destination: &Path,
+    stop: &dyn Fn() -> bool,
+) -> io::Result<PathBuf> {
     let (dir, name) = folder_and_name(destination)?;
     let kind = fs::symlink_metadata(source)?.file_type();
     if !(kind.is_file() || kind.is_dir() || kind.is_symlink()) {
@@ -149,7 +175,7 @@ pub fn copy_item(source: &Path, destination: &Path) -> io::Result<PathBuf> {
     let staging = Staging::new(dir)?;
     let staged = staging.0.join(name);
     let mut folders = Vec::new();
-    copy_tree(source, &staged, Path::new(""), &mut folders)?;
+    copy_tree(source, &staged, Path::new(""), &mut folders, stop)?;
     move_without_replace(&staged, destination)?;
     // Folders were made writable to be filled, and to be moved out of the
     // staging folder. Deepest first, as one that loses its search bit hides
@@ -217,13 +243,17 @@ impl Drop for Staging {
 /// Copies what is at `from` to `to`, where nothing is yet. Each folder is
 /// made writable by its owner whatever the original allows; what it should
 /// have is added to `folders` under its path below the copy's root, to be
-/// set when the copy is in place.
+/// set when the copy is in place. `stop` is asked before each item.
 fn copy_tree(
     from: &Path,
     to: &Path,
     relative: &Path,
     folders: &mut Vec<(PathBuf, fs::Permissions)>,
+    stop: &dyn Fn() -> bool,
 ) -> io::Result<()> {
+    if stop() {
+        return Err(io::ErrorKind::Interrupted.into());
+    }
     let metadata = fs::symlink_metadata(from)?;
     let kind = metadata.file_type();
     if kind.is_symlink() {
@@ -240,6 +270,7 @@ fn copy_tree(
                 &to.join(&name),
                 &relative.join(&name),
                 folders,
+                stop,
             )?;
         }
         Ok(())
@@ -321,6 +352,287 @@ pub fn remove_item(path: &Path) -> io::Result<()> {
     } else {
         fs::remove_file(path)
     }
+}
+
+/// What a file operation is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpKind {
+    NewFile,
+    NewFolder,
+    Rename,
+    Move,
+    Copy,
+    Duplicate,
+    Trash,
+}
+
+/// One change to the files on disk, as it is asked for.
+#[derive(Clone, Copy, Debug)]
+pub enum Op<'a> {
+    /// An empty file at this path, the folders above it made as needed.
+    NewFile(&'a Path),
+    /// A folder at this path, the folders above it made as needed.
+    NewFolder(&'a Path),
+    /// The item at `from` under another name, `to`, in the same folder.
+    Rename { from: &'a Path, to: &'a Path },
+    /// The item at `from` moved to `to`.
+    Move { from: &'a Path, to: &'a Path },
+    /// A copy of the item at `from`, at `to`.
+    Copy { from: &'a Path, to: &'a Path },
+    /// As `Copy`, asked for as a duplicate beside the original.
+    Duplicate { from: &'a Path, to: &'a Path },
+    /// The item at this path moved to the Trash.
+    Trash(&'a Path),
+}
+
+/// What an operation did, with what it takes to reverse it.
+#[derive(Debug)]
+pub struct Record {
+    pub kind: OpKind,
+    /// The item acted on, where it was. `None` for a new file or folder.
+    pub source: Option<PathBuf>,
+    /// Where the result is: the new item, the copy, the item once renamed
+    /// or moved. `None` for an item moved to the Trash.
+    pub result: Option<PathBuf>,
+    /// Where the item is in the Trash, when the system says.
+    pub trashed: Option<PathBuf>,
+    /// A move to another volume whose original could not be removed after
+    /// it was copied: it is still at `source`, and this is why.
+    pub original_left: Option<io::Error>,
+}
+
+/// What an operation is given besides its paths.
+pub struct Env<'a> {
+    /// Moves an item to the Trash, and answers where it is there when the
+    /// system says.
+    pub trash: &'a dyn Fn(&Path) -> io::Result<Option<PathBuf>>,
+    /// Asked before each file and folder of a copy: `true` stops the copy,
+    /// which then fails with `Interrupted` and leaves nothing behind.
+    pub stop: &'a dyn Fn() -> bool,
+}
+
+/// Does `op`, and answers what was done. The one way a file or folder of
+/// the project is made, renamed, moved, copied or trashed, so that every
+/// one of them leaves a record.
+///
+/// Nothing is ever replaced: an operation whose destination is taken, a
+/// dangling link included, fails with `AlreadyExists` and changes nothing.
+pub fn perform(op: Op<'_>, env: &Env<'_>) -> io::Result<Record> {
+    let record = |kind: OpKind, source: Option<&Path>, result: Option<PathBuf>| Record {
+        kind,
+        source: source.map(Path::to_path_buf),
+        result,
+        trashed: None,
+        original_left: None,
+    };
+    match op {
+        Op::NewFile(path) => {
+            if let Some(dir) = path.parent() {
+                fs::create_dir_all(dir)?;
+            }
+            // Never truncates: a file already there is an error, not an
+            // empty file.
+            fs::File::create_new(path)?;
+            Ok(record(OpKind::NewFile, None, Some(path.to_path_buf())))
+        }
+        Op::NewFolder(path) => {
+            if taken(path) {
+                return Err(io::ErrorKind::AlreadyExists.into());
+            }
+            fs::create_dir_all(path)?;
+            Ok(record(OpKind::NewFolder, None, Some(path.to_path_buf())))
+        }
+        Op::Rename { from, to } | Op::Move { from, to } => {
+            let kind = match op {
+                Op::Rename { .. } => OpKind::Rename,
+                _ => OpKind::Move,
+            };
+            let moved = move_item(from, to)?;
+            Ok(Record {
+                original_left: moved.original_left,
+                ..record(kind, Some(from), Some(moved.path))
+            })
+        }
+        Op::Copy { from, to } | Op::Duplicate { from, to } => {
+            let kind = match op {
+                Op::Copy { .. } => OpKind::Copy,
+                _ => OpKind::Duplicate,
+            };
+            let copy = copy_item_until(from, to, env.stop)?;
+            Ok(record(kind, Some(from), Some(copy)))
+        }
+        Op::Trash(path) => {
+            let trashed = (env.trash)(path)?;
+            Ok(Record {
+                trashed,
+                ..record(OpKind::Trash, Some(path), None)
+            })
+        }
+    }
+}
+
+/// [`perform`] for a move, a copy or a duplicate whose destination's name
+/// was free when it was chosen. If something has taken the name since, the
+/// item goes under the next free one in the same folder instead of failing.
+/// Any other operation is performed as it is.
+pub fn perform_free(op: Op<'_>, env: &Env<'_>) -> io::Result<Record> {
+    let (from, first) = match op {
+        Op::Move { from, to } | Op::Copy { from, to } | Op::Duplicate { from, to } => (from, to),
+        _ => return perform(op, env),
+    };
+    let mut to = first.to_path_buf();
+    // More than a few names taken in a row is not a race any more.
+    for _ in 0..8 {
+        let attempt = match op {
+            Op::Move { .. } => Op::Move { from, to: &to },
+            Op::Copy { .. } => Op::Copy { from, to: &to },
+            _ => Op::Duplicate { from, to: &to },
+        };
+        match perform(attempt, env) {
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let (dir, name) = folder_and_name(&to)?;
+                let next = dir.join(free_name(dir, name, shown_as_folder(from)));
+                if next == to {
+                    return Err(error);
+                }
+                to = next;
+            }
+            done => return done,
+        }
+    }
+    Err(io::ErrorKind::AlreadyExists.into())
+}
+
+/// Whether the item at `path` is a folder as the Explorer shows it: a
+/// folder, or a link to one. Its copies are named as a folder's are.
+fn shown_as_folder(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|m| m.is_dir())
+}
+
+/// What a paste, or a duplicate, will do with one item.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Planned {
+    /// Copied to `to`, a name nothing has.
+    Copy { from: PathBuf, to: PathBuf },
+    /// Moved to `to`, a name nothing has.
+    Move { from: PathBuf, to: PathBuf },
+    /// Cut, and pasted into the folder it is in already: it stays.
+    Stays(PathBuf),
+    /// Left alone, and why.
+    Refused { from: PathBuf, why: Refusal },
+}
+
+/// Why a paste leaves an item alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// Nothing is at its path any more.
+    Missing,
+    /// A folder, headed into itself or into a folder inside it.
+    IntoItself,
+}
+
+impl Refusal {
+    /// The refusal as the rest of a sentence that starts with the item's
+    /// name.
+    pub fn said(self) -> &'static str {
+        match self {
+            Refusal::Missing => "is no longer there",
+            Refusal::IntoItself => "cannot be pasted into itself",
+        }
+    }
+}
+
+/// What pasting `sources` into the folder `dir` will do with each of them,
+/// in order, without touching anything. Copied (`cut` false) or moved
+/// (`cut` true), an item takes its own name in `dir` when that is free and
+/// the next free `-copy` name otherwise, so that nothing is replaced: a
+/// copy pasted into the folder its original is in becomes `name-copy.ext`.
+/// Names already given to an earlier item of the same paste count as
+/// taken.
+///
+/// When `dir` is itself one of `sources`, the paste goes to the folder that
+/// item is in instead, as a paste on a file's row does: a folder copied
+/// and pasted at once lands beside the original as `folder-copy`, and one
+/// cut and pasted on itself stays.
+///
+/// A cut item pasted into the folder it is in stays where it is. A folder
+/// is refused when `dir` is inside it, and so is an item that is no longer
+/// there. A symbolic link is the item itself: it is never a folder that
+/// could hold `dir`.
+pub fn plan_paste(sources: &[PathBuf], dir: &Path, cut: bool) -> Vec<Planned> {
+    let onto = located(dir);
+    let dir = sources
+        .iter()
+        .find(|from| located(from) == onto)
+        .and_then(|from| from.parent())
+        .unwrap_or(dir);
+    let mut chosen = HashSet::new();
+    sources
+        .iter()
+        .map(|from| {
+            let refused = |why| Planned::Refused {
+                from: from.clone(),
+                why,
+            };
+            let (Some(name), Ok(metadata)) = (from.file_name(), fs::symlink_metadata(from)) else {
+                return refused(Refusal::Missing);
+            };
+            if metadata.is_dir() && is_inside(dir, from) {
+                return refused(Refusal::IntoItself);
+            }
+            if cut && located(from).parent() == Some(resolved(dir).as_path()) {
+                return Planned::Stays(from.clone());
+            }
+            let to = free_destination(dir, name, shown_as_folder(from), &mut chosen);
+            let from = from.clone();
+            if cut {
+                Planned::Move { from, to }
+            } else {
+                Planned::Copy { from, to }
+            }
+        })
+        .collect()
+}
+
+/// What duplicating `sources` will do with each of them, in order, without
+/// touching anything: a copy beside the original, under the next free
+/// `-copy` name. An item that is no longer there is refused.
+pub fn plan_duplicate(sources: &[PathBuf]) -> Vec<Planned> {
+    let mut chosen = HashSet::new();
+    sources
+        .iter()
+        .map(|from| {
+            let (Some(dir), Some(name), true) = (from.parent(), from.file_name(), taken(from))
+            else {
+                return Planned::Refused {
+                    from: from.clone(),
+                    why: Refusal::Missing,
+                };
+            };
+            Planned::Copy {
+                from: from.clone(),
+                to: free_destination(dir, name, shown_as_folder(from), &mut chosen),
+            }
+        })
+        .collect()
+}
+
+/// Where an item named `name` goes in `dir`: under [`free_name`], with the
+/// destinations in `chosen` taken as well. The answer is added to them.
+/// They are compared without regard to case, as most volumes here compare
+/// names.
+fn free_destination(
+    dir: &Path,
+    name: &OsStr,
+    folder: bool,
+    chosen: &mut HashSet<String>,
+) -> PathBuf {
+    let key = |candidate: &OsStr| dir.join(candidate).to_string_lossy().to_lowercase();
+    let name = first_free(name, folder, |candidate| {
+        taken(&dir.join(candidate)) || chosen.contains(&key(candidate))
+    });
+    chosen.insert(key(&name));
+    dir.join(name)
 }
 
 #[cfg(test)]
@@ -481,7 +793,14 @@ mod tests {
         let dir = tree.0.as_path();
         let staging = Staging::new(&dir.join("out")).unwrap();
         let staged = staging.0.join("a.txt");
-        copy_tree(&dir.join("a.txt"), &staged, Path::new(""), &mut Vec::new()).unwrap();
+        copy_tree(
+            &dir.join("a.txt"),
+            &staged,
+            Path::new(""),
+            &mut Vec::new(),
+            &|| false,
+        )
+        .unwrap();
         fs::write(dir.join("out/a.txt"), "late").unwrap();
         assert_eq!(
             move_without_replace(&staged, &dir.join("out/a.txt"))
@@ -776,5 +1095,534 @@ mod tests {
             Path::new("/p/src-generated"),
             Path::new("/p/src")
         ));
+    }
+
+    /// An environment for operations that neither trash nor stop.
+    fn plain() -> Env<'static> {
+        Env {
+            trash: &|_| Err(io::ErrorKind::Unsupported.into()),
+            stop: &|| false,
+        }
+    }
+
+    fn copy_to(from: &Path, to: &Path) -> Planned {
+        Planned::Copy {
+            from: from.to_path_buf(),
+            to: to.to_path_buf(),
+        }
+    }
+
+    fn move_to(from: &Path, to: &Path) -> Planned {
+        Planned::Move {
+            from: from.to_path_buf(),
+            to: to.to_path_buf(),
+        }
+    }
+
+    fn refused(from: &Path, why: Refusal) -> Planned {
+        Planned::Refused {
+            from: from.to_path_buf(),
+            why,
+        }
+    }
+
+    #[test]
+    fn a_paste_plan_names_each_item_and_replaces_nothing() {
+        let tree = TempTree::new(
+            "fileops-plan-paste",
+            &[
+                ("notes/a.txt", "n"),
+                ("notes/b.txt", "b"),
+                ("photos/a.txt", "p"),
+                ("photos/v1.2/", ""),
+                ("out/a.txt", "keep"),
+                ("empty/", ""),
+            ],
+        );
+        let dir = tree.0.as_path();
+        let (notes, photos, out) = (dir.join("notes"), dir.join("photos"), dir.join("out"));
+        let before = names(&out);
+
+        // Copied: its own name when free, the next free one otherwise, and
+        // a name given earlier in the same paste is taken too.
+        let sources = [
+            notes.join("a.txt"),
+            photos.join("a.txt"),
+            notes.join("b.txt"),
+        ];
+        assert_eq!(
+            plan_paste(&sources, &out, false),
+            [
+                copy_to(&sources[0], &out.join("a-copy.txt")),
+                copy_to(&sources[1], &out.join("a-copy-2.txt")),
+                copy_to(&sources[2], &out.join("b.txt")),
+            ]
+        );
+        assert_eq!(
+            plan_paste(&sources[..2], &dir.join("empty"), false),
+            [
+                copy_to(&sources[0], &dir.join("empty/a.txt")),
+                copy_to(&sources[1], &dir.join("empty/a-copy.txt")),
+            ]
+        );
+        // Into the folder the original is in: both are kept.
+        assert_eq!(
+            plan_paste(&sources[..1], &notes, false),
+            [copy_to(&sources[0], &notes.join("a-copy.txt"))]
+        );
+        // A folder's dots are part of its name.
+        let folder = photos.join("v1.2");
+        assert_eq!(
+            plan_paste(std::slice::from_ref(&folder), &photos, false),
+            [copy_to(&folder, &photos.join("v1.2-copy"))]
+        );
+
+        // Cut: moved, a clash resolved the same way; where it already is,
+        // it stays.
+        assert_eq!(
+            plan_paste(&sources, &out, true),
+            [
+                move_to(&sources[0], &out.join("a-copy.txt")),
+                move_to(&sources[1], &out.join("a-copy-2.txt")),
+                move_to(&sources[2], &out.join("b.txt")),
+            ]
+        );
+        assert_eq!(
+            plan_paste(&sources, &notes, true),
+            [
+                Planned::Stays(sources[0].clone()),
+                move_to(&sources[1], &notes.join("a-copy.txt")),
+                Planned::Stays(sources[2].clone()),
+            ]
+        );
+
+        // A plan touches nothing.
+        assert_eq!(names(&out), before);
+        assert_eq!(names(&notes), ["a.txt", "b.txt"]);
+        assert_eq!(fs::read_to_string(out.join("a.txt")).unwrap(), "keep");
+    }
+
+    #[test]
+    fn a_paste_plan_refuses_a_folder_into_itself_and_what_is_gone() {
+        let tree = TempTree::new(
+            "fileops-plan-refuse",
+            &[("photos/trip/day.txt", "d"), ("out/", "")],
+        );
+        let dir = tree.0.as_path();
+        let photos = dir.join("photos");
+        let gone = dir.join("gone.txt");
+        // The folder by another path, and a link that is an item itself.
+        symlink(&photos, dir.join("out/alias")).unwrap();
+        symlink("photos", dir.join("link")).unwrap();
+
+        for cut in [false, true] {
+            // Inside it, and the folder itself reached by another path: a
+            // paste there is into it. On its own row it goes beside it.
+            for inside in [
+                photos.join("trip"),
+                dir.join("out/alias"),
+                dir.join("out/alias/trip"),
+            ] {
+                assert_eq!(
+                    plan_paste(std::slice::from_ref(&photos), &inside, cut),
+                    [refused(&photos, Refusal::IntoItself)],
+                    "into {} (cut: {cut})",
+                    inside.display()
+                );
+            }
+            assert_eq!(
+                plan_paste(std::slice::from_ref(&gone), &dir.join("out"), cut),
+                [refused(&gone, Refusal::Missing)]
+            );
+        }
+        // One refusal does not stop the rest of the paste.
+        let day = photos.join("trip/day.txt");
+        assert_eq!(
+            plan_paste(&[photos.clone(), day.clone()], &photos.join("trip"), false),
+            [
+                refused(&photos, Refusal::IntoItself),
+                copy_to(&day, &photos.join("trip/day-copy.txt")),
+            ]
+        );
+        // Beside itself is a copy like any other, and a link goes into
+        // the folder it points at: it is the link that is copied.
+        assert_eq!(
+            plan_paste(std::slice::from_ref(&photos), dir, false),
+            [copy_to(&photos, &dir.join("photos-copy"))]
+        );
+        let link = dir.join("link");
+        assert_eq!(
+            plan_paste(std::slice::from_ref(&link), &photos, false),
+            [copy_to(&link, &photos.join("link"))]
+        );
+        assert_eq!(Refusal::IntoItself.said(), "cannot be pasted into itself");
+        assert_eq!(Refusal::Missing.said(), "is no longer there");
+    }
+
+    /// Select a folder, copy, paste: the cursor is still on the folder
+    /// copied. That used to be refused as a paste into itself; it is a
+    /// paste beside it, as the same keys on a file are.
+    #[test]
+    fn a_paste_onto_one_of_the_items_goes_beside_it() {
+        let tree = TempTree::new(
+            "fileops-plan-beside",
+            &[
+                ("photos/trip/day.txt", "d"),
+                ("photos/list.txt", "l"),
+                ("notes.txt", "n"),
+            ],
+        );
+        let dir = tree.0.as_path();
+        let photos = dir.join("photos");
+        let one = std::slice::from_ref(&photos);
+
+        // Copied and pasted at once, then again: `-copy`, then `-copy-2`.
+        assert_eq!(
+            plan_paste(one, &photos, false),
+            [copy_to(&photos, &dir.join("photos-copy"))]
+        );
+        fs::create_dir(dir.join("photos-copy")).unwrap();
+        assert_eq!(
+            plan_paste(one, &photos, false),
+            [copy_to(&photos, &dir.join("photos-copy-2"))]
+        );
+        // A folder inside it is still inside it.
+        assert_eq!(
+            plan_paste(one, &photos.join("trip"), false),
+            [refused(&photos, Refusal::IntoItself)]
+        );
+        // Everything pasted with it goes to the same folder: what was in
+        // the folder lands beside it too, and what is there already gets
+        // a name of its own.
+        let (list, notes) = (photos.join("list.txt"), dir.join("notes.txt"));
+        assert_eq!(
+            plan_paste(
+                &[photos.clone(), list.clone(), notes.clone()],
+                &photos,
+                false
+            ),
+            [
+                copy_to(&photos, &dir.join("photos-copy-2")),
+                copy_to(&list, &dir.join("list.txt")),
+                copy_to(&notes, &dir.join("notes-copy.txt")),
+            ]
+        );
+        // A nested folder's row: beside it, in the folder it is in.
+        let trip = photos.join("trip");
+        assert_eq!(
+            plan_paste(std::slice::from_ref(&trip), &trip, false),
+            [copy_to(&trip, &photos.join("trip-copy"))]
+        );
+
+        // Cut and pasted on itself: it is where it would go, and stays;
+        // what was cut with it from elsewhere moves beside it.
+        assert_eq!(
+            plan_paste(one, &photos, true),
+            [Planned::Stays(photos.clone())]
+        );
+        assert_eq!(
+            plan_paste(&[photos.clone(), list.clone()], &photos, true),
+            [
+                Planned::Stays(photos.clone()),
+                move_to(&list, &dir.join("list.txt")),
+            ]
+        );
+
+        // A link to a folder is a row that can be pasted on, too: the
+        // link is copied beside itself, not into what it points at.
+        let link = dir.join("link");
+        symlink("photos", &link).unwrap();
+        assert_eq!(
+            plan_paste(std::slice::from_ref(&link), &link, false),
+            [copy_to(&link, &dir.join("link-copy"))]
+        );
+        assert_eq!(
+            names(dir),
+            ["link", "notes.txt", "photos", "photos-copy"],
+            "a plan touches nothing"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_plan_puts_a_copy_beside_each_item() {
+        let tree = TempTree::new(
+            "fileops-plan-duplicate",
+            &[
+                ("a.txt", "a"),
+                ("a-copy.txt", "taken"),
+                ("docs/guide.md", "g"),
+            ],
+        );
+        let dir = tree.0.as_path();
+        let sources = [
+            dir.join("a.txt"),
+            dir.join("docs"),
+            dir.join("docs/guide.md"),
+            dir.join("gone.txt"),
+            // The same item twice: each copy has a name of its own.
+            dir.join("a.txt"),
+        ];
+        assert_eq!(
+            plan_duplicate(&sources),
+            [
+                copy_to(&sources[0], &dir.join("a-copy-2.txt")),
+                copy_to(&sources[1], &dir.join("docs-copy")),
+                copy_to(&sources[2], &dir.join("docs/guide-copy.md")),
+                refused(&sources[3], Refusal::Missing),
+                copy_to(&sources[4], &dir.join("a-copy-3.txt")),
+            ]
+        );
+        assert_eq!(names(dir), ["a-copy.txt", "a.txt", "docs"]);
+    }
+
+    #[test]
+    fn every_operation_answers_a_record_of_what_it_did() {
+        let tree = TempTree::new(
+            "fileops-perform",
+            &[("a.txt", "a"), ("docs/guide.md", "g"), ("bin/", "")],
+        );
+        let dir = tree.0.as_path();
+        let env = plain();
+        let at = |path: &str| dir.join(path);
+        let summary = |record: &Record| {
+            (
+                record.kind,
+                record.source.clone(),
+                record.result.clone(),
+                record.trashed.clone(),
+            )
+        };
+
+        // New: the folders above are made, and nothing is truncated.
+        let made = perform(Op::NewFile(&at("new/deep/b.txt")), &env).unwrap();
+        assert_eq!(
+            summary(&made),
+            (OpKind::NewFile, None, Some(at("new/deep/b.txt")), None)
+        );
+        assert_eq!(fs::read_to_string(at("new/deep/b.txt")).unwrap(), "");
+        let again = perform(Op::NewFile(&at("a.txt")), &env).unwrap_err();
+        assert_eq!(again.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(at("a.txt")).unwrap(), "a");
+        let made = perform(Op::NewFolder(&at("new/more")), &env).unwrap();
+        assert_eq!(
+            summary(&made),
+            (OpKind::NewFolder, None, Some(at("new/more")), None)
+        );
+        assert!(at("new/more").is_dir());
+        for taken in ["docs", "a.txt"] {
+            let error = perform(Op::NewFolder(&at(taken)), &env).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{taken}");
+        }
+
+        // Renamed and moved: where it was, and where it is.
+        let (from, to) = (at("a.txt"), at("first.txt"));
+        let renamed = perform(
+            Op::Rename {
+                from: &from,
+                to: &to,
+            },
+            &env,
+        )
+        .unwrap();
+        assert_eq!(
+            summary(&renamed),
+            (OpKind::Rename, Some(from.clone()), Some(to.clone()), None)
+        );
+        assert!(renamed.original_left.is_none());
+        let moved = perform(
+            Op::Move {
+                from: &to,
+                to: &at("docs/first.txt"),
+            },
+            &env,
+        )
+        .unwrap();
+        assert_eq!(
+            summary(&moved),
+            (
+                OpKind::Move,
+                Some(to.clone()),
+                Some(at("docs/first.txt")),
+                None
+            )
+        );
+        assert!(!to.exists());
+
+        // Copied and duplicated: both are there after.
+        let copied = perform(
+            Op::Copy {
+                from: &at("docs"),
+                to: &at("new/docs"),
+            },
+            &env,
+        )
+        .unwrap();
+        assert_eq!(
+            summary(&copied),
+            (OpKind::Copy, Some(at("docs")), Some(at("new/docs")), None)
+        );
+        assert_eq!(names(&at("new/docs")), ["first.txt", "guide.md"]);
+        let duplicate = perform(
+            Op::Duplicate {
+                from: &at("docs/guide.md"),
+                to: &at("docs/guide-copy.md"),
+            },
+            &env,
+        )
+        .unwrap();
+        assert_eq!(duplicate.kind, OpKind::Duplicate);
+        assert_eq!(
+            names(&at("docs")),
+            ["first.txt", "guide-copy.md", "guide.md"]
+        );
+        // Never over what is there.
+        let clash = perform(
+            Op::Copy {
+                from: &at("docs/guide.md"),
+                to: &at("docs/first.txt"),
+            },
+            &env,
+        )
+        .unwrap_err();
+        assert_eq!(clash.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(at("docs/first.txt")).unwrap(), "a");
+
+        // Trashed: where the item went, as the Trash says. This one is a
+        // folder of the fixture, standing in for the real one.
+        let bin = at("bin");
+        let env = Env {
+            trash: &|path| {
+                let landed = bin.join(path.file_name().unwrap());
+                fs::rename(path, &landed)?;
+                Ok(Some(landed))
+            },
+            stop: &|| false,
+        };
+        let trashed = perform(Op::Trash(&at("new/docs")), &env).unwrap();
+        assert_eq!(
+            summary(&trashed),
+            (
+                OpKind::Trash,
+                Some(at("new/docs")),
+                None,
+                Some(at("bin/docs"))
+            )
+        );
+        assert!(!at("new/docs").exists());
+        assert_eq!(names(&at("bin/docs")), ["first.txt", "guide.md"]);
+    }
+
+    #[test]
+    fn a_stopped_copy_leaves_nothing_and_a_finished_one_stays() {
+        let tree = TempTree::new(
+            "fileops-copy-stopped",
+            &[
+                ("site/a.txt", "a"),
+                ("site/b.txt", "b"),
+                ("site/css/main.css", "p {}"),
+                ("out/", ""),
+            ],
+        );
+        let dir = tree.0.as_path();
+        let (site, out) = (dir.join("site"), dir.join("out"));
+        // Stopped at every point a copy of this folder can be: before the
+        // folder itself, and before each of the five items in it.
+        for allowed in 0..5 {
+            let asked = std::cell::Cell::new(0);
+            let stop = || {
+                asked.set(asked.get() + 1);
+                asked.get() > allowed
+            };
+            let error = copy_item_until(&site, &out.join("site"), &stop).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted, "after {allowed}");
+            assert_eq!(names(&out), [] as [&str; 0], "after {allowed}");
+        }
+        assert_eq!(names(&site), ["a.txt", "b.txt", "css"], "source untouched");
+
+        // Through `perform`, and a staging folder is named as one while
+        // the copy is being built.
+        let seen = std::cell::RefCell::new(Vec::new());
+        let env = Env {
+            trash: &|_| Err(io::ErrorKind::Unsupported.into()),
+            stop: &|| {
+                seen.borrow_mut().extend(names(&out));
+                false
+            },
+        };
+        let copied = perform(
+            Op::Copy {
+                from: &site,
+                to: &out.join("site"),
+            },
+            &env,
+        )
+        .unwrap();
+        assert_eq!(copied.result, Some(out.join("site")));
+        assert_eq!(names(&out), ["site"]);
+        let seen = seen.into_inner();
+        assert!(!seen.is_empty());
+        for name in &seen {
+            assert!(is_staging(OsStr::new(name)), "{name} while copying");
+        }
+        assert!(!is_staging(OsStr::new("site")));
+        assert!(!is_staging(OsStr::new(".crc-notes.tmp")));
+    }
+
+    #[test]
+    fn an_item_takes_the_next_free_name_when_its_own_was_taken_since() {
+        let tree = TempTree::new(
+            "fileops-perform-free",
+            &[
+                ("a.txt", "new"),
+                ("b.txt", "moved"),
+                ("out/a.txt", "late"),
+                ("out/b.txt", "late"),
+                ("out/b-copy.txt", "later"),
+            ],
+        );
+        let dir = tree.0.as_path();
+        let env = plain();
+        let copied = perform_free(
+            Op::Copy {
+                from: &dir.join("a.txt"),
+                to: &dir.join("out/a.txt"),
+            },
+            &env,
+        )
+        .unwrap();
+        assert_eq!(copied.kind, OpKind::Copy);
+        assert_eq!(copied.result, Some(dir.join("out/a-copy.txt")));
+        assert_eq!(fs::read_to_string(dir.join("out/a.txt")).unwrap(), "late");
+        assert_eq!(
+            fs::read_to_string(dir.join("out/a-copy.txt")).unwrap(),
+            "new"
+        );
+
+        let moved = perform_free(
+            Op::Move {
+                from: &dir.join("b.txt"),
+                to: &dir.join("out/b.txt"),
+            },
+            &env,
+        )
+        .unwrap();
+        assert_eq!(moved.kind, OpKind::Move);
+        assert_eq!(moved.result, Some(dir.join("out/b-copy-2.txt")));
+        assert!(!dir.join("b.txt").exists());
+        assert_eq!(fs::read_to_string(dir.join("out/b.txt")).unwrap(), "late");
+        assert_eq!(
+            fs::read_to_string(dir.join("out/b-copy.txt")).unwrap(),
+            "later"
+        );
+        // Anything but a taken name is the failure it is.
+        let missing = perform_free(
+            Op::Copy {
+                from: &dir.join("absent.txt"),
+                to: &dir.join("out/absent.txt"),
+            },
+            &env,
+        )
+        .unwrap_err();
+        assert_eq!(missing.kind(), io::ErrorKind::NotFound);
     }
 }

@@ -343,6 +343,15 @@ pub fn classify(root: &Path, git_dirs: &[PathBuf], path: &Path) -> Option<Change
     if let Some(index) = relative.components().position(|c| c.as_os_str() == ".git") {
         return bookkeeping(names(relative).into_iter().skip(index + 1).collect());
     }
+    // A copy being built, in its hidden folder at any depth: nothing the
+    // tree shows changes until the copy is moved out of it, and that is an
+    // event at the copy's own path.
+    if relative
+        .components()
+        .any(|c| super::fileops::is_staging(c.as_os_str()))
+    {
+        return None;
+    }
     let mut components = relative
         .components()
         .map(|c| c.as_os_str().to_string_lossy());
@@ -427,6 +436,19 @@ mod tests {
         assert_eq!(
             classify(root, &[], Path::new("/p/src/.crc-1-2-3.tmp")),
             None
+        );
+        // The folder a copy is built in, and what is in it, at any depth.
+        for staged in [
+            "/p/.crc-copy-41-0",
+            "/p/.crc-copy-41-0/site/index.html",
+            "/p/docs/old/.crc-copy-41-7/guide.md",
+        ] {
+            assert_eq!(classify(root, &[], Path::new(staged)), None, "{staged}");
+        }
+        assert_eq!(
+            classify(root, &[], Path::new("/p/docs/site-copy/index.html")),
+            Some(Change::Tree),
+            "the copy, once it is in place"
         );
         assert_eq!(
             classify(root, &[], Path::new("/p")),

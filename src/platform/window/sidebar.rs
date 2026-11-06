@@ -2,6 +2,7 @@
 //! clicks and keys, and opening a folder with its project scan.
 
 use super::*;
+use crate::project::fileops::Op;
 
 impl EditorView {
     /// Tracks a sidebar drag and works out whether it could be dropped here.
@@ -88,8 +89,10 @@ impl EditorView {
             return;
         }
         self.move_item(
-            &drag.path,
-            &target,
+            Op::Move {
+                from: &drag.path,
+                to: &target,
+            },
             format!(
                 "moved {} to {}",
                 name.to_string_lossy(),
@@ -678,10 +681,12 @@ impl EditorView {
                     Then::Nothing
                 }
                 _ if command => return false,
-                // Several selected become the cursor's row alone; from one,
-                // the keys go back to the document.
+                // A copy that is running stops, or a cut that is waiting is
+                // called off. With neither, several selected become the
+                // cursor's row alone; from one, the keys go back to the
+                // document.
                 ESCAPE => {
-                    if !state.tree.reduce_selection() {
+                    if !explorer::escape(&mut state) && !state.tree.reduce_selection() {
                         state.sidebar_keys = false;
                     }
                     Then::Nothing
@@ -847,9 +852,10 @@ impl EditorView {
         let mut moved = 0;
         let mut failed = None;
         for (path, key) in paths.iter().zip(&keys) {
-            match project::trash_item(path) {
-                // Where it is in the Trash is what an undo will need.
-                Ok(_landed) => {
+            match self.file_op(Op::Trash(path)) {
+                // Where it is in the Trash is kept with what was done: an
+                // undo will need it.
+                Ok(_) => {
                     moved += 1;
                     if let Some(mut state) = self.state_mut() {
                         for docs in all_docs_mut(&mut state) {
@@ -1050,6 +1056,8 @@ impl EditorView {
         // the tree may have changed what is ignored.
         tree.set_ignored(state.tree.ignored_set());
         state.tree = tree;
+        // What a paste or a duplicate made has rows now.
+        explorer::select_made(&mut state);
         // Said once per scan: Go to File does not list everything.
         if finder.is_truncated() && !state.finder.is_truncated() {
             state.message = Some((
@@ -1199,7 +1207,7 @@ fn set_tree_folder(state: &mut State, index: usize, open: Option<bool>) {
 }
 
 /// A project item's name, as a message says it.
-fn item_name(path: &Path) -> String {
+pub(super) fn item_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())
@@ -1215,9 +1223,10 @@ fn trash_question(paths: &[std::path::PathBuf]) -> String {
 }
 
 /// The tree as a `dump` reports it: whether it has the keyboard, its rows
-/// by their path in the project (a folder with a slash, a selected row
-/// starred, the cursor's after a `>`), what a command on the selection
-/// would act on, and the first row shown.
+/// by their path in the project (a folder with a slash, a row cut and not
+/// yet pasted after a `~`, a selected row starred, the cursor's after a
+/// `>`), what a command on the selection would act on, the first row
+/// shown, and the file work: see [`explorer::report`].
 pub(super) fn tree_report(state: &State) -> String {
     let tree = &state.tree;
     let shown = |path: &Path| {
@@ -1233,7 +1242,8 @@ pub(super) fn tree_report(state: &State) -> String {
         .enumerate()
         .map(|(index, entry)| {
             format!(
-                "{}{}{}{}",
+                "{}{}{}{}{}",
+                if tree.is_cut(&entry.path) { "~" } else { "" },
                 if tree.is_selected(index) { "*" } else { "" },
                 if tree.cursor_row() == Some(index) {
                     ">"
@@ -1251,11 +1261,12 @@ pub(super) fn tree_report(state: &State) -> String {
         .map(|path| shown(path))
         .collect();
     format!(
-        "tree_keys: {}\ntree_rows: {}\ntree_acts_on: {}\ntree_scroll: {}",
+        "tree_keys: {}\ntree_rows: {}\ntree_acts_on: {}\ntree_scroll: {}\n{}",
         tree_has_keys(state),
         rows.join("|"),
         acts_on.join("|"),
         tree.scroll,
+        explorer::report(state),
     )
 }
 
