@@ -53,6 +53,9 @@ impl EditorView {
         sync_conflicts(&mut state);
         sync_tables(&mut state);
         super::agents::forget_emptied(&mut state);
+        // The Explorer's selection is drawn at full strength, its cursor
+        // outlined, while the tree has the keyboard in the key window.
+        state.tree.focused = key && super::sidebar::tree_has_keys(&state);
         let column = column_of(&state);
         let chrome = chrome_of(&state);
         let terminal_find_rect = super::terminal::find_rect(&state, &chrome);
@@ -1004,6 +1007,10 @@ impl EditorView {
 
         if let Some(rect) = terminal_rect {
             let searching = find.as_ref().and_then(|bar| bar.terminal.as_ref());
+            // Where its tab strip is scrolled to, kept for the presses
+            // that follow this frame.
+            let (header, _) = crate::platform::terminal::split(rect);
+            terminal_panel.settle_strip(&mut renderer.atlas, header);
             crate::platform::terminal::draw(
                 terminal_panel,
                 searching,

@@ -470,6 +470,53 @@ pub struct Panel {
     /// The ids of tabs closed while their wait was told, whose
     /// notifications are still to be taken back.
     pub withdrawn: Vec<String>,
+    /// A tab pressed in the header, dragged along the strip once the
+    /// pointer has moved far enough.
+    pub tab_drag: Option<TabDrag>,
+    /// The tab a right-click's menu is about, by [`Tab::id`]: tabs can
+    /// close and move while the menu is open, and its items act on that
+    /// session or on none.
+    pub menu_tab: Option<String>,
+    /// How far the tab strip is scrolled, in points, while its tabs do
+    /// not fit; see [`strip`].
+    pub strip_scroll: f32,
+    /// The wheel or a drag moved the strip since the active tab changed:
+    /// it stays where it was put. Otherwise it keeps that tab in view.
+    pub strip_free: bool,
+    /// The active tab when the strip was last laid out for a frame, by
+    /// the address of its lifetime token: another one is brought into view.
+    pub strip_seen: usize,
+}
+
+/// A tab pressed in the header: a drag to another place among the tabs
+/// listed once the pointer has left where it was pressed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TabDrag {
+    pub tab: usize,
+    pub start_x: f32,
+    /// Where the pointer is now.
+    pub x: f32,
+    pub y: f32,
+    /// Moved far enough to be a drag, not a click.
+    pub active: bool,
+}
+
+/// How far the pointer moves from a press on a tab before it is a drag.
+pub const TAB_DRAG_AFTER: f32 = 4.0;
+
+/// Where the tab at `index` is once the one at `from` has moved to `to`,
+/// the tabs between them each a place along. Every index kept across a
+/// move goes through this, so each still names the session it named.
+pub fn moved(index: usize, from: usize, to: usize) -> usize {
+    if index == from {
+        to
+    } else if from < index && index <= to {
+        index - 1
+    } else if to <= index && index < from {
+        index + 1
+    } else {
+        index
+    }
 }
 
 impl Default for Panel {
@@ -494,6 +541,11 @@ impl Default for Panel {
             link: None,
             opened: Vec::new(),
             withdrawn: Vec::new(),
+            tab_drag: None,
+            menu_tab: None,
+            strip_scroll: 0.0,
+            strip_free: false,
+            strip_seen: 0,
         }
     }
 }
@@ -597,11 +649,179 @@ impl Panel {
             .map_or(self.active, |(tab, _)| tab)
     }
 
+    /// What names the tab at `index` wherever it goes and for as long as
+    /// it lives: its [`Tab::id`], as [`Panel::tab_by_id`] takes it. For
+    /// what outlasts a frame, such as the tab an open menu is about.
+    pub fn id_of(&self, index: usize) -> Option<String> {
+        self.tabs
+            .get(index)
+            .map(|tab| tab.id().to_string_lossy().into_owned())
+    }
+
+    /// The tab a right-click's menu is about, where it is now; none once
+    /// it has closed.
+    pub fn menu_tab_index(&self) -> Option<usize> {
+        self.tab_by_id(self.menu_tab.as_deref()?)
+    }
+
+    /// Closes the tab whose [`Tab::id`] is `id`, a menu's Close: that
+    /// session wherever it is by now, and nothing when it has gone.
+    /// Returns whether there was one.
+    pub fn close_by_id(&mut self, id: &str) -> bool {
+        match self.tab_by_id(id) {
+            Some(index) => {
+                self.close_tab(index);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The tabs the header lists, in the order it lists them: all of
+    /// them, or in Agents mode the selected workspace's.
+    pub fn listed(&self) -> Vec<usize> {
+        (0..self.tabs.len())
+            .filter(|i| self.shown.as_ref().is_none_or(|shown| shown.contains(i)))
+            .collect()
+    }
+
+    /// Moves the tab at `from` to `to`, the tabs between them each a place
+    /// along, and everything that names a tab by its place with them: the
+    /// session with the keyboard, both of a pair, the tabs listed, a press
+    /// a program is being told of, the cell and the link under the
+    /// pointer, a drag. Returns whether it moved.
+    pub fn move_tab(&mut self, from: usize, to: usize) -> bool {
+        let len = self.tabs.len();
+        if from == to || from >= len || to >= len {
+            return false;
+        }
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        let at = |index: &mut usize| *index = moved(*index, from, to);
+        at(&mut self.active);
+        if let Some((left, right)) = &mut self.pair {
+            at(left);
+            at(right);
+        }
+        if let Some(shown) = &mut self.shown {
+            shown.iter_mut().for_each(at);
+            shown.sort_unstable();
+        }
+        if let Some((tab, ..)) = &mut self.mouse_press {
+            at(tab);
+        }
+        if let Some((tab, _)) = &mut self.mouse_cell {
+            at(tab);
+        }
+        if let Some((tab, _)) = &mut self.link {
+            at(tab);
+        }
+        if let Some(drag) = &mut self.tab_drag {
+            at(&mut drag.tab);
+        }
+        // The place a closed tab left is the place of the one that slid
+        // into it; past the last there is none to follow.
+        if let Some((.., place)) = &mut self.closed_active
+            && *place < len
+        {
+            at(place);
+        }
+        true
+    }
+
+    /// Moves `tab` `step` places along the tabs in `listed`, the header's
+    /// order: past the tabs of other workspaces between them, which keep
+    /// their places among themselves. Not past either end.
+    pub fn step_tab(&mut self, listed: &[usize], tab: usize, step: isize) -> bool {
+        let Some(place) = listed.iter().position(|i| *i == tab) else {
+            return false;
+        };
+        match place.checked_add_signed(step).and_then(|to| listed.get(to)) {
+            Some(to) => self.move_tab(tab, *to),
+            None => false,
+        }
+    }
+
+    /// Moves `tab` into the gap before the `slot`th of the tabs in
+    /// `listed`, after the last when `slot` is how many there are: where
+    /// a drag along the strip lets it go.
+    pub fn drop_tab(&mut self, listed: &[usize], tab: usize, slot: usize) -> bool {
+        let Some(place) = listed.iter().position(|i| *i == tab) else {
+            return false;
+        };
+        // Its own place is not counted once it has left it.
+        let to = if slot > place { slot - 1 } else { slot };
+        match listed.get(to) {
+            Some(to) => self.move_tab(tab, *to),
+            None => false,
+        }
+    }
+
+    /// The tab `step` along `listed` from the one showing, round from the
+    /// last to the first; none when no other is listed.
+    pub fn cycled(&self, listed: &[usize], step: isize) -> Option<usize> {
+        let place = listed.iter().position(|i| *i == self.active)?;
+        let to = (place as isize + step).rem_euclid(listed.len() as isize) as usize;
+        (listed[to] != self.active).then_some(listed[to])
+    }
+
+    /// The wheel over the strip, or a drag held at one of its ends: `by`
+    /// points along, held to what there is by the next frame.
+    pub fn scroll_strip(&mut self, by: f32) {
+        self.strip_scroll = (self.strip_scroll + by).max(0.0);
+        self.strip_free = true;
+    }
+
+    /// Lays the strip out for a frame and keeps where it is scrolled to:
+    /// a tab that has just become the active one is brought into view.
+    pub fn settle_strip(&mut self, atlas: &mut Atlas, header: Viewport) {
+        let seen = self
+            .active_tab()
+            .filter(|_| self.showing())
+            .map_or(0, |tab| std::sync::Arc::as_ptr(&tab.alive) as usize);
+        if seen != self.strip_seen {
+            self.strip_seen = seen;
+            self.strip_free = false;
+        }
+        self.strip_scroll = strip(self, atlas, header).scroll;
+    }
+
+    /// For the self-test: the tabs by title in the strip's order, the one
+    /// showing starred and those the header does not list in brackets,
+    /// the pair by title, whether the strip is scrolled, and the tab being
+    /// dragged along it.
+    pub fn report(&self) -> String {
+        let listed = self.listed();
+        let title = |index: usize| self.tabs.get(index).map_or("?".to_owned(), Tab::base_name);
+        format!(
+            "{} pair={} scrolled={} drag={}",
+            (0..self.tabs.len())
+                .map(|i| match (i == self.active, listed.contains(&i)) {
+                    (true, true) => format!("*{}", title(i)),
+                    (false, true) => title(i),
+                    (true, false) => format!("(*{})", title(i)),
+                    (false, false) => format!("({})", title(i)),
+                })
+                .collect::<Vec<_>>()
+                .join(","),
+            self.shown_pair().map_or("-".to_owned(), |(l, r)| format!(
+                "{}+{}",
+                title(l),
+                title(r)
+            )),
+            if self.strip_scroll > 0.5 { "yes" } else { "no" },
+            self.tab_drag
+                .filter(|drag| drag.active)
+                .map_or("-".to_owned(), |drag| title(drag.tab)),
+        )
+    }
+
     pub fn close_tab(&mut self, index: usize) {
         // Indices after it move down; a pair is not worth renumbering.
         self.pair = None;
         self.mouse_press = None;
         self.mouse_cell = None;
+        self.tab_drag = None;
         if index < self.tabs.len() {
             // Dropping the session hangs up on its program.
             let tab = self.tabs.remove(index);
@@ -1549,7 +1769,7 @@ pub fn draw_filter(
             "No matching lines"
         };
         let row = filter_row_rect(list, 0, atlas);
-        layout::push_ui_text(
+        layout::push_ui_text_elided(
             out,
             atlas,
             Viewport {
@@ -1808,57 +2028,232 @@ pub fn grid_size(atlas: &Atlas, screen: Viewport) -> (usize, usize) {
     (cols, rows)
 }
 
-/// Each tab and its close button, then the new-shell button.
-pub fn header_hits(
-    panel: &Panel,
-    atlas: &mut Atlas,
-    header: Viewport,
-) -> (Vec<(Viewport, Viewport)>, Viewport) {
-    let mut x = header.x;
-    let mut tabs = Vec::new();
-    for (index, tab) in panel.tabs.iter().enumerate() {
-        if panel
-            .shown
-            .as_ref()
-            .is_some_and(|shown| !shown.contains(&index))
-        {
-            tabs.push((
-                Viewport {
-                    width: 0.0,
-                    ..header
-                },
-                Viewport {
-                    width: 0.0,
-                    ..header
-                },
-            ));
+/// The widest a tab is: a longer title is cut in its middle.
+pub const TAB_MAX: f32 = 240.0;
+/// The narrowest the tabs shrink to when they do not all fit, before the
+/// strip scrolls instead: a short name such as "zsh" whole beside the
+/// close button, and enough of both ends of a long title to tell it from
+/// its neighbours.
+pub const TAB_MIN: f32 = 120.0;
+/// The least room a title cut short keeps beside its review count: the
+/// ellipsis and a few letters.
+const TITLE_MIN: f32 = 28.0;
+/// How near an end of the strip a dragged tab scrolls it.
+pub const STRIP_EDGE: f32 = 28.0;
+/// The room a tab takes beside its title: the editor tab's padding and
+/// close slot, so the two strips are one.
+const TAB_CHROME: f32 = layout::TAB_PADDING_X * 2.0 + layout::TAB_CLOSE_SLOT;
+
+/// The room a tab's dot takes before its title while it waits on someone.
+fn dot_width(tab: &Tab) -> f32 {
+    if tab.attention.is_some() { 5.0 } else { 0.0 }
+}
+
+/// One tab of the header, as [`strip`] places it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StripTab {
+    /// What of it shows: nothing (no width) for a tab the header does not
+    /// list or one scrolled out of sight.
+    pub rect: Viewport,
+    /// All of it, where it would be were none of it cut off.
+    pub whole: Viewport,
+    /// Its close button; no width unless the whole button shows.
+    pub close: Viewport,
+}
+
+/// The header's tabs and its new-shell button for a frame.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Strip {
+    /// One for each of the panel's tabs, listed or not.
+    pub tabs: Vec<StripTab>,
+    pub new: Viewport,
+    /// Where the tabs go: the header up to the buttons at its end.
+    pub area: Viewport,
+    /// How far the tabs are scrolled, and the furthest they can be.
+    pub scroll: f32,
+    pub max_scroll: f32,
+}
+
+/// The widths of tabs `natural` wide in `room`. All as they are when they
+/// fit. Otherwise the widest give way first, each tab over a cap cut to
+/// it, the cap such that they fill the room and no lower than
+/// [`TAB_MIN`]: past that they keep their widths and the strip scrolls.
+fn fit_widths(natural: &[f32], room: f32) -> Vec<f32> {
+    if natural.iter().sum::<f32>() <= room {
+        return natural.to_vec();
+    }
+    let mut sorted = natural.to_vec();
+    sorted.sort_by(f32::total_cmp);
+    let mut left = room;
+    let mut cap = TAB_MIN;
+    for (n, width) in sorted.iter().enumerate() {
+        let share = left / (sorted.len() - n) as f32;
+        if *width > share {
+            cap = share.floor().max(TAB_MIN);
+            break;
+        }
+        left -= width;
+    }
+    natural.iter().map(|width| width.min(cap)).collect()
+}
+
+/// The header's tabs, their close buttons and the new-shell button.
+///
+/// Each tab is as wide as its label, [`TAB_MAX`] at most. When they do
+/// not fit before the buttons they shrink (see [`fit_widths`]), and when
+/// that is not enough the strip scrolls: by the wheel, by a drag held at
+/// an end, and so that the active tab is in view unless the strip was
+/// moved since it became the active one. The new-shell button follows
+/// the last tab and stops before Hide Panel, so both always show and no
+/// tab is under either.
+pub fn strip(panel: &Panel, atlas: &mut Atlas, header: Viewport) -> Strip {
+    let hide = header_hide(header);
+    let new_at_most = (hide.x - layout::UI_GAP - layout::UI_CONTROL_SM).max(header.x);
+    let area = Viewport {
+        width: (new_at_most - layout::UI_GAP - header.x).max(0.0),
+        ..header
+    };
+    let listed = panel.listed();
+    let natural: Vec<f32> = listed
+        .iter()
+        .map(|i| {
+            let tab = &panel.tabs[*i];
+            (layout::ui_text_width(atlas, &label(tab)) + TAB_CHROME + dot_width(tab)).min(TAB_MAX)
+        })
+        .collect();
+    let widths = fit_widths(&natural, area.width);
+    let total: f32 = widths.iter().sum();
+    let max_scroll = (total - area.width).max(0.0);
+    let mut scroll = panel.strip_scroll.clamp(0.0, max_scroll);
+    if !panel.strip_free
+        && let Some(place) = listed.iter().position(|i| *i == panel.active)
+    {
+        let start: f32 = widths[..place].iter().sum();
+        let end = start + widths[place];
+        if start < scroll {
+            scroll = start;
+        } else if end > scroll + area.width {
+            // Its start, where the strip is narrower than the tab.
+            scroll = (end - area.width).min(start);
+        }
+        scroll = scroll.clamp(0.0, max_scroll);
+    }
+    let none = Viewport {
+        width: 0.0,
+        ..header
+    };
+    let mut tabs = vec![
+        StripTab {
+            rect: none,
+            whole: none,
+            close: none,
+        };
+        panel.tabs.len()
+    ];
+    let (left, right) = (area.x, area.x + area.width);
+    let mut x = area.x - scroll;
+    for (index, width) in listed.iter().zip(&widths) {
+        let whole = Viewport {
+            x,
+            width: *width,
+            ..header
+        };
+        x += width;
+        let from = whole.x.max(left);
+        let to = (whole.x + whole.width).min(right);
+        if to <= from {
+            tabs[*index].whole = whole;
             continue;
         }
-        // The editor tab's metrics: its padding, its close slot and the
-        // square around the close glyph, so the two strips are one.
-        let dot = if tab.attention.is_some() { 5.0 } else { 0.0 };
-        let width = layout::ui_text_width(atlas, &label(tab))
-            + layout::TAB_PADDING_X * 2.0
-            + layout::TAB_CLOSE_SLOT
-            + dot;
-        let rect = Viewport { x, width, ..header };
-        let centre = rect.x + rect.width - layout::TAB_PADDING_X - atlas.metrics.advance * 0.5;
+        let centre = whole.x + whole.width - layout::TAB_PADDING_X - atlas.metrics.advance * 0.5;
         let close = Viewport {
             x: centre - layout::TAB_CLOSE_HIT * 0.5,
             y: header.y + ((header.height - layout::TAB_CLOSE_HIT) * 0.5).floor(),
             width: layout::TAB_CLOSE_HIT,
             height: layout::TAB_CLOSE_HIT,
         };
-        tabs.push((rect, close));
-        x += width;
+        let close_shows = close.x >= from && close.x + close.width <= to;
+        // All of it, as it is, where none is cut off.
+        let cut = from > whole.x || to < whole.x + whole.width;
+        tabs[*index] = StripTab {
+            rect: Viewport {
+                x: from,
+                width: if cut { to - from } else { whole.width },
+                ..header
+            },
+            whole,
+            close: if close_shows { close } else { none },
+        };
     }
     let new = Viewport {
-        x: x + layout::UI_GAP,
+        x: (area.x + total).min(right) + layout::UI_GAP,
         y: header.y + ((header.height - layout::UI_CONTROL_SM) * 0.5).floor(),
         width: layout::UI_CONTROL_SM,
         height: layout::UI_CONTROL_SM,
     };
-    (tabs, new)
+    Strip {
+        tabs,
+        new,
+        area,
+        scroll,
+        max_scroll,
+    }
+}
+
+/// The gap a tab dragged to `x` would drop into, counted along the tabs
+/// in `listed`: before the first whose middle is past the pointer, else
+/// after the last. From the frame's own rectangles, as the labels under
+/// the pointer change width while it is held.
+pub fn drop_slot(strip: &Strip, listed: &[usize], x: f32) -> usize {
+    listed
+        .iter()
+        .position(|i| {
+            let tab = strip.tabs[*i].whole;
+            x < tab.x + tab.width * 0.5
+        })
+        .unwrap_or(listed.len())
+}
+
+/// Where the line for a drop into `slot` goes: the edge between the two
+/// tabs it would land between, kept inside the strip.
+fn drop_line(strip: &Strip, listed: &[usize], slot: usize) -> Option<f32> {
+    let x = match listed.get(slot) {
+        Some(next) => strip.tabs[*next].whole.x,
+        None => {
+            let last = strip.tabs[*listed.last()?].whole;
+            last.x + last.width
+        }
+    };
+    let area = strip.area;
+    Some(x.clamp(area.x + 1.0, (area.x + area.width - 1.0).max(area.x + 1.0)))
+}
+
+/// Which way a tab dragged to `x` scrolls a strip that does not fit:
+/// back within [`STRIP_EDGE`] of its start or before it, on within as
+/// much of its end or past it, and not at all between.
+pub fn drag_scroll(strip: &Strip, x: f32) -> f32 {
+    let area = strip.area;
+    if strip.max_scroll <= 0.0 {
+        0.0
+    } else if x < area.x + STRIP_EDGE {
+        -1.0
+    } else if x > area.x + area.width - STRIP_EDGE {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+/// Each tab and its close button, then the new-shell button: what of the
+/// strip takes a press. See [`strip`].
+pub fn header_hits(
+    panel: &Panel,
+    atlas: &mut Atlas,
+    header: Viewport,
+) -> (Vec<(Viewport, Viewport)>, Viewport) {
+    let strip = strip(panel, atlas, header);
+    let tabs = strip.tabs.iter().map(|tab| (tab.rect, tab.close)).collect();
+    (tabs, strip.new)
 }
 
 /// What the screen says when the workspace listed has no terminal left.
@@ -1894,15 +2289,52 @@ pub fn header_hide(header: Viewport) -> Viewport {
 /// The title the program set, when it set one (`claude` does, and so do
 /// most shell prompts), otherwise the name the tab started with.
 fn label(tab: &Tab) -> String {
-    // Inside ssh the tab says where.
-    let title = match &tab.remote {
-        Some(remote) => format!("ssh {}", remote.destination),
-        None => title_of(tab),
-    };
+    let title = shown_title(tab);
     match tab.review_files {
         0 => title,
         n => format!("{title} \u{b7} {n} to review"),
     }
+}
+
+/// A tab's title without its review count: inside ssh the tab says where.
+fn shown_title(tab: &Tab) -> String {
+    match &tab.remote {
+        Some(remote) => format!("ssh {}", remote.destination),
+        None => title_of(tab),
+    }
+}
+
+/// A tab's label as `room` has it: whole when it fits, else its title cut
+/// in the middle. The count of files to review stays whole after a title
+/// cut short while that leaves the title [`TITLE_MIN`], then as the number
+/// alone after whatever of the title there is room for, and is cut with
+/// the rest only where not even the number fits.
+fn fitted_label(atlas: &mut Atlas, tab: &Tab, room: f32) -> String {
+    let title = shown_title(tab);
+    let count = tab.review_files;
+    let whole = match count {
+        0 => title.clone(),
+        n => format!("{title} \u{b7} {n} to review"),
+    };
+    // Half a point of slack: the room is the label's own width taken back
+    // out of its tab's, a rounding error short of it.
+    if layout::ui_text_width(atlas, &whole) <= room + 0.5 {
+        return whole;
+    }
+    if count > 0 {
+        let words = format!(" \u{b7} {count} to review");
+        let left = room - layout::ui_text_width(atlas, &words);
+        if left >= TITLE_MIN {
+            return layout::elide_middle(atlas, &title, left) + &words;
+        }
+        let number = format!(" \u{b7} {count}");
+        let left = room - layout::ui_text_width(atlas, &number);
+        let cut = layout::elide_middle(atlas, &title, left);
+        if !cut.is_empty() {
+            return cut + &number;
+        }
+    }
+    layout::elide_middle(atlas, &whole, room)
 }
 
 fn title_of(tab: &Tab) -> String {
@@ -2004,8 +2436,14 @@ pub fn draw(
         theme.hairline,
     );
 
-    let (tabs, new) = header_hits(panel, atlas, header);
-    for (index, (tab, (rect, close))) in panel.tabs.iter().zip(tabs).enumerate() {
+    let strip = strip(panel, atlas, header);
+    let listed = panel.listed();
+    // A tab on its way to another place along the strip.
+    let drag = panel.tab_drag.filter(|drag| drag.active);
+    let first = out.len();
+    for (place, index) in listed.iter().enumerate() {
+        let (index, tab) = (*index, &panel.tabs[*index]);
+        let StripTab { rect, whole, close } = strip.tabs[index];
         if rect.width <= 0.0 {
             continue;
         }
@@ -2013,6 +2451,16 @@ pub fn draw(
         // fill under the active one with the accent rule where it meets
         // the screen, a lift under the pointer, a hairline between the rest.
         let active = index == panel.active;
+        // The one being dragged is faint where it still is: the line
+        // says where it goes.
+        let faint = |colour: [f32; 4]| {
+            if drag.is_some_and(|drag| drag.tab == index) {
+                [colour[0], colour[1], colour[2], colour[3] * 0.4]
+            } else {
+                colour
+            }
+        };
+        let hovered = drag.is_none() && layout::hovered(rect);
         if active {
             layout::push_rect(
                 out,
@@ -2024,11 +2472,14 @@ pub fn draw(
             layout::push_rect(
                 out,
                 atlas,
-                [rect.x + layout::TAB_PADDING_X, rect.y + rect.height - 2.0],
-                [rect.width - layout::TAB_PADDING_X * 2.0, 2.0],
-                theme.accent,
+                [
+                    whole.x + layout::TAB_PADDING_X,
+                    whole.y + whole.height - 2.0,
+                ],
+                [whole.width - layout::TAB_PADDING_X * 2.0, 2.0],
+                faint(theme.accent),
             );
-        } else if layout::hovered(rect) {
+        } else if hovered {
             layout::push_rect(
                 out,
                 atlas,
@@ -2036,30 +2487,30 @@ pub fn draw(
                 [rect.width, rect.height],
                 theme.row_hover,
             );
-        } else if index > 0 && index != panel.active + 1 {
+        } else if place > 0 && listed[place - 1] != panel.active {
             layout::push_rect(
                 out,
                 atlas,
-                [rect.x, rect.y + 6.0],
-                [1.0, rect.height - 12.0],
+                [whole.x, whole.y + 6.0],
+                [1.0, whole.height - 12.0],
                 theme.hairline,
             );
         }
         layout::hotspot(rect, layout::Cursor::Pointing, None);
-        let mut label_x = rect.x + layout::TAB_PADDING_X;
+        let mut label_x = whole.x + layout::TAB_PADDING_X;
         // A tab waiting on the person: a dot before its title.
         if tab.attention.is_some() {
-            layout::push_rounded_rect(
-                out,
-                Viewport {
-                    x: label_x - 5.0,
-                    y: rect.y + rect.height / 2.0 - 3.0,
-                    width: 6.0,
-                    height: 6.0,
-                },
-                3.0,
-                theme.accent,
-            );
+            let dot = Viewport {
+                x: label_x - 5.0,
+                y: whole.y + whole.height / 2.0 - 3.0,
+                width: 6.0,
+                height: 6.0,
+            };
+            // Whole or not at all: a round thing cut at the strip's end
+            // is no longer round.
+            if dot.x >= rect.x && dot.x + dot.width <= rect.x + rect.width {
+                layout::push_rounded_rect(out, dot, 3.0, faint(theme.accent));
+            }
             label_x += 5.0;
         }
         let colour = if tab.claude {
@@ -2069,24 +2520,24 @@ pub fn draw(
         } else {
             theme.tab_text_inactive
         };
-        layout::push_ui_text(
+        let room =
+            (whole.x + whole.width - layout::TAB_PADDING_X - layout::TAB_CLOSE_SLOT - label_x)
+                .max(0.0);
+        let text = fitted_label(atlas, tab, room);
+        layout::push_ui_text_elided(
             out,
             atlas,
             Viewport {
                 x: label_x,
-                width: (rect.x + rect.width
-                    - layout::TAB_PADDING_X
-                    - layout::TAB_CLOSE_SLOT
-                    - label_x)
-                    .max(0.0),
-                ..rect
+                width: room,
+                ..whole
             },
-            &label(tab),
-            colour,
+            &text,
+            faint(colour),
         );
         // The close cross on the tab that is showing and the one under the
-        // pointer, the way editor tabs do it.
-        if active || layout::hovered(rect) {
+        // pointer, the way editor tabs do it; not on one half out of sight.
+        if (active || hovered) && drag.is_none() && close.width > 0.0 {
             Button::new(close)
                 .icon(icons::CLOSE)
                 .tone(Tone::Ghost)
@@ -2095,7 +2546,27 @@ pub fn draw(
                 .draw(out, atlas, theme);
         }
     }
-    Button::new(new)
+    // A tab scrolled half out of sight ends where the strip does.
+    let (left, right) = (strip.area.x, strip.area.x + strip.area.width);
+    for quad in &mut out[first..] {
+        layout::clip_horizontal(quad, left, right);
+    }
+    // Where the dragged tab lands if let go here: a line in the accent
+    // between the two it would go between. None with the pointer off the
+    // strip, where letting go leaves it where it was.
+    if let Some(drag) = drag
+        && header.contains(drag.x, drag.y)
+        && let Some(x) = drop_line(&strip, &listed, drop_slot(&strip, &listed, drag.x))
+    {
+        layout::push_rect(
+            out,
+            atlas,
+            [x - 1.0, header.y + 4.0],
+            [2.0, header.height - 8.0],
+            theme.accent,
+        );
+    }
+    Button::new(strip.new)
         .icon(icons::ADD)
         .tone(Tone::Ghost)
         .tip("New Terminal")
@@ -2378,7 +2849,6 @@ fn draw_screen(
     }
     if back > 0 {
         let note = format!("↑ {back} lines");
-        let width = layout::ui_text_width(atlas, &note) + 20.0;
         // Under the find bar while it is open, which sits where the
         // pill does.
         let below_bar = if find.is_some() && active {
@@ -2386,14 +2856,26 @@ fn draw_screen(
         } else {
             0.0
         };
-        let pill = Viewport {
-            x: screen.x + screen.width - width,
+        // The shared pill, at the row's end and never wider than it: a
+        // narrow pane cuts the words, not the pill at its edge.
+        let row = Viewport {
             y: screen.y + below_bar,
-            width,
             height: 22.0,
+            ..screen
         };
-        layout::push_rounded_rect(out, pill, 6.0, theme.tab_hover);
-        layout::push_ui_text_centered(out, atlas, pill, &note, theme.status_text);
+        let (_, width) = layout::tag_fit(atlas, &note, row.width);
+        if width > 0.0 {
+            let x = row.x + row.width - width;
+            // Over the session's own text, which a tint alone lets through.
+            let under = Viewport {
+                x,
+                y: row.y + 3.0,
+                width,
+                height: 16.0,
+            };
+            layout::push_rounded_rect(out, under, layout::UI_RADIUS_SM, background);
+            layout::push_tag(out, atlas, x, row, &note, theme.status_text);
+        }
     }
     if let Some((first, total, top)) = kept {
         let place = (first, total, top, rows);
@@ -3339,5 +3821,573 @@ mod tests {
             "too far"
         );
         assert_eq!(mark_at(track, 31.0, lines(), 1000, 100), None, "dropped");
+    }
+
+    /// A panel of tabs titled as given, all listed.
+    fn panel_of(titles: &[&str]) -> Panel {
+        Panel {
+            open: true,
+            tabs: titles
+                .iter()
+                .map(|title| Tab {
+                    title: (*title).to_owned(),
+                    ..tab()
+                })
+                .collect(),
+            ..Panel::default()
+        }
+    }
+
+    fn titles(panel: &Panel) -> Vec<String> {
+        panel.tabs.iter().map(|tab| tab.title.clone()).collect()
+    }
+
+    /// Every place a tab is named by its index names the same session
+    /// after a move as before it: for every size up to seven, every move,
+    /// and every tab each holder could be naming.
+    #[test]
+    fn every_index_names_the_same_session_after_a_move() {
+        let link = || term::Link {
+            url: "https://example.org/plot".into(),
+            spans: vec![(3, 0, 4)],
+        };
+        for len in 1..=7usize {
+            let names: Vec<String> = (0..len).map(|i| format!("t{i}")).collect();
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            for from in 0..len {
+                for to in 0..len {
+                    for at in 0..len {
+                        let other = (at + 1) % len;
+                        let mut panel = panel_of(&names);
+                        panel.active = at;
+                        panel.pair = Some((at, other));
+                        // Every other tab from `at` on, as a workspace's
+                        // tabs lie among the others'.
+                        panel.shown = Some((0..len).filter(|i| i % 2 == at % 2).collect());
+                        panel.mouse_press = Some((at, term::mouse::Button::Left, (1, 2)));
+                        panel.mouse_cell = Some((other, (3, 4)));
+                        panel.link = Some((at, link()));
+                        panel.tab_drag = Some(TabDrag {
+                            tab: at,
+                            start_x: 0.0,
+                            x: 9.0,
+                            y: 0.0,
+                            active: true,
+                        });
+                        panel.closed_active = Some((None, PathBuf::new(), other));
+                        let name = |panel: &Panel, i: usize| panel.tabs[i].title.clone();
+                        let shown = |panel: &Panel| -> Vec<String> {
+                            let mut shown: Vec<String> = panel
+                                .shown
+                                .iter()
+                                .flatten()
+                                .map(|i| name(panel, *i))
+                                .collect();
+                            shown.sort();
+                            shown
+                        };
+                        let before = (
+                            name(&panel, panel.active),
+                            panel.pair.map(|(l, r)| (name(&panel, l), name(&panel, r))),
+                            shown(&panel),
+                            name(&panel, panel.mouse_press.unwrap().0),
+                            name(&panel, panel.mouse_cell.unwrap().0),
+                            name(&panel, panel.link.as_ref().unwrap().0),
+                            name(&panel, panel.tab_drag.unwrap().tab),
+                            name(&panel, panel.closed_active.as_ref().unwrap().2),
+                        );
+                        let mut order: Vec<String> = titles(&panel);
+                        let moving = order.remove(from);
+                        order.insert(to, moving);
+                        assert_eq!(panel.move_tab(from, to), from != to);
+                        let after = (
+                            name(&panel, panel.active),
+                            panel.pair.map(|(l, r)| (name(&panel, l), name(&panel, r))),
+                            shown(&panel),
+                            name(&panel, panel.mouse_press.unwrap().0),
+                            name(&panel, panel.mouse_cell.unwrap().0),
+                            name(&panel, panel.link.as_ref().unwrap().0),
+                            name(&panel, panel.tab_drag.unwrap().tab),
+                            name(&panel, panel.closed_active.as_ref().unwrap().2),
+                        );
+                        let what = format!("{len} tabs, {from} to {to}, holders on {at}");
+                        assert_eq!(titles(&panel), order, "{what}");
+                        assert_eq!(before, after, "{what}");
+                        // What else a press carries is untouched.
+                        assert_eq!(panel.mouse_press.unwrap().2, (1, 2), "{what}");
+                        assert_eq!(panel.mouse_cell.unwrap().1, (3, 4), "{what}");
+                        assert_eq!(panel.link.as_ref().unwrap().1, link(), "{what}");
+                        // The tabs listed stay in the strip's order.
+                        let listed = panel.shown.clone().unwrap();
+                        assert!(listed.is_sorted(), "{what}: {listed:?}");
+                    }
+                }
+            }
+        }
+        // Nothing to move: nothing changes, and it says so.
+        let mut panel = panel_of(&["a", "b"]);
+        panel.active = 1;
+        assert!(!panel.move_tab(0, 2) && !panel.move_tab(2, 0) && !panel.move_tab(1, 1));
+        assert_eq!(
+            (titles(&panel), panel.active),
+            (vec!["a".into(), "b".into()], 1)
+        );
+    }
+
+    /// A workspace's tabs move among themselves wherever the other
+    /// workspaces' tabs lie between them, and those keep their order.
+    #[test]
+    fn a_tab_moves_among_the_tabs_listed_only() {
+        let all = ["o0", "a", "o1", "b", "c", "o2", "d"];
+        let listed = [1usize, 3, 4, 6];
+        let others = |panel: &Panel| -> Vec<String> {
+            let mut names = titles(panel);
+            names.retain(|n| n.starts_with('o'));
+            names
+        };
+        let mine = |panel: &Panel| -> Vec<String> {
+            let mut names = titles(panel);
+            names.retain(|n| !n.starts_with('o'));
+            names
+        };
+        // A drop into every gap, from every place.
+        for place in 0..listed.len() {
+            for slot in 0..=listed.len() {
+                let mut panel = panel_of(&all);
+                panel.shown = Some(listed.to_vec());
+                panel.active = listed[place];
+                let mut want = mine(&panel);
+                let moving = want.remove(place);
+                want.insert(if slot > place { slot - 1 } else { slot }, moving.clone());
+                let stays = slot == place || slot == place + 1;
+                let what = format!("{moving} into gap {slot}");
+                assert_eq!(
+                    panel.drop_tab(&listed, listed[place], slot),
+                    !stays,
+                    "{what}"
+                );
+                assert_eq!(mine(&panel), want, "{what}");
+                assert_eq!(others(&panel), ["o0", "o1", "o2"], "{what}");
+                assert_eq!(panel.tabs[panel.active].title, moving, "{what}");
+                // The same tabs are listed, now in the order asked for.
+                let shown: Vec<String> = panel
+                    .listed()
+                    .iter()
+                    .map(|i| panel.tabs[*i].title.clone())
+                    .collect();
+                assert_eq!(shown, want, "{what}");
+            }
+        }
+        // A step either way, and none past an end.
+        let mut panel = panel_of(&all);
+        panel.shown = Some(listed.to_vec());
+        assert!(panel.step_tab(&listed, 3, 1));
+        assert_eq!(mine(&panel), ["a", "c", "b", "d"]);
+        let listed = panel.listed();
+        assert!(panel.step_tab(&listed, listed[1], -1));
+        assert_eq!(mine(&panel), ["c", "a", "b", "d"]);
+        let listed = panel.listed();
+        assert!(!panel.step_tab(&listed, listed[0], -1), "the first stays");
+        assert!(!panel.step_tab(&listed, listed[3], 1), "the last stays");
+        assert!(!panel.step_tab(&listed, 0, 1), "another workspace's");
+        assert_eq!(mine(&panel), ["c", "a", "b", "d"]);
+        assert_eq!(others(&panel), ["o0", "o1", "o2"]);
+        // Round the tabs listed, from the one showing.
+        panel.active = listed[3];
+        assert_eq!(panel.cycled(&listed, 1), Some(listed[0]));
+        assert_eq!(panel.cycled(&listed, -1), Some(listed[2]));
+        panel.active = 0;
+        assert_eq!(
+            panel.cycled(&listed, 1),
+            None,
+            "the one showing is not listed"
+        );
+        assert_eq!(panel_of(&["only"]).cycled(&[0], 1), None);
+    }
+
+    /// A drag ends with any tab that goes.
+    #[test]
+    fn a_closed_tab_ends_a_drag() {
+        let mut panel = panel_of(&["a", "b", "c"]);
+        panel.tab_drag = Some(TabDrag {
+            tab: 2,
+            start_x: 0.0,
+            x: 0.0,
+            y: 0.0,
+            active: true,
+        });
+        panel.close_tab(0);
+        assert_eq!(panel.tab_drag, None);
+    }
+
+    /// A menu opened on b of a, b, c, as the sidebar's session menu and
+    /// the strip's tab menu keep it: by its id. Another tab closes while
+    /// the menu is open (its program ended), and the menu's Close still
+    /// closes b, not the tab that slid into b's place.
+    #[test]
+    fn a_menus_close_is_its_own_tabs_after_another_closed() {
+        let mut panel = panel_of(&["a", "b", "c"]);
+        let id = panel.id_of(1).expect("b");
+        panel.menu_tab = Some(id.clone());
+        panel.close_tab(0);
+        assert_eq!(titles(&panel), ["b", "c"]);
+        assert_eq!(panel.tab_by_id(&id), Some(0));
+        assert_eq!(panel.menu_tab_index(), Some(0));
+        assert!(panel.close_by_id(&id));
+        assert_eq!(titles(&panel), ["c"], "b went, c stayed");
+        // And after a move: the same session at its new place.
+        let mut panel = panel_of(&["a", "b", "c"]);
+        let id = panel.id_of(1).expect("b");
+        panel.menu_tab = Some(id.clone());
+        assert!(panel.move_tab(1, 2));
+        assert_eq!(panel.menu_tab_index(), Some(2));
+        assert!(panel.close_by_id(&id));
+        assert_eq!(titles(&panel), ["a", "c"]);
+    }
+
+    /// The menu's own tab closed while it was open: its items find no
+    /// tab, and Close closes nothing.
+    #[test]
+    fn a_menus_close_does_nothing_once_its_tab_has_gone() {
+        let mut panel = panel_of(&["a", "b", "c"]);
+        let id = panel.id_of(1).expect("b");
+        panel.menu_tab = Some(id.clone());
+        panel.close_tab(1);
+        assert_eq!(panel.tab_by_id(&id), None);
+        assert_eq!(panel.menu_tab_index(), None);
+        assert!(!panel.close_by_id(&id));
+        assert_eq!(titles(&panel), ["a", "c"], "neither neighbour went");
+        assert_eq!(panel.id_of(7), None);
+    }
+
+    fn header(width: f32) -> Viewport {
+        Viewport {
+            x: 260.0,
+            y: 400.0,
+            width,
+            height: HEADER,
+        }
+    }
+
+    /// What the strip must hold to at any width: no tab past its ends,
+    /// under a button or over another, the new-shell and hide buttons
+    /// inside the header and apart, and the active tab in view.
+    fn check_strip(panel: &Panel, atlas: &mut Atlas, header: Viewport, what: &str) -> Strip {
+        let strip = strip(panel, atlas, header);
+        let hide = header_hide(header);
+        let (hits, new) = header_hits(panel, atlas, header);
+        assert_eq!(new, strip.new, "{what}");
+        assert_eq!(hits.len(), panel.tabs.len(), "{what}");
+        let end = |r: Viewport| r.x + r.width;
+        assert!(
+            new.x >= header.x && end(new) <= hide.x,
+            "{what}: {new:?} {hide:?}"
+        );
+        assert!(end(hide) <= end(header), "{what}: {hide:?}");
+        let mut last = header.x;
+        for (index, (rect, close)) in hits.iter().enumerate() {
+            let listed = panel.listed().contains(&index);
+            if !listed {
+                assert_eq!((rect.width, close.width), (0.0, 0.0), "{what}: tab {index}");
+                continue;
+            }
+            if rect.width == 0.0 {
+                assert_eq!(close.width, 0.0, "{what}: tab {index}");
+                continue;
+            }
+            assert!(
+                rect.x >= last - 0.01,
+                "{what}: tab {index} over the one before"
+            );
+            assert!(
+                end(*rect) <= new.x - layout::UI_GAP + 0.01,
+                "{what}: tab {index} {rect:?} under the button at {new:?}"
+            );
+            assert!(
+                strip.tabs[index].whole.width <= TAB_MAX,
+                "{what}: tab {index}"
+            );
+            if close.width > 0.0 {
+                assert!(
+                    close.x >= rect.x && end(*close) <= end(*rect),
+                    "{what}: tab {index}"
+                );
+            }
+            last = end(*rect);
+        }
+        if panel.showing() && !panel.tabs.is_empty() && strip.area.width >= TAB_MAX {
+            let active = strip.tabs[panel.active];
+            assert_eq!(active.rect, active.whole, "{what}: the active tab is cut");
+            assert!(active.close.width > 0.0, "{what}: its close button is gone");
+        }
+        strip
+    }
+
+    #[test]
+    fn a_few_tabs_are_as_wide_as_their_labels() {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let panel = panel_of(&["zsh", "vim notes.md", "top"]);
+        let strip = check_strip(&panel, &mut atlas, header(900.0), "three");
+        assert_eq!((strip.scroll, strip.max_scroll), (0.0, 0.0));
+        let mut x = 260.0;
+        for (tab, title) in strip.tabs.iter().zip(["zsh", "vim notes.md", "top"]) {
+            let width = layout::ui_text_width(&mut atlas, title) + TAB_CHROME;
+            assert_eq!(tab.rect, tab.whole);
+            assert!((tab.rect.x - x).abs() < 0.01 && (tab.rect.width - width).abs() < 0.01);
+            x += width;
+        }
+        // The new-shell button right after the last, as it has been.
+        assert!((strip.new.x - (x + layout::UI_GAP)).abs() < 0.01);
+        // Another workspace's tab takes no room.
+        let mut panel = panel;
+        panel.shown = Some(vec![0, 2]);
+        panel.active = 2;
+        let strip = check_strip(&panel, &mut atlas, header(900.0), "two of three");
+        assert_eq!(strip.tabs[1].rect.width, 0.0);
+        assert!(
+            (strip.tabs[2].rect.x - strip.tabs[0].rect.x - strip.tabs[0].rect.width).abs() < 0.01
+        );
+        // None listed: the button alone, at the start.
+        panel.shown = Some(Vec::new());
+        let strip = check_strip(&panel, &mut atlas, header(900.0), "none listed");
+        assert_eq!(strip.new.x, 260.0 + layout::UI_GAP);
+    }
+
+    #[test]
+    fn a_long_title_is_cut_in_the_middle_at_the_widest_a_tab_gets() {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let long = "seedlings: watering schedule for the north bed and the cold frame";
+        let mut panel = panel_of(&["zsh", long]);
+        panel.active = 1;
+        let strip = check_strip(&panel, &mut atlas, header(900.0), "long");
+        assert_eq!(strip.tabs[1].whole.width, TAB_MAX);
+        let room = TAB_MAX - TAB_CHROME;
+        let cut = fitted_label(&mut atlas, &panel.tabs[1], room);
+        assert!(
+            cut.starts_with("seedlings") && cut.ends_with("frame"),
+            "{cut}"
+        );
+        assert!(cut.contains('\u{2026}') && layout::ui_text_width(&mut atlas, &cut) <= room);
+        // The count of files to review stays whole after the cut title,
+        // then as the number, and goes only where there is no room.
+        panel.tabs[1].review_files = 12;
+        let cut = fitted_label(&mut atlas, &panel.tabs[1], room);
+        assert!(
+            cut.starts_with("seed") && cut.ends_with(" \u{b7} 12 to review"),
+            "{cut}"
+        );
+        assert!(
+            layout::ui_text_width(&mut atlas, &cut) <= room + 0.5,
+            "{cut}"
+        );
+        let narrow = TAB_MIN - TAB_CHROME;
+        let cut = fitted_label(&mut atlas, &panel.tabs[1], narrow);
+        assert!(
+            cut.ends_with(" \u{b7} 12") && cut.contains('\u{2026}'),
+            "{cut}"
+        );
+        assert!(
+            layout::ui_text_width(&mut atlas, &cut) <= narrow + 0.5,
+            "{cut}"
+        );
+        // A short name is whole at the least a tab shrinks to.
+        assert_eq!(fitted_label(&mut atlas, &panel.tabs[0], narrow), "zsh");
+        let mut waiting = tab();
+        waiting.title = "zsh".into();
+        waiting.attention = Some(String::new());
+        assert_eq!(
+            fitted_label(&mut atlas, &waiting, narrow - dot_width(&waiting)),
+            "zsh"
+        );
+    }
+
+    #[test]
+    fn many_tabs_shrink_and_then_scroll_with_the_buttons_in_sight() {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let names: Vec<String> = (0..12)
+            .map(|i| format!("garden notes and seed orders, bed {i}"))
+            .collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut panel = panel_of(&names);
+        // Wide enough for all at less than their own width: they shrink
+        // to the same width and fill the strip, and nothing scrolls.
+        let wide = header(12.0 * 150.0 + 80.0);
+        let strip_wide = check_strip(&panel, &mut atlas, wide, "shrunk");
+        assert_eq!(strip_wide.max_scroll, 0.0);
+        let width = strip_wide.tabs[0].whole.width;
+        assert!((TAB_MIN..TAB_MAX).contains(&width), "{width}");
+        assert!(
+            strip_wide
+                .tabs
+                .iter()
+                .all(|t| t.whole.width == width && t.rect == t.whole)
+        );
+        assert!(
+            width * 12.0 > strip_wide.area.width - 12.0,
+            "they fill the strip"
+        );
+        // A short one among them keeps its width: the long ones give way.
+        panel.tabs[3].title = "zsh".into();
+        let mixed = check_strip(&panel, &mut atlas, wide, "mixed");
+        let short = layout::ui_text_width(&mut atlas, "zsh") + TAB_CHROME;
+        assert!((mixed.tabs[3].whole.width - short).abs() < 0.01);
+        assert!(mixed.tabs[0].whole.width > width);
+        // Too narrow even at the least: the strip scrolls, the buttons
+        // stay where they are, and whichever tab is active is in view.
+        let narrow = header(700.0);
+        for active in 0..12 {
+            panel.active = active;
+            panel.strip_scroll = 0.0;
+            panel.strip_free = false;
+            let strip = check_strip(&panel, &mut atlas, narrow, &format!("active {active}"));
+            assert!(strip.max_scroll > 0.0);
+            assert!(strip.tabs.iter().all(|t| t.whole.width <= TAB_MIN));
+            let button_end = strip.new.x + strip.new.width + layout::UI_GAP;
+            assert!((button_end - header_hide(narrow).x).abs() < 0.01);
+            // And once settled, the next frame is the same frame.
+            panel.settle_strip(&mut atlas, narrow);
+            assert_eq!(panel.strip_scroll, strip.scroll);
+            assert_eq!(check_strip(&panel, &mut atlas, narrow, "settled"), strip);
+        }
+        // The last is active and the strip at its end. The wheel takes it
+        // back to the start, where it stays though the active tab is out
+        // of sight, until another tab becomes the active one.
+        let most = strip(&panel, &mut atlas, narrow).max_scroll;
+        assert!((panel.strip_scroll - most).abs() < 0.01);
+        panel.scroll_strip(-10_000.0);
+        panel.settle_strip(&mut atlas, narrow);
+        assert_eq!(panel.strip_scroll, 0.0);
+        let scrolled = strip(&panel, &mut atlas, narrow);
+        assert_eq!(scrolled.tabs[11].rect.width, 0.0);
+        assert_eq!(scrolled.tabs[0].rect, scrolled.tabs[0].whole);
+        panel.scroll_strip(10_000.0);
+        panel.settle_strip(&mut atlas, narrow);
+        assert!(
+            (panel.strip_scroll - most).abs() < 0.01,
+            "held to what there is"
+        );
+        panel.scroll_strip(-10_000.0);
+        panel.active = 10;
+        panel.settle_strip(&mut atlas, narrow);
+        let back = check_strip(&panel, &mut atlas, narrow, "another tab");
+        assert!(back.scroll > 0.0 && !panel.strip_free);
+        // Narrower than one tab: nothing past the strip, even so.
+        check_strip(&panel, &mut atlas, header(120.0), "tiny");
+    }
+
+    /// The header drawn with long titles, a waiting tab and review counts,
+    /// fitting, shrunk and scrolled: every label whole or ending in an
+    /// ellipsis, and nothing drawn outside the header.
+    #[test]
+    fn the_header_cuts_no_label_and_draws_inside_itself() {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let theme = Theme::default();
+        let names: Vec<String> = (0..9)
+            .map(|i| format!("harvest log and preserving notes for the autumn, part {i}"))
+            .collect();
+        let mut names: Vec<&str> = names.iter().map(String::as_str).collect();
+        names.insert(2, "zsh");
+        let mut panel = panel_of(&names);
+        panel.tabs[1].review_files = 3;
+        panel.tabs[4].attention = Some("done".into());
+        panel.tabs[4].review_files = 120;
+        for width in [1800.0, 900.0, 500.0, 260.0] {
+            for active in [0, 4, 9] {
+                panel.active = active;
+                let rect = Viewport {
+                    x: 40.0,
+                    y: 300.0,
+                    width,
+                    height: 240.0,
+                };
+                let (header, _) = split(rect);
+                panel.settle_strip(&mut atlas, header);
+                layout::take_cut_labels();
+                let mut out = Vec::new();
+                draw(&panel, None, &mut atlas, rect, &theme, &mut out);
+                let faults = layout::frame_faults(&out, rect);
+                assert!(faults.is_empty(), "{width} wide, tab {active}: {faults:?}");
+                // A drag under way draws its line inside the strip too.
+                panel.tab_drag = Some(TabDrag {
+                    tab: active,
+                    start_x: 0.0,
+                    x: header.x + header.width - 60.0,
+                    y: header.y + 10.0,
+                    active: true,
+                });
+                let mut dragging = Vec::new();
+                draw(&panel, None, &mut atlas, rect, &theme, &mut dragging);
+                let faults = layout::frame_faults(&dragging, rect);
+                assert!(
+                    faults.is_empty(),
+                    "{width} wide, dragging {active}: {faults:?}"
+                );
+                assert!(
+                    dragging
+                        .iter()
+                        .any(|q| q.size == [2.0, HEADER - 8.0] && q.color == theme.accent),
+                    "{width} wide, dragging {active}: no line"
+                );
+                panel.tab_drag = None;
+            }
+        }
+    }
+
+    /// Where a dragged tab would land, from the strip as it is laid out,
+    /// and which way it scrolls a strip that does not fit.
+    #[test]
+    fn a_drag_lands_in_the_gap_nearest_the_pointer() {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let mut panel = panel_of(&["o0", "one", "two", "o1", "three"]);
+        panel.shown = Some(vec![1, 2, 4]);
+        panel.active = 4;
+        let bar = header(900.0);
+        let laid = strip(&panel, &mut atlas, bar);
+        let listed = panel.listed();
+        let mid = |i: usize| laid.tabs[i].whole.x + laid.tabs[i].whole.width * 0.5;
+        assert_eq!(drop_slot(&laid, &listed, bar.x), 0);
+        assert_eq!(drop_slot(&laid, &listed, mid(1) - 1.0), 0);
+        assert_eq!(drop_slot(&laid, &listed, mid(1) + 1.0), 1);
+        assert_eq!(drop_slot(&laid, &listed, mid(2) + 1.0), 2);
+        assert_eq!(drop_slot(&laid, &listed, mid(4) + 1.0), 3);
+        assert_eq!(drop_slot(&laid, &listed, bar.x + 880.0), 3);
+        assert_eq!(drop_line(&laid, &listed, 1), Some(laid.tabs[2].whole.x));
+        let last = laid.tabs[4].whole;
+        assert_eq!(drop_line(&laid, &listed, 3), Some(last.x + last.width));
+        // It fits: no end scrolls it.
+        assert_eq!(drag_scroll(&laid, bar.x - 40.0), 0.0);
+        // The third before the first.
+        assert!(panel.drop_tab(&listed, 4, drop_slot(&laid, &listed, mid(1) - 1.0)));
+        assert_eq!(titles(&panel), ["o0", "three", "one", "two", "o1"]);
+        assert_eq!(panel.tabs[panel.active].title, "three");
+        // Twelve in a narrow strip: its ends scroll it, the middle not.
+        let names: Vec<String> = (0..12).map(|i| format!("bed {i}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let panel = panel_of(&names);
+        let narrow = header(400.0);
+        let laid = strip(&panel, &mut atlas, narrow);
+        assert!(laid.max_scroll > 0.0);
+        assert_eq!(drag_scroll(&laid, narrow.x + 4.0), -1.0);
+        assert_eq!(drag_scroll(&laid, narrow.x - 30.0), -1.0);
+        assert_eq!(drag_scroll(&laid, narrow.x + 200.0), 0.0);
+        assert_eq!(drag_scroll(&laid, laid.area.x + laid.area.width - 4.0), 1.0);
+        assert_eq!(drag_scroll(&laid, narrow.x + 500.0), 1.0);
+    }
+
+    #[test]
+    fn the_report_names_the_tabs_in_the_strips_order() {
+        let mut panel = panel_of(&["one", "two", "three", "other"]);
+        panel.shown = Some(vec![0, 1, 2]);
+        panel.active = 2;
+        assert_eq!(
+            panel.report(),
+            "one,two,*three,(other) pair=- scrolled=no drag=-"
+        );
+        panel.pair = Some((2, 0));
+        panel.move_tab(2, 0);
+        assert_eq!(
+            panel.report(),
+            "*three,one,two,(other) pair=three+one scrolled=no drag=-"
+        );
     }
 }

@@ -18,6 +18,11 @@ pub const BREADCRUMB_HEIGHT: f32 = 30.0;
 /// sidebar panel starts its content this far down.
 pub const SIDEBAR_HEADER_HEIGHT: f32 = 40.0;
 pub const SIDEBAR_ROW_HEIGHT: f32 = 26.0;
+/// How much of its fill a selection in the Explorer keeps while the tree
+/// does not have the keyboard.
+const SIDEBAR_UNFOCUSED_FILL: f32 = 0.6;
+/// How far its text moves from the accent toward plain text then.
+const SIDEBAR_UNFOCUSED_TEXT: f32 = 0.55;
 pub const FIND_ROW_HEIGHT: f32 = 34.0;
 /// The find bar is a panel at most this wide at the top right of the
 /// text (or the terminal's screen), over it rather than taking rows
@@ -2997,18 +3002,39 @@ pub fn build_sidebar_with_edit(
             height: SIDEBAR_ROW_HEIGHT,
             ..viewport
         };
-        if tree.selected == Some(i) {
+        let selected = tree.is_selected(i);
+        let pill = Viewport {
+            x: viewport.x + 6.0,
+            y: y + 1.0,
+            width: (viewport.width - 12.0).max(0.0),
+            height: SIDEBAR_ROW_HEIGHT - 2.0,
+        };
+        // The keyboard's row, while the tree has the keyboard: an outline,
+        // so it can be told from the rest of a selection, and found when
+        // nothing is selected. The fills over it are washes, so the inside
+        // of the ring is put back to the panel's colour first.
+        if tree.focused && tree.cursor_row() == Some(i) {
+            push_rounded_rect(out, pill, UI_RADIUS_SM + 1.0, faded(theme.accent, 0.6));
             push_rounded_rect(
                 out,
                 Viewport {
-                    x: viewport.x + 6.0,
-                    y: y + 1.0,
-                    width: (viewport.width - 12.0).max(0.0),
-                    height: SIDEBAR_ROW_HEIGHT - 2.0,
+                    x: pill.x + 1.0,
+                    y: pill.y + 1.0,
+                    width: (pill.width - 2.0).max(0.0),
+                    height: pill.height - 2.0,
                 },
-                UI_RADIUS_SM + 1.0,
-                theme.sidebar_selected,
+                UI_RADIUS_SM,
+                theme.sidebar_background,
             );
+        }
+        if selected {
+            // Full strength with the keyboard, a step back without it.
+            let fill = if tree.focused {
+                theme.sidebar_selected
+            } else {
+                faded(theme.sidebar_selected, SIDEBAR_UNFOCUSED_FILL)
+            };
+            push_rounded_rect(out, pill, UI_RADIUS_SM + 1.0, fill);
         } else {
             push_row_hover(out, row_rect, theme);
         }
@@ -3053,10 +3079,21 @@ pub fn build_sidebar_with_edit(
             }
         };
         column += chevron_w;
+        // A selected row is in the accent with the keyboard; without it,
+        // in the brightest text colour, so it still reads as picked out.
+        let picked = if tree.focused {
+            theme.accent
+        } else {
+            mixed(
+                theme.accent,
+                theme.sidebar_directory,
+                SIDEBAR_UNFOCUSED_TEXT,
+            )
+        };
         draw_icon(
             icon.glyph,
-            if tree.selected == Some(i) {
-                theme.accent
+            if selected {
+                picked
             } else {
                 dim(theme.status_text)
             },
@@ -3064,8 +3101,8 @@ pub fn build_sidebar_with_edit(
         );
         column += icon_w;
 
-        let color = if tree.selected == Some(i) {
-            theme.accent
+        let color = if selected {
+            picked
         } else if ignored == crate::project::tree::Ignored::Preview {
             // Would be ignored once the .gitignore being typed is saved.
             let [r, g, b, _] = theme.accent;

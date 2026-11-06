@@ -484,6 +484,8 @@ impl State {
             && !self.git.busy()
             && !matches!(self.drag, Some(Drag::Select { point: Some(_), .. }))
             && !(self.terminal.selecting && self.terminal.drag_point.is_some())
+            // A tab held at an end of its strip scrolls it by the frame.
+            && !self.terminal.tab_drag.is_some_and(|drag| drag.active)
             && self.project_search.rx.is_none()
             && self.term_search.as_ref().is_none_or(|s| !s.busy())
             && self

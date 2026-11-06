@@ -670,14 +670,7 @@ impl EditorView {
             if !state.agents.on {
                 return None;
             }
-            let tasks = &state.agents.tasks;
-            let selected = state.agents.selected_index();
-            let mine: Vec<usize> = (0..state.terminal.tabs.len())
-                .filter(|i| {
-                    tasks.is_empty() || task_of(tasks, &state.terminal.tabs[*i]) == selected
-                })
-                .collect();
-            Some(pick_numbered(&mine, number))
+            Some(pick_numbered(&listed_terminals(&state), number))
         });
         match terminal {
             Some(Some(tab)) => self.show_session(tab),
@@ -907,7 +900,7 @@ impl EditorView {
         match hit {
             Some(Action::Session(tab)) => {
                 if let Some(mut state) = self.state_mut() {
-                    state.agents.menu_session = Some(tab);
+                    state.agents.menu_session = state.terminal.id_of(tab);
                 }
                 let menu = context_menu_new(mtm);
                 let add = |title: &str, action: Sel| menu.addItem(&menu_item(mtm, title, action));
@@ -954,16 +947,16 @@ impl EditorView {
 
     /// A session's menu: a new session beside it, in its workspace.
     pub(super) fn agent_session_new(&self, claude: bool) {
-        let Some(tab) = self.state().and_then(|state| state.agents.menu_session) else {
-            return;
-        };
         let dir = {
             let Some(mut state) = self.state_mut() else {
                 return;
             };
-            if tab >= state.terminal.tabs.len() {
+            // The session the menu was opened on, where it is now; gone,
+            // there is no workspace to start one beside it in.
+            let menu = state.agents.menu_session.as_deref();
+            let Some(tab) = menu.and_then(|id| state.terminal.tab_by_id(id)) else {
                 return;
-            }
+            };
             let tasks = state.agents.tasks.clone();
             match task_of(&tasks, &state.terminal.tabs[tab]) {
                 Some(index) => {
@@ -977,14 +970,13 @@ impl EditorView {
         self.spawn_terminal_in(claude, Some(&dir));
     }
 
+    /// A session's menu, Close Session: the session the menu was opened
+    /// on, wherever its tab is by now, and no other when it has gone.
     pub(super) fn agent_close_session(&self) {
-        let Some(tab) = self.state().and_then(|state| state.agents.menu_session) else {
-            return;
-        };
         if let Some(mut state) = self.state_mut()
-            && tab < state.terminal.tabs.len()
+            && let Some(id) = state.agents.menu_session.take()
         {
-            state.terminal.close_tab(tab);
+            state.terminal.close_by_id(&id);
         }
         self.after_terminal_layout();
     }
@@ -1798,6 +1790,22 @@ fn adopt(tab: &mut crate::platform::terminal::Tab, id: &str) {
     if let (Some(dir), Some(held)) = (crate::term::hold::dir(), &tab.held) {
         crate::term::hold::set_workspace(&dir, held, id);
     }
+}
+
+/// The terminals the tab strip lists, in its order: in Agents mode the
+/// selected workspace's (every one while there is no workspace yet), else
+/// all of them. Worked out now, as the frame does, so a tab opened since
+/// the last frame counts.
+pub(super) fn listed_terminals(state: &State) -> Vec<usize> {
+    let tasks = &state.agents.tasks;
+    let selected = state.agents.selected_index();
+    (0..state.terminal.tabs.len())
+        .filter(|i| {
+            !state.agents.on
+                || tasks.is_empty()
+                || task_of(tasks, &state.terminal.tabs[*i]) == selected
+        })
+        .collect()
 }
 
 /// The `number`th of `items` (1 based), 9 the last, as browsers have it.

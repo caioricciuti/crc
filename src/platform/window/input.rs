@@ -443,6 +443,11 @@ impl EditorView {
             }
             return self.terminal_key(event);
         }
+        // The Explorer's tree, once pressed, has the keys until it gives
+        // them back: nothing typed there reaches the document.
+        if self.handle_tree_key(event) {
+            return true;
+        }
         if self
             .state()
             .is_some_and(|state| preview_only(&state) && !field_has_keys(&state))
@@ -459,10 +464,13 @@ impl EditorView {
             return true;
         }
         // Typing goes to the document, so the tree no longer has the keys.
+        // A name being typed in the tree is the tree's: the keys are back
+        // there when its field closes.
         if !event
             .modifierFlags()
             .contains(NSEventModifierFlags::Command)
             && let Some(mut state) = self.state_mut()
+            && state.sidebar_edit.is_none()
         {
             state.sidebar_keys = false;
         }

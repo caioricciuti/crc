@@ -1267,8 +1267,10 @@ pub struct Panel {
     /// The workspace whose sessions the terminal shows, by
     /// [`Workspace::id`].
     pub selected: Option<String>,
-    /// The session a context menu was opened on.
-    pub menu_session: Option<usize>,
+    /// The session a context menu was opened on, by its tab's id: tabs
+    /// can close while the menu is open, and its items act on that
+    /// session or on none.
+    pub menu_session: Option<String>,
     /// The folder workspace the palette is renaming, by id.
     pub renaming: Option<String>,
     /// The repository an inspector button acts on, when the workspace has

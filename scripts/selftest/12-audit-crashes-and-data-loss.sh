@@ -333,11 +333,41 @@ if [ "$(readlink "$T/moveproj/holder/source.txt")" != 'missing-target' ] || [ ! 
     fail=1
 fi
 rm "$T/moveproj/holder/source.txt"
-HOME="$T/movehome" CRC_SELFTEST="$T/move.script" "$BIN" "$T/moveproj" 2> "$T/move-allowed.err"
-if [ -e "$T/moveproj/source.txt" ] || [ "$(cat "$T/moveproj/holder/source.txt")" != 'personal sample' ]; then
+# This time the file has local history when it is dragged: it is opened,
+# edited and saved first. What was kept for it has to be under its new path
+# after the move, where the moved file finds it, and not left at the old one.
+cat > "$T/move-history.script" <<SCRIPT
+wait 400
+key 35 cmd p
+text source.txt
+key 36
+wait 300
+text a
+key 1 cmd s
+wait 400
+down 104 127
+drag 104 101
+up 104 101
+wait 600
+quit
+SCRIPT
+HOME="$T/movehome" CRC_SELFTEST="$T/move-history.script" "$BIN" "$T/moveproj" 2> "$T/move-allowed.err"
+if [ -e "$T/moveproj/source.txt" ] || [ "$(cat "$T/moveproj/holder/source.txt")" != 'apersonal sample' ]; then
     echo 'FAIL: native sidebar drag did not move into a clear folder'
     fail=1
 fi
+# move_rows <path in the project>: reason:size of each version kept for it,
+# oldest first.
+move_rows() {
+    /usr/bin/sqlite3 "$CRC_HISTORY_DB" "SELECT group_concat(row, ' ') FROM (
+        SELECT s.reason || ':' || b.size AS row FROM snapshots s
+        JOIN files f ON f.id = s.file JOIN blobs b ON b.id = s.blob
+        WHERE f.path LIKE '%/moveproj/$1' ORDER BY s.id)" 2>&1
+}
+[ "$(move_rows holder/source.txt)" = "1:16 2:17" ] \
+    || failed "move: history at the new path is [$(move_rows holder/source.txt)], expected [1:16 2:17]"
+[ -z "$(move_rows source.txt)" ] \
+    || failed "move: history was left at the old path: [$(move_rows source.txt)]"
 
 # Quick Look previews stay inside the app as read-only tabs.
 printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a1ZkAAAAASUVORK5CYII=' | base64 -D > "$T/picture.png"

@@ -174,7 +174,12 @@ the size and write it back.
   shell; type `claude` to start Claude Code. `Cmd-T` (or the tab bar's
   +) opens another terminal in the selected workspace; `Ctrl-1..9` show
   a workspace and `Cmd-Shift-U` the next session waiting on you, which
-  the Dock icon counts. The list keeps your order (pinned, then dragged,
+  the Dock icon counts. Drag a terminal's tab to put it elsewhere among
+  its workspace's tabs, or right-click it to move it or close the
+  others; a long title is shortened in its middle, a strip too crowded
+  to show whole scrolls with the + still in reach, and the order of the
+  tabs is kept across a relaunch.
+  The list keeps your order (pinned, then dragged,
   then as made); nothing a terminal does moves a row. It is read again
   every minute, and pull requests on their own: every 20 s while checks
   run, every minute with open ones, and right after a push.
@@ -370,6 +375,12 @@ the size and write it back.
   version again, and Git > Clear History for This File or Clear All
   Local History deletes what was kept, after asking.
 - **Split panes** (`Cmd-\`), up to four, each with its own tabs.
+- **Explorer** in the sidebar: the project's files as a tree. Several
+  items can be selected (`Cmd`-click, Shift-click) and moved to the Trash
+  or have their paths copied together, with one question for all of them.
+  A click on a file opens it and the keyboard stays in the document; a
+  click on a folder, or View > Focus Explorer, puts it in the tree, where
+  the arrows move, Return renames and typing jumps to a name.
 - **Search view** (`Cmd-Shift-F`) in the sidebar: the project searched as
   you type, listed by file and line with each match marked, folding
   files, files to include and exclude, and Replace All; `Cmd-P` fuzzy
@@ -525,7 +536,15 @@ the size and write it back.
 | `>` in `Cmd-P` | run a menu command |
 | `Cmd-N` | new file: a name field in the sidebar |
 | `Cmd-B` | toggle sidebar |
+| View > Focus Explorer | the keyboard in the Explorer's tree, on the open file's row |
+| `Cmd`-click, Shift-click in the Explorer | select several items |
+| arrows, Left / Right in the Explorer | move; close or open a folder, step out of it or into it |
+| Return or `F2` in the Explorer | rename in place |
+| Space / `Cmd-Down` in the Explorer | open and stay in the tree / open and move to the document |
+| type in the Explorer | jump to the next name that starts with it |
+| `Cmd-Delete` in the Explorer | move the selection to the Trash, after asking |
 | `Cmd-1..9`, `Cmd-[`, `Cmd-]` | switch tabs |
+| `Cmd-Shift-[`, `Cmd-Shift-]` | move the tab left or right: the terminal's while it has the keyboard, else the document's |
 | drag a tab, or right-click it | reorder or manage tabs |
 | scroll over the tab strip | reveal overflowed tabs |
 | double-click empty tab strip | new file |

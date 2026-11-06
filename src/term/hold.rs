@@ -106,6 +106,10 @@ pub struct Left {
     /// The workspace it was in when the window let go, which a rename or
     /// an adoption may have changed since it started; empty for none.
     pub workspace: String,
+    /// Its place among the tabs, which a drag along the strip may have
+    /// changed since it started. None in a record written before tabs
+    /// could be moved: those come back in the order they were started.
+    pub order: Option<usize>,
 }
 
 fn escape(value: &str) -> String {
@@ -194,13 +198,17 @@ impl Spec {
 
 impl Left {
     pub fn to_text(&self) -> String {
-        format!(
+        let mut out = format!(
             "events_read={}\nactive={}\nagent={}\nworkspace={}\n",
             self.events_read,
             if self.active { "1" } else { "0" },
             if self.agent { "1" } else { "0" },
             escape(&self.workspace)
-        )
+        );
+        if let Some(order) = self.order {
+            out.push_str(&format!("order={order}\n"));
+        }
+        out
     }
 
     pub fn parse(text: &str) -> Left {
@@ -211,11 +219,20 @@ impl Left {
                 "active" => left.active = value == "1",
                 "agent" => left.agent = value == "1",
                 "workspace" => left.workspace = value,
+                "order" => left.order = value.parse().ok(),
                 _ => {}
             }
         }
         left
     }
+}
+
+/// Sessions found on disk, oldest first, into the order their tabs were
+/// left in: by the place each was written with, and those written without
+/// one (by a crc from before tabs could be moved, or never let go of)
+/// after them, still oldest first.
+pub fn in_tab_order(found: &mut [Found]) {
+    found.sort_by_key(|(_, _, left)| left.order.unwrap_or(usize::MAX));
 }
 
 /// A message either way over the socket.
@@ -866,8 +883,53 @@ mod tests {
             active: true,
             agent: true,
             workspace: "folder:notes".into(),
+            order: Some(3),
         };
         assert_eq!(Left::parse(&left.to_text()), left);
+    }
+
+    #[test]
+    fn tabs_come_back_in_the_order_they_were_left_in() {
+        let found = |id: &str, order: Option<usize>| -> Found {
+            let left = Left {
+                order,
+                ..Left::default()
+            };
+            // Through its file, as the next window reads it.
+            (id.to_owned(), Spec::default(), Left::parse(&left.to_text()))
+        };
+        let ids =
+            |found: &[Found]| -> Vec<String> { found.iter().map(|(id, ..)| id.clone()).collect() };
+        // Started a, b, c, d; the third dragged before the first.
+        let mut moved = [
+            found("a", Some(1)),
+            found("b", Some(2)),
+            found("c", Some(0)),
+            found("d", Some(3)),
+        ];
+        in_tab_order(&mut moved);
+        assert_eq!(ids(&moved), ["c", "a", "b", "d"]);
+        // A record from before the order was written has none, and says
+        // so by leaving the line out: the order they were started in.
+        let old = "events_read=7\nactive=1\nagent=0\nworkspace=folder:notes\n";
+        let left = Left::parse(old);
+        assert_eq!(left.order, None);
+        assert_eq!((left.events_read, left.active), (7, true));
+        assert_eq!(left.to_text(), old, "and is written back as it was");
+        let mut old = [found("a", None), found("b", None), found("c", None)];
+        in_tab_order(&mut old);
+        assert_eq!(ids(&old), ["a", "b", "c"]);
+        // One never let go of (a crash) comes after those that were.
+        let mut mixed = [
+            found("a", None),
+            found("b", Some(1)),
+            found("c", Some(0)),
+            found("d", None),
+        ];
+        in_tab_order(&mut mixed);
+        assert_eq!(ids(&mixed), ["c", "b", "a", "d"]);
+        // A place that is not a number is no place.
+        assert_eq!(Left::parse("order=first\n").order, None);
     }
 
     #[test]

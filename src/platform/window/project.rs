@@ -379,6 +379,9 @@ impl EditorView {
                 // add, not push: the file may already be open.
                 Ok(buffer) => {
                     state.docs.add(buffer);
+                    // Typing goes to the new file, not back to the tree
+                    // its name was typed in.
+                    state.sidebar_keys = false;
                     uncover_column(&mut state);
                     let said = format!("created {}", state.name_for(path));
                     state.tell(Said::new(layout::Feedback::Success, said).detail(shown_path(path)));
@@ -412,6 +415,10 @@ impl EditorView {
             } = &mut *state;
             let open = std::iter::once(docs).chain(panes.iter_mut().map(|p| &mut p.docs));
             let moved = move_project_item(open, history, path, destination);
+            if moved.is_ok() {
+                // The Explorer's selection stays on the item.
+                state.tree.follow_move(path, destination);
+            }
             state.message = Some((
                 match &moved {
                     Ok(()) => done,

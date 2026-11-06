@@ -512,7 +512,7 @@ mod tests {
         let mut tree = Tree::new();
         tree.open(&root);
         let dist = tree.rows().iter().position(|e| e.name == "dist").unwrap();
-        tree.selected = None;
+        tree.clear_selection();
         tree.toggle(dist);
         let theme = Theme::default();
         let rect = Viewport::new(260.0, 500.0);

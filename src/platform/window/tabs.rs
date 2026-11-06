@@ -93,6 +93,33 @@ impl EditorView {
         }
     }
 
+    /// Move Tab Left and Right: the terminal showing a place along its
+    /// strip while the terminal has the keys, else the document in front
+    /// along the editor's. Not past either end.
+    pub(super) fn move_focused_tab(&self, step: isize) {
+        if self.terminal_has_keys() {
+            self.step_terminal_tab(false, step);
+            return;
+        }
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
+        // Agents mode shows no document strip to move one along.
+        if state.agents.on {
+            return;
+        }
+        let from = state.docs.active_index();
+        let Some(to) = from.checked_add_signed(step) else {
+            return;
+        };
+        if state.docs.move_tab(from, to) {
+            reveal_active_tab(&mut state);
+            drop(state);
+            self.request_redraw();
+            self.pump();
+        }
+    }
+
     /// Closes a tab, asking about unsaved changes first.
     pub(super) fn close_tab(&self, index: usize) {
         // Closing a review is answering it.

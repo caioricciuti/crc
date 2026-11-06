@@ -9,7 +9,13 @@
 //! watches the filesystem yet, so [`Tree::refresh`] exists for the cases
 //! where we know something changed.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+/// How long typed letters are kept as one prefix: after a pause this long
+/// the next letter starts a new one.
+const TYPE_AHEAD_RESET: Duration = Duration::from_millis(1000);
 
 /// Moves a project item without replacing any entry already at `destination`.
 ///
@@ -58,8 +64,24 @@ pub struct Entry {
 pub struct Tree {
     root: Option<PathBuf>,
     rows: Vec<Entry>,
-    /// Which row is highlighted, as an index into `rows`.
-    pub selected: Option<usize>,
+    /// The selected items, by path: rows come and go above them (a refresh,
+    /// a folder opening or closing), and an index would then point at
+    /// something else. Every one of them has a row; see [`Tree::settle`].
+    selection: HashSet<PathBuf>,
+    /// Where a Shift-click or Shift-arrow range is measured from.
+    anchor: Option<PathBuf>,
+    /// The keyboard's item, and the one a single-item command acts on.
+    /// While anything is selected it is one of the selected items.
+    cursor: Option<PathBuf>,
+    /// The row showing `cursor`, kept in step by [`Tree::settle`], so
+    /// neither drawing nor a key press has to search for it.
+    cursor_row: Option<usize>,
+    /// Whether the tree has the keyboard: the selection is drawn at full
+    /// strength and the cursor row is outlined. Set by the window.
+    pub focused: bool,
+    /// The letters typed to jump to a name, lower-cased, and when the last
+    /// one was typed.
+    typed: Option<(String, Instant)>,
     /// First visible row.
     pub scroll: usize,
     /// What Git ignores under the root, from [`crate::project::git::ignored`].
@@ -108,7 +130,7 @@ impl Tree {
         let root = root.into();
         self.rows = read_dir(&root, 0);
         self.root = Some(root);
-        self.selected = None;
+        self.clear_selection();
         self.scroll = 0;
     }
 
@@ -116,7 +138,7 @@ impl Tree {
     pub fn set_root(&mut self, root: impl Into<PathBuf>) {
         self.root = Some(root.into());
         self.rows.clear();
-        self.selected = None;
+        self.clear_selection();
         self.scroll = 0;
         self.ignored = Default::default();
         self.preview.clear();
@@ -170,7 +192,6 @@ impl Tree {
             .filter(|e| e.is_dir && e.expanded)
             .map(|e| e.path.clone())
             .collect();
-        let selected_path = self.selected_path();
 
         self.rows = read_dir(&root, 0);
         // Re-expand outermost-first, so nested paths exist by the time they
@@ -179,11 +200,11 @@ impl Tree {
         wanted.sort_by_key(|p| p.components().count());
         for path in wanted {
             if let Some(i) = self.rows.iter().position(|e| e.path == path) {
-                self.expand(i);
+                self.splice_children(i);
             }
         }
 
-        self.selected = self.row_of(selected_path);
+        self.settle(true);
     }
 
     /// Closes every expanded directory, leaving the top level showing.
@@ -193,7 +214,6 @@ impl Tree {
         if self.root.is_none() {
             return;
         }
-        let selected_path = self.selected_path();
         // The entries are already in memory. Collapse must not rescan a large
         // project on the AppKit event thread or silently act as Refresh.
         self.rows.retain(|entry| entry.depth == 0);
@@ -202,8 +222,8 @@ impl Tree {
         }
         self.scroll = 0;
         // A selection inside a directory that is now closed has no row to
-        // point at; keep it only if its row survived.
-        self.selected = self.row_of(selected_path);
+        // point at; keep only what still has one.
+        self.settle(false);
     }
 
     /// Expands or collapses the directory at `index`.
@@ -235,49 +255,372 @@ impl Tree {
         else {
             return false;
         };
-        let selected_path = self.selected_path();
         self.rows[index].expanded = true;
         self.rows.splice(index + 1..index + 1, children);
-        self.selected = self.row_of(selected_path);
+        self.settle(true);
         true
     }
 
     fn expand(&mut self, index: usize) {
-        let Some(entry) = self.rows.get(index) else {
-            return;
-        };
-        if !entry.is_dir || entry.expanded {
-            return;
+        if self.splice_children(index) {
+            self.settle(true);
         }
-        let children = read_dir(&entry.path, entry.depth + 1);
-        let selected = self.selected_path();
-        self.rows[index].expanded = true;
-        self.rows.splice(index + 1..index + 1, children);
-        self.reselect(selected, index);
     }
 
-    pub fn selected_path(&self) -> Option<PathBuf> {
-        self.selected
-            .and_then(|i| self.rows.get(i))
-            .map(|e| e.path.clone())
+    /// Reads the directory at `index` and puts its children below it.
+    /// Whether it did; the caller settles the selection.
+    fn splice_children(&mut self, index: usize) -> bool {
+        let Some(entry) = self.rows.get(index) else {
+            return false;
+        };
+        if !entry.is_dir || entry.expanded {
+            return false;
+        }
+        let children = read_dir(&entry.path, entry.depth + 1);
+        self.rows[index].expanded = true;
+        self.rows.splice(index + 1..index + 1, children);
+        true
     }
 
     /// The row showing `path`, if one does.
-    fn row_of(&self, path: Option<PathBuf>) -> Option<usize> {
-        path.and_then(|path| self.rows.iter().position(|e| e.path == path))
+    fn row_of(&self, path: &Path) -> Option<usize> {
+        self.rows.iter().position(|e| e.path == path)
     }
 
-    /// The selection follows its row when rows are added or removed above
-    /// it; a row that went (inside a collapsed folder) hands it to `fallback`.
-    fn reselect(&mut self, path: Option<PathBuf>, fallback: usize) {
-        if let Some(path) = path {
-            self.selected = Some(
-                self.rows
-                    .iter()
-                    .position(|e| e.path == path)
-                    .unwrap_or(fallback),
-            );
+    /// Brings the selection back in step with the rows after they changed.
+    /// What has no row any more is no longer selected: a command must never
+    /// act on an item that is not showing. A cursor whose row went (inside
+    /// a folder now closed, or deleted) is handed to the nearest folder
+    /// above it that still shows when `hand_over`, and dropped otherwise.
+    fn settle(&mut self, hand_over: bool) {
+        let was_selected = self
+            .cursor
+            .as_ref()
+            .is_some_and(|cursor| self.selection.contains(cursor));
+        if !self.selection.is_empty() {
+            let mut before = std::mem::take(&mut self.selection);
+            for entry in &self.rows {
+                if let Some(path) = before.take(&entry.path) {
+                    self.selection.insert(path);
+                }
+            }
         }
+        self.cursor_row = None;
+        if let Some(cursor) = self.cursor.take() {
+            let root = self.root.as_deref();
+            let mut at = Some(cursor.as_path());
+            while let Some(path) = at.filter(|path| Some(*path) != root) {
+                if let Some(index) = self.row_of(path) {
+                    self.cursor_row = Some(index);
+                    break;
+                }
+                if !hand_over {
+                    break;
+                }
+                at = path.parent();
+            }
+            if let Some(index) = self.cursor_row {
+                let path = self.rows[index].path.clone();
+                if was_selected {
+                    self.selection.insert(path.clone());
+                }
+                self.cursor = Some(path);
+            }
+        }
+        // The cursor went and other items are still selected: the first of
+        // them has it now.
+        if self.cursor_row.is_none()
+            && let Some(index) = (0..self.rows.len()).find(|&i| self.is_selected_path(i))
+        {
+            self.cursor = Some(self.rows[index].path.clone());
+            self.cursor_row = Some(index);
+        }
+        if !self
+            .anchor
+            .as_deref()
+            .is_some_and(|anchor| self.row_of(anchor).is_some())
+        {
+            self.anchor = self.cursor.clone();
+        }
+    }
+
+    /// The cursor's row: where the keyboard is in the tree.
+    pub fn cursor_row(&self) -> Option<usize> {
+        self.cursor_row
+    }
+
+    /// Whether the row at `index` is selected. Asked for every row drawn,
+    /// so the usual case, one item selected, does not hash a path.
+    pub fn is_selected(&self, index: usize) -> bool {
+        match self.selection.len() {
+            0 => false,
+            1 => self.cursor_row == Some(index),
+            _ => self
+                .rows
+                .get(index)
+                .is_some_and(|entry| self.selection.contains(&entry.path)),
+        }
+    }
+
+    /// How many items are selected.
+    pub fn selection_len(&self) -> usize {
+        self.selection.len()
+    }
+
+    /// The cursor's entry while it is selected: the one item a command for
+    /// one item (Rename, New File) acts on.
+    fn primary(&self) -> Option<&Entry> {
+        if self.selection.is_empty() {
+            return None;
+        }
+        self.cursor_row.and_then(|index| self.rows.get(index))
+    }
+
+    /// The one item a single-item command acts on: the cursor's.
+    pub fn selected_path(&self) -> Option<PathBuf> {
+        self.primary().map(|entry| entry.path.clone())
+    }
+
+    /// Every selected item, top to bottom as the rows show them.
+    pub fn selected_paths(&self) -> Vec<PathBuf> {
+        (0..self.rows.len())
+            .filter(|&index| self.is_selected(index))
+            .map(|index| self.rows[index].path.clone())
+            .collect()
+    }
+
+    /// What a command on the selection acts on: the selected items, less
+    /// those inside a folder that is selected too, since moving or trashing
+    /// the folder takes them with it. Top to bottom.
+    pub fn selected_roots(&self) -> Vec<PathBuf> {
+        let mut roots: Vec<PathBuf> = Vec::new();
+        for path in self.selected_paths() {
+            // Rows list a folder before what is in it, so anything nested
+            // comes straight after the folder kept last.
+            if roots.last().is_none_or(|kept| !path.starts_with(kept)) {
+                roots.push(path);
+            }
+        }
+        roots
+    }
+
+    /// Selects nothing and leaves the keyboard nowhere.
+    pub fn clear_selection(&mut self) {
+        self.selection.clear();
+        self.anchor = None;
+        self.cursor = None;
+        self.cursor_row = None;
+        self.typed = None;
+    }
+
+    /// Cmd-click: adds the row at `index` to the selection, or takes it
+    /// out. The next Shift range starts from it either way.
+    pub fn toggle_selected(&mut self, index: usize) {
+        let Some(entry) = self.rows.get(index) else {
+            return;
+        };
+        let path = entry.path.clone();
+        self.anchor = Some(path.clone());
+        if self.selection.remove(&path) {
+            // The cursor stays among what is selected: the next selected
+            // row below, or else above. With nothing left it rests here.
+            let near = (index + 1..self.rows.len())
+                .chain((0..index).rev())
+                .find(|&row| self.is_selected_path(row));
+            let row = near.unwrap_or(index);
+            self.cursor = Some(self.rows[row].path.clone());
+            self.cursor_row = Some(row);
+        } else {
+            self.selection.insert(path.clone());
+            self.cursor = Some(path);
+            self.cursor_row = Some(index);
+        }
+    }
+
+    /// [`Tree::is_selected`] by the set alone, for while the cursor is
+    /// being moved and cannot stand in for a single selection.
+    fn is_selected_path(&self, index: usize) -> bool {
+        self.rows
+            .get(index)
+            .is_some_and(|entry| self.selection.contains(&entry.path))
+    }
+
+    /// A right-click on the row at `index`: one of the selected rows keeps
+    /// the selection, so a command from the menu acts on all of it, and
+    /// only the cursor moves there; any other row is selected alone.
+    pub fn select_for_menu(&mut self, index: usize) {
+        if self.is_selected(index) {
+            self.cursor = Some(self.rows[index].path.clone());
+            self.cursor_row = Some(index);
+        } else {
+            self.select(index);
+        }
+    }
+
+    /// Shift-click and Shift-arrows: selects the rows from the anchor to
+    /// `index`, which the cursor moves to. The anchor stays.
+    pub fn select_to(&mut self, index: usize) {
+        if index >= self.rows.len() {
+            return;
+        }
+        let anchor = self
+            .anchor
+            .as_deref()
+            .and_then(|anchor| self.row_of(anchor))
+            .or(self.cursor_row)
+            .unwrap_or(index);
+        self.selection.clear();
+        for entry in &self.rows[anchor.min(index)..=anchor.max(index)] {
+            self.selection.insert(entry.path.clone());
+        }
+        self.anchor = Some(self.rows[anchor].path.clone());
+        self.cursor = Some(self.rows[index].path.clone());
+        self.cursor_row = Some(index);
+    }
+
+    /// Selects every row showing. The cursor stays where it is.
+    pub fn select_all(&mut self) {
+        if self.rows.is_empty() {
+            return;
+        }
+        self.selection = self.rows.iter().map(|e| e.path.clone()).collect();
+        let row = self.cursor_row.unwrap_or(0);
+        self.cursor = Some(self.rows[row].path.clone());
+        self.cursor_row = Some(row);
+        self.anchor = self.cursor.clone();
+    }
+
+    /// Escape: several items selected become the cursor's alone. Whether
+    /// there was anything to reduce.
+    pub fn reduce_selection(&mut self) -> bool {
+        if self.selection.len() < 2 {
+            return false;
+        }
+        match self.cursor_row {
+            Some(row) => {
+                self.select(row);
+            }
+            None => self.clear_selection(),
+        }
+        true
+    }
+
+    /// Moves the cursor to `index`: selecting that row alone, or with
+    /// `extend` (Shift) the rows from the anchor to it.
+    pub fn move_cursor(&mut self, index: usize, extend: bool) {
+        if extend {
+            self.select_to(index);
+        } else {
+            self.select(index);
+        }
+    }
+
+    /// Moves the cursor `delta` rows, stopping at the first and the last.
+    /// With no cursor yet, down starts at the first row and up at the last.
+    pub fn step_cursor(&mut self, delta: isize, extend: bool) {
+        let Some(last) = self.rows.len().checked_sub(1) else {
+            return;
+        };
+        let to = match self.cursor_row {
+            Some(row) => (row as isize).saturating_add(delta).clamp(0, last as isize) as usize,
+            None if delta < 0 => last,
+            None => 0,
+        };
+        self.move_cursor(to, extend);
+    }
+
+    /// The row of the folder holding the row at `index`, for Left.
+    pub fn parent_row(&self, index: usize) -> Option<usize> {
+        let depth = self.rows.get(index)?.depth;
+        self.rows[..index].iter().rposition(|e| e.depth < depth)
+    }
+
+    /// The first row inside the open folder at `index`, for Right.
+    pub fn first_child_row(&self, index: usize) -> Option<usize> {
+        let entry = self.rows.get(index)?;
+        let child = self.rows.get(index + 1)?;
+        (entry.is_dir && entry.expanded && child.depth > entry.depth).then_some(index + 1)
+    }
+
+    /// A letter typed while the tree has the keyboard: the cursor jumps to
+    /// the next row whose name starts with what has been typed since the
+    /// last pause, whatever its case. Whether a row was found.
+    pub fn type_ahead(&mut self, letter: char, now: Instant) -> bool {
+        let mut prefix = match self.typed.take() {
+            Some((typed, at)) if now.saturating_duration_since(at) < TYPE_AHEAD_RESET => typed,
+            _ => String::new(),
+        };
+        prefix.extend(letter.to_lowercase());
+        let found = self.jump_to_prefix(&prefix);
+        self.typed = Some((prefix, now));
+        found
+    }
+
+    /// Whether letters typed before `now` are still being added to: a
+    /// space then belongs to the name being typed.
+    pub fn typing_ahead(&self, now: Instant) -> bool {
+        self.typed
+            .as_ref()
+            .is_some_and(|(_, at)| now.saturating_duration_since(*at) < TYPE_AHEAD_RESET)
+    }
+
+    fn jump_to_prefix(&mut self, prefix: &str) -> bool {
+        let len = self.rows.len();
+        let Some(first) = prefix.chars().next() else {
+            return false;
+        };
+        // One letter, or the same one again, steps on to the next name that
+        // starts with it. A longer prefix stays on a row it already fits.
+        let stepping = prefix.chars().all(|c| c == first);
+        let prefix = if stepping {
+            &prefix[..first.len_utf8()]
+        } else {
+            prefix
+        };
+        let start = match self.cursor_row {
+            Some(row) if stepping => row + 1,
+            Some(row) => row,
+            None => 0,
+        };
+        let hit = (0..len)
+            .map(|offset| (start + offset) % len)
+            .find(|&row| starts_with_lowered(&self.rows[row].name, prefix));
+        match hit {
+            Some(row) => {
+                self.select(row);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// An item was renamed or moved, from `from` to `to`: what was selected
+    /// at the old path, or under it, is selected at the new one, so the
+    /// selection is still on the item when the tree is read again.
+    pub fn follow_move(&mut self, from: &Path, to: &Path) {
+        let moved = |path: &Path| path.strip_prefix(from).ok().map(|rest| to.join(rest));
+        self.selection = std::mem::take(&mut self.selection)
+            .into_iter()
+            .map(|path| moved(&path).unwrap_or(path))
+            .collect();
+        for path in [&mut self.anchor, &mut self.cursor].into_iter().flatten() {
+            if let Some(now) = moved(path) {
+                *path = now;
+            }
+        }
+    }
+
+    /// Takes the selection, the keyboard and the scroll position of
+    /// `live`, the tree that was showing while this one was read on a
+    /// worker: what was clicked or typed meanwhile is not lost.
+    pub fn adopt_selection(&mut self, live: &Tree) {
+        self.selection = live.selection.clone();
+        self.anchor = live.anchor.clone();
+        self.cursor = live.cursor.clone();
+        self.typed = live.typed.clone();
+        self.focused = live.focused;
+        self.scroll = live.scroll;
+        self.settle(true);
     }
 
     fn collapse(&mut self, index: usize) {
@@ -295,28 +638,32 @@ impl Tree {
             .position(|e| e.depth <= depth)
             .map(|offset| index + 1 + offset)
             .unwrap_or(self.rows.len());
-        let selected = self.selected_path();
         self.rows.drain(index + 1..end);
         self.rows[index].expanded = false;
-        self.reselect(selected, index);
+        // A cursor that was inside is on the folder now.
+        self.settle(true);
     }
 
     /// The directory new files should land in: the selected directory, the
-    /// parent of the selected file, or the root.
+    /// parent of the selected file, or the root. With several selected, the
+    /// cursor's.
     pub fn target_dir(&self) -> Option<PathBuf> {
-        match self.selected.and_then(|i| self.rows.get(i)) {
+        match self.primary() {
             Some(e) if e.is_dir => Some(e.path.clone()),
             Some(e) => e.path.parent().map(Path::to_path_buf),
             None => self.root.clone(),
         }
     }
 
-    /// Selects the row at `index`, if it exists.
+    /// Selects the row at `index` alone, if it exists: the cursor and the
+    /// anchor are there too.
     pub fn select(&mut self, index: usize) -> Option<&Entry> {
-        if index >= self.rows.len() {
-            return None;
-        }
-        self.selected = Some(index);
+        let path = self.rows.get(index)?.path.clone();
+        self.selection.clear();
+        self.selection.insert(path.clone());
+        self.anchor = Some(path.clone());
+        self.cursor = Some(path);
+        self.cursor_row = Some(index);
         self.rows.get(index)
     }
 
@@ -340,14 +687,14 @@ impl Tree {
             if i + 1 < components.len() {
                 self.expand(index);
             } else {
-                self.selected = Some(index);
+                self.select(index);
             }
         }
     }
 
-    /// Keeps the selected row inside a viewport of `rows` rows.
+    /// Keeps the cursor's row inside a viewport of `rows` rows.
     pub fn scroll_to_selection(&mut self, rows: usize) {
-        let Some(selected) = self.selected else {
+        let Some(selected) = self.cursor_row else {
             return;
         };
         if selected < self.scroll {
@@ -362,6 +709,14 @@ impl Tree {
         let next = self.scroll as isize + delta;
         self.scroll = next.clamp(0, max as isize) as usize;
     }
+}
+
+/// Whether `name` starts with `prefix`, which is already lower-case,
+/// whatever the case of `name`. Compared letter by letter: this runs for
+/// every row on a key press and must not build a string for each.
+fn starts_with_lowered(name: &str, prefix: &str) -> bool {
+    let mut letters = name.chars().flat_map(char::to_lowercase);
+    prefix.chars().all(|c| letters.next() == Some(c))
 }
 
 /// Reads one directory into rows, sorted directories-first then by name.
@@ -538,7 +893,10 @@ mod tests {
         t.open(&f.0);
         t.reveal(&f.0.join("src/nested/deep.rs"));
 
-        let selected = t.selected.and_then(|i| t.rows().get(i)).expect("selected");
+        let selected = t
+            .cursor_row()
+            .and_then(|i| t.rows().get(i))
+            .expect("selected");
         assert_eq!(selected.name, "deep.rs");
         assert!(t.rows().iter().any(|e| e.name == "nested" && e.expanded));
     }
@@ -579,7 +937,8 @@ mod tests {
             vec!["src", "README.md"]
         );
         assert!(!t.rows()[0].expanded);
-        assert_eq!(t.selected, None, "hidden selection must be cleared");
+        assert_eq!(t.cursor_row(), None, "hidden selection must be cleared");
+        assert_eq!(t.selection_len(), 0, "hidden selection must be cleared");
 
         t.refresh();
         assert!(t.rows().iter().any(|e| e.name == "later.txt"));
@@ -647,5 +1006,337 @@ mod tests {
             t.target_dir().as_deref(),
             Some(Path::new("/definitely/not/a/real/path"))
         );
+    }
+
+    /// Two folders and four files: `docs`, `src`, `alpha.txt`, `beta.txt`,
+    /// `Brief.md`, `notes.txt`, in that order, the folders closed.
+    fn picking(name: &str) -> (crate::project::TempTree, Tree) {
+        let f = crate::project::TempTree::new(
+            &format!("tree-pick-{name}"),
+            &[
+                ("docs/guide.md", ""),
+                ("docs/api/index.md", ""),
+                ("src/main.rs", ""),
+                ("src/lib.rs", ""),
+                ("alpha.txt", ""),
+                ("beta.txt", ""),
+                ("Brief.md", ""),
+                ("notes.txt", ""),
+            ],
+        );
+        let mut t = Tree::new();
+        t.open(&f.0);
+        assert_eq!(
+            names(&t),
+            [
+                "docs",
+                "src",
+                "alpha.txt",
+                "beta.txt",
+                "Brief.md",
+                "notes.txt"
+            ]
+        );
+        (f, t)
+    }
+
+    fn names(t: &Tree) -> Vec<&str> {
+        t.rows().iter().map(|e| e.name.as_str()).collect()
+    }
+
+    /// The selected rows' names, top to bottom, the cursor's in brackets.
+    fn picked(t: &Tree) -> Vec<String> {
+        (0..t.len())
+            .filter(|&i| t.is_selected(i))
+            .map(|i| {
+                let name = &t.rows()[i].name;
+                if t.cursor_row() == Some(i) {
+                    format!("[{name}]")
+                } else {
+                    name.clone()
+                }
+            })
+            .collect()
+    }
+
+    fn row(t: &Tree, name: &str) -> usize {
+        t.rows().iter().position(|e| e.name == name).expect(name)
+    }
+
+    #[test]
+    fn a_shift_range_runs_from_the_anchor_either_way() {
+        let (_f, mut t) = picking("range");
+        t.select(2);
+        assert_eq!(picked(&t), ["[alpha.txt]"]);
+        t.select_to(4);
+        assert_eq!(picked(&t), ["alpha.txt", "beta.txt", "[Brief.md]"]);
+        // Back over the anchor: the range turns round it, nothing is left
+        // behind from the first one.
+        t.select_to(0);
+        assert_eq!(picked(&t), ["[docs]", "src", "alpha.txt"]);
+        // A plain select starts over, and moves the anchor.
+        t.select(5);
+        t.select_to(4);
+        assert_eq!(picked(&t), ["[Brief.md]", "notes.txt"]);
+        // With nothing picked yet, the range is the row itself.
+        t.clear_selection();
+        t.select_to(3);
+        assert_eq!(picked(&t), ["[beta.txt]"]);
+        t.select_to(99);
+        assert_eq!(picked(&t), ["[beta.txt]"], "no such row");
+    }
+
+    #[test]
+    fn a_toggle_adds_and_removes_and_keeps_the_cursor_selected() {
+        let (f, mut t) = picking("toggle");
+        t.select(2);
+        t.toggle_selected(4);
+        assert_eq!(picked(&t), ["alpha.txt", "[Brief.md]"]);
+        assert_eq!(t.selection_len(), 2);
+        assert_eq!(t.selected_path(), Some(f.0.join("Brief.md")));
+        // The next range starts from the row toggled last.
+        t.select_to(5);
+        assert_eq!(picked(&t), ["Brief.md", "[notes.txt]"]);
+
+        t.select(2);
+        t.toggle_selected(4);
+        t.toggle_selected(0);
+        // Off again: the cursor goes to what is still selected, below first.
+        t.toggle_selected(0);
+        assert_eq!(picked(&t), ["[alpha.txt]", "Brief.md"]);
+        t.toggle_selected(4);
+        assert_eq!(picked(&t), ["[alpha.txt]"]);
+        // The last one off: nothing is selected, so nothing is acted on,
+        // and the keyboard stays where it was.
+        t.toggle_selected(2);
+        assert_eq!(picked(&t), [] as [&str; 0]);
+        assert_eq!(t.selection_len(), 0);
+        assert_eq!(t.selected_path(), None);
+        assert_eq!(t.cursor_row(), Some(2));
+        assert_eq!(t.target_dir().as_deref(), Some(f.0.as_path()));
+
+        // A right-click on one of several selected rows keeps them and
+        // moves the cursor there; on any other row it selects that one.
+        t.select(2);
+        t.select_to(4);
+        t.select_for_menu(3);
+        assert_eq!(picked(&t), ["alpha.txt", "[beta.txt]", "Brief.md"]);
+        t.select_for_menu(5);
+        assert_eq!(picked(&t), ["[notes.txt]"]);
+    }
+
+    #[test]
+    fn the_selection_follows_its_items_through_refresh_expand_and_collapse() {
+        let (f, mut t) = picking("survive");
+        t.select(row(&t, "beta.txt"));
+        t.toggle_selected(row(&t, "notes.txt"));
+        assert_eq!(picked(&t), ["beta.txt", "[notes.txt]"]);
+
+        // Rows arrive above: a folder opens.
+        t.toggle(row(&t, "docs"));
+        assert_eq!(t.cursor_row(), Some(row(&t, "notes.txt")));
+        assert_eq!(picked(&t), ["beta.txt", "[notes.txt]"]);
+        // A worker's rows arrive.
+        let src = f.0.join("src");
+        assert!(t.install_children(&src, Tree::children(&src, 1)));
+        assert_eq!(picked(&t), ["beta.txt", "[notes.txt]"]);
+        // A file appears before them, and one of them is deleted.
+        std::fs::write(f.0.join("aaa.txt"), "").unwrap();
+        t.refresh();
+        assert_eq!(picked(&t), ["beta.txt", "[notes.txt]"]);
+        assert_eq!(t.cursor_row(), Some(row(&t, "notes.txt")));
+        std::fs::remove_file(f.0.join("notes.txt")).unwrap();
+        t.refresh();
+        assert_eq!(picked(&t), ["[beta.txt]"], "the cursor's item went");
+        // Rows leave above.
+        t.toggle(row(&t, "docs"));
+        assert_eq!(picked(&t), ["[beta.txt]"]);
+        assert_eq!(t.selected_path(), Some(f.0.join("beta.txt")));
+
+        // What a closing folder hides is no longer selected, and a cursor
+        // that was inside is on the folder.
+        t.toggle_selected(row(&t, "lib.rs"));
+        t.toggle_selected(row(&t, "main.rs"));
+        assert_eq!(picked(&t), ["lib.rs", "[main.rs]", "beta.txt"]);
+        t.toggle(row(&t, "src"));
+        assert_eq!(picked(&t), ["[src]", "beta.txt"]);
+        assert_eq!(t.selected_paths(), [f.0.join("src"), f.0.join("beta.txt")]);
+        // Opening it again does not bring them back.
+        t.toggle(row(&t, "src"));
+        assert_eq!(picked(&t), ["[src]", "beta.txt"]);
+    }
+
+    #[test]
+    fn a_command_acts_on_a_selected_folder_and_not_on_what_is_in_it() {
+        let (f, mut t) = picking("nested");
+        t.toggle(row(&t, "docs"));
+        t.toggle(row(&t, "api"));
+        t.toggle(row(&t, "src"));
+        t.select(row(&t, "docs"));
+        t.toggle_selected(row(&t, "index.md"));
+        t.toggle_selected(row(&t, "guide.md"));
+        t.toggle_selected(row(&t, "lib.rs"));
+        t.toggle_selected(row(&t, "alpha.txt"));
+        assert_eq!(t.selection_len(), 5);
+        assert_eq!(t.selected_paths().len(), 5);
+        assert_eq!(
+            t.selected_roots(),
+            [
+                f.0.join("docs"),
+                f.0.join("src/lib.rs"),
+                f.0.join("alpha.txt")
+            ]
+        );
+        // A folder's name as a prefix of a neighbour's is not nesting.
+        std::fs::write(f.0.join("docs-old.txt"), "").unwrap();
+        t.refresh();
+        t.select(row(&t, "docs"));
+        t.toggle_selected(row(&t, "docs-old.txt"));
+        assert_eq!(
+            t.selected_roots(),
+            [f.0.join("docs"), f.0.join("docs-old.txt")]
+        );
+        t.select_all();
+        assert_eq!(t.selection_len(), t.len());
+        assert_eq!(t.selected_roots().len(), 7, "the top level");
+    }
+
+    #[test]
+    fn the_cursor_steps_over_closed_folders_and_into_open_ones() {
+        let (f, mut t) = picking("cursor");
+        // No cursor yet: down starts at the top, up at the bottom.
+        t.step_cursor(-1, false);
+        assert_eq!(picked(&t), ["[notes.txt]"]);
+        t.clear_selection();
+        t.step_cursor(1, false);
+        assert_eq!(picked(&t), ["[docs]"]);
+        // A closed folder is one row: its files are not stepped through.
+        t.step_cursor(1, false);
+        assert_eq!(picked(&t), ["[src]"]);
+        assert_eq!(t.first_child_row(1), None, "closed");
+        assert_eq!(t.parent_row(1), None, "top level");
+
+        t.toggle(row(&t, "docs"));
+        t.select(row(&t, "docs"));
+        assert_eq!(t.first_child_row(0), Some(1));
+        t.step_cursor(1, false);
+        assert_eq!(t.selected_path(), Some(f.0.join("docs/api")));
+        t.step_cursor(1, false);
+        assert_eq!(t.selected_path(), Some(f.0.join("docs/guide.md")));
+        assert_eq!(t.parent_row(row(&t, "guide.md")), Some(0));
+        assert_eq!(t.first_child_row(row(&t, "guide.md")), None, "a file");
+
+        // Shift extends from where the cursor was, and comes back.
+        t.step_cursor(2, true);
+        assert_eq!(picked(&t), ["guide.md", "src", "[alpha.txt]"]);
+        t.step_cursor(-1, true);
+        assert_eq!(picked(&t), ["guide.md", "[src]"]);
+        // The ends hold.
+        t.step_cursor(100, false);
+        assert_eq!(picked(&t), ["[notes.txt]"]);
+        t.step_cursor(-100, true);
+        assert_eq!(t.selection_len(), t.len());
+        assert_eq!(t.cursor_row(), Some(0));
+        // Escape leaves the cursor's row alone.
+        assert!(t.reduce_selection());
+        assert_eq!(picked(&t), ["[docs]"]);
+        assert!(!t.reduce_selection(), "nothing more to reduce");
+
+        // The cursor stays in a view of three rows.
+        t.step_cursor(100, false);
+        t.scroll_to_selection(3);
+        assert_eq!(t.scroll, t.len() - 3);
+        t.step_cursor(-100, false);
+        t.scroll_to_selection(3);
+        assert_eq!(t.scroll, 0);
+    }
+
+    #[test]
+    fn typed_letters_jump_to_the_next_name_that_starts_with_them() {
+        let (_f, mut t) = picking("typeahead");
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        t.select(0);
+        // One letter, whatever its case, and the same again steps on.
+        assert!(t.type_ahead('b', at(0)));
+        assert_eq!(picked(&t), ["[beta.txt]"]);
+        assert!(t.type_ahead('B', at(100)));
+        assert_eq!(picked(&t), ["[Brief.md]"]);
+        assert!(t.type_ahead('b', at(200)));
+        assert_eq!(picked(&t), ["[beta.txt]"], "round to the first again");
+        assert!(t.typing_ahead(at(900)));
+        assert!(!t.typing_ahead(at(1300)));
+
+        // After a pause a letter starts a new prefix; more letters narrow
+        // it, staying on a row that still fits.
+        t.select(0);
+        assert!(t.type_ahead('b', at(2000)));
+        assert_eq!(picked(&t), ["[beta.txt]"]);
+        assert!(t.type_ahead('r', at(2100)));
+        assert_eq!(picked(&t), ["[Brief.md]"]);
+        assert!(t.type_ahead('i', at(2200)));
+        assert_eq!(picked(&t), ["[Brief.md]"]);
+        // Nothing starts with it: the cursor stays.
+        assert!(!t.type_ahead('z', at(2300)));
+        assert_eq!(picked(&t), ["[Brief.md]"]);
+        // The pause is counted from the last letter.
+        assert!(t.type_ahead('n', at(3400)));
+        assert_eq!(picked(&t), ["[notes.txt]"]);
+        // Only rows that show are searched.
+        assert!(
+            !t.type_ahead('g', at(5000)),
+            "guide.md is in a closed folder"
+        );
+        t.toggle(row(&t, "docs"));
+        assert!(t.type_ahead('g', at(7000)));
+        assert_eq!(picked(&t), ["[guide.md]"]);
+    }
+
+    #[test]
+    fn a_tree_read_on_a_worker_takes_the_selection_made_meanwhile() {
+        let (f, mut live) = picking("adopt");
+        live.select(row(&live, "alpha.txt"));
+        // The worker's copy is taken, then the person goes on working.
+        let mut read = live.clone();
+        live.select(row(&live, "beta.txt"));
+        live.toggle_selected(row(&live, "notes.txt"));
+        live.scroll = 2;
+        live.focused = true;
+        std::fs::write(f.0.join("aaa.txt"), "").unwrap();
+        std::fs::remove_file(f.0.join("notes.txt")).unwrap();
+        read.refresh();
+        assert_eq!(picked(&read), ["[alpha.txt]"]);
+
+        read.adopt_selection(&live);
+        assert!(names(&read).contains(&"aaa.txt"));
+        assert_eq!(picked(&read), ["[beta.txt]"], "less the file that went");
+        assert_eq!(read.cursor_row(), Some(row(&read, "beta.txt")));
+        assert_eq!(read.scroll, 2);
+        assert!(read.focused);
+    }
+
+    #[test]
+    fn the_selection_follows_an_item_that_is_renamed_or_moved() {
+        let (f, mut t) = picking("follow");
+        t.toggle(row(&t, "docs"));
+        t.select(row(&t, "guide.md"));
+        t.toggle_selected(row(&t, "alpha.txt"));
+        // A rename in place: still selected under its new name.
+        std::fs::rename(f.0.join("alpha.txt"), f.0.join("omega.txt")).unwrap();
+        t.follow_move(&f.0.join("alpha.txt"), &f.0.join("omega.txt"));
+        t.refresh();
+        assert_eq!(picked(&t), ["guide.md", "[omega.txt]"]);
+        // A folder renamed: it is read again closed, so what was selected
+        // inside it no longer shows and is no longer selected.
+        std::fs::rename(f.0.join("docs"), f.0.join("manual")).unwrap();
+        t.follow_move(&f.0.join("docs"), &f.0.join("manual"));
+        t.refresh();
+        assert_eq!(picked(&t), ["[omega.txt]"]);
+        // Moved into a folder that is closed: the folder has the cursor.
+        std::fs::rename(f.0.join("omega.txt"), f.0.join("src/omega.txt")).unwrap();
+        t.follow_move(&f.0.join("omega.txt"), &f.0.join("src/omega.txt"));
+        t.refresh();
+        assert_eq!(picked(&t), ["[src]"]);
+        assert_eq!(t.selected_path(), Some(f.0.join("src")));
     }
 }

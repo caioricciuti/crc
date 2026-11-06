@@ -258,6 +258,36 @@ impl EditorView {
                     }
                     Mouse::Drag => press(NSEventType::LeftMouseDragged, x, y, 1, flags),
                     Mouse::Up => press(NSEventType::LeftMouseUp, x, y, 1, flags),
+                    // The menu AppKit would ask for and pop up: asked for
+                    // the same way, with what the press itself selects, and
+                    // each item put to `validateMenuItem:` as showing it
+                    // would. Nothing pops up to wait for a person.
+                    Mouse::Menu => {
+                        let Some(event) = mouse_with(NSEventType::RightMouseDown, x, y, 1, flags)
+                        else {
+                            return;
+                        };
+                        let menu: Option<Retained<NSMenu>> =
+                            unsafe { msg_send![self, menuForEvent: &*event] };
+                        let enabled: Vec<String> = menu
+                            .map(|menu| {
+                                menu.itemArray()
+                                    .iter()
+                                    .filter(|item| {
+                                        let on: Bool =
+                                            unsafe { msg_send![self, validateMenuItem: &**item] };
+                                        on.as_bool()
+                                    })
+                                    .map(|item| item.title().to_string())
+                                    .filter(|title| !title.is_empty())
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if let Some(mut state) = self.state_mut() {
+                            state.message =
+                                Some((format!("menu: {}", enabled.join("|")), Instant::now()));
+                        }
+                    }
                 }
             }
             Step::Down { x, y, count } => {
@@ -321,7 +351,10 @@ impl EditorView {
                     x.min(rect.x + rect.width - 0.5),
                     y.min(rect.y + rect.height - 0.5),
                 );
-                if self.chrome().terminal.is_some_and(|r| r.contains(x, y)) {
+                if self.terminal_strip_scroll(x, y, -*dy as f32) {
+                    // Over the terminal's tabs: its strip, as the wheel
+                    // there scrolls it.
+                } else if self.chrome().terminal.is_some_and(|r| r.contains(x, y)) {
                     let lines = self.wheel_lines_by(*dy, true, WheelTarget::Terminal);
                     self.terminal_wheel(x, y, lines, NSEventModifierFlags::empty());
                 } else {
@@ -330,6 +363,21 @@ impl EditorView {
             }
             Step::Idle(_) => {}
             Step::MenuBar(number) => self.selftest_menubar_pick(*number),
+            // What choosing a menu item does: its action, sent to the view.
+            Step::Action(name) => {
+                let Ok(name) = std::ffi::CString::new(name.as_str()) else {
+                    return;
+                };
+                let action = Sel::register(&name);
+                let responds: bool = unsafe { msg_send![self, respondsToSelector: action] };
+                if !responds {
+                    eprintln!("selftest: the view has no action {name:?}");
+                    return;
+                }
+                let app = NSApplication::sharedApplication(mtm);
+                let target: &AnyObject = self;
+                unsafe { app.sendAction_to_from(action, Some(target), None) };
+            }
             Step::Notify(number, reply) => self.selftest_notify(*number, reply.as_deref()),
             Step::Front(front) => {
                 if let Some(mut state) = self.state_mut() {
@@ -770,6 +818,9 @@ impl EditorView {
                 };
                 // Syntax spans the last frame drew the editor with.
                 let spans = state.spans.len();
+                // The Explorer's tree: who has the keys, its rows with the
+                // selection and the cursor, and what a command acts on.
+                let tree = super::sidebar::tree_report(&state);
                 // The terminal's find: whether a search is on its way, and
                 // filter mode's list, each row "number text" with its
                 // matches in brackets, the chosen one starred; and whether
@@ -820,7 +871,7 @@ impl EditorView {
                     });
                 let report = format!(
                     // First: the report ends with the document's text.
-                    "message: {}\npreview: {}\nmd: {md}\nspans: {spans}\nterminal_find: {terminal_find}\nactivity: {}\npointer_targets: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nrepo: {}\ngit_note: {}\nhome: {}\nhome_scroll: {}\nmcp: {}\nmcp_page: {}\nsettings_page: {}\nterminals: {}\nagents: {}\ninspector: {}\nteams: {}\nagents_tree: {}\nagents_activity: {}\nagents_prs: {}\nmenubar: {}\nconflicts: {}\ngit_conflicts: {}\ntable: {}\nquery: {}\nquery_sql: {}\nblame: {}\nfind_results: {}\nfind_rows: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\npeek: {}\ngutter: {}\nissue_tab: {}\nscrub: {}\nscrub_strip: {}\nscrub_fade: {}\nscrub_filter: {}\nscrub_compare: {}\nblame_heat: {}\nreplaced: {}\nreceipt: {}\nmonitor: {}\n{report}",
+                    "message: {}\npreview: {}\nmd: {md}\nspans: {spans}\n{tree}\nterminal_find: {terminal_find}\nactivity: {}\npointer_targets: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nrepo: {}\ngit_note: {}\nhome: {}\nhome_scroll: {}\nmcp: {}\nmcp_page: {}\nsettings_page: {}\nterminals: {}\nagents: {}\ninspector: {}\nteams: {}\nagents_tree: {}\nagents_activity: {}\nagents_prs: {}\nmenubar: {}\nconflicts: {}\ngit_conflicts: {}\ntable: {}\nquery: {}\nquery_sql: {}\nblame: {}\nfind_results: {}\nfind_rows: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\npeek: {}\ngutter: {}\nissue_tab: {}\nscrub: {}\nscrub_strip: {}\nscrub_fade: {}\nscrub_filter: {}\nscrub_compare: {}\nblame_heat: {}\nreplaced: {}\nreceipt: {}\nmonitor: {}\n{report}",
                     state.message.as_ref().map_or("", |(text, _)| text.as_str()),
                     state.html_preview.as_ref().map_or("closed".to_string(), |p| format!(
                         "open ext={} view={} probe={}",
@@ -919,10 +970,16 @@ impl EditorView {
                         })
                         .collect::<Vec<_>>()
                         .join("|"),
-                    state.agents.report(
-                        &state.terminal.tabs,
-                        state.terminal.active,
-                        state.terminal.shown_pair(),
+                    // With the terminal's tabs in their strip's order, on
+                    // a line of its own.
+                    format_args!(
+                        "{}\nterminal_tabs: {}",
+                        state.agents.report(
+                            &state.terminal.tabs,
+                            state.terminal.active,
+                            state.terminal.shown_pair(),
+                        ),
+                        state.terminal.report()
                     ),
                     state.agents.inspector.report(
                         state

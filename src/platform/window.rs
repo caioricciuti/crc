@@ -1408,6 +1408,10 @@ struct TreeDrag {
     over: Option<usize>,
     /// Whether the pointer is somewhere a drop is allowed at all.
     valid: bool,
+    /// The press was on one of several selected rows, and the click it may
+    /// turn out to be waits for the release: a drag must find the others
+    /// still selected.
+    deferred: bool,
 }
 
 /// What a held press is dragging. One at a time: `mouseDown:` clears it
@@ -1646,6 +1650,11 @@ define_class!(
             // Timestamp before any of our own work, so nothing we do hides
             // inside the measurement.
             let started = Instant::now();
+            // Escape gives up a terminal tab being dragged along its strip,
+            // and is spent: the shell under it hears nothing.
+            if event.keyCode() == 53 && self.cancel_terminal_tab_drag() {
+                return;
+            }
             // Mid-composition every key belongs to the input method: arrows
             // move through its candidates, Return commits, Escape cancels.
             // Acting on them here as well would move the caret out from
@@ -1688,6 +1697,7 @@ define_class!(
             // A press only starts a text selection if it lands in the text.
             if let Some(mut state) = self.state_mut() {
                 state.drag = None;
+                state.terminal.tab_drag = None;
             }
             // A press anywhere but the grid commits the cell being edited,
             // then goes on as it would have; the grid's own press sorts out
@@ -1819,7 +1829,9 @@ define_class!(
                 let Some(mut state) = self.state_mut() else {
                     return;
                 };
-                if !chrome.sidebar.is_some_and(|rect| rect.contains(x, y)) {
+                if !chrome.sidebar.is_some_and(|rect| rect.contains(x, y))
+                    || !sidebar::explorer_showing(&state)
+                {
                     state.sidebar_keys = false;
                 }
                 state.terminal.focus = chrome.terminal.is_some_and(|rect| rect.contains(x, y));
@@ -1980,6 +1992,15 @@ define_class!(
                         return;
                     };
                     state.terminal.show(index);
+                    // The press may become a drag to another place along
+                    // the strip.
+                    state.terminal.tab_drag = Some(crate::platform::terminal::TabDrag {
+                        tab: index,
+                        start_x: x,
+                        x,
+                        y,
+                        active: false,
+                    });
                     drop(state);
                     self.request_redraw();
                     self.pump();
@@ -2323,25 +2344,7 @@ define_class!(
                     self.mcp_click(x, y);
                     return;
                 }
-                // Remember what is under the pointer in case this turns into
-                // a drag. Selecting still happens now, so a plain click is
-                // unaffected.
-                {
-                    let Some(mut state) = self.state_mut() else {
-                        return;
-                    };
-                    let row = layout::sidebar_row_at(&state.tree, sidebar_field(&state), rect, y);
-                    state.drag = row
-                        .and_then(|index| state.tree.rows().get(index))
-                        .map(|entry| Drag::Tree(TreeDrag {
-                            path: entry.path.clone(),
-                            origin: (x, y),
-                            active: false,
-                            over: None,
-                            valid: false,
-                        }));
-                }
-                self.sidebar_click(y, rect);
+                self.tree_press(event, x, y, rect);
                 return;
             }
 
@@ -2441,6 +2444,10 @@ define_class!(
             let point = self.convertPoint_fromView(event.locationInWindow(), None);
             layout::set_pointer(Some((point.x as f32, point.y as f32)));
             if self.terminal_mouse_drag(event, point.x as f32, point.y as f32) {
+                return;
+            }
+            // A terminal tab held: along its strip, and nothing else.
+            if self.terminal_tab_dragged(point.x as f32, point.y as f32) {
                 return;
             }
 
@@ -2665,6 +2672,7 @@ define_class!(
             self.request_redraw();
             let point = self.convertPoint_fromView(_event.locationInWindow(), None);
             self.terminal_mouse_release(_event, point.x as f32, point.y as f32);
+            self.terminal_tab_released(point.x as f32, point.y as f32);
             if let Some(mut state) = self.state_mut()
                 && let Some(drag) = state.agents.drag.take()
                 && drag.active
@@ -2692,12 +2700,15 @@ define_class!(
                 state.terminal.drag_point = None;
                 state.autoscroll_carry = 0.0;
                 match state.drag.take() {
+                    // A drag dropped where it may be, or the click that a
+                    // press on one of several selected rows waited to be.
                     Some(Drag::Tree(drag)) if drag.active && drag.valid => Some(drag),
+                    Some(Drag::Tree(drag)) if !drag.active && drag.deferred => Some(drag),
                     _ => None,
                 }
             };
             if let Some(drag) = drop {
-                self.drop_tree_item(drag);
+                self.tree_release(drag);
             }
         }
 
@@ -2903,6 +2914,10 @@ define_class!(
                 let point = self.convertPoint_fromView(event.locationInWindow(), None);
                 let panel = self.chrome().terminal;
                 if panel.is_some_and(|rect| rect.contains(point.x as f32, point.y as f32)) {
+                    // Over its tabs the wheel scrolls the strip.
+                    if self.terminal_strip_wheel(event, point.x as f32, point.y as f32) {
+                        return;
+                    }
                     let lines = self.wheel_lines(event, WheelTarget::Terminal);
                     self.terminal_wheel(point.x as f32, point.y as f32, lines, event.modifierFlags());
                     return;
@@ -3171,7 +3186,7 @@ define_class!(
             }
             // A pointer held still past the edge of the text sends no events,
             // so this is what keeps the view moving under it.
-            if self.drag_select() || self.terminal_autoscroll() {
+            if self.drag_select() || self.terminal_autoscroll() || self.terminal_strip_autoscroll() {
                 self.request_redraw();
             }
             if self.ivars().needs_redraw.get() {
@@ -3789,14 +3804,53 @@ define_class!(
             self.pump();
         }
 
+        /// The terminal's tabs while it has the keys, else the editor's.
         #[unsafe(method(selectNextTab:))]
         fn action_next_tab(&self, _sender: Option<&AnyObject>) {
-            self.cycle_tab(1);
+            if self.terminal_has_keys() {
+                self.cycle_terminal_tab(1);
+            } else {
+                self.cycle_tab(1);
+            }
         }
 
         #[unsafe(method(selectPreviousTab:))]
         fn action_prev_tab(&self, _sender: Option<&AnyObject>) {
-            self.cycle_tab(-1);
+            if self.terminal_has_keys() {
+                self.cycle_terminal_tab(-1);
+            } else {
+                self.cycle_tab(-1);
+            }
+        }
+
+        #[unsafe(method(moveTabLeft:))]
+        fn action_move_tab_left(&self, _sender: Option<&AnyObject>) {
+            self.move_focused_tab(-1);
+        }
+
+        #[unsafe(method(moveTabRight:))]
+        fn action_move_tab_right(&self, _sender: Option<&AnyObject>) {
+            self.move_focused_tab(1);
+        }
+
+        #[unsafe(method(closeTerminalTab:))]
+        fn action_close_terminal_tab(&self, _sender: Option<&AnyObject>) {
+            self.close_menu_terminal_tab();
+        }
+
+        #[unsafe(method(closeOtherTerminalTabs:))]
+        fn action_close_other_terminal_tabs(&self, _sender: Option<&AnyObject>) {
+            self.close_other_terminal_tabs();
+        }
+
+        #[unsafe(method(moveTerminalTabLeft:))]
+        fn action_move_terminal_tab_left(&self, _sender: Option<&AnyObject>) {
+            self.step_terminal_tab(true, -1);
+        }
+
+        #[unsafe(method(moveTerminalTabRight:))]
+        fn action_move_terminal_tab_right(&self, _sender: Option<&AnyObject>) {
+            self.step_terminal_tab(true, 1);
         }
 
         /// Cmd-W closes the tab. The last one goes back to Home, as its
@@ -4082,22 +4136,12 @@ define_class!(
 
         #[unsafe(method(copyProjectItemPath:))]
         fn action_copy_item_path(&self, _sender: Option<&AnyObject>) {
-            let path = self.state().and_then(|state| state.tree.selected_path());
-            if let Some(path) = path {
-                self.copy_and_say(&path.to_string_lossy());
-            }
+            self.copy_selected_paths(false);
         }
 
         #[unsafe(method(copyProjectItemRelativePath:))]
         fn action_copy_item_relative_path(&self, _sender: Option<&AnyObject>) {
-            let path = self.state().and_then(|state| {
-                let path = state.tree.selected_path()?;
-                let root = state.tree.root()?;
-                Some(path.strip_prefix(root).map(Path::to_path_buf).unwrap_or(path))
-            });
-            if let Some(path) = path {
-                self.copy_and_say(&path.to_string_lossy());
-            }
+            self.copy_selected_paths(true);
         }
 
         #[unsafe(method(copyContextTabPath:))]
@@ -4214,81 +4258,24 @@ define_class!(
                 let Some(state) = self.state() else {
                     return;
                 };
-                state.tree.selected_path()
+                // One name at a time: not with several selected.
+                state
+                    .tree
+                    .selected_path()
+                    .filter(|_| state.tree.selection_len() == 1)
             };
             let Some(path) = path else { return };
             self.start_sidebar_edit(SidebarEditKind::Rename(path));
         }
 
+        #[unsafe(method(focusExplorer:))]
+        fn action_focus_explorer(&self, _sender: Option<&AnyObject>) {
+            self.focus_explorer();
+        }
+
         #[unsafe(method(trashProjectItem:))]
         fn action_trash_project_item(&self, _sender: Option<&AnyObject>) {
-            let path = {
-                let Some(state) = self.state() else {
-                    return;
-                };
-                state
-                    .tree
-                    .selected
-                    .and_then(|index| state.tree.rows().get(index))
-                    .map(|entry| entry.path.clone())
-            };
-            let Some(path) = path else { return };
-            let source_key = crate::platform::canonical(&path);
-            let name = path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.display().to_string());
-            if self
-                .state()
-                .is_some_and(|state| all_docs(&state).any(|d| d.has_dirty_under(&source_key)))
-            {
-                ask(
-                    MainThreadMarker::from(self),
-                    "Unsaved changes are open",
-                    "Save or close the affected tabs before moving this item to Trash.",
-                    &["OK"],
-                );
-                return;
-            }
-
-            let answer = ask(
-                MainThreadMarker::from(self),
-                &format!("Move “{name}” to Trash?"),
-                "The item can be recovered from the Trash.",
-                &["Move to Trash", "Cancel"],
-            );
-            if answer != 0 {
-                return;
-            }
-
-            match project::trash_item(&path) {
-                // Where it is in the Trash is what an undo will need.
-                Ok(_landed) => {
-                    {
-                        let Some(mut state) = self.state_mut() else {
-                            return;
-                        };
-                        for docs in all_docs_mut(&mut state) {
-                            docs.close_under(&source_key);
-                        }
-                        reveal_active_tab(&mut state);
-                        state.message = Some((format!("moved {name} to Trash"), Instant::now()));
-                    }
-                    self.refresh_project_after_disk_change();
-                    self.sync_title();
-                    self.reparse();
-                }
-                Err(error) => {
-                    if let Some(mut state) = self.state_mut() {
-                    state.message = Some((
-                        format!("could not move to Trash: {error}"),
-                        Instant::now(),
-                    ));
-                    }
-                }
-            }
-            self.request_redraw();
-            self.pump();
+            self.trash_selection();
         }
 
         #[unsafe(method(sendRequest:))]
@@ -4740,6 +4727,16 @@ define_class!(
                 self.terminal_select_all();
                 return;
             }
+            // In the Explorer, every row showing.
+            if let Some(mut state) = self.state_mut()
+                && sidebar::tree_has_keys(&state)
+            {
+                state.tree.select_all();
+                drop(state);
+                self.request_redraw();
+                self.pump();
+                return;
+            }
             let ((), focus) = self.edit_focused(|b, _| b.select_all());
             // A selection is not an edit: nothing to search again for.
             match focus {
@@ -4845,6 +4842,15 @@ define_class!(
                 state.terminal.selection.is_some()
             } else if terminal && (action == sel!(cut:) || action == sel!(undo:) || action == sel!(redo:)) {
                 false
+            } else if sidebar::tree_has_keys(&state)
+                && (action == sel!(cut:)
+                    || action == sel!(paste:)
+                    || action == sel!(undo:)
+                    || action == sel!(redo:))
+            {
+                // The Explorer's tree has the keyboard: these would edit
+                // the document behind it, where nobody is looking.
+                false
             } else if action == sel!(copy:) || action == sel!(cut:) {
                 focused_buffer(&state).has_selection()
             } else if action == sel!(undo:) {
@@ -4899,11 +4905,40 @@ define_class!(
                 state.context_tab.is_some_and(|index| index > 0)
             } else if action == sel!(moveContextTabRight:) {
                 state.context_tab.is_some_and(|index| index + 1 < state.docs.len())
-            } else if action == sel!(renameProjectItem:) || action == sel!(trashProjectItem:) {
+            } else if action == sel!(moveTabLeft:) || action == sel!(moveTabRight:) {
+                // The terminal's tab while it has the keys, else the
+                // document's, which Agents mode has no strip for.
+                let step = if action == sel!(moveTabLeft:) { -1 } else { 1 };
+                if terminal {
+                    terminal::can_step_terminal_tab(&state, false, step)
+                } else {
+                    !state.agents.on
+                        && state
+                            .docs
+                            .active_index()
+                            .checked_add_signed(step)
+                            .is_some_and(|to| to < state.docs.len())
+                }
+            } else if action == sel!(moveTerminalTabLeft:) {
+                terminal::can_step_terminal_tab(&state, true, -1)
+            } else if action == sel!(moveTerminalTabRight:) {
+                terminal::can_step_terminal_tab(&state, true, 1)
+            } else if action == sel!(closeTerminalTab:) {
+                state.terminal.menu_tab_index().is_some()
+            } else if action == sel!(closeOtherTerminalTabs:) {
+                state.terminal.menu_tab_index().is_some()
+                    && agents::listed_terminals(&state).len() > 1
+            } else if action == sel!(focusExplorer:) {
+                // The tree of an open folder; Agents has its own sidebar.
+                state.tree.root().is_some() && !state.agents.on
+            } else if action == sel!(trashProjectItem:) {
                 // Only while the tree has the keyboard, and never while a
                 // field does: Cmd-Delete anywhere else edits text, and must
                 // not reach the tree's selection.
-                state.tree.selected.is_some() && state.sidebar_keys && !field_has_keys(&state)
+                state.tree.selection_len() > 0 && sidebar::tree_has_keys(&state)
+            } else if action == sel!(renameProjectItem:) {
+                // One name at a time: not with several selected.
+                state.tree.selection_len() == 1 && sidebar::tree_has_keys(&state)
             } else if action == sel!(revealProjectInFinder:)
                 || action == sel!(gitRefresh:)
                 || action == sel!(gitCommit:)
@@ -4971,7 +5006,7 @@ define_class!(
                 // Cmd-K is the document's elsewhere: only with the keys.
                 terminal
             } else if action == sel!(copyProjectItemPath:) || action == sel!(copyProjectItemRelativePath:) {
-                state.tree.selected.is_some()
+                state.tree.selection_len() > 0
             } else if action == sel!(gitAbort:) {
                 state.git.in_progress().is_some()
             } else if action == sel!(gitContinueRebase:) {
@@ -5342,6 +5377,10 @@ impl EditorView {
                 state.terminal.focus = true;
                 state.sidebar_keys = false;
             }
+            // A tab of its strip has its own, about that tab.
+            if self.terminal_tab_menu_at(x, y) {
+                return Some(terminal_tab_menu(mtm));
+            }
             return Some(terminal_context_menu(mtm));
         }
         let in_tab_bar = chrome.tabs.contains(x, y);
@@ -5388,8 +5427,15 @@ impl EditorView {
             };
             if let Some(index) = index {
                 let mut state = self.state_mut()?;
-                state.tree.select(index);
-                state.sidebar_keys = true;
+                // On one of the selected rows the selection stays, and the
+                // menu's commands act on all of it; any other row is
+                // selected alone. The tree takes the keyboard, as a press
+                // does: the menu's items act on it.
+                state.tree.select_for_menu(index);
+                sidebar::take_tree_keys(&mut state);
+                state.terminal.focus = false;
+                let key = self.key_window();
+                terminal::report_focus(&mut state, key);
                 drop(state);
                 self.request_redraw();
                 self.pump();
@@ -6057,6 +6103,11 @@ impl EditorView {
         if self.state().is_some_and(|state| state.agents.on) {
             self.set_agents_mode(false);
         }
+        // And it has the keyboard, not the Explorer's tree: Space in the
+        // tree, which opens files through here too, takes it back.
+        if let Some(mut state) = self.state_mut() {
+            state.sidebar_keys = false;
+        }
         // Finder and `open -a` deliver documents after launch, by which
         // point the argv path has already decided there is no project. Adopt
         // the file's own directory so the sidebar is useful either way.
@@ -6485,6 +6536,9 @@ define_class!(
                                             s.app.as_deref().is_some_and(|a| a.contains("claude"))
                                         }),
                                     workspace: tab.workspace.clone().unwrap_or_default(),
+                                    // Where it is among the tabs, as a
+                                    // drag may have put it.
+                                    order: Some(index),
                                 },
                             );
                             tab.session.detach();
@@ -9338,6 +9392,36 @@ fn terminal_context_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
     menu
 }
 
+/// Right-click menu for a tab of the terminal's strip: the session it is,
+/// and its place among its workspace's tabs.
+fn terminal_tab_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
+    let menu = context_menu_new(mtm);
+    let cmd = NSEventModifierFlags::Command;
+    menu.addItem(&menu_item(mtm, "Close Terminal", sel!(closeTerminalTab:)));
+    menu.addItem(&menu_item(
+        mtm,
+        "Close Other Terminals",
+        sel!(closeOtherTerminalTabs:),
+    ));
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
+    // The keys are the menu bar's, which move the tab showing.
+    menu.addItem(&hinted_menu_item(
+        mtm,
+        "Move Tab Left",
+        sel!(moveTerminalTabLeft:),
+        "{",
+        cmd,
+    ));
+    menu.addItem(&hinted_menu_item(
+        mtm,
+        "Move Tab Right",
+        sel!(moveTerminalTabRight:),
+        "}",
+        cmd,
+    ));
+    menu
+}
+
 /// The empty tab strip, right of the last tab.
 fn tab_strip_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
     let menu = context_menu_new(mtm);
@@ -9807,6 +9891,9 @@ fn install_menu(mtm: MainThreadMarker, app: &NSApplication) {
 
     let (view_item, view_menu) = submenu("View");
     view_menu.addItem(&item("Toggle Sidebar", sel!(toggleSidebar:), "b", false));
+    // The keyboard into the tree, on the active file's row. A click on a
+    // file opens it and leaves the keys with the file.
+    view_menu.addItem(&item("Focus Explorer", sel!(focusExplorer:), "", false));
     view_menu.addItem(&item(
         "Toggle Markdown Preview",
         sel!(togglePreview:),
@@ -10112,6 +10199,9 @@ fn install_menu(mtm: MainThreadMarker, app: &NSApplication) {
         "[",
         false,
     ));
+    // With Shift, as "{" and "}": the tab itself goes that way.
+    window_menu.addItem(&item("Move Tab Left", sel!(moveTabLeft:), "{", false));
+    window_menu.addItem(&item("Move Tab Right", sel!(moveTabRight:), "}", false));
     window_menu.addItem(&NSMenuItem::separatorItem(mtm));
     window_menu.addItem(&item("Minimize", sel!(performMiniaturize:), "m", false));
     window_item.setSubmenu(Some(&window_menu));

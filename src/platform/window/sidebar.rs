@@ -74,11 +74,8 @@ impl EditorView {
         // by canonical paths.
         let source_key = crate::platform::canonical(&drag.path);
         if self
-            .ivars()
-            .state
-            .borrow()
-            .docs
-            .has_dirty_under(&source_key)
+            .state()
+            .is_some_and(|state| dirty_tabs_under(&state, &source_key))
         {
             if let Some(mut state) = self.state_mut() {
                 state.message = Some((
@@ -430,8 +427,14 @@ impl EditorView {
         true
     }
 
-    /// Handles a click in the sidebar: select, and toggle or open.
-    pub(super) fn sidebar_click(&self, y: f32, rect: Viewport) {
+    /// A press in the Explorer. The row under the pointer is selected:
+    /// alone, added to the selection or taken out of it with Command, or as
+    /// the end of a range with Shift. A plain press opens a file or toggles
+    /// a folder at once, except on one of several selected rows, where it
+    /// waits for the release: a drag from there has to find them all still
+    /// selected. The tree takes the keyboard, unless the press opened a
+    /// file, which has it then.
+    pub(super) fn tree_press(&self, event: &NSEvent, x: f32, y: f32, rect: Viewport) {
         // No folder: the panel is its empty state, whose one button opens one.
         let on_open = {
             let Some(mut state) = self.state_mut() else {
@@ -453,75 +456,466 @@ impl EditorView {
             self.request_redraw();
             return;
         }
-        let index = {
-            let Some(state) = self.state() else {
+        let flags = event.modifierFlags();
+        let command = flags.contains(NSEventModifierFlags::Command);
+        let shift = flags.contains(NSEventModifierFlags::Shift);
+        let act = {
+            let Some(mut state) = self.state_mut() else {
                 return;
             };
-            layout::sidebar_row_at(&state.tree, sidebar_field(&state), rect, y)
+            if state.tree.root().is_none() {
+                return;
+            }
+            let row = layout::sidebar_row_at(&state.tree, sidebar_field(&state), rect, y);
+            take_tree_keys(&mut state);
+            match row {
+                // Below the last row: nothing is selected, and New File is
+                // for the project root. The row of an open name field is
+                // not a row either, and a press there changes nothing.
+                None => {
+                    if state.sidebar_edit.is_none() {
+                        state.tree.clear_selection();
+                    }
+                    None
+                }
+                Some(index) if shift => {
+                    state.tree.select_to(index);
+                    None
+                }
+                Some(index) if command => {
+                    state.tree.toggle_selected(index);
+                    None
+                }
+                Some(index) => {
+                    // Remember what is under the pointer in case this turns
+                    // into a drag.
+                    let deferred = state.tree.selection_len() > 1 && state.tree.is_selected(index);
+                    state.drag = state.tree.rows().get(index).map(|entry| {
+                        Drag::Tree(TreeDrag {
+                            path: entry.path.clone(),
+                            origin: (x, y),
+                            active: false,
+                            over: None,
+                            valid: false,
+                            deferred,
+                        })
+                    });
+                    (!deferred).then_some(index)
+                }
+            }
         };
-        let Some(index) = index else {
+        match act {
+            // A file opened by a click has the keyboard: what is typed next
+            // is for it, and Cmd-Delete edits its line.
+            Some(index) => self.activate_tree_row(index, true),
+            None => {
+                self.request_redraw();
+                self.pump();
+            }
+        }
+    }
+
+    /// The release of a press in the tree that came to something: a drag
+    /// dropped where it may be, or the click a press on one of several
+    /// selected rows was waiting to be.
+    pub(super) fn tree_release(&self, drag: TreeDrag) {
+        if drag.active {
+            self.drop_tree_item(drag);
+            return;
+        }
+        let index = self
+            .state()
+            .and_then(|state| state.tree.rows().iter().position(|e| e.path == drag.path));
+        if let Some(index) = index {
+            self.activate_tree_row(index, true);
+        }
+    }
+
+    /// Focus Explorer: shows the tree when the sidebar is hidden or on
+    /// another view, gives it the keyboard, and puts the cursor on the
+    /// active document's row, or on the first row when it has none.
+    pub(super) fn focus_explorer(&self) {
+        let Some(elsewhere) = self.state().and_then(|state| {
+            (state.tree.root().is_some() && !state.agents.on).then(|| {
+                state.git_open || state.search_open || state.mcp.open || state.extensions.is_some()
+            })
+        }) else {
             return;
         };
+        if elsewhere {
+            self.activate(0);
+        }
+        {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            state.sidebar = true;
+            close_fields(&mut state);
+            take_tree_keys(&mut state);
+            state.terminal.focus = false;
+            let key = self.key_window();
+            terminal::report_focus(&mut state, key);
+            let row = state
+                .docs
+                .active()
+                .path
+                .as_deref()
+                .and_then(|open| tree_path_of(&state.tree, open));
+            if let Some(path) = row {
+                state.tree.reveal(&path);
+            }
+            if state.tree.selected_path().is_none() {
+                state.tree.select(0);
+            }
+            let rows = chrome_of(&state).sidebar.map_or(0, layout::sidebar_rows);
+            state.tree.scroll_to_selection(rows);
+            // A scan under way read the tree before any folder opened here.
+            state.tree_version += 1;
+        }
+        self.request_redraw();
+        self.resume_display_link();
+        self.pump();
+    }
 
-        let (path, is_dir, expanded, depth) = {
+    /// Selects the tree row at `index` alone and acts on it: a folder opens
+    /// or closes, a file opens in a tab. The file has the keyboard when
+    /// `to_editor` (a click, Cmd-Down); otherwise the tree keeps it (Space).
+    pub(super) fn activate_tree_row(&self, index: usize, to_editor: bool) {
+        let file = {
             let Some(mut state) = self.state_mut() else {
                 return;
             };
             let Some(entry) = state.tree.select(index) else {
                 return;
             };
-            let result = (
-                entry.path.clone(),
-                entry.is_dir,
-                entry.expanded,
-                entry.depth,
-            );
-            state.tree_version += 1;
-            // A folder keeps the keyboard in the tree; a file opens, and
-            // the document has it.
-            state.sidebar_keys = result.1;
-            result
-        };
-
-        if is_dir {
-            // Single click toggles a folder: a tree where you have to
-            // double-click to see inside is needlessly slow to browse.
-            let Some(mut state) = self.state_mut() else {
-                return;
-            };
-            if expanded {
-                state.tree.toggle(index);
-            } else if state.watch.children_pending.insert(path.clone()) {
-                let root = state.tree.root().map(Path::to_path_buf);
-                let tx = state.watch.children_tx.clone();
-                std::thread::spawn(move || {
-                    if let Some(root) = root {
-                        let children = Tree::children(&path, depth + 1);
-                        let _ = tx.send((root, path, children));
-                    }
-                });
+            let (path, is_dir) = (entry.path.clone(), entry.is_dir);
+            if is_dir {
+                // Single click toggles a folder: a tree where you have to
+                // double-click to see inside is needlessly slow to browse.
+                set_tree_folder(&mut state, index, None);
+                None
             } else {
-                // A second click before the worker finishes cancels expansion.
-                state.watch.children_pending.remove(&path);
+                Some(path)
             }
-            drop(state);
-            self.resume_display_link();
-        } else {
-            // Opening a file now adds a tab rather than replacing what is
-            // showing, so nothing has to be saved or discarded first.
-            self.load_path(&path.to_string_lossy());
-            // The opened file has the keys, not a find bar left open.
-            if let Some(mut state) = self.state_mut()
-                && let Some(bar) = &mut state.find
-            {
-                bar.has_keys = false;
+        };
+        match file {
+            None => self.resume_display_link(),
+            Some(path) => {
+                // Opening a file now adds a tab rather than replacing what is
+                // showing, so nothing has to be saved or discarded first.
+                self.load_path(&path.to_string_lossy());
+                if let Some(mut state) = self.state_mut() {
+                    // Not a find bar left open, whoever has the keys now.
+                    if let Some(bar) = &mut state.find {
+                        bar.has_keys = false;
+                    }
+                    state.sidebar_keys = !to_editor;
+                }
+                self.sync_title();
+                self.reparse();
             }
+        }
+        self.request_redraw();
+        self.pump();
+    }
+
+    /// Keys while the Explorer's tree has the keyboard. Every key without
+    /// Command is the tree's then, used or not, so none of them reaches the
+    /// document behind it. Whether the key was taken.
+    pub(super) fn handle_tree_key(&self, event: &NSEvent) -> bool {
+        const ESCAPE: u16 = 53;
+        const A: u16 = 0;
+        if !self.state().is_some_and(|state| tree_has_keys(&state)) {
+            return false;
+        }
+        let flags = event.modifierFlags();
+        let command = flags.contains(NSEventModifierFlags::Command);
+        let shift = flags.contains(NSEventModifierFlags::Shift);
+        let code = match event.keyCode() {
+            key::KEYPAD_ENTER => key::RETURN,
+            code => code,
+        };
+        let page = self.chrome().sidebar.map_or(1, layout::sidebar_rows).max(1);
+        // What needs the state let go of before it can be done.
+        enum Then {
+            Nothing,
+            Activate(usize, bool),
+            Rename(std::path::PathBuf),
+            Trash,
+        }
+        let then = {
+            let Some(mut state) = self.state_mut() else {
+                return false;
+            };
+            let cursor = state.tree.cursor_row();
+            let entry = cursor
+                .and_then(|row| state.tree.rows().get(row))
+                .map(|entry| (entry.is_dir, entry.expanded));
+            let then = match code {
+                // Command keys are the menu's, apart from the two that open
+                // and trash, which arrive here when no menu took them.
+                key::DOWN if command => match cursor {
+                    Some(row) => Then::Activate(row, true),
+                    None => Then::Nothing,
+                },
+                key::DELETE if command => Then::Trash,
+                A if command => {
+                    state.tree.select_all();
+                    Then::Nothing
+                }
+                // The other Command keys that move or delete in a document
+                // stop here and do nothing; the rest are the menu's.
+                key::UP
+                | key::LEFT
+                | key::RIGHT
+                | key::HOME
+                | key::END
+                | key::PAGE_UP
+                | key::PAGE_DOWN
+                | key::FORWARD_DELETE
+                    if command =>
+                {
+                    Then::Nothing
+                }
+                _ if command => return false,
+                // Several selected become the cursor's row alone; from one,
+                // the keys go back to the document.
+                ESCAPE => {
+                    if !state.tree.reduce_selection() {
+                        state.sidebar_keys = false;
+                    }
+                    Then::Nothing
+                }
+                key::UP => {
+                    state.tree.step_cursor(-1, shift);
+                    Then::Nothing
+                }
+                key::DOWN => {
+                    state.tree.step_cursor(1, shift);
+                    Then::Nothing
+                }
+                key::PAGE_UP => {
+                    state.tree.step_cursor(-(page as isize), shift);
+                    Then::Nothing
+                }
+                key::PAGE_DOWN => {
+                    state.tree.step_cursor(page as isize, shift);
+                    Then::Nothing
+                }
+                key::HOME => {
+                    state.tree.move_cursor(0, shift);
+                    Then::Nothing
+                }
+                key::END => {
+                    let last = state.tree.len().saturating_sub(1);
+                    state.tree.move_cursor(last, shift);
+                    Then::Nothing
+                }
+                // Left closes an open folder; from anything else it goes to
+                // the folder it is in.
+                key::LEFT => {
+                    if let Some(row) = cursor {
+                        if entry == Some((true, true)) {
+                            state.tree.select(row);
+                            set_tree_folder(&mut state, row, Some(false));
+                        } else if let Some(parent) = state.tree.parent_row(row) {
+                            state.tree.select(parent);
+                        }
+                    }
+                    Then::Nothing
+                }
+                // Right opens a closed folder; in an open one it goes to
+                // the first item inside.
+                key::RIGHT => {
+                    if let Some(row) = cursor {
+                        if entry == Some((true, false)) {
+                            state.tree.select(row);
+                            set_tree_folder(&mut state, row, Some(true));
+                        } else if let Some(child) = state.tree.first_child_row(row) {
+                            state.tree.select(child);
+                        }
+                    }
+                    Then::Nothing
+                }
+                // The name of the one selected item, in place.
+                key::RETURN | key::F2 => match state.tree.selected_path() {
+                    Some(path) if state.tree.selection_len() == 1 => Then::Rename(path),
+                    _ => Then::Nothing,
+                },
+                // Space opens what Cmd-Down opens and stays in the tree,
+                // unless a name is being typed, which it is then part of.
+                key::SPACE if !state.tree.typing_ahead(Instant::now()) => match cursor {
+                    Some(row) => Then::Activate(row, false),
+                    None => Then::Nothing,
+                },
+                _ => {
+                    let typed = event
+                        .characters()
+                        .map(|characters| typed_text(&characters.to_string()))
+                        .unwrap_or_default();
+                    let mut letters = typed.chars();
+                    if let (Some(letter), None) = (letters.next(), letters.next())
+                        && !flags.contains(NSEventModifierFlags::Control)
+                        && !flags.contains(NSEventModifierFlags::Option)
+                    {
+                        state.tree.type_ahead(letter, Instant::now());
+                    }
+                    Then::Nothing
+                }
+            };
+            state.tree.scroll_to_selection(page);
+            then
+        };
+        match then {
+            Then::Nothing => {}
+            Then::Activate(row, to_editor) => self.activate_tree_row(row, to_editor),
+            Then::Rename(path) => self.start_sidebar_edit(SidebarEditKind::Rename(path)),
+            Then::Trash => self.trash_selection(),
+        }
+        self.request_redraw();
+        self.resume_display_link();
+        true
+    }
+
+    /// Move to Trash for everything selected in the Explorer, a folder
+    /// taking what is in it: one question that says how many, and nothing
+    /// moved while a tab on any of them holds unsaved work, in any pane.
+    pub(super) fn trash_selection(&self) {
+        let Some(paths) = self.state().map(|state| {
+            if tree_has_keys(&state) {
+                state.tree.selected_roots()
+            } else {
+                Vec::new()
+            }
+        }) else {
+            return;
+        };
+        if paths.is_empty() {
+            return;
+        }
+        let keys: Vec<std::path::PathBuf> = paths
+            .iter()
+            .map(|path| crate::platform::canonical(path))
+            .collect();
+        let one = paths.len() == 1;
+        let dirty = self
+            .state()
+            .is_some_and(|state| keys.iter().any(|key| dirty_tabs_under(&state, key)));
+        let question = trash_question(&paths);
+        // A test instance shows no alert, which would wait for a person,
+        // and moves nothing to the real Trash: it says what it would do.
+        if self.ivars().testing {
+            if let Some(mut state) = self.state_mut() {
+                let said = if dirty {
+                    "would refuse: unsaved changes are open".to_string()
+                } else {
+                    format!("would ask: {question}")
+                };
+                state.message = Some((said, Instant::now()));
+            }
+            self.request_redraw();
+            self.pump();
+            return;
+        }
+        if dirty {
+            ask(
+                MainThreadMarker::from(self),
+                "Unsaved changes are open",
+                if one {
+                    "Save or close the affected tabs before moving this item to Trash."
+                } else {
+                    "Save or close the affected tabs before moving these items to Trash."
+                },
+                &["OK"],
+            );
+            return;
+        }
+        let answer = ask(
+            MainThreadMarker::from(self),
+            &question,
+            if one {
+                "The item can be recovered from the Trash."
+            } else {
+                "The items can be recovered from the Trash."
+            },
+            &["Move to Trash", "Cancel"],
+        );
+        if answer != 0 {
+            return;
+        }
+
+        let mut moved = 0;
+        let mut failed = None;
+        for (path, key) in paths.iter().zip(&keys) {
+            match project::trash_item(path) {
+                // Where it is in the Trash is what an undo will need.
+                Ok(_landed) => {
+                    moved += 1;
+                    if let Some(mut state) = self.state_mut() {
+                        for docs in all_docs_mut(&mut state) {
+                            docs.close_under(key);
+                        }
+                    }
+                }
+                Err(error) => {
+                    failed = Some(format!("{}: {error}", item_name(path)));
+                    break;
+                }
+            }
+        }
+        if let Some(mut state) = self.state_mut() {
+            reveal_active_tab(&mut state);
+            let said = match (&failed, moved) {
+                (None, 1) => format!("moved {} to Trash", item_name(&paths[0])),
+                (None, _) => format!("moved {moved} items to Trash"),
+                (Some(why), 0) => format!("could not move to Trash: {why}"),
+                (Some(why), _) => format!(
+                    "moved {moved} of {} items to Trash, then could not move {why}",
+                    paths.len()
+                ),
+            };
+            state.message = Some((said, Instant::now()));
+        }
+        if moved > 0 {
+            self.refresh_project_after_disk_change();
             self.sync_title();
             self.reparse();
         }
-
         self.request_redraw();
         self.pump();
+    }
+
+    /// Copy Path and Copy Relative Path for the selection: one path to a
+    /// line, top to bottom as the tree shows them.
+    pub(super) fn copy_selected_paths(&self, relative: bool) {
+        let Some(paths) = self.state().map(|state| {
+            let root = state.tree.root().filter(|_| relative);
+            state
+                .tree
+                .selected_paths()
+                .iter()
+                .map(|path| {
+                    root.and_then(|root| path.strip_prefix(root).ok())
+                        .unwrap_or(path)
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect::<Vec<_>>()
+        }) else {
+            return;
+        };
+        match paths.as_slice() {
+            [] => {}
+            [path] => self.copy_and_say(path),
+            _ => {
+                clipboard::write_text(&paths.join("\n"));
+                if let Some(mut state) = self.state_mut() {
+                    state.message = Some((format!("copied {} paths", paths.len()), Instant::now()));
+                }
+                self.request_redraw();
+                self.pump();
+            }
+        }
     }
 
     /// Prompts for a directory and loads it as the project root.
@@ -641,7 +1035,14 @@ impl EditorView {
             ));
             return;
         }
-        if let Some(path) = state.docs.active().path.as_deref() {
+        // What was selected, and scrolled to, while the worker read. The
+        // active document's row is shown and selected as before, unless
+        // the tree is being worked in: a cursor moved by the keyboard, or
+        // several items picked, must not jump because a file changed.
+        tree.adopt_selection(&state.tree);
+        if !(tree_has_keys(&state) || tree.selection_len() > 1)
+            && let Some(path) = state.docs.active().path.as_deref()
+        {
             tree.reveal(path);
         }
         // The worker's tree carries the ignore set from when it started;
@@ -711,5 +1112,167 @@ impl EditorView {
         if changed {
             self.request_redraw();
         }
+    }
+}
+
+/// Whether the sidebar is showing the Explorer's tree, not another view.
+pub(super) fn explorer_showing(state: &State) -> bool {
+    state.sidebar
+        && !state.agents.on
+        && !state.git_open
+        && !state.search_open
+        && !state.mcp.open
+        && state.extensions.is_none()
+}
+
+/// Whether keys go to the Explorer's tree: it was pressed last, it is what
+/// the sidebar shows, and neither a field (a name being typed, the palette,
+/// the find bar) nor the terminal has them. Drawing, the key handler and
+/// the menu's enabled state all ask this, so they cannot disagree.
+pub(super) fn tree_has_keys(state: &State) -> bool {
+    state.sidebar_keys
+        && explorer_showing(state)
+        && state.tree.root().is_some()
+        && !field_has_keys(state)
+        && !state.terminal.has_keys()
+}
+
+/// The path the tree shows the open document `open` under. Documents keep
+/// their paths resolved, and the project root may have been given through
+/// a symbolic link.
+fn tree_path_of(tree: &Tree, open: &Path) -> Option<std::path::PathBuf> {
+    let root = tree.root()?;
+    if open.starts_with(root) {
+        return Some(open.to_path_buf());
+    }
+    let rest = open.strip_prefix(crate::platform::canonical(root)).ok()?;
+    Some(root.join(rest))
+}
+
+/// The tree takes the keyboard: from the document, and from a find bar
+/// left open, which keeps its place and gets the keys back with a click.
+pub(super) fn take_tree_keys(state: &mut State) {
+    state.sidebar_keys = true;
+    if let Some(bar) = &mut state.find {
+        bar.has_keys = false;
+    }
+}
+
+/// Whether a tab on `path`, or on anything under it, holds unsaved work,
+/// in any pane: the split ones as well as the one with the keyboard.
+pub(super) fn dirty_tabs_under(state: &State, path: &Path) -> bool {
+    all_docs(state).any(|docs| docs.has_dirty_under(path))
+}
+
+/// Opens the folder at tree row `index` (`Some(true)`), closes it
+/// (`Some(false)`), or whichever it is not (`None`, a click). Closing is at
+/// once; the children of one that opens are read on a worker.
+fn set_tree_folder(state: &mut State, index: usize, open: Option<bool>) {
+    let Some(entry) = state.tree.rows().get(index) else {
+        return;
+    };
+    if !entry.is_dir {
+        return;
+    }
+    let (path, depth, expanded) = (entry.path.clone(), entry.depth, entry.expanded);
+    // A scan under way read the tree as it was before this.
+    state.tree_version += 1;
+    if expanded {
+        if open != Some(true) {
+            state.tree.toggle(index);
+        }
+    } else if open == Some(false) {
+        state.watch.children_pending.remove(&path);
+    } else if state.watch.children_pending.insert(path.clone()) {
+        let root = state.tree.root().map(Path::to_path_buf);
+        let tx = state.watch.children_tx.clone();
+        std::thread::spawn(move || {
+            if let Some(root) = root {
+                let children = Tree::children(&path, depth + 1);
+                let _ = tx.send((root, path, children));
+            }
+        });
+    } else if open.is_none() {
+        // A second click before the worker finishes cancels expansion.
+        state.watch.children_pending.remove(&path);
+    }
+}
+
+/// A project item's name, as a message says it.
+fn item_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// What Move to Trash asks before it moves `paths`: the name of the one
+/// item, or how many there are.
+fn trash_question(paths: &[std::path::PathBuf]) -> String {
+    match paths {
+        [path] => format!("Move \u{201c}{}\u{201d} to Trash?", item_name(path)),
+        _ => format!("Move {} items to Trash?", paths.len()),
+    }
+}
+
+/// The tree as a `dump` reports it: whether it has the keyboard, its rows
+/// by their path in the project (a folder with a slash, a selected row
+/// starred, the cursor's after a `>`), what a command on the selection
+/// would act on, and the first row shown.
+pub(super) fn tree_report(state: &State) -> String {
+    let tree = &state.tree;
+    let shown = |path: &Path| {
+        tree.root()
+            .and_then(|root| path.strip_prefix(root).ok())
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned()
+    };
+    let rows: Vec<String> = tree
+        .rows()
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            format!(
+                "{}{}{}{}",
+                if tree.is_selected(index) { "*" } else { "" },
+                if tree.cursor_row() == Some(index) {
+                    ">"
+                } else {
+                    ""
+                },
+                shown(&entry.path),
+                if entry.is_dir { "/" } else { "" },
+            )
+        })
+        .collect();
+    let acts_on: Vec<String> = tree
+        .selected_roots()
+        .iter()
+        .map(|path| shown(path))
+        .collect();
+    format!(
+        "tree_keys: {}\ntree_rows: {}\ntree_acts_on: {}\ntree_scroll: {}",
+        tree_has_keys(state),
+        rows.join("|"),
+        acts_on.join("|"),
+        tree.scroll,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::trash_question;
+    use std::path::PathBuf;
+
+    #[test]
+    fn the_trash_question_names_one_item_and_counts_several() {
+        assert_eq!(
+            trash_question(&[PathBuf::from("/p/notes/today.md")]),
+            "Move \u{201c}today.md\u{201d} to Trash?"
+        );
+        assert_eq!(
+            trash_question(&[PathBuf::from("/p/a.txt"), PathBuf::from("/p/docs")]),
+            "Move 2 items to Trash?"
+        );
     }
 }

@@ -705,7 +705,9 @@ impl EditorView {
             return;
         };
         let mut taken = Vec::new();
-        let (live, mut lost) = crate::term::hold::scan(&dir);
+        let (mut live, mut lost) = crate::term::hold::scan(&dir);
+        // Each where it was among the tabs, which a drag may have changed.
+        crate::term::hold::in_tab_order(&mut live);
         for (id, spec, left) in live {
             let session = crate::term::hold::connect(&dir, &id)
                 .and_then(|socket| crate::term::pty::Session::attach(socket, self.terminal_wake()));
@@ -761,6 +763,7 @@ impl EditorView {
             ));
         }
         lost.sort_by(|a, b| a.0.cmp(&b.0));
+        crate::term::hold::in_tab_order(&mut lost);
         self.restore_lost(lost);
         if taken.is_empty() {
             return;
@@ -781,6 +784,235 @@ impl EditorView {
         super::review::refresh_review(&mut state);
         drop(state);
         self.after_terminal_layout();
+    }
+
+    /// The terminal's tab strip: the header of its panel.
+    fn terminal_header(&self) -> Option<Viewport> {
+        let rect = self.chrome().terminal?;
+        Some(crate::platform::terminal::split(rect).0)
+    }
+
+    /// The pointer moved with a press on a terminal tab held: once it has
+    /// left where it was pressed the tab is on its way to another place
+    /// along the strip, and the frame shows where. Returns whether a tab
+    /// is held.
+    pub(super) fn terminal_tab_dragged(&self, x: f32, y: f32) -> bool {
+        let Some(mut state) = self.state_mut() else {
+            return false;
+        };
+        let Some(drag) = &mut state.terminal.tab_drag else {
+            return false;
+        };
+        drag.x = x;
+        drag.y = y;
+        drag.active |= (x - drag.start_x).abs() > crate::platform::terminal::TAB_DRAG_AFTER;
+        let active = drag.active;
+        drop(state);
+        if active {
+            self.request_redraw();
+            self.pump();
+        }
+        true
+    }
+
+    /// The button went up with a terminal tab held. Dragged, and let go
+    /// over the strip, it lands in the gap nearest the pointer, among its
+    /// workspace's tabs as the frame has them; let go anywhere else it
+    /// stays where it was.
+    pub(super) fn terminal_tab_released(&self, x: f32, y: f32) {
+        let header = self.terminal_header();
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
+        let Some(drag) = state.terminal.tab_drag.take().filter(|drag| drag.active) else {
+            return;
+        };
+        let state = &mut *state;
+        if let Some(header) = header.filter(|header| header.contains(x, y)) {
+            let strip = crate::platform::terminal::strip(
+                &state.terminal,
+                &mut state.renderer.atlas,
+                header,
+            );
+            let listed = state.terminal.listed();
+            let slot = crate::platform::terminal::drop_slot(&strip, &listed, x);
+            state.terminal.drop_tab(&listed, drag.tab, slot);
+        }
+        // In view again, wherever the drag left the strip.
+        state.terminal.strip_free = false;
+    }
+
+    /// Escape with a terminal tab on its way along the strip: it stays
+    /// where it was. Returns whether there was one, which spends the key.
+    pub(super) fn cancel_terminal_tab_drag(&self) -> bool {
+        let Some(mut state) = self.state_mut() else {
+            return false;
+        };
+        if !state.terminal.tab_drag.is_some_and(|drag| drag.active) {
+            return false;
+        }
+        state.terminal.tab_drag = None;
+        state.terminal.strip_free = false;
+        drop(state);
+        self.request_redraw();
+        self.pump();
+        true
+    }
+
+    /// A tab dragged to an end of a strip too long to show whole scrolls
+    /// it, by the frame, as a pointer held still sends no events. Returns
+    /// whether it scrolled, which is to say whether to draw again.
+    pub(super) fn terminal_strip_autoscroll(&self) -> bool {
+        /// Points a second.
+        const SPEED: f32 = 600.0;
+        let Some(header) = self.terminal_header() else {
+            return false;
+        };
+        let Some(mut state) = self.state_mut() else {
+            return false;
+        };
+        let state = &mut *state;
+        let Some(drag) = state.terminal.tab_drag.filter(|drag| drag.active) else {
+            return false;
+        };
+        // Level with the strip: taken off it, the drag is being given up.
+        if drag.y < header.y || drag.y >= header.y + header.height {
+            return false;
+        }
+        let strip =
+            crate::platform::terminal::strip(&state.terminal, &mut state.renderer.atlas, header);
+        let way = crate::platform::terminal::drag_scroll(&strip, drag.x);
+        let at_end = if way < 0.0 {
+            strip.scroll <= 0.0
+        } else {
+            strip.scroll >= strip.max_scroll
+        };
+        if way == 0.0 || at_end {
+            return false;
+        }
+        state
+            .terminal
+            .scroll_strip(way * SPEED * state.frame_interval.as_secs_f32());
+        true
+    }
+
+    /// The wheel over the terminal's tab strip scrolls the strip, whichever
+    /// way it turns. Returns whether the pointer was over it.
+    pub(super) fn terminal_strip_wheel(&self, event: &NSEvent, x: f32, y: f32) -> bool {
+        let (dx, dy) = (event.scrollingDeltaX(), event.scrollingDeltaY());
+        let delta = if dx.abs() > dy.abs() { dx } else { dy };
+        let points = if event.hasPreciseScrollingDeltas() {
+            -delta
+        } else {
+            -delta.signum() * 40.0
+        };
+        self.terminal_strip_scroll(x, y, points as f32)
+    }
+
+    /// [`Self::terminal_strip_wheel`] for `points` along.
+    pub(super) fn terminal_strip_scroll(&self, x: f32, y: f32, points: f32) -> bool {
+        if !self
+            .terminal_header()
+            .is_some_and(|header| header.contains(x, y))
+        {
+            return false;
+        }
+        if points != 0.0
+            && let Some(mut state) = self.state_mut()
+        {
+            state.terminal.scroll_strip(points);
+            drop(state);
+            self.request_redraw();
+            self.pump();
+        }
+        true
+    }
+
+    /// Show Next Tab and Show Previous Tab with the terminal's keys: the
+    /// next of the tabs its strip lists, round from the last to the first.
+    pub(super) fn cycle_terminal_tab(&self, step: isize) {
+        let next = self.state().and_then(|state| {
+            let listed = super::agents::listed_terminals(&state);
+            Some((state.terminal.cycled(&listed, step)?, state.agents.on))
+        });
+        match next {
+            Some((tab, true)) => self.show_session(tab),
+            Some((tab, false)) => {
+                if let Some(mut state) = self.state_mut() {
+                    state.terminal.show(tab);
+                }
+                self.after_terminal_layout();
+            }
+            None => {}
+        }
+    }
+
+    /// Move Tab Left and Right: a terminal tab a place along its strip,
+    /// the one showing or, from a tab's own menu, that one.
+    pub(super) fn step_terminal_tab(&self, of_menu: bool, step: isize) {
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
+        let listed = super::agents::listed_terminals(&state);
+        let tab = if of_menu {
+            state.terminal.menu_tab_index()
+        } else {
+            Some(state.terminal.active)
+        };
+        if let Some(tab) = tab
+            && state.terminal.step_tab(&listed, tab, step)
+        {
+            state.terminal.strip_free = false;
+        }
+        drop(state);
+        self.after_terminal_layout();
+    }
+
+    /// A terminal tab's menu, Close: that session, wherever its tab is
+    /// by now, and no other when it has gone.
+    pub(super) fn close_menu_terminal_tab(&self) {
+        if let Some(mut state) = self.state_mut()
+            && let Some(id) = state.terminal.menu_tab.take()
+        {
+            state.terminal.close_by_id(&id);
+        }
+        self.after_terminal_layout();
+    }
+
+    /// A terminal tab's menu, Close Others: every other tab its strip
+    /// lists, never another workspace's, and the one kept shows.
+    pub(super) fn close_other_terminal_tabs(&self) {
+        if let Some(mut state) = self.state_mut()
+            && let Some(keep) = state.terminal.menu_tab_index()
+        {
+            let listed = super::agents::listed_terminals(&state);
+            if listed.contains(&keep) {
+                // Back to front, so each close leaves those still to go
+                // where they were.
+                for index in listed.into_iter().rev().filter(|i| *i != keep) {
+                    state.terminal.close_tab(index);
+                }
+                // Where the closes left it.
+                if let Some(kept) = state.terminal.menu_tab_index() {
+                    state.terminal.show(kept);
+                }
+            }
+        }
+        self.after_terminal_layout();
+    }
+
+    /// A right-click on a tab of the terminal's strip: the tab its menu
+    /// is about is kept. Returns whether the point is on one.
+    pub(super) fn terminal_tab_menu_at(&self, x: f32, y: f32) -> bool {
+        let Some(mut state) = self.state_mut() else {
+            return false;
+        };
+        let tab = match frame_of(&mut state).hit(x, y) {
+            Some(Hit::TerminalTab(index) | Hit::TerminalClose(index)) => Some(*index),
+            _ => None,
+        };
+        state.terminal.menu_tab = tab.and_then(|tab| state.terminal.id_of(tab));
+        tab.is_some()
     }
 
     /// The panel appeared, went, or changed sessions: the editor column
@@ -2548,6 +2780,21 @@ pub(super) fn report_focus(state: &mut State, key_window: bool) {
             tab.session.write(if has { b"\x1b[I" } else { b"\x1b[O" });
         }
     }
+}
+
+/// Whether Move Tab Left or Right has somewhere to take a terminal tab:
+/// the one showing or, for a tab's own menu, that one, `step` along the
+/// tabs its strip lists.
+pub(super) fn can_step_terminal_tab(state: &State, of_menu: bool, step: isize) -> bool {
+    let listed = super::agents::listed_terminals(state);
+    let tab = if of_menu {
+        state.terminal.menu_tab_index()
+    } else {
+        Some(state.terminal.active)
+    };
+    tab.and_then(|tab| listed.iter().position(|i| *i == tab))
+        .and_then(|place| place.checked_add_signed(step))
+        .is_some_and(|to| to < listed.len())
 }
 
 pub(super) fn find_rect(state: &State, chrome: &Chrome) -> Option<Viewport> {

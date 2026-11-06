@@ -36,6 +36,9 @@
 //!                             of a region's width and height, with modifiers
 //!                             as for `key`; `cell.<line>.<column>` is a cell
 //!                             of the text, line from 1, column from 0
+//! menuat @<region> <fx> <fy>  a right-click there, as far as the menu it
+//!                             would open: the next dump's `message:` lists
+//!                             the menu's enabled items
 //! trackpad <x> <y> <dy> [dx]  a trackpad scroll of <dy> (and <dx>) points at
 //!                             a point; negative moves the text up or left
 //! wheelat @<region> <fx> <fy> <dy>
@@ -45,6 +48,9 @@
 //! touch <file>                create a file without notifying the project UI
 //! write <file> <text>         overwrite a file, as another program would
 //! dump <file>                 write the state of the active document
+//! action <selector>           a menu item's action sent to the view, as
+//!                             choosing the item does: for the items of a
+//!                             context menu, which have no key
 //! fade <ms>                   hold File History's fade <ms> in, for frames
 //! quit
 //! ```
@@ -174,6 +180,9 @@ pub enum Step {
     /// The menu bar item's menu, made as it opens, and its Nth workspace
     /// row (from 1) chosen. A test instance has no item; this is its path.
     MenuBar(usize),
+    /// A menu item's action, by its selector, sent to the view as choosing
+    /// the item does. A context menu's items have no key to send instead.
+    Action(String),
     /// A notification of the Nth session (from 1) answered, through the
     /// path the system's callback takes: a reply with the text, or a
     /// click without. A test instance posts none; this is its path.
@@ -191,6 +200,8 @@ pub enum Mouse {
     Down,
     Drag,
     Up,
+    /// The right button: the context menu is made, not shown.
+    Menu,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -350,11 +361,12 @@ pub fn parse(script: &str) -> Result<Vec<Step>, String> {
                 dx: args.num().ok_or_else(bad)?,
                 dy: args.num().ok_or_else(bad)?,
             }),
-            "clickat" | "downat" | "dragat" | "upat" if rest.starts_with('@') => {
+            "clickat" | "downat" | "dragat" | "upat" | "menuat" if rest.starts_with('@') => {
                 let mouse = match command {
                     "clickat" => Mouse::Click,
                     "downat" => Mouse::Down,
                     "dragat" => Mouse::Drag,
+                    "menuat" => Mouse::Menu,
                     _ => Mouse::Up,
                 };
                 let name = args.word().ok_or_else(bad)?.to_string();
@@ -435,6 +447,9 @@ pub fn parse(script: &str) -> Result<Vec<Step>, String> {
             "front" if rest == "on" || rest == "off" => steps.push(Step::Front(rest == "on")),
             "reenter" => steps.push(Step::Reenter),
             "menubar" => steps.push(Step::MenuBar(rest.parse().map_err(|_| bad())?)),
+            "action" if rest.ends_with(':') && !rest.contains(' ') => {
+                steps.push(Step::Action(rest.to_string()))
+            }
             "notify" => {
                 let (number, reply) = match rest.split_once(' ') {
                     Some((number, reply)) => (number, Some(reply.to_string())),
@@ -531,8 +546,21 @@ mod tests {
                 },
             }
         );
+        assert!(matches!(
+            parse("menuat @sidebar.row.2 0.5 0.5\n").unwrap()[..],
+            [Step::At {
+                mouse: Mouse::Menu,
+                ..
+            }]
+        ));
         assert_eq!(parse("fade 40\n").unwrap(), [Step::Fade(40)]);
         assert_eq!(parse("menubar 2\n").unwrap(), [Step::MenuBar(2)]);
+        assert_eq!(
+            parse("action closeOtherTerminalTabs:\n").unwrap(),
+            [Step::Action("closeOtherTerminalTabs:".into())]
+        );
+        assert!(parse("action\n").is_err());
+        assert!(parse("action closeOtherTerminalTabs\n").is_err());
         assert!(parse("menubar\n").is_err());
         assert_eq!(parse("notify 2\n").unwrap(), [Step::Notify(2, None)]);
         assert_eq!(
@@ -571,6 +599,7 @@ mod tests {
             "flags cmd 2",
             "clickat scrub.track 0 0.5",
             "upat @scrub.track 0",
+            "menuat sidebar.row.2 0.5 0.5",
             "downat @scrub.track 0 0.5 2",
             "click 1 2 x",
             "click @tab 2 x",
