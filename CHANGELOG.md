@@ -2,6 +2,53 @@
 
 One entry per tag, written for people who use the editor.
 
+## v0.2.0-alpha.35, 2026-11-07
+
+File management in the Explorer, and terminal panes in Agents mode.
+
+- Explorer: select several items with Cmd-click and Shift-click, and drive
+  the tree from the keyboard (arrows to move and open or close folders,
+  Space to open a file and stay, Return or F2 to rename, Cmd-Delete to
+  move to the Trash, type a name to jump to it). Focus Explorer is in the
+  View menu and the palette.
+- Cut, Copy, Paste and Duplicate work on the selection and go through the
+  system clipboard, so files copied in Finder paste into the tree and the
+  other way round. A copy never overwrites: it lands as `name-copy.ext`,
+  then `name-copy-2.ext`. Large copies run in the background and Escape
+  stops them. Cut items dim until pasted.
+- Drag and drop in the tree moves the whole selection, Option copies, a
+  closed folder opens when you hover over it, and the tree scrolls near its
+  edges. A row opens on mouse up now, so picking a file up to drag it no
+  longer opens it. Local history follows a moved file.
+- Files dropped from Finder onto the tree are copied in. When a name is
+  taken, one question covers the drop: Replace sends the old item to the
+  Trash first, Keep Both adds `-copy`, Cancel copies nothing.
+- Tree items dragged onto a terminal type their paths, dragged onto the
+  editor they open, and dragged past the window edge they become a system
+  drag that Finder and other apps can copy from, never move.
+- Undo and Redo work on file operations while the tree has the keyboard:
+  one step per action, never overwriting, with the Edit menu saying what
+  it will undo ("Undo Move of 3 Items").
+- The name field for Rename, New File and New Folder says what is wrong
+  with a name while you type ("This name is already taken"), and Enter
+  waits until it is fixed.
+- Changed files in the tree carry their Git colour and a letter (M, A, U,
+  R, C), folders with changes a dot, ignored files are dimmed. Git status
+  now refreshes when files change on disk, not only while Source Control
+  is open, so the activity bar count no longer goes stale.
+- Agents mode: drag terminal tabs to reorder them (also Cmd-Shift-[ and
+  Cmd-Shift-]), split the terminal into panes with Cmd-\ (right) and
+  Cmd-Shift-\ (down), drag the dividers (double click centres them), and
+  drag a tab onto a pane edge to split there or onto a pane to show it
+  there. Each pane keeps its own scroll and selection, and a program is
+  told its new size once, when you let go. Close Pane removes the focused
+  pane and its neighbour takes the keyboard. Panes are not restored across
+  a relaunch yet.
+- The Source Control badge on the activity bar stays inside the rail and
+  off its icon, counts cap at 99+, and labels everywhere elide with an
+  ellipsis instead of being cut at the edge. The status bar keeps the
+  caret position whole and shortens the note first.
+
 ## v0.2.0-alpha.34, 2026-11-04
 
 A fix release from a code audit of the whole app: 36 findings, most of
