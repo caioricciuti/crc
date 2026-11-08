@@ -139,7 +139,10 @@ pub fn build_text_appending(
     let glyph_dy = m.glyph_dy(m.line_height);
 
     let rows = viewport.rows(m.line_height);
-    if rows == 0 {
+    // A Quick Look file has no text: the native view over this area shows
+    // it, and is transparent where it letterboxes, so an empty line 1 with
+    // its number, band and caret would show through.
+    if rows == 0 || buffer.is_preview_file() {
         return Stats::default();
     }
 

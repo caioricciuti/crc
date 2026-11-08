@@ -778,6 +778,31 @@ mod tests {
         assert!(rect.x < gutter_width(&buffer, &atlas) + atlas.metrics.advance * 2.0);
     }
 
+    /// A video or image tab is a Quick Look view over the text area, which
+    /// is transparent where it letterboxes: the empty buffer under it must
+    /// draw no line number, current-line band or caret there.
+    #[test]
+    fn a_quick_look_file_draws_no_text_under_its_view() {
+        let dir = std::env::temp_dir().join(format!("crc-ql-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("clip.mp4");
+        std::fs::write(&path, [0u8, 0, 0, 0x18, b'f', b't', b'y', b'p']).unwrap();
+        let buffer = Buffer::open(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(buffer.is_preview_file());
+        let mut atlas = atlas();
+        let mut glyphs = Vec::new();
+        let stats = build(
+            &buffer,
+            &mut atlas,
+            Viewport::new(600.0, 200.0),
+            &Theme::default(),
+            &mut glyphs,
+        );
+        assert_eq!(stats.quads, 0);
+        assert!(glyphs.is_empty(), "drew {} quads", glyphs.len());
+    }
+
     #[test]
     fn long_unicode_line_shapes_clusters_and_maps_scrolled_caret() {
         let mut atlas = atlas();
