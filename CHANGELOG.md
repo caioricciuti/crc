@@ -2,6 +2,11 @@
 
 One entry per tag, written for people who use the editor.
 
+## v0.2.0-alpha.36, 2026-11-08
+
+- Videos, images and other files shown with Quick Look no longer have an
+  empty code line (a "1" and a blinking caret) drawn above them.
+
 ## v0.2.0-alpha.35, 2026-11-07
 
 File management in the Explorer, and terminal panes in Agents mode.
