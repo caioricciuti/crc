@@ -1024,7 +1024,8 @@ impl Panel {
                     && was.view.group == pressed.view.group
                     && self.layout_of(id).is_none()
             })
-            .map(|was| was.view.id);
+            .map(|was| was.view.id)
+            .or_else(|| self.partner(tab));
         self.show(tab);
         self.tab_drag = Some(TabDrag {
             tab,
@@ -1036,6 +1037,30 @@ impl Panel {
             pane: false,
             drop: None,
         });
+    }
+
+    /// For the session showing alone, pressed: the tab next to it in the
+    /// strip, of its workspace and listed, which a drop at an edge of its
+    /// own screen puts on the other side. None while its workspace has
+    /// panes, or has no other tab.
+    fn partner(&self, tab: usize) -> Option<PaneId> {
+        let pressed = self.tabs.get(tab)?;
+        let group = &pressed.view.group;
+        if tab != self.active
+            || !self.showing()
+            || self.layouts.iter().any(|panes| &panes.group == group)
+        {
+            return None;
+        }
+        let fits = |i: usize| {
+            i != tab
+                && self.tabs[i].view.group == *group
+                && self.shown.as_ref().is_none_or(|shown| shown.contains(&i))
+        };
+        (tab + 1..self.tabs.len())
+            .find(|&i| fits(i))
+            .or_else(|| (0..tab).rev().find(|&i| fits(i)))
+            .map(|i| self.tabs[i].view.id)
     }
 
     /// The pointer moved with a tab held, the strip in `header` and the
@@ -6440,12 +6465,34 @@ mod tests {
         let mut panel = two_workspaces();
         assert!(!drop_on(&mut panel, &atlas, "g1", "g1", CENTER));
         assert_eq!((panes_of(&panel).as_str(), front(&panel)), ("-", "g1"));
-        // The session showing, dragged over its own screen: nothing.
-        for zone in [CENTER, RIGHT, TOP] {
+        // The session showing, dragged to an edge of its own screen: it
+        // goes there, and the next tab of its workspace takes the other
+        // side. In the middle: nothing.
+        for (zone, panes) in [
+            (RIGHT, "h(0.5,g1,*g0)"),
+            (LEFT, "h(0.5,*g0,g1)"),
+            (TOP, "v(0.5,*g0,g1)"),
+        ] {
             let mut panel = two_workspaces();
-            assert!(!drop_on(&mut panel, &atlas, "g0", "g0", zone));
-            assert_eq!((panes_of(&panel).as_str(), front(&panel)), ("-", "g0"));
+            assert!(drop_on(&mut panel, &atlas, "g0", "g0", zone), "{zone:?}");
+            assert_eq!(panes_of(&panel), panes, "{zone:?}");
+            assert_eq!(front(&panel), "g0", "{zone:?}: it keeps the keyboard");
         }
+        let mut panel = two_workspaces();
+        assert!(!drop_on(&mut panel, &atlas, "g0", "g0", CENTER));
+        assert_eq!((panes_of(&panel).as_str(), front(&panel)), ("-", "g0"));
+        // The last tab of the strip takes the one before it.
+        let mut panel = two_workspaces();
+        panel.show(at(&panel, "g3"));
+        assert!(drop_on(&mut panel, &atlas, "g3", "g3", RIGHT));
+        assert_eq!(panes_of(&panel), "h(0.5,g2,*g3)");
+        // A workspace with one tab has nothing to put beside it.
+        let mut panel = two_workspaces();
+        panel.show(at(&panel, "s0"));
+        let s1 = at(&panel, "s1");
+        panel.tabs.remove(s1);
+        assert!(!drop_on(&mut panel, &atlas, "s0", "s0", RIGHT));
+        assert_eq!(panes_of(&panel), "-");
         // Another workspace's panes are no part of it.
         let mut panel = two_workspaces();
         assert!(drop_on(&mut panel, &atlas, "g1", "g1", RIGHT));
