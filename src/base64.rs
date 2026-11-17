@@ -1,5 +1,5 @@
 //! Standard base64 (RFC 4648, `+` and `/`, padded): the WebSocket
-//! handshake writes it and the registry key is read from it. No crate for
+//! handshake and the terminal's OSC 52 clipboard both use it. No crate for
 //! forty lines.
 
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

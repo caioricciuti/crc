@@ -18,8 +18,8 @@ use std::time::Duration;
 /// first on PATH would be a surprise anyway.
 pub const CURL: &str = "/usr/bin/curl";
 
-/// curl set up for crc's own downloads (the update check, the extension
-/// registry): https only, redirects too, failing on an HTTP error, at most
+/// curl set up for crc's own downloads (the update check): https only,
+/// redirects too, failing on an HTTP error, at most
 /// `max_bytes` and `seconds`. file:// only in tests and self-test runs.
 /// The caller adds headers and the URL.
 pub fn strict_get(max_bytes: u64, seconds: u32) -> Command {

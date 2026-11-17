@@ -6,9 +6,7 @@ One entry per tag, written for people who use the editor.
 
 - Extensions are gone: the WebAssembly engine, the signed registry, the
   Extensions page, Cmd-Shift-X and the Extensions icon in the strip at the
-  window's left. crc no longer runs code that is not its own. What older
-  versions left in `~/Library/Application Support/crc` (`extensions/` and
-  `registry-serial`) can be deleted.
+  window's left. crc no longer runs code that is not its own.
 - Markdown Preview is built in. Cmd-E opens the rendered page beside the
   text and Cmd-Shift-E in the whole tab, with nothing to install first.
 
