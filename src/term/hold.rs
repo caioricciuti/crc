@@ -409,12 +409,22 @@ pub fn leave(dir: &Path, id: &str, left: &Left) {
     let _ = std::fs::write(left_path(dir, id), left.to_text());
 }
 
-/// Starts a helper for `spec` with `helper` (this binary, normally) and
-/// connects to it: the id the window keeps, and the socket for
-/// [`super::pty::Session::attach`].
-pub fn start(dir: &Path, spec: &Spec, helper: &Path) -> std::io::Result<(String, UnixStream)> {
+/// A helper just started: what [`wait_for`] needs to connect to it.
+#[derive(Clone, Debug)]
+pub struct Launched {
+    /// The id the window keeps.
+    pub id: String,
+    socket: PathBuf,
+    program: PathBuf,
+}
+
+/// Starts a helper for `spec` with `helper` (this binary, normally),
+/// without waiting for it: the helper is listening a few milliseconds
+/// later, and [`wait_for`] connects then, off the main thread.
+pub fn launch(dir: &Path, spec: &Spec, helper: &Path) -> std::io::Result<Launched> {
     std::fs::create_dir_all(dir)?;
     let id = crate::project::review::new_id();
+    let socket = socket_path(&id)?;
     std::fs::write(spec_path(dir, &id), spec.to_text())?;
     let mut command = std::process::Command::new(helper);
     command
@@ -438,26 +448,48 @@ pub fn start(dir: &Path, spec: &Spec, helper: &Path) -> std::io::Result<(String,
         remove_all(dir, &id);
         return Err(e);
     }
-    let deadline = Instant::now() + START_TIMEOUT;
-    let socket = socket_path(&id)?;
-    // The helper is listening a few milliseconds after it starts, and a
-    // new terminal waits for it on the main thread: look again soon at
-    // first, then less often.
+    Ok(Launched {
+        id,
+        socket,
+        program: spec.program.clone(),
+    })
+}
+
+/// Starts a helper for `spec` with `helper` and waits to connect to it:
+/// the id the window keeps, and the socket for
+/// [`super::pty::Session::attach`].
+pub fn start(dir: &Path, spec: &Spec, helper: &Path) -> std::io::Result<(String, UnixStream)> {
+    let launched = launch(dir, spec, helper)?;
+    let socket = wait_for(dir, &launched)?;
+    Ok((launched.id, socket))
+}
+
+/// Connects to a helper [`launch`] started, once it listens: the socket
+/// for [`super::pty::Session::attach_deferred`]. Waits up to five seconds.
+pub fn wait_for(dir: &Path, launched: &Launched) -> std::io::Result<UnixStream> {
+    wait_within(dir, launched, START_TIMEOUT)
+}
+
+fn wait_within(dir: &Path, launched: &Launched, timeout: Duration) -> std::io::Result<UnixStream> {
+    let deadline = Instant::now() + timeout;
+    let id = &launched.id;
+    // The helper is listening a few milliseconds after it starts: look
+    // again soon at first, then less often.
     let mut pause = Duration::from_millis(1);
     loop {
-        match UnixStream::connect(&socket) {
-            Ok(socket) => return Ok((id, socket)),
+        match UnixStream::connect(&launched.socket) {
+            Ok(socket) => return Ok(socket),
             Err(e) => {
                 // The spec gone means the helper ran and could not start
                 // the program; it took its files with it.
-                if !spec_path(dir, &id).exists() {
+                if !spec_path(dir, id).exists() {
                     return Err(std::io::Error::other(format!(
                         "the session helper could not start {}",
-                        spec.program.display()
+                        launched.program.display()
                     )));
                 }
                 if Instant::now() >= deadline {
-                    remove_all(dir, &id);
+                    remove_all(dir, id);
                     return Err(std::io::Error::new(
                         e.kind(),
                         format!("the session helper did not answer: {e}"),
@@ -1008,6 +1040,40 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(free, "free again once the first lets go");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_launch_does_not_wait_for_the_helper_to_listen() {
+        let dir = std::env::temp_dir().join(format!("crc-hold-launch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let spec = Spec {
+            program: "/bin/sh".into(),
+            ..Spec::default()
+        };
+        // A helper that never listens: `true` takes the arguments and ends.
+        let started = Instant::now();
+        let launched = launch(&dir, &spec, Path::new("/usr/bin/true")).unwrap();
+        let took = started.elapsed();
+        assert!(took < Duration::from_millis(500), "launch took {took:?}");
+        assert!(spec_path(&dir, &launched.id).exists());
+        // Waited for, it never answers: an error in bounded time, and its
+        // files go.
+        let started = Instant::now();
+        let waited = wait_within(&dir, &launched, Duration::from_millis(150));
+        let error = waited.expect_err("nothing listens");
+        assert!(error.to_string().contains("did not answer"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(!spec_path(&dir, &launched.id).exists());
+        // A helper that could not start the program takes its spec with
+        // it: said at once, not after the timeout.
+        let launched = launch(&dir, &spec, Path::new("/usr/bin/true")).unwrap();
+        std::fs::remove_file(spec_path(&dir, &launched.id)).unwrap();
+        let error = wait_for(&dir, &launched).expect_err("no helper");
+        assert!(
+            error.to_string().contains("could not start /bin/sh"),
+            "{error}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

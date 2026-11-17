@@ -451,6 +451,57 @@ impl Session {
         })
     }
 
+    /// A program a helper just started runs, at once: `connect` waits for
+    /// the helper on a thread of its own (see [`super::hold::wait_for`]),
+    /// so a new terminal never waits for it on the main thread. What is
+    /// typed meanwhile waits in the writer's queue and goes once it is
+    /// connected. A helper that never answers ends the session, with a
+    /// line on its screen saying why.
+    pub fn attach_deferred(
+        connect: impl FnOnce() -> std::io::Result<UnixStream> + Send + 'static,
+        cols: usize,
+        rows: usize,
+        wake: Wake,
+    ) -> Session {
+        let wake: Arc<dyn Fn() + Send + Sync> = Arc::from(wake);
+        let status = Arc::new(Status::default());
+        let term = Arc::new(Mutex::new(Term::new(cols, rows)));
+        let (out, frames) = Outgoing::new();
+        let (shared, seen, replies) = (term.clone(), status.clone(), out.clone());
+        std::thread::spawn(move || {
+            // The helper says its size first; it is the one this window
+            // gave it, and a resize since is queued behind.
+            let connected = connect().and_then(|mut socket| match hold::receive(&mut socket)? {
+                Frame::Size(..) => Ok((socket.try_clone()?, socket)),
+                _ => Err(std::io::Error::other(
+                    "the session helper did not say its size",
+                )),
+            });
+            let (mut reader, mut socket) = match connected {
+                Ok(pair) => pair,
+                Err(e) => {
+                    let said = format!("crc: the session did not start: {e}\r\n");
+                    advance_output(&shared, said.as_bytes(), |_| {});
+                    seen.exited.store(true, Ordering::Release);
+                    seen.woken.store(true, Ordering::Release);
+                    wake();
+                    return;
+                }
+            };
+            let queued = replies.queued.clone();
+            std::thread::spawn(move || {
+                write_frames(frames, queued, |frame| hold::send(&mut socket, frame))
+            });
+            relay_held(&mut reader, &shared, &seen, &replies, &*wake);
+        });
+        Session {
+            term,
+            out,
+            control: Control::Held { detached: false },
+            status,
+        }
+    }
+
     /// A session with no program behind it, for the benchmarks: output
     /// comes in through [`Session::feed`], input goes nowhere, and dropping
     /// it ends nothing.
@@ -734,6 +785,52 @@ mod tests {
             }
         }
         assert_eq!(seen, [Frame::Resize(100, 30), Frame::Kill]);
+    }
+
+    #[test]
+    fn a_deferred_session_keeps_what_was_typed_before_the_helper_answered() {
+        let (ours, mut helper) = UnixStream::pair().unwrap();
+        let (go, gate) = std::sync::mpsc::channel::<()>();
+        let mut session = Session::attach_deferred(
+            move || {
+                gate.recv().unwrap();
+                Ok(ours)
+            },
+            80,
+            24,
+            Box::new(|| {}),
+        );
+        assert!(session.is_held() && !session.has_exited());
+        // Typed and resized before the helper is there.
+        session.write(b"echo x\n");
+        session.resize(100, 30);
+        go.send(()).unwrap();
+        hold::send(&mut helper, &Frame::Size(80, 24)).unwrap();
+        hold::send(&mut helper, &Frame::Output(b"ready".to_vec())).unwrap();
+        assert_eq!(
+            hold::receive(&mut helper).unwrap(),
+            Frame::Input(b"echo x\n".to_vec())
+        );
+        assert_eq!(hold::receive(&mut helper).unwrap(), Frame::Resize(100, 30));
+        assert!(wait_for(&session, |t| t.screen_text() == "ready"));
+        hold::send(&mut helper, &Frame::Exited(3)).unwrap();
+        assert!(until(Duration::from_secs(5), || session.has_exited()));
+        assert_eq!(session.exit_code(), Some(3));
+    }
+
+    #[test]
+    fn a_deferred_session_whose_helper_never_answers_ends_and_says_why() {
+        let session = Session::attach_deferred(
+            || Err(std::io::Error::other("the session helper did not answer")),
+            80,
+            24,
+            Box::new(|| {}),
+        );
+        assert!(until(Duration::from_secs(5), || session.has_exited()));
+        assert_eq!(session.exit_code(), None);
+        assert!(wait_for(&session, |t| t
+            .screen_text()
+            .contains("did not answer")));
     }
 
     fn wait_for(session: &Session, what: impl Fn(&Term) -> bool) -> bool {

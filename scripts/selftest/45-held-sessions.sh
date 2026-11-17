@@ -46,3 +46,18 @@ quit
 SCRIPT
 CRC_TERMINAL_SHELL=/bin/sh CRC_SELFTEST="$T/held-3.script" "$BIN" "$T/heldother" 2> "$T/held-3.err"
 expect_terminal "$T/held-other.out" "held-again"
+
+# A new terminal connects to its helper off the main thread: what is typed
+# before the helper listens waits for it and is not lost. The arithmetic
+# makes the output differ from the command echoed as it is typed.
+cat > "$T/held-4.script" <<SCRIPT
+wait 700
+click @toolbar.terminal
+text echo early-\$((6*7))
+key 36
+wait 1500
+dump $T/held-early.out
+quit
+SCRIPT
+CRC_TERMINAL_SHELL=/bin/sh CRC_SELFTEST="$T/held-4.script" "$BIN" "$T/heldother" 2> "$T/held-4.err"
+expect_terminal "$T/held-early.out" "early-42"

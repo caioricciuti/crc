@@ -527,17 +527,23 @@ impl EditorView {
         // A window opened on one file lets its sessions end at quit, so it
         // runs them itself, as it always ended them, and says nothing.
         let ephemeral = self.state().is_none_or(|state| state.ephemeral_session);
-        let held = self
-            .held_dir()
-            .and_then(|dir| {
-                let helper = std::env::current_exe()?;
-                crate::term::hold::start(&dir, &spec, &helper)
-            })
-            .and_then(|(id, socket)| {
-                crate::term::pty::Session::attach(socket, self.terminal_wake()).map(|s| (id, s))
-            });
-        let (spawned, held, said) = match held {
-            Ok((id, session)) => (Ok(session), Some(id), None),
+        // The helper is started here and connected to on a thread of the
+        // session's own: a new terminal never waits for it to listen.
+        let launched = self.held_dir().and_then(|dir| {
+            let helper = std::env::current_exe()?;
+            crate::term::hold::launch(&dir, &spec, &helper).map(|launched| (dir, launched))
+        });
+        let (spawned, held, said) = match launched {
+            Ok((dir, launched)) => {
+                let id = launched.id.clone();
+                let session = crate::term::pty::Session::attach_deferred(
+                    move || crate::term::hold::wait_for(&dir, &launched),
+                    cols,
+                    rows,
+                    self.terminal_wake(),
+                );
+                (Ok(session), Some(id), None)
+            }
             Err(e) => {
                 let args: Vec<&str> = launch.args.iter().map(String::as_str).collect();
                 let env: Vec<(&str, &str)> = launch
