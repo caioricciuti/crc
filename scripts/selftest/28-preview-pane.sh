@@ -2,21 +2,19 @@
 # expect helpers; run it alone with scripts/selftest.sh preview-pane.
 
 # ---- the preview pane ---------------------------------------------------------
-# Markdown Preview, built in crc-extensions, installed from a folder. Cmd-E
-# splits the pane: the text keeps the left half, the page the right. What
-# the page may load is checked from inside it: the image beside the
-# document loads, one outside the folder does not, a remote image the page
-# is made to load (Markdown Preview itself writes remote images as text) is
-# blocked by crc's rules, and a link goes nowhere. The remote image is one
+# Markdown Preview, built in. Cmd-E splits the pane: the text keeps the
+# left half, the page the right. What the page may load is checked from
+# inside it: the image beside the document loads, one outside the folder
+# does not, a remote image the page is made to load (the preview itself
+# writes remote images as text) is blocked by crc's rules, and a link goes
+# nowhere. The remote image is one
 # that exists (it loads at 64 pixels without the rules), so a 0 is the
 # rules and not a missing file. An edit re-renders without moving the page's scroll;
 # the palette hides the page while it is up; Cmd-E again closes it and
 # deletes the file it was loaded from. The divider between text and page
 # drags; Cmd-Shift-E gives the page the whole tab, where typing reaches
 # nothing, and Escape brings the split back.
-X="$PWD/tests/fixtures/extensions/markdown-preview"
-mkdir -p "$T/pvhome" "$T/pvproj/img" "$T/pvfolder" "$T/pvreg"
-cp "$X"/* "$T/pvfolder/"
+mkdir -p "$T/pvhome" "$T/pvproj/img"
 python3 - "$T" <<'PY'
 import pathlib, struct, sys, zlib
 t = pathlib.Path(sys.argv[1])
@@ -34,19 +32,6 @@ PY
 cat > "$T/pv.script" <<SCRIPT
 wait 600
 dump $T/pv-launch.out
-key 14 cmd e
-idle 300
-dump $T/pv-nopreview.out
-click @status.action
-idle 600
-dump $T/pv-action.out
-key 7 cmd,shift x
-idle 900
-click @extensions.folder
-wait 200
-click @extensions.confirm
-idle 600
-key 53
 key 14 cmd e
 idle 2500
 webjs probe
@@ -95,17 +80,11 @@ idle 300
 dump $T/pv-closed.out
 quit
 SCRIPT
-HOME="$T/pvhome" CRC_EXT_REGISTRY="file://$T/pvreg/" CRC_EXT_FOLDER="$T/pvfolder" CRC_SELFTEST="$T/pv.script" "$BIN" "$T/pvproj/doc.md" 2> "$T/pv.err"
+HOME="$T/pvhome" CRC_SELFTEST="$T/pv.script" "$BIN" "$T/pvproj/doc.md" 2> "$T/pv.err"
 # The document opened at launch is named, not pathed, in the status line.
 expect "$T/pv-launch.out" message "opened doc.md"
-# Cmd-E with nothing installed says where to get a preview, and the
-# button beside it opens Extensions on Markdown Preview.
-expect "$T/pv-nopreview.out" message "No preview installed: get Markdown Preview from crc > Extensions"
-expect "$T/pv-action.out" message ""
-grep -q '^extensions: open selected=crc.markdown-preview ' "$T/pv-action.out" \
-    || failed "preview: the message's button did not open Markdown Preview: $(grep '^extensions:' "$T/pv-action.out")"
-expect "$T/pv-open.out" preview "open ext=crc.markdown-preview view=shown probe=64/0 scroll=0 h1=Title text=6113"
-expect "$T/pv-remote.out" preview "open ext=crc.markdown-preview view=shown probe=0 remote"
+expect "$T/pv-open.out" preview "open view=shown probe=64/0 scroll=0 h1=Title text=6113"
+expect "$T/pv-remote.out" preview "open view=shown probe=0 remote"
 # 1100 wide, sidebar 240: the text's 816 points become 407, a gap, 408.
 grep -q '^layout: window 1100x760 sidebar Some(240.0) text 284,116 407x616 ' "$T/pv-open.out" \
     || failed "preview: the text did not give the page its half: $(grep '^layout:' "$T/pv-open.out")"
@@ -119,10 +98,10 @@ expect_line "$T/pv-only-typed.out" 1 "# Title"
 # Escape brings the text back at the width it was dragged to.
 [ "$(grep '^layout:' "$T/pv-split.out")" = "$(grep '^layout:' "$T/pv-dragged.out")" ] \
     || failed "preview: Escape did not bring the split back: $(grep '^layout:' "$T/pv-split.out")"
-expect "$T/pv-link.out" preview "open ext=crc.markdown-preview view=shown probe=stayed"
-expect "$T/pv-edited.out" preview "open ext=crc.markdown-preview view=shown probe=64/0 scroll=300 h1=- text=6116"
-expect "$T/pv-palette.out" preview "open ext=crc.markdown-preview view=veiled probe=64/0 scroll=300 h1=- text=6116"
-expect "$T/pv-back.out" preview "open ext=crc.markdown-preview view=shown probe=64/0 scroll=300 h1=- text=6116"
+expect "$T/pv-link.out" preview "open view=shown probe=stayed"
+expect "$T/pv-edited.out" preview "open view=shown probe=64/0 scroll=300 h1=- text=6116"
+expect "$T/pv-palette.out" preview "open view=veiled probe=64/0 scroll=300 h1=- text=6116"
+expect "$T/pv-back.out" preview "open view=shown probe=64/0 scroll=300 h1=- text=6116"
 expect "$T/pv-closed.out" preview "closed"
 [ -z "$(ls "$T/pvhome/Library/Caches/crc" 2>/dev/null | grep '^preview-')" ] \
     || failed "preview: page files left behind: $(ls "$T/pvhome/Library/Caches/crc")"

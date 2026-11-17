@@ -24,8 +24,6 @@ pub struct Command {
     pub keywords: &'static str,
     /// The menu item's action, sent the way the menu would send it.
     pub action: Sel,
-    /// The menu item's tag: which extension command, for those.
-    pub tag: isize,
 }
 
 /// Words people type for a command whose menu title says something else.
@@ -74,9 +72,8 @@ pub fn from_menu(mtm: MainThreadMarker, enabled: impl Fn(&NSMenuItem) -> bool) -
     commands
 }
 
-/// The commands in `menu`, and in the submenus inside it (an extension's
-/// commands sit under its name in the Extensions menu), grouped as
-/// "Extensions: Sort Lines" there.
+/// The commands in `menu`, and in the submenus inside it, grouped under
+/// the submenu's name as well.
 fn collect(
     menu: &NSMenu,
     group: &str,
@@ -117,7 +114,6 @@ fn collect(
                 ),
                 keywords: keywords(action),
                 action,
-                tag: item.tag(),
             });
         }
     }
@@ -215,7 +211,6 @@ mod tests {
             shortcut: String::new(),
             keywords,
             action: sel!(copy:),
-            tag: 0,
         }
     }
 

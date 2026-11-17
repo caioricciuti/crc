@@ -295,7 +295,7 @@ impl EditorView {
             Pick::Repo(path) => self.select_repo(&path),
             Pick::Recover(path) => self.recover_file(path),
             Pick::Symbol(path, line) => self.go_to_symbol(path, line),
-            Pick::Command(at, tag) => self.run_command(at, tag),
+            Pick::Command(at) => self.run_command(at),
             // By id, not place: a session may have closed, or the list
             // moved, since the row was drawn.
             Pick::Session(id) => {
@@ -347,13 +347,7 @@ impl EditorView {
     /// it handles it, otherwise down the responder chain to the window and
     /// the app. The editor first, because it is where the palette lives
     /// whether or not its window is key.
-    pub(super) fn run_command(&self, action: Sel, tag: isize) {
-        // The palette has no menu item to send: an extension command is
-        // told by its tag.
-        if action == sel!(runExtensionCommand:) {
-            self.run_extension(tag);
-            return;
-        }
+    pub(super) fn run_command(&self, action: Sel) {
         let handles: bool = unsafe { msg_send![self, respondsToSelector: action] };
         if handles {
             // It returns the action's result as an object, void or not.

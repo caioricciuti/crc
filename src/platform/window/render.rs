@@ -97,7 +97,6 @@ impl EditorView {
             task_prompt,
             commit_prompt,
             term_search,
-            extensions,
             settings_page,
             update_ready,
             replaced,
@@ -188,7 +187,7 @@ impl EditorView {
 
         // The one layout. `chrome_of` needs the whole state, so it is asked
         // before the state is taken apart field by field below.
-        let ext_details_rect = details_rect(&chrome);
+        let page_rect = details_rect(&chrome);
         let Chrome {
             toolbar: toolbar_rect,
             activity: activity_rect,
@@ -253,28 +252,13 @@ impl EditorView {
             crate::platform::settings_page::draw(
                 settings_page,
                 &mut renderer.atlas,
-                ext_details_rect,
-                theme,
-                glyphs,
-            );
-        } else if let Some(page) = extensions.as_mut().filter(|_| column == Column::Extensions) {
-            glyphs.clear();
-            crate::platform::extensions::draw_details(
-                page,
-                &mut renderer.atlas,
-                ext_details_rect,
+                page_rect,
                 theme,
                 glyphs,
             );
         } else if column == Column::Mcp {
             glyphs.clear();
-            crate::platform::mcp_page::draw(
-                mcp,
-                &mut renderer.atlas,
-                ext_details_rect,
-                theme,
-                glyphs,
-            );
+            crate::platform::mcp_page::draw(mcp, &mut renderer.atlas, page_rect, theme, glyphs);
         } else if diffing {
             glyphs.clear();
             layout::push_rect(
@@ -638,11 +622,10 @@ impl EditorView {
             glyphs,
         );
 
-        // Under the Extensions details the tabs are still laid out, so
+        // Under a page's details the tabs are still laid out, so
         // their hit list stays true, but drawn into nothing.
         let mut hidden = Vec::new();
-        let details =
-            agents.on || matches!(column, Column::Extensions | Column::Mcp | Column::Settings);
+        let details = agents.on || matches!(column, Column::Mcp | Column::Settings);
         layout::build_tab_bar(
             docs,
             *tab_scroll,
@@ -655,7 +638,7 @@ impl EditorView {
         );
 
         if details {
-            // The Extensions, MCP and Settings pages cover this row; a document's
+            // The MCP and Settings pages cover this row; a document's
             // path here would label them as something they are not.
         } else if diffing {
             // The breadcrumb row says which change is on screen, so the
@@ -801,8 +784,6 @@ impl EditorView {
                 theme,
                 sidebar_rect.filter(|_| !agents.on).map(|_| {
                     if mcp.open {
-                        4
-                    } else if extensions.is_some() {
                         3
                     } else if *git_open {
                         2
@@ -931,17 +912,6 @@ impl EditorView {
                     glyphs,
                 );
             }
-        } else if let Some(rect) = sidebar_rect
-            && let Some(page) = extensions.as_mut()
-        {
-            layout::push_rect(
-                glyphs,
-                &renderer.atlas,
-                [rect.x, rect.y],
-                [rect.width, rect.height],
-                theme.sidebar_background,
-            );
-            crate::platform::extensions::draw_list(page, &mut renderer.atlas, rect, theme, glyphs);
         } else if let Some(rect) = sidebar_rect
             && mcp.open
         {

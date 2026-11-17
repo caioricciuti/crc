@@ -13,6 +13,7 @@
 //! so a tree would only have to be flattened again; blocks carry their own
 //! indent depth instead.
 
+pub mod html;
 pub mod source;
 
 use std::ops::Range;
@@ -22,6 +23,8 @@ use std::ops::Range;
 pub struct Run {
     pub text: String,
     pub style: Style,
+    /// Where a link points or an image's source; `None` for every other run.
+    pub target: Option<String>,
 }
 
 /// How a run should be drawn. The renderer maps these onto theme colours.
@@ -540,6 +543,7 @@ pub fn parse_inline(text: &str) -> Vec<Run> {
             runs.push(Run {
                 text: std::mem::take(plain),
                 style: Style::Plain,
+                target: None,
             });
         }
     };
@@ -568,6 +572,7 @@ pub fn parse_inline(text: &str) -> Vec<Run> {
             runs.push(Run {
                 text: chars[i + 2..close].iter().collect(),
                 style: Style::Image,
+                target: Some(link_target(&chars[close + 2..paren])),
             });
             i = paren + 1;
             continue;
@@ -581,6 +586,7 @@ pub fn parse_inline(text: &str) -> Vec<Run> {
             runs.push(Run {
                 text: chars[i + 1..end].iter().collect(),
                 style: Style::Code,
+                target: None,
             });
             i = end + 1;
             continue;
@@ -601,13 +607,15 @@ pub fn parse_inline(text: &str) -> Vec<Run> {
                 runs.push(Run {
                     style: combine(style, run.style),
                     text: run.text,
+                    target: run.target,
                 });
             }
             i = end + marker;
             continue;
         }
 
-        // A link: [text](target). Only the text is shown.
+        // A link: [text](target). The editor shows only the text; the
+        // preview page links it.
         if chars[i] == '['
             && let Some(close) = misses.find_from(&chars, i + 1, ']')
             && chars.get(close + 1) == Some(&'(')
@@ -617,6 +625,7 @@ pub fn parse_inline(text: &str) -> Vec<Run> {
             runs.push(Run {
                 text: chars[i + 1..close].iter().collect(),
                 style: Style::Link,
+                target: Some(link_target(&chars[close + 2..paren])),
             });
             i = paren + 1;
             continue;
@@ -628,6 +637,16 @@ pub fn parse_inline(text: &str) -> Vec<Run> {
 
     flush(&mut plain, &mut runs);
     runs
+}
+
+/// The destination inside `( )`, without an optional `"title"` or `<>`.
+fn link_target(inside: &[char]) -> String {
+    let inside: String = inside.iter().collect();
+    let dest = inside.split_whitespace().next().unwrap_or("");
+    dest.strip_prefix('<')
+        .and_then(|d| d.strip_suffix('>'))
+        .unwrap_or(dest)
+        .to_string()
 }
 
 /// An inner style applied inside an outer one.
@@ -848,6 +867,7 @@ mod tests {
         vec![Run {
             text: text.into(),
             style: Style::Plain,
+            target: None,
         }]
     }
 

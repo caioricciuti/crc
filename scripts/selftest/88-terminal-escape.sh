@@ -3,11 +3,11 @@
 
 # ---- Escape over a page never reaches the shell -------------------------------
 # With the terminal holding the keyboard, Escape closes the page over the
-# editor column (Extensions, Settings, MCP) and is spent there: the shell
+# editor column (Settings, MCP) and is spent there: the shell
 # never hears it, so bash does not ring the bell on ESC ESC after a page
 # was merely closed. With nothing to close, Escape goes to the shell, as
 # vim and friends need. The shell stand-in logs every byte it is sent.
-mkdir -p "$T/escproj" "$T/eschome" "$T/escnoreg"
+mkdir -p "$T/escproj" "$T/eschome"
 printf 'untouched\n' > "$T/escproj/notes.txt"
 cat > "$T/esc-shell.sh" <<SHELL
 #!/bin/sh
@@ -22,12 +22,6 @@ wait 700
 wait 700
 text a
 wait 200
-key 7 cmd,shift x
-wait 500
-dump $T/esc-ext.out
-key 53
-wait 300
-dump $T/esc-ext-closed.out
 key 43 cmd ,
 wait 300
 dump $T/esc-settings.out
@@ -52,15 +46,10 @@ text c
 wait 500
 quit
 SCRIPT
-HOME="$T/eschome" CRC_EXT_REGISTRY="file://$T/escnoreg/" CRC_TERMINAL_SHELL="$T/esc-shell.sh" \
+HOME="$T/eschome" CRC_TERMINAL_SHELL="$T/esc-shell.sh" \
     CRC_SELFTEST="$T/esc.script" "$BIN" "$T/escproj/notes.txt" 2> "$T/esc.err"
 # The terminal kept the keyboard under each page, and each Escape closed
 # the page.
-expect_terminal "$T/esc-ext.out" "open=true focus=true"
-grep -q '^extensions: open ' "$T/esc-ext.out" \
-    || failed "esc-ext.out: Cmd-Shift-X did not open the Extensions page: $(grep '^extensions:' "$T/esc-ext.out")"
-grep -q '^extensions: list ' "$T/esc-ext-closed.out" \
-    || failed "esc-ext-closed.out: Escape did not close the Extensions page: $(grep '^extensions:' "$T/esc-ext-closed.out")"
 expect_terminal "$T/esc-settings.out" "open=true focus=true"
 grep -q '^settings_page: open ' "$T/esc-settings.out" \
     || failed "esc-settings.out: Cmd-, did not open the Settings page: $(grep '^settings_page:' "$T/esc-settings.out")"
@@ -72,7 +61,7 @@ grep -q '^mcp_page: open ' "$T/esc-mcp.out" \
 grep -q '^mcp_page: closed ' "$T/esc-mcp-closed.out" \
     || failed "esc-mcp-closed.out: Escape did not close the MCP page: $(grep '^mcp_page:' "$T/esc-mcp-closed.out")"
 # The shell heard the typing and the one Escape pressed with nothing open,
-# and none of the three that closed a page.
+# and none of the two that closed a page.
 bytes=$(od -An -c "$T/esc.bytes" 2>/dev/null | tr -s ' \n' ' ' | sed 's/^ //; s/ $//')
 [ "$bytes" = "a b 033 c" ] \
     || failed "esc.bytes: the shell was sent [$bytes], expected [a b 033 c]"

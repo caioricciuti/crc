@@ -560,27 +560,43 @@ mod tests {
     }
 
     #[test]
-    fn string_vectors_shared_with_the_extension_crate() {
-        let vectors = include_str!("../tests/fixtures/extensions/contract/json-strings.txt");
-        for line in vectors
-            .lines()
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        {
-            let (literal, expected) = line.split_once('\t').expect("literal, tab, expected");
+    fn string_literals_decode_and_round_trip() {
+        // Each literal and what it decodes to, or `None` when it is refused.
+        // Raw control characters inside a string are refused too; the
+        // writer never produces one.
+        let vectors: [(&str, Option<&str>); 18] = [
+            (r#""""#, Some("")),
+            (r#""plain text""#, Some("plain text")),
+            (
+                r#""quote \" backslash \\ slash \/""#,
+                Some("quote \" backslash \\ slash /"),
+            ),
+            (r#""\b\f\n\r\t""#, Some("\u{8}\u{c}\n\r\t")),
+            (r#""\u0000\u001f""#, Some("\u{0}\u{1f}")),
+            (r#""café café""#, Some("café café")),
+            (r#""café 漢字 😀""#, Some("café 漢字 😀")),
+            (r#""漢""#, Some("漢")),
+            (r#""😀""#, Some("😀")),
+            (r#""a😀b""#, Some("a😀b")),
+            (r#""\ud83d""#, None),
+            (r#""\ud83dx""#, None),
+            (r#""\ud83dA""#, None),
+            (r#""\ude00""#, None),
+            (r#""\x""#, None),
+            (r#""\u12""#, None),
+            (r#""\u12g4""#, None),
+            (r#""unterminated"#, None),
+        ];
+        for (literal, expected) in vectors {
             let parsed = parse(literal);
-            if expected == "error" {
+            let Some(text) = expected else {
                 assert!(parsed.is_err(), "{literal} should be refused");
                 continue;
-            }
-            let bytes: Vec<u8> = (0..expected.len())
-                .step_by(2)
-                .map(|i| u8::from_str_radix(&expected[i..i + 2], 16).expect("hex"))
-                .collect();
-            let text = String::from_utf8(bytes).expect("UTF-8");
-            assert_eq!(parsed, Ok(Value::String(text.clone())), "{literal}");
+            };
+            assert_eq!(parsed, Ok(Value::String(text.into())), "{literal}");
             assert_eq!(
-                parse(&compact(&Value::String(text.clone()))),
-                Ok(Value::String(text))
+                parse(&compact(&Value::String(text.into()))),
+                Ok(Value::String(text.into()))
             );
         }
     }

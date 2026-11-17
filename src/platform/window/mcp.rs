@@ -19,7 +19,6 @@ impl EditorView {
             let Some(mut state) = self.state_mut() else {
                 return;
             };
-            state.extensions = None;
             state.git_open = false;
             state.git_focus = false;
             state.search_open = false;
@@ -30,7 +29,7 @@ impl EditorView {
                 state.mcp.reload();
             }
             state.mcp.open = true;
-            // The page takes the editor column, as the Extensions page
+            // The page takes the editor column, as the Settings page
             // does; Escape, Close or a tab gives it back.
             state.mcp.details = true;
             state.mcp.note = None;

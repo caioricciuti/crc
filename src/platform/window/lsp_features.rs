@@ -711,7 +711,7 @@ impl EditorView {
                 let Some(state) = self.state() else {
                     return;
                 };
-                state.extensions.is_none() && !state.git_open
+                !state.git_open
             };
             if !explorer {
                 self.activate(0);
@@ -742,8 +742,6 @@ impl EditorView {
                 return;
             };
             let current = if state.mcp.open {
-                4
-            } else if state.extensions.is_some() {
                 3
             } else if state.git_open {
                 2
@@ -768,7 +766,6 @@ impl EditorView {
             0 => self.set_sidebar_view(false),
             1 => self.open_search(),
             2 => self.set_sidebar_view(true),
-            3 => self.open_extensions(),
             _ => self.open_mcp(),
         }
         let Some(mut state) = self.state_mut() else {

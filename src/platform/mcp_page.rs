@@ -1,5 +1,5 @@
 //! The MCP page: the editor column while the MCP sidebar is open, the way
-//! the Extensions page takes it. It says what a server is, lists each one
+//! the Settings page takes it. It says what a server is, lists each one
 //! as a card with its Start/Stop, and shows a server's tools, resources
 //! and prompts with their descriptions. A new server is added from here:
 //! an installed program through the Open panel, or a URL through the

@@ -130,7 +130,7 @@ pub fn drop_duplicates(
 pub fn blob_id(bytes: &[u8]) -> Option<String> {
     let mut object = format!("blob {}\0", bytes.len()).into_bytes();
     object.extend_from_slice(bytes);
-    let hash = crate::ext::verify::sha1(&object)?;
+    let hash = crate::hash::sha1(&object)?;
     Some(hash.iter().map(|b| format!("{b:02x}")).collect())
 }
 

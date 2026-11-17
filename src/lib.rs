@@ -9,7 +9,7 @@
 
 pub mod base64;
 pub mod complete;
-pub mod ext;
+pub mod hash;
 pub mod history;
 pub mod http;
 pub mod ide;

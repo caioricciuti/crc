@@ -39,7 +39,6 @@ impl EditorView {
             let Some(mut state) = self.state_mut() else {
                 return;
             };
-            state.extensions = None;
             state.mcp.open = false;
             state.search_open = false;
             state.search_focus = None;
@@ -425,9 +424,8 @@ impl EditorView {
     /// active document's row, or on the first row when it has none.
     pub(super) fn focus_explorer(&self) {
         let Some(elsewhere) = self.state().and_then(|state| {
-            (state.tree.root().is_some() && !state.agents.on).then(|| {
-                state.git_open || state.search_open || state.mcp.open || state.extensions.is_some()
-            })
+            (state.tree.root().is_some() && !state.agents.on)
+                .then(|| state.git_open || state.search_open || state.mcp.open)
         }) else {
             return;
         };
@@ -1023,12 +1021,7 @@ impl EditorView {
 
 /// Whether the sidebar is showing the Explorer's tree, not another view.
 pub(super) fn explorer_showing(state: &State) -> bool {
-    state.sidebar
-        && !state.agents.on
-        && !state.git_open
-        && !state.search_open
-        && !state.mcp.open
-        && state.extensions.is_none()
+    state.sidebar && !state.agents.on && !state.git_open && !state.search_open && !state.mcp.open
 }
 
 /// Whether keys go to the Explorer's tree: it was pressed last, it is what

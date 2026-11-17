@@ -64,11 +64,10 @@ struct Args {
 }
 
 impl Args {
-    const FLAGS: [&str; 8] = [
+    const FLAGS: [&str; 7] = [
         "--atlas-stress",
         "--tab-stress",
         "--reuse-edit",
-        "--markdown",
         "--find",
         "--select-query",
         "--git",
@@ -391,68 +390,6 @@ fn main() -> std::io::Result<()> {
         &theme,
         &mut glyphs,
     );
-    // The Markdown renderer extensions' READMEs use, on the given file.
-    if args.flag("--markdown") {
-        let source = docs.active().rope.to_string();
-        let blocks = crc::markdown::parse_spanned(&source);
-        glyphs.clear();
-        renderer.atlas.begin_frame();
-        let drawn = layout::build_markdown_appending(
-            &blocks,
-            0,
-            &mut renderer.atlas,
-            viewport,
-            &theme,
-            &mut glyphs,
-        );
-        println!("markdown    {} blocks, {drawn} drawn", blocks.len());
-        layout::build_toolbar(
-            &tree,
-            false,
-            None,
-            &mut renderer.atlas,
-            chrome.toolbar,
-            &theme,
-            &mut glyphs,
-        );
-        layout::build_tab_bar(
-            &docs,
-            0,
-            None,
-            &mut renderer.atlas,
-            tab_rect,
-            &theme,
-            &mut glyphs,
-            &mut tab_hits,
-        );
-        layout::build_breadcrumbs(
-            docs.active(),
-            &tree,
-            docs.is_home(),
-            &mut renderer.atlas,
-            chrome.breadcrumbs,
-            &theme,
-            &mut glyphs,
-        );
-        layout::build_sidebar(
-            &tree,
-            false,
-            &mut renderer.atlas,
-            sidebar_rect,
-            &theme,
-            &mut glyphs,
-        );
-        let bgra = renderer.render_offscreen(
-            px_w,
-            px_h,
-            &glyphs,
-            (logical_w, logical_h),
-            theme.background,
-        );
-        write_bgra(&out, px_w, px_h, &bgra)?;
-        println!("wrote       {out}");
-        return Ok(());
-    }
 
     // The find bar, drawn from the same geometry the window hit-tests.
     if args.flag("--find") {

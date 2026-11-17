@@ -3,16 +3,15 @@
 # was reviewed.
 #
 # third_party/ holds C compiled into the binary by our own build.rs, which
-# is outside everything the cargo gates look at. tests/spec/ holds the
-# official WebAssembly spec tests the interpreter is checked against. Each
-# folder's CHECKSUMS pins every file by SHA-256, and its SOURCES.md says
-# which upstream commit they came from and which differ from it on purpose.
+# is outside everything the cargo gates look at. Its CHECKSUMS pins every
+# file by SHA-256, and its SOURCES.md says which upstream commit they came
+# from and which differ from it on purpose.
 #
 # A change to a vendored file therefore shows up twice in a diff: once in a
 # file nobody can review by reading (parser.c is 206K generated lines), and
 # once as a changed line here, which is the one a reviewer will actually see.
 #
-# Usage: scripts/check-third-party.sh                   verify both folders
+# Usage: scripts/check-third-party.sh                   verify the folder
 #        scripts/check-third-party.sh --update <folder> rewrite its CHECKSUMS
 #                                                       after a deliberate
 #                                                       re-vendor
@@ -25,7 +24,7 @@ list() {
 }
 
 if [ "${1:-}" = "--update" ]; then
-    folder=${2:?"which folder: third_party or tests/spec"}
+    folder=${2:?"which folder: third_party"}
     cd "$folder"
     list | xargs shasum -a 256 > CHECKSUMS
     echo "wrote $folder/CHECKSUMS ($(wc -l < CHECKSUMS | tr -d ' ') files)"
@@ -33,7 +32,7 @@ if [ "${1:-}" = "--update" ]; then
     exit 0
 fi
 
-for folder in third_party tests/spec; do
+for folder in third_party; do
     (
         cd "$folder"
         # A file that was added without being listed is as interesting as

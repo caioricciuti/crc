@@ -60,15 +60,6 @@ type only shows up there:
 scripts/selftest.sh --debug
 ```
 
-For changes to the extension interpreter (`src/ext/wasm.rs`), `cargo
-test` already runs the official WebAssembly spec tests in
-`tests/wasm_spec.rs` and the malformed-module and limit corpora; also run
-the fuzzer for a while, and add cases for any new instruction:
-
-```sh
-cargo run --offline --example ext_fuzz -- --seconds 300
-```
-
 Use temporary repositories for Git regression tests. For a visual change,
 look at a rendered frame or a capture of the real window, not only at the
 tests; say in the pull request which checks you could not run.
@@ -125,7 +116,7 @@ happened during milestone 0 and only a dumped image caught them.
 
 For a change to the chrome, `scripts/ui-tour.sh` walks a test instance
 through every surface (home screen, editor, palette, search, Git,
-history, split, terminal, settings, extensions, preview, CSV, Agents and
+history, split, terminal, settings, preview, CSV, Agents and
 inspector) in both themes and keeps a PNG of each, drawn by the renderer
 itself rather than captured from the screen, so it needs no permission
 and the window need not be in front. Look at the frames before sending
@@ -150,8 +141,8 @@ scripts/ui-tour.sh --out DIR git  # only the frames whose names contain "git"
 
 ## Scope
 
-Issues and PRs that move toward the three bets in the README (the SQLite
-index, WASM extensions with declared capabilities, the agent-as-protocol-client
+Issues and PRs that move toward the two bets in the
+[vision](docs/vision.md) (the SQLite index and the agent-as-protocol-client
 model) are the most valuable.
 
 Before building something large, open an issue first. The architecture is

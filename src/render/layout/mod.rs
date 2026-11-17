@@ -5,7 +5,6 @@
 //! cached CoreText shaping. Only visible lines are touched, which keeps a
 //! 100MB file costing roughly the same as a small one.
 
-use crate::markdown::{Block, Run, SpannedBlock, Style};
 use crate::project::finder::{Finder, Match};
 use crate::project::icons;
 use crate::project::tree::Tree;
@@ -24,14 +23,14 @@ use crate::text::columns::TAB_WIDTH;
 mod chrome;
 mod draw;
 mod editor;
-mod markdown;
+mod prose;
 pub mod split;
 mod theme;
 mod ui;
 pub use chrome::*;
 pub use draw::*;
 pub use editor::*;
-pub use markdown::*;
+use prose::push_prose;
 pub use theme::*;
 pub use ui::*;
 
@@ -1218,53 +1217,6 @@ mod tests {
         let intervals = shaped_intervals(&shaped, &bytes, 6, 14);
         assert_eq!(intervals.len(), 2);
         assert!(intervals[0].1 < intervals[1].0);
-    }
-
-    #[test]
-    fn a_wide_code_block_stays_inside_the_preview() {
-        let mut atlas = atlas();
-        let source = format!("```\n{}\n```\n", "x".repeat(400));
-        let blocks = crate::markdown::parse_spanned(&source);
-        let mut glyphs = Vec::new();
-        let view = Viewport {
-            x: 100.0,
-            y: 50.0,
-            width: 300.0,
-            height: 200.0,
-        };
-        build_markdown_appending(&blocks, 0, &mut atlas, view, &Theme::default(), &mut glyphs);
-        assert!(!glyphs.is_empty());
-        for quad in &glyphs {
-            assert!(
-                quad.pos[0] >= view.x - 0.01
-                    && quad.pos[0] + quad.size[0] <= view.x + view.width + 0.01
-            );
-            assert!(
-                quad.pos[1] >= view.y - 0.01
-                    && quad.pos[1] + quad.size[1] <= view.y + view.height + 0.01
-            );
-        }
-    }
-
-    #[test]
-    fn a_word_too_long_to_shape_still_takes_its_room() {
-        let mut atlas = atlas();
-        let url = format!("https://example.invalid/{}", "a".repeat(700));
-        let source = format!("{url} after\n");
-        let blocks = crate::markdown::parse_spanned(&source);
-        let mut glyphs = Vec::new();
-        let view = Viewport::new(800.0, 2000.0);
-        build_markdown_appending(&blocks, 0, &mut atlas, view, &Theme::default(), &mut glyphs);
-        // The word wraps over several rows rather than running off the
-        // side, and "after" comes after it.
-        let rows: std::collections::BTreeSet<i64> =
-            glyphs.iter().map(|q| q.pos[1] as i64).collect();
-        assert!(rows.len() > 2, "the long word wraps");
-        assert!(
-            glyphs
-                .iter()
-                .all(|q| q.pos[0] + q.size[0] <= view.width + 0.01)
-        );
     }
 
     #[test]

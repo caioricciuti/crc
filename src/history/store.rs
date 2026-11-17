@@ -440,7 +440,7 @@ impl Store {
         let hash = statement.blob(0);
         let bytes = unpack(statement.int(1), statement.int(2), &statement.blob(3));
         Ok(bytes
-            .filter(|bytes| crate::ext::verify::sha256(bytes).is_some_and(|h| h[..] == hash[..]))
+            .filter(|bytes| crate::hash::sha256(bytes).is_some_and(|h| h[..] == hash[..]))
             .and_then(|bytes| String::from_utf8(bytes).ok()))
     }
 
@@ -836,7 +836,7 @@ fn key(path: &Path) -> Result<&str> {
 }
 
 fn digest(bytes: &[u8]) -> Result<[u8; 32]> {
-    crate::ext::verify::sha256(bytes).ok_or_else(|| {
+    crate::hash::sha256(bytes).ok_or_else(|| {
         Error::Sqlite(db::Error {
             code: SQLITE_TOOBIG,
             message: format!("{} bytes is too big to hash", bytes.len()),
@@ -1444,7 +1444,7 @@ mod tests {
         assert_eq!(store.read(young).unwrap().as_deref(), Some(&*shared));
         let undo = store.get_undo(Path::new("/undo")).unwrap().unwrap();
         assert_eq!(undo.journal, b"journal bytes");
-        assert_eq!(undo.base, crate::ext::verify::sha256(b"base text").unwrap());
+        assert_eq!(undo.base, crate::hash::sha256(b"base text").unwrap());
         assert_eq!(count(&store, "SELECT count(*) FROM blobs"), 2);
         // /old and /gone have nothing left, so their rows go too.
         assert_eq!(count(&store, "SELECT count(*) FROM files"), 2);
@@ -1473,7 +1473,7 @@ mod tests {
         store.put_undo(file, "v2", b"", NOW + 1).unwrap();
         let undo = store.get_undo(file).unwrap().unwrap();
         assert_eq!(undo.journal, b"");
-        assert_eq!(undo.base, crate::ext::verify::sha256(b"v2").unwrap());
+        assert_eq!(undo.base, crate::hash::sha256(b"v2").unwrap());
         assert_eq!(
             count(&store, "SELECT count(*) FROM blobs"),
             1,

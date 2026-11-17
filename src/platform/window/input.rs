@@ -358,9 +358,9 @@ impl EditorView {
         self.pump();
     }
 
-    /// Escape over a page that has the editor column: leaves the page's
-    /// confirmation, then the page. Returns whether a page took the key,
-    /// which then reaches nothing else.
+    /// Escape over a page that has the editor column: leaves the page.
+    /// Returns whether a page took the key, which then reaches nothing
+    /// else.
     fn escape_page(&self, event: &NSEvent) -> bool {
         let command = event
             .modifierFlags()
@@ -376,13 +376,7 @@ impl EditorView {
         ) {
             return false;
         }
-        let confirming = state
-            .extensions
-            .as_mut()
-            .is_some_and(|p| p.confirm.take().is_some());
-        if !confirming {
-            uncover_column(&mut state);
-        }
+        uncover_column(&mut state);
         drop(state);
         self.request_redraw();
         true
@@ -432,7 +426,7 @@ impl EditorView {
         // Escape closes what is open on screen before any shell hears it.
         // A field with the keyboard (palette, find, go to line) is ahead
         // of the terminal already; a page covering the editor column
-        // (Extensions, MCP, Settings, Review) is closed here, ahead of the
+        // (MCP, Settings, Review) is closed here, ahead of the
         // shell. The key that closed something is spent and never reaches
         // the terminal, so bash does not ring its bell on ESC ESC after a
         // page was merely closed. Only with nothing to close does Escape
@@ -675,10 +669,9 @@ impl EditorView {
         {
             return true;
         }
-        // The Extensions, MCP or Settings page has the column: Escape
-        // leaves its confirmation, then the page; nothing types into the
-        // document underneath. The palette, opened over it, keeps its own
-        // keys.
+        // The MCP or Settings page has the column: Escape leaves the page;
+        // nothing types into the document underneath. The palette, opened
+        // over it, keeps its own keys.
         if self
             .state()
             .is_some_and(|state| page_covers(&state) && state.palette.is_none())
@@ -1291,10 +1284,10 @@ fn task_digit(code: u16) -> Option<usize> {
     KEYS.iter().position(|k| *k == code).map(|i| i + 1)
 }
 
-/// Whether a page that takes the editor column whole (Extensions details,
-/// MCP, Settings) is open.
+/// Whether a page that takes the editor column whole (MCP, Settings) is
+/// open.
 fn page_covers(state: &State) -> bool {
-    ext_details(state) || mcp_details(state) || state.settings_page.open
+    mcp_details(state) || state.settings_page.open
 }
 
 /// Whether a key is Escape over a page that has the editor column, with

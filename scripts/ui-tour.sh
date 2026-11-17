@@ -150,9 +150,7 @@ sed -i '' 's/days_to_harvest: 60/days_to_harvest: 65/' "$P/src/main.rs"
 
 # ---- the tour --------------------------------------------------------------
 # Every surface is reached by its own key or toolbar control, the way a
-# person reaches it. The file-opening steps after the Extensions page land
-# in the pane behind it (see the plan's UI item 4); they are kept so that
-# fix shows up here too.
+# person reaches it.
 tour() {
     local theme=$1
     local home="$T/home/$theme"
@@ -208,11 +206,6 @@ wait 300
 key 43 cmd ,
 wait 400
 frame $out/$theme-11-settings.bmp
-key 53
-wait 200
-key 7 cmd,shift x
-wait 1200
-frame $out/$theme-12-extensions.bmp
 key 53
 wait 200
 key 35 cmd p

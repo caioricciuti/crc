@@ -3,8 +3,8 @@
 
 # ---- activity bar --------------------------------------------------------------
 # The icon strip at the left: another panel's icon switches to it, the
-# active one hides the sidebar and brings it back, and Extensions puts its
-# list in the sidebar and its details in the editor column.
+# active one hides the sidebar and brings it back, and MCP puts its list
+# in the sidebar and its page in the editor column.
 mkdir -p "$T/actproj" "$T/acthome"
 git init -q -b main "$T/actproj"
 printf 'one\n' > "$T/actproj/a.txt"
@@ -23,12 +23,12 @@ dump $T/act-hidden.out
 click @activity.source-control
 wait 100
 dump $T/act-back.out
-click @activity.extensions
+click @activity.mcp
 wait 400
-dump $T/act-ext.out
-click @extensions.close
+dump $T/act-mcp.out
+click @mcp.page.close
 wait 100
-dump $T/act-ext-list.out
+dump $T/act-mcp-list.out
 click @activity.explorer
 wait 100
 dump $T/act-explorer.out
@@ -46,11 +46,11 @@ expect "$T/act-scm.out" activity "source-control sidebar=on"
 expect "$T/act-scm.out" git_open true
 expect "$T/act-hidden.out" activity "source-control sidebar=off"
 expect "$T/act-back.out" activity "source-control sidebar=on"
-expect "$T/act-ext.out" activity "extensions sidebar=on"
-grep -q '^extensions: open ' "$T/act-ext.out" || failed "act-ext: the details did not open"
-grep -q '^extensions: list ' "$T/act-ext-list.out" || failed "act-ext-list: Close did not keep the list"
+expect "$T/act-mcp.out" activity "mcp sidebar=on"
+grep -q '^mcp_page: open ' "$T/act-mcp.out" || failed "act-mcp: the page did not open"
+grep -q '^mcp_page: closed ' "$T/act-mcp-list.out" || failed "act-mcp-list: Close did not give the column back"
+expect "$T/act-mcp-list.out" activity "mcp sidebar=on"
 expect "$T/act-explorer.out" activity "explorer sidebar=on"
-expect "$T/act-explorer.out" extensions "closed"
 # The Search view has its own icon, between Explorer and Source Control.
 expect "$T/act-search.out" activity "search sidebar=on"
 expect "$T/act-search-left.out" activity "explorer sidebar=on"

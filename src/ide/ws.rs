@@ -364,7 +364,7 @@ fn same(a: &[u8], b: &[u8]) -> bool {
 /// `Sec-WebSocket-Accept` for a client's key, RFC 6455 section 4.2.2.
 fn accept_key(key: &str) -> String {
     const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-    let digest = crate::ext::verify::sha1(format!("{key}{GUID}").as_bytes()).unwrap_or_default();
+    let digest = crate::hash::sha1(format!("{key}{GUID}").as_bytes()).unwrap_or_default();
     crate::base64::encode(&digest)
 }
 
@@ -372,7 +372,7 @@ fn accept_key(key: &str) -> String {
 pub fn new_token() -> std::io::Result<String> {
     let mut bytes = [0u8; 16];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-    Ok(crate::ext::verify::hex(&bytes))
+    Ok(crate::hash::hex(&bytes))
 }
 
 const OP_CONTINUATION: u8 = 0x0;

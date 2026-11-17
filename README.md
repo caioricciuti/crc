@@ -458,8 +458,8 @@ the size and write it back.
 - **Markdown** is styled where it is written: its syntax hidden on lines
   the caret is not on, table columns lined up, fenced code coloured by its
   language, with a rendered preview beside it (`Cmd-E`, the divider
-  dragged to size) or in the whole tab (`Cmd-Shift-E`) from the Markdown
-  Preview extension; images, PDFs, audio, video and office files open as
+  dragged to size) or in the whole tab (`Cmd-Shift-E`), rendered by crc's
+  own Markdown parser; images, PDFs, audio, video and office files open as
   Quick Look previews.
 - **CSV and TSV open as a grid**: a header that stays put, row numbers,
   columns sized from the first rows, and a Table strip that says the

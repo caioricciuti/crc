@@ -244,8 +244,8 @@ pub const EDITOR_MIN_WIDTH: f32 = 140.0;
 #[derive(Clone, Debug)]
 pub struct Chrome {
     pub toolbar: Viewport,
-    /// The icon strip at the far left: Explorer, Source Control,
-    /// Extensions. There whether or not the sidebar is.
+    /// The icon strip at the far left: Explorer, Search, Source Control,
+    /// MCP. There whether or not the sidebar is.
     pub activity: Viewport,
     pub sidebar: Option<Viewport>,
     /// Across the top of the editor column.
@@ -265,7 +265,7 @@ pub struct Chrome {
     /// Across the bottom of the whole window.
     pub status: Viewport,
     /// The preview pane: the right half of the focused pane's text, when
-    /// an extension's page is showing beside it.
+    /// a Markdown preview is showing beside it.
     pub preview: Option<Viewport>,
     /// How many editor panes share the column.
     pub panes: usize,
@@ -2634,25 +2634,23 @@ pub fn sidebar_rows(viewport: Viewport) -> usize {
 pub const ACTIVITY_WIDTH: f32 = 44.0;
 
 /// The panels the icon strip switches between, top to bottom.
-pub const ACTIVITY_ICONS: [(char, &str); 5] = [
+pub const ACTIVITY_ICONS: [(char, &str); 4] = [
     ('\u{eaf0}', "explorer"),       // cod-files
     ('\u{ea6d}', "search"),         // cod-search
     ('\u{ea68}', "source-control"), // cod-source_control
-    ('\u{eae6}', "extensions"),     // cod-extensions
     ('\u{eb2d}', "mcp"),            // cod-plug
 ];
 
 /// What each icon in the strip is, said when the pointer rests on it.
-pub const ACTIVITY_TIPS: [&str; 5] = [
+pub const ACTIVITY_TIPS: [&str; 4] = [
     "Explorer",
     "Search  \u{21e7}\u{2318}F",
     "Source Control  \u{2325}\u{2318}G",
-    "Extensions",
     "MCP Servers",
 ];
 
 /// Each icon's square in the strip.
-pub fn activity_items(strip: Viewport) -> [Viewport; 5] {
+pub fn activity_items(strip: Viewport) -> [Viewport; 4] {
     let size = ACTIVITY_WIDTH;
     std::array::from_fn(|i| Viewport {
         x: strip.x,
@@ -3322,7 +3320,7 @@ pub enum Hit {
     /// The terminal's screen.
     Terminal,
     /// An icon in the strip: 0 Explorer, 1 Search, 2 Source Control,
-    /// 3 Extensions, 4 MCP.
+    /// 3 MCP.
     Activity(usize),
     /// New file, new folder, collapse all, refresh.
     SidebarAction(usize),

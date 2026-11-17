@@ -1,8 +1,9 @@
-//! The preview pane: a WKWebView showing a page an extension made.
+//! The preview pane: a WKWebView showing the page crc makes of a Markdown
+//! document.
 //!
 //! WebKit is a system framework (linked in build.rs), driven by messages the
 //! way Quick Look is, so there is no crate for it. What the page can do is
-//! settled here, not by the extension:
+//! settled here, not by the page:
 //!
 //! - no script: `allowsContentJavaScript` is off. crc's own calls through
 //!   `evaluateJavaScript` still run, which is how an update replaces the

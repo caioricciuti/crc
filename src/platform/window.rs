@@ -59,7 +59,6 @@ mod completion;
 mod conflicts;
 mod dropped;
 mod explorer;
-mod extensions;
 mod files;
 mod find;
 mod git_menu;
@@ -75,6 +74,7 @@ mod mcp;
 mod menubar;
 mod notify;
 mod palette;
+mod preview;
 mod project;
 mod query;
 mod render;
@@ -88,11 +88,10 @@ mod table;
 mod tabs;
 mod terminal;
 mod tree_drag;
-use extensions::{ext_details, preview_command, preview_displaced};
 use mcp::{mcp_details, mcp_url_rows};
+use preview::{preview_displaced, say_not_markdown};
 use state::{
-    Blame, Ext, Gutter, Heat, Lsp, MARKDOWN_PREVIEW_ID, MessageAction, ProjectSearch, Reloads,
-    Said, Watch, message_lasts_of,
+    Blame, Gutter, Heat, Lsp, MessageAction, ProjectSearch, Reloads, Said, Watch, message_lasts_of,
 };
 use table::{active_table, sync_tables, table_grid};
 use tree_drag::TreeDrag;
@@ -367,31 +366,10 @@ impl CompletionPopup {
     }
 }
 
-/// An extension command the Extensions menu and the palette offer.
-#[derive(Clone)]
-struct ExtCommand {
-    installed: crate::ext::store::Installed,
-    command: String,
-    title: String,
-}
-
-/// An extension call waiting for its answer: where its text came from, and
-/// the whole document then, so a changed document is left alone.
-struct ExtCall {
-    buffer: u64,
-    range: std::ops::Range<usize>,
-    snapshot: crate::text::rope::Rope,
-    title: String,
-    /// A run for the preview pane: its answer is a page, and it says
-    /// nothing in the status line unless something is wrong.
-    preview: bool,
-}
-
-/// The preview pane beside a document: the extension command that makes
-/// its page, the web view once WebKit is ready, and the edits it has seen.
+/// The Markdown preview pane beside a document: the web view once WebKit
+/// is ready, and the edits it has seen.
 struct HtmlPreview {
     buffer: u64,
-    command: ExtCommand,
     /// The document's folder: the page's base URL, and the one place it
     /// may load files from.
     folder: Option<std::path::PathBuf>,
@@ -400,11 +378,8 @@ struct HtmlPreview {
     page: Option<String>,
     /// The text as of the last look; a different tree is an edit.
     observed: crate::text::rope::Rope,
-    /// The last edit not yet sent for a new page.
+    /// The last edit not yet made into a new page.
     changed_at: Option<Instant>,
-    running: bool,
-    /// A page has come back. Until one does, a failed run closes the pane.
-    answered: bool,
     /// The page takes the whole tab, the text hidden behind it.
     only: bool,
 }
@@ -412,8 +387,7 @@ struct HtmlPreview {
 impl HtmlPreview {
     /// Something is on its way: keep the display link running.
     fn busy(&self) -> bool {
-        self.running
-            || self.changed_at.is_some()
+        self.changed_at.is_some()
             || self.page.is_some()
             || self.web.as_ref().is_none_or(|w| !w.is_shown())
     }
@@ -690,8 +664,6 @@ struct State {
     history: crate::history::recorder::Recorder,
     /// Language servers, and what is asked of them.
     lsp: Lsp,
-    /// Installed extensions: their threads, commands and calls in flight.
-    ext: Ext,
     /// What keeps the project tree and index current.
     watch: Watch,
     git: crate::platform::git_panel::Panel,
@@ -776,8 +748,6 @@ struct State {
     branch_restore_initial: bool,
     /// `organize_imports_on_save` from the settings.
     organize_on_save: bool,
-    /// The Extensions page, when it has the editor column.
-    extensions: Option<crate::platform::extensions::Page>,
     /// Merge conflicts found in open documents, keyed by buffer id.
     conflict_scans: HashMap<u64, crate::platform::conflicts::Scan>,
     /// CSV and TSV documents parsed as tables, keyed by buffer id.
@@ -794,7 +764,7 @@ struct State {
     notify_waiting: bool,
     /// What the conflict controls' cursor rects were built for.
     conflict_cursor_key: Option<(u64, usize, usize, usize, usize, bool)>,
-    /// The Extensions page's targets and the bulb, as last drawn, so their
+    /// The pages' targets and the bulb, as last drawn, so their
     /// pointing-hand cursor rects are rebuilt when they move.
     pointer_targets: Vec<Viewport>,
     /// The controls of the last frame (see `layout::ui`), for cursor
@@ -875,7 +845,7 @@ struct State {
     /// Which pane, in the full order, is the one in the fields above.
     focused_pane: usize,
     native_preview: Option<NativePreview>,
-    /// An extension's page beside the active document (Cmd-E).
+    /// The Markdown preview beside the active document (Cmd-E).
     html_preview: Option<HtmlPreview>,
     /// The page's share of the editor column while it is beside the text.
     preview_share: f32,
@@ -975,8 +945,7 @@ struct State {
     /// The "Changed by agents" row a context menu was opened on, by its
     /// index in the panel's list of them.
     context_agent: Option<usize>,
-    /// The extension and the MCP row a context menu was opened on.
-    context_ext: Option<String>,
+    /// The MCP row a context menu was opened on.
     context_mcp: Option<crate::platform::mcp_panel::Action>,
     /// Parse trees, one per open document that has a grammar.
     syntax: SyntaxStore,
@@ -1237,16 +1206,6 @@ fn note_typed(state: &mut State) {
         state.gutter.dirty.insert(id, Instant::now());
     }
 }
-
-/// An extension thread: where jobs go, and where answers come back.
-type ExtWorker = (
-    mpsc::Sender<crate::ext::run::Job>,
-    mpsc::Receiver<crate::ext::run::Done>,
-);
-
-/// Consecutive failures that turn an extension off. Running out of time or
-/// instructions does not count: that is the size of what it was given.
-const EXT_FAILURES_TO_DISABLE: u32 = 3;
 
 /// What the self-test's `webjs probe` asks the preview page: each
 /// image's natural width, the scroll offset, the first heading and how
@@ -1740,30 +1699,7 @@ define_class!(
                 return;
             }
 
-            // The Extensions page owns the editor column while it is open.
-            let page_action = {
-                let Some(state) = self.state() else {
-                    return;
-                };
-                let in_list = chrome.sidebar.is_some_and(|r| r.contains(x, y));
-                match &state.extensions {
-                    Some(page)
-                        if state.palette.is_none()
-                            && ((page.details && details_rect(&chrome).contains(x, y))
-                                || in_list) =>
-                    {
-                        Some(page.hit(x, y))
-                    }
-                    _ => None,
-                }
-            };
-            if let Some(action) = page_action {
-                if let Some(action) = action {
-                    self.extensions_action(action);
-                }
-                return;
-            }
-            // So does the MCP page.
+            // The MCP page owns the editor column while it is open.
             let mcp_page_action = {
                 let Some(state) = self.state() else {
                     return;
@@ -2157,9 +2093,6 @@ define_class!(
                         let Some(mut state) = self.state_mut() else {
                             return;
                         };
-                        if let Some(page) = &mut state.extensions {
-                            page.details = false;
-                        }
                         state.mcp.details = false;
                         state.settings_page.open = false;
                         state.drag = Some(Drag::Tab(index));
@@ -2776,7 +2709,7 @@ define_class!(
                     add(rect, &NSCursor::pointingHandCursor());
                 }
             }
-            // The Extensions page's buttons and rows, and the bulb.
+            // The pages' buttons and rows, and the bulb.
             for target in &state.pointer_targets {
                 add(*target, &NSCursor::pointingHandCursor());
             }
@@ -2881,29 +2814,6 @@ define_class!(
                         state
                             .mcp
                             .scroll_page(lines as f32 * crate::platform::mcp_panel::ROW);
-                    }
-                    self.request_redraw();
-                    self.pump();
-                    return;
-                }
-            }
-            {
-                // An extension's README scrolls a block at a time.
-                let point = self.convertPoint_fromView(event.locationInWindow(), None);
-                let over_readme = self.state().is_some_and(|state| {
-                    state.extensions.as_ref().is_some_and(|p| {
-                        p.details
-                            && p.readme_rect
-                                .is_some_and(|r| r.contains(point.x as f32, point.y as f32))
-                    })
-                });
-                if over_readme {
-                    let lines = self.wheel_lines(event, WheelTarget::Readme);
-                    if lines != 0
-                        && let Some(mut state) = self.state_mut()
-                        && let Some(page) = state.extensions.as_mut()
-                    {
-                        page.scroll_readme(lines.signum());
                     }
                     self.request_redraw();
                     self.pump();
@@ -3130,8 +3040,6 @@ define_class!(
             crate::platform::jank::lap("poll_scrub");
             self.bulb_refresh();
             crate::platform::jank::lap("bulb_refresh");
-            self.ext_poll();
-            crate::platform::jank::lap("ext_poll");
             self.sync_html_preview();
             crate::platform::jank::lap("sync_html_preview");
             self.claude_flush_selection();
@@ -3282,28 +3190,26 @@ define_class!(
             }
         }
 
-        /// Opens or closes the preview pane. Rendering belongs to an
-        /// extension; with none installed, the command says where to get one.
+        /// Opens or closes the Markdown preview pane. On any other
+        /// document it says what the pane is for.
         #[unsafe(method(togglePreview:))]
         fn action_toggle_preview(&self, _sender: Option<&AnyObject>) {
-            let (open, command) = {
+            let (open, markdown) = {
                 let Some(state) = self.state() else {
                     return;
                 };
-                let active = state.docs.active().id();
+                let active = state.docs.active();
                 (
-                    state.html_preview.as_ref().is_some_and(|p| p.buffer == active),
-                    preview_command(&state),
+                    state.html_preview.as_ref().is_some_and(|p| p.buffer == active.id()),
+                    is_markdown(active),
                 )
             };
             if open {
                 self.close_preview();
-            } else if let Some(command) = command {
-                self.open_preview(command);
-            } else {
-                if let Some(mut state) = self.state_mut() {
-                    say_no_preview(&mut state);
-                }
+            } else if markdown {
+                self.open_preview();
+            } else if let Some(mut state) = self.state_mut() {
+                say_not_markdown(&mut state);
             }
             self.request_redraw();
             self.pump();
@@ -3313,25 +3219,25 @@ define_class!(
         /// the whole tab when it was closed.
         #[unsafe(method(togglePreviewOnly:))]
         fn action_toggle_preview_only(&self, _sender: Option<&AnyObject>) {
-            let (open, command) = {
+            let (open, markdown) = {
                 let Some(state) = self.state() else {
                     return;
                 };
-                let active = state.docs.active().id();
+                let active = state.docs.active();
                 (
-                    state.html_preview.as_ref().is_some_and(|p| p.buffer == active),
-                    preview_command(&state),
+                    state.html_preview.as_ref().is_some_and(|p| p.buffer == active.id()),
+                    is_markdown(active),
                 )
             };
             if !open {
-                let Some(command) = command else {
+                if !markdown {
                     if let Some(mut state) = self.state_mut() {
-                        say_no_preview(&mut state);
+                        say_not_markdown(&mut state);
                     }
                     self.request_redraw();
                     return;
-                };
-                self.open_preview(command);
+                }
+                self.open_preview();
             }
             if let Some(mut state) = self.state_mut()
                 && let Some(preview) = state.html_preview.as_mut()
@@ -3729,11 +3635,6 @@ define_class!(
             self.format_document(false);
         }
 
-        #[unsafe(method(openExtensions:))]
-        fn action_open_extensions(&self, _sender: Option<&AnyObject>) {
-            self.open_extensions();
-        }
-
         #[unsafe(method(openBreadcrumbPath:))]
         fn action_open_breadcrumb_path(&self, sender: Option<&AnyObject>) {
             let tag = sender
@@ -3745,14 +3646,6 @@ define_class!(
             if let Some(path) = path {
                 self.open_crumb_path(&path);
             }
-        }
-
-        #[unsafe(method(runExtensionCommand:))]
-        fn action_run_extension_command(&self, sender: Option<&AnyObject>) {
-            let tag = sender
-                .and_then(|s| s.downcast_ref::<NSMenuItem>())
-                .map_or(-1, |item| item.tag());
-            self.run_extension(tag);
         }
 
         #[unsafe(method(quickFix:))]
@@ -4040,44 +3933,6 @@ define_class!(
             if let Some((_, path)) = self.context_change_paths() {
                 let _ = self.open(true, path.as_os_str());
             }
-        }
-
-        #[unsafe(method(extContextInstall:))]
-        fn action_ext_install(&self, _sender: Option<&AnyObject>) {
-            if let Some(id) = self.state().and_then(|state| state.context_ext.clone()) {
-                self.extensions_action(crate::platform::extensions::Action::Install(id));
-            }
-        }
-
-        #[unsafe(method(extContextToggle:))]
-        fn action_ext_toggle(&self, _sender: Option<&AnyObject>) {
-            if let Some(id) = self.state().and_then(|state| state.context_ext.clone()) {
-                self.extensions_action(crate::platform::extensions::Action::Toggle(id));
-            }
-        }
-
-        #[unsafe(method(extContextUninstall:))]
-        fn action_ext_uninstall(&self, _sender: Option<&AnyObject>) {
-            if let Some(id) = self.state().and_then(|state| state.context_ext.clone()) {
-                self.extensions_action(crate::platform::extensions::Action::Uninstall(id));
-            }
-        }
-
-        #[unsafe(method(extContextDetails:))]
-        fn action_ext_details(&self, _sender: Option<&AnyObject>) {
-            if let Some(id) = self.state().and_then(|state| state.context_ext.clone()) {
-                self.extensions_action(crate::platform::extensions::Action::Select(id));
-            }
-        }
-
-        #[unsafe(method(extInstallFolder:))]
-        fn action_ext_folder(&self, _sender: Option<&AnyObject>) {
-            self.extensions_action(crate::platform::extensions::Action::InstallFolder);
-        }
-
-        #[unsafe(method(extRefresh:))]
-        fn action_ext_refresh(&self, _sender: Option<&AnyObject>) {
-            self.extensions_action(crate::platform::extensions::Action::Refresh);
         }
 
         #[unsafe(method(mcpContextRun:))]
@@ -5484,7 +5339,7 @@ impl EditorView {
         // there is about Git, never about the file tree hidden behind it.
         let git_showing = self
             .state()
-            .is_some_and(|state| state.git_open && state.extensions.is_none() && !state.mcp.open);
+            .is_some_and(|state| state.git_open && !state.mcp.open);
         if in_sidebar && git_showing {
             let rect = sidebar.expect("in_sidebar implies a sidebar rectangle");
             return Some(self.git_context_menu(rect, x, y));
@@ -5493,13 +5348,8 @@ impl EditorView {
         if in_sidebar && self.state().is_some_and(|state| state.agents.on) {
             return Some(self.agents_context_menu(x, y));
         }
-        // Extensions and MCP Servers fill it the same way, each with its own.
-        let (extensions, mcp) = self.state().map_or((false, false), |state| {
-            (state.extensions.is_some(), state.mcp.open)
-        });
-        if in_sidebar && extensions {
-            return Some(self.extensions_context_menu(x, y));
-        }
+        // MCP Servers fills it the same way, with its own.
+        let mcp = self.state().is_some_and(|state| state.mcp.open);
         if in_sidebar && mcp {
             return Some(self.mcp_context_menu(x, y));
         }
@@ -5583,11 +5433,10 @@ impl EditorView {
             self.table_secondary_press(x, y);
             Some(table_context_menu(mtm))
         } else {
-            let (commands, lsp) = self.state().map(|state| {
-                let lsp = lsp_server_for(&state, state.docs.active()).is_some();
-                (state.ext.commands.clone(), lsp)
-            })?;
-            Some(editor_context_menu(mtm, &commands, lsp))
+            let lsp = self
+                .state()
+                .map(|state| lsp_server_for(&state, state.docs.active()).is_some())?;
+            Some(editor_context_menu(mtm, lsp))
         }
     }
 
@@ -6085,16 +5934,9 @@ impl EditorView {
             state.cursor_rects_for = None;
         }
         let pointer_targets: Vec<Viewport> = state
-            .extensions
-            .iter()
-            .flat_map(|page| {
-                page.hits
-                    .iter()
-                    .filter(|_| page.details)
-                    .chain(page.list_hits.iter())
-                    .map(|(r, _)| *r)
-            })
-            .chain(state.lsp.bulb_rect)
+            .lsp
+            .bulb_rect
+            .into_iter()
             .chain(
                 state
                     .mcp
@@ -6918,7 +6760,7 @@ fn completion_language(buffer: &Buffer) -> String {
         })
 }
 
-/// Where the Extensions details draw: the focused pane's whole column, tabs
+/// Where a page's details draw: the focused pane's whole column, tabs
 /// and breadcrumbs included, since those name a document the details are
 /// not. Close, Escape or the strip gives the column back.
 fn details_rect(chrome: &Chrome) -> Viewport {
@@ -7073,8 +6915,6 @@ fn forget_document(state: &mut State, id: u64) {
 /// What has the editor column.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Column {
-    /// The Extensions page's details.
-    Extensions,
     /// The MCP page.
     Mcp,
     /// The Settings page.
@@ -7096,9 +6936,7 @@ enum Column {
 /// Which mode draws the editor column. Drawing, hit testing, cursor rects
 /// and the preview all ask this, in this one order.
 fn column_of(state: &State) -> Column {
-    if ext_details(state) {
-        Column::Extensions
-    } else if mcp_details(state) {
+    if mcp_details(state) {
         Column::Mcp
     } else if state.settings_page.open {
         Column::Settings
@@ -7118,14 +6956,11 @@ fn column_of(state: &State) -> Column {
 }
 
 /// Gives the editor column back to the focused pane's tabs: the pages that
-/// cover it whole (Extensions, MCP, Settings) close, as Escape
+/// cover it whole (MCP, Settings) close, as Escape
 /// closes them. Every route that opens or switches to a document calls
 /// this, so the tab it just made active is on screen rather than behind a
 /// page while the status line says it opened.
 fn uncover_column(state: &mut State) {
-    if let Some(page) = &mut state.extensions {
-        page.details = false;
-    }
     state.mcp.details = false;
     state.settings_page.open = false;
 }
@@ -7845,7 +7680,7 @@ fn frame_of(state: &mut State) -> Frame {
             conflict_scans,
             ..
         } = &mut *state;
-        // Not under a diff, a review or the Extensions page, which draw
+        // Not under a diff, a review or a page, which draw
         // over the text the controls belong to.
         let shown = matches!(column, Column::ConflictColumns | Column::Text);
         let buffer = docs.active();
@@ -7955,7 +7790,6 @@ fn frame_of(state: &mut State) -> Frame {
         mcp,
         tab_hits,
         sidebar_edit,
-        extensions,
         diff_tab,
         issue_tabs,
         agents,
@@ -8024,7 +7858,7 @@ fn frame_of(state: &mut State) -> Frame {
                 height: rect.height,
             },
         );
-        if *git_open && extensions.is_none() && !agents.on {
+        if *git_open && !agents.on {
             let g = git.sidebar(rect);
             frame.push(Hit::GitBranch, g.branch);
             if git.repo.is_some() {
@@ -8051,7 +7885,7 @@ fn frame_of(state: &mut State) -> Frame {
                 frame.push(Hit::GitRow(i), rect);
             }
         }
-        if *search_open && !*git_open && extensions.is_none() && !mcp.open && !agents.on {
+        if *search_open && !*git_open && !mcp.open && !agents.on {
             let g = search.geometry(rect);
             for (name, rect) in [
                 ("collapse", g.actions[0]),
@@ -8075,7 +7909,7 @@ fn frame_of(state: &mut State) -> Frame {
                 frame.push(Hit::SearchRow(index), rect);
             }
         }
-        if !*search_open && !*git_open && extensions.is_none() && !mcp.open && !agents.on {
+        if !*search_open && !*git_open && !mcp.open && !agents.on {
             let (_, actions) = layout::sidebar_actions(rect);
             for (index, action) in actions.into_iter().enumerate() {
                 frame.push(Hit::SidebarAction(index), action);
@@ -8100,7 +7934,7 @@ fn frame_of(state: &mut State) -> Frame {
     for (index, pane) in &chrome.others {
         frame.push(Hit::Pane(*index), pane.whole());
     }
-    let covered = matches!(column, Column::Extensions | Column::Mcp | Column::Settings);
+    let covered = matches!(column, Column::Mcp | Column::Settings);
     for hit in tab_hits.iter().filter(|_| !covered) {
         if hit.index == docs.active_index() {
             frame.push(
@@ -8226,18 +8060,6 @@ fn frame_of(state: &mut State) -> Frame {
     }
     frame.push(Hit::Status, chrome.status);
     frame
-}
-
-/// Cmd-E with nothing to render Markdown: where to get it, with the
-/// Extensions page a button away.
-fn say_no_preview(state: &mut State) {
-    state.tell(
-        Said::new(
-            layout::Feedback::Info,
-            "No preview installed: get Markdown Preview from crc > Extensions",
-        )
-        .action(MessageAction::OpenExtension(MARKDOWN_PREVIEW_ID)),
-    );
 }
 
 /// The most of the status line its right side may take, where the
@@ -8463,8 +8285,8 @@ struct BranchPick {
 /// What choosing a palette row does.
 enum Pick {
     File(std::path::PathBuf),
-    /// A menu item's action, and its tag.
-    Command(Sel, isize),
+    /// A menu item's action.
+    Command(Sel),
     /// A definition: in another file, or in the active document (`None`),
     /// and its zero-based line.
     Symbol(Option<std::path::PathBuf>, u32),
@@ -9331,7 +9153,7 @@ fn palette_rows(sources: &PaletteSources<'_>, query: &str) -> Vec<(layout::Palet
                         detail: command.group.clone(),
                         shortcut: command.shortcut.clone(),
                     },
-                    Pick::Command(command.action, command.tag),
+                    Pick::Command(command.action),
                 )
             })
             .collect();
@@ -9741,11 +9563,7 @@ fn sidebar_item_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
     menu
 }
 
-fn editor_context_menu(
-    mtm: MainThreadMarker,
-    commands: &[ExtCommand],
-    lsp: bool,
-) -> Retained<NSMenu> {
+fn editor_context_menu(mtm: MainThreadMarker, lsp: bool) -> Retained<NSMenu> {
     let menu = NSMenu::new(mtm);
     let cmd = NSEventModifierFlags::Command;
     let line = || menu.addItem(&NSMenuItem::separatorItem(mtm));
@@ -9793,23 +9611,6 @@ fn editor_context_menu(
         "f",
         cmd,
     ));
-    if commands.is_empty() {
-        return menu;
-    }
-    line();
-    // Extensions, right where the text is: each installed extension, then
-    // its commands, run on the selection (or the document) under the
-    // pointer. Two clicks rather than the palette and a typed name.
-    let extensions = NSMenu::new(mtm);
-    extensions.setTitle(&NSString::from_str("Extensions"));
-    for item in extension_items(mtm, commands) {
-        extensions.addItem(&item);
-    }
-    extensions.addItem(&NSMenuItem::separatorItem(mtm));
-    extensions.addItem(&menu_item(mtm, "Manage Extensions…", sel!(openExtensions:)));
-    let holder = menu_item(mtm, "Extensions", sel!(openExtensions:));
-    holder.setSubmenu(Some(&extensions));
-    menu.addItem(&holder);
     menu
 }
 
@@ -9838,38 +9639,6 @@ fn table_context_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
         }
     }
     menu
-}
-
-/// One item per enabled extension, named for it, holding its commands; each
-/// command's tag is its index in `commands`, which `runExtensionCommand:`
-/// runs. The menu bar's Extensions menu and the editor's context menu both
-/// list them this way.
-fn extension_items(mtm: MainThreadMarker, commands: &[ExtCommand]) -> Vec<Retained<NSMenuItem>> {
-    let mut items: Vec<(String, Retained<NSMenu>)> = Vec::new();
-    for (tag, command) in commands.iter().enumerate() {
-        let id = &command.installed.manifest.id;
-        let at = match items.iter().position(|(seen, _)| seen == id) {
-            Some(at) => at,
-            None => {
-                let submenu = NSMenu::new(mtm);
-                submenu.setTitle(&NSString::from_str(&command.installed.manifest.name));
-                items.push((id.clone(), submenu));
-                items.len() - 1
-            }
-        };
-        let item = menu_item(mtm, &command.title, sel!(runExtensionCommand:));
-        item.setTag(tag as isize);
-        items[at].1.addItem(&item);
-    }
-    items
-        .into_iter()
-        .map(|(_, submenu)| {
-            let holder = NSMenuItem::new(mtm);
-            holder.setTitle(&submenu.title());
-            holder.setSubmenu(Some(&submenu));
-            holder
-        })
-        .collect()
 }
 
 /// Builds the menu bar.
@@ -10315,19 +10084,6 @@ fn install_menu(mtm: MainThreadMarker, app: &NSApplication) {
     go_item.setSubmenu(Some(&go_menu));
     menubar.addItem(&go_item);
 
-    // Filled by `rebuild_extension_menu` with each enabled extension's
-    // commands, after the first two items.
-    let (extensions_item, extensions_menu) = submenu("Extensions");
-    extensions_menu.addItem(&item(
-        "Extensions\u{2026}",
-        sel!(openExtensions:),
-        "x",
-        true,
-    ));
-    extensions_menu.addItem(&NSMenuItem::separatorItem(mtm));
-    extensions_item.setSubmenu(Some(&extensions_menu));
-    menubar.addItem(&extensions_item);
-
     let (run_item, run_menu) = submenu("Run");
     // Cmd-Return. Greyed out unless the active document is a `.http` file,
     // so it never eats the key anywhere else.
@@ -10599,7 +10355,6 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         context_tab: None,
         context_change: None,
         context_agent: None,
-        context_ext: None,
         context_mcp: None,
         ephemeral_session: launched_with_file,
         quit: Default::default(),
@@ -10656,7 +10411,6 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
         branch_session: None,
         branch_restore_initial: !launched_with_file,
         organize_on_save: settings.organize_imports_on_save,
-        extensions: None,
         conflict_scans: HashMap::new(),
         tables: HashMap::new(),
         conflict_side: settings.conflict_side_by_side,
@@ -10753,18 +10507,6 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
             bulb_request: None,
             bulb_rect: None,
         },
-        ext: Ext {
-            registry_rx: None,
-            install_rx: None,
-            worker: None,
-            preview_worker: None,
-            failures: HashMap::new(),
-            commands: Vec::new(),
-            pending: HashMap::new(),
-            next_job: 1,
-            generation: 0,
-            logs: HashMap::new(),
-        },
         watch: Watch {
             watcher: None,
             indexer: None,
@@ -10784,7 +10526,6 @@ pub fn run(buffer: Buffer, folder: Option<std::path::PathBuf>, font: &str, size_
     view.reattach_held();
     view.apply_theme();
     view.lsp_sync_open();
-    view.rebuild_extension_menu();
     menubar::install(&view);
     notify::install(&view);
     // The delegate must outlive this function; NSApplication only holds a

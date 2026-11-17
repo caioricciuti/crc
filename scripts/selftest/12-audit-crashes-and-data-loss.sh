@@ -56,22 +56,21 @@ if [ ! -s "$T/cursors.out" ]; then
 fi
 
 # Markdown opens as styled text: the heading's marker and text have kinds
-# of their own, and the fenced block a band. With no preview extension
-# installed, Cmd-E says where to get one. Tabs can then be dragged to a new position without changing which
-# file is active.
+# of their own, and the fenced block a band. Cmd-E opens its preview and
+# closes it again. Tabs can then be dragged to a new position without
+# changing which file is active. On a new, plain document Cmd-E says what
+# the preview is for.
 printf '# One\n\nBody\n\n```rust\nfn main() {}\n```\n' > "$T/proj/one.md"
 printf 'two\n' > "$T/proj/two.txt"
 cat > "$T/tabs.script" <<SCRIPT
 key 11 cmd b
 dump $T/source.out
 key 14 cmd e
+idle 300
 dump $T/preview.out
-key 0 cmd,shift A
-wait 700
-dump $T/preview-agents.out
-key 0 cmd,shift A
-wait 700
-dump $T/preview-editor.out
+key 14 cmd e
+idle 300
+dump $T/preview-closed.out
 key 124 cmd
 text X
 dump $T/live-edit.out
@@ -85,21 +84,33 @@ up 264 62
 dump $T/reordered.out
 click 744 62 2
 dump $T/new-tab.out
+key 14 cmd e
+dump $T/preview-plain.out
+key 0 cmd,shift A
+wait 700
+dump $T/preview-agents.out
+key 0 cmd,shift A
+wait 700
+dump $T/preview-editor.out
 quit
 SCRIPT
 CRC_TERMINAL_SHELL=/bin/sh CRC_SELFTEST="$T/tabs.script" "$BIN" "$T/proj/one.md" 2> "$T/tabs.err"
 expect "$T/source.out" md "MdMarker,MdHeading bands=1"
-expect "$T/preview.out" message "No preview installed: get Markdown Preview from crc > Extensions"
-# The message was about the editor: a switch to Agents clears it, and
-# coming back does not bring it back.
-expect "$T/preview-agents.out" message ""
-expect "$T/preview-editor.out" message ""
+grep -q '^preview: open ' "$T/preview.out" \
+    || failed "preview.out: Cmd-E did not open the preview: $(grep '^preview:' "$T/preview.out")"
+expect "$T/preview-closed.out" preview "closed"
 expect_line "$T/live-edit.out" 1 "# OneX"
 expect "$T/two.out" tabs "one.md | two.txt"
 expect "$T/reordered.out" tabs "two.txt | one.md"
 expect "$T/reordered.out" active "1"
 expect "$T/new-tab.out" tabs "two.txt | one.md | Untitled"
 expect "$T/new-tab.out" active "2"
+expect "$T/preview-plain.out" message "Markdown Preview works on Markdown files"
+expect "$T/preview-plain.out" preview "closed"
+# The message was about the editor: a switch to Agents clears it, and
+# coming back does not bring it back.
+expect "$T/preview-agents.out" message ""
+expect "$T/preview-editor.out" message ""
 
 # Off the caret's line, Markdown's syntax takes no room: a click lands by
 # what is drawn, "bold end", not by the stars that are hidden.

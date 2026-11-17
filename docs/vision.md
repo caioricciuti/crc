@@ -48,8 +48,12 @@ build script and zero proc macros, every one pinned to an exact version and
 read line by line. Where the OS already ships the thing, crc uses it: CoreText
 instead of a font stack, Metal instead of a graphics layer, the system SQLite
 instead of a crate. CI fails if a new build script or proc macro appears. No
-app telemetry or required crc account. The editor is native; restricted
-extension preview pages use the system WebKit view.
+app telemetry or required crc account. The editor is native; the Markdown
+preview is rendered by crc's own parser into the system WebKit view.
+
+**It runs no stranger's code.** There is no plugin system and no
+marketplace. Everything crc does is in its own source, built and signed
+in one place; nothing is installed into it later.
 
 **It is honest about your files.** Ordinary saves use atomic replacement;
 preserving hard links can require an in-place write. External changes, from Git
@@ -71,7 +75,7 @@ proposed through the IDE bridge open as diffs you accept or reject. Files it wri
 in their tabs at once. The bridge listens on localhost only, behind a token
 only you can read.
 
-## Three bets
+## Two bets
 
 These decide what gets built, and in what order.
 
@@ -89,19 +93,7 @@ MCP, with the editor closed. Apple's SQLite is compiled without extension
 loading, so a database other programs are invited to open cannot be made to
 load code. Real references and syntax spans are next.
 
-### 2. Extensions declare what they touch
-
-An extension should be WebAssembly with a manifest that says what it may
-read, write and reach, and a host that enforces it. Installing an extension
-should never mean handing a stranger your home folder.
-
-*Built, with limited capabilities.* WASM extensions can read/replace
-selection or document text and return restricted preview pages. They
-cannot access the filesystem, network or subprocesses directly. The
-official registry is signature-checked; folder installs are marked unsigned.
-The contract is in [the extensions design](extensions.md).
-
-### 3. An agent is a protocol client, not a sidebar
+### 2. An agent is a protocol client, not a sidebar
 
 The buffer, the syntax tree and the index should sit behind one API. The
 editor's own UI is one client of it; a model is another, with exactly the
@@ -120,8 +112,8 @@ marked until you answer it. The general API is not built yet.
   Silicon only. A port would mean a second backend written from scratch, and
   that trade was made deliberately.
 - **Collect app telemetry.** crc has no app telemetry or required account.
-  Release checks, updates, the extension registry and connected tools do
-  use the network; Git, HTTP, SSH and MCP contact the services you use.
+  Release checks, updates and connected tools do use the network; Git,
+  HTTP, SSH and MCP contact the services you use.
 - **Grow a dependency without an argument.** Every crate needs a reason
   written down, and a measurement where it claims speed.
 - **Pretend.** Features are described as built, partly built or not built.

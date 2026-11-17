@@ -1453,7 +1453,7 @@ pub fn push_title(
     color: [f32; 4],
     limit: f32,
 ) -> f32 {
-    super::markdown::push_prose(out, atlas, x, y, size, Face::Bold, text, color, limit)
+    super::prose::push_prose(out, atlas, x, y, size, Face::Bold, text, color, limit)
 }
 
 /// A page's title at [`UI_TITLE`]: the one size and weight every page

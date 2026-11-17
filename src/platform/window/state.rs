@@ -229,30 +229,6 @@ pub(super) struct Lsp {
     pub(super) bulb_rect: Option<Viewport>,
 }
 
-/// Extension threads, commands and calls.
-pub(super) struct Ext {
-    /// The registry list being fetched, and a download being installed.
-    pub(super) registry_rx: Option<mpsc::Receiver<Result<crate::ext::registry::Index, String>>>,
-    pub(super) install_rx: Option<mpsc::Receiver<Result<crate::ext::store::Package, String>>>,
-    /// The extension thread, started on the first command.
-    pub(super) worker: Option<ExtWorker>,
-    /// Previews run on their own thread: a slow page must not hold up a
-    /// command someone asked for.
-    pub(super) preview_worker: Option<ExtWorker>,
-    /// Failures in a row by extension id. Three turn it off.
-    pub(super) failures: HashMap<String, u32>,
-    /// Extension commands by menu tag.
-    pub(super) commands: Vec<ExtCommand>,
-    /// Calls in flight, by job tag.
-    pub(super) pending: HashMap<u64, ExtCall>,
-    pub(super) next_job: u64,
-    /// Bumped whenever what is installed changes, so the extension thread
-    /// drops instances of what was replaced.
-    pub(super) generation: u64,
-    /// Recent log lines per extension.
-    pub(super) logs: HashMap<String, Vec<String>>,
-}
-
 /// The project watcher, the index and tree reads in flight.
 pub(super) struct Watch {
     /// FSEvents on the project root. Dropped and remade when the root moves.
@@ -453,12 +429,6 @@ impl Lsp {
     }
 }
 
-impl Ext {
-    pub(super) fn idle(&self) -> bool {
-        self.registry_rx.is_none() && self.install_rx.is_none() && self.pending.is_empty()
-    }
-}
-
 impl Watch {
     pub(super) fn idle(&self) -> bool {
         self.tree_changed_at.is_none()
@@ -478,7 +448,6 @@ impl State {
             && self.blame.idle()
             && self.heat.idle()
             && self.lsp.idle()
-            && self.ext.idle()
             && self.watch.idle()
             && self.explorer.idle()
             && self.message.is_none()
@@ -519,14 +488,9 @@ impl State {
     }
 }
 
-/// The extension that renders Markdown, as the registry names it.
-pub(super) const MARKDOWN_PREVIEW_ID: &str = "crc.markdown-preview";
-
 /// The one thing a status-line message asks for, as a button beside it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum MessageAction {
-    /// The Extensions page with this extension selected.
-    OpenExtension(&'static str),
     /// Quit the way Cmd-Q does and open the app on disk again.
     Restart,
 }
@@ -535,7 +499,6 @@ impl MessageAction {
     /// The button's label.
     pub(super) fn label(&self) -> &'static str {
         match self {
-            MessageAction::OpenExtension(_) => "Open Extensions",
             MessageAction::Restart => "Restart",
         }
     }
@@ -779,8 +742,7 @@ mod tests {
 
     #[test]
     fn a_message_with_a_button_stays_longer_than_its_kind_alone() {
-        let said = Said::new(layout::Feedback::Info, "no preview")
-            .action(MessageAction::OpenExtension(MARKDOWN_PREVIEW_ID));
+        let said = Said::new(layout::Feedback::Info, "no preview").action(MessageAction::Restart);
         assert_eq!(
             message_lasts_of("no preview", Some(&said)),
             layout::MESSAGE_ACTION_LASTS

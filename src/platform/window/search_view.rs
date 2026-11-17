@@ -59,7 +59,6 @@ impl EditorView {
             return;
         };
         close_fields(&mut state);
-        state.extensions = None;
         state.mcp.open = false;
         state.git_open = false;
         state.git_focus = false;

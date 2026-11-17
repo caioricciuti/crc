@@ -847,8 +847,6 @@ impl EditorView {
                     "{} sidebar={}",
                     if state.mcp.open {
                         "mcp"
-                    } else if state.extensions.is_some() {
-                        "extensions"
                     } else if state.git_open {
                         "source-control"
                     } else if state.search_open {
@@ -935,62 +933,32 @@ impl EditorView {
                     });
                 let report = format!(
                     // First: the report ends with the document's text.
-                    "message: {}\npreview: {}\nmd: {md}\nspans: {spans}\n{tree}\nterminal_find: {terminal_find}\nactivity: {}\npointer_targets: {}\nextensions: {}\next_commands: {}\nbulb: {}\nactions: {}\nbranch: {}\nrepo: {}\ngit_note: {}\nhome: {}\nhome_scroll: {}\nmcp: {}\nmcp_page: {}\nsettings_page: {}\nterminals: {}\nagents: {}\ninspector: {}\nteams: {}\nagents_tree: {}\nagents_activity: {}\nagents_prs: {}\nmenubar: {}\nconflicts: {}\ngit_conflicts: {}\ntable: {}\nquery: {}\nquery_sql: {}\nblame: {}\nfind_results: {}\nfind_rows: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\npeek: {}\ngutter: {}\nissue_tab: {}\nscrub: {}\nscrub_strip: {}\nscrub_fade: {}\nscrub_filter: {}\nscrub_compare: {}\nblame_heat: {}\nreplaced: {}\nreceipt: {}\nmonitor: {}\n{report}",
+                    "message: {}\npreview: {}\nmd: {md}\nspans: {spans}\n{tree}\nterminal_find: {terminal_find}\nactivity: {}\npointer_targets: {}\nbulb: {}\nactions: {}\nbranch: {}\nrepo: {}\ngit_note: {}\nhome: {}\nhome_scroll: {}\nmcp: {}\nmcp_page: {}\nsettings_page: {}\nterminals: {}\nagents: {}\ninspector: {}\nteams: {}\nagents_tree: {}\nagents_activity: {}\nagents_prs: {}\nmenubar: {}\nconflicts: {}\ngit_conflicts: {}\ntable: {}\nquery: {}\nquery_sql: {}\nblame: {}\nfind_results: {}\nfind_rows: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\npeek: {}\ngutter: {}\nissue_tab: {}\nscrub: {}\nscrub_strip: {}\nscrub_fade: {}\nscrub_filter: {}\nscrub_compare: {}\nblame_heat: {}\nreplaced: {}\nreceipt: {}\nmonitor: {}\n{report}",
                     state.message.as_ref().map_or("", |(text, _)| text.as_str()),
-                    state.html_preview.as_ref().map_or("closed".to_string(), |p| format!(
-                        "open ext={} view={} probe={}",
-                        p.command.installed.manifest.id,
-                        match &p.web {
-                            None => "none",
-                            Some(web) if web.is_veiled() => "veiled",
-                            Some(web) if web.is_shown() => "shown",
-                            Some(_) => "loading",
-                        },
-                        crate::platform::webview::probe_answer().unwrap_or_default()
-                    )),
+                    state
+                        .html_preview
+                        .as_ref()
+                        .map_or("closed".to_string(), |p| format!(
+                            "open view={} probe={}",
+                            match &p.web {
+                                None => "none",
+                                Some(web) if web.is_veiled() => "veiled",
+                                Some(web) if web.is_shown() => "shown",
+                                Some(_) => "loading",
+                            },
+                            crate::platform::webview::probe_answer().unwrap_or_default()
+                        )),
                     activity,
                     state.pointer_targets.len(),
-                    state.extensions.as_ref().map_or("closed".to_string(), |page| {
-                        use crate::platform::extensions::Registry;
-                        format!(
-                            "{} selected={} installed={} registry={} confirm={} busy={} note={}",
-                            if page.details { "open" } else { "list" },
-                            page.selected.as_deref().unwrap_or("-"),
-                            page.installed
-                                .iter()
-                                .map(|i| format!(
-                                    "{}:{}:{}:{}",
-                                    i.manifest.id,
-                                    i.manifest.version,
-                                    if i.enabled { "on" } else { "off" },
-                                    if i.signed { "signed" } else { "unsigned" }
-                                ))
-                                .collect::<Vec<_>>()
-                                .join(","),
-                            match &page.registry {
-                                Registry::Loading => "loading".to_string(),
-                                Registry::Ready(e, _) => format!(
-                                    "ready:{}",
-                                    e.iter().map(|e| e.manifest.id.as_str()).collect::<Vec<_>>().join(",")
-                                ),
-                                Registry::Failed(why) => format!("failed:{why}"),
-                            },
-                            page.confirm.as_ref().map_or("-", |c| c.manifest().id.as_str()),
-                            page.busy.as_deref().unwrap_or("-"),
-                            page.note.as_deref().unwrap_or("-"),
-                        )
-                    }),
                     state
-                        .ext.commands
-                        .iter()
-                        .map(|c| c.title.as_str())
-                        .collect::<Vec<_>>()
-                        .join("|"),
-                    state.lsp.bulb.as_ref().map_or("none".to_string(), |b| format!(
-                        "{} at {}",
-                        b.actions.iter().filter(|a| a.disabled.is_none()).count(),
-                        b.caret
-                    )),
+                        .lsp
+                        .bulb
+                        .as_ref()
+                        .map_or("none".to_string(), |b| format!(
+                            "{} at {}",
+                            b.actions.iter().filter(|a| a.disabled.is_none()).count(),
+                            b.caret
+                        )),
                     state
                         .palette
                         .as_ref()
@@ -1098,7 +1066,8 @@ impl EditorView {
                         .as_ref()
                         .map_or("-".to_string(), |field| field.field.rope.to_string()),
                     state
-                        .blame.shown
+                        .blame
+                        .shown
                         .as_ref()
                         .map_or("", |(_, _, text)| text.as_str()),
                     state
@@ -1141,12 +1110,17 @@ impl EditorView {
                             .join("|")
                     },
                     state
-                        .lsp.signature
+                        .lsp
+                        .signature
                         .as_ref()
                         .map(|t| {
                             let label = &t.signature.label;
                             match &t.signature.active {
-                                Some(r) => format!("{} [{}]", label, label.get(r.clone()).unwrap_or_default()),
+                                Some(r) => format!(
+                                    "{} [{}]",
+                                    label,
+                                    label.get(r.clone()).unwrap_or_default()
+                                ),
                                 None => label.clone(),
                             }
                         })
@@ -1175,40 +1149,51 @@ impl EditorView {
                         .as_ref()
                         .and_then(|c| c.shown.get(c.selected))
                         .map_or("", |c| c.why.as_str()),
-                    state.peek.as_ref().map_or("closed".to_string(), |p| format!(
-                        "{} {}..{} drawn={}",
-                        p.content.title,
-                        p.change.new_start + 1,
-                        p.change.new_end + 1,
-                        p.hits.is_some()
-                    )),
+                    state
+                        .peek
+                        .as_ref()
+                        .map_or("closed".to_string(), |p| format!(
+                            "{} {}..{} drawn={}",
+                            p.content.title,
+                            p.change.new_start + 1,
+                            p.change.new_end + 1,
+                            p.hits.is_some()
+                        )),
                     // The marks drawn for the active document, and whether
                     // Next Change has anything to act on.
-                    state.gutter.docs.get(&buffer.id()).map_or("none".to_string(), |entry| {
-                        let mut marks = entry
-                            .marks
-                            .iter()
-                            .map(|m| {
-                                let kind = match m.kind {
-                                    crate::project::git::MarkKind::Added => 'A',
-                                    crate::project::git::MarkKind::Modified => 'M',
-                                    crate::project::git::MarkKind::Removed => 'R',
-                                };
-                                format!("{}{kind}", m.line + 1)
-                            })
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        if !super::changes::active_has_changes(&state) {
-                            marks.push_str(" inactive");
-                        }
-                        marks
-                    }),
+                    state
+                        .gutter
+                        .docs
+                        .get(&buffer.id())
+                        .map_or("none".to_string(), |entry| {
+                            let mut marks = entry
+                                .marks
+                                .iter()
+                                .map(|m| {
+                                    let kind = match m.kind {
+                                        crate::project::git::MarkKind::Added => 'A',
+                                        crate::project::git::MarkKind::Modified => 'M',
+                                        crate::project::git::MarkKind::Removed => 'R',
+                                    };
+                                    format!("{}{kind}", m.line + 1)
+                                })
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            if !super::changes::active_has_changes(&state) {
+                                marks.push_str(" inactive");
+                            }
+                            marks
+                        }),
                     // The issue the active tab shows: number, repository,
                     // whether it takes typing, and its page.
                     super::issues::active_issue(&state).map_or("none".to_string(), |t| format!(
                         "#{} repo={}{} view_only={} url={}",
                         t.issue.number,
-                        t.repo.0.as_deref().map(|h| format!("{h}:")).unwrap_or_default(),
+                        t.repo
+                            .0
+                            .as_deref()
+                            .map(|h| format!("{h}:"))
+                            .unwrap_or_default(),
                         t.repo.1.display(),
                         state.docs.active().is_view_only(),
                         t.issue.url
@@ -1256,7 +1241,10 @@ impl EditorView {
                     },
                     state.replaced,
                     state.agents.inspector.report_receipt(),
-                    state.agents.activity.report(state.agents.arrangement.activity_folded),
+                    state
+                        .agents
+                        .activity
+                        .report(state.agents.arrangement.activity_folded),
                 );
                 // First, what Edit > Undo and Redo say: named after the
                 // Explorer's file operations while its tree has the keys.
@@ -1330,8 +1318,7 @@ fn modifier_flags(mods: &crate::platform::selftest::Mods) -> NSEventModifierFlag
 /// A region by the name a script gives it: a page's or panel's own names
 /// first, then the window frame's.
 fn region_named(state: &mut State, name: &str) -> Option<Viewport> {
-    match state.extensions.as_ref() {
-        Some(page) if name.starts_with("extensions.") => page.named(name),
+    match name {
         _ if name.starts_with("mcp.") => state.mcp.named(name),
         _ if name.starts_with("settings.") => state.settings_page.named(name),
         _ if name.starts_with("agents.") => state.agents.named(name),

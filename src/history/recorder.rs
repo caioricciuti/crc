@@ -1002,7 +1002,7 @@ impl Writer {
     fn load_undo(&self, path: &Path, base: &Rope) -> Option<Journal> {
         let undo = self.store.as_ref()?.get_undo(path).ok()??;
         let text = base.to_string();
-        if crate::ext::verify::sha256(text.as_bytes())? != undo.base {
+        if crate::hash::sha256(text.as_bytes())? != undo.base {
             return None;
         }
         undo_journal::decode(&undo.journal, base)
@@ -1551,10 +1551,7 @@ mod tests {
     /// `path`'s journal as kept, decoded against `base`: (undo, redo).
     fn journal(db: &Path, path: &Path, base: &str) -> Option<(usize, usize)> {
         let undo = Store::open(db).unwrap().get_undo(path).unwrap()?;
-        assert_eq!(
-            undo.base,
-            crate::ext::verify::sha256(base.as_bytes()).unwrap()
-        );
+        assert_eq!(undo.base, crate::hash::sha256(base.as_bytes()).unwrap());
         let journal = undo_journal::decode(&undo.journal, &Rope::from_text(base))?;
         Some((journal.undo.len(), journal.redo.len()))
     }
