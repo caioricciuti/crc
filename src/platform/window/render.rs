@@ -1860,7 +1860,7 @@ fn status_texts(parts: &StatusParts<'_>) -> (String, StatusDetail) {
     };
     let name = buffer.display_name();
     let left = parts.note.clone().or(here).unwrap_or_else(|| {
-        if buffer.is_view_only() {
+        if buffer.is_view_only() || buffer.is_preview_file() {
             return name;
         }
         let saved = if buffer.is_read_only() {
@@ -1895,8 +1895,9 @@ fn status_texts(parts: &StatusParts<'_>) -> (String, StatusDetail) {
         Some((row, column)) => format!("Row {}, Col {}", row + 1, column + 1),
         None => format!("Ln {}, Col {}", line + 1, column + 1),
     };
-    // A view-only document has no caret to place and nothing to encode.
-    let (place, format) = if buffer.is_view_only() {
+    // A view-only document or a preview (a picture, a video, a PDF) has no
+    // caret to place and nothing to encode.
+    let (place, format) = if buffer.is_view_only() || buffer.is_preview_file() {
         (String::new(), String::new())
     } else {
         (
@@ -1983,6 +1984,23 @@ mod status_tests {
             source: None,
             raw: String::new(),
         }
+    }
+
+    /// Regression: a video tab said "All changes saved" with "Ln 1, Col 1"
+    /// and "UTF-8" beside it, none of which means anything for a preview.
+    #[test]
+    fn a_preview_file_shows_its_name_and_no_caret_or_save_state() {
+        let root = std::env::temp_dir().join(format!("crc-status-preview-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("clip.mp4");
+        std::fs::write(&path, b"preview bytes").unwrap();
+        let buffer = Buffer::open(&path).unwrap();
+        let (left, right) = status_texts(&parts(&buffer));
+        let right = right.whole();
+        assert_eq!(left, "clip.mp4");
+        assert!(!right.contains("Ln "), "{right}");
+        assert!(!right.contains("UTF-8"), "{right}");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
