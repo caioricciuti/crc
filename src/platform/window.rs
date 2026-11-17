@@ -290,6 +290,37 @@ fn prefer_key_repeat() {
     }
 }
 
+/// What a double-click on the title bar does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TitleBarDoubleClick {
+    Zoom,
+    Minimize,
+    Nothing,
+}
+
+/// The "Double-click a window's title bar to" choice in Desktop & Dock.
+/// `AppleActionOnDoubleClick` holds it ("Maximize", "Fill", "Minimize",
+/// "None"); older systems only wrote `AppleMiniaturizeOnDoubleClick`.
+/// Unset means Zoom, as AppKit's own title bar does.
+fn title_bar_double_click_from(action: Option<&str>, minimize: bool) -> TitleBarDoubleClick {
+    match action {
+        Some("Minimize") => TitleBarDoubleClick::Minimize,
+        Some("None") => TitleBarDoubleClick::Nothing,
+        Some(_) => TitleBarDoubleClick::Zoom,
+        None if minimize => TitleBarDoubleClick::Minimize,
+        None => TitleBarDoubleClick::Zoom,
+    }
+}
+
+fn title_bar_double_click() -> TitleBarDoubleClick {
+    let defaults = objc2_foundation::NSUserDefaults::standardUserDefaults();
+    let action = defaults
+        .stringForKey(&NSString::from_str("AppleActionOnDoubleClick"))
+        .map(|value| value.to_string());
+    let minimize = defaults.boolForKey(&NSString::from_str("AppleMiniaturizeOnDoubleClick"));
+    title_bar_double_click_from(action.as_deref(), minimize)
+}
+
 /// The text in what the input system hands over, which is an `NSString` or
 /// an `NSAttributedString` depending on who is asking.
 fn text_of(string: &AnyObject) -> String {
@@ -2228,6 +2259,18 @@ define_class!(
             }
 
             if chrome.toolbar.contains(x, y) {
+                // The top bar stands in for the hidden title bar, so a
+                // double-click on it does what the system setting says.
+                if event.clickCount() == 2 {
+                    if let Some(window) = self.window() {
+                        match title_bar_double_click() {
+                            TitleBarDoubleClick::Zoom => window.performZoom(None),
+                            TitleBarDoubleClick::Minimize => window.performMiniaturize(None),
+                            TitleBarDoubleClick::Nothing => {}
+                        }
+                    }
+                    return;
+                }
                 if x > 120.0 && let Some(window) = self.window() {
                     window.performWindowDragWithEvent(event);
                 }
@@ -10633,6 +10676,19 @@ mod tests {
         spawn_project_refresh, typed_text,
     };
     use std::time::Duration;
+
+    /// Regression: a double-click on the top bar did nothing; it follows
+    /// the system's title bar setting, Zoom when unset.
+    #[test]
+    fn title_bar_double_click_follows_the_system_setting() {
+        use super::{TitleBarDoubleClick as A, title_bar_double_click_from as from};
+        assert_eq!(from(None, false), A::Zoom);
+        assert_eq!(from(None, true), A::Minimize);
+        assert_eq!(from(Some("Maximize"), true), A::Zoom);
+        assert_eq!(from(Some("Fill"), false), A::Zoom);
+        assert_eq!(from(Some("Minimize"), false), A::Minimize);
+        assert_eq!(from(Some("None"), false), A::Nothing);
+    }
 
     /// Regression: the files were opened skipping the missing ones and the
     /// saved index then switched to the wrong neighbour.
