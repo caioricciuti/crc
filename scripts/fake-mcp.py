@@ -145,6 +145,7 @@ def handle(message):
 
 def serve_http():
     import threading
+    import time
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     lock = threading.Lock()
@@ -200,6 +201,15 @@ def serve_http():
                 stream = "".join("event: message\ndata: " + json.dumps(m) + "\n\n" for m in out)
                 self.reply(200, stream.encode(), "text/event-stream", extra)
 
+    # Stdio mode ends at EOF; this one has no stdin to watch, so it exits
+    # once the test that started it is gone and launchd adopts it.
+    def watch_parent():
+        while True:
+            if os.getppid() == 1:
+                os._exit(0)
+            time.sleep(0.5)
+
+    threading.Thread(target=watch_parent, daemon=True).start()
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     sys.stdout.write(str(server.server_address[1]) + "\n")
     sys.stdout.flush()

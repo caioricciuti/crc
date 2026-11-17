@@ -4,11 +4,12 @@
 //! A reader thread turns the byte stream into messages and hands them over
 //! a channel; after each one it calls the wake-up the owner gave it, which
 //! in the app queues a main-thread poll. Writes go through a writer thread,
-//! so a server that stops reading never blocks the caller. The process is
-//! killed when the transport is dropped, so a server never outlives the
-//! editor.
+//! so a server that stops reading never blocks the caller. The process and
+//! everything it started are killed when the transport is dropped, so a
+//! server never outlives the editor.
 
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
@@ -72,10 +73,13 @@ impl Transport {
         framing: Framing,
         wake: Wake,
     ) -> std::io::Result<Transport> {
+        // A group of its own, so the drop can take down what a wrapper
+        // (`sh -c`, `npx`, `uv run`) started too, not only the wrapper.
         let mut child = Command::new(program)
             .args(args)
             .envs(env.iter().map(|(k, v)| (k, v)))
             .current_dir(root)
+            .process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -198,6 +202,11 @@ impl Drop for Transport {
         // closing a project never waits on a server's exit.
         self.writer = None;
         if let Some(mut child) = self.child.take() {
+            // The group id is the child's pid (`process_group(0)`), so
+            // the negative pid signals the whole group.
+            if let Ok(pid) = i32::try_from(child.id()) {
+                crate::platform::send_signal(-pid, 9);
+            }
             let _ = child.kill();
             std::thread::spawn(move || {
                 let _ = child.wait();
@@ -381,5 +390,38 @@ mod tests {
         fine.extend_from_slice(b"\r\nnull");
         let mut reader = BufReader::new(&fine[..]);
         assert_eq!(read_message(&mut reader).unwrap(), Some(Ok(Value::Null)));
+    }
+
+    #[test]
+    fn drop_kills_grandchildren() {
+        // A wrapper (`sh -c`, `npx`, `uv run`) whose real server is its own
+        // child: dropping the transport must take both down.
+        let transport = Transport::spawn_with(
+            Path::new("/bin/sh"),
+            &["-c", "sleep 300 & echo \"{\\\"pid\\\":$!}\"; wait"],
+            Path::new("/tmp"),
+            &[],
+            Framing::Lines,
+            Box::new(|| {}),
+        )
+        .unwrap();
+        let pid = match transport.recv_timeout(std::time::Duration::from_secs(5)) {
+            Some(Incoming::Message(value)) => match value.get("pid") {
+                Some(Value::Number(n)) => n.parse::<u64>().unwrap(),
+                other => panic!("no pid: {other:?}"),
+            },
+            other => panic!("no message: {other:?}"),
+        };
+        assert!(crate::platform::process_alive(pid));
+        drop(transport);
+        let start = std::time::Instant::now();
+        while crate::platform::process_alive(pid) {
+            if start.elapsed() > std::time::Duration::from_secs(2) {
+                // Do not leave it behind for the next run.
+                crate::platform::send_signal(pid as i32, 9);
+                panic!("grandchild {pid} outlived the transport");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 }

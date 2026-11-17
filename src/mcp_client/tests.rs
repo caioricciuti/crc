@@ -126,22 +126,33 @@ struct HttpFake(std::process::Child, u16);
 impl HttpFake {
     fn start(mode: &str) -> HttpFake {
         use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
         let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/fake-mcp.py");
-        let mut child = std::process::Command::new("/usr/bin/python3")
+        let child = std::process::Command::new("/usr/bin/python3")
             .args([script, mode])
+            .process_group(0)
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap();
+        // The guard first, so a panic reading the port still kills it.
+        let mut fake = HttpFake(child, 0);
         let mut line = String::new();
-        std::io::BufReader::new(child.stdout.take().unwrap())
+        std::io::BufReader::new(fake.0.stdout.take().unwrap())
             .read_line(&mut line)
             .unwrap();
-        HttpFake(child, line.trim().parse().unwrap())
+        fake.1 = line.trim().parse().unwrap();
+        fake
     }
 }
 
 impl Drop for HttpFake {
     fn drop(&mut self) {
+        // Its own group (`process_group(0)`): the negative pid is all of it.
+        if let Ok(pid) = i32::try_from(self.0.id()) {
+            crate::platform::send_signal(-pid, 9);
+        }
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
