@@ -2,13 +2,17 @@
 
 One entry per tag, written for people who use the editor.
 
-## Unreleased
+## v0.2.0-alpha.37, 2026-11-17
 
 - Extensions are gone: the WebAssembly engine, the signed registry, the
   Extensions page, Cmd-Shift-X and the Extensions icon in the strip at the
   window's left. crc no longer runs code that is not its own.
 - Markdown Preview is built in. Cmd-E opens the rendered page beside the
   text and Cmd-Shift-E in the whole tab, with nothing to install first.
+  On a file that is not Markdown, Cmd-E says so.
+- Agents mode: with one session showing, dragging its tab to an edge of
+  the screen now splits it, with the next tab of its workspace on the
+  other side. Before, the drop did nothing.
 
 ## v0.2.0-alpha.36, 2026-11-08
 
