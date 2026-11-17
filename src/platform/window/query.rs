@@ -480,7 +480,7 @@ impl EditorView {
                 return;
             };
             panel.setNameFieldStringValue(&NSString::from_str(&suggested));
-            if panel.runModal() != MODAL_RESPONSE_OK {
+            if crate::platform::jank::modal(|| panel.runModal()) != MODAL_RESPONSE_OK {
                 return;
             }
             panel

@@ -592,7 +592,9 @@ impl EditorView {
                 }
                 let menu = self.task_menu(index);
                 layout::set_pressed(None);
-                NSMenu::popUpContextMenu_withEvent_forView(&menu, event, self);
+                crate::platform::jank::modal(|| {
+                    NSMenu::popUpContextMenu_withEvent_forView(&menu, event, self)
+                });
             }
         }
         self.request_redraw();

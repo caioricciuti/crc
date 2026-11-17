@@ -566,7 +566,7 @@ impl EditorView {
             let url = NSURL::fileURLWithPath(&NSString::from_str(&dir.to_string_lossy()));
             panel.setDirectoryURL(Some(&url));
         }
-        if panel.runModal() != MODAL_RESPONSE_OK {
+        if crate::platform::jank::modal(|| panel.runModal()) != MODAL_RESPONSE_OK {
             return false;
         }
         let Some(url) = panel.URL() else {

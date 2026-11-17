@@ -700,7 +700,9 @@ impl EditorView {
             crumb.rect.x as f64,
             (crumb.rect.y + crumb.rect.height) as f64,
         );
-        menu.popUpMenuPositioningItem_atLocation_inView(None, at, Some(self));
+        crate::platform::jank::modal(|| {
+            menu.popUpMenuPositioningItem_atLocation_inView(None, at, Some(self))
+        });
     }
 
     /// Opens a file picked from a breadcrumb menu, or shows a folder in the

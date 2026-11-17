@@ -654,7 +654,7 @@ impl EditorView {
                     .unwrap_or_else(|| "Untitled.txt".to_string())
             };
             panel.setNameFieldStringValue(&NSString::from_str(&suggested));
-            if panel.runModal() != MODAL_RESPONSE_OK {
+            if crate::platform::jank::modal(|| panel.runModal()) != MODAL_RESPONSE_OK {
                 return None;
             }
             let path = panel.URL()?.path()?;

@@ -127,7 +127,9 @@ impl EditorView {
             Action::MergePullRequest => {
                 let menu = self.merge_strategy_menu();
                 layout::set_pressed(None);
-                NSMenu::popUpContextMenu_withEvent_forView(&menu, event, self);
+                crate::platform::jank::modal(|| {
+                    NSMenu::popUpContextMenu_withEvent_forView(&menu, event, self)
+                });
             }
             Action::OpenPullRequest => self.agent_open_pull_request(),
             Action::OpenWorktree

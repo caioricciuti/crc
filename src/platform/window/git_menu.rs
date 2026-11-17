@@ -292,7 +292,9 @@ impl EditorView {
         let menu = git_actions_menu(mtm);
         let at = NSPoint::new(below.x as f64, (below.y + below.height + 4.0) as f64);
         layout::set_pressed(None);
-        menu.popUpMenuPositioningItem_atLocation_inView(None, at, Some(self));
+        crate::platform::jank::modal(|| {
+            menu.popUpMenuPositioningItem_atLocation_inView(None, at, Some(self))
+        });
         self.request_redraw();
     }
 

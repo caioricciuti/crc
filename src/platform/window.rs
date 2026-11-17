@@ -1133,7 +1133,7 @@ fn choose_path(
     if let Some(message) = message {
         panel.setMessage(Some(&NSString::from_str(message)));
     }
-    if panel.runModal() != MODAL_RESPONSE_OK {
+    if crate::platform::jank::modal(|| panel.runModal()) != MODAL_RESPONSE_OK {
         return None;
     }
     Some(panel.URL()?.path()?.to_string().into())
@@ -1156,7 +1156,7 @@ fn choose_folder_from(
         let url = NSURL::fileURLWithPath(&NSString::from_str(&start.to_string_lossy()));
         panel.setDirectoryURL(Some(&url));
     }
-    if panel.runModal() != MODAL_RESPONSE_OK {
+    if crate::platform::jank::modal(|| panel.runModal()) != MODAL_RESPONSE_OK {
         return None;
     }
     Some(panel.URL()?.path()?.to_string().into())
@@ -1833,7 +1833,9 @@ define_class!(
                 let menu: Option<Retained<NSMenu>> =
                     unsafe { msg_send![self, menuForEvent: event] };
                 if let Some(menu) = menu {
-                    NSMenu::popUpContextMenu_withEvent_forView(&menu, event, self);
+                    crate::platform::jank::modal(|| {
+                        NSMenu::popUpContextMenu_withEvent_forView(&menu, event, self)
+                    });
                 }
                 return;
             }
@@ -1878,7 +1880,9 @@ define_class!(
                             state.project_menu_requested = true;
                         }
                     } else {
-                        NSMenu::popUpContextMenu_withEvent_forView(&menu, event, self);
+                        crate::platform::jank::modal(|| {
+                            NSMenu::popUpContextMenu_withEvent_forView(&menu, event, self)
+                        });
                     }
                     return;
                 }
@@ -3308,7 +3312,7 @@ define_class!(
                 env!("CARGO_PKG_VERSION"),
                 option_env!("CRC_BUILD_REVISION").unwrap_or("unknown")
             )));
-            alert.runModal();
+            crate::platform::jank::modal(|| alert.runModal());
         }
 
         #[unsafe(method(selectNextOccurrence:))]
@@ -8259,7 +8263,7 @@ fn ask(mtm: MainThreadMarker, message: &str, detail: &str, buttons: &[&str]) -> 
     for button in buttons {
         alert.addButtonWithTitle(&NSString::from_str(button));
     }
-    (alert.runModal() - FIRST).max(0) as usize
+    (crate::platform::jank::modal(|| alert.runModal()) - FIRST).max(0) as usize
 }
 
 /// The restore prompt's text: which documents came back, by name and
