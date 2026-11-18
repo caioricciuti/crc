@@ -2,16 +2,17 @@
 # expect helpers; run it alone with scripts/selftest.sh receipt.
 
 # ---- The receipt: what a session's agent ran, as its hooks said ---------
-# A stand-in agent is sent a prompt, then reports four shell commands
+# A stand-in agent is sent a prompt, then reports five shell commands
 # through the Bash hooks Claude Code runs: `echo ok` succeeded
 # (PostToolUse), `cargo test` failed with exit 101 (PostToolUseFailure)
-# after 12 tests passed and 1 failed, `cargo build` succeeded, and a dev
-# server went to the background. Its Stop hook then says the tests pass,
-# clippy is clean and it builds. In Agents mode the inspector's Receipt
-# card holds each claim up to the turn's commands (the tests failed, 12
-# passed and 1 failed, no lint ran, the build passed), counts four
-# commands, one failed, shows the test run's counts, and lists the newest
-# first. The frames are for a look at the card in both themes.
+# after 12 tests passed and 1 failed, `cargo build` succeeded, `npm
+# install left-pad` succeeded, and a dev server went to the background.
+# Its Stop hook then says the tests pass, clippy is clean and it builds.
+# In Agents mode the inspector's Receipt card holds each claim up to the
+# turn's commands (the tests failed, 12 passed and 1 failed, no lint ran,
+# the build passed), counts five commands, one failed, shows the test
+# run's counts, lists the newest first, and lists the install. The frames
+# are for a look at the card in both themes.
 case "$BIN" in /*) rc_bin=$BIN ;; *) rc_bin=$PWD/$BIN ;; esac
 P="$T/receiptproj"
 mkdir -p "$P"
@@ -25,6 +26,7 @@ printf '{"prompt":"fix the parser"}' | "$rc_bin" --hook prompt
 printf '{"tool_name":"Bash","tool_input":{"command":"echo ok"},"tool_response":{"stdout":"ok"}}' | "$rc_bin" --hook ran
 printf '{"tool_name":"Bash","tool_input":{"command":"cargo test --offline"},"error":"Exit code 101\\\\ntest result: FAILED. 12 passed; 1 failed; 0 ignored\\\\nerror: 1 test failed","is_interrupt":false}' | "$rc_bin" --hook ran-failed
 printf '{"tool_name":"Bash","tool_input":{"command":"cargo build"},"tool_response":{"stdout":""}}' | "$rc_bin" --hook ran
+printf '{"tool_name":"Bash","tool_input":{"command":"npm install left-pad"},"tool_response":{"stdout":"added 1 package"}}' | "$rc_bin" --hook ran
 printf '{"tool_name":"Bash","tool_input":{"command":"npm run dev","run_in_background":true},"tool_response":{"backgroundTaskId":"b1"}}' | "$rc_bin" --hook ran
 printf '{"hook_event_name":"Stop","last_assistant_message":"Fixed the parser.\\\\n\\\\nAll tests pass and clippy is clean. It builds."}' | "$rc_bin" --hook stop
 printf 'done\n'
@@ -52,12 +54,12 @@ SCRIPT
         CRC_SELFTEST="$T/receipt-$1.script" "$BIN" "$P" 2> "$T/receipt-$1.err"
 }
 rc_run dark dark
-expect "$T/receipt-dark.out" receipt "claims=tests:exit 101=12/1,lint:not run,build:checked ran=4 failed=1 rows=4 counts=12/1 last=bg:npm run dev"
+expect "$T/receipt-dark.out" receipt "claims=tests:exit 101=12/1,lint:not run,build:checked ran=5 failed=1 rows=5 counts=12/1 installs=0:npm install left-pad last=bg:npm run dev"
 rc_run light light
-expect "$T/receipt-light.out" receipt "claims=tests:exit 101=12/1,lint:not run,build:checked ran=4 failed=1 rows=4 counts=12/1 last=bg:npm run dev"
+expect "$T/receipt-light.out" receipt "claims=tests:exit 101=12/1,lint:not run,build:checked ran=5 failed=1 rows=5 counts=12/1 installs=0:npm install left-pad last=bg:npm run dev"
 
 # Closing the terminal keeps its ledger: the workspace's card still counts
-# the four commands once the session is gone.
+# the five commands and the install once the session is gone.
 cat > "$T/receipt-closed.script" <<SCRIPT
 wait 500
 key 8 cmd,shift C
@@ -76,4 +78,4 @@ SCRIPT
 mkdir -p "$T/home/receipt-closed/.config/crc"
 HOME="$T/home/receipt-closed" CRC_TERMINAL_SHELL=/bin/sh CRC_CLAUDE_COMMAND="$T/receipt-agent.sh" \
     CRC_SELFTEST="$T/receipt-closed.script" "$BIN" "$P" 2> "$T/receipt-closed.err"
-expect "$T/receipt-closed.out" receipt "claims=tests:exit 101=12/1,lint:not run,build:checked ran=4 failed=1 rows=4 counts=12/1 last=bg:npm run dev"
+expect "$T/receipt-closed.out" receipt "claims=tests:exit 101=12/1,lint:not run,build:checked ran=5 failed=1 rows=5 counts=12/1 installs=0:npm install left-pad last=bg:npm run dev"

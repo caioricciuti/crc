@@ -267,7 +267,11 @@ the size and write it back.
   and when; hover a row for the whole command. A test run (cargo test,
   vitest, jest, pytest, go test) shows how many tests passed and
   failed instead, read from its output as it ends; the output itself
-  is not kept. When the agent finishes
+  is not kept. Package installs (npm, pnpm, yarn and bun add or
+  install, cargo add or install, pip, uv and brew install) are listed
+  under the commands with the packages named and whether they failed;
+  an install with no packages shows as from the lockfile. When the
+  agent finishes
   a turn saying the tests pass, the code builds or the lint is clean, a
   card above it holds each claim up to the newest command of that kind
   the turn ran: checked, the failing exit code, not run, before last

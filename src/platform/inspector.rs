@@ -839,7 +839,8 @@ impl Inspector {
     /// The receipt card: what the agent's last message claimed, each with
     /// how the turn's commands bear it out, then how many commands it ran
     /// and how many failed, then the newest few, each with how it ended
-    /// and when; a test run that printed its counts shows them instead. A
+    /// and when; a test run that printed its counts shows them instead.
+    /// Under them, the packages it installed, when it installed any. A
     /// claim's tooltip is the sentence and the command behind it; a
     /// command's, the whole command. The bottom it reached.
     #[allow(clippy::too_many_arguments)]
@@ -932,8 +933,16 @@ impl Inspector {
             .filter_map(|r| r.tests.map(|t| t.code()))
             .collect();
         let facts: Vec<Fact> = labels.iter().map(String::as_str).zip(values).collect();
-        let bottom = card(out, atlas, x, y, width, &facts, theme);
+        let mut bottom = card(out, atlas, x, y, width, &facts, theme);
         rows_hotspots(x, y, width, 1, &whole);
+        if !receipt.installs.is_empty() {
+            bottom = draw_installs(receipt, atlas, x, bottom + 8.0, width, theme, out);
+        }
+        let installs: Vec<String> = receipt
+            .installs
+            .iter()
+            .map(|i| format!("{}:{}", i.outcome.code(), i.install.label()))
+            .collect();
         let checked: Vec<String> = receipt
             .claims
             .iter()
@@ -943,7 +952,7 @@ impl Inspector {
             })
             .collect();
         self.shown_receipt = Some(format!(
-            "claims={} ran={} failed={} rows={} counts={} last={}",
+            "claims={} ran={} failed={} rows={} counts={} installs={} last={}",
             if checked.is_empty() {
                 "-".into()
             } else {
@@ -956,6 +965,11 @@ impl Inspector {
                 "-".into()
             } else {
                 counted.join(",")
+            },
+            if installs.is_empty() {
+                "-".into()
+            } else {
+                installs.join(",")
             },
             receipt
                 .latest(1)
@@ -2335,6 +2349,50 @@ fn card(
         }
     }
     y + height
+}
+
+/// The receipt's installs on a card of their own: how many, and how many
+/// failed, then the newest few, each with how it ended. A row's tooltip is
+/// the whole install and the command it was in. The bottom it reached.
+fn draw_installs(
+    receipt: &Receipt,
+    atlas: &mut Atlas,
+    x: f32,
+    y: f32,
+    width: f32,
+    theme: &Theme,
+    out: &mut Vec<GlyphInstance>,
+) -> f32 {
+    let failed = receipt
+        .installs
+        .iter()
+        .filter(|i| i.outcome.failed())
+        .count();
+    let mut head = vec![(receipt.installs.len().to_string(), theme.text)];
+    if failed > 0 {
+        head.push((format!("{failed} failed"), theme.diff_removed));
+    }
+    let mut labels = vec!["Installs".to_owned()];
+    let mut values = vec![head];
+    let mut whole = Vec::new();
+    let inner = width - 20.0;
+    for installed in receipt.installs.iter().rev().take(RECEIPT_ROWS) {
+        let ink = match installed.outcome {
+            Outcome::Passed => theme.diff_added,
+            Outcome::Background => theme.gutter_text,
+            _ => theme.diff_removed,
+        };
+        let result = installed.outcome.label();
+        let taken = layout::ui_text_width(atlas, &result) + 6.0;
+        let label = installed.install.label();
+        labels.push(fit(atlas, &label, (inner - taken - 12.0).max(0.0)));
+        values.push(vec![(result, ink)]);
+        whole.push(format!("{label}\n{}", installed.command));
+    }
+    let facts: Vec<Fact> = labels.iter().map(String::as_str).zip(values).collect();
+    let bottom = card(out, atlas, x, y, width, &facts, theme);
+    rows_hotspots(x, y, width, 1, &whole);
+    bottom
 }
 
 /// A tooltip for each of a card's rows from `first` down.

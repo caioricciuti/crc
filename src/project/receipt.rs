@@ -309,6 +309,9 @@ pub struct Receipt {
     wrote: Option<usize>,
     /// What the agent's last message claimed, each checked.
     pub claims: Vec<Claim>,
+    /// The package installs its commands ran, in the order they ran, each
+    /// once, the newest [`KEEP`] of them.
+    pub installs: Vec<Installed>,
 }
 
 impl Receipt {
@@ -317,10 +320,28 @@ impl Receipt {
         if ran.outcome.failed() {
             self.failed += 1;
         }
+        for install in installs_of(&ran.command) {
+            self.note_install(Installed {
+                install,
+                outcome: ran.outcome,
+                command: ran.command.clone(),
+            });
+        }
         if self.ran.len() == KEEP {
             self.ran.pop_front();
         }
         self.ran.push_back(ran);
+    }
+
+    /// An install, unless the same one, ended the same way, is listed.
+    fn note_install(&mut self, installed: Installed) {
+        if self.installs.iter().any(|i| i.same(&installed)) {
+            return;
+        }
+        if self.installs.len() == KEEP {
+            self.installs.remove(0);
+        }
+        self.installs.push(installed);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -394,12 +415,16 @@ impl Receipt {
     }
 
     /// Takes in the receipt of a later session: the counts add up, the
-    /// commands go in the order they ran, the newest [`KEEP`] of them, and
-    /// its claims stand when it made any. A turn does not span sessions, so
-    /// what is claimed next is checked against nothing merged here.
+    /// commands go in the order they ran, the newest [`KEEP`] of them, its
+    /// installs after these, each once, and its claims stand when it made
+    /// any. A turn does not span sessions, so what is claimed next is
+    /// checked against nothing merged here.
     pub fn merge(&mut self, newer: Receipt) {
         self.total += newer.total;
         self.failed += newer.failed;
+        for installed in newer.installs {
+            self.note_install(installed);
+        }
         let mut ran: Vec<Ran> = self.ran.drain(..).chain(newer.ran).collect();
         ran.sort_by_key(|r| r.at);
         let skip = ran.len().saturating_sub(KEEP);
@@ -757,6 +782,280 @@ fn after<'a>(args: &'a [&'a str], word: &str) -> &'a [&'a str] {
 fn program_in(args: &[&str]) -> Option<Kind> {
     let at = args.iter().position(|a| !a.starts_with('-'))?;
     runs(args[at], &args[at + 1..])
+}
+
+/// A package install a command ran: the tool and what it was asked for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Install {
+    /// The program and its verb as crc names them: `npm install`, `cargo
+    /// add`, `uv pip install`.
+    pub tool: String,
+    /// The packages named, as typed, flags left out. None for an install
+    /// from a lockfile or a manifest.
+    pub packages: Vec<String>,
+}
+
+/// Package managers whose install with no packages is from the lockfile.
+const LOCKFILE_TOOLS: &[&str] = &["npm", "pnpm", "yarn", "bun"];
+
+impl Install {
+    /// A few words, for the receipt card: `npm install left-pad`, or `npm
+    /// ci (lockfile)`.
+    pub fn label(&self) -> String {
+        let program = self.tool.split(' ').next().unwrap_or_default();
+        if !self.packages.is_empty() {
+            format!("{} {}", self.tool, self.packages.join(" "))
+        } else if LOCKFILE_TOOLS.contains(&program) {
+            format!("{} (lockfile)", self.tool)
+        } else {
+            self.tool.clone()
+        }
+    }
+}
+
+/// An install with how the command that ran it ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Installed {
+    pub install: Install,
+    pub outcome: Outcome,
+    /// The whole command it came from.
+    pub command: String,
+}
+
+impl Installed {
+    /// The same install, ended the same way, whatever command it was in.
+    fn same(&self, other: &Installed) -> bool {
+        self.install == other.install && self.outcome == other.outcome
+    }
+}
+
+/// Programs that run the command after them.
+const WRAPPERS: &[&str] = &["sudo", "time", "command", "env", "nice", "nohup", "exec"];
+
+/// Flags of npm that take the next word.
+const NPM_VALUES: &[&str] = &["-w", "--workspace", "--prefix", "--registry"];
+/// Flags of pnpm, yarn and bun that take the next word; their `-w` takes
+/// none.
+const JS_VALUES: &[&str] = &["-F", "--filter", "-C", "--dir", "--cwd", "--registry"];
+/// Flags of `cargo add` and `cargo install` that take the next word.
+const CARGO_VALUES: &[&str] = &[
+    "-p",
+    "--package",
+    "-F",
+    "--features",
+    "--rename",
+    "--path",
+    "--git",
+    "--branch",
+    "--tag",
+    "--rev",
+    "--registry",
+    "--index",
+    "--manifest-path",
+    "--target",
+    "--target-dir",
+    "--version",
+    "--vers",
+    "--root",
+    "--bin",
+    "--example",
+    "--profile",
+    "-j",
+    "--jobs",
+    "--config",
+    "-Z",
+];
+/// Flags of pip and uv that take the next word.
+const PY_VALUES: &[&str] = &[
+    "-r",
+    "--requirement",
+    "-c",
+    "--constraint",
+    "-e",
+    "--editable",
+    "-i",
+    "--index-url",
+    "--extra-index-url",
+    "--index",
+    "--default-index",
+    "-f",
+    "--find-links",
+    "-t",
+    "--target",
+    "--prefix",
+    "--root",
+    "-p",
+    "--python",
+    "--group",
+    "--optional",
+    "--extra",
+    "--package",
+    "--with",
+];
+
+/// The package installs a command runs: each part of a list or pipeline
+/// that is npm, pnpm, yarn or bun adding or installing, cargo adding or
+/// installing, pip or uv installing, or brew installing. Anything in front
+/// of the program that only sets it up (an environment variable, `sudo`,
+/// `time`) is passed over; a separator inside quotes does not start a
+/// part, and a program in quotes is not run.
+pub fn installs_of(command: &str) -> Vec<Install> {
+    command_parts(command)
+        .iter()
+        .filter_map(|part| install_in(part))
+        .collect()
+}
+
+/// The parts of a command list or pipeline, split at `&&`, `||`, `;`,
+/// `|`, `&` and new lines outside quotes; a `&` in a redirect (`2>&1`)
+/// does not split.
+fn command_parts(command: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut part = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut prev = ' ';
+    for c in command.chars() {
+        if escaped {
+            escaped = false;
+            part.push(c);
+        } else if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            } else if c == '\\' && q == '"' {
+                escaped = true;
+            }
+            part.push(c);
+        } else {
+            match c {
+                '\\' => {
+                    escaped = true;
+                    part.push(c);
+                }
+                '\'' | '"' => {
+                    quote = Some(c);
+                    part.push(c);
+                }
+                ';' | '|' | '\n' => parts.push(std::mem::take(&mut part)),
+                '&' if !matches!(prev, '>' | '<') => parts.push(std::mem::take(&mut part)),
+                _ => part.push(c),
+            }
+        }
+        prev = c;
+    }
+    parts.push(part);
+    parts
+}
+
+/// Whether `word` sets an environment variable: `NAME=value`.
+fn is_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        !name.is_empty()
+            && !name.starts_with(|c: char| c.is_ascii_digit())
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
+/// The install one part of a command runs, if it is one.
+fn install_in(part: &str) -> Option<Install> {
+    let words: Vec<&str> = part.split_whitespace().collect();
+    // Past what only sets the program up: variables, wrappers and their
+    // flags.
+    let mut at = 0;
+    let mut wrapped = false;
+    while let Some(word) = words.get(at) {
+        if WRAPPERS.contains(word) {
+            wrapped = true;
+        } else if !is_assignment(word) && !(wrapped && word.starts_with('-')) {
+            break;
+        }
+        at += 1;
+    }
+    let program = *words.get(at)?;
+    let name = program.rsplit('/').next().unwrap_or(program);
+    // The words given to it, up to a redirect.
+    let args: Vec<&str> = words[at + 1..]
+        .iter()
+        .copied()
+        .take_while(|w| w.starts_with(['"', '\'']) || !w.contains(['>', '<']))
+        .collect();
+    // Its verb: the first word not a flag, a flag's value, nor a
+    // `+toolchain`.
+    let globals = match name {
+        "npm" => NPM_VALUES,
+        "pnpm" | "yarn" | "bun" => JS_VALUES,
+        "cargo" => &["-C", "-Z", "--config"],
+        "uv" => &["--directory", "--project", "-p", "--python"],
+        _ => &[],
+    };
+    let mut verb_at = 0;
+    while let Some(arg) = args.get(verb_at) {
+        if !arg.starts_with(['-', '+']) {
+            break;
+        }
+        verb_at += if globals.contains(arg) { 2 } else { 1 };
+    }
+    args.get(verb_at)?;
+    let (verb, rest) = (args[verb_at], &args[verb_at + 1..]);
+    let (tool, rest, values): (String, &[&str], &[&str]) = match (name, verb) {
+        ("npm", "install" | "i" | "in" | "add") => ("npm install".into(), rest, NPM_VALUES),
+        ("npm", "ci") => ("npm ci".into(), rest, NPM_VALUES),
+        ("pnpm", "add") | ("yarn", "add") | ("bun", "add" | "a") => {
+            (format!("{name} add"), rest, JS_VALUES)
+        }
+        ("pnpm" | "yarn" | "bun", "install" | "i") => (format!("{name} install"), rest, JS_VALUES),
+        ("cargo", "add" | "install") => (format!("cargo {verb}"), rest, CARGO_VALUES),
+        ("pip" | "pip3", "install") => (format!("{name} install"), rest, PY_VALUES),
+        ("uv", "add") => ("uv add".into(), rest, PY_VALUES),
+        ("uv", "pip" | "tool") => {
+            let next = rest.iter().position(|a| !a.starts_with('-'))?;
+            if rest[next] != "install" {
+                return None;
+            }
+            (format!("uv {verb} install"), &rest[next + 1..], PY_VALUES)
+        }
+        ("brew", "install") => ("brew install".into(), rest, &[]),
+        _ => return python_pip(name, &args),
+    };
+    Some(Install {
+        tool,
+        packages: packages(rest, values),
+    })
+}
+
+/// `python -m pip install`, as pip.
+fn python_pip(name: &str, args: &[&str]) -> Option<Install> {
+    if !matches!(name, "python" | "python3") {
+        return None;
+    }
+    let ["-m", "pip", "install", rest @ ..] = args else {
+        return None;
+    };
+    Some(Install {
+        tool: "pip install".into(),
+        packages: packages(rest, PY_VALUES),
+    })
+}
+
+/// The package names among an install's arguments: not its flags, nor the
+/// word a flag in `values` takes. Quotes around a name are taken off.
+fn packages(args: &[&str], values: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut skip = false;
+    for arg in args {
+        if std::mem::take(&mut skip) {
+            continue;
+        }
+        if arg.starts_with('-') {
+            skip = values.contains(arg);
+            continue;
+        }
+        let name = arg.trim_matches(['"', '\'']);
+        if !name.is_empty() {
+            out.push(name.to_owned());
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1122,5 +1421,140 @@ ok  \texample.com/util\t(cached)
         bare.note_said(&sentences("All tests pass."));
         assert!(bare.shown());
         assert_eq!(verdicts(&bare), [(Tests, "not run".into())]);
+    }
+
+    fn labels(command: &str) -> Vec<String> {
+        installs_of(command).iter().map(Install::label).collect()
+    }
+
+    #[test]
+    fn installs_are_known_per_tool() {
+        for (command, label) in [
+            ("npm install left-pad", "npm install left-pad"),
+            (
+                "npm i -D vitest@2 typescript",
+                "npm install vitest@2 typescript",
+            ),
+            ("npm add -w web --save-exact zod", "npm install zod"),
+            ("pnpm add -w -D eslint", "pnpm add eslint"),
+            ("pnpm --filter web add zod", "pnpm add zod"),
+            ("pnpm install", "pnpm install (lockfile)"),
+            ("yarn add react react-dom", "yarn add react react-dom"),
+            ("bun add -d @types/bun", "bun add @types/bun"),
+            ("bun install --frozen-lockfile", "bun install (lockfile)"),
+            ("cargo add serde --features derive", "cargo add serde"),
+            ("cargo add -F derive serde", "cargo add serde"),
+            (
+                "cargo +nightly install ripgrep --locked",
+                "cargo install ripgrep",
+            ),
+            ("cargo install --path .", "cargo install"),
+            ("pip install requests==2.31", "pip install requests==2.31"),
+            ("pip3 install --user -r requirements.txt", "pip3 install"),
+            (
+                "pip install 'requests>=2' -i https://example.com",
+                "pip install requests>=2",
+            ),
+            ("python3 -m pip install httpx", "pip install httpx"),
+            ("uv add --dev pytest", "uv add pytest"),
+            ("uv pip install -e . ruff", "uv pip install ruff"),
+            ("uv tool install ruff", "uv tool install ruff"),
+            ("brew install --cask iterm2", "brew install iterm2"),
+            ("/opt/homebrew/bin/brew install jq", "brew install jq"),
+        ] {
+            assert_eq!(labels(command), [label], "{command}");
+        }
+    }
+
+    #[test]
+    fn a_lockfile_install_is_listed_without_packages() {
+        assert_eq!(labels("npm install"), ["npm install (lockfile)"]);
+        assert_eq!(labels("npm ci"), ["npm ci (lockfile)"]);
+        assert_eq!(
+            labels("yarn install --immutable"),
+            ["yarn install (lockfile)"]
+        );
+        assert!(installs_of("npm ci")[0].packages.is_empty());
+    }
+
+    #[test]
+    fn installs_are_found_in_each_part_of_a_command() {
+        assert_eq!(labels("cd web && npm install"), ["npm install (lockfile)"]);
+        assert_eq!(
+            labels("cd web && npm i zod; cargo add anyhow"),
+            ["npm install zod", "cargo add anyhow"]
+        );
+        assert_eq!(
+            labels("CI=1 NODE_ENV=development npm ci 2>&1 | tail -5"),
+            ["npm ci (lockfile)"]
+        );
+        assert_eq!(
+            labels("sudo -E pip install black > /dev/null"),
+            ["pip install black"]
+        );
+        assert_eq!(
+            labels("npm i zod || npm i zod@3"),
+            ["npm install zod", "npm install zod@3"]
+        );
+    }
+
+    #[test]
+    fn what_is_not_an_install_is_not_listed() {
+        for command in [
+            "npm run install-thing",
+            "npm test",
+            "npm uninstall left-pad",
+            "cargo install-update -a",
+            "cargo build",
+            "pnpm run add",
+            "brew upgrade jq",
+            "uv pip list",
+            "pip download requests",
+            "echo npm install left-pad",
+            "git commit -m 'npm install left-pad'",
+            "git commit -m \"fix; npm install left-pad\"",
+            "sh -c 'npm install left-pad'",
+            "grep -rn 'cargo add' docs",
+        ] {
+            assert_eq!(labels(command), Vec::<String>::new(), "{command}");
+        }
+    }
+
+    #[test]
+    fn a_receipt_lists_its_installs_once_and_merges_them_in_order() {
+        let mut first = Receipt::default();
+        first.note(ran("npm install left-pad", Outcome::Passed));
+        first.note(ran("cargo test", Outcome::Passed));
+        first.note(ran("pip install nope", Outcome::Failed(1)));
+        first.note(ran("cd web && npm i left-pad", Outcome::Passed));
+        let shown = |r: &Receipt| -> Vec<(String, bool)> {
+            r.installs
+                .iter()
+                .map(|i| (i.install.label(), i.outcome.failed()))
+                .collect()
+        };
+        assert_eq!(
+            shown(&first),
+            [
+                ("npm install left-pad".into(), false),
+                ("pip install nope".into(), true),
+            ]
+        );
+        assert_eq!(first.installs[1].command, "pip install nope");
+
+        let mut later = Receipt::default();
+        later.note(ran("pip install nope", Outcome::Passed));
+        later.note(ran("npm install left-pad", Outcome::Passed));
+        later.note(ran("brew install jq", Outcome::Passed));
+        first.merge(later);
+        assert_eq!(
+            shown(&first),
+            [
+                ("npm install left-pad".into(), false),
+                ("pip install nope".into(), true),
+                ("pip install nope".into(), false),
+                ("brew install jq".into(), false),
+            ]
+        );
     }
 }
