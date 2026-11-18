@@ -839,8 +839,9 @@ impl Inspector {
     /// The receipt card: what the agent's last message claimed, each with
     /// how the turn's commands bear it out, then how many commands it ran
     /// and how many failed, then the newest few, each with how it ended
-    /// and when. A claim's tooltip is the sentence and the command behind
-    /// it; a command's, the whole command. The bottom it reached.
+    /// and when; a test run that printed its counts shows them instead. A
+    /// claim's tooltip is the sentence and the command behind it; a
+    /// command's, the whole command. The bottom it reached.
     #[allow(clippy::too_many_arguments)]
     fn draw_receipt(
         &mut self,
@@ -872,7 +873,11 @@ impl Inspector {
                 Verdict::Background(_) => theme.gutter_text,
             };
             labels.push(claim.kind.said().to_owned());
-            values.push(vec![(claim.verdict.label(), ink)]);
+            let mut row = vec![(claim.verdict.label(), ink)];
+            if let Some(tests) = claim.tests {
+                row.push((tests.label(), theme.gutter_text));
+            }
+            values.push(row);
             whole.push(match claim.verdict.command() {
                 Some(command) => format!("\u{201c}{}\u{201d}\n{command}", claim.sentence),
                 None => format!(
@@ -903,7 +908,16 @@ impl Inspector {
             let age = crate::platform::git_panel::agent_age(Duration::from_secs(
                 now.saturating_sub(ran.at),
             ));
-            let row = vec![(ran.outcome.label(), ink), (age, theme.gutter_text)];
+            // A test run says how many passed and failed in place of how
+            // it ended, which its tooltip keeps.
+            let (result, tooltip) = match ran.tests {
+                Some(tests) => (
+                    tests.label(),
+                    format!("{}\n{}", ran.command, ran.outcome.label()),
+                ),
+                None => (ran.outcome.label(), ran.command.clone()),
+            };
+            let row = vec![(result, ink), (age, theme.gutter_text)];
             let taken: f32 = row
                 .iter()
                 .map(|(v, _)| layout::ui_text_width(atlas, v) + 6.0)
@@ -911,18 +925,25 @@ impl Inspector {
             // As it ran, wrappers and all: a receipt does not tidy up.
             labels.push(fit(atlas, &ran.command, (inner - taken - 12.0).max(0.0)));
             values.push(row);
-            whole.push(ran.command.clone());
+            whole.push(tooltip);
         }
+        let counted: Vec<String> = receipt
+            .latest(RECEIPT_ROWS)
+            .filter_map(|r| r.tests.map(|t| t.code()))
+            .collect();
         let facts: Vec<Fact> = labels.iter().map(String::as_str).zip(values).collect();
         let bottom = card(out, atlas, x, y, width, &facts, theme);
         rows_hotspots(x, y, width, 1, &whole);
         let checked: Vec<String> = receipt
             .claims
             .iter()
-            .map(|c| format!("{}:{}", c.kind.name(), c.verdict.label()))
+            .map(|c| match c.tests {
+                Some(tests) => format!("{}:{}={}", c.kind.name(), c.verdict.label(), tests.code()),
+                None => format!("{}:{}", c.kind.name(), c.verdict.label()),
+            })
             .collect();
         self.shown_receipt = Some(format!(
-            "claims={} ran={} failed={} rows={} last={}",
+            "claims={} ran={} failed={} rows={} counts={} last={}",
             if checked.is_empty() {
                 "-".into()
             } else {
@@ -931,6 +952,11 @@ impl Inspector {
             receipt.total,
             receipt.failed,
             whole.len(),
+            if counted.is_empty() {
+                "-".into()
+            } else {
+                counted.join(",")
+            },
             receipt
                 .latest(1)
                 .next()

@@ -263,15 +263,28 @@ pub fn hook(kind: &str, input: &str, dir: &Path) -> Result<Option<Event>, String
                 .collect(),
         ),
         "ran" | "ran-failed" => {
-            use crate::project::receipt::{Outcome, Ran, clean_command, failure_outcome};
+            use crate::project::receipt::{
+                Kind, Outcome, Ran, clean_command, failure_outcome, kinds_of, test_counts,
+            };
             let command = value
                 .path("tool_input.command")
                 .and_then(|v| v.as_str())
                 .ok_or("no command in the tool input")?;
+            let text = |name: &str| value.path(name).and_then(|v| v.as_str()).unwrap_or("");
+            // What the command printed, read for its test counts and then
+            // dropped: output can hold secrets, so it is never kept.
+            let output = if kind == "ran-failed" {
+                text("error").to_owned()
+            } else {
+                format!(
+                    "{}\n{}",
+                    text("tool_response.stdout"),
+                    text("tool_response.stderr")
+                )
+            };
             let outcome = if kind == "ran-failed" {
-                let error = value.get("error").and_then(|v| v.as_str()).unwrap_or("");
                 let interrupted = value.get("is_interrupt").and_then(|v| v.as_bool()) == Some(true);
-                failure_outcome(error, interrupted)
+                failure_outcome(&output, interrupted)
             } else if value
                 .path("tool_input.run_in_background")
                 .and_then(|v| v.as_bool())
@@ -281,10 +294,17 @@ pub fn hook(kind: &str, input: &str, dir: &Path) -> Result<Option<Event>, String
             } else {
                 Outcome::Passed
             };
+            // A run stopped part way, or still going, has no counts to
+            // stand on.
+            let finished = !matches!(outcome, Outcome::Background | Outcome::Interrupted);
+            let tests = (finished && kinds_of(command).contains(&Kind::Tests))
+                .then(|| test_counts(&output))
+                .flatten();
             Event::Ran(Ran {
                 at: crate::platform::unix_seconds(),
                 outcome,
                 command: clean_command(command),
+                tests,
             })
         }
         "teammate-idle" => Event::TeammateIdle(
@@ -628,11 +648,15 @@ fn append(dir: &Path, event: &Event) -> std::io::Result<()> {
             let sentences: Vec<String> = sentences.iter().map(|s| clean(s)).collect();
             format!("said\t{}\n", sentences.join("\t"))
         }
+        // The test counts, when there are any, after the command: a line
+        // without them reads as it always has.
         Event::Ran(ran) => format!(
-            "ran\t{}\t{}\t{}\n",
+            "ran\t{}\t{}\t{}{}\n",
             ran.at,
             ran.outcome.code(),
-            clean(&ran.command)
+            clean(&ran.command),
+            ran.tests
+                .map_or_else(String::new, |t| format!("\t{}", t.code()))
         ),
     };
     std::fs::create_dir_all(dir)?;
@@ -699,13 +723,15 @@ fn parse_event(line: &str) -> Option<Event> {
         "prompted" => Event::Prompted(rest.to_owned()),
         "said" => Event::Said(rest.split('\t').map(str::to_owned).collect()),
         "ran" => {
-            let mut parts = rest.splitn(3, '\t');
+            use crate::project::receipt::{Outcome, Ran, TestCounts};
+            let mut parts = rest.splitn(4, '\t');
             let at = parts.next()?.parse().ok()?;
-            let outcome = crate::project::receipt::Outcome::from_code(parts.next()?)?;
-            Event::Ran(crate::project::receipt::Ran {
+            let outcome = Outcome::from_code(parts.next()?)?;
+            Event::Ran(Ran {
                 at,
                 outcome,
                 command: parts.next()?.to_owned(),
+                tests: parts.next().and_then(TestCounts::from_code),
             })
         }
         "apierror" => {
@@ -1721,6 +1747,7 @@ mod tests {
             at: 400,
             outcome: Outcome::Passed,
             command: "git status".into(),
+            tests: None,
         });
         let shown = card(Some(&merged), Some(&live)).expect("card");
         assert_eq!(shown.total, 4);
@@ -2275,6 +2302,90 @@ mod tests {
         let receipt = receipt_until(&dir, first_two);
         assert_eq!((receipt.total, receipt.failed), (2, 1));
         assert_eq!(receipt_until(&dir, read).total, 4);
+    }
+
+    /// A test command's counts come from its output, on a success from
+    /// stdout and stderr (jest prints to stderr), on a failure from the
+    /// error; only the counts reach the events file, never the output.
+    #[test]
+    fn a_test_run_keeps_its_counts_and_not_its_output() {
+        use crate::project::receipt::TestCounts;
+        let tree = TempTree::new("review-counts", &[]);
+        let dir = tree.0.join("session");
+        let tests = |kind: &str, input: &str| match hook(kind, input, &dir).expect("hook") {
+            Some(Event::Ran(ran)) => ran.tests,
+            other => panic!("{other:?}"),
+        };
+        let counts = |passed, failed| Some(TestCounts { passed, failed });
+        assert_eq!(
+            tests(
+                "ran-failed",
+                r#"{"tool_input":{"command":"cargo test"},"error":"Exit code 101\ntest result: FAILED. 12 passed; 1 failed; 0 ignored\nSECRET_TOKEN=abc123","is_interrupt":false}"#
+            ),
+            counts(12, 1)
+        );
+        assert_eq!(
+            tests(
+                "ran",
+                r#"{"tool_input":{"command":"npx jest"},"tool_response":{"stdout":"","stderr":"Tests:       20 passed, 20 total\nSECRET_TOKEN=abc123"}}"#
+            ),
+            counts(20, 0)
+        );
+        // Not a test command: its output is not read.
+        assert_eq!(
+            tests(
+                "ran",
+                r#"{"tool_input":{"command":"cat log.txt"},"tool_response":{"stdout":"test result: ok. 3 passed; 0 failed"}}"#
+            ),
+            None
+        );
+        // Stopped part way: no counts.
+        assert_eq!(
+            tests(
+                "ran-failed",
+                r#"{"tool_input":{"command":"cargo test"},"error":"test result: ok. 3 passed; 0 failed","is_interrupt":true}"#
+            ),
+            None
+        );
+        let events = std::fs::read_to_string(dir.join("events")).expect("events");
+        assert!(!events.contains("SECRET"), "{events}");
+        let ends: Vec<&str> = events
+            .lines()
+            .map(|l| l.rsplit('\t').next().unwrap_or(""))
+            .collect();
+        assert_eq!(ends, ["12/1", "20/0", "cat log.txt", "cargo test"]);
+        let receipt = receipt_until(&dir, u64::MAX);
+        let read: Vec<_> = receipt.ran.iter().map(|r| r.tests).collect();
+        assert_eq!(read, [counts(12, 1), counts(20, 0), None, None]);
+    }
+
+    /// Lines written before test counts were kept, and lines whose counts
+    /// this build cannot read, still give their command.
+    #[test]
+    fn ran_lines_without_test_counts_still_parse() {
+        use crate::project::receipt::{Outcome, Ran, TestCounts};
+        let parsed = |line: &str| match parse_event(line) {
+            Some(Event::Ran(ran)) => ran,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            parsed("ran\t300\t101\tcargo test --offline"),
+            Ran {
+                at: 300,
+                outcome: Outcome::Failed(101),
+                command: "cargo test --offline".into(),
+                tests: None,
+            }
+        );
+        assert_eq!(
+            parsed("ran\t300\t101\tcargo test\t12/1").tests,
+            Some(TestCounts {
+                passed: 12,
+                failed: 1
+            })
+        );
+        let odd = parsed("ran\t300\t0\tcargo test\tsomething new");
+        assert_eq!((odd.command.as_str(), odd.tests), ("cargo test", None));
     }
 
     /// The Stop input as Claude Code sent it (2.1.316, probed

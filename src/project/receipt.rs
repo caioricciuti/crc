@@ -98,6 +98,9 @@ pub struct Ran {
     pub outcome: Outcome,
     /// On one line, at most [`COMMAND_CHARS`].
     pub command: String,
+    /// How many tests it passed and failed, for a test command whose
+    /// output said so.
+    pub tests: Option<TestCounts>,
 }
 
 /// The command as a receipt keeps it: one line, bounded.
@@ -109,6 +112,187 @@ pub fn clean_command(command: &str) -> String {
         .chars()
         .take(COMMAND_CHARS)
         .collect()
+}
+
+/// How many tests a run passed and failed, as its runner printed them.
+/// Only the counts are kept, never the output they came from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TestCounts {
+    pub passed: u32,
+    pub failed: u32,
+}
+
+impl TestCounts {
+    /// How it is kept in the events file: `passed/failed`.
+    pub fn code(self) -> String {
+        format!("{}/{}", self.passed, self.failed)
+    }
+
+    pub fn from_code(code: &str) -> Option<TestCounts> {
+        let (passed, failed) = code.split_once('/')?;
+        Some(TestCounts {
+            passed: passed.parse().ok()?,
+            failed: failed.parse().ok()?,
+        })
+    }
+
+    /// A few words, for the receipt's rows: `12 passed, 1 failed`.
+    pub fn label(self) -> String {
+        match (self.passed, self.failed) {
+            (passed, 0) => format!("{passed} passed"),
+            (0, failed) => format!("{failed} failed"),
+            (passed, failed) => format!("{passed} passed, {failed} failed"),
+        }
+    }
+}
+
+/// The test counts a runner's output reports: the `test result:` lines of
+/// cargo test, added up, or nextest's summary; the `Tests` line of vitest
+/// or jest; pytest's closing line; go test's `--- PASS` and `--- FAIL`
+/// lines, or with no `-v` its `ok` packages as the passed. `None` when the
+/// output has none of them.
+pub fn test_counts(output: &str) -> Option<TestCounts> {
+    let output = without_escapes(output);
+    let lines: Vec<&str> = output.lines().map(str::trim).collect();
+    cargo_counts(&lines)
+        .or_else(|| js_counts(&lines))
+        .or_else(|| pytest_counts(&lines))
+        .or_else(|| go_counts(&output))
+}
+
+/// The text with its terminal escapes (colours, mostly) taken out.
+fn without_escapes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        if chars.next() == Some('[') {
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The number right before `word` in `text`, words split at anything
+/// that is not a letter or a digit: `12` for `passed` in `12 passed; 1
+/// failed`.
+fn count_before(text: &str, word: &str) -> Option<u32> {
+    let words: Vec<&str> = text
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    words
+        .windows(2)
+        .find(|pair| pair[1] == word)
+        .and_then(|pair| pair[0].parse().ok())
+}
+
+/// `test result: ok. 12 passed; 1 failed; ...`, once per test binary, or
+/// nextest's `12 tests run: 11 passed, 1 failed, 0 skipped`.
+fn cargo_counts(lines: &[&str]) -> Option<TestCounts> {
+    let mut found: Option<TestCounts> = None;
+    for line in lines.iter().filter(|l| l.starts_with("test result:")) {
+        let total = found.get_or_insert_default();
+        total.passed += count_before(line, "passed").unwrap_or(0);
+        total.failed += count_before(line, "failed").unwrap_or(0);
+    }
+    found.or_else(|| {
+        let line = lines.iter().rev().find(|l| l.contains(" tests run: "))?;
+        let (_, rest) = line.split_once(" tests run: ")?;
+        Some(TestCounts {
+            passed: count_before(rest, "passed").unwrap_or(0),
+            failed: count_before(rest, "failed").unwrap_or(0),
+        })
+    })
+}
+
+/// Jest's `Tests:       1 failed, 12 passed, 13 total`, or vitest's
+/// `Tests  1 failed | 12 passed (13)`; not vitest's `Test Files` line.
+fn js_counts(lines: &[&str]) -> Option<TestCounts> {
+    lines.iter().rev().find_map(|line| {
+        let rest = line.strip_prefix("Tests")?;
+        if !rest.starts_with([':', ' ', '\t']) {
+            return None;
+        }
+        let passed = count_before(rest, "passed");
+        let failed = count_before(rest, "failed");
+        (passed.is_some() || failed.is_some()).then(|| TestCounts {
+            passed: passed.unwrap_or(0),
+            failed: failed.unwrap_or(0),
+        })
+    })
+}
+
+/// What pytest's closing line may count, besides `passed` and `failed`.
+const PYTEST_WORDS: &[&str] = &[
+    "passed",
+    "failed",
+    "error",
+    "errors",
+    "skipped",
+    "xfailed",
+    "xpassed",
+    "warning",
+    "warnings",
+    "deselected",
+    "rerun",
+];
+
+/// pytest's closing line, `=== 3 passed, 1 failed in 0.20s ===`, or with
+/// `-q` the same without the rules. An error counts as a failure.
+fn pytest_counts(lines: &[&str]) -> Option<TestCounts> {
+    lines.iter().rev().find_map(|line| {
+        let (counts, _) = line.trim_matches(['=', ' ']).split_once(" in ")?;
+        let mut found = TestCounts::default();
+        let mut any = false;
+        for part in counts.split(", ") {
+            let (n, word) = part.split_once(' ')?;
+            let n: u32 = n.parse().ok()?;
+            if !PYTEST_WORDS.contains(&word) {
+                return None;
+            }
+            match word {
+                "passed" => found.passed += n,
+                "failed" | "error" | "errors" => found.failed += n,
+                _ => {}
+            }
+            any = true;
+        }
+        any.then_some(found)
+    })
+}
+
+/// go test: with `-v`, a `--- PASS` or `--- FAIL` line per test (subtests
+/// are indented and not counted); without it, only the failures are named,
+/// so each `ok` package counts as one passed. A package that did not build
+/// counts as one failed when no test failed.
+fn go_counts(output: &str) -> Option<TestCounts> {
+    let (mut pass, mut fail, mut ok, mut broken) = (0, 0, 0, 0);
+    for line in output.lines() {
+        if line.starts_with("--- PASS: ") {
+            pass += 1;
+        } else if line.starts_with("--- FAIL: ") {
+            fail += 1;
+        } else if line.starts_with("ok  ") || line.starts_with("ok\t") {
+            ok += 1;
+        } else if line.starts_with("FAIL\t") {
+            broken += 1;
+        }
+    }
+    if pass + fail + ok + broken == 0 {
+        return None;
+    }
+    Some(TestCounts {
+        passed: if pass > 0 { pass } else { ok },
+        failed: if fail > 0 { fail } else { broken },
+    })
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -181,10 +365,11 @@ impl Receipt {
                     .iter()
                     .rev()
                     .filter(|(_, ran)| kinds_of(&ran.command).contains(&kind));
-                let verdict = match of_kind
+                let seen = of_kind
                     .clone()
-                    .find(|(_, r)| r.outcome != Outcome::Background)
-                {
+                    .find(|(_, r)| r.outcome != Outcome::Background);
+                let tests = seen.and_then(|(_, ran)| ran.tests);
+                let verdict = match seen {
                     Some((_, ran)) if ran.outcome.failed() => Verdict::Contradicted {
                         command: ran.command.clone(),
                         outcome: ran.outcome,
@@ -202,6 +387,7 @@ impl Receipt {
                     kind,
                     sentence,
                     verdict,
+                    tests,
                 }
             })
             .collect();
@@ -310,6 +496,9 @@ pub struct Claim {
     /// The sentence that said it.
     pub sentence: String,
     pub verdict: Verdict,
+    /// The test counts of the command its verdict rests on, when it
+    /// printed them.
+    pub tests: Option<TestCounts>,
 }
 
 /// A message as a session keeps it: its sentences, each on one line, the
@@ -623,6 +812,7 @@ mod tests {
                     Outcome::Failed(1)
                 },
                 command: format!("c{i}"),
+                tests: None,
             });
         }
         assert_eq!(receipt.total, KEEP + 5);
@@ -726,7 +916,159 @@ mod tests {
             at: 0,
             outcome,
             command: command.into(),
+            tests: None,
         }
+    }
+
+    fn counts(passed: u32, failed: u32) -> Option<TestCounts> {
+        Some(TestCounts { passed, failed })
+    }
+
+    #[test]
+    fn cargo_test_counts_add_up_over_its_binaries() {
+        let output = "\
+running 12 tests
+test parse::one ... ok
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+running 3 tests
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+
+   Doc-tests crc
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+";
+        assert_eq!(test_counts(output), counts(14, 1));
+        // As a failed run's error carries it, coloured.
+        let error = "Exit code 101\n\u{1b}[31mtest result: FAILED.\u{1b}[0m 12 passed; 1 failed; \
+                     0 ignored\nerror: test failed, to rerun pass `--lib`";
+        assert_eq!(test_counts(error), counts(12, 1));
+        let nextest = "        PASS [   0.004s] crc parse::one\n     Summary [   0.5s] \
+                       12 tests run: 11 passed, 1 failed, 0 skipped";
+        assert_eq!(test_counts(nextest), counts(11, 1));
+    }
+
+    #[test]
+    fn vitest_and_jest_counts_come_from_their_tests_line() {
+        let jest = "\
+FAIL src/sum.test.js
+Test Suites: 1 failed, 2 passed, 3 total
+Tests:       1 failed, 12 passed, 13 total
+Snapshots:   0 total
+Time:        1.2 s";
+        assert_eq!(test_counts(jest), counts(12, 1));
+        let vitest = "\
+ Test Files  1 failed | 2 passed (3)
+      Tests  1 failed | 12 passed (13)
+   Start at  10:00:00
+   Duration  420ms";
+        assert_eq!(test_counts(vitest), counts(12, 1));
+        assert_eq!(
+            test_counts(" Test Files  3 passed (3)\n      Tests  20 passed (20)"),
+            counts(20, 0)
+        );
+    }
+
+    #[test]
+    fn pytest_counts_come_from_its_closing_line() {
+        let output = "\
+============================= test session starts ==============================
+collected 4 items
+
+tests/test_parse.py ...F                                                 [100%]
+=========================== short test summary info ============================
+FAILED tests/test_parse.py::test_empty - AssertionError
+========================= 3 passed, 1 failed in 0.20s ==========================";
+        assert_eq!(test_counts(output), counts(3, 1));
+        assert_eq!(
+            test_counts("....\n4 passed, 2 warnings in 0.05s"),
+            counts(4, 0)
+        );
+        assert_eq!(
+            test_counts("=== 1 failed, 5 passed, 1 error, 2 skipped in 65.12s (0:01:05) ==="),
+            counts(5, 2)
+        );
+    }
+
+    #[test]
+    fn go_test_counts_tests_or_packages() {
+        let verbose = "\
+=== RUN   TestParse
+--- PASS: TestParse (0.00s)
+=== RUN   TestTable
+    --- PASS: TestTable/empty (0.00s)
+    --- FAIL: TestTable/long (0.00s)
+--- FAIL: TestTable (0.00s)
+=== RUN   TestLex
+--- PASS: TestLex (0.00s)
+FAIL
+FAIL\texample.com/parse\t0.012s
+ok  \texample.com/lex\t0.004s";
+        assert_eq!(test_counts(verbose), counts(2, 1));
+        let quiet = "\
+--- FAIL: TestTable (0.00s)
+    table_test.go:12: got 1, want 2
+FAIL
+FAIL\texample.com/parse\t0.012s
+ok  \texample.com/lex\t0.004s
+ok  \texample.com/util\t(cached)
+?   \texample.com/cmd\t[no test files]";
+        assert_eq!(test_counts(quiet), counts(2, 1));
+        assert_eq!(
+            test_counts(
+                "# example.com/parse\nparse.go:3:1: syntax error\nFAIL\texample.com/parse [build failed]"
+            ),
+            counts(0, 1)
+        );
+    }
+
+    #[test]
+    fn output_without_counts_has_none() {
+        for output in [
+            "",
+            "ok",
+            "Exit code 101\nerror: could not compile `crc`",
+            "Compiling crc v0.1.0\n    Finished `test` profile",
+            " Test Files  no tests",
+            "Tests: 0 total",
+            "no tests ran in 0.01s",
+            "fixed the parser in 2 places",
+            "took 3 passed in review",
+        ] {
+            assert_eq!(test_counts(output), None, "{output:?}");
+        }
+    }
+
+    #[test]
+    fn test_counts_survive_their_code_and_read_as_words() {
+        for tests in [counts(12, 1), counts(0, 0), counts(u32::MAX, 3)] {
+            let tests = tests.expect("counts");
+            assert_eq!(TestCounts::from_code(&tests.code()), Some(tests));
+        }
+        assert_eq!(TestCounts::from_code("12"), None);
+        assert_eq!(TestCounts::from_code("a/1"), None);
+        let label = |p, f| counts(p, f).expect("counts").label();
+        assert_eq!(label(12, 1), "12 passed, 1 failed");
+        assert_eq!(label(12, 0), "12 passed");
+        assert_eq!(label(0, 3), "3 failed");
+    }
+
+    #[test]
+    fn a_claim_carries_the_counts_of_its_command() {
+        let mut receipt = Receipt::default();
+        receipt.note_prompt();
+        receipt.note(Ran {
+            tests: counts(12, 1),
+            ..ran("cargo test", Outcome::Failed(101))
+        });
+        receipt.note(ran("cargo build", Outcome::Passed));
+        receipt.note_said(&sentences("All tests pass. It builds."));
+        let tests: Vec<_> = receipt.claims.iter().map(|c| c.tests).collect();
+        assert_eq!(tests, [counts(12, 1), None]);
+        // Merged into a workspace's card, the counts go with the command.
+        let mut merged = Receipt::default();
+        merged.merge(receipt);
+        assert_eq!(merged.ran[0].tests, counts(12, 1));
+        assert_eq!(merged.claims[0].tests, counts(12, 1));
     }
 
     fn verdicts(receipt: &Receipt) -> Vec<(Kind, String)> {

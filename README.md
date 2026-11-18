@@ -264,7 +264,10 @@ the size and write it back.
   showing actually ran, as Claude Code's hooks report it rather than as
   the agent tells it: how many shell commands and how many failed, then
   the newest six with their result (ok, exit N, stopped, background)
-  and when; hover a row for the whole command. When the agent finishes
+  and when; hover a row for the whole command. A test run (cargo test,
+  vitest, jest, pytest, go test) shows how many tests passed and
+  failed instead, read from its output as it ends; the output itself
+  is not kept. When the agent finishes
   a turn saying the tests pass, the code builds or the lint is clean, a
   card above it holds each claim up to the newest command of that kind
   the turn ran: checked, the failing exit code, not run, before last
