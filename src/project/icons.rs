@@ -43,6 +43,7 @@ pub const GIT_COMMIT: char = '\u{eafc}'; // cod-git_commit
 pub const REPO_PULL: char = '\u{eb40}'; // cod-repo_pull
 pub const REPO_PUSH: char = '\u{eb41}'; // cod-repo_push
 pub const CLOUD_DOWNLOAD: char = '\u{eac2}'; // cod-cloud_download
+pub const COPY: char = '\u{ebcc}'; // cod-copy
 pub const GO_TO_FILE: char = '\u{ea94}'; // cod-go_to_file
 pub const WARNING: char = '\u{ea6c}'; // cod-warning
 pub const ERROR: char = '\u{ea87}'; // cod-error

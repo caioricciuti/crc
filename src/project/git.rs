@@ -427,6 +427,42 @@ pub fn commits_since(root: &Path, since: u64, limit: usize) -> Result<Vec<String
         .collect())
 }
 
+/// The commits on HEAD made in or after the second `since` (Unix
+/// seconds), oldest first, the newest `limit` of them, each with Git's
+/// `%G?` for its signature. Runs the signature's checker for each, so
+/// only on demand.
+pub fn commits_from(
+    root: &Path,
+    since: u64,
+    limit: usize,
+) -> Result<Vec<crate::project::receipt::CommitFact>, String> {
+    let since = format!("--since=@{since}");
+    let limit = format!("--max-count={limit}");
+    let out = run(
+        root,
+        &[
+            "log",
+            &since,
+            &limit,
+            "--reverse",
+            "--format=%h%x09%G?%x09%s",
+        ],
+    )?;
+    Ok(String::from_utf8_lossy(&out)
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, '\t');
+            let hash = parts.next()?.to_owned();
+            let signature = parts.next()?.chars().next()?;
+            Some(crate::project::receipt::CommitFact {
+                hash,
+                signature,
+                subject: parts.next().unwrap_or("").to_owned(),
+            })
+        })
+        .collect())
+}
+
 /// Files Git would show under `directory`: tracked ones and untracked
 /// ones it does not ignore, joined onto `directory`. What the project
 /// index reads.
@@ -2204,6 +2240,42 @@ mod tests {
         assert_eq!(commits_since(dir, at - 1, 5).unwrap(), ["plant the beans"]);
         // A visit in the same second as the commit came after it.
         assert!(commits_since(dir, at, 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn commits_from_a_second_carry_their_signature_oldest_first() {
+        let base = TempRepo::new("from");
+        let dir = base.path();
+        run(dir, &["init", "--quiet"]).unwrap();
+        for (key, value) in [
+            ("user.name", "test"),
+            ("user.email", "test@example.invalid"),
+            ("commit.gpgsign", "false"),
+        ] {
+            run(dir, &["config", key, value]).unwrap();
+        }
+        for (n, subject) in ["sow", "water", "pick"].iter().enumerate() {
+            std::fs::write(dir.join("a.txt"), n.to_string()).unwrap();
+            run(dir, &["add", "a.txt"]).unwrap();
+            run(dir, &["commit", "--quiet", "-m", subject]).unwrap();
+        }
+        let at: u64 = String::from_utf8(run(dir, &["log", "-1", "--format=%ct"]).unwrap())
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let from = commits_from(dir, at - 60, 2).unwrap();
+        let subjects: Vec<&str> = from.iter().map(|c| c.subject.as_str()).collect();
+        assert_eq!(subjects, ["water", "pick"]);
+        assert!(from.iter().all(|c| c.signature == 'N' && c.hash.len() >= 7));
+        // A commit in the same second as the start is the session's.
+        assert!(
+            commits_from(dir, at, 5)
+                .unwrap()
+                .iter()
+                .any(|c| c.subject == "pick")
+        );
+        assert!(commits_from(dir, at + 1, 5).unwrap().is_empty());
     }
 
     fn count(dir: &Path) -> String {

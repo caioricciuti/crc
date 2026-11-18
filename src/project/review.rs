@@ -946,7 +946,15 @@ pub fn ledger_in(ledgers: &Path, workspace: &str) -> crate::project::receipt::Re
 /// folders, [`ledger_keys`]), merged as one.
 fn ledger_of_keys(ledgers: &Path, keys: &[String]) -> crate::project::receipt::Receipt {
     let mut receipt = crate::project::receipt::Receipt::default();
-    // Oldest archived first, so a later session's claims stand.
+    for dir in ledger_sessions(ledgers, keys) {
+        receipt.merge(receipt_until(&dir, u64::MAX));
+    }
+    receipt
+}
+
+/// The closed sessions filed under every key in `keys`, oldest archived
+/// first, so a later session's claims stand.
+fn ledger_sessions(ledgers: &Path, keys: &[String]) -> Vec<PathBuf> {
     let mut sessions: Vec<(std::time::SystemTime, PathBuf)> = keys
         .iter()
         .filter_map(|key| std::fs::read_dir(ledger_dir(ledgers, key)).ok())
@@ -962,10 +970,72 @@ fn ledger_of_keys(ledgers: &Path, keys: &[String]) -> crate::project::receipt::R
         })
         .collect();
     sessions.sort();
-    for (_, dir) in sessions {
-        receipt.merge(receipt_until(&dir, u64::MAX));
+    sessions.into_iter().map(|(_, dir)| dir).collect()
+}
+
+/// What a handoff reads from the sessions beside their receipt: the files
+/// their agents wrote, each once, in the order first written, and when the
+/// first of them started, in Unix seconds.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Trail {
+    pub wrote: Vec<PathBuf>,
+    pub started: Option<u64>,
+}
+
+/// The [`Trail`] of the sessions in `dirs`. A session started when its
+/// folder's name says ([`new_id`]), or failing that at its first command.
+pub fn trail(dirs: &[PathBuf]) -> Trail {
+    let mut trail = Trail::default();
+    for dir in dirs {
+        let mut first_ran = None;
+        let text = std::fs::read(dir.join("events")).unwrap_or_default();
+        for line in String::from_utf8_lossy(&text).lines() {
+            match parse_event(line) {
+                Some(Event::Wrote { path, .. }) if !trail.wrote.contains(&path) => {
+                    trail.wrote.push(path);
+                }
+                Some(Event::Ran(ran)) if first_ran.is_none() => first_ran = Some(ran.at),
+                _ => {}
+            }
+        }
+        if let Some(at) = started_by_name(dir).or(first_ran) {
+            trail.started = Some(trail.started.map_or(at, |s| s.min(at)));
+        }
     }
-    receipt
+    trail
+}
+
+/// When the session in `dir` started, by its name: [`new_id`]'s
+/// nanoseconds, in hex, before the process and the count.
+fn started_by_name(dir: &Path) -> Option<u64> {
+    let name = dir.file_name()?.to_str()?;
+    let [nanos, pid, n] = name.split('-').collect::<Vec<_>>()[..] else {
+        return None;
+    };
+    if pid.parse::<u32>().is_err() || n.parse::<u64>().is_err() {
+        return None;
+    }
+    let nanos = u128::from_str_radix(nanos, 16).ok()?;
+    u64::try_from(nanos / 1_000_000_000).ok()
+}
+
+/// The [`Trail`] of the workspace's Receipt card, read now: its closed
+/// sessions, as [`workspace_receipt`] files them, and `live`, the session
+/// of the terminal showing.
+pub fn workspace_trail(
+    workspace: Option<&str>,
+    folder: Option<&Path>,
+    live: Option<&Path>,
+) -> Trail {
+    let mut dirs = match (workspace, ledgers_root()) {
+        (Some(id), Some(ledgers)) => ledger_sessions(&ledgers, &ledger_keys(id, folder)),
+        _ => Vec::new(),
+    };
+    dirs.extend(
+        live.filter(|d| !d.as_os_str().is_empty())
+            .map(Path::to_path_buf),
+    );
+    trail(&dirs)
 }
 
 /// What the workspace's Receipt card shows: its ledger with the receipt of
@@ -1766,6 +1836,52 @@ mod tests {
             card(Some(&Default::default()), Some(&live)),
             Some(std::borrow::Cow::Borrowed(_))
         ));
+    }
+
+    /// A handoff's files and start: what the sessions wrote, each once,
+    /// from when the earliest began, by its name or its first command.
+    #[test]
+    fn a_trail_has_the_files_written_and_the_earliest_start() {
+        let tree = TempTree::new("review-trail", &[]);
+        // 2023-11-14T22:13:20Z, as new_id names a folder.
+        let named = format!("{:x}-123-0", 1_700_000_000_000_000_000u128);
+        let events = [
+            (
+                named.as_str(),
+                "wrote\tWrite\t/w/a.rs\nran\t1700000100\t0\tls\nwrote\tEdit\t/w/b.rs\n",
+            ),
+            (
+                "ledger-copy",
+                "ran\t1700000050\t0\tls\nwrote\tEdit\t/w/a.rs\n",
+            ),
+            ("quiet", "wrote\tWrite\t/w/c.rs\n"),
+        ];
+        let dirs: Vec<PathBuf> = events
+            .iter()
+            .map(|(name, text)| {
+                let dir = tree.0.join(name);
+                std::fs::create_dir_all(&dir).expect("mkdir");
+                std::fs::write(dir.join("events"), text).expect("events");
+                dir
+            })
+            .collect();
+        let trail = trail(&dirs);
+        assert_eq!(
+            trail.wrote,
+            [
+                PathBuf::from("/w/a.rs"),
+                PathBuf::from("/w/b.rs"),
+                PathBuf::from("/w/c.rs")
+            ]
+        );
+        assert_eq!(trail.started, Some(1_700_000_000));
+        // Without a name to go by, its first command.
+        assert_eq!(super::trail(&dirs[1..]).started, Some(1_700_000_050));
+        assert_eq!(super::trail(&dirs[2..]).started, None);
+        assert_eq!(
+            started_by_name(Path::new(&new_id())).map(|s| s > 0),
+            Some(true)
+        );
     }
 
     #[test]

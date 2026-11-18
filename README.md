@@ -281,6 +281,10 @@ the size and write it back.
   Closing a session's terminal keeps what it ran: the card goes on
   counting the workspace's closed sessions for 30 days. Only the
   commands and their results are kept, never their output.
+  Copy Handoff puts the card on the clipboard as plain text for a chat
+  or a pull request: the claims, the commits made since the session
+  started with whether each is signed, the installs, the test counts,
+  the files written and the failed commands.
   At the bottom of the Agents sidebar, the Activity panel shows the
   whole Mac every two seconds: CPU with a short history, memory used
   and its pressure, disk and network rates, and the three processes

@@ -1058,6 +1058,140 @@ fn packages(args: &[&str], values: &[&str]) -> Vec<String> {
     out
 }
 
+/// A commit made in the session, as a handoff lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitFact {
+    /// Abbreviated, as `git log` prints it.
+    pub hash: String,
+    /// Git's `%G?`: `N` for no signature, `G` for a good one.
+    pub signature: char,
+    pub subject: String,
+}
+
+impl CommitFact {
+    /// A word or two on its signature: unsigned only when it has none.
+    pub fn signature_label(&self) -> &'static str {
+        match self.signature {
+            'N' => "unsigned",
+            'G' | 'U' => "signed",
+            'B' => "bad signature",
+            _ => "signed, unverified",
+        }
+    }
+}
+
+/// What a session handed off, as plain text to paste into a chat or a pull
+/// request: the claims checked, the commits made since it started
+/// (`commits`, oldest first), the installs, the latest test counts of each
+/// test command, the files written (`wrote`, shown under `folder` when they
+/// are in it), and the commands that failed. A section with nothing in it
+/// is left out; with nothing at all, the text is empty. No command's
+/// output is in it: the receipt never keeps any.
+pub fn handoff_text(
+    receipt: &Receipt,
+    commits: &[CommitFact],
+    wrote: &[std::path::PathBuf],
+    folder: Option<&std::path::Path>,
+) -> String {
+    let mut sections: Vec<(String, Vec<String>)> = Vec::new();
+    let claims = receipt
+        .claims
+        .iter()
+        .map(|c| match c.tests {
+            Some(tests) => format!(
+                "{}: {} ({})",
+                c.kind.said(),
+                c.verdict.label(),
+                tests.label()
+            ),
+            None => format!("{}: {}", c.kind.said(), c.verdict.label()),
+        })
+        .collect();
+    sections.push(("Claims checked".into(), claims));
+    let commits = commits
+        .iter()
+        .map(|c| format!("{} ({}) {}", c.hash, c.signature_label(), c.subject))
+        .collect();
+    sections.push(("Commits".into(), commits));
+    let installs = receipt
+        .installs
+        .iter()
+        .map(|i| format!("{}: {}", i.install.label(), i.outcome.label()))
+        .collect();
+    sections.push(("Installs".into(), installs));
+    // The newest counts of each test command, in the order they last ran.
+    let mut tests: Vec<(&str, TestCounts)> = Vec::new();
+    for ran in &receipt.ran {
+        if let Some(counts) = ran.tests {
+            tests.retain(|(command, _)| *command != ran.command);
+            tests.push((&ran.command, counts));
+        }
+    }
+    let tests = tests
+        .iter()
+        .map(|(command, counts)| format!("{command}: {}", counts.label()))
+        .collect();
+    sections.push(("Tests".into(), tests));
+    let mut files: Vec<String> = Vec::new();
+    for path in wrote {
+        let shown = folder
+            .and_then(|f| path.strip_prefix(f).ok())
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned();
+        if !files.contains(&shown) {
+            files.push(shown);
+        }
+    }
+    sections.push(("Files written".into(), files));
+    // Each failure once, with how many times it ended that way.
+    let mut failed: Vec<(&str, Outcome, usize)> = Vec::new();
+    for ran in receipt.ran.iter().filter(|r| r.outcome.failed()) {
+        match failed
+            .iter_mut()
+            .find(|(c, o, _)| *c == ran.command && *o == ran.outcome)
+        {
+            Some((.., times)) => *times += 1,
+            None => failed.push((&ran.command, ran.outcome, 1)),
+        }
+    }
+    let failed = failed
+        .iter()
+        .map(|(command, outcome, times)| match times {
+            1 => format!("{}: {command}", outcome.label()),
+            n => format!("{}: {command} ({n} times)", outcome.label()),
+        })
+        .collect();
+    sections.push(("Failed commands".into(), failed));
+    sections.retain(|(_, lines)| !lines.is_empty());
+    if sections.is_empty() && receipt.total == 0 {
+        return String::new();
+    }
+    let commands = match receipt.total {
+        0 => "no commands".to_owned(),
+        1 => "1 command".to_owned(),
+        n => format!("{n} commands"),
+    };
+    let mut text = match (receipt.total, receipt.failed) {
+        (0, _) => format!("Receipt: {commands} ran\n"),
+        (_, 0) => format!("Receipt: {commands} ran, none failed\n"),
+        (_, failed) => format!("Receipt: {commands} ran, {failed} failed\n"),
+    };
+    for (title, lines) in sections {
+        // The tests are per command, not counted.
+        if title == "Tests" {
+            text.push_str(&format!("\n{title}\n"));
+        } else {
+            text.push_str(&format!("\n{title}: {}\n", lines.len()));
+        }
+        for line in lines {
+            text.push_str(&format!("- {line}\n"));
+        }
+    }
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1556,5 +1690,118 @@ ok  \texample.com/util\t(cached)
                 ("brew install jq".into(), false),
             ]
         );
+    }
+
+    fn handoff_receipt() -> Receipt {
+        let mut receipt = Receipt::default();
+        receipt.note_prompt();
+        receipt.note(ran("npm install left-pad", Outcome::Passed));
+        receipt.note(Ran {
+            tests: counts(10, 2),
+            ..ran("cargo test", Outcome::Failed(101))
+        });
+        receipt.note(ran("cargo build", Outcome::Failed(1)));
+        receipt.note(Ran {
+            tests: counts(12, 1),
+            ..ran("cargo test", Outcome::Failed(101))
+        });
+        receipt.note(Ran {
+            tests: counts(4, 0),
+            ..ran("npm test", Outcome::Passed)
+        });
+        receipt.note(ran("npm run dev", Outcome::Background));
+        receipt.note_said(&sentences("All tests pass. It builds. Clippy is clean."));
+        receipt
+    }
+
+    #[test]
+    fn a_handoff_lists_every_section() {
+        let commits = [
+            CommitFact {
+                hash: "1a2b3c4".into(),
+                signature: 'N',
+                subject: "Fix the parser".into(),
+            },
+            CommitFact {
+                hash: "5d6e7f8".into(),
+                signature: 'G',
+                subject: "Add a test".into(),
+            },
+        ];
+        let folder = std::path::Path::new("/w/proj");
+        let wrote = [
+            folder.join("src/parse.rs"),
+            folder.join("README.md"),
+            folder.join("src/parse.rs"),
+            std::path::PathBuf::from("/elsewhere/notes.md"),
+        ];
+        let text = handoff_text(&handoff_receipt(), &commits, &wrote, Some(folder));
+        assert_eq!(
+            text,
+            "\
+Receipt: 6 commands ran, 3 failed
+
+Claims checked: 3
+- Said tests pass: checked (4 passed)
+- Said it builds: exit 1
+- Said lint is clean: not run
+
+Commits: 2
+- 1a2b3c4 (unsigned) Fix the parser
+- 5d6e7f8 (signed) Add a test
+
+Installs: 1
+- npm install left-pad: ok
+
+Tests
+- cargo test: 12 passed, 1 failed
+- npm test: 4 passed
+
+Files written: 3
+- src/parse.rs
+- README.md
+- /elsewhere/notes.md
+
+Failed commands: 2
+- exit 101: cargo test (2 times)
+- exit 1: cargo build
+"
+        );
+        assert!(!text.contains('\u{2014}'));
+    }
+
+    #[test]
+    fn an_empty_handoff_is_empty() {
+        assert_eq!(handoff_text(&Receipt::default(), &[], &[], None), "");
+    }
+
+    #[test]
+    fn a_handoff_leaves_out_what_it_has_none_of() {
+        // Commands that all passed, no tests, no installs, nothing written.
+        let mut receipt = Receipt::default();
+        receipt.note(ran("cargo build", Outcome::Passed));
+        assert_eq!(
+            handoff_text(&receipt, &[], &[], None),
+            "Receipt: 1 command ran, none failed\n"
+        );
+        // Only a commit and a file, outside any folder.
+        let commits = [CommitFact {
+            hash: "abc1234".into(),
+            signature: 'E',
+            subject: "Tidy".into(),
+        }];
+        let text = handoff_text(
+            &Receipt::default(),
+            &commits,
+            &[std::path::PathBuf::from("/a/b.rs")],
+            None,
+        );
+        assert_eq!(
+            text,
+            "Receipt: no commands ran\n\nCommits: 1\n- abc1234 (signed, unverified) Tidy\n\nFiles written: 1\n- /a/b.rs\n"
+        );
+        for section in ["Claims", "Installs", "Tests", "Failed"] {
+            assert!(!text.contains(section), "{section}");
+        }
     }
 }

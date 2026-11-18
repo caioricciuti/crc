@@ -933,7 +933,7 @@ impl EditorView {
                     });
                 let report = format!(
                     // First: the report ends with the document's text.
-                    "message: {}\npreview: {}\nmd: {md}\nspans: {spans}\n{tree}\nterminal_find: {terminal_find}\nactivity: {}\npointer_targets: {}\nbulb: {}\nactions: {}\nbranch: {}\nrepo: {}\ngit_note: {}\nhome: {}\nhome_scroll: {}\nmcp: {}\nmcp_page: {}\nsettings_page: {}\nterminals: {}\nagents: {}\ninspector: {}\nteams: {}\nagents_tree: {}\nagents_activity: {}\nagents_prs: {}\nmenubar: {}\nconflicts: {}\ngit_conflicts: {}\ntable: {}\nquery: {}\nquery_sql: {}\nblame: {}\nfind_results: {}\nfind_rows: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\npeek: {}\ngutter: {}\nissue_tab: {}\nscrub: {}\nscrub_strip: {}\nscrub_fade: {}\nscrub_filter: {}\nscrub_compare: {}\nblame_heat: {}\nreplaced: {}\nreceipt: {}\nmonitor: {}\n{report}",
+                    "message: {}\npreview: {}\nmd: {md}\nspans: {spans}\n{tree}\nterminal_find: {terminal_find}\nactivity: {}\npointer_targets: {}\nbulb: {}\nactions: {}\nbranch: {}\nrepo: {}\ngit_note: {}\nhome: {}\nhome_scroll: {}\nmcp: {}\nmcp_page: {}\nsettings_page: {}\nterminals: {}\nagents: {}\ninspector: {}\nteams: {}\nagents_tree: {}\nagents_activity: {}\nagents_prs: {}\nmenubar: {}\nconflicts: {}\ngit_conflicts: {}\ntable: {}\nquery: {}\nquery_sql: {}\nblame: {}\nfind_results: {}\nfind_rows: {}\nsignature: {}\nrename: {}\nread_only: {}\nunshaped: {}\nignored_rows: {}\ncompletion_why: {}\npeek: {}\ngutter: {}\nissue_tab: {}\nscrub: {}\nscrub_strip: {}\nscrub_fade: {}\nscrub_filter: {}\nscrub_compare: {}\nblame_heat: {}\nreplaced: {}\nreceipt: {}\nmonitor: {}\npasteboard: {}\n{report}",
                     state.message.as_ref().map_or("", |(text, _)| text.as_str()),
                     state
                         .html_preview
@@ -1245,6 +1245,11 @@ impl EditorView {
                         .agents
                         .activity
                         .report(state.agents.arrangement.activity_folded),
+                    // The instance's own clipboard, its lines a bar apart.
+                    clipboard::read_text()
+                        .unwrap_or_default()
+                        .trim_end()
+                        .replace('\n', " | "),
                 );
                 // First, what Edit > Undo and Redo say: named after the
                 // Explorer's file operations while its tree has the keys.

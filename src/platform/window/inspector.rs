@@ -19,6 +19,8 @@ const AWAY_EVERY: f64 = 300.0;
 const PUSH_SETTLE: f64 = 2.0;
 /// How often the terminals are looked at for ssh, in Agents mode.
 const SESSIONS_EVERY: f64 = 2.0;
+/// The most commits a handoff lists: the newest.
+const HANDOFF_COMMITS: usize = 50;
 
 impl EditorView {
     pub(super) fn inspector_click(&self, event: &NSEvent, x: f32, y: f32) {
@@ -132,6 +134,7 @@ impl EditorView {
                 });
             }
             Action::OpenPullRequest => self.agent_open_pull_request(),
+            Action::CopyHandoff => self.copy_handoff(),
             Action::OpenWorktree
             | Action::WorktreeTerminal
             | Action::CleanUpWorktree
@@ -144,6 +147,69 @@ impl EditorView {
         }
         self.request_redraw();
         self.pump();
+    }
+
+    /// The Receipt card's Copy Handoff: the receipt the card shows, the
+    /// files its sessions wrote and the commits made in the workspace's
+    /// folder since the first of them started, as text on the clipboard.
+    /// Git is read here, at the click, never for a frame; a remote
+    /// workspace has no commits listed.
+    fn copy_handoff(&self) {
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
+        let Some(task) = state
+            .agents
+            .selected_index()
+            .map(|i| state.agents.tasks[i].clone())
+        else {
+            return;
+        };
+        // As the card is drawn: the terminal showing, when it is this
+        // workspace's, after its closed ones.
+        let selected = state.agents.selected_index();
+        let live = state
+            .terminal
+            .active_tab()
+            .filter(|t| crate::platform::agents::task_of(&state.agents.tasks, t) == selected);
+        let live_dir = live.map(|t| t.review.clone());
+        let live = live.map(|t| t.receipt.clone());
+        let folder = (task.host.is_none() && !task.folderless()).then(|| task.path.clone());
+        let id = task.id();
+        let receipt =
+            crate::project::review::workspace_receipt(Some(&id), folder.as_deref(), live.as_ref())
+                .map(std::borrow::Cow::into_owned)
+                .unwrap_or_default();
+        let trail = crate::project::review::workspace_trail(
+            Some(&id),
+            folder.as_deref(),
+            live_dir.as_deref(),
+        );
+        let commits = match (&folder, trail.started) {
+            (Some(folder), Some(started)) => {
+                crate::project::git::commits_from(folder, started, HANDOFF_COMMITS)
+                    .unwrap_or_default()
+            }
+            _ => Vec::new(),
+        };
+        // Written files are kept resolved, so the folder is too.
+        let resolved = folder.as_deref().map(crate::platform::canonical);
+        let text = crate::project::receipt::handoff_text(
+            &receipt,
+            &commits,
+            &trail.wrote,
+            resolved.as_deref(),
+        );
+        if text.is_empty() {
+            state.say(layout::Feedback::Info, "Nothing to hand off yet");
+        } else {
+            clipboard::write_text(&text);
+            let lines = text.lines().count();
+            state.say(
+                layout::Feedback::Success,
+                format!("Copied the handoff, {lines} lines"),
+            );
+        }
     }
 
     /// The header's refresh: a Check of every repository card of the

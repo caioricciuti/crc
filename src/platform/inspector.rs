@@ -72,6 +72,9 @@ pub enum Action {
     /// Check: a fetch from the repository's remote, so ahead and behind
     /// say what the remote has now.
     CheckRemote,
+    /// The Receipt card's Copy Handoff: what the session did, as text on
+    /// the clipboard.
+    CopyHandoff,
 }
 
 impl Action {
@@ -95,6 +98,7 @@ impl Action {
             Action::HideIssues => "issues_hide",
             Action::FoldRepo => "repo_fold",
             Action::CheckRemote => "check",
+            Action::CopyHandoff => "handoff",
         }
     }
 }
@@ -644,6 +648,7 @@ impl Inspector {
                             | Action::HideIssues
                             | Action::FoldRepo
                             | Action::CheckRemote
+                            | Action::CopyHandoff
                     ) && r.as_deref().is_none_or(|r| r == path)
                 })
                 .map(|(_, a, _)| a.name())
@@ -854,7 +859,35 @@ impl Inspector {
         theme: &Theme,
         out: &mut Vec<GlyphInstance>,
     ) -> f32 {
-        text(out, atlas, x, y, width, "RECEIPT", theme.status_text);
+        // Copy Handoff, at the right of the title: the card as text, with
+        // the commits and files read at the click.
+        let b = Viewport {
+            x,
+            y: y - 1.0,
+            width: 0.0,
+            height: layout::UI_CONTROL_SM,
+        };
+        let button = layout::Button::new(b)
+            .label("Copy Handoff")
+            .icon(icons::COPY)
+            .tip("Copy what this workspace's agents did as text: claims, commits, installs, tests, files written and failed commands");
+        let bw = button.content_width(atlas, 10.0);
+        let b = Viewport {
+            x: x + width - bw,
+            width: bw,
+            ..b
+        };
+        layout::Button { rect: b, ..button }.draw(out, atlas, theme);
+        self.hits.push((b, Action::CopyHandoff, None));
+        text(
+            out,
+            atlas,
+            x,
+            y,
+            (width - bw - 8.0).max(0.0),
+            "RECEIPT",
+            theme.status_text,
+        );
         let y = y + ROW;
         let now = crate::platform::unix_seconds();
         let failed = if receipt.failed == 0 {
