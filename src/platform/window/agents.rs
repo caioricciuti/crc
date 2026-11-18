@@ -333,6 +333,7 @@ impl EditorView {
             self.request_redraw();
         }
         self.poll_rewind();
+        self.poll_restore();
     }
 
     /// From the Activity panel's worker: a read landed.

@@ -83,6 +83,9 @@ pub enum Action {
     /// A file under the selected turn: opened in File History at the
     /// version the agent left that turn.
     RewindFile,
+    /// Under the selected turn: every file its session wrote put back as
+    /// it was at the turn's end, once asked.
+    RewindRestore,
 }
 
 impl Action {
@@ -110,6 +113,7 @@ impl Action {
             Action::FoldRewind => "rewind_fold",
             Action::RewindTurn(_) => "rewind_turn",
             Action::RewindFile => "rewind_file",
+            Action::RewindRestore => "rewind_restore",
         }
     }
 }
@@ -155,6 +159,8 @@ const REWIND_TURNS: usize = 30;
 const TURN_HEIGHT: f32 = 44.0;
 /// A file or command under the selected turn.
 const SUB_ROW: f32 = 22.0;
+/// The Restore button's row under the selected turn.
+const RESTORE_ROW: f32 = 30.0;
 
 /// A written file as Rewind lists it: from the workspace's `folder` when
 /// inside it, else whole.
@@ -332,6 +338,8 @@ pub struct Inspector {
     shown_rewind: Option<String>,
     /// A file's version for a turn, being looked up in local history.
     pub rewind_rx: Option<mpsc::Receiver<RewindFound>>,
+    /// What restoring to the selected turn would do, being read.
+    pub restore_rx: Option<mpsc::Receiver<crate::project::review::RestorePlan>>,
 }
 
 /// What looking up a turn's version of a file found: the session, the
@@ -715,6 +723,7 @@ impl Inspector {
                             | Action::FoldRewind
                             | Action::RewindTurn(_)
                             | Action::RewindFile
+                            | Action::RewindRestore
                     ) && r.as_deref().is_none_or(|r| r == path)
                 })
                 .map(|(_, a, _)| a.name())
@@ -1231,12 +1240,15 @@ impl Inspector {
                     .as_ref()
                     .is_some_and(|(dir, index)| *dir == session.dir && *index == turn.index)
             };
+            // A session that wrote files can be put back to any turn.
+            let restorable = session.turns.iter().any(|t| !t.wrote.is_empty());
+            let restore_row = if restorable { RESTORE_ROW } else { 0.0 };
             let height: f32 = shown
                 .iter()
                 .map(|t| {
                     TURN_HEIGHT
                         + if open(t) {
-                            (t.wrote.len() + t.ran.len()) as f32 * SUB_ROW + 4.0
+                            (t.wrote.len() + t.ran.len()) as f32 * SUB_ROW + 4.0 + restore_row
                         } else {
                             0.0
                         }
@@ -1387,6 +1399,26 @@ impl Inspector {
                         Some(&format!("{}\n{}", ran.command, ran.outcome.label())),
                     );
                     ty += SUB_ROW;
+                }
+                if restorable {
+                    let label = format!("Restore Files to Turn {}", turn.index);
+                    let b = Viewport {
+                        x: x + 10.0,
+                        y: ty + (RESTORE_ROW - layout::UI_CONTROL_SM) / 2.0,
+                        width: 0.0,
+                        height: layout::UI_CONTROL_SM,
+                    };
+                    let button = layout::Button::new(b)
+                        .label(&label)
+                        .icon(icons::HISTORY)
+                        // It replaces what the files hold now.
+                        .tone(layout::Tone::Danger)
+                        .tip("Put every file this session wrote back as it was when this turn ended. You are asked first; the text each file has now is kept in File History");
+                    let bw = button.content_width(atlas, 10.0).min(inner);
+                    let b = Viewport { width: bw, ..b };
+                    layout::Button { rect: b, ..button }.draw(out, atlas, theme);
+                    self.hits.push((b, Action::RewindRestore, None));
+                    ty += RESTORE_ROW;
                 }
                 ty += 2.0;
             }

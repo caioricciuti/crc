@@ -53,7 +53,7 @@ rw_launch() {
     printf 'theme = "%s"\n' "$2" > "$T/home/rewind-$1/.config/crc/config.toml"
     HOME="$T/home/rewind-$1" CRC_HISTORY_DB="$T/rewind-$1.db" CRC_TERMINAL_SHELL=/bin/sh \
         CRC_CLAUDE_COMMAND="$T/rewind-agent.sh" \
-        CRC_SELFTEST="$T/rewind-$1.script" "$BIN" "$rw_proj" 2> "$T/rewind-$1.err"
+        CRC_SELFTEST="$T/rewind-$1.script" "$BIN" "$rw_proj" 2> "$T/rewind-$1.${3:-err}"
 }
 # rw_scrub <dump>: the scrub line without its counts of what is loaded.
 rw_scrub() {
@@ -145,3 +145,55 @@ expect "$T/rewind-light-missing.out" rewind "sessions=1 turns=2 rows=2 sel=2 fil
 rw_got=$(rw_scrub "$T/rewind-light-file.out")
 [ "$rw_got" = "3/3@local:by agent first=second notes" ] \
     || failed "rewind-light-file.out: scrub is [$rw_got], expected [3/3@local:by agent first=second notes]"
+
+# Restore to a turn, from a project as it was before the first run. Back
+# to turn 1: notes.md takes turn 1's version, and plan.md and .env, which
+# the agent created in turn 2, go. Then forward to turn 2: notes.md and
+# plan.md come back, said changed since the agent left them (the restore
+# changed them); .env, a secret with no version kept, is left as it is.
+rm -f "$rw_proj/plan.md" "$rw_proj/.env"
+printf 'x\n' > "$rw_proj/notes.md"
+cat > "$T/rewind-restore.script" <<SCRIPT
+wait 500
+key 8 cmd,shift C
+wait 700
+wait 700
+wait 700
+wait 700
+key 0 cmd,shift A
+wait 700
+wait 500
+click @inspector.rewind_turn.1
+wait 300
+frame $T/rewind-restore.png
+click @inspector.rewind_restore
+wait 700
+wait 500
+dump $T/rewind-restore-1.out
+click @inspector.rewind_turn.0
+wait 300
+click @inspector.rewind_restore
+wait 700
+wait 500
+dump $T/rewind-restore-2.out
+quit
+SCRIPT
+# Its stderr holds the questions a test instance prints instead of asking,
+# so it is a .log, checked here for anything else.
+rw_launch restore dark log
+if grep -v '^crc: restore to turn: ' "$T/rewind-restore.log" | grep -v '^slow frame' | grep -q .; then
+    failed "rewind-restore.log: the app wrote to stderr: $(cat "$T/rewind-restore.log")"
+fi
+expect "$T/rewind-restore-1.out" message "Restored 3 files to turn 1"
+expect "$T/rewind-restore-2.out" message "Restored 2 files to turn 2"
+[ "$(cat "$rw_proj/notes.md")" = "second notes" ] \
+    || failed "rewind restore: notes.md is [$(cat "$rw_proj/notes.md")], expected [second notes]"
+[ "$(cat "$rw_proj/plan.md" 2>/dev/null)" = "the plan" ] \
+    || failed "rewind restore: plan.md did not come back with turn 2"
+[ ! -e "$rw_proj/.env" ] || failed "rewind restore: .env came back with no version kept"
+grep -q 'restore to turn: Restore 3 files to how turn 1 left them? notes.md, plan.md, .env' "$T/rewind-restore.log" \
+    || failed "rewind-restore.log: no question for turn 1"
+grep -q 'Changed since the agent left them, and that change is replaced: notes.md, plan.md' "$T/rewind-restore.log" \
+    || failed "rewind-restore.log: turn 2's question does not name the changed files"
+grep -q 'Left as they are: .env (no saved version from turn 2)' "$T/rewind-restore.log" \
+    || failed "rewind-restore.log: turn 2's question does not name .env"

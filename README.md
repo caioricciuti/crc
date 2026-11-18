@@ -290,8 +290,17 @@ the size and write it back.
   commands it ran, and how many failed. Click a turn to list its files
   and commands; click a file to open it in File History at the version
   the agent left in that turn (a file local history skips, such as a
-  secret, opens as it is and says so). Rewind only reads: it puts
-  nothing back. View > Show Rewind opens the inspector on it.
+  secret, opens as it is and says so). Restore Files to Turn N, under a
+  selected turn, puts every file the session wrote back as it was when
+  that turn ended: a file the agent created later is removed, one it
+  changed later goes back to how it was before the session. crc asks
+  first, naming the files changed since the agent left them and the
+  ones with no saved version, which stay as they are. The text each
+  file had is kept in File History, so a restore can be undone from
+  there. A file open with unsaved changes stops the restore. Closing a
+  session's terminal keeps its copies from before each first write for
+  30 days, with its commands. View > Show Rewind opens the inspector on
+  it.
   At the bottom of the Agents sidebar, the Activity panel shows the
   whole Mac every two seconds: CPU with a short history, memory used
   and its pressure, disk and network rates, and the three processes

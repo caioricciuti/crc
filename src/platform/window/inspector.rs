@@ -22,6 +22,33 @@ const SESSIONS_EVERY: f64 = 2.0;
 /// The most commits a handoff lists: the newest.
 const HANDOFF_COMMITS: usize = 50;
 
+/// The most files a restore's question names; the rest are counted.
+const RESTORE_NAMED: usize = 8;
+
+/// `names` joined, the first [`RESTORE_NAMED`] of them, and how many more.
+fn names(names: impl Iterator<Item = String>) -> String {
+    let all: Vec<String> = names.collect();
+    let mut said = all
+        .iter()
+        .take(RESTORE_NAMED)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if all.len() > RESTORE_NAMED {
+        said.push_str(&format!(" and {} more", all.len() - RESTORE_NAMED));
+    }
+    said
+}
+
+/// "1 file", "2 files".
+fn plural_files(n: usize) -> String {
+    if n == 1 {
+        "1 file".to_owned()
+    } else {
+        format!("{n} files")
+    }
+}
+
 impl EditorView {
     pub(super) fn inspector_click(&self, event: &NSEvent, x: f32, y: f32) {
         let Some(action) = self
@@ -113,10 +140,11 @@ impl EditorView {
         // under it opens at the turn's version.
         if matches!(
             action,
-            Action::FoldRewind | Action::RewindTurn(_) | Action::RewindFile
+            Action::FoldRewind | Action::RewindTurn(_) | Action::RewindFile | Action::RewindRestore
         ) {
             match (action, repo) {
                 (Action::RewindFile, Some(path)) => self.rewind_file(path),
+                (Action::RewindRestore, _) => self.rewind_restore(),
                 (Action::RewindTurn(n), _) => {
                     if let Some(mut state) = self.state_mut() {
                         state.agents.inspector.select_turn(n);
@@ -171,7 +199,8 @@ impl EditorView {
             | Action::CheckRemote
             | Action::FoldRewind
             | Action::RewindTurn(_)
-            | Action::RewindFile => {}
+            | Action::RewindFile
+            | Action::RewindRestore => {}
         }
         self.request_redraw();
         self.pump();
@@ -338,6 +367,207 @@ impl EditorView {
         }
         self.request_redraw();
         self.resume_display_link();
+    }
+
+    /// Restore Files to Turn N, under the selected turn: what it would do
+    /// is read on a worker (local history and the files), and
+    /// [`Self::poll_restore`] asks and does it.
+    fn rewind_restore(&self) {
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
+        let inspector = &mut state.agents.inspector;
+        if inspector.restore_rx.is_some() {
+            return;
+        }
+        let Some((dir, index)) = inspector.rewind_turn.clone() else {
+            return;
+        };
+        let Some(session) = inspector.rewind.sessions.iter().find(|s| s.dir == dir) else {
+            return;
+        };
+        let Some(at) = session.turns.iter().position(|t| t.index == index) else {
+            return;
+        };
+        let (turns, live) = (session.turns.clone(), session.live);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let store = crate::history::store::default_path().and_then(|db| {
+                crate::history::store::Store::open_to_read(&db)
+                    .ok()
+                    .flatten()
+            });
+            let plan = crate::project::review::restore_plan(&dir, &turns, at, live, store.as_ref());
+            let _ = tx.send(plan);
+        });
+        inspector.restore_rx = Some(rx);
+        drop(state);
+        self.resume_display_link();
+    }
+
+    /// Takes what [`Self::rewind_restore`] found: asks, naming the files
+    /// changed since their agent left them, the ones with nothing to go
+    /// back to and an agent maybe still at work, then puts the files back,
+    /// each one's text before kept in local history. A file open with
+    /// unsaved changes stops it: those are saved or reverted first.
+    pub(super) fn poll_restore(&self) {
+        let plan = {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            let Some(rx) = &state.agents.inspector.restore_rx else {
+                return;
+            };
+            match rx.try_recv() {
+                Ok(plan) => {
+                    state.agents.inspector.restore_rx = None;
+                    plan
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    state.agents.inspector.restore_rx = None;
+                    return;
+                }
+            }
+        };
+        let name = |path: &Path| {
+            path.file_name().map_or_else(
+                || path.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            )
+        };
+        let turn = plan.turn;
+        if plan.files.is_empty() {
+            if let Some(mut state) = self.state_mut() {
+                let note = if plan.refused.is_empty() {
+                    format!("Every file is already as turn {turn} left it")
+                } else {
+                    format!(
+                        "Nothing to restore to turn {turn}: no saved version of {}",
+                        names(plan.refused.iter().map(|(p, _)| name(p)))
+                    )
+                };
+                state.say(layout::Feedback::Info, note);
+            }
+            self.request_redraw();
+            return;
+        }
+        let unsaved: Vec<String> = self.state().map_or_else(Vec::new, |state| {
+            plan.files
+                .iter()
+                .filter(|f| {
+                    all_docs(&state).any(|docs| {
+                        docs.iter().any(|b| {
+                            b.is_dirty() && b.path.as_deref().is_some_and(|p| same_file(p, &f.path))
+                        })
+                    })
+                })
+                .map(|f| name(&f.path))
+                .collect()
+        });
+        if !unsaved.is_empty() {
+            if let Some(mut state) = self.state_mut() {
+                state.say(
+                    layout::Feedback::Failure,
+                    format!(
+                        "Not restored: save or revert {} first",
+                        names(unsaved.into_iter())
+                    ),
+                );
+            }
+            self.request_redraw();
+            return;
+        }
+        let count = plural_files(plan.files.len());
+        let message = format!("Restore {count} to how turn {turn} left them?");
+        let mut detail = vec![names(plan.files.iter().map(|f| name(&f.path)))];
+        let changed: Vec<String> = plan
+            .files
+            .iter()
+            .filter(|f| f.changed)
+            .map(|f| name(&f.path))
+            .collect();
+        if !changed.is_empty() {
+            detail.push(format!(
+                "Changed since the agent left them, and that change is replaced: {}",
+                names(changed.into_iter())
+            ));
+        }
+        if !plan.refused.is_empty() {
+            let left: Vec<String> = plan
+                .refused
+                .iter()
+                .map(|(p, why)| format!("{} ({why})", name(p)))
+                .collect();
+            detail.push(format!("Left as they are: {}", left.join(", ")));
+        }
+        if plan.running {
+            detail.push("The agent in this terminal may still be working.".into());
+        }
+        detail.push("The text each file has now is kept in File History.".into());
+        let detail = detail.join("\n\n");
+        let go = if std::env::var_os("CRC_SELFTEST").is_some() {
+            // A test instance cannot answer a modal: it says what it would
+            // have asked, and takes the answer from the environment.
+            eprintln!(
+                "crc: restore to turn: {message} {}",
+                detail.replace('\n', " ")
+            );
+            std::env::var("CRC_REWIND_ANSWER").map_or(true, |a| a != "cancel")
+        } else {
+            ask(
+                MainThreadMarker::from(self),
+                &message,
+                &detail,
+                &["Restore", "Cancel"],
+            ) == 0
+        };
+        if !go {
+            return;
+        }
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
+        let mut failed = Vec::new();
+        let mut restored = 0;
+        for file in &plan.files {
+            match crate::project::review::restore_file(file) {
+                Ok(before) => {
+                    restored += 1;
+                    let text = before
+                        .as_deref()
+                        .and_then(|b| crate::text::file_format::decode(b).ok());
+                    if let Some((text, _)) = text {
+                        state.history.restored_on_disk(
+                            &file.path,
+                            &crate::text::rope::Rope::from_text(&text),
+                        );
+                    }
+                }
+                Err(e) => failed.push(e),
+            }
+        }
+        if restored > 0 {
+            note_files_written(&mut state);
+        }
+        if failed.is_empty() {
+            state.say(
+                layout::Feedback::Success,
+                format!("Restored {} to turn {turn}", plural_files(restored)),
+            );
+        } else {
+            state.say(
+                layout::Feedback::Failure,
+                format!(
+                    "Restored {restored} of {} to turn {turn}: {}",
+                    plural_files(plan.files.len()),
+                    failed.join("; ")
+                ),
+            );
+        }
+        drop(state);
+        self.request_redraw();
+        self.pump();
     }
 
     /// View > Show Rewind: the inspector opened, Rewind unfolded and

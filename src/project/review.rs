@@ -936,9 +936,10 @@ fn ledger_dir(ledgers: &Path, workspace: &str) -> PathBuf {
     ledgers.join(format!("{:016x}", fingerprint(workspace)))
 }
 
-/// Moves the session's `events` and `about` into the ledger of
-/// `workspace`; a session with no events, or no workspace to file it
-/// under, keeps nothing.
+/// Moves the session's `events`, `about` and `files` (its copies from
+/// before each first write, which a restore to a turn goes back to) into
+/// the ledger of `workspace`; a session with no events, or no workspace to
+/// file it under, keeps nothing.
 fn keep_ledger(dir: &Path, ledgers: &Path, workspace: &str) {
     let Some(id) = dir.file_name() else {
         return;
@@ -950,7 +951,7 @@ fn keep_ledger(dir: &Path, ledgers: &Path, workspace: &str) {
     if std::fs::create_dir_all(&to).is_err() {
         return;
     }
-    for name in ["events", "about"] {
+    for name in ["events", "about", "files"] {
         let _ = std::fs::rename(dir.join(name), to.join(name));
     }
     LEDGERS_CHANGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1384,6 +1385,227 @@ pub fn turn_version(
                 && until.is_none_or(|until| at < until)
         })
         .map(|e| e.id)
+}
+
+/// What a file goes back to in a restore.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Back {
+    /// An agent's version from local history, written in the file's
+    /// current encoding and line endings.
+    Text(String),
+    /// The session's copy from before its first write, byte for byte.
+    Bytes(Vec<u8>),
+    /// The agent created it: it goes.
+    Absent,
+}
+
+/// One file of a [`RestorePlan`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Restoring {
+    pub path: PathBuf,
+    pub to: Back,
+    /// Not as the session last left it: someone, or something, changed it
+    /// since. Restoring drops that change, so it is asked about.
+    pub changed: bool,
+    /// The file's size and hash when the plan was read; a restore refuses a
+    /// file that moved since.
+    pub seen: String,
+}
+
+/// What restoring a session to the end of one of its turns would do.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RestorePlan {
+    /// The turn's index, as the Rewind view numbers it.
+    pub turn: usize,
+    /// The files to put back, in the order the session first wrote them.
+    pub files: Vec<Restoring>,
+    /// Files already as they were at the turn's end.
+    pub same: usize,
+    /// Files with nothing known to put back, and why: left as they are.
+    pub refused: Vec<(PathBuf, String)>,
+    /// The session's last turn has not ended: its agent may still write.
+    pub running: bool,
+}
+
+/// What restoring the session in `dir` to the end of `turns[at]` would do:
+/// every file the session wrote goes back to how it was then. A file the
+/// session wrote by then takes the version local history kept of it in
+/// the last turn that wrote it, looked up in that turn alone, so a missing
+/// version never brings back an older one. A file first written after
+/// goes back to the session's copy from before it wrote it, or away when
+/// the agent created it. `live` says the session is the terminal showing.
+pub fn restore_plan(
+    dir: &Path,
+    turns: &[Turn],
+    at: usize,
+    live: bool,
+    store: Option<&crate::history::store::Store>,
+) -> RestorePlan {
+    let mut plan = RestorePlan {
+        turn: turns.get(at).map_or(0, |t| t.index),
+        running: live && turns.last().is_some_and(|t| t.ended.is_none()),
+        ..RestorePlan::default()
+    };
+    let Some(session) = dir.file_name().and_then(|n| n.to_str()) else {
+        return plan;
+    };
+    let mut paths: Vec<&PathBuf> = Vec::new();
+    for turn in turns {
+        for path in &turn.wrote {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+    }
+    let checkpoints = files(dir);
+    for path in paths {
+        let entries = store
+            .and_then(|s| s.list(&crate::platform::canonical(path)).ok())
+            .unwrap_or_default();
+        let last = turns
+            .iter()
+            .enumerate()
+            .take(at + 1)
+            .rfind(|(_, t)| t.wrote.contains(path));
+        let to = match last {
+            Some((n, turn)) => {
+                let until = turns.get(n + 1).map(|t| t.started);
+                let text = turn_version(&entries, session, turn.started, until)
+                    .and_then(|id| store?.read(id).ok().flatten());
+                match text {
+                    Some(text) => Ok(Back::Text(text)),
+                    None => Err(format!("no saved version from turn {}", turn.index)),
+                }
+            }
+            None => baseline(&checkpoints, path),
+        };
+        let to = match to {
+            Ok(to) => to,
+            Err(why) => {
+                plan.refused.push((path.clone(), why));
+                continue;
+            }
+        };
+        let now = std::fs::read(path).ok();
+        if now.as_deref().is_some_and(|bytes| is_back(bytes, &to))
+            || (now.is_none() && to == Back::Absent)
+        {
+            plan.same += 1;
+            continue;
+        }
+        let seen = file_fingerprint(path).unwrap_or_default();
+        plan.files.push(Restoring {
+            changed: !left_so(dir, path, session, &entries, store, now.as_deref(), &seen),
+            path: path.clone(),
+            to,
+            seen,
+        });
+    }
+    plan
+}
+
+/// The session's copy of `path` from before its first write, as a
+/// restore puts it back.
+fn baseline(checkpoints: &[File], path: &Path) -> Result<Back, String> {
+    let file = checkpoints.iter().find(|f| {
+        f.path == path || crate::platform::canonical(&f.path) == crate::platform::canonical(path)
+    });
+    match file.map(|f| &f.checkpoint) {
+        Some(Checkpoint::Text(kept)) => std::fs::read(kept)
+            .map(Back::Bytes)
+            .map_err(|e| format!("the copy from before the session: {e}")),
+        Some(Checkpoint::Absent) => Ok(Back::Absent),
+        Some(Checkpoint::TooLarge) => Err("too large: no copy from before the session".into()),
+        Some(Checkpoint::Unhooked(_)) | None => Err("no copy from before the session".into()),
+    }
+}
+
+/// Whether the file's `bytes` are what `to` puts back.
+fn is_back(bytes: &[u8], to: &Back) -> bool {
+    match to {
+        Back::Bytes(kept) => bytes == kept.as_slice(),
+        Back::Text(text) => {
+            crate::text::file_format::decode(bytes).is_ok_and(|(now, _)| now == *text)
+        }
+        Back::Absent => false,
+    }
+}
+
+/// Whether `path` is as the session last left it: as its post hook
+/// recorded it, or as its newest version in local history.
+fn left_so(
+    dir: &Path,
+    path: &Path,
+    session: &str,
+    entries: &[crate::history::store::Entry],
+    store: Option<&crate::history::store::Store>,
+    now: Option<&[u8]>,
+    seen: &str,
+) -> bool {
+    let after = std::fs::read_to_string(dir.join("files").join(format!("{}.after", key(path))));
+    if after.is_ok_and(|after| after == seen) {
+        return true;
+    }
+    let newest = entries.iter().find(|e| {
+        e.reason == crate::history::store::Reason::Agent && e.session.as_deref() == Some(session)
+    });
+    let text = newest.and_then(|e| store?.read(e.id).ok().flatten());
+    match (text, now) {
+        (Some(text), Some(now)) => is_back(now, &Back::Text(text)),
+        _ => false,
+    }
+}
+
+/// Puts one file of a [`RestorePlan`] back, unless it moved since the plan
+/// was read. Answers what it held, for local history to keep: `None` when
+/// it was not there.
+pub fn restore_file(file: &Restoring) -> Result<Option<Vec<u8>>, String> {
+    let name = file.path.file_name().map_or_else(
+        || file.path.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let said = |e: std::io::Error| format!("{name}: {e}");
+    let now = file_fingerprint(&file.path).map_err(said)?;
+    if now != file.seen {
+        return Err(format!("{name} changed while the restore was asked about"));
+    }
+    let before = match std::fs::read(&file.path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(said(e)),
+    };
+    let bytes = match &file.to {
+        Back::Absent => {
+            match std::fs::remove_file(&file.path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(said(e)),
+                _ => {}
+            }
+            return Ok(before);
+        }
+        Back::Bytes(bytes) => bytes.clone(),
+        Back::Text(text) => {
+            // The file's own encoding and dominant line ending, as a save
+            // of the open document would keep them.
+            let format = before
+                .as_deref()
+                .and_then(|b| crate::text::file_format::decode(b).ok())
+                .map(|(_, format)| crate::text::file_format::DiskFormat {
+                    endings: Vec::new(),
+                    ..format
+                })
+                .unwrap_or_default();
+            let mut out = Vec::new();
+            let rope = crate::text::rope::Rope::from_text(text);
+            crate::text::file_format::write(&mut out, &rope, &format).map_err(said)?;
+            out
+        }
+    };
+    if let Some(parent) = file.path.parent() {
+        std::fs::create_dir_all(parent).map_err(said)?;
+    }
+    // Written in place, so the file keeps its mode, as Undo does.
+    std::fs::write(&file.path, bytes).map_err(said)?;
+    Ok(before)
 }
 
 /// What the workspace's Receipt card shows: its ledger with the receipt of
@@ -2279,7 +2501,7 @@ mod tests {
     /// Hooks write a receipt into a session, which the session's tab
     /// closing archives: the ledger has its commands, not its files.
     #[test]
-    fn archive_keeps_events_and_drops_checkpoints() {
+    fn archive_keeps_events_and_checkpoints() {
         let tree = TempTree::new("review-archive", &[("work/a.txt", "one\n")]);
         let ledgers = tree.0.join("ledgers");
         let dir = tree.0.join("sessions").join("s1");
@@ -2296,7 +2518,9 @@ mod tests {
         let kept = ledger_dir(&ledgers, "ws").join("s1");
         assert!(kept.join("events").is_file());
         assert!(kept.join("about").is_file());
-        assert!(!kept.join("files").exists(), "no checkpoint is kept");
+        // The copy from before the write, for a restore to a turn.
+        assert_eq!(files(&kept).len(), 1);
+        assert!(matches!(files(&kept)[0].checkpoint, Checkpoint::Text(_)));
         assert_eq!(receipt_until(&kept, u64::MAX).total, 2);
         assert_eq!(ledger_in(&ledgers, "ws").total, 2);
         assert_eq!(about(&kept).0, "Agent");
@@ -2306,6 +2530,151 @@ mod tests {
         archive_in(&quiet, &ledgers, "ws");
         assert!(!quiet.exists());
         assert!(!ledger_dir(&ledgers, "ws").join("s2").exists());
+    }
+
+    /// A session wrote a.txt in turn 1 and again in turn 2, created b.txt
+    /// in turn 2, and wrote c.txt in turn 1 with no version kept.
+    /// Restoring to turn 1 puts a.txt back to turn 1's version and removes
+    /// b.txt; back to turn 2 brings both again, said changed since the
+    /// session left them. A file that moved after the plan is refused.
+    #[test]
+    fn restore_puts_files_back_as_a_turn_left_them() {
+        let tree = TempTree::new(
+            "review-restore",
+            &[("a.txt", "one\n"), ("c.txt", "c\n"), ("crlf.txt", "x\r\n")],
+        );
+        let root = crate::platform::canonical(&tree.0);
+        let dir = root.join("5f3a-1-0");
+        let session = "5f3a-1-0";
+        let (a, b, c, crlf) = (
+            root.join("a.txt"),
+            root.join("b.txt"),
+            root.join("c.txt"),
+            root.join("crlf.txt"),
+        );
+        for path in [&a, &b, &c, &crlf] {
+            checkpoint(&dir, path).expect("checkpoint");
+        }
+        let store = Store::open(&root.join("history.db")).expect("store");
+        let write = |path: &Path, text: &str, at: i64| {
+            std::fs::write(path, text).expect("write");
+            store
+                .put_agent_snapshot(path, &text.replace('\r', ""), session, at)
+                .expect("snapshot");
+        };
+        write(&a, "two\n", 150_000);
+        std::fs::write(&c, "c turn 1\n").expect("write");
+        write(&crlf, "y\r\n", 160_000);
+        write(&a, "three\n", 250_000);
+        write(&b, "bee\n", 260_000);
+        let turn = |index: usize, started: u64, wrote: &[&PathBuf]| Turn {
+            index,
+            prompt: None,
+            started,
+            ended: Some(started + 50),
+            wrote: wrote.iter().map(|p| (*p).clone()).collect(),
+            ran: Vec::new(),
+        };
+        let turns = [turn(1, 100, &[&a, &c, &crlf]), turn(2, 200, &[&a, &b])];
+
+        // As the session left them: nothing to go back to for turn 2.
+        let plan = restore_plan(&dir, &turns, 1, true, Some(&store));
+        assert_eq!((plan.turn, plan.files.len(), plan.same), (2, 0, 3));
+        assert_eq!(
+            plan.refused,
+            [(c.clone(), "no saved version from turn 1".into())]
+        );
+        assert!(!plan.running);
+
+        // Back to turn 1: a.txt's first version, b.txt gone, crlf.txt as it
+        // was then. None was changed since the session left it.
+        let plan = restore_plan(&dir, &turns, 0, true, Some(&store));
+        let to: Vec<(&Path, &Back, bool)> = plan
+            .files
+            .iter()
+            .map(|f| (f.path.as_path(), &f.to, f.changed))
+            .collect();
+        assert_eq!(
+            to,
+            [
+                (a.as_path(), &Back::Text("two\n".into()), false),
+                (b.as_path(), &Back::Absent, false),
+            ]
+        );
+        assert_eq!(plan.same, 1, "crlf.txt is as turn 1 left it");
+        for file in &plan.files {
+            restore_file(file).expect("restore");
+        }
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "two\n");
+        assert!(!b.exists());
+
+        // Forward to turn 2 again: both said changed, since the restore,
+        // not the session, left them so.
+        let plan = restore_plan(&dir, &turns, 1, true, Some(&store));
+        assert_eq!(plan.files.len(), 2);
+        assert!(plan.files.iter().all(|f| f.changed));
+        // a.txt moves after the plan was read: refused, left as it is.
+        std::fs::write(&a, "mine\n").unwrap();
+        assert!(restore_file(&plan.files[0]).is_err());
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "mine\n");
+        assert_eq!(restore_file(&plan.files[1]).expect("b"), None);
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "bee\n");
+
+        // A version kept as text goes back in the file's own line endings.
+        std::fs::write(&crlf, "z\r\n").unwrap();
+        let plan = restore_plan(&dir, &turns, 0, true, Some(&store));
+        let crlf_back = plan.files.iter().find(|f| f.path == crlf).expect("crlf");
+        restore_file(crlf_back).expect("crlf");
+        assert_eq!(std::fs::read(&crlf).unwrap(), b"y\r\n");
+
+        // A live session still in its last turn is said to be running.
+        let mut open = turns.clone();
+        open[1].ended = None;
+        assert!(restore_plan(&dir, &open, 0, true, Some(&store)).running);
+        assert!(!restore_plan(&dir, &open, 0, false, Some(&store)).running);
+    }
+
+    /// A turn whose write kept no version never falls back to an earlier
+    /// turn's version of the file.
+    #[test]
+    fn restore_refuses_a_file_whose_turn_kept_no_version() {
+        let tree = TempTree::new("review-restore-gap", &[("a.txt", "one\n")]);
+        let root = crate::platform::canonical(&tree.0);
+        let dir = root.join("5f3a-2-0");
+        let a = root.join("a.txt");
+        checkpoint(&dir, &a).expect("checkpoint");
+        let store = Store::open(&root.join("history.db")).expect("store");
+        store
+            .put_agent_snapshot(&a, "two\n", "5f3a-2-0", 150_000)
+            .expect("snapshot");
+        std::fs::write(&a, "three\n").unwrap();
+        let turns = [
+            Turn {
+                index: 1,
+                prompt: None,
+                started: 100,
+                ended: Some(140),
+                wrote: vec![a.clone()],
+                ran: Vec::new(),
+            },
+            Turn {
+                index: 2,
+                prompt: None,
+                started: 200,
+                ended: Some(240),
+                wrote: vec![a.clone()],
+                ran: Vec::new(),
+            },
+        ];
+        let plan = restore_plan(&dir, &turns, 1, false, Some(&store));
+        assert!(plan.files.is_empty());
+        assert_eq!(
+            plan.refused,
+            [(a.clone(), "no saved version from turn 2".into())]
+        );
+        // Without local history at all, nothing is known either.
+        let plan = restore_plan(&dir, &turns, 0, false, None);
+        assert_eq!(plan.refused, [(a, "no saved version from turn 1".into())]);
     }
 
     #[test]

@@ -648,6 +648,20 @@ impl Recorder {
         }
     }
 
+    /// `path` was put back on disk by a restore to an agent's turn:
+    /// `before`, what it held, is kept, as [`Recorder::before_restore`]
+    /// keeps an open document's.
+    pub fn restored_on_disk(&mut self, path: &Path, before: &Rope) {
+        if before.len_bytes() <= MAX_BYTES && self.filter.allows(path) {
+            self.send(Job::Snapshot {
+                path: path.to_owned(),
+                rope: before.clone(),
+                reason: Reason::BeforeRestore,
+                at: now_ms(),
+            });
+        }
+    }
+
     /// `path` is about to be written by an edit made without opening it
     /// (a project-wide replace, a rename symbol): `before` is its text.
     pub fn edited_on_disk(&mut self, path: &Path, before: &Rope) {
@@ -1598,6 +1612,22 @@ mod tests {
         recorder.edited_on_disk(&dir.join(".env"), &Rope::from_text("SECRET=1\n"));
         recorder.finish(std::iter::empty(), secs(10));
         assert_eq!(reasons(&db, &file), [Reason::EditedOnDisk]);
+        assert_eq!(reasons(&db, &dir.join(".env")), []);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A restore to an agent's turn keeps each file's text from before it,
+    /// by the same filter.
+    #[test]
+    fn a_restore_on_disk_keeps_the_text_before() {
+        let dir = temp("restored-on-disk");
+        let db = dir.join("history.db");
+        let mut recorder = recorder(&db, "", Timing::default());
+        let file = dir.join("a.txt");
+        recorder.restored_on_disk(&file, &Rope::from_text("before\n"));
+        recorder.restored_on_disk(&dir.join(".env"), &Rope::from_text("SECRET=1\n"));
+        recorder.finish(std::iter::empty(), secs(10));
+        assert_eq!(reasons(&db, &file), [Reason::BeforeRestore]);
         assert_eq!(reasons(&db, &dir.join(".env")), []);
         std::fs::remove_dir_all(dir).unwrap();
     }
