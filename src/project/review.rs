@@ -155,6 +155,7 @@ pub const FINISHED: &str = "finished";
 /// the session's `events`, when the hook is one that is.
 pub fn hook(kind: &str, input: &str, dir: &Path) -> Result<Option<Event>, String> {
     let value = crate::json::parse(input).map_err(|e| format!("hook input: {e}"))?;
+    note_claude_session(dir, &value);
     let written = || -> Result<(String, PathBuf), String> {
         let tool = value
             .get("tool_name")
@@ -614,18 +615,22 @@ pub fn count(dir: &Path) -> usize {
 }
 
 /// One line per event. Tabs and line breaks in the text become spaces, so
-/// a line always splits back into the same fields.
+/// a line always splits back into the same fields. Wrote, prompted, asked
+/// and apierror lines start with the time they were written, in Unix
+/// seconds, as ran lines do, for [`turns`]; the window's events go without
+/// it.
 fn append(dir: &Path, event: &Event) -> std::io::Result<()> {
     let clean = |s: &str| s.replace(['\t', '\n', '\r'], " ");
+    let at = crate::platform::unix_seconds();
     let line = match event {
         Event::Wrote { tool, path } => {
             format!(
-                "wrote\t{}\t{}\n",
+                "wrote\t{at}\t{}\t{}\n",
                 clean(tool),
                 clean(&path.to_string_lossy())
             )
         }
-        Event::Asked(text) => format!("asked\t{}\n", clean(text)),
+        Event::Asked(text) => format!("asked\t{at}\t{}\n", clean(text)),
         Event::Failed(text) => format!("failed\t{}\n", clean(text)),
         Event::Task {
             id,
@@ -641,9 +646,9 @@ fn append(dir: &Path, event: &Event) -> std::io::Result<()> {
         ),
         Event::TeammateIdle(name) => format!("idle\t{}\n", clean(name)),
         Event::ApiError { error, details } => {
-            format!("apierror\t{}\t{}\n", clean(error), clean(details))
+            format!("apierror\t{at}\t{}\t{}\n", clean(error), clean(details))
         }
-        Event::Prompted(text) => format!("prompted\t{}\n", clean(text)),
+        Event::Prompted(text) => format!("prompted\t{at}\t{}\n", clean(text)),
         Event::Said(sentences) => {
             let sentences: Vec<String> = sentences.iter().map(|s| clean(s)).collect();
             format!("said\t{}\n", sentences.join("\t"))
@@ -695,16 +700,43 @@ pub fn read_events(dir: &Path, from: u64) -> (Vec<Event>, u64) {
 
 /// One line of the events file; `None` for a line this build cannot read.
 fn parse_event(line: &str) -> Option<Event> {
+    timed_event(line).map(|(_, event)| event)
+}
+
+/// The time a line of `fields` fields after its kind starts with, and the
+/// fields. A line written before it had a time has one field fewer, and its
+/// text no tab, so the count tells the two apart.
+fn stamped(rest: &str, fields: usize) -> (Option<u64>, &str) {
+    if rest.matches('\t').count() >= fields
+        && let Some((at, fields)) = rest.split_once('\t')
+        && let Ok(at) = at.parse()
+    {
+        return (Some(at), fields);
+    }
+    (None, rest)
+}
+
+/// [`parse_event`] with the time the line was written, when it has one:
+/// wrote, prompted, asked and apierror lines from before times were kept
+/// do not.
+fn timed_event(line: &str) -> Option<(Option<u64>, Event)> {
     let (kind, rest) = line.split_once('\t').unwrap_or((line, ""));
-    Some(match kind {
+    let mut at = None;
+    let event = match kind {
         "wrote" => {
+            let (time, rest) = stamped(rest, 2);
+            at = time;
             let (tool, path) = rest.split_once('\t')?;
             Event::Wrote {
                 tool: tool.to_owned(),
                 path: PathBuf::from(path),
             }
         }
-        "asked" => Event::Asked(rest.to_owned()),
+        "asked" => {
+            let (time, text) = stamped(rest, 1);
+            at = time;
+            Event::Asked(text.to_owned())
+        }
         "failed" => Event::Failed(rest.to_owned()),
         "task" => {
             let mut parts = rest.splitn(4, '\t');
@@ -720,21 +752,28 @@ fn parse_event(line: &str) -> Option<Event> {
             }
         }
         "idle" => Event::TeammateIdle(rest.to_owned()),
-        "prompted" => Event::Prompted(rest.to_owned()),
+        "prompted" => {
+            let (time, text) = stamped(rest, 1);
+            at = time;
+            Event::Prompted(text.to_owned())
+        }
         "said" => Event::Said(rest.split('\t').map(str::to_owned).collect()),
         "ran" => {
             use crate::project::receipt::{Outcome, Ran, TestCounts};
             let mut parts = rest.splitn(4, '\t');
-            let at = parts.next()?.parse().ok()?;
+            let time = parts.next()?.parse().ok()?;
+            at = Some(time);
             let outcome = Outcome::from_code(parts.next()?)?;
             Event::Ran(Ran {
-                at,
+                at: time,
                 outcome,
                 command: parts.next()?.to_owned(),
                 tests: parts.next().and_then(TestCounts::from_code),
             })
         }
         "apierror" => {
+            let (time, rest) = stamped(rest, 2);
+            at = time;
             let (error, details) = rest.split_once('\t').unwrap_or((rest, ""));
             Event::ApiError {
                 error: error.to_owned(),
@@ -742,7 +781,8 @@ fn parse_event(line: &str) -> Option<Event> {
             }
         }
         _ => return None,
-    })
+    };
+    Some((at, event))
 }
 
 /// The commands a session's events record before byte `until`: the
@@ -1019,6 +1059,95 @@ fn started_by_name(dir: &Path) -> Option<u64> {
     u64::try_from(nanos / 1_000_000_000).ok()
 }
 
+/// One turn of a session: what its agent did from a prompt to the end of
+/// its answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Turn {
+    /// 1 for the first prompt's turn, and so on; 0 only for what came
+    /// before any prompt.
+    pub index: usize,
+    /// The prompt's first line, as the prompt hook kept it; `None` for
+    /// turn 0.
+    pub prompt: Option<String>,
+    /// When it started and ended, in Unix seconds, 0 for a line written
+    /// before times were kept. `ended` is `None` while it is still running.
+    pub started: u64,
+    pub ended: Option<u64>,
+    /// The files the agent wrote, each once, in the order first written.
+    pub wrote: Vec<PathBuf>,
+    /// The commands it ran, in the order they ran.
+    pub ran: Vec<crate::project::receipt::Ran>,
+}
+
+/// The turns of the session in `dir`, live or archived as a ledger, in
+/// order. A prompt starts a turn; Stop or an API error ends it, and so
+/// does the next prompt when neither came. What the agent wrote or ran before the first
+/// prompt (a session resumed, or hooks from before the prompt hook) is
+/// kept as turn 0, not dropped, since a restore must know of it. What it
+/// did after a Stop, before the next prompt, stays with the turn that
+/// ended.
+pub fn turns(dir: &Path) -> Vec<Turn> {
+    let mut turns: Vec<Turn> = Vec::new();
+    let text = std::fs::read(dir.join("events")).unwrap_or_default();
+    for line in String::from_utf8_lossy(&text).lines() {
+        let Some((at, event)) = timed_event(line) else {
+            continue;
+        };
+        let at = at.unwrap_or(0);
+        if let Event::Prompted(prompt) = event {
+            if let Some(last) = turns.last_mut()
+                && last.ended.is_none()
+            {
+                last.ended = Some(at);
+            }
+            turns.push(Turn {
+                index: turns.last().map_or(1, |t| t.index + 1),
+                prompt: Some(prompt),
+                started: at,
+                ended: None,
+                wrote: Vec::new(),
+                ran: Vec::new(),
+            });
+            continue;
+        }
+        // An API error ends the turn as Stop does; a question mid-turn is
+        // not its end.
+        let ends = match &event {
+            Event::Asked(text) => Some(text == FINISHED),
+            Event::ApiError { .. } => Some(true),
+            _ => None,
+        };
+        if let Some(ends) = ends {
+            if ends && let Some(last) = turns.last_mut() {
+                last.ended = Some(at);
+            }
+            continue;
+        }
+        if !matches!(event, Event::Wrote { .. } | Event::Ran(_)) {
+            continue;
+        }
+        if turns.is_empty() {
+            turns.push(Turn {
+                index: 0,
+                prompt: None,
+                started: at,
+                ended: None,
+                wrote: Vec::new(),
+                ran: Vec::new(),
+            });
+        }
+        let Some(turn) = turns.last_mut() else {
+            continue;
+        };
+        match event {
+            Event::Wrote { path, .. } if !turn.wrote.contains(&path) => turn.wrote.push(path),
+            Event::Ran(ran) => turn.ran.push(ran),
+            _ => {}
+        }
+    }
+    turns
+}
+
 /// The [`Trail`] of the workspace's Receipt card, read now: its closed
 /// sessions, as [`workspace_receipt`] files them, and `live`, the session
 /// of the terminal showing.
@@ -1266,16 +1395,16 @@ pub fn summary(root: &Path) -> Vec<(PathBuf, String, usize)> {
 }
 
 /// Records which tab and folder a session belongs to, once, so the review
-/// can name it after the tab is gone.
+/// can name it after the tab is gone. A hook may have started the file
+/// with [`CLAUDE_SESSION`]; this adds to it.
 pub fn describe(dir: &Path, title: &str, folder: &Path) {
-    let path = dir.join("about");
-    if path.exists() || !dir.is_dir() {
+    if !dir.is_dir() || about_field(&about_text(dir), "title").is_some() {
         return;
     }
     let clean = |s: &str| s.replace(['\n', '\r'], " ");
-    let _ = std::fs::write(
-        path,
-        format!(
+    let _ = add_about(
+        dir,
+        &format!(
             "title={}\nfolder={}\n",
             clean(title),
             // Resolved, as the file paths are, so one is a prefix of the other.
@@ -1284,19 +1413,65 @@ pub fn describe(dir: &Path, title: &str, folder: &Path) {
     );
 }
 
+/// The key of Claude's own id for the session in `about`.
+const CLAUDE_SESSION: &str = "claude_session";
+
+/// Records Claude's own id for the session, the `session_id` of a hook's
+/// input, in its `about`, the first time a hook has one; an id already
+/// there stays. Two hooks at once may both add it, the same id twice, and
+/// [`claude_session`] reads the first.
+fn note_claude_session(dir: &Path, input: &crate::json::Value) {
+    let Some(id) = input.get("session_id").and_then(|v| v.as_str()) else {
+        return;
+    };
+    // An id, not text: anything else could break the file's lines.
+    let id_like = !id.is_empty()
+        && id.len() <= 128
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if id_like && claude_session(dir).is_none() {
+        let _ = add_about(dir, &format!("{CLAUDE_SESSION}={id}\n"));
+    }
+}
+
+/// Claude's own id for the session in `dir`, when a hook recorded it.
+pub fn claude_session(dir: &Path) -> Option<String> {
+    about_field(&about_text(dir), CLAUDE_SESSION)
+}
+
+/// Adds lines to the session's `about`, in one append: the window and a
+/// hook may both write it.
+fn add_about(dir: &Path, lines: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("about"))?
+        .write_all(lines.as_bytes())
+}
+
+fn about_text(dir: &Path) -> String {
+    std::fs::read_to_string(dir.join("about")).unwrap_or_default()
+}
+
+/// The first `key=value` of an `about` file's text.
+fn about_field(text: &str, key: &str) -> Option<String> {
+    text.lines()
+        .find_map(|l| l.strip_prefix(key)?.strip_prefix('='))
+        .map(str::to_owned)
+}
+
 /// The session's tab title and its folder, as [`describe`] wrote them;
 /// "Terminal" and an empty path when it never did.
 pub fn about(dir: &Path) -> (String, PathBuf) {
-    let text = std::fs::read_to_string(dir.join("about")).unwrap_or_default();
-    let field = |key: &str| {
-        text.lines()
-            .find_map(|l| l.strip_prefix(key)?.strip_prefix('='))
-            .map(str::to_owned)
-    };
-    let title = field("title").unwrap_or_else(|| "Terminal".into());
+    let text = about_text(dir);
+    let title = about_field(&text, "title").unwrap_or_else(|| "Terminal".into());
     (
         title,
-        field("folder").map(PathBuf::from).unwrap_or_default(),
+        about_field(&text, "folder")
+            .map(PathBuf::from)
+            .unwrap_or_default(),
     )
 }
 
@@ -1882,6 +2057,262 @@ mod tests {
             started_by_name(Path::new(&new_id())).map(|s| s > 0),
             Some(true)
         );
+    }
+
+    /// Hooks write a session's turns as they happen: each prompt starts
+    /// one, Stop ends it, and the files and commands between are its own.
+    /// The ledger the session's tab leaves reads the same.
+    #[test]
+    fn turns_group_writes_between_prompt_and_stop() {
+        let tree = TempTree::new("review-turns", &[("work/a.rs", ""), ("work/b.rs", "")]);
+        let dir = tree.0.join("sessions").join("s1");
+        let a = crate::platform::canonical(&tree.0.join("work/a.rs"));
+        let b = crate::platform::canonical(&tree.0.join("work/b.rs"));
+        let c = crate::platform::canonical(&tree.0.join("work")).join("c.rs");
+        let before = crate::platform::unix_seconds();
+        hook("prompt", r#"{"prompt":"fix the parser\nand more"}"#, &dir).expect("prompt");
+        hook("pre", &pre(&a), &dir).expect("pre");
+        hook("ran", r#"{"tool_input":{"command":"cargo test"}}"#, &dir).expect("ran");
+        hook("pre", &pre(&b), &dir).expect("pre");
+        hook("pre", &pre(&a), &dir).expect("pre");
+        hook("stop", r#"{"last_assistant_message":"Done."}"#, &dir).expect("stop");
+        hook("prompt", r#"{"prompt":"now c"}"#, &dir).expect("prompt");
+        hook("pre", &pre(&c), &dir).expect("pre");
+        let after = crate::platform::unix_seconds();
+
+        let turns = turns(&dir);
+        assert_eq!(turns.len(), 2, "{turns:?}");
+        let (first, second) = (&turns[0], &turns[1]);
+        assert_eq!(first.index, 1);
+        assert_eq!(first.prompt.as_deref(), Some("fix the parser"));
+        assert_eq!(first.wrote, [a.clone(), b.clone()]);
+        let commands: Vec<&str> = first.ran.iter().map(|r| r.command.as_str()).collect();
+        assert_eq!(commands, ["cargo test"]);
+        assert!(before <= first.started && first.started <= after);
+        let ended = first.ended.expect("the first turn ended");
+        assert!(first.started <= ended && ended <= second.started);
+        assert_eq!(second.index, 2);
+        assert_eq!(second.prompt.as_deref(), Some("now c"));
+        assert_eq!(second.wrote, [c]);
+        assert!(second.ran.is_empty());
+        assert_eq!(second.ended, None, "still running");
+
+        // The archived ledger keeps the times, so its turns are the same.
+        let ledgers = tree.0.join("ledgers");
+        archive_in(&dir, &ledgers, "ws");
+        assert_eq!(super::turns(&ledger_dir(&ledgers, "ws").join("s1")), turns);
+    }
+
+    /// What came before the first prompt is turn 0, with no prompt; a
+    /// prompt with no Stop ends at the next prompt; a write after Stop
+    /// stays with the turn that just ended; a question is not the end, an
+    /// API error is.
+    #[test]
+    fn turns_keep_what_came_before_the_first_prompt_as_turn_0() {
+        let tree = TempTree::new(
+            "review-turn-0",
+            &[(
+                "s/events",
+                "ran\t100\t0\tls\n\
+                 wrote\t101\tWrite\t/w/early.rs\n\
+                 prompted\t110\tfirst\n\
+                 wrote\t111\tEdit\t/w/a.rs\n\
+                 prompted\t120\tsecond\n\
+                 wrote\t121\tEdit\t/w/b.rs\n\
+                 asked\t125\tClaude needs your permission\n\
+                 wrote\t126\tEdit\t/w/b.rs\n\
+                 asked\t130\tfinished\n\
+                 wrote\t131\tEdit\t/w/late.rs\n\
+                 prompted\t140\tthird\n\
+                 wrote\t141\tEdit\t/w/c.rs\n\
+                 apierror\t145\toverloaded\tAPI Error: 529\n\
+                 prompted\t150\tfourth\n",
+            )],
+        );
+        let turns = turns(&tree.0.join("s"));
+        // Index, prompt, start, end, files written, commands run.
+        type Row<'a> = (
+            usize,
+            Option<&'a str>,
+            u64,
+            Option<u64>,
+            Vec<&'a Path>,
+            usize,
+        );
+        let summary: Vec<Row> = turns
+            .iter()
+            .map(|t| {
+                (
+                    t.index,
+                    t.prompt.as_deref(),
+                    t.started,
+                    t.ended,
+                    t.wrote.iter().map(PathBuf::as_path).collect(),
+                    t.ran.len(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (0, None, 100, Some(110), vec![Path::new("/w/early.rs")], 1),
+                (
+                    1,
+                    Some("first"),
+                    110,
+                    Some(120),
+                    vec![Path::new("/w/a.rs")],
+                    0
+                ),
+                (
+                    2,
+                    Some("second"),
+                    120,
+                    Some(130),
+                    vec![Path::new("/w/b.rs"), Path::new("/w/late.rs")],
+                    0
+                ),
+                (
+                    3,
+                    Some("third"),
+                    140,
+                    Some(145),
+                    vec![Path::new("/w/c.rs")],
+                    0
+                ),
+                (4, Some("fourth"), 150, None, Vec::new(), 0),
+            ]
+        );
+        // Prompted from the start: no turn 0.
+        let tree = TempTree::new(
+            "review-turn-1",
+            &[("s/events", "prompted\t5\tgo\nwrote\t6\tWrite\t/w/a.rs\n")],
+        );
+        let turns = super::turns(&tree.0.join("s"));
+        assert_eq!(turns.len(), 1);
+        assert_eq!((turns[0].index, turns[0].ended), (1, None));
+        assert!(super::turns(&tree.0.join("none")).is_empty());
+    }
+
+    /// Lines written before wrote, prompted, asked and apierror lines had a time
+    /// still read, as turns with no time, and in the trail.
+    #[test]
+    fn event_lines_without_a_time_still_parse() {
+        let old = |line: &str| timed_event(line).expect(line);
+        assert_eq!(
+            old("wrote\tEdit\t/w/a.rs"),
+            (
+                None,
+                Event::Wrote {
+                    tool: "Edit".into(),
+                    path: PathBuf::from("/w/a.rs")
+                }
+            )
+        );
+        assert_eq!(
+            old("wrote\t300\tEdit\t/w/a.rs"),
+            (
+                Some(300),
+                Event::Wrote {
+                    tool: "Edit".into(),
+                    path: PathBuf::from("/w/a.rs")
+                }
+            )
+        );
+        assert_eq!(
+            old("prompted\t12 apples"),
+            (None, Event::Prompted("12 apples".into()))
+        );
+        assert_eq!(
+            old("prompted\t300\t12 apples"),
+            (Some(300), Event::Prompted("12 apples".into()))
+        );
+        assert_eq!(
+            old("asked\tfinished"),
+            (None, Event::Asked(FINISHED.into()))
+        );
+        assert_eq!(
+            old("asked\t300\tfinished"),
+            (Some(300), Event::Asked(FINISHED.into()))
+        );
+        assert_eq!(
+            old("asked\t300\t"),
+            (Some(300), Event::Asked(String::new()))
+        );
+        let overloaded = |details: &str| Event::ApiError {
+            error: "overloaded".into(),
+            details: details.into(),
+        };
+        assert_eq!(
+            old("apierror\toverloaded\tAPI Error: 529"),
+            (None, overloaded("API Error: 529"))
+        );
+        assert_eq!(old("apierror\toverloaded\t"), (None, overloaded("")));
+        assert_eq!(
+            old("apierror\t300\toverloaded\tAPI Error: 529"),
+            (Some(300), overloaded("API Error: 529"))
+        );
+        assert_eq!(
+            old("apierror\t300\toverloaded\t"),
+            (Some(300), overloaded(""))
+        );
+
+        let tree = TempTree::new(
+            "review-old-lines",
+            &[(
+                "s/events",
+                "prompted\tfirst\nwrote\tWrite\t/w/a.rs\nasked\tfinished\n\
+                 prompted\t50\tsecond\nwrote\t51\tEdit\t/w/b.rs\n",
+            )],
+        );
+        let dir = tree.0.join("s");
+        let turns = turns(&dir);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(
+            (turns[0].started, turns[0].ended, turns[0].wrote.len()),
+            (0, Some(0), 1)
+        );
+        assert_eq!((turns[1].started, turns[1].ended), (50, None));
+        assert_eq!(
+            trail(std::slice::from_ref(&dir)).wrote,
+            [PathBuf::from("/w/a.rs"), PathBuf::from("/w/b.rs")]
+        );
+    }
+
+    /// Claude's own id for the session goes in `about` once, from the
+    /// first hook that has one, beside the tab's title and folder.
+    #[test]
+    fn the_claude_session_id_is_recorded_once() {
+        let tree = TempTree::new("review-claude-session", &[]);
+        let dir = tree.0.join("s");
+        hook("prompt", r#"{"prompt":"a"}"#, &dir).expect("prompt");
+        assert_eq!(claude_session(&dir), None);
+        let id = "3f2a9c1e-7b4d-4e8a-9c0f-1a2b3c4d5e6f";
+        hook(
+            "prompt",
+            &format!(r#"{{"session_id":"{id}","prompt":"b"}}"#),
+            &dir,
+        )
+        .expect("prompt");
+        hook("stop", r#"{"session_id":"another"}"#, &dir).expect("stop");
+        assert_eq!(claude_session(&dir).as_deref(), Some(id));
+        describe(&dir, "Agent", Path::new("/work/garden-log"));
+        let text = std::fs::read_to_string(dir.join("about")).expect("about");
+        assert_eq!(text.matches("claude_session=").count(), 1, "{text}");
+        assert_eq!(
+            about(&dir),
+            ("Agent".into(), PathBuf::from("/work/garden-log"))
+        );
+        // Anything that is not an id is not kept.
+        let other = tree.0.join("t");
+        hook(
+            "prompt",
+            r#"{"session_id":"a\nfolder=/x","prompt":"a"}"#,
+            &other,
+        )
+        .expect("hook");
+        assert_eq!(claude_session(&other), None);
+        assert!(!other.join("about").exists());
     }
 
     #[test]
