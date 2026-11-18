@@ -8,7 +8,8 @@
 //! lands, so there is no race with the watcher, and appends a line to its
 //! `events` file. The window reads new lines when the terminal prints.
 //! After the write, `crc --hook post` records the file as the agent left
-//! it, which is what Undo checks before it puts anything back.
+//! it, which is what Undo checks before it puts anything back, and keeps
+//! that text in local history as the session's version.
 //!
 //! Layout of a session folder:
 //!
@@ -152,8 +153,15 @@ pub const FINISHED: &str = "finished";
 /// `post` records the file as the tool left it, `notify` records the
 /// agent's question, `stop-failure` the API error that ended the turn,
 /// `prompt` the first line of what the person sent. The event appended to
-/// the session's `events`, when the hook is one that is.
-pub fn hook(kind: &str, input: &str, dir: &Path) -> Result<Option<Event>, String> {
+/// the session's `events`, when the hook is one that is. With `history`,
+/// `post` also keeps the file's new text in local history, as the
+/// session's version of it.
+pub fn hook(
+    kind: &str,
+    input: &str,
+    dir: &Path,
+    history: Option<&crate::history::recorder::AgentHistory>,
+) -> Result<Option<Event>, String> {
     let value = crate::json::parse(input).map_err(|e| format!("hook input: {e}"))?;
     note_claude_session(dir, &value);
     let written = || -> Result<(String, PathBuf), String> {
@@ -185,10 +193,12 @@ pub fn hook(kind: &str, input: &str, dir: &Path) -> Result<Option<Event>, String
         }
         "post" => {
             let (_, path) = written()?;
+            let kept = keep_version(history, dir, &path);
             let holder = holder(dir, &path);
             if has(&holder, &path) {
                 record_after(&holder, &path).map_err(|e| format!("{}: {e}", path.display()))?;
             }
+            kept?;
             return Ok(None);
         }
         "notify" => Event::Asked(
@@ -338,12 +348,41 @@ pub fn run_hook(kind: &str) {
         &mut std::io::Read::take(std::io::stdin(), 16 << 20),
         &mut input,
     );
+    // Only a write done has a version to keep, so only then the settings
+    // are read.
+    let history = (kind == "post")
+        .then(crate::history::recorder::AgentHistory::from_settings)
+        .flatten();
     let result = match read {
-        Ok(_) => hook(kind, &input, &dir),
+        Ok(_) => hook(kind, &input, &dir, history.as_ref()),
         Err(e) => Err(format!("hook input: {e}")),
     };
     if let Err(e) = result {
         let _ = append(&dir, &Event::Failed(e));
+    }
+}
+
+/// Keeps `path` as the agent just left it in local history, as a version
+/// of the crc session in `dir`: its folder's name, the id a ledger keeps
+/// too, so the session's turns can find their versions. Claude's own id is
+/// not used: a crc session may hold several of Claude's, and the turns are
+/// the crc session's. The session that wrote is named even when another
+/// holds the file's checkpoint.
+fn keep_version(
+    history: Option<&crate::history::recorder::AgentHistory>,
+    dir: &Path,
+    path: &Path,
+) -> Result<(), String> {
+    let (Some(history), Some(session)) = (history, dir.file_name().and_then(|n| n.to_str())) else {
+        return Ok(());
+    };
+    if git_metadata(path) {
+        return Ok(());
+    }
+    match history.wrote(path, session) {
+        // A history from a newer crc is read-only, which is not a failure.
+        Ok(_) | Err(crate::history::store::Error::ReadOnly) => Ok(()),
+        Err(e) => Err(format!("{}: {e}", path.display())),
     }
 }
 
@@ -1642,6 +1681,14 @@ fn forget(dir: &Path, file: &File) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::recorder::AgentHistory;
+    use crate::history::store::{Reason, Store};
+
+    /// [`super::hook`] with no local history: a test never writes to the
+    /// person's own.
+    fn hook(kind: &str, input: &str, dir: &Path) -> Result<Option<Event>, String> {
+        super::hook(kind, input, dir, None)
+    }
 
     #[test]
     fn ids_made_at_once_differ() {
@@ -1696,6 +1743,157 @@ mod tests {
             r#"{{"hook_event_name":"PreToolUse","cwd":"/","tool_name":"Edit","tool_input":{{"file_path":{}}}}}"#,
             crate::json::compact(&crate::json::string(&path.to_string_lossy()))
         )
+    }
+
+    /// Local history in a history file of the test's own, as
+    /// `CRC_HISTORY_DB` points a self-test at one.
+    fn history_in(tree: &TempTree, exclude: &str) -> AgentHistory {
+        AgentHistory {
+            db: tree.0.join("history").join("history.db"),
+            on: true,
+            exclude: exclude.into(),
+        }
+    }
+
+    /// `path`'s versions in `history`, newest first, with their text.
+    fn versions(history: &AgentHistory, path: &Path) -> Vec<(Reason, Option<String>, String)> {
+        let Some(store) = Store::open_to_read(&history.db).expect("open") else {
+            return Vec::new();
+        };
+        store
+            .list(path)
+            .expect("list")
+            .into_iter()
+            .map(|e| {
+                let text = store.read(e.id).expect("read").unwrap_or_default();
+                (e.reason, e.session, text)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_write_done_is_kept_in_local_history_as_the_sessions_version() {
+        let tree = TempTree::new("review-history", &[("a.txt", "one\n")]);
+        let dir = tree.0.join("5f3a-77-0");
+        let history = history_in(&tree, "");
+        let a = crate::platform::canonical(&tree.0.join("a.txt"));
+        let post = |dir: &Path| super::hook("post", &pre(&a), dir, Some(&history));
+
+        hook("pre", &pre(&a), &dir).expect("hook");
+        std::fs::write(&a, "two\r\nlines\r\n").expect("agent writes");
+        assert_eq!(post(&dir).expect("hook"), None);
+        // Kept as a document opened on it holds it: LF line endings.
+        assert_eq!(
+            versions(&history, &a),
+            [(
+                Reason::Agent,
+                Some("5f3a-77-0".to_owned()),
+                "two\nlines\n".to_owned()
+            )]
+        );
+        // The same text again in the same session is the same version; a
+        // new text is a new one.
+        post(&dir).expect("hook");
+        std::fs::write(&a, "three\n").expect("agent writes");
+        post(&dir).expect("hook");
+        let texts: Vec<String> = versions(&history, &a).into_iter().map(|v| v.2).collect();
+        assert_eq!(texts, ["three\n", "two\nlines\n"]);
+        // Undo's record of the file is kept as before.
+        let file = files(&dir).remove(0);
+        assert_eq!(undoable_now(&dir, &file), Ok(()));
+
+        // Another session leaving the same text has its own version, even
+        // though the first session holds the file's checkpoint.
+        let other = tree.0.join("5f3a-78-0");
+        super::hook("post", &pre(&a), &other, Some(&history)).expect("hook");
+        let sessions: Vec<Option<String>> =
+            versions(&history, &a).into_iter().map(|v| v.1).collect();
+        assert_eq!(
+            sessions,
+            [
+                Some("5f3a-78-0".to_owned()),
+                Some("5f3a-77-0".to_owned()),
+                Some("5f3a-77-0".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn local_historys_rules_hold_for_agent_writes() {
+        let tree = TempTree::new(
+            "review-history-rules",
+            &[
+                (".env", "TOKEN=1\n"),
+                ("logs/run.log", "log\n"),
+                ("kept.txt", "kept\n"),
+                ("repo/.git/config", "[core]\n"),
+            ],
+        );
+        let dir = tree.0.join("session");
+        let history = history_in(&tree, "*.log");
+        let post = |path: &Path| {
+            let path = crate::platform::canonical(path);
+            super::hook("post", &pre(&path), &dir, Some(&history)).expect("hook");
+            versions(&history, &path).len()
+        };
+        // Secrets by name, the user's globs, Git's own files.
+        assert_eq!(post(&tree.0.join(".env")), 0);
+        assert_eq!(post(&tree.0.join("logs/run.log")), 0);
+        assert_eq!(post(&tree.0.join("repo/.git/config")), 0);
+        // Too big, and not text.
+        let big = tree.0.join("big.txt");
+        std::fs::write(&big, "x".repeat(crate::history::recorder::MAX_BYTES + 1)).expect("write");
+        assert_eq!(post(&big), 0);
+        let binary = tree.0.join("blob.bin");
+        std::fs::write(&binary, [0u8, 1, 2, 0, 255]).expect("write");
+        assert_eq!(post(&binary), 0);
+        // Not on this Mac's disk, as a file on another machine is: nothing,
+        // and no failure for the agent.
+        assert_eq!(post(&tree.0.join("elsewhere/gone.txt")), 0);
+        assert!(!dir.join("events").exists(), "nothing failed");
+        // Local history off.
+        let off = AgentHistory {
+            on: false,
+            ..history_in(&tree, "")
+        };
+        let kept = crate::platform::canonical(&tree.0.join("kept.txt"));
+        super::hook("post", &pre(&kept), &dir, Some(&off)).expect("hook");
+        assert_eq!(versions(&history, &kept).len(), 0);
+        // And what the rules allow is kept.
+        assert_eq!(post(&tree.0.join("kept.txt")), 1);
+    }
+
+    /// A history the hook cannot write is the hook's failure, said the way
+    /// its others are; one from a newer crc is read-only, which is not one.
+    #[test]
+    fn a_history_that_cannot_be_written_never_fails_the_agent() {
+        let tree = TempTree::new("review-history-broken", &[("a.txt", "one\n")]);
+        let dir = tree.0.join("session");
+        let a = crate::platform::canonical(&tree.0.join("a.txt"));
+
+        let newer = history_in(&tree, "");
+        std::fs::create_dir_all(newer.db.parent().unwrap()).expect("mkdir");
+        crate::index::db::Db::open(&newer.db)
+            .expect("db")
+            .execute("PRAGMA user_version = 99")
+            .expect("version");
+        super::hook("post", &pre(&a), &dir, Some(&newer)).expect("hook");
+        assert!(!dir.join("events").exists(), "read-only is not a failure");
+
+        // A history file that is a folder cannot be opened at all.
+        let broken = AgentHistory {
+            db: tree.0.join("folder.db"),
+            on: true,
+            exclude: String::new(),
+        };
+        std::fs::create_dir_all(&broken.db).expect("mkdir");
+        // An error, which run_hook appends as a failure and never returns
+        // to the agent.
+        let failed = super::hook("post", &pre(&a), &dir, Some(&broken));
+        assert!(
+            failed.as_ref().is_err_and(|e| e.contains("a.txt")),
+            "{failed:?}"
+        );
     }
 
     #[test]

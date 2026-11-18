@@ -398,9 +398,10 @@ the size and write it back.
   the files you edit, up to 2 MB each, for 30 days
   (`~/Library/Application Support/crc/history.db`): as opened, at each
   save, before a reload, when closed unsaved and after 30 seconds without
-  typing. `.env` files, keys and `~/.ssh` are never kept;
-  `local_history_exclude` leaves out more, and `local_history = false`
-  turns it off. Undo and redo survive a restart: reopen a file that has
+  typing. Each file an agent in a crc terminal writes is kept too, open
+  or not, as that session's version. `.env` files, keys and `~/.ssh` are
+  never kept; `local_history_exclude` leaves out more, and
+  `local_history = false` turns it off. Undo and redo survive a restart: reopen a file that has
   not changed on disk since crc last saw it and they come back. Git >
   Recover Deleted File opens a deleted file's last
   version again, and Git > Clear History for This File or Clear All

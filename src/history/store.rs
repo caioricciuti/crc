@@ -27,10 +27,13 @@ use crate::index::db::{self, Db, Value};
 /// Migrations only ever add: a file from an older crc is brought forward,
 /// one from a newer crc is opened read-only. A new `Reason` raises it too,
 /// so an older crc never reads a reason it cannot name.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
-/// `MIGRATIONS[n]` takes a file from version `n` to `n + 1`.
-const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = ["
+/// `MIGRATIONS[n]` takes a file from version `n` to `n + 1`. Each runs
+/// once: under the write lock, in the transaction that records the new
+/// version, after reading the version again.
+const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [
+    "
     CREATE TABLE files (
         id   INTEGER PRIMARY KEY,
         path TEXT NOT NULL UNIQUE
@@ -59,7 +62,14 @@ const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = ["
         size  INTEGER NOT NULL,
         data  BLOB NOT NULL
     ) STRICT;
-"];
+",
+    // Version 2: the crc session an agent's version was written in
+    // (`Reason::Agent`); NULL for every other version.
+    "ALTER TABLE snapshots ADD COLUMN session TEXT;",
+];
+
+/// The first version whose snapshots have a `session` column.
+const SESSION_VERSION: i64 = 2;
 
 /// Pages returned to the file system per incremental vacuum step, so one
 /// step never holds the write lock for long.
@@ -152,10 +162,13 @@ pub enum Reason {
     Quit,
     BeforeRestore,
     EditedOnDisk,
+    /// An agent in a crc terminal wrote the file: its text just after,
+    /// from the agent's hook, with the session's id.
+    Agent,
 }
 
 impl Reason {
-    pub const ALL: [Reason; 8] = [
+    pub const ALL: [Reason; 9] = [
         Reason::Opened,
         Reason::Saved,
         Reason::Idle,
@@ -164,6 +177,7 @@ impl Reason {
         Reason::Quit,
         Reason::BeforeRestore,
         Reason::EditedOnDisk,
+        Reason::Agent,
     ];
 
     /// The value written to the database. Never renumber.
@@ -177,6 +191,7 @@ impl Reason {
             Reason::Quit => 6,
             Reason::BeforeRestore => 7,
             Reason::EditedOnDisk => 8,
+            Reason::Agent => 9,
         }
     }
 
@@ -197,6 +212,9 @@ pub struct Entry {
     pub reason: Reason,
     /// The text's length in bytes, uncompressed.
     pub size: usize,
+    /// The crc session an agent's version was written in, its folder's
+    /// name; `None` for any other version.
+    pub session: Option<String>,
 }
 
 /// A file's saved undo journal and the text it applies to.
@@ -254,6 +272,9 @@ pub struct Store {
     db: Db,
     read_only: bool,
     quarantined: Option<PathBuf>,
+    /// Whether the file's snapshots have a `session` column: false only
+    /// for a file a reader found not yet migrated.
+    sessions: bool,
 }
 
 impl Store {
@@ -261,10 +282,10 @@ impl Store {
     /// database or fails its check is renamed aside and a new one started;
     /// `take_quarantined` says where it went.
     pub fn open(path: &Path) -> Result<Store> {
-        match Store::open_once(path) {
+        match Store::open_once(path, true) {
             Err(e) if e.is_corrupt() => {
                 let aside = quarantine(path)?;
-                let mut store = Store::open_once(path)?;
+                let mut store = Store::open_once(path, true)?;
                 store.quarantined = Some(aside);
                 Ok(store)
             }
@@ -272,7 +293,19 @@ impl Store {
         }
     }
 
-    fn open_once(path: &Path) -> Result<Store> {
+    /// Opens or creates the history at `path` for a write or two from
+    /// another process, an agent's hook: as [`Store::open`], but without
+    /// the check, which reads the whole file, so the hook stays quick. A
+    /// damaged file fails here instead, and is left for the window's
+    /// history thread to set aside. Writes wait at most `busy_ms` on
+    /// another connection's lock.
+    pub fn open_quick(path: &Path, busy_ms: i32) -> Result<Store> {
+        let store = Store::open_once(path, false)?;
+        store.db.set_busy_timeout(busy_ms);
+        Ok(store)
+    }
+
+    fn open_once(path: &Path, check: bool) -> Result<Store> {
         private_files(path)?;
         let db = Db::open(path)?;
         let version = query_int(&db, "PRAGMA user_version", &[])?.unwrap_or(0);
@@ -282,18 +315,12 @@ impl Store {
                 db: Db::open_readonly(path)?,
                 read_only: true,
                 quarantined: None,
+                // Migrations only ever add, so a newer file has it too.
+                sessions: true,
             });
         }
-        let check = {
-            let mut statement = db.prepare("PRAGMA quick_check")?;
-            if statement.step()? {
-                statement.text(0)
-            } else {
-                String::new()
-            }
-        };
-        if check != "ok" {
-            return Err(Error::Corrupt(check));
+        if check {
+            check_integrity(&db)?;
         }
         // auto_vacuum only takes on a file with no tables yet, so it goes
         // first; on an existing file it is a no-op.
@@ -318,6 +345,7 @@ impl Store {
             db,
             read_only: false,
             quarantined: None,
+            sessions: true,
         })
     }
 
@@ -332,10 +360,13 @@ impl Store {
         }
         let db = Db::open_readonly(path)?;
         db.set_busy_timeout(READ_BUSY_MS);
+        // Not migrated yet when no writer has opened it since an update.
+        let version = query_int(&db, "PRAGMA user_version", &[])?.unwrap_or(0);
         Ok(Some(Store {
             db,
             read_only: true,
             quarantined: None,
+            sessions: version >= SESSION_VERSION,
         }))
     }
 
@@ -366,6 +397,31 @@ impl Store {
         reason: Reason,
         at: i64,
     ) -> Result<Option<SnapshotId>> {
+        self.put_version(path, text, reason, at, None)
+    }
+
+    /// [`Store::put_snapshot`] for a version an agent wrote in the crc
+    /// session `session`. Its text may equal the latest version and still
+    /// be kept, once per session, so every session that wrote the file
+    /// has a version of its own to go back to.
+    pub fn put_agent_snapshot(
+        &self,
+        path: &Path,
+        text: &str,
+        session: &str,
+        at: i64,
+    ) -> Result<Option<SnapshotId>> {
+        self.put_version(path, text, Reason::Agent, at, Some(session))
+    }
+
+    fn put_version(
+        &self,
+        path: &Path,
+        text: &str,
+        reason: Reason,
+        at: i64,
+        session: Option<&str>,
+    ) -> Result<Option<SnapshotId>> {
         self.writable()?;
         let key = key(path)?;
         let hash = digest(text.as_bytes())?;
@@ -378,12 +434,14 @@ impl Store {
                 &[hash.as_slice().into()],
             )?;
             if let (Some(file), Some(blob)) = (file, blob) {
-                let latest = query_int(
-                    db,
-                    "SELECT blob FROM snapshots WHERE file = ?1 ORDER BY id DESC LIMIT 1",
-                    &[file.into()],
+                let mut latest = db.prepare(
+                    "SELECT blob, session FROM snapshots WHERE file = ?1 ORDER BY id DESC LIMIT 1",
                 )?;
-                if latest == Some(blob) {
+                latest.bind(&[file.into()])?;
+                if latest.step()?
+                    && latest.int(0) == blob
+                    && (session.is_none() || text_or_null(&latest, 1).as_deref() == session)
+                {
                     return Ok(None);
                 }
             }
@@ -395,8 +453,17 @@ impl Store {
                 Some(blob) => blob,
                 None => insert_blob(db, &hash, text.as_bytes())?,
             };
-            db.prepare("INSERT INTO snapshots (file, blob, at, reason) VALUES (?1, ?2, ?3, ?4)")?
-                .run(&[file.into(), blob.into(), at.into(), reason.id().into()])?;
+            db.prepare(
+                "INSERT INTO snapshots (file, blob, at, reason, session)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?
+            .run(&[
+                file.into(),
+                blob.into(),
+                at.into(),
+                reason.id().into(),
+                session.map_or(Value::Null, Value::from),
+            ])?;
             Ok(Some(SnapshotId(db.last_insert_rowid())))
         })?)
     }
@@ -404,12 +471,14 @@ impl Store {
     /// `path`'s versions, newest first.
     pub fn list(&self, path: &Path) -> Result<Vec<Entry>> {
         let key = key(path)?;
-        let mut statement = self.db.prepare(
-            "SELECT s.id, s.at, s.reason, b.size FROM snapshots s
+        // A file a reader found not yet migrated has no sessions to read.
+        let session = if self.sessions { "s.session" } else { "NULL" };
+        let mut statement = self.db.prepare(&format!(
+            "SELECT s.id, s.at, s.reason, b.size, {session} FROM snapshots s
              JOIN files f ON f.id = s.file
              JOIN blobs b ON b.id = s.blob
-             WHERE f.path = ?1 ORDER BY s.id DESC",
-        )?;
+             WHERE f.path = ?1 ORDER BY s.id DESC"
+        ))?;
         statement.bind(&[key.into()])?;
         let mut entries = Vec::new();
         while statement.step()? {
@@ -421,6 +490,7 @@ impl Store {
                 at: statement.int(1),
                 reason,
                 size: usize::try_from(statement.int(3)).unwrap_or(0),
+                session: text_or_null(&statement, 4),
             });
         }
         Ok(entries)
@@ -676,6 +746,23 @@ impl Store {
     }
 }
 
+/// `PRAGMA quick_check`, as an error when it finds anything.
+fn check_integrity(db: &Db) -> Result<()> {
+    let check = {
+        let mut statement = db.prepare("PRAGMA quick_check")?;
+        if statement.step()? {
+            statement.text(0)
+        } else {
+            String::new()
+        }
+    };
+    if check == "ok" {
+        Ok(())
+    } else {
+        Err(Error::Corrupt(check))
+    }
+}
+
 struct Row {
     id: i64,
     file: i64,
@@ -768,6 +855,11 @@ fn collect_garbage(db: &Db) -> db::Result<usize> {
          AND NOT EXISTS (SELECT 1 FROM undo WHERE file = files.id)",
     )?;
     Ok(blobs)
+}
+
+/// A text column that may be NULL.
+fn text_or_null(statement: &db::Statement<'_>, col: i32) -> Option<String> {
+    (!statement.is_null(col)).then(|| statement.text(col))
 }
 
 fn query_int(db: &Db, sql: &str, params: &[Value<'_>]) -> db::Result<Option<i64>> {
@@ -957,12 +1049,192 @@ mod tests {
     #[test]
     fn reason_ids_are_stable() {
         let ids: Vec<i64> = Reason::ALL.iter().map(|r| r.id()).collect();
-        assert_eq!(ids, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(ids, [1, 2, 3, 4, 5, 6, 7, 8, 9]);
         for reason in Reason::ALL {
             assert_eq!(Reason::from_id(reason.id()), Some(reason));
         }
         assert_eq!(Reason::from_id(0), None);
-        assert_eq!(Reason::from_id(9), None);
+        assert_eq!(Reason::from_id(10), None);
+    }
+
+    /// A file as a crc from before sessions made it: version 1, with a
+    /// version of `/notes/plan.md` in it.
+    fn version_one(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let db = Db::open(path).unwrap();
+        db.execute(MIGRATIONS[0]).unwrap();
+        db.execute("PRAGMA user_version = 1").unwrap();
+        let file = insert_file(&db, "/notes/plan.md").unwrap();
+        let hash = digest(b"from version one").unwrap();
+        let blob = insert_blob(&db, &hash, b"from version one").unwrap();
+        db.prepare("INSERT INTO snapshots (file, blob, at, reason) VALUES (?1, ?2, ?3, ?4)")
+            .unwrap()
+            .run(&[
+                file.into(),
+                blob.into(),
+                NOW.into(),
+                Reason::Saved.id().into(),
+            ])
+            .unwrap();
+    }
+
+    fn columns(store: &Store) -> Vec<String> {
+        let mut statement = store.db.prepare("PRAGMA table_info(snapshots)").unwrap();
+        statement.bind(&[]).unwrap();
+        let mut names = Vec::new();
+        while statement.step().unwrap() {
+            names.push(statement.text(1));
+        }
+        names
+    }
+
+    #[test]
+    fn a_version_one_file_is_migrated_and_keeps_its_versions() {
+        let path = temp("migrate-v1");
+        version_one(&path);
+        let file = Path::new("/notes/plan.md");
+
+        // A reader before any writer has migrated it reads it as it is.
+        let reader = Store::open_to_read(&path).unwrap().unwrap();
+        let before = reader.list(file).unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].session, None);
+        drop(reader);
+
+        let store = Store::open(&path).unwrap();
+        assert!(!store.read_only());
+        assert_eq!(count(&store, "PRAGMA user_version"), 2);
+        assert_eq!(
+            columns(&store),
+            ["id", "file", "blob", "at", "reason", "session"]
+        );
+        let entries = store.list(file).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].reason, Reason::Saved);
+        assert_eq!(entries[0].session, None);
+        assert_eq!(
+            store.read(entries[0].id).unwrap().as_deref(),
+            Some("from version one")
+        );
+        drop(store);
+
+        // Opened again, quickly or not, it migrates nothing a second time.
+        let quick = Store::open_quick(&path, 100).unwrap();
+        assert_eq!(columns(&quick).len(), 6);
+        drop(quick);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.list(file).unwrap().len(), 1);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn two_crcs_migrating_at_once_migrate_once() {
+        let path = temp("migrate-race");
+        version_one(&path);
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || Store::open(&path).map(|_| ()))
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap().unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(count(&store, "PRAGMA user_version"), SCHEMA_VERSION);
+        assert_eq!(store.list(Path::new("/notes/plan.md")).unwrap().len(), 1);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn agent_versions_keep_their_session() {
+        let path = temp("agent");
+        let store = Store::open(&path).unwrap();
+        let file = Path::new("/notes/plan.md");
+        let idle = put(&store, "/notes/plan.md", "before", NOW);
+        let agent = store
+            .put_agent_snapshot(file, "after", "session-a", NOW + 1)
+            .unwrap()
+            .expect("a new version");
+        assert_eq!(
+            store
+                .put_agent_snapshot(file, "after", "session-a", NOW + 2)
+                .unwrap(),
+            None,
+            "the same session writing the same text again is one version"
+        );
+        // Another session leaving the same text has a version of its own.
+        let other = store
+            .put_agent_snapshot(file, "after", "session-b", NOW + 3)
+            .unwrap()
+            .expect("a version for the other session");
+        // And the window's own version of that text is not stored again.
+        assert_eq!(
+            store
+                .put_snapshot(file, "after", Reason::Saved, NOW + 4)
+                .unwrap(),
+            None
+        );
+        let entries = store.list(file).unwrap();
+        assert_eq!(ids(&entries), [other.0, agent.0, idle.0]);
+        let shown: Vec<(Reason, Option<&str>)> = entries
+            .iter()
+            .map(|e| (e.reason, e.session.as_deref()))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                (Reason::Agent, Some("session-b")),
+                (Reason::Agent, Some("session-a")),
+                (Reason::Idle, None),
+            ]
+        );
+        assert_eq!(store.read(agent).unwrap().as_deref(), Some("after"));
+        assert_eq!(count(&store, "SELECT count(*) FROM blobs"), 2);
+        // A reader sees them too.
+        let reader = Store::open_to_read(&path).unwrap().unwrap();
+        assert_eq!(reader.list(file).unwrap(), entries);
+        cleanup(&path);
+    }
+
+    /// What an older crc does with a version it cannot name: it is left
+    /// out of the list, not read as something else.
+    #[test]
+    fn a_reason_from_a_newer_crc_is_left_out() {
+        let path = temp("unknown-reason");
+        let store = Store::open(&path).unwrap();
+        let kept = put(&store, "/notes/plan.md", "one", NOW);
+        put(&store, "/notes/plan.md", "two", NOW + 1);
+        store
+            .db
+            .execute("UPDATE snapshots SET reason = 99 WHERE id <> 1")
+            .unwrap();
+        assert_eq!(
+            ids(&store.list(Path::new("/notes/plan.md")).unwrap()),
+            [kept.0]
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_quick_open_creates_migrates_and_respects_a_newer_file() {
+        let path = temp("quick");
+        let store = Store::open_quick(&path, 100).unwrap();
+        assert!(!store.read_only());
+        assert_eq!(count(&store, "PRAGMA user_version"), SCHEMA_VERSION);
+        store
+            .put_agent_snapshot(Path::new("/x"), "x", "s", NOW)
+            .unwrap()
+            .unwrap();
+        store.db.execute("PRAGMA user_version = 99").unwrap();
+        drop(store);
+        let store = Store::open_quick(&path, 100).unwrap();
+        assert!(store.read_only());
+        assert!(matches!(
+            store.put_agent_snapshot(Path::new("/x"), "y", "s", NOW),
+            Err(Error::ReadOnly)
+        ));
+        cleanup(&path);
     }
 
     #[test]
@@ -1056,13 +1328,15 @@ mod tests {
                     id: b,
                     at: NOW + 5,
                     reason: Reason::Saved,
-                    size: 6
+                    size: 6,
+                    session: None,
                 },
                 Entry {
                     id: a,
                     at: NOW,
                     reason: Reason::Opened,
-                    size: 5
+                    size: 5,
+                    session: None,
                 },
             ]
         );

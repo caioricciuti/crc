@@ -577,6 +577,7 @@ mod tests {
             at: at_ms,
             reason,
             size: 1,
+            session: None,
         };
         Version::local(&entry, Path::new("/garden/garden.txt"))
     }

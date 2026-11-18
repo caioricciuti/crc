@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use super::store::{Caps, Error, Reason, Store};
+use super::store::{Caps, Error, Reason, SnapshotId, Store};
 use crate::complete::glob::{self, Pattern};
 use crate::platform::dispatch::Wake;
 use crate::text::buffer::{Buffer, DiskEvent};
@@ -786,6 +786,106 @@ impl Recorder {
             self.worker = None;
             self.on = false;
         }
+    }
+}
+
+/// How long an agent's hook waits on another crc's lock on the history
+/// before it lets the version go: the agent waits on the hook.
+const AGENT_BUSY_MS: i32 = 1000;
+
+/// Where an agent's hook keeps the versions the agent writes, and whether
+/// it may: the history file and the `local_history` settings.
+pub struct AgentHistory {
+    pub db: PathBuf,
+    pub on: bool,
+    pub exclude: String,
+}
+
+impl AgentHistory {
+    /// As the window would record: [`default_path`](super::store::default_path)
+    /// and the settings file. `None` when there is nowhere to keep them.
+    pub fn from_settings() -> Option<AgentHistory> {
+        let settings = crate::platform::settings::Settings::load();
+        Some(AgentHistory {
+            db: super::store::default_path()?,
+            on: settings.local_history,
+            exclude: settings.local_history_exclude,
+        })
+    }
+
+    /// An agent in the crc session `session` just wrote `path`: its text
+    /// on disk now is kept as a [`Reason::Agent`] version, by the rules an
+    /// open document's versions follow (no secrets, nothing the user's
+    /// globs leave out, nothing over [`MAX_BYTES`] or not text). `None`
+    /// when nothing was kept: left out, gone from this Mac's disk (as a
+    /// file on another machine is), equal to the session's last version
+    /// of it, or a history from a newer crc, which is read-only.
+    pub fn wrote(&self, path: &Path, session: &str) -> Result<Option<SnapshotId>, Error> {
+        if !self.on || !Filter::new(home(), &self.exclude).allows(path) {
+            return Ok(None);
+        }
+        let Some(text) = disk_text(path)? else {
+            return Ok(None);
+        };
+        // The store asserts its writes are off the main thread, the
+        // window's rule; the hook's process keeps to it too.
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| self.put(path, &text, session))
+                .join()
+                .unwrap_or(Ok(None))
+        })
+    }
+
+    fn put(&self, path: &Path, text: &str, session: &str) -> Result<Option<SnapshotId>, Error> {
+        let store = Store::open_quick(&self.db, AGENT_BUSY_MS)?;
+        if store.read_only() {
+            return Ok(None);
+        }
+        let at = now_ms();
+        let mut result = store.put_agent_snapshot(path, text, session, at);
+        if matches!(result, Err(Error::Full(_))) {
+            // Once more with what retention would drop gone, as the
+            // history thread does.
+            let _ = store.prune(now_ms(), &Caps::default());
+            result = store.put_agent_snapshot(path, text, session, at);
+        }
+        // The window prunes after every PRUNE_EVERY versions it adds; a
+        // hook has no count of its own, so it prunes on the ids that are a
+        // multiple of it, about as often.
+        if let Ok(Some(id)) = &result
+            && id.0 % PRUNE_EVERY as i64 == 0
+        {
+            let _ = store.prune(now_ms(), &Caps::default());
+        }
+        result
+    }
+}
+
+/// `path`'s text as a document opened on it would hold it (decoded, LF
+/// line endings), or `None` when it is not there, not text, or over
+/// [`MAX_BYTES`].
+fn disk_text(path: &Path) -> Result<Option<String>, Error> {
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    // UTF-16 takes up to twice the bytes of the text it holds; anything
+    // past that cannot fit once decoded.
+    if !meta.is_file() || meta.len() > 2 * MAX_BYTES as u64 {
+        return Ok(None);
+    }
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    match crate::text::file_format::decode(&bytes) {
+        Ok((text, _)) if text.len() <= MAX_BYTES => Ok(Some(text)),
+        Ok(_) => Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => Ok(None),
+        Err(e) => Err(e.into()),
     }
 }
 

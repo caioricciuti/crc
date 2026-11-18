@@ -290,6 +290,7 @@ pub(super) fn reason_words(reason: Reason) -> &'static str {
         Reason::Quit => "at quit",
         Reason::BeforeRestore => "before restore",
         Reason::EditedOnDisk => "edited on disk",
+        Reason::Agent => "by agent",
     }
 }
 
@@ -3284,6 +3285,7 @@ mod tests {
             at: id * 1000,
             reason,
             size: 1,
+            session: None,
         };
         Version::local(&entry, Path::new("/garden/garden.txt"))
     }
@@ -3359,7 +3361,8 @@ mod tests {
                 "closed without saving",
                 "at quit",
                 "before restore",
-                "edited on disk"
+                "edited on disk",
+                "by agent"
             ]
         );
         // From blame: a local version is no commit, whatever the prefix.
