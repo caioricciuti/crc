@@ -2873,6 +2873,7 @@ impl Panel {
             || self.pr_rx.is_some()
             || self.reading_issue()
             || self.inspector.checking_any()
+            || self.inspector.rewind_rx.is_some()
     }
 
     /// The list, an operation or the inspector is being read; a pull

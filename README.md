@@ -285,6 +285,13 @@ the size and write it back.
   or a pull request: the claims, the commits made since the session
   started with whether each is signed, the installs, the test counts,
   the files written and the failed commands.
+  Under it, Rewind lists the workspace's sessions, newest first, turn by
+  turn: each prompt with when it started, how many files it wrote and
+  commands it ran, and how many failed. Click a turn to list its files
+  and commands; click a file to open it in File History at the version
+  the agent left in that turn (a file local history skips, such as a
+  secret, opens as it is and says so). Rewind only reads: it puts
+  nothing back. View > Show Rewind opens the inspector on it.
   At the bottom of the Agents sidebar, the Activity panel shows the
   whole Mac every two seconds: CPU with a short history, memory used
   and its pressure, disk and network rates, and the three processes

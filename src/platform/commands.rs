@@ -42,6 +42,8 @@ fn keywords(action: Sel) -> &'static str {
         "join unwrap command"
     } else if action == sel!(toggleBlameHeat:) {
         "age recent gutter annotate"
+    } else if action == sel!(showRewind:) {
+        "turns session agent history undo rewind"
     } else if action == sel!(recoverDeletedFile:) {
         "local history restore undelete lost removed"
     } else if action == sel!(clearFileHistory:) || action == sel!(clearAllHistory:) {

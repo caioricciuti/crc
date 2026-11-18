@@ -4440,6 +4440,11 @@ define_class!(
             self.toggle_inspector();
         }
 
+        #[unsafe(method(showRewind:))]
+        fn action_show_rewind(&self, _sender: Option<&AnyObject>) {
+            self.show_rewind();
+        }
+
         #[unsafe(method(agentsTick:))]
         fn action_agents_tick(&self, _sender: Option<&AnyObject>) {
             self.agents_tick();
@@ -4847,6 +4852,9 @@ define_class!(
                     && !state.docs.active().is_frozen()
             } else if action == sel!(saveDocumentAs:) {
                 !state.docs.active().is_frozen()
+            } else if action == sel!(showRewind:) {
+                // The selected workspace's sessions, in Agents mode.
+                state.agents.on && state.agents.selected_index().is_some()
             } else if action == sel!(fileHistory:) {
                 // The key says why when it is not.
                 let active = state.docs.active();
@@ -9916,6 +9924,7 @@ fn install_menu(mtm: MainThreadMarker, app: &NSApplication) {
     inspector
         .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
     view_menu.addItem(&inspector);
+    view_menu.addItem(&item("Show Rewind", sel!(showRewind:), "", false));
     view_menu.addItem(&item(
         "Next Waiting Agent",
         sel!(nextWaitingAgent:),

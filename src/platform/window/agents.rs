@@ -332,6 +332,7 @@ impl EditorView {
         if changed || landed {
             self.request_redraw();
         }
+        self.poll_rewind();
     }
 
     /// From the Activity panel's worker: a read landed.

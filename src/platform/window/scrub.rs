@@ -20,7 +20,7 @@
 use std::collections::VecDeque;
 
 use super::*;
-use crate::history::store::{Reason, Store};
+use crate::history::store::{Reason, SnapshotId, Store};
 use crate::ide::diff::Change;
 use crate::project::git::MarkKind;
 use crate::project::history::{Blob, BlobReader, HISTORY_LIMIT, Source, Version};
@@ -379,13 +379,46 @@ pub(super) fn reslot(
     (newer.unwrap_or(after.len()), false)
 }
 
-/// Where a history opened from the blame heat strip goes: a commit, by
-/// its hash or a prefix of it, and the caret's line and the first line
-/// shown in the file as that commit left it.
+/// Where a history opened at a version goes: from the blame heat strip,
+/// a commit, by its hash or a prefix of it, and the caret's line and the
+/// first line shown in the file as that commit left it; from Rewind, a
+/// local version, the caret where the file has it.
 pub(super) struct Goto {
-    pub(super) commit: String,
+    pub(super) target: Target,
     pub(super) line: usize,
     pub(super) top: usize,
+}
+
+/// The version a [`Goto`] is for.
+pub(super) enum Target {
+    Commit(String),
+    Local(SnapshotId),
+}
+
+impl Goto {
+    /// The local version `id`, the caret left where it is.
+    pub(super) fn local(id: SnapshotId) -> Goto {
+        Goto {
+            target: Target::Local(id),
+            line: 0,
+            top: 0,
+        }
+    }
+}
+
+/// The slot of the local version `id` in `versions`, and what to say when
+/// the list does not have it: the newest stands in.
+pub(super) fn local_slot(versions: &[Version], id: SnapshotId) -> (usize, Option<String>) {
+    match versions
+        .iter()
+        .position(|v| matches!(v.source, Source::Local { id: have, .. } if have == id))
+    {
+        Some(slot) => (slot, None),
+        None => (
+            versions.len().saturating_sub(1),
+            Some("that version is not in this file's history".to_owned()),
+        ),
+    }
 }
 
 /// The version of `versions` made by `commit` (a hash, or a prefix of
@@ -1766,11 +1799,16 @@ impl EditorView {
         let (worker_tx, rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let halt = stop.clone();
-        // Opened at a commit from blame: not among the local versions.
-        let filter = match state.scrub_filter {
-            Filter::Local if goto.is_some() => Filter::All,
-            filter => filter,
+        // Opened at a commit from blame: not among the local versions; at
+        // a local version from Rewind: not among the commits.
+        let filter = match (state.scrub_filter, goto.as_ref().map(|g| &g.target)) {
+            (Filter::Local, Some(Target::Commit(_)))
+            | (Filter::Commits, Some(Target::Local(_))) => Filter::All,
+            (filter, _) => filter,
         };
+        // Opened at a version, it opens with that version's lines, not
+        // after a step from the working tree's.
+        let placed = goto.is_some();
         std::thread::spawn(move || {
             let from = Lister {
                 db: crate::history::store::default_path(),
@@ -1796,7 +1834,7 @@ impl EditorView {
             diffs: HashMap::new(),
             worktree,
             start,
-            placed: goto.is_some(),
+            placed,
             goto,
             note: None,
             fade: None,
@@ -2128,13 +2166,26 @@ impl EditorView {
                         let count = versions.len();
                         // Opened at a commit: that version first, the caret
                         // where the line was. One the list lacks stands in
-                        // with the file's caret, clamped.
+                        // with the file's caret, clamped. At a local
+                        // version: that one, with the file's caret.
                         let first = match scrub.goto.take() {
-                            Some(goto) => {
-                                let (slot, note) = goto_slot(&versions, &goto.commit, capped);
+                            Some(Goto {
+                                target: Target::Commit(commit),
+                                line,
+                                top,
+                            }) => {
+                                let (slot, note) = goto_slot(&versions, &commit, capped);
                                 if note.is_none() {
-                                    scrub.start = (goto.line, 0, goto.top);
+                                    scrub.start = (line, 0, top);
                                 }
+                                scrub.note = note;
+                                slot
+                            }
+                            Some(Goto {
+                                target: Target::Local(id),
+                                ..
+                            }) => {
+                                let (slot, note) = local_slot(&versions, id);
                                 scrub.note = note;
                                 slot
                             }
@@ -3325,6 +3376,27 @@ mod tests {
         assert_eq!(counted(&all, ""), "4 versions");
         assert_eq!(counted(&commits, "+"), "2+ commits");
         assert_eq!(counted(&local[..1], ""), "1 local version");
+    }
+
+    /// Rewind opens a history at a local version by its id: its own slot,
+    /// never a commit's, and the newest with a note when it is gone.
+    #[test]
+    fn a_history_opens_at_a_local_version_by_its_id() {
+        let all = [
+            commit_v("a"),
+            local_v(1, Reason::Saved),
+            local_v(2, Reason::Agent),
+            commit_v("b"),
+        ];
+        assert_eq!(local_slot(&all, SnapshotId(2)), (2, None));
+        assert_eq!(local_slot(&all, SnapshotId(1)), (1, None));
+        let (slot, note) = local_slot(&all, SnapshotId(9));
+        assert_eq!(slot, 3);
+        assert!(note.is_some());
+        assert_eq!(local_slot(&[], SnapshotId(1)).0, 0);
+        // Among the local versions alone, its slot there.
+        let local = visible(&all, Filter::Local).0;
+        assert_eq!(local_slot(&local, SnapshotId(2)), (1, None));
     }
 
     #[test]

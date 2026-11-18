@@ -889,23 +889,25 @@ impl EditorView {
                 });
                 // The receipt of the terminal showing, when it is this
                 // workspace's, after what its closed terminals ran.
-                let live = terminal_panel
-                    .active_tab()
-                    .filter(|t| {
-                        crate::platform::agents::task_of(&agents.tasks, t)
-                            == agents.selected_index()
-                    })
-                    .map(|t| &t.receipt);
+                let live_tab = terminal_panel.active_tab().filter(|t| {
+                    crate::platform::agents::task_of(&agents.tasks, t) == agents.selected_index()
+                });
+                let live = live_tab.map(|t| &t.receipt);
                 let workspace = selected.as_ref().map(|w| w.id());
-                let receipt = crate::project::review::workspace_receipt(
+                // A local folder only: a remote one's path means nothing
+                // here.
+                let folder = selected
+                    .as_ref()
+                    .filter(|w| w.host.is_none())
+                    .map(|w| w.path.as_path());
+                let receipt =
+                    crate::project::review::workspace_receipt(workspace.as_deref(), folder, live);
+                // Its sessions' turns, read again only when they changed.
+                agents.inspector.rewind = crate::project::review::workspace_rewind(
                     workspace.as_deref(),
-                    // A local folder only: a remote one's path means
-                    // nothing here.
-                    selected
-                        .as_ref()
-                        .filter(|w| w.host.is_none())
-                        .map(|w| w.path.as_path()),
-                    live,
+                    folder,
+                    live_tab.map(|t| t.review.as_path()),
+                    live_tab.map_or(0, |t| t.events_read),
                 );
                 agents.inspector.draw(
                     selected.as_ref(),

@@ -75,6 +75,14 @@ pub enum Action {
     /// The Receipt card's Copy Handoff: what the session did, as text on
     /// the clipboard.
     CopyHandoff,
+    /// Rewind's title row: the section folded to it, or opened.
+    FoldRewind,
+    /// A turn's row in Rewind, by its place among the rows drawn: its
+    /// files and commands shown under it, or hidden again.
+    RewindTurn(usize),
+    /// A file under the selected turn: opened in File History at the
+    /// version the agent left that turn.
+    RewindFile,
 }
 
 impl Action {
@@ -99,6 +107,9 @@ impl Action {
             Action::FoldRepo => "repo_fold",
             Action::CheckRemote => "check",
             Action::CopyHandoff => "handoff",
+            Action::FoldRewind => "rewind_fold",
+            Action::RewindTurn(_) => "rewind_turn",
+            Action::RewindFile => "rewind_file",
         }
     }
 }
@@ -136,6 +147,23 @@ type Fact<'a> = (&'a str, Vec<(String, [f32; 4])>);
 
 /// The newest commands the receipt card lists.
 const RECEIPT_ROWS: usize = 6;
+
+/// The newest sessions Rewind lists, and the newest turns of each.
+const REWIND_SESSIONS: usize = 10;
+const REWIND_TURNS: usize = 30;
+/// A turn's row in Rewind: what it did, then its prompt.
+const TURN_HEIGHT: f32 = 44.0;
+/// A file or command under the selected turn.
+const SUB_ROW: f32 = 22.0;
+
+/// A written file as Rewind lists it: from the workspace's `folder` when
+/// inside it, else whole.
+fn shown_path(path: &Path, folder: Option<&Path>) -> String {
+    match folder.and_then(|f| path.strip_prefix(f).ok()) {
+        Some(rest) if !rest.as_os_str().is_empty() => rest.display().to_string(),
+        _ => path.display().to_string(),
+    }
+}
 
 /// A worktree strip's height: its branch, where it stands, and its last
 /// commit.
@@ -282,7 +310,38 @@ pub struct Inspector {
     reread: bool,
     /// The Checks the header's refresh started, while any of them runs.
     checks_all: Vec<RepoKey>,
+    /// The selected workspace's sessions and their turns, for Rewind: set
+    /// before each draw.
+    pub rewind: std::sync::Arc<crate::project::review::Rewind>,
+    /// Rewind folded to its title row.
+    pub rewind_folded: bool,
+    /// The turn selected in Rewind, by its session's folder and its
+    /// index, whose files and commands show under it.
+    pub rewind_turn: Option<(PathBuf, usize)>,
+    /// The turns drawn last frame, in order, which a turn row's click
+    /// names by its place.
+    shown_turns: Vec<(PathBuf, usize)>,
+    /// Files a turn kept no version of, found out by a click: session,
+    /// turn and file. Their rows say so.
+    pub rewind_missing: Vec<(PathBuf, usize, PathBuf)>,
+    /// Where Rewind's title was drawn last frame, before the scroll.
+    rewind_y: Option<f32>,
+    /// Scroll Rewind into view at the next draw.
+    pub reveal_rewind: bool,
+    /// Rewind as last drawn, as the self-test reads it.
+    shown_rewind: Option<String>,
+    /// A file's version for a turn, being looked up in local history.
+    pub rewind_rx: Option<mpsc::Receiver<RewindFound>>,
 }
+
+/// What looking up a turn's version of a file found: the session, the
+/// turn's index, the file, and the version, when the turn kept one.
+pub type RewindFound = (
+    PathBuf,
+    usize,
+    PathBuf,
+    Option<crate::history::store::SnapshotId>,
+);
 
 impl Inspector {
     /// Reads each repository's status on a worker, unless fresh ones are in
@@ -541,7 +600,11 @@ impl Inspector {
         };
         // A worktree strip's button, or an issue row, by its place: `.1`
         // the second.
-        if rest.starts_with("worktree_") || rest.starts_with("issue") || rest.starts_with("repo_") {
+        if rest.starts_with("worktree_")
+            || rest.starts_with("issue")
+            || rest.starts_with("repo_")
+            || rest.starts_with("rewind_")
+        {
             return self
                 .hits
                 .iter()
@@ -649,6 +712,9 @@ impl Inspector {
                             | Action::FoldRepo
                             | Action::CheckRemote
                             | Action::CopyHandoff
+                            | Action::FoldRewind
+                            | Action::RewindTurn(_)
+                            | Action::RewindFile
                     ) && r.as_deref().is_none_or(|r| r == path)
                 })
                 .map(|(_, a, _)| a.name())
@@ -729,6 +795,8 @@ impl Inspector {
         self.shown_folded.clear();
         self.shown_remote = remote.map(|r| r.login());
         self.shown_receipt = None;
+        self.shown_rewind = None;
+        self.rewind_y = None;
         self.shown_host = workspace
             .filter(|_| remote.is_none())
             .and_then(|w| Some(format!("{}:{}", w.host.as_ref()?, w.path.display())));
@@ -820,7 +888,15 @@ impl Inspector {
             + self.scroll
             + PAD;
         self.max_scroll = (end - bottom).max(0.0);
-        let shift = self.scroll.min(self.max_scroll) - self.scroll;
+        // View > Show Rewind: its title at the top, as far as it goes.
+        let mut want = self.scroll;
+        if self.reveal_rewind
+            && let Some(at) = self.rewind_y
+        {
+            self.reveal_rewind = false;
+            want = (at - (top - self.scroll) - 4.0).max(0.0);
+        }
+        let shift = want.min(self.max_scroll) - self.scroll;
         self.scroll += shift;
         for mut quad in body {
             quad.pos[1] -= shift;
@@ -1021,6 +1097,444 @@ impl Inspector {
         self.shown_receipt.clone().unwrap_or_else(|| "-".into())
     }
 
+    /// For the self-test: Rewind as last drawn, or `-`.
+    pub fn report_rewind(&self) -> String {
+        self.shown_rewind.clone().unwrap_or_else(|| "-".into())
+    }
+
+    /// The turn row drawn `n`th last frame: selected, its files and
+    /// commands shown under it, or, selected already, not.
+    pub fn select_turn(&mut self, n: usize) {
+        let Some(turn) = self.shown_turns.get(n).cloned() else {
+            return;
+        };
+        self.rewind_turn = (self.rewind_turn.as_ref() != Some(&turn)).then_some(turn);
+    }
+
+    /// The selected turn, as Rewind has it: its session's folder, the
+    /// turn, and when the next turn of its session started, if one did.
+    pub fn selected_turn(&self) -> Option<(PathBuf, crate::project::review::Turn, Option<u64>)> {
+        let (dir, index) = self.rewind_turn.as_ref()?;
+        let session = self.rewind.sessions.iter().find(|s| s.dir == *dir)?;
+        let at = session.turns.iter().position(|t| t.index == *index)?;
+        let next = session.turns.get(at + 1).map(|t| t.started);
+        Some((dir.clone(), session.turns[at].clone(), next))
+    }
+
+    /// Rewind: the workspace's sessions, newest first, each a card of its
+    /// turns, newest first. A turn's row says when it started, how many
+    /// files it wrote and commands it ran, how many failed, and under that
+    /// its prompt, whole in the tooltip. A click selects it and lists its
+    /// files, which open in File History at the turn's version, and its
+    /// commands with how each ended. The title row folds it. The bottom it
+    /// reached.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_rewind(
+        &mut self,
+        atlas: &mut Atlas,
+        x: f32,
+        y: f32,
+        width: f32,
+        theme: &Theme,
+        out: &mut Vec<GlyphInstance>,
+    ) -> f32 {
+        let rewind = self.rewind.clone();
+        self.rewind_y = Some(y);
+        self.shown_turns.clear();
+        let folded = self.rewind_folded;
+        let row = Viewport {
+            x: x - 4.0,
+            y,
+            width: width + 8.0,
+            height: ROW,
+        };
+        let over = layout::hovered(row);
+        if over {
+            layout::push_rounded_rect(out, row, layout::UI_RADIUS_SM, theme.row_hover);
+        }
+        layout::hotspot(
+            row,
+            layout::Cursor::Pointing,
+            Some(if folded {
+                "Show Rewind"
+            } else {
+                "Fold Rewind to one row"
+            }),
+        );
+        self.hits.push((row, Action::FoldRewind, None));
+        layout::push_icon_centered(
+            out,
+            atlas,
+            Viewport {
+                x,
+                y: y + 3.0,
+                width: 16.0,
+                height: 20.0,
+            },
+            if folded {
+                icons::CHEVRON_RIGHT
+            } else {
+                icons::CHEVRON_DOWN
+            },
+            if over { theme.text } else { theme.gutter_text },
+        );
+        let turns: usize = rewind.sessions.iter().map(|s| s.turns.len()).sum();
+        let count = plural(turns, "turn");
+        let cw = layout::ui_text_width(atlas, &count);
+        text(
+            out,
+            atlas,
+            x + width - cw,
+            y + 3.0,
+            cw + 2.0,
+            &count,
+            theme.gutter_text,
+        );
+        text(
+            out,
+            atlas,
+            x + 20.0,
+            y + 3.0,
+            (width - 20.0 - cw - 8.0).max(0.0),
+            "REWIND",
+            theme.status_text,
+        );
+        let mut y = y + ROW;
+        if folded {
+            self.shown_rewind = Some(format!("folded turns={turns}"));
+            return y;
+        }
+        let now = crate::platform::unix_seconds();
+        let inner = width - 20.0;
+        let mut selected = None;
+        for session in rewind.sessions.iter().take(REWIND_SESSIONS) {
+            // Which session, and when it started.
+            let started = crate::project::review::session_started(&session.dir)
+                .map(|at| {
+                    crate::platform::git_panel::agent_age(Duration::from_secs(
+                        now.saturating_sub(at),
+                    ))
+                })
+                .map_or_else(String::new, |age| format!(", started {age}"));
+            let label = if session.live {
+                format!("This terminal{started}")
+            } else {
+                format!("Closed session{started}")
+            };
+            text(out, atlas, x, y + 2.0, width, &label, theme.gutter_text);
+            y += 22.0;
+            let shown: Vec<&crate::project::review::Turn> =
+                session.turns.iter().rev().take(REWIND_TURNS).collect();
+            let chosen = self.rewind_turn.clone();
+            let open = |turn: &crate::project::review::Turn| {
+                chosen
+                    .as_ref()
+                    .is_some_and(|(dir, index)| *dir == session.dir && *index == turn.index)
+            };
+            let height: f32 = shown
+                .iter()
+                .map(|t| {
+                    TURN_HEIGHT
+                        + if open(t) {
+                            (t.wrote.len() + t.ran.len()) as f32 * SUB_ROW + 4.0
+                        } else {
+                            0.0
+                        }
+                })
+                .sum::<f32>()
+                + 8.0;
+            layout::push_card(
+                out,
+                Viewport {
+                    x,
+                    y,
+                    width,
+                    height,
+                },
+                theme,
+            );
+            let mut ty = y + 4.0;
+            for (n, turn) in shown.iter().enumerate() {
+                let is_open = open(turn);
+                let block = Viewport {
+                    x: x + 4.0,
+                    y: ty,
+                    width: width - 8.0,
+                    height: TURN_HEIGHT,
+                };
+                if n > 0 {
+                    layout::push_rect(out, atlas, [x + 10.0, ty], [inner, 1.0], theme.hairline);
+                }
+                let over = layout::hovered(block);
+                if is_open {
+                    layout::push_rounded_rect(
+                        out,
+                        block,
+                        layout::UI_RADIUS_SM,
+                        theme.sidebar_selected,
+                    );
+                } else if over {
+                    layout::push_rounded_rect(out, block, layout::UI_RADIUS_SM, theme.row_hover);
+                }
+                self.hits
+                    .push((block, Action::RewindTurn(self.shown_turns.len()), None));
+                self.shown_turns.push((session.dir.clone(), turn.index));
+                // When, then what it did: files, commands, failures.
+                let failed = turn.ran.iter().filter(|r| r.outcome.failed()).count();
+                let when = match turn.ended {
+                    None if session.live => "running".to_owned(),
+                    None => "unfinished".to_owned(),
+                    Some(_) => crate::platform::git_panel::agent_age(Duration::from_secs(
+                        now.saturating_sub(turn.started),
+                    )),
+                };
+                let mut values = vec![
+                    (when, theme.gutter_text),
+                    (plural(turn.wrote.len(), "file"), theme.text),
+                    (plural(turn.ran.len(), "cmd"), theme.text),
+                ];
+                if failed > 0 {
+                    values.push((format!("{failed} failed"), theme.diff_removed));
+                }
+                let number = format!("#{}", turn.index);
+                text(out, atlas, x + 10.0, ty + 3.0, inner, &number, theme.text);
+                let gap = 8.0;
+                let mut vx = x + 10.0 + inner;
+                for (value, colour) in values.iter().rev() {
+                    let w = layout::ui_text_width(atlas, value);
+                    vx -= w;
+                    text(out, atlas, vx, ty + 3.0, w + 2.0, value, *colour);
+                    vx -= gap;
+                }
+                // Its prompt, as much as fits; whole in the tooltip.
+                let prompt = turn.prompt.as_deref().filter(|p| !p.is_empty());
+                let (line, ink) = match prompt {
+                    Some(p) => (p.to_owned(), theme.status_text),
+                    None if turn.index == 0 => {
+                        ("before the first prompt".into(), theme.gutter_text)
+                    }
+                    None => ("no prompt kept".into(), theme.gutter_text),
+                };
+                let fitted = fit(atlas, &line, inner);
+                text(out, atlas, x + 10.0, ty + 22.0, inner, &fitted, ink);
+                let tip = match prompt {
+                    Some(p) => format!(
+                        "Turn {}: \u{201c}{p}\u{201d}\nClick to {} its files and commands",
+                        turn.index,
+                        if is_open { "hide" } else { "show" }
+                    ),
+                    None => format!(
+                        "Turn {}\nClick to {} its files and commands",
+                        turn.index,
+                        if is_open { "hide" } else { "show" }
+                    ),
+                };
+                layout::hotspot(block, layout::Cursor::Pointing, Some(&tip));
+                ty += TURN_HEIGHT;
+                if !is_open {
+                    continue;
+                }
+                selected = Some(*turn);
+                ty += 2.0;
+                for path in &turn.wrote {
+                    ty = self.rewind_file_row(
+                        &rewind, session, turn, path, atlas, x, ty, width, theme, out,
+                    );
+                }
+                for ran in &turn.ran {
+                    let ink = match ran.outcome {
+                        Outcome::Passed => theme.diff_added,
+                        Outcome::Background => theme.gutter_text,
+                        _ => theme.diff_removed,
+                    };
+                    let result = match ran.tests {
+                        Some(tests) => tests.label(),
+                        None => ran.outcome.label(),
+                    };
+                    let rw = layout::ui_text_width(atlas, &result);
+                    text(
+                        out,
+                        atlas,
+                        x + 10.0 + inner - rw,
+                        ty + 1.0,
+                        rw + 2.0,
+                        &result,
+                        ink,
+                    );
+                    layout::push_icon_centered(
+                        out,
+                        atlas,
+                        Viewport {
+                            x: x + 12.0,
+                            y: ty + 1.0,
+                            width: 14.0,
+                            height: 20.0,
+                        },
+                        icons::TERMINAL,
+                        theme.gutter_text,
+                    );
+                    let room = (inner - rw - 30.0).max(0.0);
+                    let command = fit(atlas, &ran.command, room);
+                    text(out, atlas, x + 30.0, ty + 1.0, room, &command, theme.text);
+                    layout::hotspot(
+                        Viewport {
+                            x: x + 4.0,
+                            y: ty,
+                            width: width - 8.0,
+                            height: SUB_ROW,
+                        },
+                        layout::Cursor::Arrow,
+                        Some(&format!("{}\n{}", ran.command, ran.outcome.label())),
+                    );
+                    ty += SUB_ROW;
+                }
+                ty += 2.0;
+            }
+            y += height;
+            if session.turns.len() > shown.len() {
+                note(
+                    out,
+                    atlas,
+                    x,
+                    y,
+                    width,
+                    &format!(
+                        "and {} earlier",
+                        plural(session.turns.len() - shown.len(), "turn")
+                    ),
+                    theme,
+                );
+                y += ROW;
+            }
+            y += 8.0;
+        }
+        if rewind.sessions.len() > REWIND_SESSIONS {
+            note(
+                out,
+                atlas,
+                x,
+                y,
+                width,
+                &format!(
+                    "and {} older",
+                    plural(rewind.sessions.len() - REWIND_SESSIONS, "session")
+                ),
+                theme,
+            );
+            y += ROW;
+        }
+        let files = selected.map_or_else(
+            || "-".to_owned(),
+            |turn| {
+                let names: Vec<String> = turn
+                    .wrote
+                    .iter()
+                    .map(|p| shown_path(p, rewind.folder.as_deref()))
+                    .collect();
+                if names.is_empty() {
+                    "-".to_owned()
+                } else {
+                    names.join(",")
+                }
+            },
+        );
+        let missing: Vec<String> = self
+            .rewind_missing
+            .iter()
+            .filter(|(dir, index, _)| self.rewind_turn.as_ref() == Some(&(dir.clone(), *index)))
+            .map(|(.., p)| shown_path(p, rewind.folder.as_deref()))
+            .collect();
+        self.shown_rewind = Some(format!(
+            "sessions={} turns={turns} rows={} sel={} files={files} cmds={} missing={}",
+            rewind.sessions.len(),
+            self.shown_turns.len(),
+            selected.map_or_else(|| "-".to_owned(), |t| t.index.to_string()),
+            selected.map_or(0, |t| t.ran.len()),
+            if missing.is_empty() {
+                "-".to_owned()
+            } else {
+                missing.join(",")
+            },
+        ));
+        y
+    }
+
+    /// A file under the selected turn: its path from the workspace's
+    /// folder, a click opening File History at the turn's version of it,
+    /// and, once a click found none, a note that there is none. The y
+    /// under it.
+    #[allow(clippy::too_many_arguments)]
+    fn rewind_file_row(
+        &mut self,
+        rewind: &crate::project::review::Rewind,
+        session: &crate::project::review::Rewound,
+        turn: &crate::project::review::Turn,
+        path: &Path,
+        atlas: &mut Atlas,
+        x: f32,
+        y: f32,
+        width: f32,
+        theme: &Theme,
+        out: &mut Vec<GlyphInstance>,
+    ) -> f32 {
+        let inner = width - 20.0;
+        let row = Viewport {
+            x: x + 4.0,
+            y,
+            width: width - 8.0,
+            height: SUB_ROW,
+        };
+        let missing = self
+            .rewind_missing
+            .iter()
+            .any(|(dir, index, p)| *dir == session.dir && *index == turn.index && p == path);
+        let over = layout::hovered(row);
+        if over {
+            layout::push_rounded_rect(out, row, layout::UI_RADIUS_SM, theme.row_hover);
+        }
+        self.hits
+            .push((row, Action::RewindFile, Some(path.to_path_buf())));
+        layout::hotspot(
+            row,
+            layout::Cursor::Pointing,
+            Some(&format!(
+                "{}\nOpen in File History as the agent left it in turn {}",
+                path.display(),
+                turn.index
+            )),
+        );
+        layout::push_icon_centered(
+            out,
+            atlas,
+            Viewport {
+                x: x + 12.0,
+                y: y + 1.0,
+                width: 14.0,
+                height: 20.0,
+            },
+            icons::HISTORY,
+            if over { theme.text } else { theme.gutter_text },
+        );
+        let mut room = (inner - 20.0).max(0.0);
+        if missing {
+            let said = "no saved version";
+            let sw = layout::ui_text_width(atlas, said);
+            text(
+                out,
+                atlas,
+                x + 10.0 + inner - sw,
+                y + 1.0,
+                sw + 2.0,
+                said,
+                theme.gutter_text,
+            );
+            room = (room - sw - 8.0).max(0.0);
+        }
+        let name = fit(atlas, &shown_path(path, rewind.folder.as_deref()), room);
+        text(out, atlas, x + 30.0, y + 1.0, room, &name, theme.text);
+        y + SUB_ROW
+    }
+
     /// Scrolls the body by `points`, down the content positive.
     pub fn scroll_by(&mut self, points: f32) {
         self.scroll = (self.scroll + points).clamp(0.0, self.max_scroll);
@@ -1106,6 +1620,10 @@ impl Inspector {
         // The session showing: what its agent ran, as its hooks said.
         if let Some(receipt) = receipt.filter(|r| r.shown()) {
             y = self.draw_receipt(receipt, atlas, x, y, width, theme, out) + 14.0;
+        }
+        // Its sessions, turn by turn.
+        if !self.rewind.sessions.is_empty() {
+            y = self.draw_rewind(atlas, x, y, width, theme, out) + 6.0;
         }
         // The terminal showing is in ssh: where it is, not this Mac's Git.
         if let Some(remote) = remote {
@@ -2811,6 +3329,106 @@ mod tests {
         let said = report(&inspector);
         assert!(said.ends_with(" issues=unread"), "{said}");
         assert!(!layout::take_animating(), "{said}");
+    }
+
+    /// Rewind lists a session's turns newest first, a row each inside the
+    /// column; a click on one lists its files, from the workspace's folder
+    /// when inside it, each a row that opens it; the title folds it all.
+    /// None of it counts among a repository's buttons.
+    #[test]
+    fn rewind_lists_turns_and_a_selected_turns_files() {
+        use crate::project::receipt::{Outcome, Ran};
+        use crate::project::review::{Rewind, Rewound, Turn};
+        let turn = |index: usize, started: u64, wrote: &[&str], ran: Vec<Ran>| Turn {
+            index,
+            prompt: Some(format!(
+                "prompt number {index}, which is long enough to be cut short at the end of its row"
+            )),
+            started,
+            ended: Some(started + 5),
+            wrote: wrote.iter().map(PathBuf::from).collect(),
+            ran,
+        };
+        let failed = Ran {
+            at: 105,
+            outcome: Outcome::Failed(101),
+            command: "cargo test".into(),
+            tests: None,
+        };
+        let session = PathBuf::from("/s/one");
+        let mut inspector = Inspector {
+            rewind: std::sync::Arc::new(Rewind {
+                folder: Some(PathBuf::from("/r")),
+                sessions: vec![Rewound {
+                    dir: session.clone(),
+                    live: true,
+                    turns: vec![
+                        turn(1, 100, &["/r/a.txt"], vec![failed]),
+                        turn(2, 200, &["/r/src/b.txt", "/elsewhere/c.txt"], Vec::new()),
+                    ],
+                }],
+            }),
+            ..Default::default()
+        };
+        let out = drawn(&mut inspector, &HashMap::new(), true);
+        assert_eq!(
+            inspector.report_rewind(),
+            "sessions=1 turns=2 rows=2 sel=- files=- cmds=0 missing=-"
+        );
+        assert!(
+            !report(&inspector).contains("rewind"),
+            "{}",
+            report(&inspector)
+        );
+        let row = |inspector: &Inspector, name: &str| inspector.named(name).expect(name);
+        let newest = row(&inspector, "inspector.rewind_turn.0");
+        let older = row(&inspector, "inspector.rewind_turn.1");
+        assert!(older.y >= newest.y + newest.height);
+        for r in [newest, older] {
+            assert!(r.x >= PAD && r.x + r.width <= WIDTH - PAD, "{r:?}");
+        }
+        assert!(
+            out.iter()
+                .all(|q| q.pos[0] >= 0.0 && q.pos[0] + q.size[0] <= WIDTH + 0.5)
+        );
+        assert_eq!(
+            inspector.hit(newest.x + 1.0, newest.y + 1.0),
+            Some((Action::RewindTurn(0), None))
+        );
+
+        // The newest turn selected: its files under it, then clicked again,
+        // not.
+        inspector.select_turn(0);
+        drawn(&mut inspector, &HashMap::new(), true);
+        assert_eq!(
+            inspector.report_rewind(),
+            "sessions=1 turns=2 rows=2 sel=2 files=src/b.txt,/elsewhere/c.txt cmds=0 missing=-"
+        );
+        let file = row(&inspector, "inspector.rewind_file.1");
+        assert_eq!(
+            inspector.hit(file.x + 1.0, file.y + 1.0),
+            Some((Action::RewindFile, Some(PathBuf::from("/elsewhere/c.txt"))))
+        );
+        let (dir, turn2, next) = inspector.selected_turn().expect("selected");
+        assert_eq!((dir, turn2.index, next), (session.clone(), 2, None));
+        // The older one: its next turn's start bounds its versions.
+        inspector.select_turn(1);
+        assert_eq!(inspector.selected_turn().map(|t| t.2), Some(Some(200)));
+        drawn(&mut inspector, &HashMap::new(), true);
+        assert!(
+            inspector
+                .report_rewind()
+                .contains(" sel=1 files=a.txt cmds=1 ")
+        );
+        inspector.select_turn(1);
+        assert!(inspector.selected_turn().is_none());
+
+        // Folded to its title row.
+        inspector.rewind_folded = true;
+        drawn(&mut inspector, &HashMap::new(), true);
+        assert_eq!(inspector.report_rewind(), "folded turns=2");
+        assert!(inspector.named("inspector.rewind_turn.0").is_none());
+        assert!(inspector.named("inspector.rewind_fold").is_some());
     }
 
     #[test]

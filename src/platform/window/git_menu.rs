@@ -567,7 +567,7 @@ impl EditorView {
                     // The line stays where it is on screen.
                     let offset = line.saturating_sub(buffer.scroll_line);
                     Ok(super::scrub::Goto {
-                        commit: commit.sha.clone(),
+                        target: super::scrub::Target::Commit(commit.sha.clone()),
                         line: origin,
                         top: origin.saturating_sub(offset),
                     })

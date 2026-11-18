@@ -109,6 +109,31 @@ impl EditorView {
             self.pump();
             return;
         }
+        // Rewind's title folds it, a turn's row selects it, and a file
+        // under it opens at the turn's version.
+        if matches!(
+            action,
+            Action::FoldRewind | Action::RewindTurn(_) | Action::RewindFile
+        ) {
+            match (action, repo) {
+                (Action::RewindFile, Some(path)) => self.rewind_file(path),
+                (Action::RewindTurn(n), _) => {
+                    if let Some(mut state) = self.state_mut() {
+                        state.agents.inspector.select_turn(n);
+                    }
+                }
+                (Action::FoldRewind, _) => {
+                    if let Some(mut state) = self.state_mut() {
+                        let inspector = &mut state.agents.inspector;
+                        inspector.rewind_folded = !inspector.rewind_folded;
+                    }
+                }
+                _ => {}
+            }
+            self.request_redraw();
+            self.pump();
+            return;
+        }
         // The buttons act on the workspace shown, in the repository whose
         // card they are on.
         if let Some(mut state) = self.state_mut() {
@@ -143,7 +168,10 @@ impl EditorView {
             | Action::LoadIssues
             | Action::HideIssues
             | Action::FoldRepo
-            | Action::CheckRemote => {}
+            | Action::CheckRemote
+            | Action::FoldRewind
+            | Action::RewindTurn(_)
+            | Action::RewindFile => {}
         }
         self.request_redraw();
         self.pump();
@@ -210,6 +238,152 @@ impl EditorView {
                 format!("Copied the handoff, {lines} lines"),
             );
         }
+    }
+
+    /// A file under the selected Rewind turn: the version the turn's
+    /// agent left of it is looked up in local history on a worker, and
+    /// [`Self::poll_rewind`] opens it. Nothing reads the store here.
+    fn rewind_file(&self, path: PathBuf) {
+        let Some(mut state) = self.state_mut() else {
+            return;
+        };
+        let Some((dir, turn, next)) = state.agents.inspector.selected_turn() else {
+            return;
+        };
+        let Some(session) = dir.file_name().and_then(|n| n.to_str()).map(str::to_owned) else {
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let file = crate::platform::canonical(&path);
+            let found = crate::history::store::default_path()
+                .and_then(|db| {
+                    crate::history::store::Store::open_to_read(&db)
+                        .ok()
+                        .flatten()
+                })
+                .and_then(|store| store.list(&file).ok())
+                .and_then(|entries| {
+                    crate::project::review::turn_version(&entries, &session, turn.started, next)
+                });
+            let _ = tx.send((dir, turn.index, path, found));
+        });
+        state.agents.inspector.rewind_rx = Some(rx);
+        drop(state);
+        self.resume_display_link();
+    }
+
+    /// Takes what [`Self::rewind_file`] found: the file opens, in File
+    /// History at the turn's version when it kept one. When it kept none
+    /// the file opens as it is, and its row and the status line say so.
+    pub(super) fn poll_rewind(&self) {
+        let (dir, index, path, version) = {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            let Some(rx) = &state.agents.inspector.rewind_rx else {
+                return;
+            };
+            match rx.try_recv() {
+                Ok(found) => {
+                    state.agents.inspector.rewind_rx = None;
+                    found
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    state.agents.inspector.rewind_rx = None;
+                    return;
+                }
+            }
+        };
+        let name = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        if !path.is_file() {
+            if let Some(mut state) = self.state_mut() {
+                state.say(
+                    layout::Feedback::Info,
+                    format!("{name} is no longer on disk"),
+                );
+            }
+            self.request_redraw();
+            return;
+        }
+        self.load_path(&path.to_string_lossy());
+        let opened = self.state().is_some_and(|state| {
+            state
+                .docs
+                .active()
+                .path
+                .as_deref()
+                .is_some_and(|p| same_file(p, &path))
+        });
+        match version {
+            Some(id) if opened => self.open_history_at(Some(super::scrub::Goto::local(id))),
+            Some(_) => {}
+            None => {
+                if let Some(mut state) = self.state_mut() {
+                    let missing = (dir, index, path);
+                    let inspector = &mut state.agents.inspector;
+                    if !inspector.rewind_missing.contains(&missing) {
+                        inspector.rewind_missing.push(missing);
+                    }
+                    state.say(
+                        layout::Feedback::Info,
+                        format!("No saved agent version of {name} for turn {index}"),
+                    );
+                }
+            }
+        }
+        self.request_redraw();
+        self.resume_display_link();
+    }
+
+    /// View > Show Rewind: the inspector opened, Rewind unfolded and
+    /// scrolled to. A workspace with no agent turns says so.
+    pub(super) fn show_rewind(&self) {
+        let hidden = {
+            let Some(mut state) = self.state_mut() else {
+                return;
+            };
+            let Some(task) = state
+                .agents
+                .selected_index()
+                .filter(|_| state.agents.on)
+                .map(|i| state.agents.tasks[i].clone())
+            else {
+                return;
+            };
+            // As the inspector reads it, for when it has not been drawn.
+            let selected = state.agents.selected_index();
+            let live = state
+                .terminal
+                .active_tab()
+                .filter(|t| crate::platform::agents::task_of(&state.agents.tasks, t) == selected);
+            let rewind = crate::project::review::workspace_rewind(
+                Some(&task.id()),
+                task.host.is_none().then_some(task.path.as_path()),
+                live.map(|t| t.review.as_path()),
+                live.map_or(0, |t| t.events_read),
+            );
+            let inspector = &mut state.agents.inspector;
+            inspector.rewind = rewind;
+            inspector.rewind_folded = false;
+            inspector.reveal_rewind = !inspector.rewind.sessions.is_empty();
+            if !inspector.reveal_rewind {
+                state.say(
+                    layout::Feedback::Info,
+                    "No agent turns in this workspace yet",
+                );
+            }
+            state.agents.inspector.hidden
+        };
+        if hidden {
+            self.toggle_inspector();
+        }
+        self.request_redraw();
+        self.resume_display_link();
     }
 
     /// The header's refresh: a Check of every repository card of the

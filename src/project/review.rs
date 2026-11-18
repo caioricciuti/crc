@@ -1195,15 +1195,195 @@ pub fn workspace_trail(
     folder: Option<&Path>,
     live: Option<&Path>,
 ) -> Trail {
-    let mut dirs = match (workspace, ledgers_root()) {
-        (Some(id), Some(ledgers)) => ledger_sessions(&ledgers, &ledger_keys(id, folder)),
+    let mut dirs = workspace_sessions(workspace, folder, live);
+    // Oldest first, so the files read in the order first written.
+    dirs.reverse();
+    trail(&dirs)
+}
+
+/// The sessions of the workspace's Receipt card: its closed sessions, as
+/// [`workspace_receipt`] files them, and `live`, the session of the
+/// terminal showing; newest first, by when each started.
+pub fn workspace_sessions(
+    workspace: Option<&str>,
+    folder: Option<&Path>,
+    live: Option<&Path>,
+) -> Vec<PathBuf> {
+    workspace_sessions_in(ledgers_root().as_deref(), workspace, folder, live)
+}
+
+/// [`workspace_sessions`] from the ledgers under `ledgers`.
+pub fn workspace_sessions_in(
+    ledgers: Option<&Path>,
+    workspace: Option<&str>,
+    folder: Option<&Path>,
+    live: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut dirs = match (workspace, ledgers) {
+        (Some(id), Some(ledgers)) => ledger_sessions(ledgers, &ledger_keys(id, folder)),
         _ => Vec::new(),
     };
-    dirs.extend(
-        live.filter(|d| !d.as_os_str().is_empty())
-            .map(Path::to_path_buf),
+    if let Some(live) = live.filter(|d| !d.as_os_str().is_empty())
+        && !dirs.iter().any(|d| d.file_name() == live.file_name())
+    {
+        dirs.push(live.to_path_buf());
+    }
+    // A name that says no start goes last; one archived later than another
+    // with the same start stays ahead of it, as the ledgers have them.
+    dirs.reverse();
+    dirs.sort_by_key(|dir| std::cmp::Reverse(started_by_name(dir).unwrap_or(0)));
+    dirs
+}
+
+/// When the session in `dir` started, in Unix seconds, by its name.
+pub fn session_started(dir: &Path) -> Option<u64> {
+    started_by_name(dir)
+}
+
+/// Counts every ledger archived or pruned in this process: what was read
+/// from the ledgers is good while it says the same.
+pub fn ledgers_changed() -> u64 {
+    LEDGERS_CHANGED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// One session of a workspace's Rewind: its folder, whether it is the
+/// terminal showing, and its turns, oldest first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rewound {
+    pub dir: PathBuf,
+    pub live: bool,
+    pub turns: Vec<Turn>,
+}
+
+/// What a workspace's Rewind shows: its sessions with their turns, newest
+/// first, and its folder resolved, as written files are kept.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Rewind {
+    pub folder: Option<PathBuf>,
+    pub sessions: Vec<Rewound>,
+}
+
+/// The sessions of [`workspace_sessions`] with their [`turns`], newest
+/// first; a session with none is left out. The closed ones are read once,
+/// and again only when a ledger was archived or pruned or another
+/// workspace shows; the live one when another terminal shows or the window
+/// read more of its events (`events_read`). So a plain frame never touches
+/// the disk, and an agent at work has only its own session read again.
+pub fn workspace_rewind(
+    workspace: Option<&str>,
+    folder: Option<&Path>,
+    live: Option<&Path>,
+    events_read: u64,
+) -> std::sync::Arc<Rewind> {
+    type Closed = (Option<String>, Option<PathBuf>, u64);
+    type Key = (Closed, Option<PathBuf>, u64);
+    type Read = (Key, std::sync::Arc<Rewind>);
+    static READ: std::sync::Mutex<Option<Read>> = std::sync::Mutex::new(None);
+    let live = live.filter(|d| !d.as_os_str().is_empty());
+    let key: Key = (
+        (
+            workspace.map(str::to_owned),
+            folder.map(Path::to_path_buf),
+            ledgers_changed(),
+        ),
+        live.map(Path::to_path_buf),
+        events_read,
     );
-    trail(&dirs)
+    let mut read = READ
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let last = read.take();
+    if let Some((at, rewind)) = &last
+        && *at == key
+    {
+        let rewind = rewind.clone();
+        *read = last;
+        return rewind;
+    }
+    let not_live = |dir: &Path| live.is_none_or(|l| dir.file_name() != l.file_name());
+    let mut sessions: Vec<Rewound> = match last {
+        Some((at, rewind)) if at.0 == key.0 => rewind
+            .sessions
+            .iter()
+            .filter(|s| !s.live && not_live(&s.dir))
+            .cloned()
+            .collect(),
+        _ => {
+            let dirs: Vec<PathBuf> = workspace_sessions(workspace, folder, None)
+                .into_iter()
+                .filter(|d| not_live(d))
+                .collect();
+            rewind_of(&dirs, None)
+        }
+    };
+    if let Some(live) = live {
+        let turns = turns(live);
+        if !turns.is_empty() {
+            insert_live(
+                &mut sessions,
+                Rewound {
+                    dir: live.to_path_buf(),
+                    live: true,
+                    turns,
+                },
+            );
+        }
+    }
+    let rewind = std::sync::Arc::new(Rewind {
+        folder: folder
+            .filter(|f| !f.as_os_str().is_empty())
+            .map(crate::platform::canonical),
+        sessions,
+    });
+    *read = Some((key, rewind.clone()));
+    rewind
+}
+
+/// `live` among `sessions` (newest first) where [`workspace_sessions`]
+/// puts it: ahead of any that started no later.
+fn insert_live(sessions: &mut Vec<Rewound>, live: Rewound) {
+    let started = started_by_name(&live.dir).unwrap_or(0);
+    let at = sessions
+        .iter()
+        .position(|s| started_by_name(&s.dir).unwrap_or(0) <= started)
+        .unwrap_or(sessions.len());
+    sessions.insert(at, live);
+}
+
+/// The turns of each of `dirs`, in their order, leaving out a session
+/// with none; `live` is marked.
+pub fn rewind_of(dirs: &[PathBuf], live: Option<&Path>) -> Vec<Rewound> {
+    dirs.iter()
+        .map(|dir| Rewound {
+            dir: dir.clone(),
+            live: live.is_some_and(|l| l == dir),
+            turns: turns(dir),
+        })
+        .filter(|s| !s.turns.is_empty())
+        .collect()
+}
+
+/// The local history version an agent kept of a file in the turn that ran
+/// from `from` until `until` (the next turn's start, `None` for the last),
+/// in Unix seconds: the newest of `entries` (newest first, as
+/// [`crate::history::store::Store::list`] gives them) kept by the crc
+/// session `session` in that time. `None` when the turn kept none.
+pub fn turn_version(
+    entries: &[crate::history::store::Entry],
+    session: &str,
+    from: u64,
+    until: Option<u64>,
+) -> Option<crate::history::store::SnapshotId> {
+    entries
+        .iter()
+        .find(|e| {
+            let at = u64::try_from(e.at.div_euclid(1000)).unwrap_or(0);
+            e.reason == crate::history::store::Reason::Agent
+                && e.session.as_deref() == Some(session)
+                && at >= from
+                && until.is_none_or(|until| at < until)
+        })
+        .map(|e| e.id)
 }
 
 /// What the workspace's Receipt card shows: its ledger with the receipt of
@@ -1266,7 +1446,7 @@ fn ledger_cached(
         Option<std::sync::Arc<crate::project::receipt::Receipt>>,
     );
     static READ: std::sync::Mutex<Vec<Read>> = std::sync::Mutex::new(Vec::new());
-    let changed = LEDGERS_CHANGED.load(std::sync::atomic::Ordering::Relaxed);
+    let changed = ledgers_changed();
     let mut read = READ
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2390,6 +2570,102 @@ mod tests {
         assert_eq!(turns.len(), 1);
         assert_eq!((turns[0].index, turns[0].ended), (1, None));
         assert!(super::turns(&tree.0.join("none")).is_empty());
+    }
+
+    /// A workspace's Rewind lists its sessions newest first by when each
+    /// started, as its name says, whatever order they were archived in:
+    /// the live one among them, once, and a name with no start last.
+    #[test]
+    fn workspace_sessions_are_newest_first_by_start() {
+        let tree = TempTree::new("review-sessions", &[]);
+        let ledgers = tree.0.join("ledgers");
+        let named = |secs: u128| format!("{:x}-123-0", secs * 1_000_000_000);
+        let (old, middle, new) = (named(1_000), named(2_000), named(3_000));
+        // Archived newest first, then the oldest, then one with no start.
+        for name in [new.as_str(), old.as_str(), "plain"] {
+            let dir = tree.0.join("sessions").join(name);
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            std::fs::write(dir.join("events"), "prompted\t5\tgo\n").expect("events");
+            archive_in(&dir, &ledgers, "ws");
+        }
+        let live = tree.0.join("sessions").join(&middle);
+        std::fs::create_dir_all(&live).expect("mkdir");
+        std::fs::write(live.join("events"), "wrote\t6\tWrite\t/w/a.rs\n").expect("events");
+        let names = |dirs: Vec<PathBuf>| -> Vec<String> {
+            dirs.iter()
+                .map(|d| d.file_name().unwrap().to_string_lossy().into_owned())
+                .collect()
+        };
+        let all = workspace_sessions_in(Some(&ledgers), Some("ws"), None, Some(&live));
+        assert_eq!(names(all.clone()), [&new, &middle, &old, "plain"]);
+        assert_eq!(all[1], live);
+        // No live terminal; another workspace has none.
+        let closed = workspace_sessions_in(Some(&ledgers), Some("ws"), None, None);
+        assert_eq!(names(closed), [&new, &old, "plain"]);
+        assert!(workspace_sessions_in(Some(&ledgers), Some("other"), None, None).is_empty());
+        // A live session already archived is not listed twice.
+        let again = ledger_dir(&ledgers, "ws").join(&new);
+        let once = workspace_sessions_in(Some(&ledgers), Some("ws"), None, Some(&again));
+        assert_eq!(once.len(), 3);
+
+        // Their turns: the live one marked; one with none left out.
+        std::fs::create_dir_all(tree.0.join("quiet")).expect("mkdir");
+        let mut dirs = all;
+        dirs.push(tree.0.join("quiet"));
+        let rewound = rewind_of(&dirs, Some(&live));
+        assert_eq!(rewound.len(), 4);
+        assert_eq!(
+            rewound.iter().map(|s| s.live).collect::<Vec<_>>(),
+            [false, true, false, false]
+        );
+        assert_eq!(rewound[1].turns[0].index, 0);
+        assert_eq!(session_started(&live), Some(2_000));
+
+        // The live one read on its own goes where the list has it.
+        let mut closed: Vec<Rewound> = rewound.iter().filter(|s| !s.live).cloned().collect();
+        insert_live(&mut closed, rewound[1].clone());
+        assert_eq!(closed, rewound);
+    }
+
+    /// A turn's version of a file: the newest the turn's own session kept
+    /// by agent between the turn's start and the next turn's, not another
+    /// session's, not one kept by hand, and none when it kept nothing.
+    #[test]
+    fn a_turn_finds_its_session_s_agent_version() {
+        use crate::history::store::{Entry, Reason, SnapshotId};
+        let entry = |id: i64, secs: i64, reason: Reason, session: Option<&str>| Entry {
+            id: SnapshotId(id),
+            at: secs * 1000 + 400,
+            reason,
+            size: 1,
+            session: session.map(str::to_owned),
+        };
+        // Newest first, as the store lists them.
+        let entries = [
+            entry(7, 300, Reason::Agent, Some("s1")),
+            entry(6, 250, Reason::Saved, None),
+            entry(5, 210, Reason::Agent, Some("s2")),
+            entry(4, 205, Reason::Agent, Some("s1")),
+            entry(3, 201, Reason::Agent, Some("s1")),
+            entry(2, 150, Reason::Agent, Some("s1")),
+            entry(1, 100, Reason::Opened, None),
+        ];
+        // The first turn, 140 until 200; the second from 200 until 300;
+        // the third from 300 on.
+        assert_eq!(
+            turn_version(&entries, "s1", 140, Some(200)),
+            Some(SnapshotId(2))
+        );
+        assert_eq!(
+            turn_version(&entries, "s1", 200, Some(300)),
+            Some(SnapshotId(4))
+        );
+        assert_eq!(turn_version(&entries, "s1", 300, None), Some(SnapshotId(7)));
+        assert_eq!(turn_version(&entries, "s2", 200, None), Some(SnapshotId(5)));
+        // Kept nothing then, or not this session.
+        assert_eq!(turn_version(&entries, "s1", 90, Some(140)), None);
+        assert_eq!(turn_version(&entries, "s3", 0, None), None);
+        assert_eq!(turn_version(&[], "s1", 0, None), None);
     }
 
     /// Lines written before wrote, prompted, asked and apierror lines had a time
