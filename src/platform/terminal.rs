@@ -1620,10 +1620,15 @@ impl Panel {
                 self.withdrawn.push(tab.id().to_string_lossy().into_owned());
             }
             // Its agent review session goes with it: what its agent changed
-            // is for the Git panel now. A tab left to a helper at quit is
+            // is for the Git panel now, what it ran stays in its
+            // workspace's ledger. A tab left to a helper at quit is
             // detached, not closed, and keeps its session.
             if !tab.review.as_os_str().is_empty() {
-                crate::project::review::remove(&tab.review);
+                let workspace = tab
+                    .workspace
+                    .clone()
+                    .unwrap_or_else(|| tab.folder.to_string_lossy().into_owned());
+                crate::project::review::archive(&tab.review, &workspace);
             }
             let beside = heir.and_then(|heir| self.index_of(heir));
             if index != self.active {

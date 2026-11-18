@@ -207,6 +207,24 @@ impl Receipt {
             .collect();
     }
 
+    /// Takes in the receipt of a later session: the counts add up, the
+    /// commands go in the order they ran, the newest [`KEEP`] of them, and
+    /// its claims stand when it made any. A turn does not span sessions, so
+    /// what is claimed next is checked against nothing merged here.
+    pub fn merge(&mut self, newer: Receipt) {
+        self.total += newer.total;
+        self.failed += newer.failed;
+        let mut ran: Vec<Ran> = self.ran.drain(..).chain(newer.ran).collect();
+        ran.sort_by_key(|r| r.at);
+        let skip = ran.len().saturating_sub(KEEP);
+        self.ran = ran.into_iter().skip(skip).collect();
+        if !newer.claims.is_empty() {
+            self.claims = newer.claims;
+        }
+        self.turn = self.total;
+        self.wrote = None;
+    }
+
     /// The newest `n`, newest first.
     pub fn latest(&self, n: usize) -> impl Iterator<Item = &Ran> {
         self.ran.iter().rev().take(n)

@@ -54,3 +54,25 @@ rc_run dark dark
 expect "$T/receipt-dark.out" receipt "claims=tests:exit 101,lint:not run,build:checked ran=4 failed=1 rows=4 last=bg:npm run dev"
 rc_run light light
 expect "$T/receipt-light.out" receipt "claims=tests:exit 101,lint:not run,build:checked ran=4 failed=1 rows=4 last=bg:npm run dev"
+
+# Closing the terminal keeps its ledger: the workspace's card still counts
+# the four commands once the session is gone.
+cat > "$T/receipt-closed.script" <<SCRIPT
+wait 500
+key 8 cmd,shift C
+wait 700
+wait 700
+wait 700
+wait 500
+key 13 cmd w
+wait 500
+key 0 cmd,shift A
+wait 700
+wait 500
+dump $T/receipt-closed.out
+quit
+SCRIPT
+mkdir -p "$T/home/receipt-closed/.config/crc"
+HOME="$T/home/receipt-closed" CRC_TERMINAL_SHELL=/bin/sh CRC_CLAUDE_COMMAND="$T/receipt-agent.sh" \
+    CRC_SELFTEST="$T/receipt-closed.script" "$BIN" "$P" 2> "$T/receipt-closed.err"
+expect "$T/receipt-closed.out" receipt "claims=tests:exit 101,lint:not run,build:checked ran=4 failed=1 rows=4 last=bg:npm run dev"

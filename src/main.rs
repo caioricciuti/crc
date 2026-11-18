@@ -112,7 +112,11 @@ fn prune_sessions() {
     };
     let held =
         crc::term::hold::dir().map_or_else(Vec::new, |dir| crc::term::hold::held_reviews(&dir));
-    review::prune(&sessions, review::MAX_AGE, &held);
+    let ledgers = review::ledgers_root();
+    review::prune(&sessions, review::MAX_AGE, &held, ledgers.as_deref());
+    if let Some(ledgers) = &ledgers {
+        review::prune_ledgers(ledgers, review::LEDGER_AGE);
+    }
     let Some(once) = crc::platform::app_support().map(|dir| dir.join("sessions-pruned")) else {
         return;
     };

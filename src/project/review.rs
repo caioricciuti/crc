@@ -36,6 +36,9 @@
 //! A session's folder goes when its terminal closes, moved aside as
 //! `<id>.gone` and removed on a thread; a terminal a helper holds across
 //! windows keeps its folder. [`prune`] at launch removes what that missed.
+//! Its `events` and `about` stay, as the workspace's ledger: [`archive`]
+//! moves them to `ledgers/<workspace>/<id>` first, outside `sessions`, and
+//! [`prune_ledgers`] drops them after [`LEDGER_AGE`].
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -51,9 +54,17 @@ pub const MAX_CHECKPOINT: u64 = 8 << 20;
 /// never came back) stays on disk.
 pub const MAX_AGE: std::time::Duration = std::time::Duration::from_secs(2 * 24 * 60 * 60);
 
+/// How long the ledger of a closed session stays on disk.
+pub const LEDGER_AGE: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 60 * 60);
+
 /// Where every session folder lives.
 pub fn root() -> Option<PathBuf> {
     Some(crate::platform::app_support()?.join("sessions"))
+}
+
+/// Where the ledgers of closed sessions live, a folder per workspace.
+pub fn ledgers_root() -> Option<PathBuf> {
+    Some(crate::platform::app_support()?.join("ledgers"))
 }
 
 /// A folder name no other terminal, in this run or an earlier one, has.
@@ -736,8 +747,16 @@ const GONE: &str = ".gone";
 /// Removes session folders untouched for longer than `max_age`, except
 /// those in `keep` (the sessions of terminals still held), and whatever
 /// [`remove`] moved aside and did not finish; says how many went. A
-/// folder's time is its newest event or checkpoint.
-pub fn prune(root: &Path, max_age: std::time::Duration, keep: &[PathBuf]) -> usize {
+/// folder's time is its newest event or checkpoint. With `ledgers`, an
+/// aged session that says its folder keeps its ledger under that folder,
+/// as a tab outside any workspace does: which workspace it was started in
+/// is not on disk.
+pub fn prune(
+    root: &Path,
+    max_age: std::time::Duration,
+    keep: &[PathBuf],
+    ledgers: Option<&Path>,
+) -> usize {
     let Ok(entries) = std::fs::read_dir(root) else {
         return 0;
     };
@@ -755,6 +774,9 @@ pub fn prune(root: &Path, max_age: std::time::Duration, keep: &[PathBuf]) -> usi
         let old = newest
             .and_then(|at| now.duration_since(at).ok())
             .is_some_and(|age| age >= max_age);
+        if old && let Some(ledgers) = ledgers {
+            keep_ledger(&dir, ledgers, &about(&dir).1.to_string_lossy());
+        }
         if (old || is_gone(&dir)) && std::fs::remove_dir_all(&dir).is_ok() {
             removed += 1;
         }
@@ -801,6 +823,201 @@ pub fn remove(dir: &Path) {
     std::thread::spawn(move || {
         let _ = std::fs::remove_dir_all(gone);
     });
+}
+
+/// The folder of a workspace's ledger: named by a hash of its id, which
+/// may be a path or `host:path`.
+fn ledger_dir(ledgers: &Path, workspace: &str) -> PathBuf {
+    ledgers.join(format!("{:016x}", fingerprint(workspace)))
+}
+
+/// Moves the session's `events` and `about` into the ledger of
+/// `workspace`; a session with no events, or no workspace to file it
+/// under, keeps nothing.
+fn keep_ledger(dir: &Path, ledgers: &Path, workspace: &str) {
+    let Some(id) = dir.file_name() else {
+        return;
+    };
+    if workspace.is_empty() || is_gone(dir) || !dir.join("events").is_file() {
+        return;
+    }
+    let to = ledger_dir(ledgers, workspace).join(id);
+    if std::fs::create_dir_all(&to).is_err() {
+        return;
+    }
+    for name in ["events", "about"] {
+        let _ = std::fs::rename(dir.join(name), to.join(name));
+    }
+    LEDGERS_CHANGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Bumped whenever a ledger is archived or pruned, so the card reads the
+/// ledgers again only then and never touches the disk on a plain frame.
+/// Only this process writes ledgers: hooks write a session's events.
+static LEDGERS_CHANGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Removes the session as [`remove`] does, its terminal closed, keeping
+/// its ledger for `workspace` (a [`crate::platform::agents::Workspace::id`],
+/// or the tab's folder when it was started in none).
+pub fn archive(dir: &Path, workspace: &str) {
+    if let Some(ledgers) = ledgers_root() {
+        archive_in(dir, &ledgers, workspace);
+    } else {
+        remove(dir);
+    }
+}
+
+/// [`archive`] into the ledgers under `ledgers`.
+pub fn archive_in(dir: &Path, ledgers: &Path, workspace: &str) {
+    keep_ledger(dir, ledgers, workspace);
+    remove(dir);
+}
+
+/// Removes the ledgers of sessions closed longer than `max_age` ago, and
+/// the folders of workspaces left with none; says how many went. A
+/// ledger's time is when it was archived.
+pub fn prune_ledgers(ledgers: &Path, max_age: std::time::Duration) -> usize {
+    let Ok(workspaces) = std::fs::read_dir(ledgers) else {
+        return 0;
+    };
+    let now = std::time::SystemTime::now();
+    let mut removed = 0;
+    for workspace in workspaces.filter_map(Result::ok).map(|e| e.path()) {
+        let Ok(sessions) = std::fs::read_dir(&workspace) else {
+            continue;
+        };
+        for dir in sessions.filter_map(Result::ok).map(|e| e.path()) {
+            let old = std::fs::metadata(&dir)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|at| now.duration_since(at).ok())
+                .is_some_and(|age| age >= max_age);
+            if old && std::fs::remove_dir_all(&dir).is_ok() {
+                removed += 1;
+            }
+        }
+        // Only when empty.
+        let _ = std::fs::remove_dir(&workspace);
+    }
+    if removed > 0 {
+        LEDGERS_CHANGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    removed
+}
+
+/// Every command the closed sessions of `workspace` ran, in the order they
+/// ran, with the claims of the last session that made any.
+pub fn ledger(workspace: &str) -> crate::project::receipt::Receipt {
+    ledgers_root().map_or_else(Default::default, |ledgers| ledger_in(&ledgers, workspace))
+}
+
+/// [`ledger`] from the ledgers under `ledgers`.
+pub fn ledger_in(ledgers: &Path, workspace: &str) -> crate::project::receipt::Receipt {
+    ledger_of_keys(ledgers, &[workspace.to_owned()])
+}
+
+/// The ledger filed under every key in `keys` (a workspace's id and
+/// folders, [`ledger_keys`]), merged as one.
+fn ledger_of_keys(ledgers: &Path, keys: &[String]) -> crate::project::receipt::Receipt {
+    let mut receipt = crate::project::receipt::Receipt::default();
+    // Oldest archived first, so a later session's claims stand.
+    let mut sessions: Vec<(std::time::SystemTime, PathBuf)> = keys
+        .iter()
+        .filter_map(|key| std::fs::read_dir(ledger_dir(ledgers, key)).ok())
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .map(|p| {
+            let at = std::fs::metadata(&p)
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            (at, p)
+        })
+        .collect();
+    sessions.sort();
+    for (_, dir) in sessions {
+        receipt.merge(receipt_until(&dir, u64::MAX));
+    }
+    receipt
+}
+
+/// What the workspace's Receipt card shows: its ledger with the receipt of
+/// its terminal showing, `live`, after it. The live session's claims are
+/// the ones that stand while it is there.
+pub fn card<'a>(
+    ledger: Option<&crate::project::receipt::Receipt>,
+    live: Option<&'a crate::project::receipt::Receipt>,
+) -> Option<std::borrow::Cow<'a, crate::project::receipt::Receipt>> {
+    let Some(ledger) = ledger.filter(|l| l.shown()) else {
+        return live.map(std::borrow::Cow::Borrowed);
+    };
+    let mut merged = ledger.clone();
+    // A terminal that has run and claimed nothing yet leaves the last
+    // session's claim check standing.
+    if let Some(live) = live.filter(|l| l.shown()) {
+        merged.merge(live.clone());
+        merged.claims.clone_from(&live.claims);
+    }
+    Some(std::borrow::Cow::Owned(merged))
+}
+
+/// [`card`] for the workspace with id `workspace` and folder `folder`, its
+/// ledger read once and again only when a session is archived into it or
+/// pruned from it.
+pub fn workspace_receipt<'a>(
+    workspace: Option<&str>,
+    folder: Option<&Path>,
+    live: Option<&'a crate::project::receipt::Receipt>,
+) -> Option<std::borrow::Cow<'a, crate::project::receipt::Receipt>> {
+    let ledger = workspace.and_then(|id| ledger_cached(id, folder));
+    card(ledger.as_deref(), live)
+}
+
+/// The keys a workspace's sessions are filed under: its id, and for a tab
+/// started outside any workspace its folder, as given and resolved.
+fn ledger_keys(workspace: &str, folder: Option<&Path>) -> Vec<String> {
+    let mut keys = vec![workspace.to_owned()];
+    if let Some(folder) = folder.filter(|f| !f.as_os_str().is_empty()) {
+        let resolved = std::fs::canonicalize(folder).ok();
+        for key in std::iter::once(folder).chain(resolved.as_deref()) {
+            let key = key.to_string_lossy().into_owned();
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+    }
+    keys
+}
+
+/// The ledger of a workspace, read once and again only after a ledger was
+/// archived or pruned ([`LEDGERS_CHANGED`]); `None` when it has none.
+fn ledger_cached(
+    workspace: &str,
+    folder: Option<&Path>,
+) -> Option<std::sync::Arc<crate::project::receipt::Receipt>> {
+    type Read = (
+        String,
+        u64,
+        Option<std::sync::Arc<crate::project::receipt::Receipt>>,
+    );
+    static READ: std::sync::Mutex<Vec<Read>> = std::sync::Mutex::new(Vec::new());
+    let changed = LEDGERS_CHANGED.load(std::sync::atomic::Ordering::Relaxed);
+    let mut read = READ
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, at, receipt)) = read.iter().find(|(id, ..)| id == workspace)
+        && *at == changed
+    {
+        return receipt.clone();
+    }
+    let receipt = ledgers_root()
+        .map(|ledgers| ledger_of_keys(&ledgers, &ledger_keys(workspace, folder)))
+        .filter(crate::project::receipt::Receipt::shown)
+        .map(std::sync::Arc::new);
+    read.retain(|(id, ..)| id != workspace);
+    read.push((workspace.to_owned(), changed, receipt.clone()));
+    receipt
 }
 
 /// Quoted for `sh`: the whole string, literally.
@@ -1380,14 +1597,16 @@ mod tests {
         let tree = TempTree::new(
             "review-prune",
             &[
-                ("fresh/events", ""),
+                ("fresh/events", "ran\t1\t0\tcargo test\n"),
+                ("fresh/about", "title=t\nfolder=/w\n"),
                 ("held/events", ""),
                 ("left.gone/events", ""),
             ],
         );
+        let ledgers = TempTree::new("review-prune-ledgers", &[]);
         let held = tree.0.join("held");
         assert_eq!(
-            prune(&tree.0, MAX_AGE, &[]),
+            prune(&tree.0, MAX_AGE, &[], Some(&ledgers.0)),
             1,
             "a removal left behind goes"
         );
@@ -1397,12 +1616,129 @@ mod tests {
             prune(
                 &tree.0,
                 std::time::Duration::ZERO,
-                std::slice::from_ref(&held)
+                std::slice::from_ref(&held),
+                Some(&ledgers.0)
             ),
             1
         );
         assert!(!tree.0.join("fresh").exists());
         assert!(held.is_dir());
+        // The aged session's commands stay, under its folder.
+        assert_eq!(ledger_in(&ledgers.0, "/w").total, 1);
+    }
+
+    /// Hooks write a receipt into a session, which the session's tab
+    /// closing archives: the ledger has its commands, not its files.
+    #[test]
+    fn archive_keeps_events_and_drops_checkpoints() {
+        let tree = TempTree::new("review-archive", &[("work/a.txt", "one\n")]);
+        let ledgers = tree.0.join("ledgers");
+        let dir = tree.0.join("sessions").join("s1");
+        let file = tree.0.join("work/a.txt");
+        hook("pre", &pre(&file), &dir).expect("pre");
+        assert!(dir.join("files").is_dir());
+        describe(&dir, "Agent", &tree.0.join("work"));
+        for command in ["cargo test", "cargo build"] {
+            let input = format!(r#"{{"tool_input":{{"command":"{command}"}}}}"#);
+            hook("ran", &input, &dir).expect("ran");
+        }
+        archive_in(&dir, &ledgers, "ws");
+        assert!(!dir.exists(), "the session folder goes");
+        let kept = ledger_dir(&ledgers, "ws").join("s1");
+        assert!(kept.join("events").is_file());
+        assert!(kept.join("about").is_file());
+        assert!(!kept.join("files").exists(), "no checkpoint is kept");
+        assert_eq!(receipt_until(&kept, u64::MAX).total, 2);
+        assert_eq!(ledger_in(&ledgers, "ws").total, 2);
+        assert_eq!(about(&kept).0, "Agent");
+        // Nothing to keep: a session with no events, or no workspace.
+        let quiet = tree.0.join("sessions").join("s2");
+        std::fs::create_dir_all(quiet.join("files")).expect("mkdir");
+        archive_in(&quiet, &ledgers, "ws");
+        assert!(!quiet.exists());
+        assert!(!ledger_dir(&ledgers, "ws").join("s2").exists());
+    }
+
+    #[test]
+    fn ledgers_older_than_30_days_are_pruned() {
+        let tree = TempTree::new(
+            "review-ledger-age",
+            &[
+                ("old/a/events", "ran\t1\t0\tls\n"),
+                ("old/b/events", "ran\t2\t0\tls\n"),
+                ("both/c/events", "ran\t3\t0\tls\n"),
+                ("both/d/events", "ran\t4\t0\tls\n"),
+            ],
+        );
+        let aged = std::time::SystemTime::now() - LEDGER_AGE - std::time::Duration::from_secs(60);
+        for session in ["old/a", "old/b", "both/c"] {
+            std::fs::File::open(tree.0.join(session))
+                .and_then(|f| f.set_modified(aged))
+                .expect("age");
+        }
+        assert_eq!(prune_ledgers(&tree.0, LEDGER_AGE), 3);
+        assert!(!tree.0.join("old").exists(), "an emptied workspace goes");
+        assert!(!tree.0.join("both/c").exists());
+        assert!(tree.0.join("both/d/events").is_file());
+    }
+
+    /// Sessions archived into a workspace read as one receipt, commands in
+    /// the order they ran; the card puts the live terminal's after them.
+    #[test]
+    fn ledger_merges_archived_sessions() {
+        use crate::project::receipt::Outcome;
+        let tree = TempTree::new("review-ledger-merge", &[]);
+        let ledgers = tree.0.join("ledgers");
+        let session = |name: &str, workspace: &str, events: &str| {
+            let dir = tree.0.join("sessions").join(name);
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            std::fs::write(dir.join("events"), events).expect("events");
+            archive_in(&dir, &ledgers, workspace);
+        };
+        session(
+            "one",
+            "/repo",
+            "prompted\tfix it\nran\t100\t0\tcargo build\nran\t300\t101\tcargo test\n",
+        );
+        session(
+            "two",
+            "/repo",
+            "ran\t200\t0\tcargo fmt\nsaid\tThe tests pass.\n",
+        );
+        session("other", "/elsewhere", "ran\t150\t0\tls\n");
+        let merged = ledger_in(&ledgers, "/repo");
+        assert_eq!((merged.total, merged.failed), (3, 1));
+        let commands: Vec<&str> = merged.ran.iter().map(|r| r.command.as_str()).collect();
+        assert_eq!(commands, ["cargo build", "cargo fmt", "cargo test"]);
+        assert_eq!(merged.claims.len(), 1, "the claims of the last session");
+        assert!(ledger_in(&ledgers, "/nowhere").is_empty());
+
+        // The card: the ledger alone, or with the live terminal's after it.
+        assert!(card(None, None).is_none());
+        assert_eq!(card(Some(&merged), None).expect("card").total, 3);
+        let mut live = crate::project::receipt::Receipt::default();
+        live.note(crate::project::receipt::Ran {
+            at: 400,
+            outcome: Outcome::Passed,
+            command: "git status".into(),
+        });
+        let shown = card(Some(&merged), Some(&live)).expect("card");
+        assert_eq!(shown.total, 4);
+        assert_eq!(
+            shown.latest(1).next().map(|r| r.command.as_str()),
+            Some("git status")
+        );
+        assert!(shown.claims.is_empty(), "the live session's claims stand");
+        // Regression: a fresh terminal, nothing run or claimed yet, wiped
+        // the closed session's claim check off the card.
+        let fresh = crate::project::receipt::Receipt::default();
+        let shown = card(Some(&merged), Some(&fresh)).expect("card");
+        assert_eq!(shown.total, 3);
+        assert_eq!(shown.claims.len(), 1, "the last session's claims stand");
+        assert!(matches!(
+            card(Some(&Default::default()), Some(&live)),
+            Some(std::borrow::Cow::Borrowed(_))
+        ));
     }
 
     #[test]

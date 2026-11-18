@@ -271,6 +271,9 @@ the size and write it back.
   edit (it passed, then the agent wrote a file), or unseen (it ran in
   the background). Hover a claim for the sentence and the command
   behind it. Only Claude sessions crc starts, with `agent_review` on.
+  Closing a session's terminal keeps what it ran: the card goes on
+  counting the workspace's closed sessions for 30 days. Only the
+  commands and their results are kept, never their output.
   At the bottom of the Agents sidebar, the Activity panel shows the
   whole Mac every two seconds: CPU with a short history, memory used
   and its pressure, disk and network rates, and the three processes

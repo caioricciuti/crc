@@ -888,20 +888,31 @@ impl EditorView {
                     crate::platform::agents::folder_name(w, &agents.tasks)
                 });
                 // The receipt of the terminal showing, when it is this
-                // workspace's.
-                let receipt = terminal_panel
+                // workspace's, after what its closed terminals ran.
+                let live = terminal_panel
                     .active_tab()
                     .filter(|t| {
                         crate::platform::agents::task_of(&agents.tasks, t)
                             == agents.selected_index()
                     })
                     .map(|t| &t.receipt);
+                let workspace = selected.as_ref().map(|w| w.id());
+                let receipt = crate::project::review::workspace_receipt(
+                    workspace.as_deref(),
+                    // A local folder only: a remote one's path means
+                    // nothing here.
+                    selected
+                        .as_ref()
+                        .filter(|w| w.host.is_none())
+                        .map(|w| w.path.as_path()),
+                    live,
+                );
                 agents.inspector.draw(
                     selected.as_ref(),
                     repos.as_deref(),
                     &worktrees,
                     remote.as_ref(),
-                    receipt,
+                    receipt.as_deref(),
                     pull_request.as_ref().map(Option::as_ref),
                     github,
                     issues,
