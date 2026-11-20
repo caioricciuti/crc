@@ -2129,18 +2129,23 @@ impl Panel {
             .tip("More Git Actions")
             .draw(out, atlas, theme);
         if busy {
-            // Work under way, where the eye already is.
-            layout::push_progress(
+            // Work under way, where the eye already is: a bar sliding along
+            // a track the column's width, so a still frame of it reads as
+            // progress rather than a stray mark.
+            let bar = Viewport {
+                x: column.x,
+                y: column.y + layout::SIDEBAR_HEADER_HEIGHT - 2.0,
+                width: column.width - 1.0,
+                height: 2.0,
+            };
+            layout::push_rect(
                 out,
                 atlas,
-                Viewport {
-                    x: column.x,
-                    y: column.y + layout::SIDEBAR_HEADER_HEIGHT - 2.0,
-                    width: column.width - 1.0,
-                    height: 2.0,
-                },
-                theme,
+                [bar.x, bar.y],
+                [bar.width, 2.0],
+                theme.control_hover,
             );
+            layout::push_progress(out, atlas, bar, theme);
         }
 
         let Some(snapshot) = &self.snapshot else {
@@ -2646,11 +2651,10 @@ impl Panel {
         if conflicted {
             return;
         }
-        // The staging box, a checkbox on the row it acts on: empty in the
-        // control's resting fill for a change in the working tree, ticked
-        // in the accent once it is staged, so the row says which at rest.
-        // Open File joins it while the pointer is on the row, when the
-        // empty box also shows the plus it will act as.
+        // The staging box, a checkbox on the row it acts on: an outlined
+        // empty box for a change in the working tree, filled with the
+        // accent and ticked once it is staged, so the row says which at
+        // rest. Open File joins it while the pointer is on the row.
         if over {
             Button::new(g.open(rect))
                 .icon(icons::GO_TO_FILE)
@@ -2658,20 +2662,21 @@ impl Panel {
                 .tip("Open File")
                 .draw(out, atlas, theme);
         }
-        let mut toggle = Button::new(g.toggle(rect))
-            .on(staged)
-            .enabled(!self.busy())
-            .tip(if staged {
-                "Unstage Changes"
+        push_stage_box(
+            out,
+            atlas,
+            g.toggle(rect),
+            staged,
+            !self.busy(),
+            if selected {
+                Some(theme.palette_selected)
+            } else if over {
+                Some(theme.row_hover)
             } else {
-                "Stage Changes"
-            });
-        if staged {
-            toggle = toggle.icon(icons::CHECK);
-        } else if over {
-            toggle = toggle.icon(icons::ADD);
-        }
-        toggle.draw(out, atlas, theme);
+                None
+            },
+            theme,
+        );
     }
 
     /// A row under "Changed by agents": the file as a Changes row shows
@@ -2872,6 +2877,97 @@ impl Panel {
             out,
         );
     }
+}
+
+/// The side of the staging checkbox, centred in its row's 22 pt target.
+const STAGE_BOX: f32 = 14.0;
+
+/// Where the staging checkbox draws inside its target `hit`.
+fn stage_box_rect(hit: Viewport) -> Viewport {
+    Viewport {
+        x: (hit.x + (hit.width - STAGE_BOX) * 0.5).round(),
+        y: (hit.y + (hit.height - STAGE_BOX) * 0.5).round(),
+        width: STAGE_BOX,
+        height: STAGE_BOX,
+    }
+}
+
+/// A file row's staging checkbox in `hit`: unstaged, an outline around the
+/// sidebar's own fill (`wash`, the row's hover or selection tint, over it
+/// so the box sits in the row); staged, filled with the accent and ticked.
+/// The whole target is the hotspot, with Stage or Unstage as its tip.
+#[allow(clippy::too_many_arguments)]
+fn push_stage_box(
+    out: &mut Vec<GlyphInstance>,
+    atlas: &mut Atlas,
+    hit: Viewport,
+    staged: bool,
+    enabled: bool,
+    wash: Option<[f32; 4]>,
+    theme: &Theme,
+) {
+    if hit.width <= 0.0 || hit.height <= 0.0 {
+        return;
+    }
+    let over = enabled && layout::hovered(hit);
+    let down = enabled && layout::pressed(hit);
+    let shown = stage_box_rect(hit);
+    let inner = Viewport {
+        x: shown.x + 1.0,
+        y: shown.y + 1.0,
+        width: shown.width - 2.0,
+        height: shown.height - 2.0,
+    };
+    let alpha = if enabled { 1.0 } else { 0.45 };
+    if staged {
+        let fill = if down {
+            layout::mixed(theme.accent, [0.0, 0.0, 0.0, 1.0], 0.18)
+        } else {
+            theme.accent
+        };
+        layout::push_rounded_rect(out, shown, layout::UI_RADIUS_SM, layout::faded(fill, alpha));
+        layout::push_icon_scaled(
+            out,
+            atlas,
+            shown,
+            icons::CHECK,
+            layout::faded(theme.ink_on_solid(), alpha),
+            0.8,
+        );
+    } else {
+        let ring = if over {
+            theme.status_text
+        } else {
+            theme.gutter_text
+        };
+        layout::push_rounded_rect(out, shown, layout::UI_RADIUS_SM, layout::faded(ring, alpha));
+        layout::push_rounded_rect(
+            out,
+            inner,
+            layout::UI_RADIUS_SM,
+            if down {
+                theme.control_pressed
+            } else {
+                theme.sidebar_background
+            },
+        );
+        if let Some(wash) = wash.filter(|_| !down) {
+            layout::push_rounded_rect(out, inner, layout::UI_RADIUS_SM, wash);
+        }
+    }
+    layout::hotspot(
+        hit,
+        if enabled {
+            layout::Cursor::Pointing
+        } else {
+            layout::Cursor::Arrow
+        },
+        Some(if staged {
+            "Unstage Changes"
+        } else {
+            "Stage Changes"
+        }),
+    );
 }
 
 /// Diff lines in a column: old and new line numbers in a gutter, additions
@@ -3883,6 +3979,42 @@ mod tests {
         // The toggle stays inside its row, so it can never stage a neighbour.
         assert!(toggle.x >= rect.x && toggle.x + toggle.width <= rect.x + rect.width);
         assert!(toggle.y >= rect.y && toggle.y + toggle.height <= rect.y + rect.height);
+    }
+
+    /// The staging box drew as a 22 pt filled square with nothing in it,
+    /// which read as a missing icon. It is a checkbox now: a smaller box
+    /// centred in the same target, outlined when unstaged, filled with
+    /// the accent when staged.
+    #[test]
+    fn the_staging_box_reads_as_a_checkbox() {
+        let g = Sidebar::new(column(), 1);
+        let row = Viewport {
+            x: column().x,
+            y: 300.0,
+            width: column().width,
+            height: 22.0,
+        };
+        let hit = g.toggle(row);
+        let shown = stage_box_rect(hit);
+        assert!(shown.width < hit.width && shown.height < hit.height);
+        assert!(shown.x >= hit.x && shown.x + shown.width <= hit.x + hit.width);
+        assert!(shown.y >= hit.y && shown.y + shown.height <= hit.y + hit.height);
+        assert!(((shown.x + shown.width * 0.5) - (hit.x + hit.width * 0.5)).abs() <= 0.5);
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        for theme in [Theme::dark(), Theme::light()] {
+            let mut out = Vec::new();
+            push_stage_box(&mut out, &mut atlas, hit, false, true, None, &theme);
+            // An outline: the ring in the muted ink, the sidebar inside it.
+            assert_eq!(out.len(), 2);
+            assert_eq!(out[0].color, theme.gutter_text);
+            assert_eq!(out[1].color, theme.sidebar_background);
+            assert_eq!(out[1].size[0], STAGE_BOX - 2.0);
+            let mut out = Vec::new();
+            push_stage_box(&mut out, &mut atlas, hit, true, true, None, &theme);
+            // Staged: the accent, and a tick on it.
+            assert_eq!(out[0].color, theme.accent);
+            assert_eq!(out.len(), 2, "a fill and a tick");
+        }
     }
 
     /// The modal clamped itself to a fixed size whatever it held. The docked

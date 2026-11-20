@@ -3711,6 +3711,48 @@ impl Panel {
     }
 }
 
+/// The facts under a folder workspace's card: its folder, unless that is
+/// the name the card already shows, then what its Git last said (branch,
+/// uncommitted files, commits to push or pull).
+pub fn folder_line(
+    title: &str,
+    folder: String,
+    known: Option<&crate::platform::inspector::Known>,
+) -> Vec<String> {
+    let mut parts = Vec::new();
+    if !same_name(title, &folder) {
+        parts.push(folder);
+    }
+    if let Some(known) = known {
+        parts.push(
+            known
+                .branch
+                .clone()
+                .unwrap_or_else(|| "detached HEAD".to_owned()),
+        );
+        if known.dirty > 0 {
+            parts.push(format!(
+                "{} change{}",
+                known.dirty,
+                if known.dirty == 1 { "" } else { "s" }
+            ));
+        }
+        if known.to_push > 0 {
+            parts.push(format!("{} to push", known.to_push));
+        }
+        if known.to_pull > 0 {
+            parts.push(format!("{} to pull", known.to_pull));
+        }
+    }
+    parts
+}
+
+/// Whether a folder's name only repeats the title shown above it, case
+/// aside: a workspace is named after its folder unless you renamed it.
+pub fn same_name(title: &str, folder: &str) -> bool {
+    title.trim().to_lowercase() == folder.trim().to_lowercase()
+}
+
 /// A workspace's folder as its row and inspector show it: `host:path` for
 /// one on a host, else as the palette shows a folder (`~/...`); `-` for
 /// one without a folder.
@@ -4280,27 +4322,25 @@ impl Panel {
         // tooltip.
         if task.folder && !task.folderless() && child.is_none() {
             let room = (right - name_x).max(0.0);
-            let mut parts = vec![folder_name(&task, &self.tasks)];
-            if let Some(known) = self.repo_known(&task) {
-                parts.push(
-                    known
-                        .branch
-                        .clone()
-                        .unwrap_or_else(|| "detached HEAD".to_owned()),
+            let mut parts = folder_line(
+                &name,
+                folder_name(&task, &self.tasks),
+                self.repo_known(&task),
+            );
+            if parts.is_empty() {
+                // Nothing the name does not already say: the path is the
+                // name's tooltip instead.
+                layout::hotspot(
+                    Viewport {
+                        x: name_x,
+                        width: layout::ui_text_width(atlas, &name).min(room),
+                        ..line1
+                    },
+                    layout::Cursor::Pointing,
+                    Some(&shown_folder(&task)),
                 );
-                if known.dirty > 0 {
-                    parts.push(format!(
-                        "{} change{}",
-                        known.dirty,
-                        if known.dirty == 1 { "" } else { "s" }
-                    ));
-                }
-                if known.to_push > 0 {
-                    parts.push(format!("{} to push", known.to_push));
-                }
-                if known.to_pull > 0 {
-                    parts.push(format!("{} to pull", known.to_pull));
-                }
+                self.hits.push((card, Action::Select(index)));
+                return;
             }
             while parts.len() > 1
                 && layout::ui_text_width(atlas, &parts.join(" \u{b7} ")) > room + 0.5
@@ -6001,6 +6041,45 @@ mod tests {
         std::fs::create_dir_all(dir.join("src/deep")).unwrap();
         assert_eq!(discover(&dir.join("src/deep")), vec![dir.clone()]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A folder workspace's card read "garden / 1 terminal / garden ·
+    /// main · 3 changes": the folder repeated the name above it. It goes
+    /// when it only repeats it, stays when the workspace was renamed or
+    /// the folder is told apart by its parent.
+    #[test]
+    fn a_folder_card_does_not_repeat_its_name() {
+        use crate::platform::inspector::Known;
+        let known = Known {
+            branch: Some("main".into()),
+            dirty: 3,
+            to_push: 1,
+            to_pull: 0,
+        };
+        let line = |title: &str, folder: &str, known: Option<&Known>| {
+            folder_line(title, folder.to_owned(), known).join(" \u{b7} ")
+        };
+        assert_eq!(
+            line("garden", "garden", Some(&known)),
+            "main \u{b7} 3 changes \u{b7} 1 to push"
+        );
+        assert_eq!(
+            line("GARDEN", "garden", Some(&known)),
+            "main \u{b7} 3 changes \u{b7} 1 to push"
+        );
+        assert_eq!(
+            line("Balcony", "garden", Some(&known)),
+            "garden \u{b7} main \u{b7} 3 changes \u{b7} 1 to push"
+        );
+        assert_eq!(
+            line("garden", "plots/garden", None),
+            "plots/garden",
+            "a folder told apart by its parent says so"
+        );
+        // Not a repository and named after its folder: nothing to add.
+        assert!(folder_line("garden", "garden".into(), None).is_empty());
+        let detached = Known::default();
+        assert_eq!(line("garden", "garden", Some(&detached)), "detached HEAD");
     }
 
     #[test]

@@ -228,10 +228,10 @@ wait 400
 frame $out/$theme-14-csv.bmp
 key 0 cmd,shift A
 wait 1200
-frame $out/$theme-15-agents.bmp
+frame $out/$theme-15-agents-inspector.bmp
 click @toolbar.inspector
-wait 1200
-frame $out/$theme-16-inspector.bmp
+wait 600
+frame $out/$theme-16-agents-inspector-hidden.bmp
 quit
 SCRIPT
     HOME="$home" CRC_SELFTEST="$T/$theme.script" "$BIN" "$P" 2> "$T/$theme.err" \

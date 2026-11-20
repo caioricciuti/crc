@@ -859,6 +859,13 @@ impl Inspector {
     /// repositories, each with the name its row has, what it has been
     /// doing, and whether it is merged. `folded`: the repositories whose
     /// cards are folded to their name row.
+    /// Whether the line under the title names the folder: not when it would
+    /// only repeat the title, as it does for a workspace named after it.
+    pub fn shows_folder(&self, title: &str) -> bool {
+        !self.folder_label.is_empty()
+            && !crate::platform::agents::same_name(title, &self.folder_label)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &mut self,
@@ -933,17 +940,22 @@ impl Inspector {
             }
         }
         if checking {
-            layout::push_progress(
+            // On a track the panel's width, so a still frame reads as
+            // progress rather than a stray mark.
+            let bar = Viewport {
+                x: rect.x + 1.0,
+                y: rect.y + layout::SIDEBAR_HEADER_HEIGHT - 2.0,
+                width: rect.width - 1.0,
+                height: 2.0,
+            };
+            layout::push_rect(
                 out,
                 atlas,
-                Viewport {
-                    x: rect.x + 1.0,
-                    y: rect.y + layout::SIDEBAR_HEADER_HEIGHT - 2.0,
-                    width: rect.width - 1.0,
-                    height: 2.0,
-                },
-                theme,
+                [bar.x, bar.y],
+                [bar.width, 2.0],
+                theme.control_hover,
             );
+            layout::push_progress(out, atlas, bar, theme);
         }
         // The body scrolls under the header: drawn moved up by `scroll`,
         // then cut to the room under the header, its buttons with it.
@@ -1691,9 +1703,10 @@ impl Inspector {
             );
             return;
         };
-        let name = workspace.name();
-        let name = fit(atlas, &name, width);
+        let full_name = workspace.name();
+        let name = fit(atlas, &full_name, width);
         layout::push_title(out, atlas, x, y, 15.0, &name, theme.text, width);
+        let title_y = y;
         y += 24.0;
         // No folder: no Git to show, only where its terminals start.
         if workspace.folderless() {
@@ -1711,21 +1724,36 @@ impl Inspector {
             );
             return;
         }
-        // Its folder by name; the whole path is the tooltip.
-        let shown = fit(atlas, &self.folder_label, width);
+        // Its folder by name, unless the title already is that name; the
+        // whole path is the tooltip, of the title when the line is left out.
         let path = crate::platform::agents::shown_folder(workspace);
-        layout::hotspot(
-            Viewport {
-                x,
-                y,
-                width: layout::ui_text_width(atlas, &shown).min(width),
-                height: ROW,
-            },
-            layout::Cursor::Arrow,
-            Some(&path),
-        );
-        text(out, atlas, x, y, width, &shown, theme.gutter_text);
-        y += ROW;
+        if self.shows_folder(&full_name) {
+            let shown = fit(atlas, &self.folder_label, width);
+            layout::hotspot(
+                Viewport {
+                    x,
+                    y,
+                    width: layout::ui_text_width(atlas, &shown).min(width),
+                    height: ROW,
+                },
+                layout::Cursor::Arrow,
+                Some(&path),
+            );
+            text(out, atlas, x, y, width, &shown, theme.gutter_text);
+            y += ROW;
+        } else {
+            layout::hotspot(
+                Viewport {
+                    x,
+                    y: title_y,
+                    width: layout::ui_text_width(atlas, &name).min(width),
+                    height: 22.0,
+                },
+                layout::Cursor::Arrow,
+                Some(&path),
+            );
+            y += 4.0;
+        }
         // The session showing: what its agent ran, as its hooks said.
         if let Some(receipt) = receipt.filter(|r| r.shown()) {
             y = self.draw_receipt(receipt, atlas, x, y, width, theme, out) + 14.0;
@@ -3744,6 +3772,23 @@ mod tests {
         inspector.read_at = Some(Instant::now() - TOUCHED_WAIT);
         inspector.want(None, &wanted);
         assert!(inspector.busy());
+    }
+
+    /// The panel read "garden" over "garden": the folder line repeated the
+    /// title. It names the folder only when that says something more.
+    #[test]
+    fn the_folder_line_is_left_out_when_it_repeats_the_title() {
+        let mut inspector = Inspector {
+            folder_label: "garden".into(),
+            ..Default::default()
+        };
+        assert!(!inspector.shows_folder("garden"));
+        assert!(!inspector.shows_folder("Garden"));
+        assert!(inspector.shows_folder("Balcony"));
+        inspector.folder_label = "plots/garden".into();
+        assert!(inspector.shows_folder("garden"));
+        inspector.folder_label = String::new();
+        assert!(!inspector.shows_folder("garden"));
     }
 
     #[test]
