@@ -35,6 +35,7 @@ struct VertexOut {
     float2 local;
     float2 size [[flat]];
     float radius [[flat]];
+    float blur [[flat]];
 };
 
 vertex VertexOut vs_glyph(uint vid                    [[vertex_id]],
@@ -60,6 +61,7 @@ vertex VertexOut vs_glyph(uint vid                    [[vertex_id]],
     out.local    = corner * g.size;
     out.size     = g.size;
     out.radius   = as_type<float>(g.pad0);
+    out.blur     = as_type<float>(g.pad1);
     return out;
 }
 
@@ -68,9 +70,12 @@ fragment float4 fs_glyph(VertexOut in [[stage_in]],
                          sampler         samp  [[sampler(0)]])
 {
     if (in.flags & (1u << 31u)) {
-        float2 q = abs(in.local - in.size * 0.5) - in.size * 0.5 + in.radius;
+        // A blurred one (a shadow) is the shape inset by `blur` on every
+        // side, its edge spread over `blur` either way: soft, still one quad.
+        float2 q = abs(in.local - in.size * 0.5) - (in.size * 0.5 - in.blur) + in.radius;
         float distance = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - in.radius;
-        float coverage = 1.0 - smoothstep(-fwidth(distance) * 0.5, fwidth(distance) * 0.5, distance);
+        float edge = max(fwidth(distance) * 0.5, in.blur);
+        float coverage = 1.0 - smoothstep(-edge, edge, distance);
         float alpha = in.color.a * coverage;
         return float4(in.color.rgb * alpha, alpha);
     }

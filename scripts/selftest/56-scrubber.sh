@@ -74,6 +74,16 @@ wait 100
 dump $T/scrub-save.out
 key 1 cmd,shift s
 wait 100
+key 123
+wait 300
+dump $T/scrub-stepped.out
+key 33 cmd [
+wait 100
+dump $T/scrub-left.out
+key 30 cmd ]
+wait 100
+key 123
+wait 300
 key 53
 wait 100
 dump $T/scrub-closed.out
@@ -171,6 +181,14 @@ esac
 expect "$T/scrub-save.out" message "a version from history is not saved"
 expect "$T/scrub-save.out" dirty "false"
 expect "$T/scrub-closed.out" scrub "closed"
+# A version's line belongs to the history's tab: it goes with it.
+case "$(grep -m1 '^message: ' "$T/scrub-stepped.out")" in
+    *" of 5)") ;;
+    *) failed "scrubber: a step did not say its version: $(grep -m1 '^message: ' "$T/scrub-stepped.out")" ;;
+esac
+expect "$T/scrub-left.out" active "0"
+expect "$T/scrub-left.out" message ""
+expect "$T/scrub-closed.out" message ""
 expect "$T/scrub-closed.out" scrub_strip "none"
 expect "$T/scrub-closed.out" tabs "journal.txt"
 expect "$T/scrub-closed.out" cursor "4:1"

@@ -157,6 +157,9 @@ pub(super) struct Scrub {
     stop: Arc<AtomicBool>,
     /// The worker has stopped: nothing more will arrive.
     gone: bool,
+    /// The status-line message showing while the history's tab was last in
+    /// front: the history's own, which goes once another tab or pane is.
+    heard: Option<String>,
 }
 
 impl Drop for Scrub {
@@ -1717,6 +1720,53 @@ fn close(state: &mut State, back: bool) {
         state.docs.switch(index);
     }
     reveal_active_tab(state);
+    // What the history said goes with its tab, as with any tab closed: a
+    // version's line left in the status line over the split or the
+    // terminal opened next reads as being about them.
+    state.dismiss(layout::Dismissal::TabClosed);
+}
+
+/// Whether the message `showing` is the history's and its tab was just
+/// left: `heard` is what showed while the tab was last in front, and
+/// `front` whether it is now.
+pub(super) fn left_history_message(
+    front: bool,
+    showing: Option<&str>,
+    heard: Option<&str>,
+) -> bool {
+    !front && heard.is_some() && showing == heard
+}
+
+/// After every frame: while the history's tab is in front the message
+/// showing is noted as the history's; once another tab or pane is, that
+/// message goes, unless it is one that stays until read (a failure).
+fn follow_front(state: &mut State) {
+    let active = state.docs.active().id();
+    let State {
+        scrub,
+        message,
+        said,
+        ..
+    } = state;
+    let Some(scrub) = scrub.as_mut() else {
+        return;
+    };
+    let front = scrub.sibling == Some(active);
+    let showing = message.as_ref().map(|(text, _)| text.as_str());
+    if front {
+        if scrub.heard.as_deref() != showing {
+            scrub.heard = showing.map(str::to_owned);
+        }
+        return;
+    }
+    if left_history_message(front, showing, scrub.heard.as_deref())
+        && showing.is_some_and(|text| {
+            super::state::message_goes_on(text, said.as_ref(), layout::Dismissal::TabClosed)
+        })
+    {
+        *message = None;
+    }
+    scrub.heard = None;
 }
 
 impl EditorView {
@@ -1847,6 +1897,7 @@ impl EditorView {
             rx,
             stop,
             gone: false,
+            heard: None,
         });
         state.message = Some((format!("reading the history of {name}"), Instant::now()));
         Ok(())
@@ -2072,6 +2123,7 @@ impl EditorView {
             let Some(mut state) = self.state_mut() else {
                 return;
             };
+            follow_front(&mut state);
             let State {
                 scrub, docs, panes, ..
             } = &mut *state;
@@ -3722,6 +3774,7 @@ mod tests {
             rx,
             stop: Arc::new(AtomicBool::new(false)),
             gone: false,
+            heard: None,
         };
         (scrub, requests)
     }
@@ -3730,6 +3783,22 @@ mod tests {
     /// worker's diff with the working tree, which is asked for first and
     /// asked again when the working tree changes; and a version restores
     /// only once it is read and shown.
+    /// Regression: a version's line ("cc2e7b0 Tester, just now: ...
+    /// (1 of 1)") stayed in the status line over the split, the terminal
+    /// and Settings after the history's tab was left.
+    #[test]
+    fn the_historys_message_goes_when_its_tab_is_left() {
+        let said = Some("cc2e7b0 Tester, just now: feat (1 of 1)");
+        // In front: nothing goes.
+        assert!(!left_history_message(true, said, said));
+        // Left with its message still showing: it goes.
+        assert!(left_history_message(false, said, said));
+        // Something else said since (the tab switched to, a save): stays.
+        assert!(!left_history_message(false, Some("saved notes.md"), said));
+        // Nothing heard in front (the tab was never shown): nothing goes.
+        assert!(!left_history_message(false, said, None));
+    }
+
     #[test]
     fn marks_come_from_the_version_before_or_the_working_tree() {
         let (mut scrub, requests) = scrub_of(vec![commit_v("a"), local_v(1, Reason::Saved)]);

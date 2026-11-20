@@ -295,8 +295,11 @@ impl PaneChrome {
     }
 }
 
-/// Between two panes.
+/// Between two panes: the divider's hairline.
 pub const PANE_GAP: f32 = 1.0;
+/// Room between a pane's text and the divider on its right, so a line
+/// that runs on is cut short of the hairline rather than against it.
+pub const PANE_TEXT_END: f32 = 8.0;
 /// The narrowest the text or the page beside it is dragged to.
 pub const PREVIEW_MIN: f32 = 160.0;
 /// Points on the page's side of the split that take the divider's drag
@@ -374,11 +377,23 @@ impl Chrome {
             width: pane_width,
             ..full_column
         };
+        // A pane with another to its right keeps its text off the divider.
+        let text_end = |index: usize, text: Viewport| {
+            if index + 1 < panes {
+                Viewport {
+                    width: (text.width - PANE_TEXT_END).max(0.0),
+                    ..text
+                }
+            } else {
+                text
+            }
+        };
         let mut others = Vec::new();
         for index in (0..panes).filter(|i| *i != focused) {
             let (tabs, rest) = pane_column(index).split_top(TAB_BAR_HEIGHT);
             let (breadcrumbs, rest) = rest.split_top(BREADCRUMB_HEIGHT);
             let (_, text) = rest.split_top(TEXT_TOP_PAD);
+            let text = text_end(index, text);
             others.push((
                 index,
                 PaneChrome {
@@ -403,6 +418,7 @@ impl Chrome {
             (None, rest)
         };
         let (_, text) = rest.split_top(TEXT_TOP_PAD);
+        let text = text_end(focused, text);
 
         Chrome {
             toolbar,
@@ -2038,20 +2054,7 @@ pub fn build_palette(
         cursor,
         selection,
     } = palette;
-    for (spread, alpha) in [(10.0, 0.07), (6.0, 0.10), (2.0, 0.14)] {
-        push_rounded_rect(
-            out,
-            Viewport {
-                x: viewport.x - spread,
-                y: viewport.y + 4.0,
-                width: viewport.width + spread * 2.0,
-                height: viewport.height + spread,
-            },
-            14.0,
-            [0.0, 0.0, 0.0, alpha],
-        );
-    }
-    push_panel(out, viewport, 12.0, theme);
+    push_floating_panel(out, viewport, 12.0, theme);
     let input = palette_input(viewport);
     push_icon_scaled(
         out,

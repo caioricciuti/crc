@@ -1081,9 +1081,10 @@ pub fn push_blame_heat(
     }
 }
 
-/// The lightbulb on the caret's line, where its number was: the server has
-/// code actions there. The number is the only one drawn in the active
-/// gutter colour, so it is taken back out of `out`, which [`build_full`]
+/// The lightbulb on the caret's line, in the fold cell after its number:
+/// the server has code actions there. The number stays, so the gutter
+/// neither loses a digit nor grows; the line's fold chevron, the only
+/// thing in that cell, is taken back out of `out`, which [`build_full`]
 /// has just filled. Returns where the bulb is, for clicks.
 pub fn push_bulb(
     out: &mut Vec<GlyphInstance>,
@@ -1097,18 +1098,26 @@ pub fn push_bulb(
     let line = buffer.rope.byte_to_line(buffer.cursor());
     let row = *rows.iter().find(|r| r.line == line && r.first)?;
     let slot = atlas.slot_for(crate::project::icons::LIGHTBULB)?;
-    let numbers_end = viewport.x + gutter_width(buffer, atlas) - m.advance;
+    let chevrons = [
+        crate::project::icons::CHEVRON_DOWN,
+        crate::project::icons::CHEVRON_RIGHT,
+    ]
+    .map(|icon| atlas.slot_for(icon).map(|s| s.uv));
+    let text_x = viewport.x + gutter_width(buffer, atlas);
+    let cell = text_x - m.advance;
     let (top, bottom) = (row.y, row.y + m.line_height);
     out.retain(|g| {
-        !(g.color == theme.gutter_text_active
-            && g.pos[0] >= viewport.x
-            && g.pos[0] < numbers_end
+        !(chevrons.contains(&Some(g.uv))
+            && g.pos[0] >= cell - 0.5
+            && g.pos[0] < text_x
             && g.pos[1] >= top
             && g.pos[1] < bottom)
     });
     let (cell_w, cell_h) = atlas.cell_size();
-    let size = [cell_w * slot.cells as f32 * 0.8, cell_h * 0.8];
-    let x = m.snap(numbers_end - size[0]);
+    // Centred in the cell, so it neither touches the number nor reaches
+    // the caret at the line's start.
+    let size = [cell_w * slot.cells as f32 * 0.7, cell_h * 0.7];
+    let x = m.snap(cell + m.advance * 0.5 - size[0] * 0.5);
     let y = top + (m.line_height - size[1]) * 0.5;
     if y < viewport.y || y + size[1] > viewport.y + viewport.height {
         return None;
@@ -1134,9 +1143,10 @@ pub fn push_bulb(
 /// [`push_bulb`] draws it.
 pub fn bulb_at(buffer: &Buffer, atlas: &Atlas, x: f32, y: f32) -> bool {
     let m = atlas.metrics;
-    let numbers_end = gutter_width(buffer, atlas) - m.advance;
-    let (cell_w, _) = atlas.cell_size();
-    if x < numbers_end - cell_w * 2.0 || x >= numbers_end {
+    // The fold chevron's cell, as [`fold_chevron_at`] reads it: the bulb
+    // takes that cell's clicks on its line.
+    let gutter = gutter_width(buffer, atlas);
+    if x < gutter - m.advance * 1.2 || x >= gutter {
         return false;
     }
     let line = buffer.rope.byte_to_line(buffer.cursor());
@@ -1379,18 +1389,7 @@ pub fn build_change_peek(
         height,
     };
 
-    push_rounded_rect(
-        out,
-        Viewport {
-            x: panel.x - 3.0,
-            y: panel.y + 2.0,
-            width: panel.width + 6.0,
-            height: panel.height + 3.0,
-        },
-        10.0,
-        [0.0, 0.0, 0.0, 0.16],
-    );
-    push_panel(out, panel, 8.0, theme);
+    push_floating_panel(out, panel, 8.0, theme);
 
     // The header: what kind of change, its title, and the controls.
     let header = Viewport {
@@ -1930,7 +1929,7 @@ pub fn build_signature(
         width,
         height,
     };
-    push_panel(out, panel, 6.0, theme);
+    push_floating_panel(out, panel, 6.0, theme);
     let active = active.filter(|r| r.start <= r.end && shown.get(r.clone()).is_some());
     let parts: [(&str, [f32; 4]); 3] = match &active {
         Some(r) => [
@@ -2036,18 +2035,7 @@ pub fn build_completion_ribbon(
         height,
     };
 
-    push_rounded_rect(
-        out,
-        Viewport {
-            x: panel.x - 3.0,
-            y: panel.y + 2.0,
-            width: panel.width + 6.0,
-            height: panel.height + 3.0,
-        },
-        10.0,
-        [0.0, 0.0, 0.0, 0.16],
-    );
-    push_panel(out, panel, 8.0, theme);
+    push_floating_panel(out, panel, 8.0, theme);
 
     let (cell_w, cell_h) = atlas.cell_size();
     let glyph_dy = atlas.metrics.glyph_dy(RIBBON_HEIGHT - 6.0);

@@ -612,6 +612,33 @@ impl EditorView {
                 *word_wrap,
             );
         }
+        // The dividers between panes: a hairline in the gap left of every
+        // pane but the first, from the tab bar to the column's foot, the
+        // same whatever the panes show (a document, Home, a grid).
+        if !agents.on
+            && !matches!(column, Column::Mcp | Column::Settings)
+            && !other_panes.is_empty()
+        {
+            let first = other_panes
+                .iter()
+                .map(|(_, rects)| rects.tabs.x)
+                .fold(tab_rect.x, f32::min);
+            let bottom = editor_rect.y + editor_rect.height;
+            let seams = other_panes
+                .iter()
+                .map(|(_, rects)| rects.tabs.x)
+                .chain([tab_rect.x])
+                .filter(|x| *x > first);
+            for x in seams {
+                layout::push_rect(
+                    glyphs,
+                    &renderer.atlas,
+                    [x - layout::PANE_GAP, tab_rect.y],
+                    [layout::PANE_GAP, (bottom - tab_rect.y).max(0.0)],
+                    theme.divider,
+                );
+            }
+        }
         layout::build_toolbar(
             tree,
             agents.on,
@@ -1077,6 +1104,7 @@ impl EditorView {
         let agents_note = note.clone();
         let (status, detail) = status_texts(&StatusParts {
             buffer,
+            home,
             note,
             diagnostics: diagnostics.map(Vec::as_slice),
             blame: blame
@@ -1418,7 +1446,7 @@ fn draw_find_bar(
     let terminal = bar.terminal.is_some();
     // A panel floating over the text or the screen, with the palette's
     // edge, so it reads as laid on it rather than cut into it.
-    layout::push_panel(glyphs, rect, layout::UI_RADIUS_LG, theme);
+    layout::push_floating_panel(glyphs, rect, layout::UI_RADIUS_LG, theme);
     let g = layout::FindGeometry::panel(rect, find_chips(terminal), !terminal);
     if !terminal {
         Button::new(g.toggle)
@@ -1645,6 +1673,9 @@ fn draw_prompt(
 /// What the status line says, gathered by `render`.
 struct StatusParts<'a> {
     buffer: &'a Buffer,
+    /// Home is showing: nothing is open, so there is no document to name,
+    /// save, place a caret in or encode.
+    home: bool,
     /// A transient note: a save result, an open error.
     note: Option<String>,
     /// The document's diagnostics, from its language server.
@@ -1873,6 +1904,9 @@ fn status_texts(parts: &StatusParts<'_>) -> (String, StatusDetail) {
     };
     let name = buffer.display_name();
     let left = parts.note.clone().or(here).unwrap_or_else(|| {
+        if parts.home {
+            return String::new();
+        }
         if buffer.is_view_only() || buffer.is_preview_file() {
             return name;
         }
@@ -1910,7 +1944,7 @@ fn status_texts(parts: &StatusParts<'_>) -> (String, StatusDetail) {
     };
     // A view-only document or a preview (a picture, a video, a PDF) has no
     // caret to place and nothing to encode.
-    let (place, format) = if buffer.is_view_only() || buffer.is_preview_file() {
+    let (place, format) = if parts.home || buffer.is_view_only() || buffer.is_preview_file() {
         (String::new(), String::new())
     } else {
         (
@@ -1949,6 +1983,7 @@ mod status_tests {
     fn parts(buffer: &Buffer) -> StatusParts<'_> {
         StatusParts {
             buffer,
+            home: false,
             note: None,
             diagnostics: None,
             blame: None,
@@ -2014,6 +2049,30 @@ mod status_tests {
         assert!(!right.contains("Ln "), "{right}");
         assert!(!right.contains("UTF-8"), "{right}");
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Regression: with nothing open, Home's status line said "Untitled
+    /// All changes saved" and "Ln 1, Col 1  UTF-8  LF" about a document
+    /// nobody opened. A note still shows there, and the branch.
+    #[test]
+    fn home_shows_no_document_in_the_status_line() {
+        let buffer = Buffer::new();
+        let home = StatusParts {
+            home: true,
+            branch: "main".into(),
+            ..parts(&buffer)
+        };
+        let (left, right) = status_texts(&home);
+        let right = right.whole();
+        assert_eq!(left, "");
+        assert!(!right.contains("Ln "), "{right}");
+        assert!(!right.contains("UTF-8"), "{right}");
+        assert!(right.contains("main"), "{right}");
+        let noted = StatusParts {
+            note: Some("opened garden".into()),
+            ..home
+        };
+        assert_eq!(status_texts(&noted).0, "opened garden");
     }
 
     #[test]

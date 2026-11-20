@@ -7703,17 +7703,6 @@ fn draw_other_pane(
     {
         layout::push_blame_heat(glyphs, &renderer.atlas, text, &rows, theme, &doc.strip());
     }
-    // The seam between panes.
-    layout::push_rect(
-        glyphs,
-        &renderer.atlas,
-        [rects.tabs.x - layout::PANE_GAP, rects.tabs.y],
-        [
-            layout::PANE_GAP,
-            rects.text.y + rects.text.height - rects.tabs.y,
-        ],
-        theme.divider,
-    );
 }
 
 /// Every rectangle the pointer can land on this frame, from the same

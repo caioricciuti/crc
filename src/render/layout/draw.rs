@@ -772,6 +772,66 @@ pub fn push_panel(out: &mut Vec<GlyphInstance>, rect: Viewport, radius: f32, the
     );
 }
 
+/// A panel that floats over the window (the palette, the find bar, a peek,
+/// the completion list): its soft shadow, then [`push_panel`].
+pub fn push_floating_panel(
+    out: &mut Vec<GlyphInstance>,
+    rect: Viewport,
+    radius: f32,
+    theme: &Theme,
+) {
+    push_shadow(out, rect, radius, theme);
+    push_panel(out, rect, radius, theme);
+}
+
+/// The shadow under a floating `rect`: a wide soft one a little below it
+/// and a faint tight one at its edge, each a single blurred quad, so it
+/// reads as lifted rather than outlined. The same in both themes but for
+/// `theme.shadow`.
+pub fn push_shadow(out: &mut Vec<GlyphInstance>, rect: Viewport, radius: f32, theme: &Theme) {
+    for (blur, drop, alpha) in [(18.0, 8.0, 0.55), (3.0, 1.0, 0.35)] {
+        push_blurred_rect(
+            out,
+            Viewport {
+                y: rect.y + drop,
+                ..rect
+            },
+            radius,
+            blur,
+            faded(theme.shadow, alpha),
+        );
+    }
+}
+
+/// `rect` with its edge spread `blur` points either way: the quad grows
+/// by `blur` on every side to hold the falloff.
+fn push_blurred_rect(
+    out: &mut Vec<GlyphInstance>,
+    rect: Viewport,
+    radius: f32,
+    blur: f32,
+    color: [f32; 4],
+) {
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
+    }
+    out.push(GlyphInstance {
+        pos: [rect.x - blur, rect.y - blur],
+        size: [rect.width + blur * 2.0, rect.height + blur * 2.0],
+        color,
+        flags: crate::render::metal::ROUNDED,
+        _pad: [
+            radius
+                .min(rect.width * 0.5)
+                .min(rect.height * 0.5)
+                .to_bits(),
+            blur.to_bits(),
+            0,
+        ],
+        ..Default::default()
+    });
+}
+
 /// A single analytically antialiased quad; no extra textures or draw calls.
 pub fn push_rounded_rect(
     out: &mut Vec<GlyphInstance>,

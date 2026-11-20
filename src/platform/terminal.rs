@@ -2563,7 +2563,7 @@ pub fn draw_filter(
     theme: &Theme,
     out: &mut Vec<GlyphInstance>,
 ) {
-    layout::push_panel(out, list, layout::UI_RADIUS_LG, theme);
+    layout::push_floating_panel(out, list, layout::UI_RADIUS_LG, theme);
     let row_h = filter_row_height(atlas);
     if find.rows.is_empty() {
         let says = if find.error.is_some() {

@@ -51,7 +51,8 @@ pub struct GlyphInstance {
 
 /// [`GlyphInstance::flags`] bit 0: the glyph brings its own colour (emoji).
 pub const COLORED: u32 = 1;
-/// Analytic rounded rectangle; `_pad[0]` stores its logical-point radius.
+/// Analytic rounded rectangle; `_pad[0]` stores its logical-point radius
+/// and `_pad[1]` its blur, 0 for a sharp edge (see `push_shadow`).
 pub const ROUNDED: u32 = 1 << 31;
 
 /// Frames the GPU may be drawing while the next is written: one instance

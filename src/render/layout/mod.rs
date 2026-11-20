@@ -1474,6 +1474,83 @@ mod tests {
         assert_eq!(fold_chevron_at(&buffer, &atlas, bar, middle(1)), None);
     }
 
+    /// Regression: the code-action bulb was drawn in place of the caret
+    /// line's number, so line 1 read as a bulb with no number. It sits in
+    /// the fold cell after the number now, in place of the chevron, and
+    /// the number is drawn whole beside it.
+    #[test]
+    fn the_bulb_leaves_the_line_number_and_takes_the_fold_cell() {
+        let mut atlas = atlas();
+        let m = atlas.metrics;
+        let theme = Theme::default();
+        let mut text = String::from("fn a() {\n    b\n}\n");
+        for n in 0..12 {
+            text.push_str(&format!("line {n}\n"));
+        }
+        let buffer = Buffer::from_text(&text);
+        let view = Viewport {
+            x: 40.0,
+            y: 30.0,
+            width: 600.0,
+            height: 400.0,
+        };
+        let mut out = Vec::new();
+        build_full(&buffer, &mut atlas, view, &theme, "", &[], &mut out);
+        let rows = screen_rows(&buffer, view, m.line_height);
+        let gutter = gutter_width(&buffer, &atlas);
+        let first_row = |g: &GlyphInstance| g.pos[1] >= view.y && g.pos[1] < view.y + m.line_height;
+        // The digits' columns, short of the fold cell.
+        let numbers = |g: &GlyphInstance| g.pos[0] < view.x + gutter - m.advance;
+        let number: Vec<GlyphInstance> = out
+            .iter()
+            .filter(|g| g.color == theme.gutter_text_active && first_row(g) && numbers(g))
+            .copied()
+            .collect();
+        assert_eq!(number.len(), 1, "line 1's number before the bulb");
+        let chevron = atlas
+            .slot_for(crate::project::icons::CHEVRON_DOWN)
+            .unwrap()
+            .uv;
+        assert!(
+            out.iter().any(|g| g.uv == chevron && first_row(g)),
+            "a foldable line has its chevron"
+        );
+
+        let bulb = push_bulb(&mut out, &mut atlas, &buffer, view, &rows, &theme).unwrap();
+        let after: Vec<GlyphInstance> = out
+            .iter()
+            .filter(|g| g.color == theme.gutter_text_active && first_row(g) && numbers(g))
+            .copied()
+            .collect();
+        assert_eq!(after.len(), 1, "the number is still drawn");
+        // The icon is centred in its box: the box's middle is the cell's.
+        let digit_end = after[0].pos[0] + m.advance;
+        let middle_x = bulb.x + bulb.width * 0.5;
+        assert!(
+            middle_x > digit_end && middle_x < view.x + gutter,
+            "the bulb centred at {middle_x} is not in the cell from {digit_end} to {}",
+            view.x + gutter
+        );
+        assert!(
+            !out.iter().any(|g| g.uv == chevron && first_row(g)),
+            "the bulb replaces the chevron, not sits on it"
+        );
+        // Its click is where it is drawn, and the number's is not.
+        let middle = m.line_height * 0.5;
+        assert!(bulb_at(
+            &buffer,
+            &atlas,
+            bulb.x - view.x + bulb.width * 0.5,
+            middle
+        ));
+        assert!(!bulb_at(
+            &buffer,
+            &atlas,
+            after[0].pos[0] - view.x + 1.0,
+            middle
+        ));
+    }
+
     #[test]
     fn heat_fades_with_age_and_ends_after_a_year() {
         const DAY: i64 = 86_400;

@@ -30,6 +30,9 @@ pub struct Theme {
     /// Dims the editor behind a floating panel. Without it the palette reads
     /// as a rectangle that fell on the screen rather than as a modal.
     pub scrim: [f32; 4],
+    /// The soft shadow under a floating panel, at its darkest: the palette,
+    /// the find bar, a peek, the completion list.
+    pub shadow: [f32; 4],
     pub status_background: [f32; 4],
     pub status_text: [f32; 4],
     /// The current line's own number, which is the one you actually read.
@@ -208,6 +211,7 @@ impl Theme {
             sidebar_selected: [0.122, 0.541, 0.388, 0.12],
             palette_selected: [0.122, 0.541, 0.388, 0.12],
             scrim: [0.000, 0.000, 0.000, 0.26],
+            shadow: [0.000, 0.000, 0.000, 0.24],
 
             syn_keyword: [0.486, 0.227, 0.929, 1.0],
             syn_function: [0.114, 0.306, 0.847, 1.0],
@@ -283,6 +287,7 @@ impl Default for Theme {
             sidebar_selected: [0.651, 0.867, 0.761, 0.12],
             palette_selected: [0.651, 0.867, 0.761, 0.12],
             scrim: [0.000, 0.000, 0.000, 0.40],
+            shadow: [0.000, 0.000, 0.000, 0.45],
 
             // Syntax. Eight hue families that stay apart at the code size on
             // the graphite background: names are cool (violet, blue, mint,
