@@ -3491,6 +3491,7 @@ impl Panel {
                 }
                 Line::Session(index) => {
                     let tab = &tabs[*index];
+                    layout::hotspot(row, layout::Cursor::Pointing, None);
                     if active_tab == Some(*index) {
                         layout::push_rounded_rect(out, row, layout::UI_RADIUS_SM, theme.row_hover);
                     } else if layout::hovered(row) {
@@ -3570,6 +3571,7 @@ impl Panel {
                         width: (row.width - indent).max(0.0),
                         ..row
                     };
+                    layout::hotspot(row, layout::Cursor::Pointing, None);
                     if layout::hovered(row) {
                         layout::push_row_hover(out, row, theme);
                     }
@@ -3927,6 +3929,10 @@ impl Panel {
         }
         let is_selected = selected == Some(index);
         let over = layout::hovered(card);
+        // The card's own, under the chevron, menu and folder line drawn
+        // after it: moving between cards changes the hotspot, so the hover
+        // wash follows the pointer.
+        layout::hotspot(card, layout::Cursor::Pointing, None);
         if is_selected {
             layout::push_rounded_rect(out, card, layout::UI_RADIUS, theme.sidebar_selected);
         } else if over {
@@ -4774,6 +4780,52 @@ mod tests {
                 "the Agents sidebar at {width}"
             );
         }
+    }
+
+    /// Every card is a hotspot of its own, so moving the pointer from one
+    /// card to the next changes the hot spot and redraws the hover wash.
+    #[test]
+    fn each_card_is_a_hotspot_of_its_own() {
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let theme = Theme::default();
+        let mut panel = Panel {
+            folders: vec![folder("garden", "/w/garden"), folder("notes", "/w/notes")],
+            ..Panel::default()
+        };
+        panel.rebuild();
+        let column = Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: 260.0,
+            height: 600.0,
+        };
+        let mut out = Vec::new();
+        layout::begin_frame();
+        panel.draw(&[], None, &mut atlas, column, &theme, &mut out);
+        let spots = layout::hotspots();
+        let cards: Vec<Viewport> = panel
+            .hits
+            .iter()
+            .filter(|(_, a)| matches!(a, Action::Select(_)))
+            .map(|(r, _)| *r)
+            .collect();
+        assert_eq!(cards.len(), 2);
+        let mut at = Vec::new();
+        for card in &cards {
+            assert!(
+                spots
+                    .iter()
+                    .any(|s| s.rect == *card && s.cursor == layout::Cursor::Pointing),
+                "no hotspot for the card at {card:?}"
+            );
+            let hit = layout::hotspot_at(
+                &spots,
+                card.x + card.width - 4.0,
+                card.y + card.height * 0.5,
+            );
+            at.push(hit.expect("a card's edge is over a hotspot"));
+        }
+        assert_ne!(at[0], at[1]);
     }
 
     fn rows(panel: &Panel) -> Vec<String> {

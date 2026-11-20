@@ -203,13 +203,15 @@ fn draw_page(
     // The body, scrolled.
     let body_top = y;
     let body_start = out.len();
+    let body_hot = layout::hotspots_len();
     let bottom = rect.y + rect.height;
-    page.rect = Some(Viewport {
+    let body = Viewport {
         x: rect.x,
         y: body_top,
         width: rect.width,
         height: (bottom - body_top).max(0.0),
-    });
+    };
+    page.rect = Some(body);
     let max_scroll = (page.content - (bottom - body_top)).max(0.0);
     page.scroll = page.scroll.clamp(0.0, max_scroll);
     let mut y = body_top - page.scroll;
@@ -274,6 +276,9 @@ fn draw_page(
                     theme.hairline,
                 );
             }
+            // The row's own, under its Edit link: moving between rows
+            // changes the hotspot, so the wash follows the pointer.
+            layout::hotspot(row, layout::Cursor::Pointing, None);
             if layout::hovered(row) {
                 layout::push_rounded_rect(out, row, layout::UI_RADIUS_LG, theme.row_hover);
             }
@@ -322,6 +327,9 @@ fn draw_page(
     }
     page.content = y + page.scroll - body_top;
     page.hits = hits;
+    // A row scrolled under the header or past the bottom is cut away, so
+    // it must not keep the pointer either.
+    layout::clip_hotspots(body_hot, body);
     (body_top, body_start)
 }
 

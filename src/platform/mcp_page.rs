@@ -159,13 +159,15 @@ fn draw_page(
     // The body, scrolled.
     let body_top = y;
     let body_start = out.len();
+    let body_hot = layout::hotspots_len();
     let bottom = rect.y + rect.height;
-    panel.page_rect = Some(Viewport {
+    let body = Viewport {
         x: rect.x,
         y: body_top,
         width: rect.width,
         height: (bottom - body_top).max(0.0),
-    });
+    };
+    panel.page_rect = Some(body);
     let max_scroll = (panel.page_content - (bottom - body_top)).max(0.0);
     panel.page_scroll = panel.page_scroll.clamp(0.0, max_scroll);
     let mut y = body_top - panel.page_scroll;
@@ -177,6 +179,9 @@ fn draw_page(
     }
     panel.page_content = y + panel.page_scroll - body_top + 12.0;
     panel.page_hits = hits;
+    // A row scrolled under the header or past the bottom is cut away, so
+    // it must not keep the pointer either.
+    layout::clip_hotspots(body_hot, body);
     (body_top, body_start)
 }
 
@@ -276,6 +281,9 @@ fn draw_home(
         };
         let open = panel.selected == Some(si);
         layout::push_card(out, card, theme);
+        // The card's own, under its button: moving between cards changes
+        // the hotspot, so the wash follows the pointer.
+        layout::hotspot(card, layout::Cursor::Pointing, None);
         if open || layout::hovered(card) {
             layout::push_rounded_rect(out, card, layout::UI_RADIUS_LG, theme.row_hover);
         }
@@ -570,6 +578,7 @@ fn item_row(
         width: measure + 16.0,
         height,
     };
+    layout::hotspot(row, layout::Cursor::Pointing, None);
     if layout::hovered(row) {
         layout::push_rounded_rect(out, row, layout::UI_RADIUS, theme.row_hover);
     }
