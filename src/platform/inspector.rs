@@ -142,6 +142,10 @@ pub struct Issues<'a> {
 
 type Read = (PathBuf, Result<Status, String>);
 
+/// A status read as it lands: its host, the statuses, and when each of
+/// the repositories fetched last, for those on this Mac that ever did.
+type Landed = (Option<String>, Vec<Read>, Vec<(PathBuf, u64)>);
+
 /// A repository to read: its folder, the branch to compare with, and
 /// whether to look up its latest tag.
 pub type Want = (PathBuf, Option<String>, bool);
@@ -180,8 +184,8 @@ const STRIP: f32 = 64.0;
 /// "up to date" only says nothing came in by the last fetch.
 pub enum Check {
     /// The fetch, on a worker of its own: each repository's runs beside
-    /// the others', and beside the panel's one operation.
-    Running(mpsc::Receiver<Result<String, String>>),
+    /// the others', and beside the panel's one operation. When it began.
+    Running(mpsc::Receiver<Result<String, String>>, Instant),
     /// When it answered, in Unix seconds.
     Done(u64),
     /// What Git said.
@@ -206,10 +210,20 @@ impl Ink {
     }
 }
 
+/// How long a Check runs before its row says it is still at it: a fetch
+/// over ssh can be waiting on a key that wants a touch.
+const SLOW_CHECK: Duration = Duration::from_secs(8);
+
 /// The Remote row's values: where the branch stands against its upstream
-/// as last fetched, then, faintly, when that was checked (`now` in Unix
-/// seconds, for the clock).
-fn remote_values(status: &Status, check: Option<&Check>, now: u64) -> Vec<(String, Ink)> {
+/// as last fetched, then, faintly, when that was checked: by a Check, or
+/// by whatever fetched last (`fetched`, FETCH_HEAD's time), the later of
+/// the two. `now` in Unix seconds, for the clock.
+fn remote_values(
+    status: &Status,
+    check: Option<&Check>,
+    fetched: Option<u64>,
+    now: u64,
+) -> Vec<(String, Ink)> {
     if status.upstream.is_none() {
         return vec![("not pushed".into(), Ink::Faint)];
     }
@@ -225,19 +239,39 @@ fn remote_values(status: &Status, check: Option<&Check>, now: u64) -> Vec<(Strin
     } else {
         parts.join(", ")
     };
-    let checked = match check {
-        None => ("not checked".to_owned(), Ink::Faint),
-        Some(Check::Running(_)) => ("checking\u{2026}".to_owned(), Ink::Faint),
-        Some(Check::Done(at)) => (
+    let at = |at: u64| {
+        (
             format!(
                 "checked {}",
-                crate::platform::clock_time(*at as i64, now as i64)
+                crate::platform::clock_time(at as i64, now as i64)
             ),
             Ink::Faint,
-        ),
+        )
+    };
+    let checked = match check {
+        None => fetched.map_or(("not checked".to_owned(), Ink::Faint), at),
+        Some(Check::Running(_, started)) => match started.elapsed() {
+            slow if slow >= SLOW_CHECK => (
+                format!("still fetching\u{2026} {}s", slow.as_secs()),
+                Ink::Faint,
+            ),
+            _ => ("checking\u{2026}".to_owned(), Ink::Faint),
+        },
+        Some(Check::Done(done)) => at(fetched.map_or(*done, |f| f.max(*done))),
         Some(Check::Failed(_)) => ("check failed".to_owned(), Ink::Removed),
     };
     vec![(counts, Ink::Text), checked]
+}
+
+/// The Latest tag row's values: the tag, then, faintly, the commits since
+/// it as "+13", none when HEAD is the tag. Short, so a long tag keeps its
+/// room.
+fn tag_values(tag: &str, since: usize) -> Vec<(String, Ink)> {
+    let mut values = vec![(tag.to_owned(), Ink::Text)];
+    if since > 0 {
+        values.push((format!("+{since}"), Ink::Faint));
+    }
+    values
 }
 
 /// What a repository's last status read said that is shown when its card
@@ -265,7 +299,7 @@ pub struct Inspector {
     read_at: Option<Instant>,
     /// Something the statuses show was written to since they were read.
     touched: bool,
-    rx: Option<mpsc::Receiver<(Option<String>, Vec<Read>)>>,
+    rx: Option<mpsc::Receiver<Landed>>,
     /// The repositories being read, and their host.
     reading: Option<(Option<String>, Vec<PathBuf>)>,
     /// Each button, with the repository it acts on.
@@ -316,6 +350,14 @@ pub struct Inspector {
     reread: bool,
     /// The Checks the header's refresh started, while any of them runs.
     checks_all: Vec<RepoKey>,
+    /// Per repository on this Mac, when it last fetched, by whatever
+    /// fetched (see [`crate::platform::git_panel::last_fetch`]): read with
+    /// its status, on the worker.
+    fetched: HashMap<RepoKey, u64>,
+    /// What the Checks that failed said, to be said on the status line.
+    check_failures: Vec<String>,
+    /// The repository a Pull runs in: checked when it answers.
+    pub pull_after: Option<RepoKey>,
     /// The selected workspace's sessions and their turns, for Rewind: set
     /// before each draw.
     pub rewind: std::sync::Arc<crate::project::review::Rewind>,
@@ -384,7 +426,7 @@ impl Inspector {
         let wanted = wanted.to_vec();
         std::thread::spawn(move || {
             let runner = crate::platform::agents::runner(host.as_deref());
-            let read = wanted
+            let read: Vec<Read> = wanted
                 .into_iter()
                 .map(|(dir, base, tags)| {
                     let status =
@@ -392,7 +434,17 @@ impl Inspector {
                     (dir, status)
                 })
                 .collect();
-            let _ = tx.send((host, read));
+            // A host's FETCH_HEAD is not on this disk.
+            let fetched = match host {
+                Some(_) => Vec::new(),
+                None => read
+                    .iter()
+                    .filter_map(|(dir, _)| {
+                        crate::platform::git_panel::last_fetch(dir).map(|at| (dir.clone(), at))
+                    })
+                    .collect(),
+            };
+            let _ = tx.send((host, read, fetched));
         });
         self.rx = Some(rx);
         self.reading = Some(key);
@@ -439,7 +491,7 @@ impl Inspector {
             };
             let _ = tx.send(answer);
         });
-        self.checks.insert(repo, Check::Running(rx));
+        self.checks.insert(repo, Check::Running(rx, Instant::now()));
     }
 
     /// The header's refresh: a Check, each on its own worker, of every
@@ -467,7 +519,7 @@ impl Inspector {
         self.checks_all.retain(|key| {
             self.checks
                 .get(key)
-                .is_some_and(|c| matches!(c, Check::Running(_)))
+                .is_some_and(|c| matches!(c, Check::Running(..)))
         });
         self.checks_all.extend(due.iter().cloned());
         due.len()
@@ -480,12 +532,14 @@ impl Inspector {
 
     /// Whether `repo`'s Check is running.
     pub fn checking(&self, repo: &RepoKey) -> bool {
-        matches!(self.checks.get(repo), Some(Check::Running(_)))
+        matches!(self.checks.get(repo), Some(Check::Running(..)))
     }
 
     /// Whether any repository's Check is running.
     pub fn checking_any(&self) -> bool {
-        self.checks.values().any(|c| matches!(c, Check::Running(_)))
+        self.checks
+            .values()
+            .any(|c| matches!(c, Check::Running(..)))
     }
 
     /// `repo`'s Check, once asked for.
@@ -498,7 +552,7 @@ impl Inspector {
     fn poll_checks(&mut self) -> bool {
         let mut answered = false;
         for check in self.checks.values_mut() {
-            let Check::Running(rx) = check else {
+            let Check::Running(rx, _) = check else {
                 continue;
             };
             let answer = match rx.try_recv() {
@@ -508,7 +562,10 @@ impl Inspector {
             };
             *check = match answer {
                 Ok(_) => Check::Done(crate::platform::unix_seconds()),
-                Err(e) => Check::Failed(e),
+                Err(e) => {
+                    self.check_failures.push(e.clone());
+                    Check::Failed(e)
+                }
             };
             answered = true;
         }
@@ -520,6 +577,22 @@ impl Inspector {
             }
         }
         answered
+    }
+
+    /// What the Checks that failed since the last call said, Git's own
+    /// words, for the status line.
+    pub fn take_check_failures(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.check_failures)
+    }
+
+    /// A Pull in `repo` answered: it fetched, so the repository is
+    /// checked now, and its status is read again.
+    pub fn pulled(&mut self, repo: RepoKey) {
+        if !self.checking(&repo) {
+            self.checks
+                .insert(repo, Check::Done(crate::platform::unix_seconds()));
+        }
+        self.invalidate();
     }
 
     /// Takes a finished read or Check. Returns whether anything shown
@@ -536,8 +609,12 @@ impl Inspector {
         };
         let mut changed = true;
         match rx.try_recv() {
-            Ok((host, read)) => {
+            Ok((host, read, fetched)) => {
                 changed = host != self.read_host || read != self.status;
+                for (path, at) in fetched {
+                    let was = self.fetched.insert((host.clone(), path), at);
+                    changed |= was != Some(at);
+                }
                 // A read for a workspace no longer selected still counts:
                 // the next `want` reads the one that is.
                 self.read_for = read.iter().map(|(p, _)| p.clone()).collect();
@@ -697,7 +774,7 @@ impl Inspector {
                     let key = (self.read_host.clone(), path.to_path_buf());
                     match self.checks.get(&key) {
                         None => " check=none",
-                        Some(Check::Running(_)) => " check=running",
+                        Some(Check::Running(..)) => " check=running",
                         Some(Check::Done(_)) => " check=ok",
                         Some(Check::Failed(_)) => " check=err",
                     }
@@ -2721,13 +2798,18 @@ impl Inspector {
         }
         let key = (self.read_host.clone(), repo.to_path_buf());
         let check = self.checks.get(&key);
-        let checking = matches!(check, Some(Check::Running(_)));
+        let checking = matches!(check, Some(Check::Running(..)));
         facts.push((
             "Remote",
-            remote_values(status, check, crate::platform::unix_seconds())
-                .into_iter()
-                .map(|(value, ink)| (value, ink.colour(theme)))
-                .collect(),
+            remote_values(
+                status,
+                check,
+                self.fetched.get(&key).copied(),
+                crate::platform::unix_seconds(),
+            )
+            .into_iter()
+            .map(|(value, ink)| (value, ink.colour(theme)))
+            .collect(),
         ));
         let failed = match check {
             Some(Check::Failed(e)) => e.lines().map(str::trim).find(|l| !l.is_empty()),
@@ -2748,31 +2830,30 @@ impl Inspector {
                 ]
             },
         ));
-        if let Some((tag, since)) = &status.tag {
+        // The tag's row is short, so a long tag is not cut for the count;
+        // its tooltip says it whole.
+        let tag_tip = status.tag.as_ref().map(|(tag, since)| {
             facts.push((
                 "Latest tag",
-                vec![
-                    (tag.clone(), theme.text),
-                    (
-                        format!("{} since", plural(*since, "commit")),
-                        theme.gutter_text,
-                    ),
-                ],
+                tag_values(tag, *since)
+                    .into_iter()
+                    .map(|(value, ink)| (value, ink.colour(theme)))
+                    .collect(),
             ));
-        }
+            (
+                facts.len() - 1,
+                format!("{tag}, {} since", plural(*since, "commit")),
+            )
+        });
+        let card_y = y;
         let mut y = card(out, atlas, x, y, width, &facts, theme) + 10.0;
-        // A Check that failed says why, faintly, under the card.
+        if let Some((row, tip)) = tag_tip {
+            rows_hotspots(x, card_y, width, row, &[tip]);
+        }
+        // A Check that failed says why under the card.
         if let Some(why) = failed {
             let why = fit(atlas, why, width);
-            text(
-                out,
-                atlas,
-                x,
-                y - 6.0,
-                width,
-                &why,
-                layout::faded(theme.gutter_text, 0.7),
-            );
+            text(out, atlas, x, y - 6.0, width, &why, theme.text);
             y += 20.0;
         }
 
@@ -3644,7 +3725,7 @@ mod tests {
         };
         let mut land = |read: Vec<Read>| {
             let (tx, rx) = mpsc::channel();
-            tx.send((None, read)).unwrap();
+            tx.send((None, read, Vec::new())).unwrap();
             inspector.rx = Some(rx);
             inspector.poll()
         };
@@ -3696,6 +3777,7 @@ mod tests {
                 (repos[0].clone(), Ok(dirty)),
                 (repos[1].clone(), Ok(Status::default())),
             ],
+            Vec::new(),
         ))
         .unwrap();
         inspector.rx = Some(rx);
@@ -3950,7 +4032,7 @@ mod tests {
     #[test]
     fn the_remote_row_says_whether_and_when_the_remote_was_checked() {
         let words = |status: &Status, check: Option<&Check>| -> Vec<(String, Ink)> {
-            remote_values(status, check, 1_790_000_000)
+            remote_values(status, check, None, 1_790_000_000)
         };
         let unpushed = Status::default();
         assert_eq!(
@@ -3970,7 +4052,7 @@ mod tests {
         );
         let (_tx, rx) = mpsc::channel();
         assert_eq!(
-            words(&even, Some(&Check::Running(rx)))[1],
+            words(&even, Some(&Check::Running(rx, Instant::now())))[1],
             ("checking\u{2026}".into(), Ink::Faint)
         );
         let at = 1_790_000_000 - 120;
@@ -3997,6 +4079,55 @@ mod tests {
                 ("check failed".into(), Ink::Removed)
             ]
         );
+    }
+
+    #[test]
+    fn the_remote_row_reads_the_last_fetch_and_says_a_slow_check_is_still_going() {
+        let now = 1_790_000_000;
+        let clock = |at: u64| {
+            format!(
+                "checked {}",
+                crate::platform::clock_time(at as i64, now as i64)
+            )
+        };
+        let even = Status {
+            upstream: Some("origin/main".into()),
+            ..Default::default()
+        };
+        // Fetched before this run, by anything: checked then, not "not
+        // checked" after every launch.
+        assert_eq!(
+            remote_values(&even, None, Some(now - 600), now)[1],
+            (clock(now - 600), Ink::Faint)
+        );
+        // A pull or a terminal fetched after the Check: the later time.
+        assert_eq!(
+            remote_values(&even, Some(&Check::Done(now - 900)), Some(now - 60), now)[1],
+            (clock(now - 60), Ink::Faint)
+        );
+        assert_eq!(
+            remote_values(&even, Some(&Check::Done(now - 30)), Some(now - 60), now)[1],
+            (clock(now - 30), Ink::Faint)
+        );
+        // Still fetching after a while: waiting on a key's touch, perhaps.
+        let (_tx, rx) = mpsc::channel();
+        let slow = Check::Running(rx, Instant::now() - Duration::from_secs(12));
+        assert_eq!(
+            remote_values(&even, Some(&slow), None, now)[1],
+            ("still fetching\u{2026} 12s".into(), Ink::Faint)
+        );
+    }
+
+    #[test]
+    fn the_latest_tag_row_counts_commits_since_it_briefly() {
+        assert_eq!(
+            tag_values("v0.12.0-alpha.3", 13),
+            vec![
+                ("v0.12.0-alpha.3".into(), Ink::Text),
+                ("+13".into(), Ink::Faint)
+            ]
+        );
+        assert_eq!(tag_values("v1.0.0", 0), vec![("v1.0.0".into(), Ink::Text)]);
     }
 
     #[test]
@@ -4028,9 +4159,10 @@ mod tests {
         );
         assert!(inspector.named("inspector.check").is_some());
         let (_tx, rx) = mpsc::channel();
-        inspector
-            .checks
-            .insert((None, PathBuf::from("/r")), Check::Running(rx));
+        inspector.checks.insert(
+            (None, PathBuf::from("/r")),
+            Check::Running(rx, Instant::now()),
+        );
         drawn_status(&mut inspector, even.clone());
         assert!(!live(&inspector).contains(&Action::Pull));
         assert!(!live(&inspector).contains(&Action::CheckRemote));
@@ -4129,7 +4261,53 @@ mod tests {
         // Its status is wanted again (the panel asks at once): it has
         // what came in.
         assert!(inspector.read_at.is_none());
-        assert_eq!(read_status(&mut inspector, &mine).to_pull, 1);
+        let status = read_status(&mut inspector, &mine);
+        assert_eq!(status.to_pull, 1);
+        // The Remote row says it was checked, at the clock.
+        let now = crate::platform::unix_seconds();
+        let row = remote_values(
+            &status,
+            inspector.check_of(&key),
+            inspector.fetched.get(&key).copied(),
+            now,
+        );
+        assert!(row[1].0.starts_with("checked "), "{row:?}");
+        assert!(inspector.take_check_failures().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_repo_fetched_before_this_run_reads_as_checked_then() {
+        let (root, mine, _) = origin_and_clone("fetched");
+        let mut inspector = Inspector::default();
+        let key: RepoKey = (None, mine.clone());
+        // Never fetched since the clone: no FETCH_HEAD.
+        let status = read_status(&mut inspector, &mine);
+        assert_eq!(
+            remote_values(&status, None, inspector.fetched.get(&key).copied(), 0)[1].0,
+            "not checked"
+        );
+        // A terminal fetches; a later read knows when, with no Check run.
+        git(&mine, &["fetch", "-q"]);
+        inspector.invalidate();
+        let status = read_status(&mut inspector, &mine);
+        let at = inspector.fetched.get(&key).copied().expect("a fetch time");
+        let now = crate::platform::unix_seconds();
+        assert!(now.abs_diff(at) < 120, "{at} {now}");
+        assert_eq!(
+            remote_values(&status, None, Some(at), now)[1].0,
+            format!(
+                "checked {}",
+                crate::platform::clock_time(at as i64, now as i64)
+            )
+        );
+        // A Pull that answered marks it checked, over a Check that failed.
+        inspector
+            .checks
+            .insert(key.clone(), Check::Failed("fatal: no".into()));
+        inspector.pulled(key.clone());
+        assert!(matches!(inspector.check_of(&key), Some(Check::Done(_))));
+        assert!(inspector.read_at.is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4149,6 +4327,11 @@ mod tests {
             Some(Check::Failed(e)) => assert!(e.contains("no-such-orchard"), "{e}"),
             _ => panic!("the check did not fail"),
         }
+        // The status line is told, once, in Git's words.
+        let said = inspector.take_check_failures();
+        assert_eq!(said.len(), 1);
+        assert!(said[0].contains("no-such-orchard"), "{said:?}");
+        assert!(inspector.take_check_failures().is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4210,9 +4393,10 @@ mod tests {
         };
         // Meadow is checking already: its Check is not started again.
         let (meadow_tx, meadow_rx) = mpsc::channel();
-        inspector
-            .checks
-            .insert((None, meadow.clone()), Check::Running(meadow_rx));
+        inspector.checks.insert(
+            (None, meadow.clone()),
+            Check::Running(meadow_rx, Instant::now()),
+        );
         let repos = [orchard.clone(), vineyard.clone(), meadow.clone(), unread];
         // Statuses read for this Mac are not another host's.
         assert_eq!(inspector.check_all(Some("box"), &repos, None), 0);

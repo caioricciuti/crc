@@ -1742,6 +1742,8 @@ fn with_agent(cmd: &mut Command, ssh_auth_sock: Option<&Path>) {
 /// agent socket from the settings (see [`with_agent`]). Nothing can
 /// prompt: there is no terminal and `GIT_TERMINAL_PROMPT` is 0, so a
 /// credential that is missing fails with Git's message instead of hanging.
+/// What it says is Git's stderr, else its stdout: a pull with nothing new
+/// says "Already up to date." on stdout alone.
 pub fn remote(root: &Path, what: Remote, ssh_auth_sock: Option<&Path>) -> Result<String, String> {
     let branch = run(root, &["symbolic-ref", "--quiet", "--short", "HEAD"])
         .map(|b| String::from_utf8_lossy(&b).trim().to_owned())
@@ -1763,7 +1765,11 @@ pub fn remote(root: &Path, what: Remote, ssh_auth_sock: Option<&Path>) -> Result
     let ended = bounded(&mut cmd, None, &args[0])?;
     let said = String::from_utf8_lossy(&ended.stderr).trim().to_owned();
     if ended.status.success() {
-        Ok(said)
+        Ok(if said.is_empty() {
+            String::from_utf8_lossy(&ended.stdout).trim().to_owned()
+        } else {
+            said
+        })
     } else if what == Remote::Pull && said.contains("fast-forward") {
         // Git's own hint names `git config` and command-line flags.
         Err("the branches have diverged: use Git > Pull with Rebase or Pull with Merge".into())
@@ -2389,6 +2395,11 @@ mod tests {
         let mine = clone("mine");
         commit(&mine, "shared.txt", "one\n");
         run(&mine, &["push", "--quiet", "-u", "origin", "HEAD"]).unwrap();
+        // Nothing new: Git says so on stdout alone, and that is the answer.
+        assert_eq!(
+            remote(&mine, Remote::Pull, None).unwrap(),
+            "Already up to date."
+        );
         let theirs = clone("theirs");
         commit(&theirs, "theirs.txt", "theirs\n");
         run(&theirs, &["push", "--quiet"]).unwrap();

@@ -267,12 +267,18 @@ impl EditorView {
         // A tab clicked, a session started or closed: what shows now is
         // the latest place for the switcher.
         note_focus(&mut state);
+        // A Check that failed says so on the status line too, in Git's
+        // words: the card's row alone was easy to miss.
+        for failed in state.agents.inspector.take_check_failures() {
+            state.say(layout::Feedback::Failure, format!("Check failed: {failed}"));
+        }
         let done = state.agents.take_done();
         let issue = state.agents.take_issue_detail();
         let mut start_in = None;
         let mut prompt = None;
         if let Some(done) = done {
             changed = true;
+            let pulled = state.agents.inspector.pull_after.take();
             match done {
                 Ok(Done {
                     said,
@@ -282,6 +288,10 @@ impl EditorView {
                     state.say(layout::Feedback::Success, said);
                     start_in = dir;
                     prompt = claude;
+                    // A Pull fetched: its repository is checked now.
+                    if let Some(repo) = pulled {
+                        state.agents.inspector.pulled(repo);
+                    }
                 }
                 Err(e) => state.say(layout::Feedback::Failure, e),
             }

@@ -967,16 +967,33 @@ impl EditorView {
         let sock = self.state().and_then(|state| state.ssh_auth_sock.clone());
         let host = self.menu_host();
         let remote = host.is_some();
+        let on = host.clone();
         let folder = self.agent_operation(
             |t| format!("{} {}\u{2026}", what.verb(), t.name()),
-            move |path| match host {
-                Some(host) => {
-                    let runner = crate::platform::agents::runner(Some(&host));
-                    crate::project::worktree::remote_on(&runner, &path, what)
-                }
-                None => crate::project::git::remote(&path, what, sock.as_deref()),
+            move |path| {
+                let said = match on {
+                    Some(host) => {
+                        let runner = crate::platform::agents::runner(Some(&host));
+                        crate::project::worktree::remote_on(&runner, &path, what)
+                    }
+                    None => crate::project::git::remote(&path, what, sock.as_deref()),
+                }?;
+                // Git said nothing: the status line still says it is done.
+                Ok(if !said.is_empty() {
+                    said
+                } else if what == crate::project::git::Remote::Push {
+                    "Pushed".into()
+                } else {
+                    "Pulled".into()
+                })
             },
         );
+        // A pull fetches: its repository's Remote row says checked after.
+        if what == crate::project::git::Remote::Pull
+            && let (Some(folder), Some(mut state)) = (folder.clone(), self.state_mut())
+        {
+            state.agents.inspector.pull_after = Some((host, folder));
+        }
         // A host's pushes are not heard here (its Git is not watched): its
         // pull request is read again when the push answers.
         if remote && what == crate::project::git::Remote::Push {

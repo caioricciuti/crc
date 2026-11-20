@@ -3173,7 +3173,7 @@ pub fn sync_text(upstream: bool, fetched_at: Option<u64>, now: u64) -> Option<St
 /// it (the panel, the inspector's Check, a terminal). `None` before a
 /// first fetch. A linked worktree's `.git` is a file naming its Git
 /// directory, whose `commondir` names the one FETCH_HEAD is in.
-fn last_fetch(root: &std::path::Path) -> Option<u64> {
+pub(crate) fn last_fetch(root: &std::path::Path) -> Option<u64> {
     let git_dir = crate::project::git::common_git_dir(&crate::project::git::own_git_dir(root)?);
     std::fs::metadata(git_dir.join("FETCH_HEAD"))
         .ok()?

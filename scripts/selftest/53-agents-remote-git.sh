@@ -147,7 +147,8 @@ for arg in "'add' '--all' && git 'commit' '-q' '-m' 'wip remote'" "'merge' '--no
     grep -qF -- "$arg" "$llog" 2>/dev/null || failed "remote-git: no change over ssh had [$arg]"
 done
 
-# Someone else pushes to fix; the next launch pulls it on the host.
+# Someone else pushes to fix; the next launch pulls it on the host, and
+# the pull having fetched, the Remote row says it was checked.
 git clone -q -b fix "$RGO" "$T/rgit-other"
 printf 'theirs\n' > "$T/rgit-other/t.txt"
 testgit "$T/rgit-other" add t.txt
@@ -172,7 +173,7 @@ SCRIPT
 HOME="$RGH" CRC_TERMINAL_SHELL=/bin/sh CRC_SSH_COMMAND="$T/rgit-ssh.sh" \
     CRC_SELFTEST="$T/rgit-pull.script" "$BIN" "$T/rgitproj" 2> "$T/rgit-pull.err"
 expect "$T/rgit-behind.out" inspector "remote=myhost:$fix_path branch=fix base=main ahead=3 behind=0 upstream=origin/fix push=0 pull=1 dirty=0 changes=+2-0 tag=- check=none buttons=pull"
-expect "$T/rgit-pulled.out" inspector "remote=myhost:$fix_path branch=fix base=main ahead=4 behind=0 upstream=origin/fix push=0 pull=0 dirty=0 changes=+3-0 tag=- check=none buttons=pull"
+expect "$T/rgit-pulled.out" inspector "remote=myhost:$fix_path branch=fix base=main ahead=4 behind=0 upstream=origin/fix push=0 pull=0 dirty=0 changes=+3-0 tag=- check=ok buttons=pull"
 [ -f "$fix_path/t.txt" ] || failed "remote-git: Pull did not bring t.txt on the host"
 grep -qF -- "'pull' '--ff-only'" "$llog" 2>/dev/null || failed "remote-git: no pull over ssh had [--ff-only]"
 
