@@ -2,6 +2,43 @@
 
 One entry per tag, written for people who use the editor.
 
+## v0.2.0-alpha.38, 2026-11-20
+
+- Settings has real controls: switches for on/off settings, a stepper for
+  the font size and segmented choices for the theme and the like. A change
+  applies at once and rewrites only its line of config.toml; it waits while
+  config.toml has unsaved edits in a tab.
+- Hover is instant on Agents cards, session and task rows, and the rows of
+  the Settings and MCP pages. Before, the highlight lagged until something
+  else redrew the window.
+- Count badges are centred: one digit is a round badge, more is a pill.
+- Pull and Check in the Workspace inspector say what happened. An
+  up-to-date pull says so, the Remote row shows when it was last checked,
+  a slow fetch shows how long it has been running, and a failure stays
+  readable.
+- Rewind: the Workspace inspector lists each agent session turn by turn
+  (the prompt, files written, commands run). A file opens in File History
+  at the version the agent left, and Restore Files to Turn N puts every
+  file the session wrote back to how it was when that turn ended, asking
+  first and keeping the current text as a "before restore" version.
+- Every file an agent writes in a crc terminal is kept in local history,
+  shown as "by agent" in File History.
+- The Receipt card keeps a session's record after its terminal closes (for
+  30 days), shows pass and fail counts for test runs, lists the packages
+  the agent installed, and Copy Handoff puts a plain-text summary on the
+  clipboard.
+- A polish pass across the window: soft shadows under floating panels, real
+  stage checkboxes in Source Control, shortcuts written the macOS way
+  everywhere, one-line command palette rows, tabs with even room round
+  their titles, a quieter status bar, a code-action bulb in the gutter, a
+  one-row history strip, and CSV tables with a header row and row count.
+- Opening a new terminal no longer stalls the window for a moment.
+- MCP servers started through a shell or a package runner are stopped
+  completely when crc lets them go.
+- Double-clicking the top bar zooms the window (or follows the system
+  setting).
+- Video, image and PDF tabs show only their name in the status bar.
+
 ## v0.2.0-alpha.37, 2026-11-17
 
 - Extensions are gone: the WebAssembly engine, the signed registry, the

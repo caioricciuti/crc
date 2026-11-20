@@ -70,10 +70,13 @@ does, its value and its default. They live in `~/.config/crc/config.toml`,
 created from a commented template the first time: `font`, `font_size`,
 `theme` (`system`, `dark` or `light`), `caret_blink`, `update_check`,
 `format_on_save`, `organize_imports_on_save`, `word_wrap`, `ssh_auth_sock`,
-`conflict_view` (`inline` or `side-by-side`) and `agent_review`. Edit on the page opens
-the file at that setting, and Open config.toml opens it whole. Saving the file
-applies it; a line crc cannot use is said in the status line with its
-number. `Cmd-=`, `Cmd--` and `Cmd-0` change
+`conflict_view` (`inline` or `side-by-side`) and `agent_review`. On/off
+settings are switches, the font size is a stepper and settings with a few
+values are segmented choices: a change rewrites only that line of the file
+and applies at once, and is refused while config.toml has unsaved edits in
+a tab. Text settings have Edit, which opens the file at that line, and
+Open config.toml opens it whole. Saving the file applies it; a line crc
+cannot use is said in the status line with its number. `Cmd-=`, `Cmd--` and `Cmd-0` change
 the size and write it back.
 
 ## What works
