@@ -974,6 +974,41 @@ impl Atlas {
         self.solid
     }
 
+    /// Cell top to the baseline a shaped glyph from `font` is drawn on, in
+    /// device pixels, padding excluded.
+    ///
+    /// The glyph's own font decides where its baseline sits. Using the
+    /// monospace ascent for every face put a larger proportional face's
+    /// ascenders above the top of the cell, where they were cut off: the
+    /// first line of a heading lost the tops of its letters.
+    fn shaped_ascent_px(&self, font: &CTFont) -> f32 {
+        let ascent = unsafe { font.ascent() } as f32;
+        let descent = unsafe { font.descent() } as f32;
+        let room = (self.cell_px.1 - PAD) as f32;
+        if ascent + descent > room {
+            // Taller than a cell even so. Keep the ascenders, which carry
+            // more of a letter's identity than the descenders do.
+            room - descent.min(room * 0.2)
+        } else {
+            ascent.max(self.metrics.ascent * self.metrics.scale)
+        }
+    }
+
+    /// Where a UI capital or digit's ink starts and ends, in points down
+    /// from the top of its glyph quad: for centring a number in a pill,
+    /// where centring the cell leaves it low by the cell's descent.
+    pub fn ui_cap_ink(&self) -> (f32, f32) {
+        let origin = baseline_origin(self.cell_px, self.shaped_ascent_px(&self.ui_font), 0.0);
+        // CoreGraphics puts the pen on a whole pixel, rounded down towards
+        // the cell bottom: a fractional baseline lands up to a pixel lower.
+        let baseline = self.cell_px.1 as f32 - (origin.y as f32).floor();
+        let cap = unsafe { self.ui_font.cap_height() } as f32;
+        (
+            (baseline - cap) / self.metrics.scale,
+            baseline / self.metrics.scale,
+        )
+    }
+
     /// Cell size in logical points, including the sampling gutter.
     pub fn cell_size(&self) -> (f32, f32) {
         (
@@ -1158,20 +1193,7 @@ impl Atlas {
         let needed = shift as f64 + (ink.origin.x + ink.size.width).max(0.0) + PAD as f64;
         let cells = ((needed / self.cell_px.0 as f64).ceil() as usize).clamp(1, 4);
         let cell = self.alloc(cells)?;
-        // The glyph's own font decides where its baseline sits. Using the
-        // monospace ascent for every face put a larger proportional face's
-        // ascenders above the top of the cell, where they were cut off: the
-        // first line of a heading lost the tops of its letters.
-        let ascent = unsafe { font.ascent() } as f32;
-        let descent = unsafe { font.descent() } as f32;
-        let room = (self.cell_px.1 - PAD) as f32;
-        let ascent_px = if ascent + descent > room {
-            // Taller than a cell even so. Keep the ascenders, which carry
-            // more of a letter's identity than the descenders do.
-            room - descent.min(room * 0.2)
-        } else {
-            ascent.max(self.metrics.ascent * self.metrics.scale)
-        };
+        let ascent_px = self.shaped_ascent_px(font);
         self.draw_glyph_shifted(cell, font, glyph.glyph, ascent_px, cells, shift as f32);
         let color =
             unsafe { font.symbolic_traits() }.contains(CTFontSymbolicTraits::ColorGlyphsTrait);

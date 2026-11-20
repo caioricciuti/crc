@@ -768,17 +768,42 @@ fn count_pill(
     }
     let pill = Viewport {
         x: x.min(right - w).max(row.x),
-        y: row.y + ((row.height - 16.0) * 0.5).round(),
+        y: row.y + ((row.height - COUNT_HEIGHT) * 0.5).round(),
         width: w,
-        height: 16.0,
+        height: COUNT_HEIGHT,
     };
-    push_rounded_rect(out, pill, 8.0, fill);
-    push_ui_text_centered(out, atlas, pill, &label, ink);
+    push_rounded_rect(out, pill, COUNT_HEIGHT * 0.5, fill);
+    // Digits have no descenders: their ink is what is centred, not the
+    // cell, whose descent and the code size's taller cell put it low.
+    let scale = count_scale(atlas);
+    let (top, bottom) = atlas.ui_cap_ink();
+    let y0 = pill.y + pill.height * 0.5 - (top + bottom) * 0.5 * scale;
+    let glyphs = out.len();
+    push_ui_text_scaled_at(out, atlas, pill, y0, &label, ink, scale);
+    // The quads are whole cells, taller and wider than the pill at a large
+    // code size; the pill is where they end.
+    for quad in &mut out[glyphs..] {
+        clip_horizontal(quad, pill.x, pill.x + pill.width);
+        clip_vertical(quad, pill.y, pill.y + pill.height);
+    }
     w
 }
 
 /// The space between a heading and its count.
 pub const COUNT_GAP: f32 = 8.0;
+/// Height of a count pill; one digit makes it a circle.
+const COUNT_HEIGHT: f32 = 16.0;
+/// Room either side of a count's label.
+const COUNT_PAD: f32 = 5.0;
+/// How tall a count's digits are, in points, whatever the UI size: about
+/// half the pill, as a system badge sets them.
+const COUNT_INK: f32 = 8.0;
+
+/// The share of the UI size a count's label is drawn at.
+fn count_scale(atlas: &Atlas) -> f32 {
+    let (top, bottom) = atlas.ui_cap_ink();
+    (COUNT_INK / (bottom - top).max(1.0)).min(1.0)
+}
 
 /// What a count pill says: the number, and `999+` past that.
 fn count_label(count: usize) -> String {
@@ -791,7 +816,11 @@ fn count_label(count: usize) -> String {
 
 /// How wide [`push_count`] draws `count`: for what is laid out beside it.
 pub fn count_width(atlas: &mut Atlas, count: usize) -> f32 {
-    (ui_text_width(atlas, &count_label(count)) + 10.0).max(18.0)
+    if count < 10 {
+        return COUNT_HEIGHT;
+    }
+    let text = ui_text_width(atlas, &count_label(count)) * count_scale(atlas);
+    (text + COUNT_PAD * 2.0).ceil().max(COUNT_HEIGHT)
 }
 
 /// A section heading in a sidebar list: chevron, small-caps-like title and
@@ -882,6 +911,22 @@ pub fn push_ui_text_scaled(
     color: [f32; 4],
     scale: f32,
 ) {
+    let (_, ch) = atlas.cell_size();
+    let y0 = rect.y + (rect.height - ch * scale) * 0.5;
+    push_ui_text_scaled_at(out, atlas, rect, y0, text, color, scale);
+}
+
+/// [`push_ui_text_scaled`] centred across `rect`, with the glyph quads'
+/// top at `y0`.
+fn push_ui_text_scaled_at(
+    out: &mut Vec<GlyphInstance>,
+    atlas: &mut Atlas,
+    rect: Viewport,
+    y0: f32,
+    text: &str,
+    color: [f32; 4],
+    scale: f32,
+) {
     let Some(line) = atlas.shape_ui(text) else {
         return;
     };
@@ -891,7 +936,7 @@ pub fn push_ui_text_scaled(
     #[cfg(test)]
     note_cut(text, width, rect.width);
     let x0 = rect.x + (rect.width - width) * 0.5;
-    let y0 = m.snap(rect.y + (rect.height - ch * scale) * 0.5);
+    let y0 = m.snap(y0);
     for glyph in &line.glyphs {
         let Some(slot) = atlas.slot_for_shaped(&line, glyph) else {
             continue;
@@ -2453,6 +2498,60 @@ mod tests {
             0.0
         );
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn a_counts_digits_sit_in_the_middle_of_its_pill() {
+        let theme = Theme::dark();
+        let fill = theme.diff_modified;
+        let ink = theme.ink_on_solid();
+        // The UI size the app uses, under a code size that grows the cell
+        // the label is drawn from; and a larger UI size.
+        for (mut atlas, sizes) in [
+            (Atlas::build("SF Mono", 13.0, 2.0), "13/13"),
+            (Atlas::build_with_ui("SF Mono", 20.0, 13.0, 2.0), "20/13"),
+            (Atlas::build_with_ui("SF Mono", 13.0, 20.0, 2.0), "13/20"),
+        ] {
+            for count in [1, 4, 12, 98_765] {
+                let row = row(120.0);
+                let mut out = Vec::new();
+                let w = push_count_solid(&mut out, &mut atlas, row.x, row, count, fill, &theme);
+                let pill = out.iter().find(|q| q.color == fill).unwrap();
+                let (top, bottom) = (pill.pos[1], pill.pos[1] + pill.size[1]);
+                if count < 10 {
+                    assert_eq!(w, pill.size[1], "one digit is a circle at {sizes}");
+                }
+                let (aw, ah) = (atlas.width as f32, atlas.height as f32);
+                let (mut ink_top, mut ink_bottom) = (f32::MAX, f32::MIN);
+                for quad in out.iter().filter(|q| q.color == ink) {
+                    assert!(
+                        quad.pos[1] >= top - 0.01 && quad.pos[1] + quad.size[1] <= bottom + 0.01,
+                        "{count} at {sizes}: a glyph from {} to {} leaves the pill ({top} to {bottom})",
+                        quad.pos[1],
+                        quad.pos[1] + quad.size[1],
+                    );
+                    let (x0, x1) = ((quad.uv[0] * aw) as u32, (quad.uv[2] * aw) as u32);
+                    let (y0, y1) = (quad.uv[1] * ah, quad.uv[3] * ah);
+                    for y in y0 as u32..y1 as u32 {
+                        let inked = (x0..x1)
+                            .any(|x| atlas.pixels[((y * atlas.width + x) * 4 + 3) as usize] > 32);
+                        if inked {
+                            let at = |py: f32| quad.pos[1] + (py - y0) / (y1 - y0) * quad.size[1];
+                            ink_top = ink_top.min(at(y as f32));
+                            ink_bottom = ink_bottom.max(at(y as f32 + 1.0));
+                        }
+                    }
+                }
+                assert!(ink_top < ink_bottom, "{count} at {sizes}: no ink");
+                // Clipping keeps a low digit inside the pill by cutting it
+                // off: the ink itself has to clear both edges, evenly.
+                let (above, below) = (ink_top - top, bottom - ink_bottom);
+                assert!(
+                    above >= 2.0 && below >= 2.0 && (above - below).abs() <= 1.0,
+                    "{count} at {sizes}: {above} above the digits, {below} below"
+                );
+            }
+        }
     }
 
     // ---- pills -----------------------------------------------------------
