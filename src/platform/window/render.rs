@@ -1084,7 +1084,8 @@ impl EditorView {
                 } else {
                     layout::message_alpha(at.elapsed(), message_lasts_of(text, said.as_ref()))
                 };
-                (Some(text.clone()), alpha)
+                // Shown in sentence case, however its sayer spelled it.
+                (Some(layout::sentence_case(text).into_owned()), alpha)
             }
             _ => {
                 *message = None;

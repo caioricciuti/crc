@@ -462,7 +462,7 @@ pub const DESCRIBED: [Described; 16] = [
     Described {
         key: "font_size",
         group: "Appearance",
-        what: "8 to 32 points. Cmd-= and Cmd-- change it, Cmd-0 goes back.",
+        what: "8 to 32 points. \u{2318}= and \u{2318}- change it, \u{2318}0 goes back.",
     },
     Described {
         key: "caret_blink",

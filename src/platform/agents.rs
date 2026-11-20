@@ -3314,7 +3314,7 @@ impl Panel {
             [column.width, column.height],
             theme.sidebar_background,
         );
-        layout::push_sidebar_title(out, atlas, column, "AGENTS", 2, theme);
+        layout::push_sidebar_title(out, atlas, column, "Agents", 2, theme);
         let [new, refresh] = layout::sidebar_header_buttons::<2>(column);
         for (rect, icon, tip, action) in [
             (

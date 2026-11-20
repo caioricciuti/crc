@@ -2114,7 +2114,7 @@ impl Panel {
                 .tip("Switch Repository")
                 .draw(out, atlas, theme),
             None => {
-                layout::push_sidebar_title(out, atlas, column, "SOURCE CONTROL", 2, theme);
+                layout::push_sidebar_title(out, atlas, column, "Source control", 2, theme);
             }
         }
         Button::new(g.refresh)
@@ -2639,13 +2639,18 @@ impl Panel {
                 theme.gutter_text,
             );
         }
+        let (letter, tip) = crate::project::marks::change_letter(code);
+        let mut buf = [0; 4];
         layout::push_ui_text_centered(
             out,
             atlas,
             g.letter(rect),
-            &String::from_utf8_lossy(&[code]),
+            letter.encode_utf8(&mut buf),
             colour,
         );
+        if !tip.is_empty() {
+            layout::hotspot(g.letter(rect), layout::Cursor::Pointing, Some(tip));
+        }
         // A conflicted file is staged by Mark Resolved above its text, once
         // no markers are left in it; a box here would stage the markers.
         if conflicted {

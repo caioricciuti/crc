@@ -42,6 +42,20 @@ impl Mark {
         }
     }
 
+    /// What the letter stands for, for its tooltip.
+    pub fn tip(self) -> &'static str {
+        match self {
+            Mark::Modified => "Modified",
+            Mark::Added => "Added",
+            Mark::Untracked => "Untracked",
+            Mark::Deleted => "Deleted",
+            Mark::Renamed => "Renamed",
+            Mark::Conflicted => "Conflicted",
+            Mark::Contains => "Changes inside",
+            Mark::ContainsConflict => "A conflict inside",
+        }
+    }
+
     /// Whether the mark is a folder's, for what is inside it.
     pub fn of_folder(self) -> bool {
         matches!(self, Mark::Contains | Mark::ContainsConflict)
@@ -77,6 +91,23 @@ impl Mark {
             Mark::ContainsConflict => 6,
             Mark::Conflicted => 7,
         }
+    }
+}
+
+/// The letter Source Control's list shows for Git's one-letter status
+/// `code`, and what it stands for. An untracked file is `U`, as the
+/// Explorer marks it, not Git's `?`.
+pub fn change_letter(code: u8) -> (char, &'static str) {
+    match code {
+        b'?' => ('U', Mark::Untracked.tip()),
+        b'M' => ('M', Mark::Modified.tip()),
+        b'A' => ('A', Mark::Added.tip()),
+        b'D' => ('D', Mark::Deleted.tip()),
+        b'R' => ('R', Mark::Renamed.tip()),
+        b'C' => ('C', "Copied"),
+        b'T' => ('T', "Type changed"),
+        b'!' => ('!', Mark::Conflicted.tip()),
+        other => (other as char, ""),
     }
 }
 
@@ -240,6 +271,15 @@ mod tests {
         }
         assert_eq!(Mark::Contains.letter(), None);
         assert_eq!(Mark::ContainsConflict.letter(), None);
+    }
+
+    #[test]
+    fn an_untracked_file_is_u_in_both_lists() {
+        // Source Control's letter for Git's `?` is the Explorer's.
+        let (letter, tip) = change_letter(b'?');
+        assert_eq!(Some(letter.to_string().as_str()), Mark::Untracked.letter());
+        assert_eq!(tip, "Untracked");
+        assert_eq!(change_letter(b'M'), ('M', "Modified"));
     }
 
     #[test]

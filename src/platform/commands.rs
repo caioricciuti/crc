@@ -18,7 +18,7 @@ pub struct Command {
     pub title: String,
     /// The top-level menu it lives in: File, View, Git...
     pub group: String,
-    /// The key equivalent in menu notation, such as `⌘⇧O`. Empty for none.
+    /// The key equivalent in menu notation, such as `⇧⌘O`. Empty for none.
     pub shortcut: String,
     /// Other words it goes by, matched but not shown.
     pub keywords: &'static str,
@@ -126,20 +126,21 @@ pub fn shortcut(key: &str, mask: NSEventModifierFlags) -> String {
     if key.is_empty() {
         return String::new();
     }
-    let mut out = String::new();
-    for (flag, symbol) in [
-        (NSEventModifierFlags::Control, '⌃'),
-        (NSEventModifierFlags::Option, '⌥'),
-        (NSEventModifierFlags::Shift, '⇧'),
-        (NSEventModifierFlags::Command, '⌘'),
+    use crate::render::layout::{key_mods, shortcut_text};
+    let mut mods = 0;
+    for (flag, bit) in [
+        (NSEventModifierFlags::Control, key_mods::CONTROL),
+        (NSEventModifierFlags::Option, key_mods::OPTION),
+        (NSEventModifierFlags::Shift, key_mods::SHIFT),
+        (NSEventModifierFlags::Command, key_mods::COMMAND),
     ] {
         if mask.contains(flag) {
-            out.push(symbol);
+            mods |= bit;
         }
     }
     // An upper-case key equivalent implies Shift, as AppKit draws it.
-    if key.chars().any(char::is_uppercase) && !out.contains('⇧') {
-        out.insert(out.find('⌘').unwrap_or(out.len()), '⇧');
+    if key.chars().any(char::is_uppercase) {
+        mods |= key_mods::SHIFT;
     }
     let name = match key {
         "\r" => "↩".to_owned(),
@@ -154,8 +155,7 @@ pub fn shortcut(key: &str, mask: NSEventModifierFlags) -> String {
             _ => key.to_uppercase(),
         },
     };
-    out.push_str(&name);
-    out
+    shortcut_text(mods, &name)
 }
 
 /// Indices into `commands` matching `query`, best first. An empty query

@@ -210,6 +210,19 @@ pub enum Tone {
     Danger,
 }
 
+/// Fill and ink of a button that cannot act, whatever its tone: the
+/// control's resting fill (none for a ghost) and the label in the muted
+/// colour, so it reads as there but not now. No accent: a washed-out
+/// primary read as a faded call to action, and the gutter grey left a
+/// disabled Pull nearly invisible.
+pub fn disabled_colours(tone: Tone, theme: &Theme) -> ([f32; 4], [f32; 4]) {
+    let ink = theme.status_text;
+    match tone {
+        Tone::Ghost => ([0.0, 0.0, 0.0, 0.0], ink),
+        _ => (theme.tab_hover, ink),
+    }
+}
+
 /// One control. Build it, then [`Button::draw`] it.
 #[derive(Clone, Copy, Debug)]
 pub struct Button<'a> {
@@ -318,13 +331,7 @@ impl<'a> Button<'a> {
         let down = self.enabled && pressed(self.rect);
         let clear = [0.0, 0.0, 0.0, 0.0];
         if !self.enabled {
-            // A primary that cannot act yet is still the primary: the
-            // accent, washed out, not a lesser secondary.
-            return match self.tone {
-                Tone::Ghost => (clear, faded(theme.gutter_text, 0.8)),
-                Tone::Primary => (faded(theme.accent, 0.22), faded(theme.accent, 0.7)),
-                _ => (theme.tab_hover, faded(theme.gutter_text, 0.8)),
-            };
+            return disabled_colours(self.tone, theme);
         }
         if self.on {
             let fill = if down {
@@ -823,8 +830,8 @@ pub fn count_width(atlas: &mut Atlas, count: usize) -> f32 {
     (text + COUNT_PAD * 2.0).ceil().max(COUNT_HEIGHT)
 }
 
-/// A section heading in a sidebar list: chevron, small-caps-like title and
-/// its count, on the same baseline as the rows under it.
+/// A section heading in a sidebar list: chevron, title and its count, on
+/// the same baseline as the rows under it.
 #[allow(clippy::too_many_arguments)]
 pub fn push_section_heading(
     out: &mut Vec<GlyphInstance>,
@@ -869,10 +876,24 @@ pub fn push_section_heading(
     );
 }
 
-/// A heading in capitals from `row`'s left edge and, right after it, its
-/// count. The count keeps its room at the end of the row; the title is
-/// what gives way, with an ellipsis, so neither leaves the row. The
-/// width the title drew at.
+/// A panel's title or a section's heading, as every panel sets one: the
+/// text as given, in sentence case ("Source control", "Top processes"),
+/// at the UI size in the muted colour, cut with an ellipsis to `rect`.
+/// The width it drew at.
+pub fn push_section_title(
+    out: &mut Vec<GlyphInstance>,
+    atlas: &mut Atlas,
+    rect: Viewport,
+    title: &str,
+    theme: &Theme,
+) -> f32 {
+    push_ui_text_elided(out, atlas, rect, title, theme.status_text)
+}
+
+/// A heading from `row`'s left edge and, right after it, its count. The
+/// count keeps its room at the end of the row; the title is what gives
+/// way, with an ellipsis, so neither leaves the row. The width the title
+/// drew at.
 pub fn push_counted_heading(
     out: &mut Vec<GlyphInstance>,
     atlas: &mut Atlas,
@@ -882,7 +903,6 @@ pub fn push_counted_heading(
     colour: [f32; 4],
     theme: &Theme,
 ) -> f32 {
-    let upper = title.to_uppercase();
     let count_room = count.map_or(0.0, |count| count_width(atlas, count) + COUNT_GAP);
     let w = push_ui_text_elided(
         out,
@@ -891,7 +911,7 @@ pub fn push_counted_heading(
             width: (row.width - count_room).max(0.0),
             ..row
         },
-        &upper,
+        title,
         colour,
     );
     if let Some(count) = count {
@@ -1596,6 +1616,30 @@ pub fn feedback_of(text: &str) -> Feedback {
     }
 }
 
+/// A status-line message as it is shown: in sentence case, its first
+/// letter a capital ("opened main.rs" shows "Opened main.rs"). Only when
+/// its first word is a plain lowercase word of ours: a file name
+/// (`main.rs`), a path, a commit (`cc2e7b0`), a flag or crc's own name
+/// starts the line as it is spelled. The text the app keeps, and matches
+/// messages by, is left as it was.
+pub fn sentence_case(text: &str) -> std::borrow::Cow<'_, str> {
+    let word = text
+        .split(|c: char| c.is_whitespace() || matches!(c, ':' | ',' | ';' | '\u{2026}'))
+        .next()
+        .unwrap_or("");
+    let plain = !word.is_empty()
+        && word.chars().all(|c| c.is_ascii_lowercase() || c == '\'')
+        && word.starts_with(|c: char| c.is_ascii_lowercase())
+        && !matches!(word, "crc" | "git" | "gh" | "ssh" | "npm" | "cargo");
+    if !plain {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    out.push(text.as_bytes()[0].to_ascii_uppercase() as char);
+    out.push_str(&text[1..]);
+    std::borrow::Cow::Owned(out)
+}
+
 /// How long a status-line message stays: a failure twice as long, since
 /// it has to be read, not just noticed.
 pub fn message_lasts(text: &str) -> std::time::Duration {
@@ -1863,6 +1907,36 @@ pub fn push_empty_state(
         b.draw(out, atlas, theme);
     }
     laid.button
+}
+
+// ---- shortcuts --------------------------------------------------------------
+
+/// Modifier keys of a shortcut, for [`shortcut_text`]: or them together.
+pub mod key_mods {
+    pub const CONTROL: u8 = 1;
+    pub const OPTION: u8 = 2;
+    pub const SHIFT: u8 = 4;
+    pub const COMMAND: u8 = 8;
+}
+
+/// A shortcut as macOS writes it: the modifiers in the menu's order
+/// (⌃⌥⇧⌘), then the key. Every place crc shows a shortcut, the palette's
+/// rows, Home's keys and tooltips, spells it through here so none of them
+/// reads ⌘⇧O where the menu bar says ⇧⌘O.
+pub fn shortcut_text(mods: u8, key: &str) -> String {
+    let mut out = String::new();
+    for (flag, glyph) in [
+        (key_mods::CONTROL, '\u{2303}'),
+        (key_mods::OPTION, '\u{2325}'),
+        (key_mods::SHIFT, '\u{21e7}'),
+        (key_mods::COMMAND, '\u{2318}'),
+    ] {
+        if mods & flag != 0 {
+            out.push(glyph);
+        }
+    }
+    out.push_str(key);
+    out
 }
 
 // A key cap: how a keyboard shortcut is drawn wherever one is shown as
@@ -2208,14 +2282,14 @@ mod tests {
     }
 
     #[test]
-    fn a_disabled_primary_keeps_the_accent_and_an_overlay_fades_in_once() {
+    fn a_disabled_primary_drops_the_accent_and_an_overlay_fades_in_once() {
         let theme = Theme::dark();
         let rect = Viewport::new(80.0, UI_CONTROL);
         set_pointer(None);
         let primary = Button::new(rect).tone(Tone::Primary).enabled(false);
         let secondary = Button::new(rect).tone(Tone::Secondary).enabled(false);
-        assert_ne!(primary.colours(&theme), secondary.colours(&theme));
-        assert_eq!(primary.colours(&theme).0[..3], theme.accent[..3]);
+        assert_eq!(primary.colours(&theme), secondary.colours(&theme));
+        assert_ne!(primary.colours(&theme).0[..3], theme.accent[..3]);
         // An overlay: thin on its first frame, whole after the fade, and
         // asking for frames only until then.
         take_animating();
@@ -2411,6 +2485,59 @@ mod tests {
     }
 
     #[test]
+    fn shortcuts_read_in_the_menu_order() {
+        use key_mods::*;
+        assert_eq!(shortcut_text(COMMAND | SHIFT, "O"), "\u{21e7}\u{2318}O");
+        assert_eq!(shortcut_text(COMMAND | OPTION, "G"), "\u{2325}\u{2318}G");
+        assert_eq!(
+            shortcut_text(COMMAND | SHIFT | OPTION | CONTROL, "K"),
+            "\u{2303}\u{2325}\u{21e7}\u{2318}K"
+        );
+        assert_eq!(shortcut_text(COMMAND, "="), "\u{2318}=");
+    }
+
+    #[test]
+    fn a_disabled_button_is_neutral_whatever_its_tone() {
+        for theme in [Theme::dark(), Theme::light()] {
+            let primary = Button::new(row(100.0)).tone(Tone::Primary);
+            let (on_fill, _) = primary.colours(&theme);
+            let off = |tone| {
+                Button::new(row(100.0))
+                    .tone(tone)
+                    .enabled(false)
+                    .colours(&theme)
+            };
+            let (fill, ink) = off(Tone::Primary);
+            assert_ne!(fill, on_fill, "a disabled primary is not the accent");
+            assert_eq!(fill, theme.tab_hover, "the control's resting fill");
+            assert_ne!(ink, theme.ink_on_solid());
+            // One look for every filled tone; a ghost stays unfilled.
+            assert_eq!(off(Tone::Secondary), (fill, ink));
+            assert_eq!(off(Tone::Danger), (fill, ink));
+            assert_eq!(off(Tone::Ghost).0[3], 0.0);
+            // Readable: the label is not the faint gutter grey.
+            assert!(ink[3] > 0.5);
+        }
+    }
+
+    #[test]
+    fn a_message_starts_with_a_capital_unless_it_starts_with_a_name() {
+        assert_eq!(sentence_case("opened main.rs"), "Opened main.rs");
+        assert_eq!(sentence_case("save failed: full"), "Save failed: full");
+        assert_eq!(sentence_case("Folder opened"), "Folder opened");
+        for kept in [
+            "main.rs saved",
+            "cc2e7b0 reverted",
+            "crc was updated on disk",
+            "src/main.rs: no match",
+            "--force refused",
+            "",
+        ] {
+            assert_eq!(sentence_case(kept), kept);
+        }
+    }
+
+    #[test]
     fn a_heading_gives_way_to_its_count() {
         let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
         let theme = Theme::dark();
@@ -2462,7 +2589,8 @@ mod tests {
             colour,
             &theme,
         );
-        assert_eq!(title, ui_text_width(&mut atlas, "CHANGES"));
+        // Set as given, in sentence case, not in capitals.
+        assert_eq!(title, ui_text_width(&mut atlas, "Changes"));
         let pill = out.iter().find(|q| q.color == theme.tab_hover).unwrap();
         assert_eq!(pill.pos[0], row.x + title + COUNT_GAP);
     }

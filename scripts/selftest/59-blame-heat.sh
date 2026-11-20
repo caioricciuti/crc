@@ -81,7 +81,7 @@ SCRIPT
 CRC_SELFTEST="$T/heat.script" "$BIN" "$T/heatproj/garden.txt" 2> "$T/heat.err"
 expect "$T/heat-off.out" blame_heat "off"
 expect "$T/heat-palette.out" palette_first "Blame Heat"
-grep -Eq '^blame_heat: on lines=5 commits=3 unsigned=3 shown=4 hidden_from=- spots=2 tip=[0-9a-f]{7}  Tester  2 months ago / name the rows / unsigned / Cmd-click: open in File History$' "$T/heat-on.out" \
+grep -Eq '^blame_heat: on lines=5 commits=3 unsigned=3 shown=4 hidden_from=- spots=2 tip=[0-9a-f]{7}  Tester  2 months ago / name the rows / unsigned / ⌘-click: open in File History$' "$T/heat-on.out" \
     || failed "heat-on.out: $(grep '^blame_heat:' "$T/heat-on.out")"
 heat_hash() { git -C "$T/heatproj" rev-parse --short=7 "$1"; }
 # Command click beside leeks: the first commit, the caret on line 3.

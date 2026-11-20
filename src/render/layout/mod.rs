@@ -658,6 +658,58 @@ mod tests {
         assert!(hit.close_x0 >= hit.x0 && hit.close_x1 <= hit.x1);
     }
 
+    /// Every tab is its title, the same padding and the close slot: a
+    /// short name is not padded out to a floor, so the air before the
+    /// slot is the same on each, and no title is cut at its own width.
+    #[test]
+    fn every_tab_has_the_same_air_around_its_title() {
+        let tab = |name: &str| {
+            let mut buffer = Buffer::from_text("");
+            buffer.path = Some(format!("/tmp/{name}").into());
+            buffer
+        };
+        let mut docs = Documents::new(tab("a.md"));
+        docs.add(tab("main.rs"));
+        docs.add(tab("harvest-notes.md"));
+        docs.add(tab("lib.rs"));
+        docs.add(tab("notes.md"));
+        let mut atlas = atlas();
+        let rect = Viewport::new(1200.0, TAB_BAR_HEIGHT);
+        let theme = Theme::default();
+        let mut out = Vec::new();
+        let mut hits = Vec::new();
+        build_tab_bar(
+            &docs, 0, None, &mut atlas, rect, &theme, &mut out, &mut hits,
+        );
+        assert_eq!(hits.len(), 5);
+        // The room the title is drawn in holds it whole: no ellipsis.
+        for hit in &hits {
+            let title = docs.title(hit.index);
+            let path = format!("/tmp/{title}");
+            let icon = icon_width(
+                &mut atlas,
+                crate::project::icons::for_file(path.as_ref()).glyph,
+            );
+            let room = (hit.x1 - hit.x0) - TAB_PADDING_X * 2.0 - TAB_CLOSE_SLOT - icon - 6.0;
+            assert_eq!(
+                elide_middle(&mut atlas, &title, room),
+                title,
+                "{title} in {room}"
+            );
+        }
+        let air: Vec<f32> = hits
+            .iter()
+            .map(|hit| {
+                let title = docs.title(hit.index);
+                (hit.x1 - hit.x0) - ui_text_width(&mut atlas, &title)
+            })
+            .collect();
+        assert!(
+            (air[1] - air[2]).abs() < 0.01,
+            "main.rs and harvest-notes.md differ in air: {air:?}"
+        );
+    }
+
     #[test]
     fn deep_fallback_matches_unscrolled_geometry_and_clicks() {
         let prefix = "é漢\t🌍x\t".repeat(150_000);

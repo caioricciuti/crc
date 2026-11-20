@@ -179,7 +179,7 @@ pub(super) fn heat_tip(
         tip.push('\n');
         tip.push_str(note);
     }
-    tip.push_str("\nCmd-click: open in File History");
+    tip.push_str("\n\u{2318}-click: open in File History");
     tip
 }
 
@@ -898,7 +898,7 @@ mod tests {
         assert_eq!(doc.alpha, [1.0, 0.0, 0.0]);
         assert_eq!(
             doc.tips[0],
-            "aaaaaaa  Robin  1 hour ago\nplant beans\nunsigned\nCmd-click: open in File History"
+            "aaaaaaa  Robin  1 hour ago\nplant beans\nunsigned\n\u{2318}-click: open in File History"
         );
         assert!(doc.tips[1].contains("\nsigned\n"));
         assert!(

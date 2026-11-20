@@ -282,7 +282,7 @@ impl EditorView {
             // The document is the point: the page gives the column back.
             state.mcp.details = false;
             reveal_active_tab(&mut state);
-            state.message = Some(("Cmd-Return runs the call".into(), Instant::now()));
+            state.message = Some(("\u{2318}\u{21a9} runs the call".into(), Instant::now()));
         }
         self.sync_title();
         self.reparse();

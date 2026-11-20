@@ -485,9 +485,9 @@ impl Panel {
             atlas,
             column,
             if self.references {
-                "REFERENCES"
+                "References"
             } else {
-                "SEARCH"
+                "Search"
             },
             3,
             theme,

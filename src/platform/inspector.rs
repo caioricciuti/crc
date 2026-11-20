@@ -908,7 +908,7 @@ impl Inspector {
             [1.0, rect.height],
             theme.hairline,
         );
-        layout::push_sidebar_title(out, atlas, rect, "WORKSPACE", 2, theme);
+        layout::push_sidebar_title(out, atlas, rect, "Workspace", 2, theme);
         let [refresh, close] = layout::sidebar_header_buttons::<2>(rect);
         // While the Checks it started run, refresh waits, and a bar slides
         // under the header.
@@ -1059,7 +1059,7 @@ impl Inspector {
             x,
             y,
             (width - bw - 8.0).max(0.0),
-            "RECEIPT",
+            "Receipt",
             theme.status_text,
         );
         let y = y + ROW;
@@ -1294,7 +1294,7 @@ impl Inspector {
             x + 20.0,
             y + 3.0,
             (width - 20.0 - cw - 8.0).max(0.0),
-            "REWIND",
+            "Rewind",
             theme.status_text,
         );
         let mut y = y + ROW;
@@ -1764,7 +1764,7 @@ impl Inspector {
         }
         // The terminal showing is in ssh: where it is, not this Mac's Git.
         if let Some(remote) = remote {
-            text(out, atlas, x, y, width, "SSH SESSION", theme.status_text);
+            text(out, atlas, x, y, width, "SSH session", theme.status_text);
             y += ROW;
             let mut facts: Vec<Fact> = vec![("Host", vec![(remote.host.clone(), theme.text)])];
             if let Some(user) = &remote.user {
@@ -1786,7 +1786,7 @@ impl Inspector {
         // A remote workspace: where its terminals go, then its Git as a
         // local one's, read on the host.
         if let Some(host) = &workspace.host {
-            text(out, atlas, x, y, width, "REMOTE FOLDER", theme.status_text);
+            text(out, atlas, x, y, width, "Remote folder", theme.status_text);
             y += ROW;
             let mut facts: Vec<Fact> = vec![
                 ("Host", vec![(host.clone(), theme.text)]),
@@ -1949,7 +1949,7 @@ impl Inspector {
         if y + ROW > bottom {
             return;
         }
-        text(out, atlas, x, y, width, "PULL REQUEST", theme.status_text);
+        text(out, atlas, x, y, width, "Pull request", theme.status_text);
         y += ROW;
         if !github {
             note(
@@ -2064,7 +2064,7 @@ impl Inspector {
         if pr.list.is_empty() || y + ROW > bottom {
             return;
         }
-        text(out, atlas, x, y, width, "CHECKS", theme.status_text);
+        text(out, atlas, x, y, width, "Checks", theme.status_text);
         y += ROW;
         let count = |s: CheckState| pr.list.iter().filter(|c| c.state == s).count();
         let mut summary = Vec::new();
@@ -2163,7 +2163,7 @@ impl Inspector {
             out,
             atlas,
             heading,
-            "WORKTREES",
+            "Worktrees",
             Some(worktrees.len()),
             theme.status_text,
             theme,
@@ -2517,7 +2517,18 @@ impl Inspector {
             return y;
         }
         let mut y = y;
-        text(out, atlas, x, y, width, "ISSUES", theme.status_text);
+        layout::push_section_title(
+            out,
+            atlas,
+            Viewport {
+                x,
+                y,
+                width,
+                height: 20.0,
+            },
+            "Issues",
+            theme,
+        );
         // Not asked for: a button to, and nothing read.
         if !issues.loaded.contains(key) {
             y += ROW;

@@ -213,7 +213,7 @@ impl Panel {
         );
         let x = column.x + 10.0;
         let width = (column.width - 20.0).max(0.0);
-        layout::push_sidebar_title(out, atlas, column, "MCP SERVERS", 2, theme);
+        layout::push_sidebar_title(out, atlas, column, "MCP servers", 2, theme);
         let [edit, reload] = Panel::buttons(column);
         for (rect, icon, tip, action) in [
             (edit, icons::EDIT, "Edit mcp.json", Action::Edit),

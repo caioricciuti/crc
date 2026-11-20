@@ -800,23 +800,28 @@ pub fn build_home_view(
         (
             icons::FOLDER,
             "Open Folder\u{2026}",
-            "\u{2318}\u{21e7}O",
+            shortcut_text(key_mods::COMMAND | key_mods::SHIFT, "O"),
             HomeAction::OpenFolder,
         ),
         (
             icons::NEW_FILE,
             "New File",
-            "\u{2318}N",
+            shortcut_text(key_mods::COMMAND, "N"),
             HomeAction::NewFile,
         ),
         (
             icons::SEARCH,
             "Go to File",
-            "\u{2318}P",
+            shortcut_text(key_mods::COMMAND, "P"),
             HomeAction::FindFile,
         ),
     ];
-    let restart = replaced.then_some((icons::REFRESH, "Restart crc", "", HomeAction::Restart));
+    let restart = replaced.then_some((
+        icons::REFRESH,
+        "Restart crc",
+        String::new(),
+        HomeAction::Restart,
+    ));
     for (glyph, label, keys, action) in actions.into_iter().chain(restart) {
         if y + ROW > bottom {
             return;
@@ -861,7 +866,7 @@ pub fn build_home_view(
                 width: 88.0,
                 height: 20.0,
             },
-            keys,
+            &keys,
             dim,
         );
         hits.push(HomeHit { rect: row, action });
@@ -937,12 +942,24 @@ pub fn build_home_view(
     // Keys: the rest of the shortcuts, two columns, each key in a cap of
     // one width so they read as keys and the actions line up.
     let keys = [
-        ("\u{2318}B", "Show or hide the sidebar"),
-        ("\u{2318}\u{2325}G", "Source Control"),
-        ("\u{2318}\u{21e7}F", "Find in project"),
-        ("\u{2318}\u{21e7}C", "Claude Code"),
-        ("\u{2318}O", "Open a file"),
-        ("\u{2318}=", "Zoom in"),
+        (
+            shortcut_text(key_mods::COMMAND, "B"),
+            "Show or hide the sidebar",
+        ),
+        (
+            shortcut_text(key_mods::COMMAND | key_mods::OPTION, "G"),
+            "Source Control",
+        ),
+        (
+            shortcut_text(key_mods::COMMAND | key_mods::SHIFT, "F"),
+            "Find in project",
+        ),
+        (
+            shortcut_text(key_mods::COMMAND | key_mods::SHIFT, "C"),
+            "Claude Code",
+        ),
+        (shortcut_text(key_mods::COMMAND, "O"), "Open a file"),
+        (shortcut_text(key_mods::COMMAND, "="), "Zoom in"),
     ];
     const KEY_ROW: f32 = 28.0;
     let rows_needed = keys.len().div_ceil(2) as f32 * KEY_ROW;
@@ -1596,11 +1613,20 @@ pub fn timeline_column(track: Viewport, slots: usize, index: usize) -> Viewport 
 /// Results the Cmd-P palette lists; more than fit, so the list scrolls.
 pub const PALETTE_RESULTS: usize = 100;
 pub const PALETTE_HEADER: f32 = 72.0;
-pub const PALETTE_ROW: f32 = 44.0;
-pub const PALETTE_FOOTER: f32 = 32.0;
+/// One line to a row: the title, then what it is or where it lives,
+/// dimmed, on the same line. Two lines doubled the list's height for a
+/// word ("File", "crc") that a glance does not need on its own line.
+pub const PALETTE_ROW: f32 = 32.0;
+/// The footer's hint, with air under it as well as over it.
+pub const PALETTE_FOOTER: f32 = 38.0;
 
 /// Rows sketched while a palette list is on its way.
 pub const PALETTE_SKELETON_ROWS: usize = 3;
+
+/// Between a row's title and its dimmed detail.
+const PALETTE_DETAIL_GAP: f32 = 8.0;
+/// Between the last row and the footer's rule.
+const PALETTE_FOOTER_GAP: f32 = 4.0;
 
 /// How many rows the palette makes room for: its `count`, or the
 /// sketched ones while the list is `loading` and still empty.
@@ -2118,8 +2144,8 @@ pub fn build_palette(
         theme.status_text,
     );
     if rows.is_empty() && loading {
-        // On its way: the shape of the rows to come, an icon and two
-        // lines each, as a file or symbol row is laid out.
+        // On its way: the shape of the rows to come, an icon and a
+        // line each, as a row is laid out.
         for n in 0..PALETTE_SKELETON_ROWS {
             push_skeleton_row(
                 out,
@@ -2130,8 +2156,8 @@ pub fn build_palette(
                     height: PALETTE_ROW,
                 },
                 20.0,
-                (0.38 + 0.12 * (n % 2) as f32, 0.24),
-                true,
+                (0.38 + 0.12 * (n % 2) as f32, 0.0),
+                false,
                 theme,
             );
         }
@@ -2216,15 +2242,17 @@ pub fn build_palette(
             ui_text_width(atlas, &item.shortcut) + 16.0
         };
         let text_width = (rect.width - text_x - 18.0 - shortcut_width).max(0.0);
-        push_ui_text_elided(
+        let line = Viewport {
+            x: rect.x + text_x,
+            width: text_width,
+            ..rect
+        };
+        // The title keeps its room; the detail after it, dimmed, takes
+        // what is left and is cut first.
+        let title_w = push_ui_text_elided(
             out,
             atlas,
-            Viewport {
-                x: rect.x + text_x,
-                y: y + 1.0,
-                width: text_width,
-                height: 23.0,
-            },
+            line,
             &item.title,
             if index == selected {
                 theme.accent
@@ -2232,18 +2260,20 @@ pub fn build_palette(
                 theme.text
             },
         );
-        push_ui_text_elided(
-            out,
-            atlas,
-            Viewport {
-                x: rect.x + text_x,
-                y: y + 22.0,
-                width: text_width,
-                height: 19.0,
-            },
-            &item.detail,
-            theme.status_text,
-        );
+        let detail_x = title_w + PALETTE_DETAIL_GAP;
+        if !item.detail.is_empty() && detail_x < text_width {
+            push_ui_text_elided(
+                out,
+                atlas,
+                Viewport {
+                    x: line.x + detail_x,
+                    width: text_width - detail_x,
+                    ..line
+                },
+                &item.detail,
+                theme.status_text,
+            );
+        }
         if !item.shortcut.is_empty() {
             push_ui_text_right(
                 out,
@@ -2263,7 +2293,7 @@ pub fn build_palette(
     push_rect(
         out,
         atlas,
-        [viewport.x + 1.0, footer],
+        [viewport.x + 1.0, footer + PALETTE_FOOTER_GAP],
         [viewport.width - 2.0, 0.5],
         theme.hairline,
     );
@@ -2272,9 +2302,9 @@ pub fn build_palette(
         atlas,
         Viewport {
             x: viewport.x + 18.0,
-            y: footer,
+            y: footer + PALETTE_FOOTER_GAP,
             width: viewport.width - 36.0,
-            height: PALETTE_FOOTER,
+            height: PALETTE_FOOTER - PALETTE_FOOTER_GAP,
         },
         // Escape is the key cap at the top right; said once.
         &format!("↑ ↓  Navigate       ↵  {action}"),
@@ -2363,11 +2393,22 @@ fn tab_icon(docs: &Documents, index: usize) -> Option<icons::Icon> {
 /// A tab's width with its title measured in the UI font it is drawn in.
 /// [`tab_width`] counts monospace cells, which a proportional title does
 /// not fill: every tab had a different amount of air after its name.
+///
+/// Every tab is its content, the same padding and the close slot, as a
+/// terminal tab is, whether or not its cross shows: a floor as wide as
+/// [`TAB_MIN_WIDTH`] padded short names out, so the gap before the slot
+/// changed from tab to tab and the widths read as arbitrary.
 pub fn tab_width_ui(docs: &Documents, index: usize, atlas: &mut Atlas) -> f32 {
     let icon = tab_icon(docs, index).map_or(0.0, |i| icon_width(atlas, i.glyph) + 6.0);
     let label = ui_text_width(atlas, &docs.title(index));
-    (icon + label + TAB_PADDING_X * 2.0 + TAB_CLOSE_SLOT + 4.0).clamp(TAB_MIN_WIDTH, TAB_MAX_WIDTH)
+    // The 4pt keeps a title measured to the fraction from being cut by
+    // the rounding of the room it is drawn in.
+    (icon + label + 4.0 + TAB_PADDING_X * 2.0 + TAB_CLOSE_SLOT)
+        .clamp(TAB_UI_MIN_WIDTH, TAB_MAX_WIDTH)
 }
+
+/// The narrowest a tab drawn in the UI font gets: room to aim at.
+const TAB_UI_MIN_WIDTH: f32 = 72.0;
 
 /// [`tab_strip_start`] with the widths given by `width_of`.
 pub fn tab_strip_start_by(
@@ -2805,7 +2846,7 @@ pub fn push_sidebar_title(
         width: (row.width - used - UI_GAP).max(0.0),
         ..row
     };
-    push_ui_text_elided(out, atlas, rect, title, theme.status_text);
+    push_section_title(out, atlas, rect, title, theme);
     rect
 }
 
@@ -2947,7 +2988,7 @@ pub fn build_sidebar_with_edit(
     // No folder: the one empty state, with the one thing to do. Home,
     // beside it, lists the rest.
     if tree.root().is_none() {
-        push_sidebar_title(out, atlas, viewport, "EXPLORER", 0, theme);
+        push_sidebar_title(out, atlas, viewport, "Explorer", 0, theme);
         push_empty_state(
             out,
             atlas,
@@ -2959,7 +3000,7 @@ pub fn build_sidebar_with_edit(
     }
 
     // The panel's name and its actions, on one row.
-    let title = if scm { "SOURCE CONTROL" } else { "EXPLORER" };
+    let title = if scm { "Source control" } else { "Explorer" };
     if scm {
         // The panel draws its own actions and the rest of the column.
         return 0;
@@ -3163,6 +3204,7 @@ pub fn build_sidebar_with_edit(
             if slot.x >= name_x {
                 let colour = dim(git_mark_colour(mark, theme));
                 push_row_mark(out, atlas, slot, mark.letter(), colour);
+                hotspot(slot, Cursor::Pointing, Some(mark.tip()));
                 name_end = slot.x - UI_GAP;
             }
         }
@@ -4390,7 +4432,7 @@ mod narrow_sidebar_tests {
         let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
         let theme = Theme::default();
         for width in WIDTHS {
-            for (title, actions) in [("EXPLORER", 4), ("SOURCE CONTROL", 2), ("WORKSPACE", 2)] {
+            for (title, actions) in [("Explorer", 4), ("Source control", 2), ("Workspace", 2)] {
                 let column = column(width);
                 let mut out = Vec::new();
                 take_cut_labels();

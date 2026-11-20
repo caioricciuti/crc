@@ -462,20 +462,7 @@ impl Monitor {
         let net = at(disk.y + LINE, LINE);
         let heading = at(card.y + CARD + 6.0, HEADING);
         let process = |n: usize| at(heading.y + HEADING + n as f32 * LINE, LINE);
-        const SMALL: f32 = 0.85;
-        const PROCESSES: &str = "TOP PROCESSES";
-        let heading_w = layout::ui_text_width(atlas, PROCESSES) * SMALL;
-        layout::push_ui_text_scaled(
-            out,
-            atlas,
-            Viewport {
-                width: heading_w,
-                ..heading
-            },
-            PROCESSES,
-            theme.gutter_text,
-            SMALL,
-        );
+        layout::push_section_title(out, atlas, heading, "Top processes", theme);
         let Some(sample) = &self.sample else {
             // The shape of what is coming: the chart's empty well and the
             // meter's track, a bar for each line's figures.
