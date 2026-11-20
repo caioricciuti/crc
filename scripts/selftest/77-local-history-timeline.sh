@@ -112,7 +112,8 @@ case "$(grep -m1 '^scrub: ' "$T/lh-local.out")" in
     *) failed "lh: the second save: $(grep -m1 '^scrub: ' "$T/lh-local.out")" ;;
 esac
 lh_clock "$T/lh-local.out" scrub_strip "saved, " " | 3 of 4 | older=true newer=true"
-lh_clock "$T/lh-local.out" message "local version, saved, " " (3 of 4)"
+# The strip says which version; the status line does not repeat it.
+expect "$T/lh-local.out" message ""
 lh_clock "$T/lh-local.out" tabs "plan.txt | plan.txt @ saved " ""
 expect "$T/lh-local.out" gutter "1M inactive"
 case "$(grep -m1 '^scrub: ' "$T/lh-local-older.out")" in
@@ -154,8 +155,8 @@ esac
 [ "$(cat "$T/lhproj/plan.txt")" = "omega" ] \
     || failed "lh: plan.txt was written: $(cat "$T/lhproj/plan.txt")"
 
-# Outside Git: memo.txt's local versions alone, the filter with nothing
-# to choose; bare.txt has none, and is not in Git.
+# Outside Git: memo.txt's local versions alone, so no filter to choose
+# with; bare.txt has none, and is not in Git.
 cat > "$T/lh-loose.script" <<SCRIPT
 wait 800
 wait 300
@@ -166,9 +167,6 @@ dump $T/lh-loose.out
 key 123
 wait 300
 dump $T/lh-loose-older.out
-click @scrub.filter
-wait 100
-dump $T/lh-loose-filter.out
 quit
 SCRIPT
 CRC_HISTORY_DB="$lhdb" CRC_SELFTEST="$T/lh-loose.script" "$BIN" "$T/lhloose/memo.txt" 2> "$T/lh-loose.err"
@@ -183,8 +181,9 @@ case "$(grep -m1 '^scrub: ' "$T/lh-loose-older.out")" in
     *) failed "lh: outside Git, opened: $(grep -m1 '^scrub: ' "$T/lh-loose-older.out")" ;;
 esac
 lh_clock "$T/lh-loose-older.out" scrub_strip "opened, " " | 1 of 2 | older=false newer=true"
-expect "$T/lh-loose-filter.out" message "memo.txt has no commits to filter by"
-expect "$T/lh-loose-filter.out" scrub_filter "all 2/2 local:opened,local:saved"
+# Nothing to choose between: the strip offers no filter (the unit test
+# the_strip_row_steps_places_and_spaces_its_controls checks its regions).
+expect "$T/lh-loose-older.out" scrub_filter "all 2/2 local:opened,local:saved"
 cat > "$T/lh-bare.script" <<SCRIPT
 wait 800
 wait 300

@@ -90,10 +90,8 @@ case "$(grep -m1 '^scrub: ' "$T/heat-cmd-click.out")" in
     *) failed "heat: cmd-click: $(grep -m1 '^scrub: ' "$T/heat-cmd-click.out")" ;;
 esac
 expect "$T/heat-cmd-click.out" cursor "3:1"
-case "$(grep -m1 '^message: ' "$T/heat-cmd-click.out")" in
-    "message: $(heat_hash HEAD~2) Tester, "*" ago: plant the beds (1 of 3)") ;;
-    *) failed "heat: cmd-click: $(grep -m1 '^message: ' "$T/heat-cmd-click.out")" ;;
-esac
+# The strip says which version; the status line does not repeat it.
+expect "$T/heat-cmd-click.out" message ""
 # A plain click beside kale: the last commit.
 case "$(grep -m1 '^scrub: ' "$T/heat-click.out")" in
     "scrub: 3/3@$(heat_hash HEAD) "*" first=Beans") ;;

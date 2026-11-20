@@ -946,7 +946,15 @@ pub fn draw_strip(
     theme: &Theme,
     out: &mut Vec<GlyphInstance>,
 ) {
-    let pill = layout::strip_pill(out, atlas, strip, "Table", theme.accent);
+    // No pill: the segmented control below already says this is a table,
+    // and a tinted word over it reads as one more button. A zero-width
+    // anchor puts the facts on the segments' left edge.
+    let pill = Viewport {
+        x: strip.x + 4.0,
+        y: strip.y + 6.0,
+        width: 0.0,
+        height: 28.0,
+    };
     // The facts row is the query's while it has something to say: a run in
     // flight, what the last one failed with, or what a result tab holds.
     if let Some(result) = query.result {
@@ -1059,9 +1067,10 @@ pub fn draw_strip(
     layout::strip_hairline(out, atlas, strip, theme);
 }
 
-/// "4 rows and 3 columns in people.csv, comma-separated".
+/// "4 rows and 3 columns in people.csv, comma-separated": the rows under
+/// the header, as the grid numbers them.
 fn shape_facts(view: &TableView, file: &str) -> String {
-    let rows = view.table.rows.len();
+    let rows = view.body_rows();
     let columns = view.column_count();
     let mut facts = format!(
         "{rows} {} and {columns} {} in {file}, {}",
@@ -1156,26 +1165,27 @@ pub fn draw(
         [rect.width, 1.0],
         theme.hairline,
     );
-    layout::push_rect(
-        out,
-        atlas,
-        [left - 1.0, rect.y],
-        [1.0, rect.height],
-        theme.hairline,
-    );
-    // Column rules, one each, the height of the grid.
-    for c in on_screen.iter().copied().filter(|c| *c > 0) {
-        let x = left + edges[c] - scroll_x;
-        if x >= left {
-            layout::push_rect(out, atlas, [x, rect.y], [1.0, rect.height], theme.hairline);
-        }
-    }
-
     // The body records on screen, and the rule under each.
     let shown: Vec<(usize, f32)> = (0..visible)
         .map(|n| (1 + view.scroll_row + n, body.y + n as f32 * line_height))
         .take_while(|(index, _)| *index < view.table.rows.len())
         .collect();
+    // The gutter's rule and the column rules, one each, as far down as the
+    // last row: under a short table the pane is empty, not ruled.
+    let depth = grid_depth(rect, line_height, shown.len());
+    layout::push_rect(
+        out,
+        atlas,
+        [left - 1.0, rect.y],
+        [1.0, depth],
+        theme.hairline,
+    );
+    for c in on_screen.iter().copied().filter(|c| *c > 0) {
+        let x = left + edges[c] - scroll_x;
+        if x >= left {
+            layout::push_rect(out, atlas, [x, rect.y], [1.0, depth], theme.hairline);
+        }
+    }
     for (_, y) in &shown {
         layout::push_rect(
             out,
@@ -1186,19 +1196,24 @@ pub fn draw(
         );
     }
 
-    let mut draw_row = |index: usize, y: f32, colour: [f32; 4], out: &mut Vec<GlyphInstance>| {
+    // The header in the bold face and unnumbered; the body numbered from
+    // 1, so a row's number is its place under the header.
+    let mut draw_row = |index: usize, y: f32, out: &mut Vec<GlyphInstance>| {
         let Some(row) = view.table.rows.get(index) else {
             return;
         };
-        let number = (index + 1).to_string();
-        layout::push_text(
-            out,
-            atlas,
-            left - (number.len() as f32 + 1.0) * cells.advance,
-            y,
-            &number,
-            theme.gutter_text,
-        );
+        let header = index == 0;
+        if !header {
+            let number = row_number(index);
+            layout::push_text(
+                out,
+                atlas,
+                left - (number.len() as f32 + 1.0) * cells.advance,
+                y,
+                &number,
+                theme.gutter_text,
+            );
+        }
         for c in &on_screen {
             let Some(cell) = row.cells.get(*c) else {
                 continue;
@@ -1206,15 +1221,19 @@ pub fn draw(
             let x = left + edges[*c] - scroll_x + CELL_PAD;
             let text = cell_label(rope, cell, view.widths[*c]);
             let from = out.len();
-            layout::push_text(out, atlas, x, y, &text, colour);
+            if header {
+                push_bold_text(out, atlas, x, y, &text, theme.text);
+            } else {
+                layout::push_text(out, atlas, x, y, &text, theme.text);
+            }
             for quad in &mut out[from..] {
                 layout::clip_horizontal(quad, left, right);
             }
         }
     };
-    draw_row(0, rect.y, theme.status_text, out);
+    draw_row(0, rect.y, out);
     for (index, y) in shown {
-        draw_row(index, y, theme.text, out);
+        draw_row(index, y, out);
     }
 
     // The selected cell: a one point outline on the rules around it (the
@@ -1291,6 +1310,47 @@ pub fn draw(
         for quad in &mut out[from..] {
             layout::clip_horizontal(quad, left, right);
         }
+    }
+}
+
+/// How far down from the grid's top its rules run: the header and the
+/// `rows` body rows on screen, never past the pane.
+pub fn grid_depth(rect: Viewport, line_height: f32, rows: usize) -> f32 {
+    ((rows + 1) as f32 * line_height).min(rect.height)
+}
+
+/// The number a record shows in the gutter: its place under the header.
+/// The header itself has none.
+pub fn row_number(record: usize) -> String {
+    record.to_string()
+}
+
+/// A run of text in the code font's bold, in the regular face's cells, so
+/// a header lines up with the column under it.
+fn push_bold_text(
+    out: &mut Vec<GlyphInstance>,
+    atlas: &mut Atlas,
+    x: f32,
+    y: f32,
+    text: &str,
+    color: [f32; 4],
+) {
+    let (cell_w, cell_h) = atlas.cell_size();
+    let m = atlas.metrics;
+    let glyph_dy = m.glyph_dy(m.line_height);
+    let mut column = 0usize;
+    for ch in text.chars() {
+        if let Some(slot) = atlas.slot_for_face(ch, crate::render::font::Face::Bold) {
+            out.push(GlyphInstance {
+                pos: [x + column as f32 * m.advance, y + glyph_dy],
+                size: [cell_w * slot.cells as f32, cell_h],
+                uv: slot.uv,
+                flags: slot.flags(),
+                color,
+                ..Default::default()
+            });
+        }
+        column += display_width(ch);
     }
 }
 
@@ -2226,5 +2286,56 @@ mod tests {
         assert_eq!(reparsed.table.rows.len(), 100_000);
         assert!(b.undo());
         assert_eq!(b.rope.to_string(), text);
+    }
+
+    /// The facts count the rows under the header, the gutter numbers them
+    /// from 1 and leaves the header bare, and the rules stop at the last
+    /// row instead of running to the pane's foot.
+    #[test]
+    fn the_header_is_not_a_row_and_the_rules_stop_at_the_last_one() {
+        let rope =
+            Rope::from_text("date,plant,grams\n2026-06-02,lettuce,120\n2026-06-09,mint,30\n");
+        let mut view = TableView::parse(&rope);
+        assert_eq!(
+            shape_facts(&view, "harvest.csv"),
+            "2 rows and 3 columns in harvest.csv, comma-separated"
+        );
+        let header_only = TableView::parse(&Rope::from_text("a,b\n"));
+        assert!(shape_facts(&header_only, "x.csv").starts_with("0 rows and 2 columns"));
+        assert_eq!(row_number(1), "1");
+
+        let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
+        let theme = Theme::dark();
+        let cells = Cells::of(&atlas);
+        let rect = Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: 600.0,
+            height: 400.0,
+        };
+        let mut out = Vec::new();
+        draw(&mut view, &rope, None, &mut atlas, rect, &theme, &mut out);
+        // The vertical rules: the gutter's and one between each column.
+        let rules: Vec<_> = out
+            .iter()
+            .filter(|q| q.color == theme.hairline && q.size[0] == 1.0)
+            .collect();
+        assert_eq!(rules.len(), 3);
+        let depth = 3.0 * cells.line_height;
+        assert!(
+            rules.iter().all(|q| q.size[1] == depth),
+            "rules not {depth} tall"
+        );
+        assert_eq!(grid_depth(rect, cells.line_height, 2), depth);
+        // A table taller than its pane is ruled to the pane's foot only.
+        assert_eq!(grid_depth(rect, cells.line_height, 10_000), rect.height);
+        // Two row numbers in the gutter, one digit each, none on the
+        // header's line.
+        let numbers: Vec<_> = out
+            .iter()
+            .filter(|q| q.color == theme.gutter_text)
+            .collect();
+        assert_eq!(numbers.len(), 2);
+        assert!(numbers.iter().all(|q| q.pos[1] >= cells.line_height));
     }
 }

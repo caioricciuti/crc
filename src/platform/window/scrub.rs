@@ -469,6 +469,11 @@ impl Scrub {
         self.sibling == Some(active) || (self.sibling.is_none() && self.live == active)
     }
 
+    /// The file's own tab, when `id` is the history's.
+    pub(super) fn file_of(&self, id: u64) -> Option<u64> {
+        (self.sibling == Some(id)).then_some(self.live)
+    }
+
     /// Something is on its way that the display link has to poll for.
     pub(super) fn busy(&self) -> bool {
         !self.gone
@@ -682,37 +687,6 @@ impl Scrub {
             return Err("this version could not be read, so it cannot be restored".into());
         }
         Ok(())
-    }
-
-    /// What the status line says of version `slot`.
-    fn describe(&self, slot: usize) -> String {
-        let count = self.count();
-        let more = if self.capped { "+" } else { "" };
-        let now = crate::platform::unix_seconds() as i64;
-        match self.versions.as_ref().and_then(|v| v.get(slot)) {
-            Some(Version {
-                source: Source::Local { reason, .. },
-                time,
-                ..
-            }) => format!(
-                "local version, {}, {} ({} of {count}{more})",
-                reason_words(*reason),
-                crate::platform::clock_time(*time, now),
-                slot + 1,
-            ),
-            Some(version) => format!(
-                "{} {}, {}: {} ({} of {count}{more})",
-                short(&version.commit),
-                version.author,
-                crate::project::git::ago(version.time, now),
-                version.summary,
-                slot + 1,
-            ),
-            None => format!(
-                "working tree, after {}",
-                counted(self.versions.as_deref().unwrap_or_default(), more)
-            ),
-        }
     }
 }
 
@@ -990,14 +964,19 @@ pub(super) fn freeze_fade(state: &mut State, ms: u64) {
 }
 
 // ---- the strip --------------------------------------------------------------
-// Above the history's tab: which version it is, Older and Newer, the
-// filter, what the gutter marks against, a timeline of every version with
-// the working tree at its right end, to click or drag along, and Restore.
+// Above the history's tab. The first row names it and says which version
+// it is: the commit, its author and age, and its summary. The second is one
+// row of controls on the strip's spacing: Older and Newer, the place, the
+// filter when there is a choice to make, the comparison, a timeline of
+// every version with the working tree at its right end, to click or drag
+// along, and Restore.
 
-const OLDER: &str = "Older";
-const NEWER: &str = "Newer";
-const COMPARE: &str = "vs Working Tree";
+const OLDER: &str = "\u{2039} Older";
+const NEWER: &str = "Newer \u{203a}";
+const COMPARE: &str = "Compare with Working Tree";
 const RESTORE: &str = "Restore";
+/// The strip's left and right inset, which its title and Restore keep.
+const STRIP_INSET: f32 = 16.0;
 
 /// The history whose strip is above the active tab.
 pub(super) fn strip_scrub(state: &State) -> Option<&Scrub> {
@@ -1009,10 +988,13 @@ pub(super) fn strip_scrub(state: &State) -> Option<&Scrub> {
 pub(super) struct StripRects {
     pub(super) older: Viewport,
     pub(super) newer: Viewport,
+    /// "3 of 5": as wide as the widest it can say, so nothing after it
+    /// moves as the steps go.
+    pub(super) position: Viewport,
     /// All, Commits or Local; as wide as the widest, so the timeline does
-    /// not move when it changes.
+    /// not move when it changes. No width while there is nothing to filter.
     pub(super) filter: Viewport,
-    /// Lit while the gutter marks against the working tree.
+    /// On while the gutter marks against the working tree.
     pub(super) compare: Viewport,
     /// At the second row's right end.
     pub(super) restore: Viewport,
@@ -1021,31 +1003,61 @@ pub(super) struct StripRects {
     pub(super) track: Viewport,
 }
 
-/// The steps, the filter and the comparison are one segmented control:
-/// their cells touch, and the track runs under all four.
-pub(super) fn strip_rects(atlas: &mut Atlas, strip: Viewport) -> StripRects {
-    let older = layout::strip_button(atlas, strip, strip.x + 16.0, OLDER, 24.0);
-    let newer = layout::strip_button(atlas, strip, older.x + older.width, NEWER, 24.0);
-    let widest = [Filter::All, Filter::Commits, Filter::Local]
-        .into_iter()
-        .max_by(|a, b| {
-            let (a, b) = (
-                layout::ui_text_width(atlas, a.label()),
-                layout::ui_text_width(atlas, b.label()),
-            );
-            a.total_cmp(&b)
-        })
-        .unwrap_or_default();
-    let filter = layout::strip_button(atlas, strip, newer.x + newer.width, widest.label(), 24.0);
-    let compare = layout::strip_button(atlas, strip, filter.x + filter.width, COMPARE, 24.0);
-    let restore = layout::strip_button(atlas, strip, 0.0, RESTORE, 24.0);
+/// A button on the second row at `x`, its label inset as every control's.
+fn strip_control(atlas: &mut Atlas, strip: Viewport, x: f32, label: &str) -> Viewport {
+    layout::strip_button(atlas, strip, x, label, 2.0 * layout::UI_INSET)
+}
+
+/// The second row, left to right: the two steps a gap apart, then the
+/// place, the filter, the toggle and the timeline an inset apart, and
+/// Restore at the right end.
+pub(super) fn strip_rects(scrub: &Scrub, atlas: &mut Atlas, strip: Viewport) -> StripRects {
+    let older = strip_control(atlas, strip, strip.x + STRIP_INSET, OLDER);
+    let newer = strip_control(atlas, strip, older.x + older.width + layout::UI_GAP, NEWER);
+    let count = scrub.versions.as_ref().map_or(0, Vec::len).max(1);
+    let more = if scrub.capped { "+" } else { "" };
+    let widest = [
+        format!("{count} of {count}{more}"),
+        "working tree".to_string(),
+        "loading\u{2026}".to_string(),
+    ]
+    .iter()
+    .map(|text| layout::ui_text_width(atlas, text))
+    .fold(0.0_f32, f32::max)
+    .ceil();
+    let position = Viewport {
+        x: newer.x + newer.width + layout::UI_INSET,
+        width: widest,
+        ..newer
+    };
+    let mut x = position.x + position.width + layout::UI_INSET;
+    let filter = if filter_open(scrub) {
+        let label = [Filter::All, Filter::Commits, Filter::Local]
+            .into_iter()
+            .map(Filter::label)
+            .max_by(|a, b| {
+                layout::ui_text_width(atlas, a).total_cmp(&layout::ui_text_width(atlas, b))
+            })
+            .unwrap_or_default();
+        let rect = strip_control(atlas, strip, x, label);
+        x = rect.x + rect.width + layout::UI_GAP;
+        rect
+    } else {
+        Viewport {
+            x,
+            width: 0.0,
+            ..position
+        }
+    };
+    let compare = strip_control(atlas, strip, x, COMPARE);
+    let restore = strip_control(atlas, strip, 0.0, RESTORE);
     let restore = Viewport {
-        x: strip.x + strip.width - 16.0 - restore.width,
+        x: strip.x + strip.width - STRIP_INSET - restore.width,
         ..restore
     };
-    // On the first row, level with the pill.
+    // On the first row, level with the title.
     let close = Viewport {
-        x: strip.x + strip.width - 16.0 - layout::UI_CONTROL,
+        x: strip.x + strip.width - STRIP_INSET - layout::UI_CONTROL,
         y: strip.y + 6.0,
         width: layout::UI_CONTROL,
         height: layout::UI_CONTROL,
@@ -1059,6 +1071,7 @@ pub(super) fn strip_rects(atlas: &mut Atlas, strip: Viewport) -> StripRects {
     StripRects {
         older,
         newer,
+        position,
         filter,
         compare,
         restore,
@@ -1083,19 +1096,23 @@ fn filter_open(scrub: &Scrub) -> bool {
 }
 
 /// The strip's clickable parts: the close button always, the rest once
-/// the versions are listed.
+/// the versions are listed, and the filter while it has a choice.
 pub(super) fn strip_hits(
     scrub: &Scrub,
     atlas: &mut Atlas,
     strip: Viewport,
 ) -> Vec<(Hit, Viewport)> {
-    let rects = strip_rects(atlas, strip);
+    let rects = strip_rects(scrub, atlas, strip);
     let mut hits = vec![(Hit::ScrubClose, rects.close)];
     if scrub.versions.is_some() {
         hits.extend([
             (Hit::ScrubOlder, rects.older),
             (Hit::ScrubNewer, rects.newer),
-            (Hit::ScrubFilter, rects.filter),
+        ]);
+        if rects.filter.width > 0.0 {
+            hits.push((Hit::ScrubFilter, rects.filter));
+        }
+        hits.extend([
             (Hit::ScrubCompare, rects.compare),
             (Hit::ScrubRestore, rects.restore),
             (Hit::ScrubTrack, rects.track),
@@ -1184,7 +1201,7 @@ fn slot_tip(scrub: &Scrub, slot: usize, now: i64) -> String {
     }
 }
 
-/// The pill, the facts, the place, the buttons and the timeline.
+/// The title, the facts, the controls and the timeline.
 pub(super) fn draw_strip(
     scrub: &Scrub,
     atlas: &mut Atlas,
@@ -1193,34 +1210,29 @@ pub(super) fn draw_strip(
     out: &mut Vec<GlyphInstance>,
 ) {
     let now = crate::platform::unix_seconds() as i64;
-    // A local version has a pill of its own, in the local ticks' colour.
+    // A local version says so in the colour of its timeline marks.
     let local = scrub
         .versions
         .as_ref()
         .and_then(|v| v.get(scrub.center()))
         .is_some_and(Version::is_local);
-    let pill = if local {
-        layout::strip_pill(out, atlas, strip, "Local", theme.diff_modified)
+    let (title, ink) = if local {
+        ("Local Version", theme.diff_modified)
     } else {
-        layout::strip_pill(out, atlas, strip, "History", theme.accent)
+        ("History", theme.text)
     };
-    let rects = strip_rects(atlas, strip);
+    let rects = strip_rects(scrub, atlas, strip);
+    let title_rect = Viewport {
+        x: strip.x + STRIP_INSET,
+        y: rects.close.y,
+        width: layout::ui_text_width(atlas, title).ceil(),
+        height: layout::UI_CONTROL,
+    };
+    layout::push_ui_text(out, atlas, title_rect, title, ink);
     let text = strip_text(scrub, now);
-    let left = pill.x + pill.width + 12.0;
-    let right_width = layout::ui_text_width(atlas, &text.right);
-    layout::push_ui_text_right(
-        out,
-        atlas,
-        Viewport {
-            x: left,
-            width: (rects.close.x - 8.0 - left).max(0.0),
-            ..pill
-        },
-        &text.right,
-        theme.status_text,
-    );
-    // The facts stop short of the place; the summary gives way first.
-    let room = (rects.close.x - 8.0 - right_width - 16.0 - left).max(0.0);
+    let left = title_rect.x + title_rect.width + layout::UI_INSET;
+    // The facts stop short of the close button; the summary gives way first.
+    let room = (rects.close.x - layout::UI_INSET - left).max(0.0);
     let lead_width = layout::ui_text_width(atlas, &text.lead);
     let facts = if lead_width >= room {
         crate::platform::inspector::fit(atlas, text.lead.trim_end(), room)
@@ -1230,36 +1242,46 @@ pub(super) fn draw_strip(
         let summary = crate::platform::inspector::fit(atlas, &summary, room - lead_width);
         format!("{}{summary}", text.lead)
     };
-    layout::strip_facts(out, atlas, strip, pill, &facts, theme);
-    let (older, newer) = steps_open(scrub);
-    // One control: the steps, the filter (lit while it leaves versions
-    // out) and the comparison (lit while the gutter marks against the
-    // working tree).
-    layout::push_segmented(
+    layout::push_ui_text_elided(
         out,
         atlas,
-        &[
-            layout::Segment::new(rects.older, OLDER)
-                .enabled(older)
-                .tip("Older Version  \u{2190}"),
-            layout::Segment::new(rects.newer, NEWER)
-                .enabled(newer)
-                .tip("Newer Version  \u{2192}"),
-            layout::Segment::new(rects.filter, scrub.filter.label())
-                .enabled(filter_open(scrub))
-                .on(scrub.filter != Filter::All)
-                .tip("Show All Versions, Commits or Local Versions"),
-            layout::Segment::new(rects.compare, COMPARE)
-                .enabled(scrub.versions.is_some())
-                .on(scrub.against_tree)
-                .tip(if scrub.against_tree {
-                    "Marking Changes Against the Working Tree"
-                } else {
-                    "Mark Changes Against the Working Tree, Not the Version Before"
-                }),
-        ],
-        theme,
+        Viewport {
+            x: left,
+            width: room,
+            ..title_rect
+        },
+        &facts,
+        theme.status_text,
     );
+    let (older, newer) = steps_open(scrub);
+    Button::new(rects.older)
+        .label(OLDER)
+        .enabled(older)
+        .tip("Older Version  \u{2190}")
+        .draw(out, atlas, theme);
+    Button::new(rects.newer)
+        .label(NEWER)
+        .enabled(newer)
+        .tip("Newer Version  \u{2192}")
+        .draw(out, atlas, theme);
+    layout::push_ui_text(out, atlas, rects.position, &text.right, theme.status_text);
+    if rects.filter.width > 0.0 {
+        Button::new(rects.filter)
+            .label(scrub.filter.label())
+            .on(scrub.filter != Filter::All)
+            .tip("Show All Versions, Commits or Local Versions")
+            .draw(out, atlas, theme);
+    }
+    Button::new(rects.compare)
+        .label(COMPARE)
+        .enabled(scrub.versions.is_some())
+        .on(scrub.against_tree)
+        .tip(if scrub.against_tree {
+            "Marking Changes Against the Working Tree"
+        } else {
+            "Mark Changes Against the Working Tree, Not the Version Before"
+        })
+        .draw(out, atlas, theme);
     // Restore throws the working tree's text away: plain until a past
     // version is shown and read, then the strip's one primary action.
     let restorable = scrub.restorable().is_ok();
@@ -1411,28 +1433,21 @@ fn draw_timeline(
             );
         }
     }
-    // The working tree: the thumb's own shape, hollow, at the right end.
-    // It is no commit, so no tick; and it is where the thumb rests, so it
-    // is the thumb's outline rather than a second shape on the line.
-    let ground = theme.background.map(|c| c as f32);
+    // The working tree: a tick at the right end like a commit's, at full
+    // strength, so the line ends alike at both ends and the thumb is the
+    // one shape on it that is not a tick.
     let thumb_at = |x: f32| Viewport {
         x: m.snap(x - THUMB.0 * 0.5),
         y: mid - THUMB.1 * 0.5,
         width: THUMB.0,
         height: THUMB.1,
     };
-    let home = thumb_at(last);
-    layout::push_rounded_rect(out, home, THUMB.0 * 0.5, layout::faded(ink, 0.9));
-    layout::push_rounded_rect(
+    layout::push_rect(
         out,
-        Viewport {
-            x: home.x + 1.5,
-            y: home.y + 1.5,
-            width: (home.width - 3.0).max(0.0),
-            height: (home.height - 3.0).max(0.0),
-        },
-        (THUMB.0 - 3.0) * 0.5,
-        ground,
+        atlas,
+        [m.snap(last - 0.5), mid - 5.0],
+        [1.0, 10.0],
+        layout::faded(ink, 0.85),
     );
     // Under the pointer: that version brighter, and what it is said when
     // the pointer rests there.
@@ -1525,7 +1540,7 @@ pub(super) fn history_step(event: &NSEvent) -> Option<Option<Step>> {
 /// the history's tab (made on the first), the caret and the view are moved
 /// through the diffs, and the gutter marks what that commit changed.
 /// Returns what to say, and whether the tab was just made.
-fn show(state: &mut State) -> Option<(String, bool)> {
+fn show(state: &mut State) -> Option<(Option<String>, bool)> {
     let State {
         scrub,
         docs,
@@ -1615,11 +1630,9 @@ fn show(state: &mut State) -> Option<(String, bool)> {
         },
     );
     scrub.request();
-    let said = match scrub.note.take() {
-        Some(note) => format!("{note}: {}", scrub.describe(target)),
-        None => scrub.describe(target),
-    };
-    Some((said, !made))
+    // The strip above says which version this is; the status line only
+    // carries a note about how it was reached.
+    Some((scrub.note.take(), !made))
 }
 
 /// Restore This Version: the version shown replaces the text of the file's
@@ -1989,7 +2002,7 @@ impl EditorView {
             let Some(count) = scrub.versions.as_ref().map(Vec::len) else {
                 return;
             };
-            let track = strip_rects(&mut state.renderer.atlas, strip).track;
+            let track = strip_rects(scrub, &mut state.renderer.atlas, strip).track;
             layout::timeline_slot_at(track, count + 1, x)
         };
         self.step_history(Step::To(slot));
@@ -2159,7 +2172,8 @@ impl EditorView {
             };
             match show(&mut state) {
                 Some((said, made)) => {
-                    state.message = Some((said, Instant::now()));
+                    // A version shown ends any "loading" or "reading" line.
+                    state.message = said.map(|said| (said, Instant::now()));
                     if made {
                         reveal_active_tab(&mut state);
                     }
@@ -3797,6 +3811,60 @@ mod tests {
         assert!(!left_history_message(false, Some("saved notes.md"), said));
         // Nothing heard in front (the tab was never shown): nothing goes.
         assert!(!left_history_message(false, said, None));
+    }
+
+    /// The strip's second row: the steps open only where there is a
+    /// version to go to, the place says which of how many, the controls
+    /// sit on the shared spacing, and the filter is there only while it
+    /// has a choice to make.
+    #[test]
+    fn the_strip_row_steps_places_and_spaces_its_controls() {
+        let mut atlas = crate::render::font::Atlas::build("SF Mono", 13.0, 2.0);
+        let strip = Viewport {
+            x: 300.0,
+            y: 100.0,
+            width: 1100.0,
+            height: 74.0,
+        };
+        let (mut scrub, _requests) = scrub_of(vec![commit_v("a"), commit_v("b"), commit_v("c")]);
+        // The oldest: Older has nowhere to go.
+        scrub.shown = 0;
+        assert_eq!(steps_open(&scrub), (false, true));
+        assert_eq!(strip_text(&scrub, 0).right, "1 of 3");
+        // The working tree: Newer has nowhere to go.
+        scrub.shown = 3;
+        assert_eq!(steps_open(&scrub), (true, false));
+        assert_eq!(strip_text(&scrub, 0).right, "working tree");
+        scrub.shown = 1;
+        assert_eq!(steps_open(&scrub), (true, true));
+        assert_eq!(strip_text(&scrub, 0).right, "2 of 3");
+
+        let r = strip_rects(&scrub, &mut atlas, strip);
+        let end = |v: Viewport| v.x + v.width;
+        assert_eq!(r.older.x, strip.x + STRIP_INSET);
+        assert_eq!(r.newer.x - end(r.older), layout::UI_GAP);
+        assert_eq!(r.position.x - end(r.newer), layout::UI_INSET);
+        // Commits alone: no filter, and the toggle takes its place.
+        assert_eq!(r.filter.width, 0.0);
+        assert_eq!(r.compare.x - end(r.position), layout::UI_INSET);
+        assert_eq!(r.track.x - end(r.compare), layout::UI_INSET);
+        assert!((r.restore.x - end(r.track) - layout::UI_INSET).abs() < 0.01);
+        assert_eq!(end(r.restore), strip.x + strip.width - STRIP_INSET);
+        for control in [r.older, r.newer, r.compare, r.restore] {
+            assert_eq!(control.height, layout::UI_CONTROL);
+            assert_eq!(control.y, r.older.y);
+        }
+        let hits = strip_hits(&scrub, &mut atlas, strip);
+        assert!(!hits.iter().any(|(hit, _)| *hit == Hit::ScrubFilter));
+
+        // Commits and local versions: the filter, a gap before the toggle.
+        let (scrub, _requests) = scrub_of(vec![commit_v("a"), local_v(1, Reason::Saved)]);
+        let r = strip_rects(&scrub, &mut atlas, strip);
+        assert!(r.filter.width > 0.0);
+        assert_eq!(r.filter.x - end(r.position), layout::UI_INSET);
+        assert_eq!(r.compare.x - end(r.filter), layout::UI_GAP);
+        let hits = strip_hits(&scrub, &mut atlas, strip);
+        assert!(hits.iter().any(|(hit, _)| *hit == Hit::ScrubFilter));
     }
 
     #[test]

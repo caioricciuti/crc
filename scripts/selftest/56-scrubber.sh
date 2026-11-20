@@ -74,8 +74,10 @@ wait 100
 dump $T/scrub-save.out
 key 1 cmd,shift s
 wait 100
-key 123
+key 115
 wait 300
+key 123
+wait 100
 dump $T/scrub-stepped.out
 key 33 cmd [
 wait 100
@@ -99,12 +101,9 @@ esac
 expect "$T/scrub-open.out" tabs "journal.txt | journal.txt @ $(scrub_hash HEAD)"
 expect "$T/scrub-open.out" active "1"
 expect "$T/scrub-open.out" cursor "4:1"
-# The age moves on with the calendar; the rest of the line does not.
-case "$(grep -m1 '^message: ' "$T/scrub-open.out")" in
-    "message: $(scrub_hash HEAD) Tester, "*" ago: five (5 of 5)") ;;
-    *) failed "scrubber: open: $(grep -m1 '^message: ' "$T/scrub-open.out")" ;;
-esac
-# The strip above the version says the same, and offers both steps.
+# The strip above the version says which it is, once: the status line
+# does not repeat it. It offers both steps.
+expect "$T/scrub-open.out" message ""
 case "$(grep -m1 '^scrub_strip: ' "$T/scrub-open.out")" in
     "scrub_strip: $(scrub_hash HEAD)   Tester, "*" ago   five | 5 of 5 | older=true newer=true") ;;
     *) failed "scrubber: strip: $(grep -m1 '^scrub_strip: ' "$T/scrub-open.out")" ;;
@@ -153,10 +152,7 @@ esac
 expect "$T/scrub-oldest.out" cursor "3:1"
 # The oldest version has no parent read: no marks, not every line added.
 expect "$T/scrub-oldest.out" gutter " inactive"
-case "$(grep -m1 '^message: ' "$T/scrub-oldest.out")" in
-    "message: $(scrub_hash HEAD~4) Tester, "*" ago: one (1 of 5)") ;;
-    *) failed "scrubber: Home: $(grep -m1 '^message: ' "$T/scrub-oldest.out")" ;;
-esac
+expect "$T/scrub-oldest.out" message ""
 case "$(grep -m1 '^scrub_strip: ' "$T/scrub-oldest.out")" in
     "scrub_strip: $(scrub_hash HEAD~4)   Tester, "*" ago   one | 1 of 5 | older=false newer=true") ;;
     *) failed "scrubber: strip at the oldest: $(grep -m1 '^scrub_strip: ' "$T/scrub-oldest.out")" ;;
@@ -168,7 +164,7 @@ case "$(grep -m1 '^scrub: ' "$T/scrub-end.out")" in
     *) failed "scrubber: End: $(grep -m1 '^scrub: ' "$T/scrub-end.out")" ;;
 esac
 expect "$T/scrub-end.out" tabs "journal.txt | journal.txt @ working tree"
-expect "$T/scrub-end.out" message "working tree, after 5 commits"
+expect "$T/scrub-end.out" message ""
 expect "$T/scrub-end.out" scrub_strip "journal.txt as open in its tab, after 5 commits | working tree | older=true newer=false"
 expect_line "$T/scrub-end.out" 7 "zeta"
 expect "$T/scrub-typed.out" dirty "false"
@@ -181,11 +177,9 @@ esac
 expect "$T/scrub-save.out" message "a version from history is not saved"
 expect "$T/scrub-save.out" dirty "false"
 expect "$T/scrub-closed.out" scrub "closed"
-# A version's line belongs to the history's tab: it goes with it.
-case "$(grep -m1 '^message: ' "$T/scrub-stepped.out")" in
-    *" of 5)") ;;
-    *) failed "scrubber: a step did not say its version: $(grep -m1 '^message: ' "$T/scrub-stepped.out")" ;;
-esac
+# What a step says belongs to the history's tab: it goes with it. Left
+# at the oldest version says so.
+expect "$T/scrub-stepped.out" message "this is the oldest version"
 expect "$T/scrub-left.out" active "0"
 expect "$T/scrub-left.out" message ""
 expect "$T/scrub-closed.out" message ""

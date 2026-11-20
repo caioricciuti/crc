@@ -722,6 +722,154 @@ pub fn push_segmented(
     }
 }
 
+// ---- the toggle and the stepper -------------------------------------------
+// A switch for a setting that is on or off, and a number between two
+// bounds with a step down and a step up. Both sit on a row at the row's
+// control height, in the control ramp's fills; a toggle's on and off
+// differ by the accent alone.
+
+/// A toggle's track: as tall as a control in a row, a little wider than
+/// two of its knobs.
+pub const UI_TOGGLE: [f32; 2] = [38.0, UI_CONTROL_SM];
+/// A stepper's parts: each step button, and the value between them.
+pub const UI_STEP: f32 = 26.0;
+pub const UI_STEP_VALUE: f32 = 52.0;
+
+/// The rect a toggle takes with its top right corner at `(right, y)`.
+pub fn toggle_rect(right: f32, y: f32) -> Viewport {
+    Viewport {
+        x: right - UI_TOGGLE[0],
+        y,
+        width: UI_TOGGLE[0],
+        height: UI_TOGGLE[1],
+    }
+}
+
+/// Draws a toggle in `rect` and registers it: the track in the pressed
+/// control fill when off and the accent when on, the knob at the end it
+/// is at.
+pub fn push_toggle(
+    out: &mut Vec<GlyphInstance>,
+    rect: Viewport,
+    on: bool,
+    theme: &Theme,
+    tip: Option<&str>,
+) {
+    let hover = hovered(rect);
+    let down = pressed(rect);
+    let track = match (on, down, hover) {
+        (true, true, _) => mixed(theme.accent, [0.0, 0.0, 0.0, 1.0], 0.18),
+        (true, false, true) => mixed(
+            theme.accent,
+            if theme.is_dark() {
+                [1.0, 1.0, 1.0, 1.0]
+            } else {
+                [0.0, 0.0, 0.0, 1.0]
+            },
+            0.12,
+        ),
+        (true, false, false) => theme.accent,
+        // Off sits a step darker than a button's resting fill: a toggle is
+        // drawn on a card, where that fill all but vanished in the light
+        // table.
+        (false, true, _) => mixed(theme.control_pressed, theme.text, 0.2),
+        (false, false, true) => mixed(theme.control_pressed, theme.text, 0.1),
+        (false, false, false) => theme.control_pressed,
+    };
+    push_rounded_rect(out, rect, rect.height * 0.5, track);
+    let knob = rect.height - UI_SEGMENT_INSET * 2.0;
+    let knob_rect = Viewport {
+        x: if on {
+            rect.x + rect.width - UI_SEGMENT_INSET - knob
+        } else {
+            rect.x + UI_SEGMENT_INSET
+        },
+        y: rect.y + UI_SEGMENT_INSET,
+        width: knob,
+        height: knob,
+    };
+    // White on the light table, the text colour on the dark one: a knob
+    // that reads on both the resting fill and the accent.
+    let ink = if theme.is_dark() {
+        theme.text
+    } else {
+        theme.palette_background
+    };
+    // A ring of the theme's shadow under it keeps its edge on either fill.
+    let ring = Viewport {
+        x: knob_rect.x - 0.5,
+        y: knob_rect.y - 0.5,
+        width: knob + 1.0,
+        height: knob + 1.0,
+    };
+    push_rounded_rect(out, ring, ring.height * 0.5, theme.shadow);
+    push_rounded_rect(out, knob_rect, knob * 0.5, ink);
+    hotspot(rect, Cursor::Pointing, tip);
+}
+
+/// Where a stepper's parts go with its right edge at `right`: the step
+/// down, the value, the step up.
+pub fn stepper_rects(right: f32, y: f32, height: f32) -> [Viewport; 3] {
+    let x = right - UI_STEP * 2.0 - UI_STEP_VALUE;
+    let at = |x: f32, width: f32| Viewport {
+        x,
+        y,
+        width,
+        height,
+    };
+    [
+        at(x, UI_STEP),
+        at(x + UI_STEP, UI_STEP_VALUE),
+        at(x + UI_STEP + UI_STEP_VALUE, UI_STEP),
+    ]
+}
+
+/// Draws a stepper: the track in the resting fill, a ghost minus and plus
+/// that are greyed at their bound, and the value in the middle.
+pub fn push_stepper(
+    out: &mut Vec<GlyphInstance>,
+    atlas: &mut Atlas,
+    rects: [Viewport; 3],
+    value: &str,
+    can: [bool; 2],
+    theme: &Theme,
+) {
+    let [less, middle, more] = rects;
+    let track = Viewport {
+        width: more.x + more.width - less.x,
+        ..less
+    };
+    let radius = if track.height <= UI_CONTROL_SM {
+        UI_RADIUS_SM
+    } else {
+        UI_RADIUS
+    };
+    push_rounded_rect(out, track, radius, theme.tab_hover);
+    for (rect, glyph, enabled, tip) in [
+        (less, icons::REMOVE, can[0], "Smaller"),
+        (more, icons::ADD, can[1], "Larger"),
+    ] {
+        // A ghost at rest and a disabled one share their ink, so the step
+        // past a bound is drawn fainter by hand.
+        if !enabled {
+            push_icon_centered(out, atlas, rect, glyph, faded(theme.status_text, 0.4));
+            continue;
+        }
+        Button::new(Viewport {
+            x: rect.x + UI_SEGMENT_INSET,
+            y: rect.y + UI_SEGMENT_INSET,
+            width: rect.width - UI_SEGMENT_INSET * 2.0,
+            height: rect.height - UI_SEGMENT_INSET * 2.0,
+        })
+        .icon(glyph)
+        .tone(Tone::Ghost)
+        .radius(UI_RADIUS_SM)
+        .tip(tip)
+        .draw(out, atlas, theme);
+    }
+    push_ui_text_centered(out, atlas, middle, value, theme.text);
+}
+
 /// A small rounded count beside a heading: `Changes (3)` without the
 /// brackets. Drawn at `x`, or as far left of it as keeps the pill inside
 /// `row`; the width it took.
@@ -1133,12 +1281,15 @@ pub fn spark_ceiling(values: &[f32]) -> f32 {
     [0.25, 0.5].into_iter().find(|c| peak <= *c).unwrap_or(1.0)
 }
 
-/// A sparkline: `values` from 0 to 1, oldest first, as `slots` bars in a
-/// faint well, the newest at its right. The scale tops out at
-/// [`spark_ceiling`], marked by a hairline and named in the well's corner,
-/// so a bar's height never overstates. A bar over `hot.0` is drawn in
-/// `hot.1`. A slot without a value draws nothing, and an idle one next to
-/// nothing.
+/// A sparkline: `values` from 0 to 1, oldest first, as a filled line
+/// across a faint well, the newest at its right edge. The run is spread
+/// over the whole width, so a short history already reads as a line; one
+/// longer than `slots` is averaged down to that many points. The scale
+/// tops out at [`spark_ceiling`], so a quiet run still has a shape; the
+/// figure beside the chart says how much, and no scale word is drawn in
+/// the well, where the line would cross it. The well's floor is a
+/// hairline. Where the line is over `hot.0` it is drawn in `hot.1`.
+/// With no values the well alone is drawn, which is the chart's skeleton.
 #[allow(clippy::too_many_arguments)]
 pub fn push_sparkline(
     out: &mut Vec<GlyphInstance>,
@@ -1150,8 +1301,12 @@ pub fn push_sparkline(
     hot: (f32, [f32; 4]),
     theme: &Theme,
 ) {
-    const GAP: f32 = 1.0;
     const INSET: f32 = 3.0;
+    /// The width of one column of the area: two points keeps a sidebar's
+    /// chart near a hundred columns.
+    const STEP: f32 = 2.0;
+    /// The line along the area's top.
+    const STROKE: f32 = 1.5;
     // The well is the card's tone stepped toward the sidebar under it:
     // sunk in dark, lifted in light, either way a place of its own.
     push_rounded_rect(
@@ -1164,64 +1319,59 @@ pub fn push_sparkline(
         x: rect.x + INSET,
         y: rect.y + INSET,
         width: (rect.width - 2.0 * INSET).max(0.0),
-        height: (rect.height - INSET).max(0.0),
+        height: (rect.height - 2.0 * INSET).max(0.0),
     };
-    let levels = spark_buckets(values, slots);
-    // Nothing read yet: the well alone, which is the chart's skeleton.
-    if levels.is_empty() || plot.width <= 0.0 || plot.height <= 0.0 {
+    let levels = spark_buckets(values, slots.max(1));
+    if levels.is_empty() || plot.width < 1.0 || plot.height <= STROKE {
         return;
     }
     let ceiling = spark_ceiling(&levels);
-    let step = (plot.width + GAP) / slots as f32;
-    let first = slots - levels.len();
-    for (n, level) in levels.iter().enumerate() {
-        let slot = first + n;
-        // Under half a percent is idle: nothing, not a sliver.
-        if *level <= 0.005 {
-            continue;
-        }
-        let h = (level.min(1.0) / ceiling * plot.height)
-            .min(plot.height)
-            .max(1.0);
-        let x = (plot.x + slot as f32 * step).round();
-        let bar = Viewport {
-            x,
-            y: plot.y + plot.height - h,
-            width: ((plot.x + (slot + 1) as f32 * step - GAP).round() - x).max(1.0),
-            height: h,
-        };
-        let ink = if *level > hot.0 { hot.1 } else { colour };
-        push_rounded_rect(out, bar, 1.0, ink);
-    }
-    // The scale, over the bars: its top as a hairline, its value as a word.
+    let bottom = plot.y + plot.height;
+    // The floor, under the area.
     push_rect(
         out,
         atlas,
-        [plot.x, plot.y],
+        [plot.x, bottom - 1.0],
         [plot.width, 1.0],
         theme.hairline,
     );
-    const SCALE: f32 = 0.7;
-    let label = match ceiling {
-        c if c <= 0.25 => "25%",
-        c if c <= 0.5 => "50%",
-        _ => "100%",
+    // The level a share of the way across, between the two points it
+    // falls between; one point is level all the way across.
+    let level_at = |t: f32| -> f32 {
+        if levels.len() == 1 {
+            return levels[0];
+        }
+        let p = t.clamp(0.0, 1.0) * (levels.len() - 1) as f32;
+        let i = (p.floor() as usize).min(levels.len() - 2);
+        levels[i] + (levels[i + 1] - levels[i]) * (p - i as f32)
     };
-    let (_, ch) = atlas.cell_size();
-    let label_w = ui_text_width(atlas, label) * SCALE;
-    push_ui_text_scaled(
-        out,
-        atlas,
-        Viewport {
-            x: plot.x + 1.0,
-            y: plot.y + 1.0,
-            width: label_w,
-            height: ch * SCALE,
-        },
-        label,
-        theme.gutter_text,
-        SCALE,
-    );
+    // The top of the line at a level: the ceiling at the plot's top, idle
+    // on the floor.
+    let top_at =
+        |level: f32| bottom - STROKE - (level / ceiling).clamp(0.0, 1.0) * (plot.height - STROKE);
+    let right = plot.x + plot.width;
+    let mut x = plot.x;
+    while x < right {
+        let next = (x + STEP).min(right);
+        let (a, b) = (
+            level_at((x - plot.x) / plot.width),
+            level_at((next - plot.x) / plot.width),
+        );
+        let ink = if a.max(b) > hot.0 { hot.1 } else { colour };
+        let (high, low) = (top_at(a).min(top_at(b)), top_at(a).max(top_at(b)));
+        let fill_top = low + STROKE;
+        if fill_top < bottom {
+            push_rect(
+                out,
+                atlas,
+                [x, fill_top],
+                [next - x, bottom - fill_top],
+                faded(ink, 0.22),
+            );
+        }
+        push_rect(out, atlas, [x, high], [next - x, low - high + STROKE], ink);
+        x = next;
+    }
 }
 
 /// A meter: `fraction` of a rounded track filled in `colour` from the
@@ -2082,51 +2232,64 @@ mod tests {
         assert_eq!(bars[0], 1.5);
         assert_eq!(bars[6], 27.0);
         assert!(spark_buckets(&run, 0).is_empty());
-        // Drawn in a well inset 3 from its sides and top, the newest at
-        // the right edge.
+    }
+
+    #[test]
+    fn a_sparkline_spreads_every_sample_across_the_well() {
         let mut out = Vec::new();
         let mut atlas = Atlas::build("SF Mono", 13.0, 2.0);
         let theme = Theme::dark();
+        // A well 3 in from each side: a plot from 3 to 103 across, 3 to 31
+        // down.
         let rect = Viewport {
             x: 0.0,
             y: 0.0,
-            width: 34.0,
-            height: 28.0,
+            width: 106.0,
+            height: 34.0,
         };
-        // Scaled to a quarter: 0.25 fills the plot, 0.1 a bit under half,
-        // a trace a point, an idle one nothing, one over the hot
-        // mark its own colour.
-        let (bar, hot) = ([0.1, 0.2, 0.3, 1.0], [0.3, 0.2, 0.1, 1.0]);
-        push_sparkline(
-            &mut out,
-            &mut atlas,
-            rect,
-            &[0.25, 0.1, 0.006, 0.001],
-            4,
-            bar,
-            (0.8, hot),
-            &theme,
-        );
-        let bars: Vec<_> = out.iter().filter(|g| g.color == bar).collect();
-        assert_eq!(bars.len(), 3);
-        assert_eq!(bars[0].size[1], 25.0);
-        assert_eq!(bars[1].size[1], 10.0);
-        assert_eq!(bars[2].size[1], 1.0);
-        assert_eq!(bars[0].pos[0], 3.0);
-        out.clear();
-        push_sparkline(
-            &mut out,
-            &mut atlas,
-            rect,
-            &[0.9],
-            4,
-            bar,
-            (0.8, hot),
-            &theme,
-        );
-        let red: Vec<_> = out.iter().filter(|g| g.color == hot).collect();
-        assert_eq!(red.len(), 1);
-        assert_eq!(red[0].pos[0] + red[0].size[0], 31.0);
+        let (line, hot) = ([0.1, 0.2, 0.3, 1.0], [0.3, 0.2, 0.1, 1.0]);
+        let draw = |out: &mut Vec<GlyphInstance>, atlas: &mut Atlas, values: &[f32]| {
+            out.clear();
+            push_sparkline(out, atlas, rect, values, 30, line, (0.8, hot), &theme);
+        };
+        // The stroke of the line: drawn in the colour itself, the fill
+        // under it faded.
+        let stroke = |out: &[GlyphInstance], ink: [f32; 4]| -> Vec<GlyphInstance> {
+            out.iter().filter(|g| g.color == ink).copied().collect()
+        };
+        // Two samples fill the width, not the last two of thirty slots:
+        // the oldest at the left edge, the newest at the right.
+        draw(&mut out, &mut atlas, &[0.25, 0.0]);
+        let s = stroke(&out, line);
+        assert_eq!(s.first().map(|g| g.pos[0]), Some(3.0));
+        let last = s.last().unwrap();
+        assert_eq!(last.pos[0] + last.size[0], 103.0);
+        // A quarter is the ceiling: the left starts at the plot's top, the
+        // right sits on the floor.
+        assert_eq!(s[0].pos[1], 3.0);
+        assert_eq!(last.pos[1] + last.size[1], 31.0);
+        // Every sample is drawn: a peak in the middle of five shows there.
+        draw(&mut out, &mut atlas, &[0.0, 0.0, 0.25, 0.0, 0.0]);
+        let s = stroke(&out, line);
+        let peak = s
+            .iter()
+            .min_by(|a, b| a.pos[1].total_cmp(&b.pos[1]))
+            .unwrap();
+        assert!((peak.pos[0] - 53.0).abs() <= 2.0, "{}", peak.pos[0]);
+        // No scale word for the line to cross.
+        assert!(!out.iter().any(|g| g.color == theme.gutter_text));
+        // One sample is level across the whole well.
+        draw(&mut out, &mut atlas, &[0.1]);
+        let s = stroke(&out, line);
+        assert!(s.iter().all(|g| g.pos[1] == s[0].pos[1]));
+        assert_eq!(s.len(), 50);
+        // Over the hot mark, its own colour.
+        draw(&mut out, &mut atlas, &[0.9, 0.9]);
+        assert!(stroke(&out, line).is_empty());
+        assert_eq!(stroke(&out, hot).len(), 50);
+        // Nothing read: the well alone.
+        draw(&mut out, &mut atlas, &[]);
+        assert_eq!(out.len(), 1);
     }
 
     #[test]

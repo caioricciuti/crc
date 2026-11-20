@@ -699,15 +699,32 @@ impl EditorView {
                 theme.status_text,
             );
         } else {
-            layout::build_breadcrumbs(
-                buffer,
-                tree,
-                home,
-                &mut renderer.atlas,
-                breadcrumb_rect,
-                theme,
-                glyphs,
-            );
+            // A version from history: its tab already says which; the row
+            // says where the file is.
+            if let Some(file) = scrub
+                .as_ref()
+                .and_then(|s| s.file_of(buffer.id()))
+                .and_then(|live| super::buffer_by_id(docs, panes, live))
+            {
+                layout::build_breadcrumb_trail(
+                    file,
+                    tree,
+                    &mut renderer.atlas,
+                    breadcrumb_rect,
+                    theme,
+                    glyphs,
+                );
+            } else {
+                layout::build_breadcrumbs(
+                    buffer,
+                    tree,
+                    home,
+                    &mut renderer.atlas,
+                    breadcrumb_rect,
+                    theme,
+                    glyphs,
+                );
+            }
             if let Some(strip) = response_rect
                 && let Some(view) = responses.get(&buffer.id())
             {
@@ -1105,7 +1122,8 @@ impl EditorView {
         let agents_note = note.clone();
         let (status, detail) = status_texts(&StatusParts {
             buffer,
-            home,
+            // The Settings and MCP pages cover the document as Home does.
+            home: home || matches!(column, Column::Settings | Column::Mcp),
             note,
             diagnostics: diagnostics.map(Vec::as_slice),
             blame: blame
@@ -1674,8 +1692,9 @@ fn draw_prompt(
 /// What the status line says, gathered by `render`.
 struct StatusParts<'a> {
     buffer: &'a Buffer,
-    /// Home is showing: nothing is open, so there is no document to name,
-    /// save, place a caret in or encode.
+    /// Home, or a page that covers the document (Settings, MCP), is
+    /// showing: there is no document in view to name, save, place a caret
+    /// in, encode or diagnose.
     home: bool,
     /// A transient note: a save result, an open error.
     note: Option<String>,
@@ -1888,7 +1907,7 @@ fn join_status(parts: &[&str]) -> String {
 fn status_texts(parts: &StatusParts<'_>) -> (String, StatusDetail) {
     let buffer = parts.buffer;
     let (line, column) = buffer.cursor_position();
-    let (here, counts) = match parts.diagnostics {
+    let (here, counts) = match parts.diagnostics.filter(|_| !parts.home) {
         Some(list) if !list.is_empty() => {
             let here = list
                 .iter()
@@ -1956,7 +1975,11 @@ fn status_texts(parts: &StatusParts<'_>) -> (String, StatusDetail) {
             ]),
         )
     };
-    let lsp = parts.lsp.as_deref().map(|lsp| format!("● {lsp}"));
+    let lsp = parts
+        .lsp
+        .as_deref()
+        .filter(|_| !parts.home)
+        .map(|lsp| format!("● {lsp}"));
     let right = StatusDetail {
         lead: join_status(&[
             if parts.claude { STATUS_CLAUDE } else { "" },
@@ -2074,6 +2097,36 @@ mod status_tests {
             ..home
         };
         assert_eq!(status_texts(&noted).0, "opened garden");
+    }
+
+    /// Regression: with the Settings page in front, the status line still
+    /// said "Untitled   All changes saved" and "Ln 1, Col 1  UTF-8  LF"
+    /// about the document under it. The page passes `home`: its name,
+    /// place, format, diagnostics and server go; the branch and a note stay.
+    #[test]
+    fn a_page_over_the_document_hides_it_from_the_status_line() {
+        let mut buffer = Buffer::new();
+        buffer.insert("x");
+        let list = [diagnostic(0, Severity::Error, "broken")];
+        let page = StatusParts {
+            home: true,
+            branch: "main".into(),
+            diagnostics: Some(&list),
+            lsp: Some("rust-analyzer".into()),
+            ..parts(&buffer)
+        };
+        let (left, right) = status_texts(&page);
+        let right = right.whole();
+        assert_eq!(left, "");
+        for gone in ["Ln ", "UTF-8", "rust-analyzer", "✕"] {
+            assert!(!right.contains(gone), "{gone}: {right}");
+        }
+        assert!(right.contains("main"), "{right}");
+        let noted = StatusParts {
+            note: Some("Caret blink off".into()),
+            ..page
+        };
+        assert_eq!(status_texts(&noted).0, "Caret blink off");
     }
 
     #[test]

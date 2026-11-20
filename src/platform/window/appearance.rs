@@ -150,9 +150,67 @@ impl EditorView {
             }
             Action::Open => self.open_settings_file(None),
             Action::Edit(key) => self.open_settings_file(Some(key)),
+            Action::Toggle(..) | Action::Step(..) | Action::Choose(..) => {
+                if let Some((key, change)) = action.change() {
+                    self.change_setting(key, change);
+                }
+            }
         }
         self.request_redraw();
         self.pump();
+    }
+
+    /// A control on the Settings page: the one line of config.toml it
+    /// stands for is rewritten, then the file is applied the way saving it
+    /// in a tab applies it, so the file stays the one source.
+    fn change_setting(&self, key: &str, change: crate::platform::settings::Change<'_>) {
+        use crate::platform::settings::{Settings, label_of};
+        // config.toml open with unsaved edits: writing under them would
+        // leave the tab and the file disagreeing, and a save would undo the
+        // change or the reload would drop the edits. Neither is touched.
+        let dirty = self.state().is_some_and(|state| {
+            Settings::path().is_some_and(|path| {
+                let path = crate::platform::canonical(&path);
+                all_docs(&state).flat_map(|docs| docs.iter()).any(|buffer| {
+                    buffer.is_dirty()
+                        && buffer
+                            .path
+                            .as_deref()
+                            .is_some_and(|p| crate::platform::canonical(p) == path)
+                })
+            })
+        });
+        if dirty {
+            if let Some(mut state) = self.state_mut() {
+                state.say(
+                    layout::Feedback::Failure,
+                    "Save or revert config.toml first",
+                );
+            }
+            return;
+        }
+        // Read fresh: the file may have been edited since the page was.
+        let (current, _) = Settings::load_checked();
+        let Some(literal) = current.literal_for(key, change) else {
+            return;
+        };
+        if let Err(e) = Settings::set_value(key, &literal) {
+            if let Some(mut state) = self.state_mut() {
+                state.say(layout::Feedback::Failure, format!("settings: {e}"));
+            }
+            return;
+        }
+        self.apply_settings_file();
+        if let Some(mut state) = self.state_mut()
+            && state.settings_page.problems.is_empty()
+        {
+            let said = format!(
+                "{} {}",
+                label_of(key),
+                state.settings_page.settings.display_of(key).to_lowercase()
+            );
+            state.say(layout::Feedback::Success, said);
+        }
     }
 
     /// config.toml in a tab, created from the template when there is none,

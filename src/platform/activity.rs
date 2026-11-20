@@ -36,6 +36,9 @@ const LINE: f32 = 20.0;
 const CHART: f32 = 28.0;
 /// The memory meter under its line.
 const METER: f32 = 4.0;
+/// The card's inset from the sidebar's sides: the agent cards' own, so
+/// both share their left and right edges.
+const EDGE: f32 = 6.0;
 /// A card's inset: its lines from its sides, and from its top and bottom.
 const PAD_X: f32 = 10.0;
 const PAD_Y: f32 = 4.0;
@@ -437,12 +440,13 @@ impl Monitor {
         if folded {
             return title;
         }
-        // The totals on a card, as the inspector groups its facts; the
-        // processes under it, on the card's lines.
+        // The totals on a card, as the inspector groups its facts, edge to
+        // edge with the agent cards above; the processes under it, on the
+        // card's lines.
         let card = Viewport {
-            x: rect.x + 8.0,
+            x: rect.x + EDGE,
             y: rect.y + TITLE + 2.0,
-            width: (rect.width - 16.0).max(0.0),
+            width: (rect.width - 2.0 * EDGE).max(0.0),
             height: CARD,
         };
         layout::push_card(out, card, theme);

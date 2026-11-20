@@ -1992,6 +1992,48 @@ mod tests {
     }
 
     #[test]
+    fn a_wrapped_markdown_table_stops_at_the_wrap_column() {
+        // A table wider than the wrap: its padded rows do not wrap, and
+        // used to run on to the text area's edge, under the scrollbar.
+        let mut atlas = atlas();
+        let text = "| a | b |\n|---|---|\n| one | two three four five six seven |\n\nx\n";
+        let styled = crate::markdown::source::style(text);
+        let markdown = Markdown::of(Some(&styled));
+        let mut buffer = Buffer::from_text(text);
+        buffer.place_cursor(text.len() - 2, crate::text::buffer::Motion::Move);
+        let m = atlas.metrics;
+        let gutter = gutter_width(&buffer, &atlas);
+        let viewport = Viewport::new(gutter + 30.0 * m.advance, 400.0);
+        buffer.wrap = Some(20);
+        let right = wrap_right(buffer.wrap, viewport.x + gutter, m.advance, viewport.width);
+        assert!((right - (gutter + 20.0 * m.advance)).abs() < 0.01);
+        let rows = screen_rows(&buffer, viewport, m.line_height);
+        let mut out = Vec::new();
+        build_full_search(
+            &buffer,
+            &mut atlas,
+            viewport,
+            &rows,
+            &Theme::default(),
+            "",
+            None,
+            &[],
+            &markdown,
+            false,
+            &mut out,
+        );
+        let glyphs = out.iter().filter(|q| q.uv != atlas.solid_uv());
+        for quad in glyphs {
+            assert!(
+                quad.pos[0] + quad.size[0] <= right + 0.01,
+                "a glyph past the wrap column: {quad:?}"
+            );
+        }
+        // Not wrapping, the edge is the text area's.
+        assert_eq!(wrap_right(None, gutter, m.advance, 500.0), 500.0);
+    }
+
+    #[test]
     fn a_shaped_line_keeps_to_the_cell_grid() {
         // Shaped by CoreText at the font's own advance, then stretched to
         // the grid's rounded one: its columns stand over an ASCII line's.

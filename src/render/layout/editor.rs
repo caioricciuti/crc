@@ -241,6 +241,10 @@ pub fn build_text_appending(
         .collect();
     let bracket = if focused { bracket_match(buffer) } else { None };
     let wrapping = buffer.wrap.is_some();
+    // Where a row's text is cut. A wrapped row ends at its wrap column,
+    // short of the scrollbar; a Markdown table, whose padded cells do not
+    // wrap, is cut there too rather than running on under the scrollbar.
+    let text_right = wrap_right(buffer.wrap, text_x, m.advance, viewport.x + viewport.width);
     let touched = touched_lines(buffer);
     let _ = (offset, first);
 
@@ -629,7 +633,7 @@ pub fn build_text_appending(
                 }
             }
             for quad in &mut out[source_quads..] {
-                clip_horizontal(quad, text_x, viewport.x + viewport.width);
+                clip_horizontal(quad, text_x, text_right);
             }
             shaped_carets.push((row_index, shaped.clone(), row_x0, map));
             if row.first {
@@ -712,7 +716,7 @@ pub fn build_text_appending(
                         for k in 0..pad {
                             let x =
                                 text_x + (column as f32 + shift + k as f32) * m.advance - scroll_x;
-                            if x >= text_x && x <= viewport.x + viewport.width {
+                            if x >= text_x && x <= text_right {
                                 out.push(GlyphInstance {
                                     pos: [x, y + glyph_dy],
                                     size: [cell_w * slot.cells as f32, cell_h],
@@ -782,7 +786,7 @@ pub fn build_text_appending(
             }
         }
         for quad in &mut out[source_quads..] {
-            clip_horizontal(quad, text_x, viewport.x + viewport.width);
+            clip_horizontal(quad, text_x, text_right);
         }
         if row.first {
             stats.lines += 1;
@@ -2502,6 +2506,12 @@ impl ScreenRow {
 /// The rows with any part in `viewport`, top to bottom. Every place that
 /// puts text on screen or finds text under the pointer reads these, so the
 /// two cannot disagree about where a wrapped row is.
+/// The right edge a row's text is cut at: the wrap column while the
+/// document wraps, never past `edge`, the text area's own right edge.
+pub fn wrap_right(wrap: Option<usize>, text_x: f32, advance: f32, edge: f32) -> f32 {
+    wrap.map_or(edge, |cols| (text_x + cols as f32 * advance).min(edge))
+}
+
 /// What a Markdown document draws beyond its colours: the band behind code
 /// blocks, and on lines no caret or selection touches, its syntax hidden and
 /// its table cells padded. Empty for any other document.

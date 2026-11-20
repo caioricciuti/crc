@@ -439,9 +439,10 @@ impl Settings {
 }
 
 /// One setting as the Settings page shows it: its key in the file, the
-/// group it is listed under, and what it does.
+/// name it is shown by, the group it is listed under, and what it does.
 pub struct Described {
     pub key: &'static str,
+    pub label: &'static str,
     pub group: &'static str,
     pub what: &'static str,
 }
@@ -451,85 +452,299 @@ pub struct Described {
 pub const DESCRIBED: [Described; 16] = [
     Described {
         key: "theme",
+        label: "Theme",
         group: "Appearance",
         what: "Light, dark, or whatever the system uses.",
     },
     Described {
         key: "font",
+        label: "Font",
         group: "Appearance",
         what: "The code font: any monospace face installed on this Mac.",
     },
     Described {
         key: "font_size",
+        label: "Font size",
         group: "Appearance",
         what: "8 to 32 points. \u{2318}= and \u{2318}- change it, \u{2318}0 goes back.",
     },
     Described {
         key: "caret_blink",
+        label: "Caret blink",
         group: "Appearance",
         what: "Whether the caret blinks. It is solid while you type either way.",
     },
     Described {
         key: "word_wrap",
+        label: "Word wrap",
         group: "Editing",
         what: "Wrap long lines: auto wraps Markdown and text files. Option-Z flips one document.",
     },
     Described {
         key: "format_on_save",
+        label: "Format on save",
         group: "Editing",
         what: "Format the file with its language server when saving it.",
     },
     Described {
         key: "organize_imports_on_save",
+        label: "Organize imports on save",
         group: "Editing",
         what: "Sort and prune imports with the language server when saving, before any format.",
     },
     Described {
         key: "conflict_view",
+        label: "Merge conflicts",
         group: "Git",
         what: "How a file with merge conflicts opens: in the text, or as columns.",
     },
     Described {
         key: "blame_heat",
+        label: "Blame heat",
         group: "Git",
         what: "Shade a strip in the gutter by how recently each line was changed. Git > Blame Heat flips it for the session.",
     },
     Described {
         key: "ssh_auth_sock",
+        label: "SSH agent socket",
         group: "Git",
         what: "The SSH agent socket for fetch, pull and push, for when crc is opened from the Dock without your shell's SSH_AUTH_SOCK.",
     },
     Described {
         key: "update_check",
+        label: "Check for updates",
         group: "App",
         what: "Once a day at launch, ask GitHub whether a newer release exists. Nothing is downloaded.",
     },
     Described {
         key: "agent_review",
+        label: "Review agent edits",
         group: "Agents",
         what: "Keep each file as it was before the Claude Code crc starts first edits it, so its changes can be reviewed and undone.",
     },
     Described {
         key: "auto_continue",
+        label: "Continue after API errors",
         group: "Agents",
         what: "When a Claude Code turn ends on a temporary API error, type \"continue\" into it after 20, 40 and 80 seconds, unless you type first.",
     },
     Described {
         key: "notify_waiting",
+        label: "Notify when an agent waits",
         group: "Agents",
         what: "Notify when an agent waits: a macOS notification for a session that starts waiting while it is not the one in front of you. Reply from it, or click it to go there.",
     },
     Described {
         key: "local_history",
+        label: "Local history",
         group: "Local History",
         what: "Keep past versions of the files you edit: opened, saved, reloaded, closed unsaved, and after 30 seconds without typing. Never secrets.",
     },
     Described {
         key: "local_history_exclude",
+        label: "Left out of local history",
         group: "Local History",
         what: "More files for local history to leave out: globs as in .gitignore, separated by commas.",
     },
 ];
+
+/// How the Settings page changes a key: a switch, a stepper between two
+/// bounds, one of a few words, or the file at that line for free text.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Control {
+    Toggle,
+    Stepper {
+        min: f32,
+        max: f32,
+    },
+    /// The choices, as (what the page shows, what the file says).
+    Choice(&'static [(&'static str, &'static str)]),
+    Text,
+}
+
+/// The control the Settings page draws for `key`.
+pub fn control_of(key: &str) -> Control {
+    match key {
+        "font_size" => Control::Stepper {
+            min: MIN_FONT_SIZE,
+            max: MAX_FONT_SIZE,
+        },
+        "theme" => Control::Choice(&[("System", "system"), ("Light", "light"), ("Dark", "dark")]),
+        "word_wrap" => Control::Choice(&[("Auto", "auto"), ("On", "on"), ("Off", "off")]),
+        "conflict_view" => {
+            Control::Choice(&[("Inline", "inline"), ("Side by Side", "side-by-side")])
+        }
+        "caret_blink"
+        | "update_check"
+        | "format_on_save"
+        | "organize_imports_on_save"
+        | "blame_heat"
+        | "agent_review"
+        | "auto_continue"
+        | "notify_waiting"
+        | "local_history" => Control::Toggle,
+        _ => Control::Text,
+    }
+}
+
+/// The name the Settings page shows for `key`, or the key itself.
+pub fn label_of(key: &str) -> &str {
+    DESCRIBED
+        .iter()
+        .find(|d| d.key == key)
+        .map_or(key, |d| d.label)
+}
+
+/// A stepper's next value: one point from `value` toward `up` or down,
+/// landing on a whole number, inside `min..=max`. `None` at the bound.
+pub fn stepped(value: f32, up: bool, min: f32, max: f32) -> Option<f32> {
+    let next = if up {
+        value.floor() + 1.0
+    } else {
+        value.ceil() - 1.0
+    }
+    .clamp(min, max);
+    ((next - value).abs() > 0.001).then_some(next)
+}
+
+impl Settings {
+    /// What a toggle reads: whether `key` is on.
+    pub fn flag_of(&self, key: &str) -> bool {
+        self.value_of(key) == "true"
+    }
+
+    /// A number setting's value, for a stepper.
+    pub fn number_of(&self, key: &str) -> f32 {
+        match key {
+            "font_size" => self.font_size,
+            _ => 0.0,
+        }
+    }
+
+    /// A choice setting's word as the file spells it, without its quotes.
+    pub fn word_of(&self, key: &str) -> String {
+        let value = self.value_of(key);
+        unquote(&value).map_or(value.clone(), |w| w.into_owned())
+    }
+
+    /// A key's value as a person reads it: no quotes, On and Off, the
+    /// choice's own name.
+    pub fn display_of(&self, key: &str) -> String {
+        match control_of(key) {
+            Control::Toggle => if self.flag_of(key) { "On" } else { "Off" }.to_owned(),
+            Control::Stepper { .. } => format!("{} pt", format_size(self.number_of(key))),
+            Control::Choice(choices) => {
+                let word = self.word_of(key);
+                choices
+                    .iter()
+                    .find(|(_, w)| *w == word)
+                    .map_or(word.clone(), |(label, _)| (*label).to_owned())
+            }
+            Control::Text => match key {
+                "ssh_auth_sock" => self.ssh_auth_sock.as_ref().map_or_else(
+                    || "Not set".to_owned(),
+                    |p| p.to_string_lossy().into_owned(),
+                ),
+                "local_history_exclude" if self.local_history_exclude.trim().is_empty() => {
+                    "None".to_owned()
+                }
+                _ => self.word_of(key),
+            },
+        }
+    }
+
+    /// What the file should say for `key` after a page control changed
+    /// it: a toggle flipped, a stepper moved, a choice made.
+    pub fn literal_for(&self, key: &str, change: Change<'_>) -> Option<String> {
+        match (control_of(key), change) {
+            (Control::Toggle, Change::Flip) => {
+                Some(if self.flag_of(key) { "false" } else { "true" }.to_owned())
+            }
+            (Control::Stepper { min, max }, Change::Step(up)) => {
+                stepped(self.number_of(key), up, min, max).map(format_size)
+            }
+            (Control::Choice(choices), Change::Choose(word)) => {
+                choices.iter().any(|(_, w)| *w == word).then(|| quote(word))
+            }
+            _ => None,
+        }
+    }
+
+    /// Sets one key in config.toml to `literal`, as the file spells it,
+    /// leaving every other line, and any comment after the value, as it
+    /// was. A missing file starts from the template.
+    pub fn set_value(key: &str, literal: &str) -> std::io::Result<()> {
+        let Some(path) = Settings::path() else {
+            return Err(std::io::Error::other("no home directory"));
+        };
+        set_value_in(&path, key, literal)
+    }
+}
+
+/// What a control on the Settings page asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Change<'a> {
+    Flip,
+    Step(bool),
+    Choose(&'a str),
+}
+
+fn set_value_in(path: &Path, key: &str, literal: &str) -> std::io::Result<()> {
+    let existing = match std::fs::read(path) {
+        Ok(bytes) => String::from_utf8(bytes).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "the settings file is not UTF-8, so it was left alone",
+            )
+        })?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    let base = if existing.trim().is_empty() {
+        TEMPLATE
+    } else {
+        existing.as_str()
+    };
+    let text = with_value(base, key, literal);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    crate::platform::write_atomically(path, text.as_bytes())
+}
+
+/// `text` with the line that sets `key` (the last one, which is the one
+/// that counts) given `literal` as its value, its spacing and any comment
+/// after the value kept; or the line appended when no line sets it.
+fn with_value(text: &str, key: &str, literal: &str) -> String {
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let at = lines
+        .iter()
+        .rposition(|line| split_line(line).is_some_and(|(k, _)| k == key));
+    let Some(at) = at else {
+        let mut out = text.to_owned();
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&format!("{key} = {literal}\n"));
+        return out;
+    };
+    let line = lines[at];
+    let (_, value) = split_line(line).expect("matched above");
+    // `value` is a slice of `line`, so its place in the line is known.
+    let start = value.as_ptr() as usize - line.as_ptr() as usize;
+    let end = start + value.len();
+    let mut out = String::with_capacity(text.len() + literal.len());
+    for (i, l) in lines.iter().enumerate() {
+        if i == at {
+            out.push_str(&line[..start]);
+            out.push_str(literal);
+            out.push_str(&line[end..]);
+        } else {
+            out.push_str(l);
+        }
+    }
+    out
+}
 
 impl Settings {
     /// A key's value as the file would spell it, for the Settings page.
@@ -717,6 +932,91 @@ mod tests {
             let (_, problems) = Settings::parse_checked(&format!("{key} = {value}\n"));
             assert!(problems.is_empty(), "{key} = {value}: {problems:?}");
         }
+    }
+
+    #[test]
+    fn a_page_change_rewrites_one_value_and_keeps_the_rest() {
+        let text = "# mine\ncaret_blink = true   # keep me\nfont_size = 13\ntab_width = 2\n";
+        let s = Settings::parse(text);
+        let flipped = s.literal_for("caret_blink", Change::Flip).unwrap();
+        assert_eq!(flipped, "false");
+        assert_eq!(
+            with_value(text, "caret_blink", &flipped),
+            "# mine\ncaret_blink = false   # keep me\nfont_size = 13\ntab_width = 2\n"
+        );
+        // The last line that sets the key is the one that counts.
+        assert_eq!(
+            with_value("theme = \"dark\"\ntheme = \"light\"", "theme", "\"system\""),
+            "theme = \"dark\"\ntheme = \"system\""
+        );
+        // A key not set yet is appended; a commented one is left alone.
+        assert_eq!(
+            with_value("# blame_heat = true\nfont = \"A\"", "blame_heat", "true"),
+            "# blame_heat = true\nfont = \"A\"\nblame_heat = true\n"
+        );
+        // Through the file: a missing one starts from the template.
+        let dir = std::env::temp_dir().join(format!("crc-settings-set-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let _ = std::fs::remove_file(&path);
+        set_value_in(&path, "caret_blink", "false").unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            written,
+            TEMPLATE.replace("caret_blink = true", "caret_blink = false")
+        );
+        assert!(!Settings::parse(&written).caret_blink);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn steppers_stop_at_their_bounds_and_choices_take_their_words() {
+        assert_eq!(stepped(13.0, true, 8.0, 32.0), Some(14.0));
+        assert_eq!(stepped(13.5, true, 8.0, 32.0), Some(14.0));
+        assert_eq!(stepped(13.5, false, 8.0, 32.0), Some(13.0));
+        assert_eq!(stepped(32.0, true, 8.0, 32.0), None);
+        assert_eq!(stepped(8.0, false, 8.0, 32.0), None);
+        let at_max = Settings::parse("font_size = 32\n");
+        assert_eq!(at_max.literal_for("font_size", Change::Step(true)), None);
+        assert_eq!(
+            at_max
+                .literal_for("font_size", Change::Step(false))
+                .as_deref(),
+            Some("31")
+        );
+        let s = Settings::default();
+        assert_eq!(
+            s.literal_for("theme", Change::Choose("light")).as_deref(),
+            Some("\"light\"")
+        );
+        assert_eq!(s.literal_for("theme", Change::Choose("sepia")), None);
+        assert_eq!(s.literal_for("font", Change::Flip), None);
+    }
+
+    #[test]
+    fn labels_and_values_read_as_words() {
+        assert_eq!(label_of("font_size"), "Font size");
+        assert_eq!(label_of("caret_blink"), "Caret blink");
+        for d in &DESCRIBED {
+            assert!(!d.label.contains('_'), "{}: {}", d.key, d.label);
+            assert!(
+                d.label.starts_with(|c: char| c.is_uppercase()),
+                "{}",
+                d.label
+            );
+        }
+        let s = Settings::parse("conflict_view = \"side-by-side\"\nblame_heat = true\n");
+        assert_eq!(s.display_of("theme"), "System");
+        assert_eq!(s.display_of("font"), "SF Mono");
+        assert_eq!(s.display_of("font_size"), "13 pt");
+        assert_eq!(s.display_of("blame_heat"), "On");
+        assert_eq!(s.display_of("caret_blink"), "On");
+        assert_eq!(s.display_of("format_on_save"), "Off");
+        assert_eq!(s.display_of("conflict_view"), "Side by Side");
+        assert_eq!(s.display_of("ssh_auth_sock"), "Not set");
+        assert_eq!(s.display_of("local_history_exclude"), "None");
+        assert_eq!(control_of("caret_blink"), Control::Toggle);
+        assert_eq!(control_of("font"), Control::Text);
     }
 
     #[test]

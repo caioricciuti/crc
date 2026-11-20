@@ -3848,6 +3848,63 @@ pub fn build_breadcrumbs(
     );
 }
 
+/// The breadcrumb row over a tab that shows another file's text, such as
+/// a version from its history: that file's path, as the row would name
+/// it, but read-only. Its parts open nothing, so none lights up or takes
+/// the pointer.
+pub fn build_breadcrumb_trail(
+    buffer: &Buffer,
+    tree: &Tree,
+    atlas: &mut Atlas,
+    rect: Viewport,
+    theme: &Theme,
+    out: &mut Vec<GlyphInstance>,
+) {
+    let crumbs = breadcrumb_segments(buffer, tree, atlas, rect);
+    let right = rect.x + rect.width - 20.0;
+    let last = crumbs.len().saturating_sub(1);
+    for (index, crumb) in crumbs.iter().enumerate() {
+        let x = crumb.rect.x + 4.0;
+        let color = if index == last {
+            theme.text
+        } else {
+            theme.status_text
+        };
+        push_ui_text_elided(
+            out,
+            atlas,
+            Viewport {
+                x,
+                width: (right - x).max(0.0),
+                ..rect
+            },
+            &crumb.label,
+            color,
+        );
+        if index < last {
+            let sx = x + ui_text_width(atlas, &crumb.label);
+            push_ui_text(
+                out,
+                atlas,
+                Viewport {
+                    x: sx,
+                    width: (right - sx).max(0.0),
+                    ..rect
+                },
+                CRUMB_SEPARATOR,
+                theme.gutter_text,
+            );
+        }
+    }
+    push_rect(
+        out,
+        atlas,
+        [rect.x, rect.y + rect.height - 1.0 / atlas.metrics.scale],
+        [rect.width, 1.0 / atlas.metrics.scale],
+        theme.hairline,
+    );
+}
+
 #[cfg(test)]
 mod home_tests {
     use super::*;
